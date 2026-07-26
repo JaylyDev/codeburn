@@ -19,6 +19,7 @@ import {
   recordAntigravityStatusLinePayload,
   shouldReparseAntigravitySource,
 } from '../../src/providers/antigravity.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 const requireForTest = createRequire(import.meta.url)
@@ -56,7 +57,9 @@ function createCurrentAntigravityCliDb(dbPath: string, fixture: CurrentCliFixtur
 async function collectAntigravityCalls(source: { path: string; project: string; provider: string }): Promise<ParsedProviderCall[]> {
   const parser = createAntigravityProvider().createSessionParser(source, new Set())
   const calls: ParsedProviderCall[] = []
-  for await (const call of parser.parse()) calls.push(call)
+  // Route through the pricing pass so cost assertions see the report-path
+  // costUSD (converted sites emit costBasis + pricingModel, not costUSD).
+  for await (const call of parser.parse()) calls.push(priceProviderCall(call))
   return calls
 }
 
@@ -349,7 +352,7 @@ describe('antigravity provider helpers', () => {
 
       const parser = createAntigravityProvider().createSessionParser(source, new Set())
       const calls = []
-      for await (const call of parser.parse()) calls.push(call)
+      for await (const call of parser.parse()) calls.push(priceProviderCall(call))
 
       expect(calls).toHaveLength(1)
       expect(calls[0]).toMatchObject({

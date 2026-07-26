@@ -177,6 +177,16 @@ function resolveModel(metadata: VibeMetadata): string {
   return configured?.alias ?? configured?.name ?? DEFAULT_MODEL
 }
 
+// Residual pricing-table dependency (Phase 0 misfit; revisit in Phase 8): this
+// decoder computes ONE session cost — a provider-reported `session_cost`, else
+// Vibe's own per-million prices, else the generic price table — and ALLOCATES it
+// evenly across the session's assistant messages (allocateCost). Per-call token
+// buckets therefore do not each reproduce their per-call dollar figure, so the
+// generic 'estimated' pass cannot recreate the number. The decoder's allocated
+// dollar figure is authoritative, so emitted calls are marked costBasis
+// 'measured' and the pass passes costUSD through untouched. Only the last of the
+// three branches consults the price table; lifting it out would require moving
+// allocation host-side, which is a Core-extraction concern beyond Phase 0.
 function calculateSessionCost(metadata: VibeMetadata, model: string, inputTokens: number, outputTokens: number): number {
   const stats = metadata.stats ?? {}
   const sessionCost = safeNumber(stats.session_cost)
@@ -333,6 +343,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           reasoningTokens: 0,
           webSearchRequests: 0,
           costUSD,
+          costBasis: 'measured',
           tools,
           bashCommands,
           timestamp: fallbackTimestamp,
@@ -380,6 +391,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           reasoningTokens: 0,
           webSearchRequests: 0,
           costUSD: allocateCost(costUSD, assistantMessages.length),
+          costBasis: 'measured',
           tools,
           bashCommands,
           timestamp: message.timestamp ?? fallbackTimestamp,

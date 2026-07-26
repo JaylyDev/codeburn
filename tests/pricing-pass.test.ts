@@ -47,6 +47,19 @@ describe('priceProviderCall', () => {
     expect(priceProviderCall(call).costUSD).toBe(0.0042)
   })
 
+  it("prices `pricingModel` instead of `model` when supplied (antigravity misfit)", () => {
+    const call = baseCall({
+      costBasis: 'estimated',
+      model: 'gemini-3.1-pro-high',
+      pricingModel: 'gemini-3.1-pro',
+    })
+    // The suffix-stripped pricing model is what reaches the price table; the
+    // display model is not.
+    expect(priceProviderCall(call).costUSD).toBe(
+      models.calculateCost('gemini-3.1-pro', 100, 50, 0, 0, 0, 'standard'),
+    )
+  })
+
   it('leaves an unconverted call (no costBasis) exactly as-is', () => {
     const call = baseCall({ costUSD: 0.99 })
     expect(priceProviderCall(call)).toBe(call)

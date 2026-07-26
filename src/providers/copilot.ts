@@ -823,6 +823,17 @@ function createJsonlParser(
 
             // Tokens are real counts written by the CLI, so this cost is
             // measured, not char-estimated: costIsEstimated is false.
+            //
+            // NOT lifted to the pricing pass (Phase 0 residual; revisit Phase 8):
+            // this call carries reasoningTokens for reporting but deliberately
+            // prices output as 0 (the per-turn assistant.message events own the
+            // output cost; billing it here would double-count). The generic
+            // 'estimated' path bills outputTokens + reasoningTokens, so it cannot
+            // reproduce this reasoning-excluded figure when reasoningTokens > 0.
+            // Keep the in-decoder price call; the pass leaves it untouched (no
+            // costBasis). copilot is non-whitelisted, so the cache-read recompute
+            // already bills reasoning here — a pre-existing cold/warm divergence
+            // left exactly as-is.
             const costUSD = calculateCost(model, inputTokens, 0, cacheWriteTokens, cacheReadTokens, 0)
 
             yield {
@@ -897,7 +908,6 @@ function createJsonlParser(
           // Copilot JSONL only logs outputTokens; inputTokens are NOT available.
           // Cost will be lower than actual API cost. This is the original
           // behaviour — OTel data (below) replaces it when available.
-          const costUSD = calculateCost(currentModel, 0, outputTokens, 0, 0, 0)
 
           yield {
             provider: 'copilot',
@@ -910,7 +920,7 @@ function createJsonlParser(
             cachedInputTokens: 0,
             reasoningTokens: 0,
             webSearchRequests: 0,
-            costUSD,
+            costBasis: 'estimated' as const,
             tools,
             bashCommands,
             skills: skills.length > 0 ? skills : undefined,
@@ -964,7 +974,6 @@ function createChatSessionParser(
         seenKeys.add(dedupKey)
 
         const model = modelFromChatSessionRequest(rawReq, metadata)
-        const costUSD = calculateCost(model, inputTokens, outputTokens, 0, 0, 0)
         const timestamp = timestampToISO(rawReq['timestamp']) || sessionCreatedAt
 
         yield {
@@ -979,7 +988,7 @@ function createChatSessionParser(
           cachedInputTokens: 0,
           reasoningTokens: 0,
           webSearchRequests: 0,
-          costUSD,
+          costBasis: 'estimated' as const,
           tools: extractChatSessionTools(metadata),
           bashCommands: [],
           timestamp,
@@ -1545,7 +1554,6 @@ function createJetBrainsParser(
             const model = turn.model || storeModel || 'copilot-anthropic-auto'
             // Errored turns (failed generation) contribute no billable output.
             const outputTokens = turn.errored ? 0 : estimateTokens(turn.replyText)
-            const costUSD = outputTokens > 0 ? calculateCost(model, 0, outputTokens, 0, 0, 0) : 0
             // Project resolution precedence:
             //   1. projectName — the plugin's own recorded label (1.12+),
             //      joined across kind dirs by store id. Authoritative.
@@ -1569,7 +1577,10 @@ function createJetBrainsParser(
               cachedInputTokens: 0,
               reasoningTokens: 0,
               webSearchRequests: 0,
-              costUSD,
+              // Tokens are char-estimated (costIsEstimated) but the dollar
+              // amount is still table-priced from those tokens: costBasis
+              // 'estimated'. Errored turns have outputTokens 0 → priced to $0.
+              costBasis: 'estimated' as const,
               costIsEstimated: true,
               tools: [],
               bashCommands: [],
@@ -1784,15 +1795,9 @@ function createOtelParser(
             const subagentTypes = subagentsByTrace.get(spanMetadata.trace_id)
             const timestamp = epochToISO(spanMetadata.start_time_ms)
 
-            // calculateCost with FULL token data — this is the key improvement.
-            const costUSD = calculateCost(
-              model,
-              inputTokens,
-              outputTokens,
-              cacheCreationTokens,
-              cacheReadTokens,
-              0 // reasoningTokens — not exposed in current OTel schema
-            )
+            // FULL token data (input + cache) — the key improvement — priced by
+            // the pass. reasoningTokens is 0 (not in the OTel schema), so the
+            // output basis is exactly outputTokens.
 
             yield {
               provider: 'copilot',
@@ -1806,7 +1811,7 @@ function createOtelParser(
               cachedInputTokens: 0,
               reasoningTokens: 0,
               webSearchRequests: 0,
-              costUSD,
+              costBasis: 'estimated' as const,
               tools,
               bashCommands,
               subagentTypes: subagentTypes && subagentTypes.length > 0 ? subagentTypes : undefined,

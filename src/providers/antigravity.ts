@@ -6,7 +6,6 @@ import { homedir } from 'os'
 import { fileURLToPath } from 'url'
 import https from 'https'
 
-import { calculateCost } from '../models.js'
 import { isSqliteAvailable, isSqliteBusyError, openDatabase } from '../sqlite.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
@@ -765,7 +764,6 @@ function buildCallFromSqliteGenMetadataRow(cascadeId: string, row: AntigravityGe
   const responseId = antigravitySqliteResponseId(usageFields, String(row.idx))
   const model = antigravitySqliteModel(chatFields)
   const pricingModel = normalizePricingModel(model)
-  const costUSD = calculateCost(pricingModel, inputTokens, responseTokens + thinkingTokens, 0, 0, 0)
 
   return {
     provider: 'antigravity',
@@ -777,7 +775,12 @@ function buildCallFromSqliteGenMetadataRow(cascadeId: string, row: AntigravityGe
     cachedInputTokens: 0,
     reasoningTokens: thinkingTokens,
     webSearchRequests: 0,
-    costUSD,
+    // Whitelisted for cost persistence: the pass prices `pricingModel` (which
+    // strips suffixes / applies aliases) and the result is stored verbatim, so
+    // the display `model` never reaches the price table. reasoning is billed at
+    // the output rate (outputTokens + reasoningTokens), matching the lift.
+    costBasis: 'estimated',
+    pricingModel,
     tools: [],
     bashCommands: [],
     timestamp: antigravitySqliteCreatedAt(chatFields),
@@ -895,7 +898,6 @@ function buildCallsFromGeneratorMetadata(
     const model = dropPlaceholderModelId(modelMap[usage.model] ?? usage.model)
     const pricingModel = normalizePricingModel(model)
     const timestamp = entry.chatModel?.chatStartMetadata?.createdAt ?? ''
-    const costUSD = calculateCost(pricingModel, inputTokens, responseTokens + thinkingTokens, 0, 0, 0)
 
     results.push({
       provider: 'antigravity',
@@ -907,7 +909,10 @@ function buildCallsFromGeneratorMetadata(
       cachedInputTokens: 0,
       reasoningTokens: thinkingTokens,
       webSearchRequests: 0,
-      costUSD,
+      // See buildCallFromSqliteGenMetadataRow: pricing pass prices `pricingModel`
+      // and the whitelist persists the result verbatim.
+      costBasis: 'estimated',
+      pricingModel,
       tools: [],
       bashCommands: [],
       timestamp,
@@ -1110,14 +1115,6 @@ async function parseStatusLineCalls(source: SessionSource, seenKeys: Set<string>
       if (seenKeys.has(dedupKey)) continue
 
       const u = billableUsage
-      const costUSD = calculateCost(
-        normalizePricingModel(event.model),
-        u.inputTokens,
-        u.outputTokens,
-        u.cacheCreationInputTokens,
-        u.cacheReadInputTokens,
-        0,
-      )
 
       results.push({
         provider: 'antigravity',
@@ -1132,7 +1129,10 @@ async function parseStatusLineCalls(source: SessionSource, seenKeys: Set<string>
         // of inventing a breakdown.
         reasoningTokens: 0,
         webSearchRequests: 0,
-        costUSD,
+        // Pass prices `pricingModel` (reasoningTokens is 0 here, so the output
+        // basis is exactly u.outputTokens); whitelist persists the result.
+        costBasis: 'estimated',
+        pricingModel: normalizePricingModel(event.model),
         tools: [],
         bashCommands: [],
         timestamp: event.at,

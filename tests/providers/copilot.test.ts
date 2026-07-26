@@ -7,6 +7,7 @@ import { createRequire } from 'node:module'
 import { copilot, createCopilotProvider, getVSCodeGlobalStorageDirs, getVSCodeWorkspaceStorageDirs } from '../../src/providers/copilot.js'
 import { isSqliteAvailable } from '../../src/sqlite.js'
 import { calculateCost } from '../../src/models.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
@@ -120,7 +121,9 @@ async function createChatSessionFile(filePath: string, entries: unknown[]) {
 
 async function collectCalls(source: { path: string; project: string; provider: string; sourceType?: string }, seenKeys = new Set<string>()) {
   const calls: ParsedProviderCall[] = []
-  for await (const call of copilot.createSessionParser(source, seenKeys).parse()) calls.push(call)
+  // Route through the host-side pricing pass so cost assertions see the same
+  // costUSD the report path produces (converted sites emit costBasis, not costUSD).
+  for await (const call of copilot.createSessionParser(source, seenKeys).parse()) calls.push(priceProviderCall(call))
   return calls
 }
 
@@ -142,7 +145,7 @@ describe('copilot provider - JSONL parsing', () => {
 
     const source = { path: eventsPath, project: 'myproject', provider: 'copilot' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     const call = calls[0]!
@@ -1043,7 +1046,7 @@ describe('copilot provider - OTel cache token parsing', () => {
 
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(otelSources[0]!, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(1)
