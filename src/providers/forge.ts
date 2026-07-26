@@ -3,7 +3,6 @@ import { homedir } from 'os'
 import { join } from 'path'
 
 import { extractBashCommands } from '../bash-utils.js'
-import { calculateCost } from '../models.js'
 import { getSqliteLoadError, isSqliteAvailable, openDatabase, type SqliteDatabase } from '../sqlite.js'
 import type { ParsedProviderCall, Provider, SessionParser, SessionSource } from './types.js'
 
@@ -211,7 +210,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
             cachedInputTokens,
             reasoningTokens: 0,
             webSearchRequests: 0,
-            costUSD: calculateCost(model, inputTokens, outputTokens, 0, cachedInputTokens, 0),
+            costBasis: 'estimated',
             tools,
             bashCommands,
             timestamp: sqliteTimestampToIso(row.updated_at ?? row.created_at),

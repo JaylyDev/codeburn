@@ -4,6 +4,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 
 import { createGrokProvider } from '../../src/providers/grok.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
@@ -118,7 +119,7 @@ describe('grok provider - parsing', () => {
     const calls: ParsedProviderCall[] = []
     if (!source) return calls
     for await (const call of provider.createSessionParser(source, seen).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
     return calls
   }
