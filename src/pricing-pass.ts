@@ -24,8 +24,12 @@ export function priceProviderCall(call: ParsedProviderCall): ParsedProviderCall 
   // at the output rate. Provider calls never carry 1-hour cache tokens (the
   // cache write path hardcodes them to 0), so the default 0 is correct here.
   const outputForCost = call.outputTokens + call.reasoningTokens
+  // Seam extension: price `pricingModel` when the decoder supplied one (its
+  // display `model` differs from the model the price table is keyed by, e.g.
+  // antigravity's suffix-stripped / aliased id). Falls back to `model` for
+  // every provider whose display model is already its pricing model.
   const costUSD = calculateCost(
-    call.model,
+    call.pricingModel ?? call.model,
     call.inputTokens,
     outputForCost,
     call.cacheCreationInputTokens,

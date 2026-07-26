@@ -35,6 +35,12 @@ export type ParsedProviderCall = {
   // Orthogonal to `costIsEstimated`, which flags estimated *tokens* (e.g. char
   // counts) regardless of how the dollar amount was derived.
   costBasis?: 'measured' | 'estimated'
+  // Model to price with when it differs from the display `model` (antigravity
+  // strips agent/effort suffixes and applies pricing aliases before pricing).
+  // Seam extension for the pricing pass: when set, the 'estimated' path prices
+  // this model instead of `model`, so the decoder no longer needs the price
+  // table. Absent for every provider whose display model IS its pricing model.
+  pricingModel?: string
   costIsEstimated?: boolean
   tools: string[]
   bashCommands: string[]
