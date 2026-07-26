@@ -4,6 +4,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 
 import { rooCode, createRooCodeProvider } from '../../src/providers/roo-code.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
@@ -74,7 +75,7 @@ describe('roo-code provider - parsing', () => {
 
     const source = { path: taskDir, project: 'task-001', provider: 'roo-code' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of rooCode.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of rooCode.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     const call = calls[0]!
@@ -96,7 +97,7 @@ describe('roo-code provider - parsing', () => {
 
     const source = { path: taskDir, project: 'task-002', provider: 'roo-code' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of rooCode.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of rooCode.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.model).toBe('claude-sonnet-4-5')
@@ -113,7 +114,7 @@ describe('roo-code provider - parsing', () => {
 
     const source = { path: taskDir, project: 'task-003', provider: 'roo-code' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of rooCode.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of rooCode.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.model).toBe('cline-auto')
@@ -143,7 +144,7 @@ describe('roo-code provider - parsing', () => {
 
     const source = { path: taskDir, project: 'task-005', provider: 'roo-code' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of rooCode.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of rooCode.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(0)
   })
@@ -155,7 +156,7 @@ describe('roo-code provider - parsing', () => {
 
     const source = { path: taskDir, project: 'task-006', provider: 'roo-code' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of rooCode.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of rooCode.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(0)
   })
@@ -169,7 +170,7 @@ describe('roo-code provider - parsing', () => {
 
     const source = { path: taskDir, project: 'task-007', provider: 'roo-code' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of rooCode.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of rooCode.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(0)
   })
@@ -182,7 +183,7 @@ describe('roo-code provider - parsing', () => {
 
     const source = { path: taskDir, project: 'task-008', provider: 'roo-code' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of rooCode.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of rooCode.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.costUSD).toBeGreaterThan(0)

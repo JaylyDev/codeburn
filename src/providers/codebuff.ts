@@ -2,7 +2,6 @@ import { readdir, readFile, stat } from 'fs/promises'
 import { basename, dirname, join } from 'path'
 import { homedir } from 'os'
 
-import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
@@ -400,12 +399,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
         // Prefer calculated cost from tokens when available (multi-provider
         // models routed through Codebuff still show up in LiteLLM); otherwise
-        // fall back to the credit-based approximation.
-        let costUSD = calculateCost(model, usage.input, usage.output, usage.cacheWrite, usage.cacheRead, 0)
-        if (costUSD === 0 && credits > 0) {
-          costUSD = credits * USD_PER_CREDIT
-        }
-
+        // fall back to the credit-based approximation. The pricing pass applies
+        // fallbackCostUSD only when the table price is 0 (unknown model),
+        // reproducing that precedence.
         yield {
           provider: 'codebuff',
           model,
@@ -416,7 +412,8 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           cachedInputTokens: usage.cacheRead,
           reasoningTokens: 0,
           webSearchRequests: 0,
-          costUSD,
+          costBasis: 'estimated',
+          ...(credits > 0 ? { fallbackCostUSD: credits * USD_PER_CREDIT } : {}),
           tools: acc.tools,
           bashCommands: acc.bash,
           timestamp,

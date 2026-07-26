@@ -2,7 +2,6 @@ import { readdir, readFile, stat } from 'fs/promises'
 import { basename, join, posix, win32 } from 'path'
 import { homedir } from 'os'
 
-import { calculateCost } from '../models.js'
 import type { SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 type UiMessage = {
@@ -193,7 +192,6 @@ export function createClineParser(source: SessionSource, seenKeys: Set<string>, 
         if (tokensIn === 0 && tokensOut === 0) continue
 
         const timestamp = entry.ts ? new Date(entry.ts).toISOString() : ''
-        const costUSD = cost ?? calculateCost(model, tokensIn, tokensOut, cacheWrites, cacheReads, 0)
 
         yield {
           provider: providerName,
@@ -205,7 +203,9 @@ export function createClineParser(source: SessionSource, seenKeys: Set<string>, 
           cachedInputTokens: cacheReads,
           reasoningTokens: 0,
           webSearchRequests: 0,
-          costUSD,
+          ...(cost != null
+            ? { costUSD: cost, costBasis: 'measured' as const }
+            : { costBasis: 'estimated' as const }),
           tools: [],
           bashCommands: [],
           timestamp,

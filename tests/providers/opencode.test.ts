@@ -6,6 +6,7 @@ import { tmpdir } from 'os'
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { isSqliteAvailable } from '../../src/sqlite.js'
 import { createOpenCodeProvider } from '../../src/providers/opencode.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 type TestDb = {
@@ -107,7 +108,7 @@ async function collectCalls(provider: ReturnType<typeof createOpenCodeProvider>,
   const source = { path: `${dbPath}:${sessionId}`, project: 'myproject', provider: 'opencode' }
   const calls: ParsedProviderCall[] = []
   for await (const call of provider.createSessionParser(source, seenKeys ?? new Set()).parse()) {
-    calls.push(call)
+    calls.push(priceProviderCall(call))
   }
   return calls
 }
@@ -654,7 +655,7 @@ skipUnlessSqlite('opencode provider - session parsing', () => {
     const provider = createOpenCodeProvider(tmpDir)
     const source = { path: '/nonexistent/db.db:sess-1', project: 'test', provider: 'opencode' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
     expect(calls).toHaveLength(0)
   })
 

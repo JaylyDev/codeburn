@@ -1,7 +1,6 @@
 import { readdir } from 'fs/promises'
 import { join } from 'path'
 
-import { calculateCost } from '../models.js'
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, blobToText, isSqliteBusyError, type SqliteDatabase } from '../sqlite.js'
 import { buildAssistantCall, parseTimestamp, sanitize, type MessageData, type PartData } from './session-message.js'
 import type {
@@ -232,8 +231,6 @@ export function createSqliteSessionParser(
             if (!seenKeys.has(dedupKey)) {
               seenKeys.add(dedupKey)
               const model = sessionTokens.model ?? 'unknown'
-              let costUSD = calculateCost(model, sessionTokens.input, sessionTokens.output, sessionTokens.cacheWrite, sessionTokens.cacheRead, 0)
-              if (costUSD === 0 && sessionTokens.cost > 0) costUSD = sessionTokens.cost
               yield {
                 provider: config.providerName,
                 model,
@@ -244,7 +241,8 @@ export function createSqliteSessionParser(
                 cachedInputTokens: sessionTokens.cacheRead,
                 reasoningTokens: sessionTokens.reasoning,
                 webSearchRequests: 0,
-                costUSD,
+                costBasis: 'estimated',
+                ...(sessionTokens.cost > 0 ? { fallbackCostUSD: sessionTokens.cost } : {}),
                 tools: [],
                 bashCommands: [],
                 timestamp: parseTimestamp(messages[0]!.time_created),

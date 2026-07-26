@@ -4,6 +4,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 
 import { createCodebuffProvider } from '../../src/providers/codebuff.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
@@ -175,7 +176,7 @@ describe('codebuff provider - JSONL parsing', () => {
     const source = { path: chatDir, project: 'proj', provider: 'codebuff' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(1)
@@ -212,7 +213,7 @@ describe('codebuff provider - JSONL parsing', () => {
     const source = { path: chatDir, project: 'proj', provider: 'codebuff' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(1)
@@ -223,8 +224,10 @@ describe('codebuff provider - JSONL parsing', () => {
     expect(call.cacheCreationInputTokens).toBe(1000)
     expect(call.cacheReadInputTokens).toBe(500)
     expect(call.cachedInputTokens).toBe(500)
-    // With real token counts the calculated cost takes precedence over credits.
-    expect(call.costUSD).toBeGreaterThan(0)
+    // With real token counts the table cost takes precedence over the credit
+    // fallback: claude-haiku-4-5 priced on 5000/2000/1000/500 buckets = $0.0163,
+    // not the credits*$0.01 = $0.10 the fallback would have produced.
+    expect(call.costUSD).toBeCloseTo(0.0163, 6)
   })
 
   it('falls back to providerOptions.codebuff.usage in the stashed RunState history', async () => {
@@ -262,7 +265,7 @@ describe('codebuff provider - JSONL parsing', () => {
     const source = { path: chatDir, project: 'proj', provider: 'codebuff' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(1)
@@ -281,7 +284,7 @@ describe('codebuff provider - JSONL parsing', () => {
     const source = { path: chatDir, project: 'proj', provider: 'codebuff' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(0)
@@ -322,7 +325,7 @@ describe('codebuff provider - JSONL parsing', () => {
     const source = { path: chatDir, project: 'proj', provider: 'codebuff' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(2)
@@ -341,7 +344,7 @@ describe('codebuff provider - JSONL parsing', () => {
     }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
     expect(calls).toHaveLength(0)
   })
@@ -355,7 +358,7 @@ describe('codebuff provider - JSONL parsing', () => {
     const source = { path: chatDir, project: 'proj', provider: 'codebuff' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
     expect(calls).toHaveLength(0)
   })
@@ -423,7 +426,7 @@ describe('codebuff provider - sessionId channel scoping', () => {
     const source = { path: chatDir, project: 'proj', provider: 'codebuff' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(1)
@@ -445,7 +448,7 @@ describe('codebuff provider - sessionId channel scoping', () => {
     const source = { path: chatDir, project: 'proj', provider: 'codebuff' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(1)
