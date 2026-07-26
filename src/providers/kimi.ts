@@ -5,7 +5,7 @@ import { homedir } from 'os'
 
 import { extractBashCommands } from '../bash-utils.js'
 import { readSessionLines } from '../fs-utils.js'
-import { calculateCost, getShortModelName } from '../models.js'
+import { getShortModelName } from '../models.js'
 import type { ParsedProviderCall, Provider, SessionParser, SessionSource } from './types.js'
 
 type JsonObject = Record<string, unknown>
@@ -297,14 +297,6 @@ function createParser(source: SessionSource, shareDir: string, seenKeys: Set<str
         seenKeys.add(dedupKey)
 
         const model = stringField(envelope.payload, 'model') ?? stringField(envelope.payload, 'model_name') ?? configuredModel
-        const costUSD = calculateCost(
-          model,
-          usage.inputTokens,
-          usage.outputTokens,
-          usage.cacheCreationInputTokens,
-          usage.cacheReadInputTokens,
-          0,
-        )
 
         yield {
           provider: 'kimi',
@@ -316,7 +308,7 @@ function createParser(source: SessionSource, shareDir: string, seenKeys: Set<str
           cachedInputTokens: usage.cacheReadInputTokens,
           reasoningTokens: 0,
           webSearchRequests: 0,
-          costUSD,
+          costBasis: 'estimated',
           tools: [...tools],
           bashCommands: [...bashCommands],
           timestamp: envelope.timestamp,

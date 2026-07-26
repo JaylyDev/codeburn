@@ -4,6 +4,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 
 import { createPiProvider } from '../../src/providers/pi.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 import { classifyTurn } from '../../src/classifier.js'
 import type { ParsedApiCall, ParsedTurn } from '../../src/types.js'
@@ -208,7 +209,7 @@ describe('pi provider - JSONL parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'pi' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(1)
@@ -249,7 +250,7 @@ describe('pi provider - JSONL parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'pi' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     // The assistant turn is still parsed, and the string user content is paired.
@@ -275,7 +276,7 @@ describe('pi provider - JSONL parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'pi' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls[0]!.tools).toEqual(['Read', 'Edit', 'Bash'])
@@ -296,7 +297,7 @@ describe('pi provider - JSONL parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'pi' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls[0]!.bashCommands).toEqual(['git', 'bun'])
@@ -319,7 +320,7 @@ describe('pi provider - JSONL parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'pi' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     // The SKILL.md read is surfaced as the Skill tool (not Read); the plain
@@ -341,7 +342,7 @@ describe('pi provider - JSONL parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'pi' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls[0]!.skills).toEqual(['commit-workflow'])
@@ -361,7 +362,7 @@ describe('pi provider - JSONL parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'pi' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls[0]!.skills).toEqual(['deep-research'])
@@ -381,7 +382,7 @@ describe('pi provider - JSONL parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'pi' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls[0]!.skills).toEqual([])
@@ -401,7 +402,7 @@ describe('pi provider - JSONL parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'pi' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     // End to end: the parsed skill load must reach `subCategory`, or the
@@ -422,7 +423,7 @@ describe('pi provider - JSONL parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'pi' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(0)
@@ -441,12 +442,12 @@ describe('pi provider - JSONL parsing', () => {
 
     const firstRun: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, seenKeys).parse()) {
-      firstRun.push(call)
+      firstRun.push(priceProviderCall(call))
     }
 
     const secondRun: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, seenKeys).parse()) {
-      secondRun.push(call)
+      secondRun.push(priceProviderCall(call))
     }
 
     expect(firstRun).toHaveLength(1)
@@ -467,7 +468,7 @@ describe('pi provider - JSONL parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'pi' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(2)
@@ -482,7 +483,7 @@ describe('pi provider - JSONL parsing', () => {
     const source = { path: '/nonexistent/session.jsonl', project: 'test', provider: 'pi' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
     expect(calls).toHaveLength(0)
   })
