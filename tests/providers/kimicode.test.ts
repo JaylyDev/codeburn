@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
 import { calculateCost } from '../../src/models.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import { createKimicodeProvider, kimicode } from '../../src/providers/kimicode.js'
 import type { ParsedProviderCall, Provider, SessionSource } from '../../src/providers/types.js'
 
@@ -138,7 +139,7 @@ async function collect(
   seenKeys = new Set<string>(),
 ): Promise<ParsedProviderCall[]> {
   const calls: ParsedProviderCall[] = []
-  for await (const call of provider.createSessionParser(source, seenKeys).parse()) calls.push(call)
+  for await (const call of provider.createSessionParser(source, seenKeys).parse()) calls.push(priceProviderCall(call))
   return calls
 }
 

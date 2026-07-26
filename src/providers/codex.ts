@@ -540,6 +540,11 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
             if (seenKeys.has(dedupKey)) { pendingTools = []; pendingToolSequence = []; pendingUserMessage = ''; pendingOutputChars = 0; pendingLocAdded = 0; pendingLocRemoved = 0; pendingEditFailed = 0; continue }
             seenKeys.add(dedupKey)
 
+            // Phase-0 residual (issue #809): NOT converted to costBasis:'estimated'.
+            // codex-cache.ts persists the whole ParsedProviderCall (costUSD included);
+            // dropping costUSD here changes every newly-written cache entry without a
+            // CODEX_CACHE_VERSION bump, yielding a mixed-format v7 cache. Deferred to
+            // Phase 4 (codex decoder carve-out owns its result-cache state).
             const costUSD = calculateCost(model, estInput, estOutput, 0, 0, 0)
 
             results.push({
@@ -651,6 +656,10 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           if (seenKeys.has(dedupKey)) continue
           seenKeys.add(dedupKey)
 
+          // Phase-0 residual (issue #809): left on the in-decoder pricing path for
+          // the same reason as the estimate branch above — codex-cache.ts persists
+          // costUSD, so converting would change cached bytes without a version bump.
+          // Deferred to Phase 4.
           const costUSD = calculateCost(
             model,
             uncachedInputTokens,

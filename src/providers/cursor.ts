@@ -2,7 +2,6 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
 
-import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import { readCachedResults, writeCachedResults } from '../cursor-cache.js'
 import { isSqliteAvailable, isSqliteBusyError, getSqliteLoadError, openDatabase, blobToText, type SqliteDatabase } from '../sqlite.js'
@@ -821,7 +820,6 @@ function parseBubbles(
       // conversation's model seen on its assistant bubbles or agent stream.
       const effectiveModel = row.model ?? scans.get(conversationId)?.model ?? agentStreams.get(conversationId)?.model ?? null
       const pricingModel = resolveModel(effectiveModel)
-      const costUSD = calculateCost(pricingModel, inputTokens, outputTokens, 0, 0, 0)
 
       const userQuestion = lastUserMsg.get(conversationId) ?? ''
       const assistantText = blobToText(row.user_text)
@@ -844,7 +842,8 @@ function parseBubbles(
         model: modelForDisplay(effectiveModel),
         inputTokens,
         outputTokens,
-        costUSD,
+        costBasis: 'estimated',
+        pricingModel,
         tools: [
           ...(hasCode ? ['cursor:edit', ...languages.map(l => `lang:${l}`)] : []),
           ...(agentTurn?.tools ?? []),
@@ -893,7 +892,8 @@ function parseBubbles(
       model: modelForDisplay(effectiveModel),
       inputTokens,
       outputTokens,
-      costUSD: calculateCost(resolveModel(effectiveModel), inputTokens, outputTokens, 0, 0, 0),
+      costBasis: 'estimated',
+      pricingModel: resolveModel(effectiveModel),
       tools: stream?.tools ?? [],
       bashCommands: stream?.bash ?? [],
       timestamp,
@@ -919,7 +919,8 @@ function parseBubbles(
       model: modelForDisplay(stream.model),
       inputTokens,
       outputTokens,
-      costUSD: calculateCost(resolveModel(stream.model), inputTokens, outputTokens, 0, 0, 0),
+      costBasis: 'estimated',
+      pricingModel: resolveModel(stream.model),
       tools: stream.tools,
       bashCommands: stream.bash,
       timestamp: agentKvTimestamp,

@@ -3,7 +3,6 @@ import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 
 import { extractBashCommands } from '../bash-utils.js'
-import { calculateCost } from '../models.js'
 import type { ParsedProviderCall, ProbeRoot, Provider, SessionParser, SessionSource } from './types.js'
 
 type JsonObject = Record<string, unknown>
@@ -315,14 +314,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           cachedInputTokens: cacheReadInputTokens,
           reasoningTokens: 0,
           webSearchRequests: 0,
-          costUSD: calculateCost(
-            realModel,
-            inputTokens,
-            outputTokens,
-            cacheCreationInputTokens,
-            cacheReadInputTokens,
-            0,
-          ),
+          costBasis: 'estimated',
           costIsEstimated: true,
           tools: pendingTools,
           bashCommands: pendingBashCommands,
