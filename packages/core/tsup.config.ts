@@ -10,6 +10,7 @@ export default defineConfig({
     'src/diagnostics.ts',
     'src/fingerprint.ts',
     'src/contracts.ts',
+    'src/providers/claude/index.ts',
   ],
   format: ['esm'],
   target: 'node20',

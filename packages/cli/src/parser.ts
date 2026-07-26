@@ -4,9 +4,31 @@ import { basename, dirname, join, resolve, sep } from 'path'
 import { readSessionLines } from './fs-utils.js'
 import { calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash } from './models.js'
 import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
-import { normalizeContentBlocks } from './content-utils.js'
 import { discoverAllSessions, getProvider } from './providers/index.js'
 import { priceProviderCall } from './pricing-pass.js'
+import {
+  buildSpawnPrSets,
+  collectSessionMeta,
+  collectToolResultMeta,
+  compactEntry,
+  countStructuredPatchLoc,
+  decodeAdvisorCalls,
+  decodeAssistantCall,
+  dedupeStreamingMessageIds,
+  emptySessionMeta,
+  extractMcpInventory,
+  extractPrUrlsFromText,
+  getMessageId,
+  groupIntoTurns as decodeGroupIntoTurns,
+  isPositiveNumber,
+  parseJsonlLine,
+  safeNumber,
+  shouldSkipLine,
+  type DecodedCall,
+  type DecodedTurn,
+  type SessionMeta,
+  type ToolResultMeta,
+} from '@codeburn/core/providers/claude'
 import { flushCodexCache } from './codex-cache.js'
 import { antigravityCascadeIdFromPath, flushAntigravityCache, shouldReparseAntigravitySource } from './providers/antigravity.js'
 import { getDesktopSessionsDirs } from './providers/claude.js'
@@ -30,10 +52,7 @@ import {
 import { acquireCacheRefreshLock, type RefreshLockHandle } from './cache-refresh-lock.js'
 import type { ParsedProviderCall, SessionSource } from './providers/types.js'
 import type {
-  ApiUsageIteration,
-  AssistantMessageContent,
   ClassifiedTurn,
-  ContentBlock,
   DateRange,
   JournalEntry,
   ParsedApiCall,
@@ -42,10 +61,8 @@ import type {
   SessionSummary,
   SessionSourceMetadata,
   TokenUsage,
-  ToolCall,
-  ToolUseBlock,
 } from './types.js'
-import { classifyTurn, BASH_TOOLS, EDIT_TOOLS } from './classifier.js'
+import { classifyTurn } from './classifier.js'
 import { extractBashCommands } from './bash-utils.js'
 
 function unsanitizePath(dirName: string): string {
@@ -134,1011 +151,37 @@ async function resolveCanonicalProjectPath(cwd: string): Promise<{ path: string;
   }
 }
 
-const LARGE_JSONL_LINE_BYTES = 32 * 1024
-
-export function parseJsonlLine(line: string | Buffer): JournalEntry | null {
-  if (Buffer.isBuffer(line)) {
-    if (line.length > LARGE_JSONL_LINE_BYTES) return parseLargeJsonl(line)
-    try {
-      return JSON.parse(line.toString('utf-8')) as JournalEntry
-    } catch {
-      return null
-    }
-  }
-  if (line.length > LARGE_JSONL_LINE_BYTES) return parseLargeJsonl(line)
-  try {
-    return JSON.parse(line) as JournalEntry
-  } catch {
-    return null
-  }
+// ── Claude decode (moved to @codeburn/core) ────────────────────────────
+//
+// The pure Claude decode — line scanning, compaction, per-call/turn extraction,
+// rich-capture meta — now lives in `@codeburn/core/providers/claude`. These
+// re-exports keep every existing `from './parser.js'` import working. The CLI is
+// the ADAPTER: it prices the cost-free decode output (host-side pricing table)
+// and splits raw bash command strings (strip-ansi dependency that must stay out
+// of the zod-only core), mapping the result into ParsedApiCall / ParsedTurn.
+export {
+  parseJsonlLine,
+  shouldSkipLine,
+  compactEntry,
+  safeNumber,
+  isPositiveNumber,
+  countStructuredPatchLoc,
+  emptySessionMeta,
+  collectToolResultMeta,
+  collectSessionMeta,
+  dedupeStreamingMessageIds,
+  buildSpawnPrSets,
+  extractMcpInventory,
+  extractPrUrlsFromText,
 }
-
-const RAW_HEAD_BYTES = 2048
-
-type JsonValueBounds = {
-  start: number
-  end: number
-  kind: 'string' | 'object' | 'array' | 'scalar'
-}
-
-type JsonIndexedSource = string | Buffer
-
-type JsonSource = {
-  readonly raw: JsonIndexedSource
-  readonly length: number
-  readonly slice: (start: number, end: number, maxChars?: number) => string
-}
-
-function isAsciiWhitespace(ch: number | undefined): boolean {
-  return ch === 0x20 || ch === 0x0a || ch === 0x0d || ch === 0x09 || ch === 0x0b || ch === 0x0c
-}
-
-function isBufferWhitespaceAt(source: Buffer, index: number): boolean {
-  const byte = source[index]
-  if (isAsciiWhitespace(byte)) return true
-  if (byte === undefined || byte < 0x80) return false
-
-  let start = index
-  while (start > 0) {
-    const preceding = source[start]
-    if (preceding === undefined || (preceding & 0xc0) !== 0x80) break
-    start--
-  }
-  const first = source[start]
-  if (first === undefined) return false
-  let codePoint: number | undefined
-  let byteLength = 0
-  if (first >= 0xc2 && first <= 0xdf) {
-    const second = source[start + 1]
-    if (second === undefined || (second & 0xc0) !== 0x80) return false
-    codePoint = ((first & 0x1f) << 6) | (second & 0x3f)
-    byteLength = 2
-  } else if (first >= 0xe0 && first <= 0xef) {
-    const second = source[start + 1]
-    const third = source[start + 2]
-    if (second === undefined || third === undefined || (second & 0xc0) !== 0x80 || (third & 0xc0) !== 0x80) return false
-    codePoint = ((first & 0x0f) << 12) | ((second & 0x3f) << 6) | (third & 0x3f)
-    byteLength = 3
-  } else if (first >= 0xf0 && first <= 0xf4) {
-    const second = source[start + 1]
-    const third = source[start + 2]
-    const fourth = source[start + 3]
-    if (second === undefined || third === undefined || fourth === undefined || (second & 0xc0) !== 0x80 || (third & 0xc0) !== 0x80 || (fourth & 0xc0) !== 0x80) {
-      return false
-    }
-    codePoint = ((first & 0x07) << 18) | ((second & 0x3f) << 12) | ((third & 0x3f) << 6) | (fourth & 0x3f)
-    byteLength = 4
-  }
-  if (codePoint === undefined || index >= start + byteLength) return false
-  return codePoint === 0x00a0 || codePoint === 0x1680 || (codePoint >= 0x2000 && codePoint <= 0x200a) || codePoint === 0x2028 || codePoint === 0x2029 || codePoint === 0x202f || codePoint === 0x205f || codePoint === 0x3000 || codePoint === 0xfeff
-}
-
-function safeBufferSegmentEnd(source: Buffer, index: number): number {
-  while (index > 0 && ((source[index] ?? 0) & 0xc0) === 0x80) index--
-  return index
-}
-
-function createJsonSource(source: string | Buffer): JsonSource {
-  if (typeof source === 'string') {
-    return {
-      raw: source,
-      length: source.length,
-      slice: (start, end, maxChars = Number.POSITIVE_INFINITY) => source.slice(start, Math.min(end, start + maxChars)),
-    }
-  }
-
-  return {
-    raw: source,
-    length: source.length,
-    slice: (start, end, maxChars = Number.POSITIVE_INFINITY) => {
-      const cappedEnd = Number.isFinite(maxChars) ? safeBufferSegmentEnd(source, Math.min(end, start + maxChars * 4)) : end
-      return source.subarray(start, cappedEnd).toString('utf-8').slice(0, maxChars)
-    },
-  }
-}
-
-function jsonCharCodeAt(source: JsonSource, index: number): number {
-  return typeof source.raw === 'string' ? source.raw.charCodeAt(index) : source.raw[index] ?? Number.NaN
-}
-
-function skipJsonWhitespace(source: JsonSource, start: number, limit = source.length): number {
-  if (typeof source.raw === 'string') {
-    let i = start
-    while (i < limit && /\s/.test(source.raw[i]!)) i++
-    return i
-  }
-  let i = start
-  while (i < limit && isBufferWhitespaceAt(source.raw, i)) i++
-  return i
-}
-
-function findJsonStringEnd(source: JsonSource, start: number, limit = source.length): number {
-  return typeof source.raw === 'string'
-    ? findJsonStringEndString(source.raw, start, limit)
-    : findJsonStringEndBuffer(source.raw, start, limit)
-}
-
-function findJsonContainerEnd(source: JsonSource, start: number, open: number, close: number, limit = source.length): number {
-  return typeof source.raw === 'string'
-    ? findJsonContainerEndString(source.raw, start, open, close, limit)
-    : findJsonContainerEndBuffer(source.raw, start, open, close, limit)
-}
-
-function findObjectFieldValue(source: JsonSource, objectStart: number, objectEnd: number, field: string): JsonValueBounds | null {
-  return typeof source.raw === 'string'
-    ? findObjectFieldValueString(source.raw, objectStart, objectEnd, field)
-    : findObjectFieldValueBuffer(source.raw, objectStart, objectEnd, field)
-}
-
-function findJsonValueBounds(source: JsonSource, start: number, limit = source.length): JsonValueBounds | null {
-  return typeof source.raw === 'string'
-    ? findJsonValueBoundsString(source.raw, start, limit)
-    : findJsonValueBoundsBuffer(source.raw, start, limit)
-}
-
-function readJsonString(source: JsonSource, bounds: JsonValueBounds | null, cap = Number.POSITIVE_INFINITY): string | undefined {
-  if (typeof source.raw === 'string') return readJsonStringString(source.raw, bounds, cap)
-  return readJsonStringBuffer(source.raw, bounds, cap)
-}
-
-function readJsonNumberField(source: JsonSource, objectBounds: JsonValueBounds | null, field: string): number | undefined {
-  if (!objectBounds || objectBounds.kind !== 'object') return undefined
-  const bounds = findObjectFieldValue(source, objectBounds.start, objectBounds.end, field)
-  if (!bounds) return undefined
-  const value = Number(source.slice(bounds.start, bounds.end))
-  return Number.isFinite(value) ? value : undefined
-}
-
-// The large-line parsers avoid JSON.parse on the whole (multi-KB) line, but the
-// usage object itself is tiny; parse just that slice to recover advisor
-// (/advisor) iterations, which the byte-scanner cannot cheaply extract. Without
-// this, an advisor escalation on a large assistant turn would be dropped.
-function extractAdvisorIterations(usageObjectJson: string): ApiUsageIteration[] | undefined {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(usageObjectJson)
-  } catch {
-    return undefined
-  }
-  const iterations = (parsed as { iterations?: unknown }).iterations
-  if (!Array.isArray(iterations)) return undefined
-  const advisor = iterations.filter(
-    (it): it is ApiUsageIteration =>
-      !!it && typeof it === 'object' && (it as { type?: unknown }).type === 'advisor_message',
-  )
-  return advisor.length > 0 ? advisor : undefined
-}
-
-function parseLargeUsage(source: JsonSource, usageBounds: JsonValueBounds | null) {
-  const usage: AssistantMessageContent['usage'] = {
-    input_tokens: readJsonNumberField(source, usageBounds, 'input_tokens') ?? 0,
-    output_tokens: readJsonNumberField(source, usageBounds, 'output_tokens') ?? 0,
-    cache_creation_input_tokens: readJsonNumberField(source, usageBounds, 'cache_creation_input_tokens'),
-    cache_read_input_tokens: readJsonNumberField(source, usageBounds, 'cache_read_input_tokens'),
-  }
-
-  if (usageBounds?.kind === 'object') {
-    const cacheCreation = findObjectFieldValue(source, usageBounds.start, usageBounds.end, 'cache_creation')
-    const ephemeral5m = readJsonNumberField(source, cacheCreation, 'ephemeral_5m_input_tokens')
-    const ephemeral1h = readJsonNumberField(source, cacheCreation, 'ephemeral_1h_input_tokens')
-    if (ephemeral5m !== undefined || ephemeral1h !== undefined) {
-      ;(usage as AssistantMessageContent['usage']).cache_creation = {
-        ...(ephemeral5m !== undefined ? { ephemeral_5m_input_tokens: ephemeral5m } : {}),
-        ...(ephemeral1h !== undefined ? { ephemeral_1h_input_tokens: ephemeral1h } : {}),
-      }
-    }
-
-    const serverToolUse = findObjectFieldValue(source, usageBounds.start, usageBounds.end, 'server_tool_use')
-    const webSearch = readJsonNumberField(source, serverToolUse, 'web_search_requests')
-    const webFetch = readJsonNumberField(source, serverToolUse, 'web_fetch_requests')
-    if (webSearch !== undefined || webFetch !== undefined) {
-      ;(usage as AssistantMessageContent['usage']).server_tool_use = {
-        ...(webSearch !== undefined ? { web_search_requests: webSearch } : {}),
-        ...(webFetch !== undefined ? { web_fetch_requests: webFetch } : {}),
-      }
-    }
-
-    const speed = readJsonString(source, findObjectFieldValue(source, usageBounds.start, usageBounds.end, 'speed'))
-    if (speed === 'standard' || speed === 'fast') usage.speed = speed
-
-    const advisor = extractAdvisorIterations(source.slice(usageBounds.start, usageBounds.end))
-    if (advisor) usage.iterations = advisor
-  }
-
-  return usage
-}
-
-function extractLargeToolBlocks(source: JsonSource, contentBounds: JsonValueBounds | null): ToolUseBlock[] {
-  if (!contentBounds || contentBounds.kind !== 'array') return []
-  const tools: ToolUseBlock[] = []
-  let i = contentBounds.start + 1
-  while (i < contentBounds.end - 1 && tools.length < MAX_TOOL_BLOCKS) {
-    i = skipJsonWhitespace(source, i, contentBounds.end)
-    if (jsonCharCodeAt(source, i) === 0x2c) {
-      i++
-      continue
-    }
-    if (jsonCharCodeAt(source, i) !== 0x7b) {
-      i++
-      continue
-    }
-    const objectEnd = findJsonContainerEnd(source, i, 0x7b, 0x7d, contentBounds.end)
-    if (objectEnd === -1) break
-    const objectBounds = { start: i, end: objectEnd + 1, kind: 'object' as const }
-    const blockType = readJsonString(source, findObjectFieldValue(source, objectBounds.start, objectBounds.end, 'type'))
-    if (blockType === 'tool_use') {
-      const name = readJsonString(source, findObjectFieldValue(source, objectBounds.start, objectBounds.end, 'name')) ?? ''
-      const id = readJsonString(source, findObjectFieldValue(source, objectBounds.start, objectBounds.end, 'id')) ?? ''
-      const inputBounds = findObjectFieldValue(source, objectBounds.start, objectBounds.end, 'input')
-      const input: Record<string, unknown> = {}
-      if (inputBounds?.kind === 'object') {
-        if (name === 'Skill') {
-          const skill = readJsonString(source, findObjectFieldValue(source, inputBounds.start, inputBounds.end, 'skill'), 200)
-          const skillName = readJsonString(source, findObjectFieldValue(source, inputBounds.start, inputBounds.end, 'name'), 200)
-          if (skill !== undefined) input['skill'] = skill
-          if (skillName !== undefined) input['name'] = skillName
-        } else if (name === 'Read' || name === 'FileReadTool' || EDIT_TOOLS.has(name)) {
-          const filePath = readJsonString(source, findObjectFieldValue(source, inputBounds.start, inputBounds.end, 'file_path'), BASH_COMMAND_CAP)
-          if (filePath !== undefined) input['file_path'] = filePath
-        } else if (name === 'Agent' || name === 'Task') {
-          const subagentType = readJsonString(source, findObjectFieldValue(source, inputBounds.start, inputBounds.end, 'subagent_type'), 200)
-          if (subagentType !== undefined) input['subagent_type'] = subagentType
-        } else if (BASH_TOOLS.has(name)) {
-          const command = readJsonString(source, findObjectFieldValue(source, inputBounds.start, inputBounds.end, 'command'), BASH_COMMAND_CAP)
-          if (command !== undefined) input['command'] = command
-        }
-      }
-      tools.push({ type: 'tool_use', id, name, input })
-    }
-    i = objectEnd + 1
-  }
-  return tools
-}
-
-function extractLargeUserText(source: JsonSource, contentBounds: JsonValueBounds | null): string | undefined {
-  if (!contentBounds) return undefined
-  if (contentBounds.kind === 'string') return readJsonString(source, contentBounds, USER_TEXT_CAP)
-  if (contentBounds.kind !== 'array') return undefined
-
-  let text = ''
-  let i = contentBounds.start + 1
-  while (i < contentBounds.end - 1 && text.length < USER_TEXT_CAP) {
-    i = skipJsonWhitespace(source, i, contentBounds.end)
-    if (jsonCharCodeAt(source, i) === 0x2c) {
-      i++
-      continue
-    }
-    if (jsonCharCodeAt(source, i) !== 0x7b) {
-      i++
-      continue
-    }
-    const objectEnd = findJsonContainerEnd(source, i, 0x7b, 0x7d, contentBounds.end)
-    if (objectEnd === -1) break
-    const objectBounds = { start: i, end: objectEnd + 1, kind: 'object' as const }
-    const type = readJsonString(source, findObjectFieldValue(source, objectBounds.start, objectBounds.end, 'type'))
-    if (type === 'text' || type === 'input_text') {
-      const part = readJsonString(
-        source,
-        findObjectFieldValue(source, objectBounds.start, objectBounds.end, 'text'),
-        USER_TEXT_CAP - text.length,
-      )
-      if (part) text += (text ? ' ' : '') + part
-    }
-    i = objectEnd + 1
-  }
-  return text || undefined
-}
-
-function extractLargeAddedNames(source: JsonSource, attachmentBounds: JsonValueBounds | null): string[] {
-  if (!attachmentBounds || attachmentBounds.kind !== 'object') return []
-  const attachmentType = readJsonString(source, findObjectFieldValue(source, attachmentBounds.start, attachmentBounds.end, 'type'))
-  if (attachmentType !== 'deferred_tools_delta') return []
-  const addedNames = findObjectFieldValue(source, attachmentBounds.start, attachmentBounds.end, 'addedNames')
-  if (!addedNames || addedNames.kind !== 'array') return []
-  const names: string[] = []
-  let i = addedNames.start + 1
-  while (i < addedNames.end - 1 && names.length < MAX_ADDED_NAMES) {
-    i = skipJsonWhitespace(source, i, addedNames.end)
-    if (jsonCharCodeAt(source, i) === 0x2c) {
-      i++
-      continue
-    }
-    if (jsonCharCodeAt(source, i) !== 0x22) {
-      i++
-      continue
-    }
-    const end = findJsonStringEnd(source, i, addedNames.end)
-    if (end === -1) break
-    const name = readJsonString(source, { start: i, end: end + 1, kind: 'string' }, 500)
-    if (name) names.push(name)
-    i = end + 1
-  }
-  return names
-}
-
-// Does the raw key bytes/chars at [keyStart, keyEnd) equal one of `fields`? This
-// compares the RAW key (escapes and all), exactly as findObjectFieldValue did, so
-// a key like "type" still does not match "type". Returns the matched field
-// name so the caller can bucket the value.
-function matchCapturedField(
-  source: JsonSource,
-  fieldBuffers: Buffer[] | null,
-  keyStart: number,
-  keyEnd: number,
-  fields: readonly string[],
-): string | null {
-  if (fieldBuffers === null) {
-    const key = (source.raw as string).slice(keyStart, keyEnd)
-    return fields.includes(key) ? key : null
-  }
-  const raw = source.raw as Buffer
-  const keyLength = keyEnd - keyStart
-  for (let k = 0; k < fields.length; k++) {
-    const fieldBuffer = fieldBuffers[k]!
-    if (keyLength === fieldBuffer.length && raw.subarray(keyStart, keyEnd).equals(fieldBuffer)) return fields[k]!
-  }
-  return null
-}
-
-// Single pass over one JSON object, capturing the bounds of several top-level
-// fields at once. This is the multi-field generalization of findObjectFieldValue:
-// it reproduces that walk exactly — same whitespace/comma handling, same
-// first-match-wins on duplicate keys, and the same "stop on a truncated key or an
-// unparseable value" behavior that findObjectFieldValue expressed as `return null`
-// — but visits each byte once instead of re-walking the object per field. On large
-// Claude lines a multi-KB tool blob often precedes these keys, so a per-field walk
-// re-scanned that blob once for every field it trailed.
-function extractObjectFields(
-  source: JsonSource,
-  objectStart: number,
-  objectEnd: number,
-  fields: readonly string[],
-): Record<string, JsonValueBounds | null> {
-  const captured: Record<string, JsonValueBounds | null> = {}
-  for (const field of fields) captured[field] = null
-  if (jsonCharCodeAt(source, objectStart) !== 0x7b) return captured
-
-  const fieldBuffers = typeof source.raw === 'string' ? null : fields.map((f) => Buffer.from(f))
-  let remaining = fields.length
-  let i = objectStart + 1
-  while (i < objectEnd - 1 && remaining > 0) {
-    i = skipJsonWhitespace(source, i, objectEnd)
-    const ch = jsonCharCodeAt(source, i)
-    if (ch === 0x2c) {
-      i++
-      continue
-    }
-    // Any non-'"' byte here is stray content between members; step over it and
-    // resync on the next quote, exactly as the per-field walk did.
-    if (ch !== 0x22) {
-      i++
-      continue
-    }
-    const keyEnd = findJsonStringEnd(source, i, objectEnd)
-    if (keyEnd === -1) break // truncated key: findObjectFieldValue returned null here
-    const keyStart = i + 1
-    i = skipJsonWhitespace(source, keyEnd + 1, objectEnd)
-    if (jsonCharCodeAt(source, i) !== 0x3a) continue // missing ':' — resync on the next member
-    const value = findJsonValueBounds(source, i + 1, objectEnd)
-    if (!value) break // unparseable value: findObjectFieldValue returned null here
-    const matched = matchCapturedField(source, fieldBuffers, keyStart, keyEnd, fields)
-    if (matched !== null && captured[matched] === null) {
-      captured[matched] = value // keep the first occurrence, like findObjectFieldValue
-      remaining-- // once every field is found the rest of the object is dead weight
-    }
-    i = value.end
-  }
-  return captured
-}
-
-const LARGE_ROOT_FIELDS = ['type', 'timestamp', 'sessionId', 'cwd', 'gitBranch', 'attachment', 'message'] as const
-const LARGE_ASSISTANT_MESSAGE_FIELDS = ['model', 'usage', 'id', 'content'] as const
-
-function parseLargeJsonl(line: string | Buffer): JournalEntry | null {
-  const source = createJsonSource(line)
-  const rootStart = skipJsonWhitespace(source, 0)
-  const rootEnd = findJsonContainerEnd(source, rootStart, 0x7b, 0x7d)
-  if (rootEnd === -1) return null
-  const rootLimit = rootEnd + 1
-  const root = extractObjectFields(source, rootStart, rootLimit, LARGE_ROOT_FIELDS)
-  const type = readJsonString(source, root['type'])
-  if (!type) return null
-
-  const entry: JournalEntry = { type }
-  const timestamp = readJsonString(source, root['timestamp'])
-  const sessionId = readJsonString(source, root['sessionId'])
-  const cwd = readJsonString(source, root['cwd'])
-  const gitBranch = readJsonString(source, root['gitBranch'])
-  if (timestamp !== undefined) entry.timestamp = timestamp
-  if (sessionId !== undefined) entry.sessionId = sessionId
-  if (cwd !== undefined) entry.cwd = cwd
-  if (gitBranch !== undefined) entry.gitBranch = gitBranch
-  const addedNames = extractLargeAddedNames(source, root['attachment'])
-  if (addedNames.length > 0) {
-    ;(entry as Record<string, unknown>)['attachment'] = { type: 'deferred_tools_delta', addedNames }
-  }
-
-  const message = root['message']
-  if (type === 'user') {
-    if (message?.kind === 'object') {
-      const content = findObjectFieldValue(source, message.start, message.end, 'content')
-      const text = extractLargeUserText(source, content)
-      if (text !== undefined) entry.message = { role: 'user', content: text }
-    }
-    return entry
-  }
-
-  if (type !== 'assistant') return entry
-  if (message?.kind !== 'object') return entry
-  const messageFields = extractObjectFields(source, message.start, message.end, LARGE_ASSISTANT_MESSAGE_FIELDS)
-  const model = readJsonString(source, messageFields['model'])
-  const usageBounds = messageFields['usage']
-  if (!model || usageBounds?.kind !== 'object') return entry
-  const id = readJsonString(source, messageFields['id'])
-  const contentBounds = messageFields['content']
-
-  entry.message = {
-    type: 'message',
-    role: 'assistant',
-    model,
-    ...(id !== undefined ? { id } : {}),
-    content: extractLargeToolBlocks(source, contentBounds),
-    usage: parseLargeUsage(source, usageBounds),
-  }
-
-  return entry
-}
-
-function findJsonStringEndString(source: string, start: number, limit = source.length): number {
-  for (let i = start + 1; i < limit; i++) {
-    const ch = source.charCodeAt(i)
-    if (ch === 0x5c) {
-      i++
-      continue
-    }
-    if (ch === 0x22) return i
-  }
-  return -1
-}
-
-function findJsonContainerEndString(source: string, start: number, open: number, close: number, limit = source.length): number {
-  let depth = 0
-  let inString = false
-  for (let i = start; i < limit; i++) {
-    const ch = source.charCodeAt(i)
-    if (inString) {
-      if (ch === 0x5c) {
-        i++
-      } else if (ch === 0x22) {
-        inString = false
-      }
-      continue
-    }
-    if (ch === 0x22) {
-      inString = true
-    } else if (ch === open) {
-      depth++
-    } else if (ch === close) {
-      depth--
-      if (depth === 0) return i
-    }
-  }
-  return -1
-}
-
-function findJsonValueBoundsString(source: string, start: number, limit = source.length): JsonValueBounds | null {
-  let i = start
-  while (i < limit && /\s/.test(source[i]!)) i++
-  if (i >= limit) return null
-  const ch = source.charCodeAt(i)
-  if (ch === 0x22) {
-    const end = findJsonStringEndString(source, i, limit)
-    return end === -1 ? null : { start: i, end: end + 1, kind: 'string' }
-  }
-  if (ch === 0x7b) {
-    const end = findJsonContainerEndString(source, i, 0x7b, 0x7d, limit)
-    return end === -1 ? null : { start: i, end: end + 1, kind: 'object' }
-  }
-  if (ch === 0x5b) {
-    const end = findJsonContainerEndString(source, i, 0x5b, 0x5d, limit)
-    return end === -1 ? null : { start: i, end: end + 1, kind: 'array' }
-  }
-  let end = i
-  while (end < limit) {
-    const c = source.charCodeAt(end)
-    if (c === 0x2c || c === 0x7d || c === 0x5d || /\s/.test(source[end]!)) break
-    end++
-  }
-  return { start: i, end, kind: 'scalar' }
-}
-
-function findJsonStringEndBuffer(source: Buffer, start: number, limit = source.length): number {
-  for (let i = start + 1; i < limit; i++) {
-    const ch = source[i]
-    if (ch === 0x5c) {
-      i++
-      continue
-    }
-    if (ch === 0x22) return i
-  }
-  return -1
-}
-
-function findJsonContainerEndBuffer(source: Buffer, start: number, open: number, close: number, limit = source.length): number {
-  let depth = 0
-  let inString = false
-  for (let i = start; i < limit; i++) {
-    const ch = source[i]
-    if (inString) {
-      if (ch === 0x5c) {
-        i++
-      } else if (ch === 0x22) {
-        inString = false
-      }
-      continue
-    }
-    if (ch === 0x22) {
-      inString = true
-    } else if (ch === open) {
-      depth++
-    } else if (ch === close) {
-      depth--
-      if (depth === 0) return i
-    }
-  }
-  return -1
-}
-
-function findJsonValueBoundsBuffer(source: Buffer, start: number, limit = source.length): JsonValueBounds | null {
-  let i = start
-  while (i < limit && isBufferWhitespaceAt(source, i)) i++
-  if (i >= limit) return null
-  const ch = source[i]
-  if (ch === 0x22) {
-    const end = findJsonStringEndBuffer(source, i, limit)
-    return end === -1 ? null : { start: i, end: end + 1, kind: 'string' }
-  }
-  if (ch === 0x7b) {
-    const end = findJsonContainerEndBuffer(source, i, 0x7b, 0x7d, limit)
-    return end === -1 ? null : { start: i, end: end + 1, kind: 'object' }
-  }
-  if (ch === 0x5b) {
-    const end = findJsonContainerEndBuffer(source, i, 0x5b, 0x5d, limit)
-    return end === -1 ? null : { start: i, end: end + 1, kind: 'array' }
-  }
-  let end = i
-  while (end < limit) {
-    const c = source[end]
-    if (c === 0x2c || c === 0x7d || c === 0x5d || isBufferWhitespaceAt(source, end)) break
-    end++
-  }
-  return { start: i, end, kind: 'scalar' }
-}
-
-function findObjectFieldValueString(source: string, objectStart: number, objectEnd: number, field: string): JsonValueBounds | null {
-  if (source.charCodeAt(objectStart) !== 0x7b) return null
-  let i = objectStart + 1
-  while (i < objectEnd - 1) {
-    while (i < objectEnd && /\s/.test(source[i]!)) i++
-    if (source.charCodeAt(i) === 0x2c) {
-      i++
-      continue
-    }
-    if (source.charCodeAt(i) !== 0x22) {
-      i++
-      continue
-    }
-    const keyEnd = findJsonStringEndString(source, i, objectEnd)
-    if (keyEnd === -1) return null
-    const keyStart = i + 1
-    i = keyEnd + 1
-    while (i < objectEnd && /\s/.test(source[i]!)) i++
-    if (source.charCodeAt(i) !== 0x3a) continue
-    const value = findJsonValueBoundsString(source, i + 1, objectEnd)
-    if (!value) return null
-    if (source.slice(keyStart, keyEnd) === field) return value
-    i = value.end
-  }
-  return null
-}
-
-function findObjectFieldValueBuffer(source: Buffer, objectStart: number, objectEnd: number, field: string): JsonValueBounds | null {
-  if (source[objectStart] !== 0x7b) return null
-  let i = objectStart + 1
-  while (i < objectEnd - 1) {
-    while (i < objectEnd && isBufferWhitespaceAt(source, i)) i++
-    if (source[i] === 0x2c) {
-      i++
-      continue
-    }
-    if (source[i] !== 0x22) {
-      i++
-      continue
-    }
-    const keyEnd = findJsonStringEndBuffer(source, i, objectEnd)
-    if (keyEnd === -1) return null
-    const keyStart = i + 1
-    i = keyEnd + 1
-    while (i < objectEnd && isBufferWhitespaceAt(source, i)) i++
-    if (source[i] !== 0x3a) continue
-    const value = findJsonValueBoundsBuffer(source, i + 1, objectEnd)
-    if (!value) return null
-    if (keyEnd - keyStart === field.length && source.subarray(keyStart, keyEnd).equals(Buffer.from(field))) return value
-    i = value.end
-  }
-  return null
-}
-
-function appendStringJsonSegment(source: string, start: number, end: number, current: string, cap: number): string {
-  if (start >= end || current.length >= cap) return current
-  return current + source.slice(start, Math.min(end, start + cap - current.length))
-}
-
-function appendBufferJsonSegment(source: Buffer, start: number, end: number, current: string, cap: number): string {
-  if (start >= end || current.length >= cap) return current
-  const remaining = cap - current.length
-  const cappedEnd = Number.isFinite(cap) ? safeBufferSegmentEnd(source, Math.min(end, start + remaining * 4)) : end
-  return current + source.subarray(start, cappedEnd).toString('utf-8').slice(0, remaining)
-}
-
-function readJsonStringString(source: string, bounds: JsonValueBounds | null, cap = Number.POSITIVE_INFINITY): string | undefined {
-  if (!bounds || bounds.kind !== 'string') return undefined
-  let out = ''
-  const contentEnd = bounds.end - 1
-  let segmentStart = bounds.start + 1
-  let i = segmentStart
-  let scanLimit = Number.isFinite(cap) ? Math.min(contentEnd, segmentStart + cap) : contentEnd
-  while (i < contentEnd && out.length < cap) {
-    if (i >= scanLimit) {
-      out = appendStringJsonSegment(source, segmentStart, i, out, cap)
-      if (out.length >= cap) break
-      segmentStart = i
-      scanLimit = Number.isFinite(cap) ? Math.min(contentEnd, i + cap - out.length) : contentEnd
-      continue
-    }
-    const ch = source.charCodeAt(i)
-    if (ch !== 0x5c) {
-      i++
-      continue
-    }
-    out = appendStringJsonSegment(source, segmentStart, i, out, cap)
-    if (out.length >= cap) break
-    i++
-    const next = source.charCodeAt(i)
-    if (Number.isNaN(next)) break
-    if (next === 0x6e) out += '\n'
-    else if (next === 0x72) out += '\r'
-    else if (next === 0x74) out += '\t'
-    else if (next === 0x62) out += '\b'
-    else if (next === 0x66) out += '\f'
-    else if (next === 0x75 && i + 4 < bounds.end) {
-      const code = Number.parseInt(source.slice(i + 1, i + 5), 16)
-      if (Number.isFinite(code)) out += String.fromCharCode(code)
-      i += 4
-    } else {
-      out += String.fromCharCode(next)
-    }
-    segmentStart = i + 1
-    i++
-  }
-  return appendStringJsonSegment(source, segmentStart, contentEnd, out, cap)
-}
-
-function readJsonStringBuffer(source: Buffer, bounds: JsonValueBounds | null, cap = Number.POSITIVE_INFINITY): string | undefined {
-  if (!bounds || bounds.kind !== 'string') return undefined
-  let out = ''
-  const contentEnd = bounds.end - 1
-  let segmentStart = bounds.start + 1
-  let i = segmentStart
-  let scanLimit = Number.isFinite(cap) ? Math.min(contentEnd, segmentStart + cap * 4) : contentEnd
-  while (i < contentEnd && out.length < cap) {
-    if (i >= scanLimit) {
-      const segmentEnd = safeBufferSegmentEnd(source, i)
-      out = appendBufferJsonSegment(source, segmentStart, segmentEnd, out, cap)
-      if (out.length >= cap) break
-      segmentStart = segmentEnd
-      i = segmentEnd
-      scanLimit = Number.isFinite(cap) ? Math.min(contentEnd, i + (cap - out.length) * 4) : contentEnd
-      continue
-    }
-    const ch = source[i]
-    if (ch !== 0x5c) {
-      i++
-      continue
-    }
-    out = appendBufferJsonSegment(source, segmentStart, i, out, cap)
-    if (out.length >= cap) break
-    i++
-    const next = source[i]
-    if (next === undefined) break
-    if (next === 0x6e) out += '\n'
-    else if (next === 0x72) out += '\r'
-    else if (next === 0x74) out += '\t'
-    else if (next === 0x62) out += '\b'
-    else if (next === 0x66) out += '\f'
-    else if (next === 0x75 && i + 4 < bounds.end) {
-      const code = Number.parseInt(source.subarray(i + 1, i + 5).toString('ascii'), 16)
-      if (Number.isFinite(code)) out += String.fromCharCode(code)
-      i += 4
-    } else {
-      out += String.fromCharCode(next)
-    }
-    segmentStart = i + 1
-    i++
-  }
-  return appendBufferJsonSegment(source, segmentStart, contentEnd, out, cap)
-}
-
-function getTopLevelRawJsonStringField(head: string, field: string): string | null {
-  let i = 0
-  while (i < head.length && /\s/.test(head[i]!)) i++
-  if (head.charCodeAt(i) !== 0x7b) return null
-  i++
-  while (i < head.length) {
-    while (i < head.length && /\s/.test(head[i]!)) i++
-    if (head.charCodeAt(i) === 0x2c) {
-      i++
-      continue
-    }
-    if (head.charCodeAt(i) === 0x7d) return null
-    if (head.charCodeAt(i) !== 0x22) return null
-    const keyEnd = findJsonStringEndString(head, i)
-    if (keyEnd === -1) return null
-    const key = head.slice(i + 1, keyEnd)
-    i = keyEnd + 1
-    while (i < head.length && /\s/.test(head[i]!)) i++
-    if (head.charCodeAt(i) !== 0x3a) return null
-    const value = findJsonValueBoundsString(head, i + 1)
-    if (!value) return null
-    if (key === field) return readJsonStringString(head, value) ?? null
-    i = value.end
-  }
-  return null
-}
-
-export function shouldSkipLine(line: string, threshold: string): boolean {
-  const head = line.length > RAW_HEAD_BYTES ? line.slice(0, RAW_HEAD_BYTES) : line
-  const type = getTopLevelRawJsonStringField(head, 'type')
-  if (type !== 'user' && type !== 'assistant') return false
-  const ts = getTopLevelRawJsonStringField(head, 'timestamp')
-  if (!ts || ts.length < 10) return false
-  return ts < threshold
-}
-
-const USER_TEXT_CAP = 2000
-const BASH_COMMAND_CAP = 2000
-const MAX_TOOL_BLOCKS = 500
-const MAX_ADDED_NAMES = 1000
-
-export function compactEntry(raw: JournalEntry): JournalEntry {
-  const entry: JournalEntry = { type: raw.type }
-
-  if (raw.timestamp !== undefined) entry.timestamp = raw.timestamp
-  if (raw.sessionId !== undefined) entry.sessionId = raw.sessionId
-  if (raw.cwd !== undefined) entry.cwd = raw.cwd
-  // Preserved so groupIntoTurns can stamp each turn's git branch (rich capture).
-  if (typeof raw.gitBranch === 'string' && raw.gitBranch) entry.gitBranch = raw.gitBranch
-  // Preserved so groupIntoTurns can attribute each PR reference to its turn.
-  // Only `pr-link` entries carry `prUrl`; every other field of theirs is dropped.
-  if (raw.type === 'pr-link') {
-    const prUrl = (raw as Record<string, unknown>)['prUrl']
-    if (typeof prUrl === 'string' && prUrl) (entry as Record<string, unknown>)['prUrl'] = prUrl
-  }
-
-  const att = (raw as Record<string, unknown>)['attachment']
-  if (att && typeof att === 'object') {
-    const a = att as Record<string, unknown>
-    if (a['type'] === 'deferred_tools_delta' && Array.isArray(a['addedNames'])) {
-      const names: string[] = []
-      for (let i = 0; i < Math.min(a['addedNames'].length, MAX_ADDED_NAMES); i++) {
-        const n = a['addedNames'][i]
-        if (typeof n === 'string') names.push(n)
-      }
-      ;(entry as Record<string, unknown>)['attachment'] = { type: 'deferred_tools_delta', addedNames: names }
-    }
-  }
-
-  if (!raw.message) return entry
-
-  if (raw.message.role === 'user') {
-    const content = raw.message.content
-    if (typeof content === 'string') {
-      entry.message = { role: 'user', content: content.slice(0, USER_TEXT_CAP) }
-    } else if (Array.isArray(content)) {
-      let remaining = USER_TEXT_CAP
-      const blocks: { type: 'text'; text: string }[] = []
-      for (const b of content) {
-        if (remaining <= 0) break
-        if (!b || typeof b !== 'object' || b.type !== 'text') continue
-        const text = (b as { text?: unknown }).text
-        if (typeof text !== 'string') continue
-        const sliced = text.slice(0, remaining)
-        blocks.push({ type: 'text', text: sliced })
-        remaining -= sliced.length
-      }
-      entry.message = { role: 'user', content: blocks }
-    }
-    return entry
-  }
-
-  const msg = raw.message as AssistantMessageContent
-  if (!msg.usage || !msg.model) return entry
-
-  const rawContent = msg.content
-  const contentArr = Array.isArray(rawContent) ? rawContent : []
-  const toolBlocks = contentArr.filter((b): b is ToolUseBlock => b != null && typeof b === 'object' && b.type === 'tool_use')
-  const compactContent: ContentBlock[] = toolBlocks.slice(0, MAX_TOOL_BLOCKS).map(tb => {
-    let input: Record<string, unknown> = {}
-    if (tb.name === 'Skill') {
-      const ri = (tb.input ?? {}) as Record<string, unknown>
-      if (typeof ri['skill'] === 'string') input['skill'] = (ri['skill'] as string).slice(0, 200)
-      if (typeof ri['name'] === 'string') input['name'] = (ri['name'] as string).slice(0, 200)
-    } else if (tb.name === 'Read' || tb.name === 'FileReadTool' || EDIT_TOOLS.has(tb.name)) {
-      const ri = (tb.input ?? {}) as Record<string, unknown>
-      if (typeof ri['file_path'] === 'string') input['file_path'] = (ri['file_path'] as string).slice(0, BASH_COMMAND_CAP)
-    } else if (tb.name === 'Agent' || tb.name === 'Task') {
-      const ri = (tb.input ?? {}) as Record<string, unknown>
-      if (typeof ri['subagent_type'] === 'string') input['subagent_type'] = (ri['subagent_type'] as string).slice(0, 200)
-    } else if (BASH_TOOLS.has(tb.name)) {
-      const ri = (tb.input ?? {}) as Record<string, unknown>
-      if (typeof ri['command'] === 'string') {
-        input['command'] = (ri['command'] as string).slice(0, BASH_COMMAND_CAP)
-      }
-    }
-    return { type: 'tool_use' as const, id: tb.id ?? '', name: tb.name, input }
-  })
-
-  const u = msg.usage
-  const compactUsage: AssistantMessageContent['usage'] = {
-    input_tokens: u.input_tokens,
-    output_tokens: u.output_tokens,
-  }
-  if (u.cache_creation_input_tokens) compactUsage.cache_creation_input_tokens = u.cache_creation_input_tokens
-  if (u.cache_creation) {
-    compactUsage.cache_creation = {
-      ...(u.cache_creation.ephemeral_5m_input_tokens ? { ephemeral_5m_input_tokens: u.cache_creation.ephemeral_5m_input_tokens } : {}),
-      ...(u.cache_creation.ephemeral_1h_input_tokens ? { ephemeral_1h_input_tokens: u.cache_creation.ephemeral_1h_input_tokens } : {}),
-    }
-  }
-  if (u.cache_read_input_tokens) compactUsage.cache_read_input_tokens = u.cache_read_input_tokens
-  if (u.server_tool_use) {
-    compactUsage.server_tool_use = {
-      ...(u.server_tool_use.web_search_requests ? { web_search_requests: u.server_tool_use.web_search_requests } : {}),
-      ...(u.server_tool_use.web_fetch_requests ? { web_fetch_requests: u.server_tool_use.web_fetch_requests } : {}),
-    }
-  }
-  if (u.speed) compactUsage.speed = u.speed
-  // Preserve only advisor_message iterations (/advisor sub-usage) so
-  // parseAdvisorCalls can attribute the advisor model's spend; drop the rest to
-  // keep the cache small. Other iteration types (plain `message`, and the
-  // `fallback_message` written when a turn retries on another model) are not
-  // accounted here, a separate pre-existing gap, so they are not preserved.
-  if (Array.isArray(u.iterations)) {
-    const advisorIterations = u.iterations
-      .filter((it): it is ApiUsageIteration => !!it && it.type === 'advisor_message')
-      .map(it => {
-        const compact: ApiUsageIteration = { type: 'advisor_message' }
-        if (typeof it.model === 'string') compact.model = it.model
-        if (it.input_tokens) compact.input_tokens = it.input_tokens
-        if (it.output_tokens) compact.output_tokens = it.output_tokens
-        if (it.cache_creation_input_tokens) compact.cache_creation_input_tokens = it.cache_creation_input_tokens
-        if (it.cache_read_input_tokens) compact.cache_read_input_tokens = it.cache_read_input_tokens
-        if (it.cache_creation) {
-          compact.cache_creation = {
-            ...(it.cache_creation.ephemeral_5m_input_tokens ? { ephemeral_5m_input_tokens: it.cache_creation.ephemeral_5m_input_tokens } : {}),
-            ...(it.cache_creation.ephemeral_1h_input_tokens ? { ephemeral_1h_input_tokens: it.cache_creation.ephemeral_1h_input_tokens } : {}),
-          }
-        }
-        if (it.server_tool_use?.web_search_requests) compact.server_tool_use = { web_search_requests: it.server_tool_use.web_search_requests }
-        if (it.speed) compact.speed = it.speed
-        return compact
-      })
-    if (advisorIterations.length > 0) compactUsage.iterations = advisorIterations
-  }
-
-  entry.message = {
-    type: 'message',
-    role: 'assistant',
-    model: msg.model,
-    usage: compactUsage,
-    content: compactContent,
-    ...(msg.id ? { id: msg.id } : {}),
-  }
-
-  return entry
-}
-
-function extractToolNames(content: ContentBlock[]): string[] {
-  return content
-    .filter((b): b is ToolUseBlock => b.type === 'tool_use')
-    .map(b => b.name)
-}
+export type { ToolResultMeta, SessionMeta }
 
 function extractMcpTools(tools: string[]): string[] {
   return tools.filter(t => t.startsWith('mcp__'))
 }
 
-function extractSkillNames(content: ContentBlock[]): string[] {
-  return content
-    .filter((b): b is ToolUseBlock => b.type === 'tool_use' && b.name === 'Skill')
-    .map(b => {
-      const input = (b.input ?? {}) as Record<string, unknown>
-      const raw = input['skill'] ?? input['name']
-      return typeof raw === 'string' ? raw.trim() : ''
-    })
-    .filter(name => name.length > 0)
-}
-
-function extractSubagentTypes(content: ContentBlock[]): string[] {
-  return content
-    .filter((b): b is ToolUseBlock => b.type === 'tool_use' && (b.name === 'Agent' || b.name === 'Task'))
-    .map(b => {
-      const input = (b.input ?? {}) as Record<string, unknown>
-      const raw = input['subagent_type']
-      return typeof raw === 'string' ? raw.trim() : ''
-    })
-    .filter(name => name.length > 0)
-}
-
 function extractCoreTools(tools: string[]): string[] {
   return tools.filter(t => !t.startsWith('mcp__'))
-}
-
-function extractBashCommandsFromContent(content: ContentBlock[]): string[] {
-  return content
-    .filter((b): b is ToolUseBlock => b.type === 'tool_use' && BASH_TOOLS.has((b as ToolUseBlock).name))
-    .flatMap(b => {
-      const command = (b.input as Record<string, unknown>)?.command
-      return typeof command === 'string' ? extractBashCommands(command) : []
-    })
-}
-
-function getUserMessageText(entry: JournalEntry): string {
-  if (!entry.message || entry.message.role !== 'user') return ''
-  const content = entry.message.content
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    return content
-      .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-      .map(b => b.text)
-      .join(' ')
-  }
-  return ''
-}
-
-function getMessageId(entry: JournalEntry): string | null {
-  if (entry.type !== 'assistant') return null
-  const msg = entry.message as AssistantMessageContent | undefined
-  return msg?.id ?? null
-}
-
-export function safeNumber(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
-}
-
-export function isPositiveNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0
-}
-
-function extractClaudeCacheCreation(usage: {
-  cache_creation_input_tokens?: number
-  cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }
-}): { totalTokens: number; oneHourTokens: number } {
-  const legacyTotal = safeNumber(usage.cache_creation_input_tokens)
-  const cacheCreation = usage.cache_creation
-  const fiveMinuteTokens = safeNumber(cacheCreation?.ephemeral_5m_input_tokens)
-  const oneHourTokens = safeNumber(cacheCreation?.ephemeral_1h_input_tokens)
-  const splitTotal = fiveMinuteTokens + oneHourTokens
-
-  if (splitTotal === 0) return { totalTokens: legacyTotal, oneHourTokens: 0 }
-
-  // Valid Claude usage reports the legacy total and split total as equal.
-  // Keep the larger value so malformed partial splits do not drop tokens.
-  const totalTokens = Math.max(legacyTotal, splitTotal)
-  return {
-    totalTokens,
-    oneHourTokens: Math.min(oneHourTokens, totalTokens),
-  }
 }
 
 /// Apply local-model savings accounting to a call. If the raw model name is
@@ -1168,473 +211,74 @@ function applyLocalModelSavings(call: ParsedApiCall): ParsedApiCall {
   }
 }
 
-// ── Rich Session Capture (Claude) ──────────────────────────────────────
-//
-// Parse-time extraction of edit sizes, interruptions, error counts, git branch,
-// and session titles/PR links from the raw JSONL. Capture-only: no report or
-// payload consumes these yet. Everything is optional and omitted at zero/false
-// to keep the cache cost minimal.
-
-// Per-call metadata keyed by tool_use_id, built from a session's user
-// (tool-result) entries before compaction discards `toolUseResult` and the
-// tool_result blocks' `is_error` flag.
-export type ToolResultMeta = {
-  locAdded: number
-  locRemoved: number
-  interrupted: boolean
-  userModified: boolean
-  isError: boolean
-}
-
-// Session-level accumulator: last `ai-title` wins, `pr-link` URLs accumulate,
-// and any sidechain entry flips `isSidechain`. parentUuid is deliberately not
-// captured as a session link — it references an intra-file entry uuid, not
-// another session's id, so it cannot reliably connect two sessions.
-export type SessionMeta = {
-  title?: string
-  prLinks: string[]
-  isSidechain: boolean
-  // Sidechain side: the parent session id (a sidechain entry's internal
-  // `sessionId`, which is the spawning session). First non-empty value wins.
-  parentSessionId?: string
-  // Parent side: agentId -> the `tool_use` id of the `Agent`/`Task` block that
-  // spawned it, read from the spawn result's `toolUseResult.agentId`. First value
-  // per agentId wins. Empty for sessions that spawned no completed subagent.
-  agentSpawnLinks: Record<string, string>
-  // Parent side: agent ids whose spawn result named them but whose exact launching
-  // tool_use could not be paired (an ambiguous multi-result record). Drives the
-  // grace-window fallback for a late child. Deduped.
-  ambiguousSpawnAgentIds: string[]
-}
-
-export function emptySessionMeta(): SessionMeta {
-  return { prLinks: [], isSidechain: false, agentSpawnLinks: {}, ambiguousSpawnAgentIds: [] }
-}
-
-// Count added/removed lines from a Claude `toolUseResult.structuredPatch`. Each
-// hunk's `lines` array holds unified-diff content lines: a leading '+' is an
-// added line, '-' a removed line, ' ' context. Numbers only — patch text is
-// never stored. Missing/empty/non-array patches count as zero.
-export function countStructuredPatchLoc(patch: unknown): { added: number; removed: number } {
-  let added = 0
-  let removed = 0
-  if (!Array.isArray(patch)) return { added, removed }
-  for (const hunk of patch) {
-    const lines = (hunk as { lines?: unknown } | null)?.lines
-    if (!Array.isArray(lines)) continue
-    for (const line of lines) {
-      if (typeof line !== 'string') continue
-      if (line.startsWith('+')) added++
-      else if (line.startsWith('-')) removed++
-    }
-  }
-  return { added, removed }
-}
-
-// Record tool-result metadata from a raw user entry into `map`, keyed by the
-// tool_result block's tool_use_id. Must run on the RAW entry (before
-// compactEntry drops toolUseResult / is_error). Large tool-result lines parsed
-// as buffers lose toolUseResult (the byte scanner does not extract it) — an
-// accepted gap for oversized outputs.
-export function collectToolResultMeta(entry: JournalEntry, map: Map<string, ToolResultMeta>): void {
-  if (entry.type !== 'user') return
-  const msg = entry.message
-  const content = msg && typeof msg === 'object' ? (msg as { content?: unknown }).content : undefined
-  if (!Array.isArray(content)) return
-  const tur = (entry as Record<string, unknown>)['toolUseResult']
-  const turObj = tur && typeof tur === 'object' ? tur as Record<string, unknown> : undefined
-  const loc = countStructuredPatchLoc(turObj?.['structuredPatch'])
-  const interrupted = turObj?.['interrupted'] === true
-  const userModified = turObj?.['userModified'] === true
-  for (const b of content) {
-    if (!b || typeof b !== 'object' || (b as { type?: unknown }).type !== 'tool_result') continue
-    const id = (b as { tool_use_id?: unknown }).tool_use_id
-    if (typeof id !== 'string' || !id) continue
-    const isError = (b as { is_error?: unknown }).is_error === true
-    map.set(id, { locAdded: loc.added, locRemoved: loc.removed, interrupted, userModified, isError })
-  }
-}
-
-// Accumulate session-level metadata from a raw entry. `ai-title` is last-wins
-// (Claude refines the title over the session); `pr-link` URLs union; any
-// sidechain entry marks the session.
-export function collectSessionMeta(entry: JournalEntry, meta: SessionMeta): void {
-  if (entry.type === 'ai-title') {
-    const t = (entry as Record<string, unknown>)['aiTitle']
-    if (typeof t === 'string' && t.trim()) meta.title = t.trim().slice(0, 200)
-  } else if (entry.type === 'pr-link') {
-    const url = (entry as Record<string, unknown>)['prUrl']
-    if (typeof url === 'string' && url && !meta.prLinks.includes(url)) meta.prLinks.push(url)
-  }
-  if (entry.isSidechain === true) {
-    meta.isSidechain = true
-    // A sidechain entry's own `sessionId` is the id of the session that spawned
-    // it (32/32 on real data; cross-checked against the owning directory at
-    // stamp time). First value wins; every entry in the file carries the same id.
-    const sid = (entry as Record<string, unknown>)['sessionId']
-    if (!meta.parentSessionId && typeof sid === 'string' && sid) meta.parentSessionId = sid
-  }
-  // Parent side: the `Agent`/`Task` spawn result records the spawned agent's id in
-  // `toolUseResult.agentId`; pair it with the `tool_result` block's `tool_use_id`
-  // (the spawn's `tool_use` id) so a child can be folded into the launching turn.
-  // Read from the RAW entry (compaction strips `toolUseResult`).
-  const tur = (entry as Record<string, unknown>)['toolUseResult']
-  if (tur && typeof tur === 'object') {
-    const agentId = (tur as Record<string, unknown>)['agentId']
-    if (typeof agentId === 'string' && agentId && !(agentId in meta.agentSpawnLinks)) {
-      const msg = entry.message
-      const content = msg && typeof msg === 'object' ? (msg as { content?: unknown }).content : undefined
-      if (Array.isArray(content)) {
-        const results = content.filter((b): b is Record<string, unknown> =>
-          !!b && typeof b === 'object' && (b as { type?: unknown }).type === 'tool_result'
-          && typeof (b as { tool_use_id?: unknown }).tool_use_id === 'string' && !!(b as { tool_use_id?: unknown }).tool_use_id)
-        let spawnId: string | undefined
-        if (results.length === 1) {
-          spawnId = results[0]!['tool_use_id'] as string
-        } else if (results.length > 1) {
-          // Several batched tool results share one entry: pair the agentId with the
-          // block whose `content` is the spawn result (equals `toolUseResult.content`),
-          // so an unrelated sibling block cannot capture the id. When the match is
-          // ambiguous (identical blocks, or none match) the spawn link is left
-          // unset ON PURPOSE: the child then folds via the timestamp-bucket fallback
-          // in resolveChild rather than risk pairing with the wrong id.
-          const turContent = JSON.stringify((tur as Record<string, unknown>)['content'])
-          const matches = results.filter(b => JSON.stringify(b['content']) === turContent)
-          if (matches.length === 1) spawnId = matches[0]!['tool_use_id'] as string
-        }
-        if (spawnId) meta.agentSpawnLinks[agentId] = spawnId
-        // We know this parent spawned `agentId` (its result named it) but could not
-        // pair the exact tool_use: record it as an AMBIGUOUS pairing so a late child
-        // can still fold via the grace window. Not the same as an absent spawn.
-        else if (!meta.ambiguousSpawnAgentIds.includes(agentId)) meta.ambiguousSpawnAgentIds.push(agentId)
-      }
-    }
-  }
-}
-
-export function parseApiCall(entry: JournalEntry, toolResultMeta?: Map<string, ToolResultMeta>): ParsedApiCall | null {
-  if (entry.type !== 'assistant') return null
-  const msg = entry.message as AssistantMessageContent | undefined
-  if (!msg?.usage || !msg?.model) return null
-
-  const usage = msg.usage
-  const cacheCreation = extractClaudeCacheCreation(usage)
-  const tokens: TokenUsage = {
-    inputTokens: usage.input_tokens ?? 0,
-    outputTokens: usage.output_tokens ?? 0,
-    cacheCreationInputTokens: cacheCreation.totalTokens,
-    cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
-    cachedInputTokens: 0,
-    reasoningTokens: 0,
-    webSearchRequests: usage.server_tool_use?.web_search_requests ?? 0,
-  }
-
-  // Defensive: a message whose `content` is a string (not an array of blocks)
-  // would crash the helpers below; normalize so one bad record can't abort the
-  // whole backfill (issue #441).
-  const contentBlocks = normalizeContentBlocks(msg.content)
-  const tools = extractToolNames(contentBlocks)
-  const skills = extractSkillNames(contentBlocks)
-  const subagentTypes = extractSubagentTypes(contentBlocks)
+// Host-side pricing + bash splitting: map one cost-free DecodedCall into the
+// CLI's ParsedApiCall. `costUSD` is priced from token buckets by the same
+// pricing table cachedCallToApiCall re-prices with (a cache round-trip is a
+// no-op), then local-model savings are applied; raw bash command strings are
+// split by the CLI's ANSI-aware splitter. Every other field passes through.
+function mapDecodedCall(d: DecodedCall): ParsedApiCall {
   const costUSD = calculateCost(
-    msg.model,
-    tokens.inputTokens,
-    tokens.outputTokens,
-    tokens.cacheCreationInputTokens,
-    tokens.cacheReadInputTokens,
-    tokens.webSearchRequests,
-    usage.speed ?? 'standard',
-    cacheCreation.oneHourTokens,
+    d.model,
+    d.usage.inputTokens,
+    d.usage.outputTokens,
+    d.usage.cacheCreationInputTokens,
+    d.usage.cacheReadInputTokens,
+    d.usage.webSearchRequests,
+    d.speed,
+    d.cacheCreationOneHourTokens ?? 0,
   )
-
-  const bashCmds = extractBashCommandsFromContent(contentBlocks)
-
-  // Subagent-spawn `tool_use` ids in this message (`Agent`/`Task` blocks). Kept so
-  // groupIntoTurns can attach them to the turn and by-PR attribution can fold each
-  // spawned sidechain back into the turn that launched it.
-  const spawnIds = contentBlocks
-    .filter((b): b is ToolUseBlock => b.type === 'tool_use' && (b.name === 'Agent' || b.name === 'Task') && !!b.id)
-    .map(b => b.id)
-
-  const toolSeq: ToolCall[][] = contentBlocks
-    .filter((b): b is ToolUseBlock => b.type === 'tool_use')
-    .map(b => {
-      const call: ToolCall = { tool: b.name }
-      const inp = (b.input ?? {}) as Record<string, unknown>
-      if (typeof inp['file_path'] === 'string') call.file = inp['file_path'] as string
-      if (typeof inp['command'] === 'string') call.command = inp['command'] as string
-      return [call]
-    })
-
-  // Attribute tool-result metadata (edit LOC, interruptions, errors) to this
-  // call by summing over the tool_use ids it issued. Omitted entirely when no
-  // meta map is supplied (e.g. the guard usage path) or nothing was recorded.
-  let locAdded = 0
-  let locRemoved = 0
-  let toolErrors = 0
-  let interrupted = false
-  let userModified = false
-  if (toolResultMeta && toolResultMeta.size > 0) {
-    for (const b of contentBlocks) {
-      if (b.type !== 'tool_use') continue
-      const m = toolResultMeta.get((b as ToolUseBlock).id)
-      if (!m) continue
-      locAdded += m.locAdded
-      locRemoved += m.locRemoved
-      if (m.isError) toolErrors++
-      if (m.interrupted) interrupted = true
-      if (m.userModified) userModified = true
-    }
-  }
-
   return applyLocalModelSavings({
     provider: 'claude',
-    model: msg.model,
-    usage: tokens,
+    model: d.model,
+    usage: d.usage,
     costUSD,
-    tools,
-    mcpTools: extractMcpTools(tools),
-    skills,
-    subagentTypes,
-    hasAgentSpawn: tools.includes('Agent'),
-    hasPlanMode: tools.includes('EnterPlanMode'),
-    speed: usage.speed ?? 'standard',
-    timestamp: entry.timestamp ?? '',
-    bashCommands: bashCmds,
-    deduplicationKey: msg.id ?? `claude:${entry.timestamp}`,
-    cacheCreationOneHourTokens: cacheCreation.oneHourTokens || undefined,
-    toolSequence: toolSeq.length > 0 ? toolSeq : undefined,
-    ...(spawnIds.length > 0 ? { spawnToolUseIds: spawnIds } : {}),
-    ...(locAdded ? { locAdded } : {}),
-    ...(locRemoved ? { locRemoved } : {}),
-    ...(interrupted ? { interrupted: true } : {}),
-    ...(userModified ? { userModified: true } : {}),
-    ...(toolErrors ? { toolErrors } : {}),
+    tools: d.tools,
+    mcpTools: d.mcpTools,
+    skills: d.skills,
+    subagentTypes: d.subagentTypes,
+    hasAgentSpawn: d.hasAgentSpawn,
+    hasPlanMode: d.hasPlanMode,
+    speed: d.speed,
+    timestamp: d.timestamp,
+    bashCommands: d.rawBashCommands.flatMap(extractBashCommands),
+    deduplicationKey: d.deduplicationKey,
+    cacheCreationOneHourTokens: d.cacheCreationOneHourTokens,
+    toolSequence: d.toolSequence,
+    ...(d.spawnToolUseIds ? { spawnToolUseIds: d.spawnToolUseIds } : {}),
+    ...(d.locAdded ? { locAdded: d.locAdded } : {}),
+    ...(d.locRemoved ? { locRemoved: d.locRemoved } : {}),
+    ...(d.interrupted ? { interrupted: true } : {}),
+    ...(d.userModified ? { userModified: true } : {}),
+    ...(d.toolErrors ? { toolErrors: d.toolErrors } : {}),
   })
 }
 
-/// Claude Code's advisor tool (/advisor) escalates hard decisions to a stronger
-/// advisor model mid-turn. Those tokens are recorded as `advisor_message`
-/// records inside `message.usage.iterations` under the advisor's own model, and
-/// are excluded from the top-level `message.usage` totals that `parseApiCall`
-/// reads. Emit them as separate calls so the advisor's spend is counted and
-/// attributed to the advisor model rather than silently dropped.
-export function parseAdvisorCalls(entry: JournalEntry): ParsedApiCall[] {
-  if (entry.type !== 'assistant') return []
-  const msg = entry.message as AssistantMessageContent | undefined
-  const iterations = msg?.usage?.iterations
-  if (!msg?.usage || !Array.isArray(iterations)) return []
-
-  const calls: ParsedApiCall[] = []
-  const baseKey = msg.id ?? `claude:${entry.timestamp}`
-  // Ordinal among advisor entries (not the raw array index) so the dedup key is
-  // identical whether it is computed from the raw record (guard path) or the
-  // compacted record whose non-advisor iterations were dropped (report path).
-  let advisorOrdinal = 0
-  for (const it of iterations) {
-    if (!it || it.type !== 'advisor_message') continue
-    const model = typeof it.model === 'string' && it.model ? it.model : msg.model
-    if (!model) continue
-    const index = advisorOrdinal++
-
-    const cacheCreation = extractClaudeCacheCreation(it)
-    const tokens: TokenUsage = {
-      inputTokens: it.input_tokens ?? 0,
-      outputTokens: it.output_tokens ?? 0,
-      cacheCreationInputTokens: cacheCreation.totalTokens,
-      cacheReadInputTokens: it.cache_read_input_tokens ?? 0,
-      cachedInputTokens: 0,
-      reasoningTokens: 0,
-      webSearchRequests: it.server_tool_use?.web_search_requests ?? 0,
-    }
-    const speed = it.speed ?? msg.usage.speed ?? 'standard'
-    const costUSD = calculateCost(
-      model,
-      tokens.inputTokens,
-      tokens.outputTokens,
-      tokens.cacheCreationInputTokens,
-      tokens.cacheReadInputTokens,
-      tokens.webSearchRequests,
-      speed,
-      cacheCreation.oneHourTokens,
-    )
-
-    calls.push(applyLocalModelSavings({
-      provider: 'claude',
-      model,
-      usage: tokens,
-      costUSD,
-      tools: [],
-      mcpTools: [],
-      skills: [],
-      subagentTypes: [],
-      hasAgentSpawn: false,
-      hasPlanMode: false,
-      speed,
-      timestamp: entry.timestamp ?? '',
-      bashCommands: [],
-      deduplicationKey: `${baseKey}:advisor:${index}`,
-      cacheCreationOneHourTokens: cacheCreation.oneHourTokens || undefined,
-    }))
+function mapDecodedTurn(t: DecodedTurn): ParsedTurn {
+  return {
+    userMessage: t.userMessage,
+    assistantCalls: t.assistantCalls.map(mapDecodedCall),
+    timestamp: t.timestamp,
+    sessionId: t.sessionId,
+    ...(t.gitBranch ? { gitBranch: t.gitBranch } : {}),
+    ...(t.prRefs?.length ? { prRefs: t.prRefs } : {}),
+    ...(t.spawnToolUseIds?.length ? { spawnToolUseIds: t.spawnToolUseIds } : {}),
   }
-  return calls
 }
 
-export function dedupeStreamingMessageIds(entries: JournalEntry[]): JournalEntry[] {
-  const firstIdxById = new Map<string, number>()
-  const lastIdxById = new Map<string, number>()
-  for (let i = 0; i < entries.length; i++) {
-    const id = getMessageId(entries[i]!)
-    if (!id) continue
-    if (!firstIdxById.has(id)) firstIdxById.set(id, i)
-    lastIdxById.set(id, i)
-  }
-  if (lastIdxById.size === 0) return entries
-  const result: JournalEntry[] = []
-  for (let i = 0; i < entries.length; i++) {
-    const id = getMessageId(entries[i]!)
-    if (id && lastIdxById.get(id) !== i) continue
-    if (id && firstIdxById.get(id) !== i) {
-      const firstTs = entries[firstIdxById.get(id)!]!.timestamp
-      result.push({ ...entries[i]!, timestamp: firstTs ?? entries[i]!.timestamp })
-      continue
-    }
-    result.push(entries[i]!)
-  }
-  return result
+// Adapter wrappers preserving the historical signatures/returns. guard/usage.ts
+// and the parser's own turn builder call these; the decode is core, the pricing
+// is host-side.
+export function parseApiCall(entry: JournalEntry, toolResultMeta?: Map<string, ToolResultMeta>): ParsedApiCall | null {
+  const decoded = decodeAssistantCall(entry, toolResultMeta)
+  return decoded ? mapDecodedCall(decoded) : null
+}
+
+export function parseAdvisorCalls(entry: JournalEntry): ParsedApiCall[] {
+  return decodeAdvisorCalls(entry).map(mapDecodedCall)
 }
 
 export function groupIntoTurns(entries: JournalEntry[], seenMsgIds: Set<string>, toolResultMeta?: Map<string, ToolResultMeta>): ParsedTurn[] {
-  const turns: ParsedTurn[] = []
-  let currentUserMessage = ''
-  let currentCalls: ParsedApiCall[] = []
-  let currentTimestamp = ''
-  let currentSessionId = ''
-  // Git branch of the turn currently being accumulated. Captured at turn start
-  // from the user entry (gitBranch is on every user/assistant entry); a
-  // continuation turn with no leading user text falls back to its first call.
-  let currentBranch: string | undefined
-  // GitHub PR URLs referenced within the turn currently being accumulated. A
-  // `pr-link` entry is emitted after the assistant creates/references a PR, so it
-  // lands inside the same turn (before the next user message) and attaches here.
-  let currentPrRefs: string[] = []
-  // Subagent-spawn `tool_use` ids emitted within the current turn (deduped),
-  // carried from each call's `spawnToolUseIds`.
-  let currentSpawnIds: string[] = []
-
-  for (const entry of entries) {
-    const entryBranch = typeof entry.gitBranch === 'string' && entry.gitBranch ? entry.gitBranch : undefined
-    if (entry.type === 'user') {
-      const text = getUserMessageText(entry)
-      if (text.trim()) {
-        if (currentCalls.length > 0) {
-          turns.push({
-            userMessage: currentUserMessage,
-            assistantCalls: currentCalls,
-            timestamp: currentTimestamp,
-            sessionId: currentSessionId,
-            ...(currentBranch ? { gitBranch: currentBranch } : {}),
-            ...(currentPrRefs.length > 0 ? { prRefs: [...currentPrRefs].sort() } : {}),
-            ...(currentSpawnIds.length > 0 ? { spawnToolUseIds: currentSpawnIds } : {}),
-          })
-        }
-        currentUserMessage = text
-        currentCalls = []
-        currentTimestamp = entry.timestamp ?? ''
-        currentSessionId = entry.sessionId ?? ''
-        currentBranch = entryBranch
-        currentPrRefs = extractPrUrlsFromText(text)
-        currentSpawnIds = []
-      }
-    } else if (entry.type === 'assistant') {
-      if (entryBranch && !currentBranch) currentBranch = entryBranch
-      const msgId = getMessageId(entry)
-      if (msgId && seenMsgIds.has(msgId)) continue
-      if (msgId) seenMsgIds.add(msgId)
-      const call = parseApiCall(entry, toolResultMeta)
-      if (call) {
-        currentCalls.push(call)
-        if (call.spawnToolUseIds) for (const id of call.spawnToolUseIds) if (!currentSpawnIds.includes(id)) currentSpawnIds.push(id)
-      }
-      for (const advisorCall of parseAdvisorCalls(entry)) currentCalls.push(advisorCall)
-    } else if (entry.type === 'pr-link') {
-      const url = (entry as Record<string, unknown>)['prUrl']
-      if (typeof url === 'string' && url && !currentPrRefs.includes(url)) currentPrRefs.push(url)
-    }
-  }
-
-  if (currentCalls.length > 0) {
-    turns.push({
-      userMessage: currentUserMessage,
-      assistantCalls: currentCalls,
-      timestamp: currentTimestamp,
-      sessionId: currentSessionId,
-      ...(currentBranch ? { gitBranch: currentBranch } : {}),
-      ...(currentPrRefs.length > 0 ? { prRefs: [...currentPrRefs].sort() } : {}),
-      ...(currentSpawnIds.length > 0 ? { spawnToolUseIds: currentSpawnIds } : {}),
-    })
-  }
-
-  return turns
-}
-
-// Map each subagent-spawn `tool_use` id to the PR set active at the turn that
-// emitted it, walking the FULL turn list in order. A turn's own `prRefs` apply to
-// spawns within it; otherwise the carried set does. First occurrence of a spawn id
-// wins deterministically (tool_use ids are unique in practice; this only guards a
-// pathological restatement). Drives cross-range subagent PR attribution.
-export function buildSpawnPrSets(turns: Array<{ prRefs?: string[]; spawnToolUseIds?: string[] }>): Record<string, string[]> {
-  const out: Record<string, string[]> = {}
-  let cur: string[] = []
-  for (const turn of turns) {
-    const active = turn.prRefs?.length ? turn.prRefs : cur
-    for (const id of turn.spawnToolUseIds ?? []) if (!(id in out)) out[id] = active
-    if (turn.prRefs?.length) cur = turn.prRefs
-  }
-  return out
-}
-
-/**
- * Extract MCP tool inventory observed across a session's JSONL entries.
- *
- * Claude Code emits `attachment.type === "deferred_tools_delta"` entries whose
- * `addedNames` array lists every tool currently available at that turn (built-in
- * tools plus all `mcp__<server>__<tool>` names exposed by configured MCP
- * servers). Tool inventory can change mid-session if the user reloads MCP
- * config, so we union every occurrence rather than trusting only the first.
- *
- * Built-in tools are filtered out: only `mcp__*` identifiers survive.
- */
-// Fully-qualified MCP tool name shape: `mcp__<server>__<tool>`. Both server
-// and tool segments must be non-empty. Names like `mcp__server` (no tool
-// segment) or `mcp__server__` (trailing empty tool) would silently pollute
-// the inventory and break downstream `split('__')` consumers, so they're
-// rejected here.
-function isMcpToolName(name: string): boolean {
-  if (!name.startsWith('mcp__')) return false
-  const rest = name.slice(5) // strip `mcp__`
-  const sep = rest.indexOf('__')
-  if (sep <= 0) return false                   // missing or empty server
-  if (sep >= rest.length - 2) return false     // missing or empty tool
-  return true
-}
-
-export function extractMcpInventory(entries: JournalEntry[]): string[] {
-  const inventory = new Set<string>()
-  for (const entry of entries) {
-    const att = entry['attachment']
-    if (!att || typeof att !== 'object') continue
-    const a = att as { type?: unknown; addedNames?: unknown }
-    if (a.type !== 'deferred_tools_delta') continue
-    if (!Array.isArray(a.addedNames)) continue
-    for (const name of a.addedNames) {
-      if (typeof name !== 'string') continue
-      if (!isMcpToolName(name)) continue
-      inventory.add(name)
-    }
-  }
-  if (inventory.size === 0) return []
-  return Array.from(inventory).sort()
+  return decodeGroupIntoTurns(entries, seenMsgIds, toolResultMeta).map(mapDecodedTurn)
 }
 
 function extractCanonicalCwd(entries: JournalEntry[]): string | undefined {
@@ -2314,13 +958,6 @@ function summarizeProject(project: string, projectPath: string, sessions: Sessio
   }
 }
 
-// Provider-neutral explicit-reference capture. Every saved provider session
-// passes through this boundary. Full URLs only: a bare "#123" is repository-
-// ambiguous and must never silently move spend between repositories.
-const PR_URL_IN_TEXT_RE = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/g
-export function extractPrUrlsFromText(text: string): string[] {
-  return [...new Set(text.match(PR_URL_IN_TEXT_RE) ?? [])].sort()
-}
 
 function providerCallToTurn(call: ParsedProviderCall): ParsedTurn {
   const tools = call.tools
