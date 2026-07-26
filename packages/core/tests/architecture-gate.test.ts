@@ -118,8 +118,14 @@ const CORRECTION_PHRASES = [
 const USER_MESSAGE_ALLOWLIST = new Set([
   'src/providers/claude/decode.ts',
   'src/providers/claude/types.ts',
+  'src/providers/codewhale/decode.ts',
+  'src/providers/codewhale/types.ts',
   'src/providers/codex/decode.ts',
   'src/providers/codex/types.ts',
+  'src/providers/grok/decode.ts',
+  'src/providers/grok/types.ts',
+  'src/providers/kimi/decode.ts',
+  'src/providers/kimi/types.ts',
   'src/providers/qwen/decode.ts',
   'src/providers/qwen/types.ts',
 ])

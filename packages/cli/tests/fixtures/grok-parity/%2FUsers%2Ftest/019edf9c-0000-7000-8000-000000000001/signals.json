@@ -1,0 +1,7 @@
+{
+  "primaryModelId": "grok-build",
+  "modelsUsed": ["grok-build"],
+  "toolsUsed": ["read_file", "run_terminal_command", "grep"],
+  "contextTokensUsed": 40000,
+  "contextWindowTokens": 512000
+}
