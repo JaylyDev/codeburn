@@ -4,6 +4,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 
 import { clearSessionCache, parseAllSessions } from '../../src/parser.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import { sessionCachePath } from '../../src/session-cache.js'
 import { MAX_SESSION_FILE_BYTES } from '../../src/fs-utils.js'
 import { codewhale, createCodeWhaleProvider } from '../../src/providers/codewhale.js'
@@ -64,7 +65,7 @@ async function parseOne(path: string, seenKeys = new Set<string>()): Promise<Par
   const source = { path, project: 'fixture', provider: 'codewhale' }
   const calls: ParsedProviderCall[] = []
   for await (const call of codewhale.createSessionParser(source, seenKeys).parse()) {
-    calls.push(call)
+    calls.push(priceProviderCall(call))
   }
   return calls
 }

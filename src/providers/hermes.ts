@@ -2,7 +2,7 @@ import { readdir, stat } from 'fs/promises'
 import { basename, dirname, join } from 'path'
 import { homedir } from 'os'
 
-import { calculateCost, getShortModelName } from '../models.js'
+import { getShortModelName } from '../models.js'
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, isSqliteBusyError, type SqliteDatabase } from '../sqlite.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 import type { ToolCall } from '../types.js'
@@ -390,23 +390,12 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
         seenKeys.add(dedupKey)
 
         // Hermes bills reasoning tokens at the output rate (same as Gemini).
-        // The LiteLLM model table is used as a fallback when Hermes has not
-        // stored an actual or estimated cost for the session.
-        const calculatedCost = calculateCost(
-          model,
-          inputTokens,
-          outputTokens + reasoningTokens,
-          cacheWriteTokens,
-          cacheReadTokens,
-          0,
-        )
+        // When Hermes stored an actual or estimated cost, pass it as measured;
+        // otherwise the pricing pass will estimate from token buckets.
         const recordedCost =
           (row.actual_cost_usd ?? 0) > 0 ? row.actual_cost_usd!
           : (row.estimated_cost_usd ?? 0) > 0 ? row.estimated_cost_usd!
           : null
-        // When Hermes stored no cost (e.g. subscription-billed sessions), the
-        // figure is our LiteLLM-priced estimate from the session token totals.
-        const costUSD = recordedCost ?? calculatedCost
         const costIsEstimated = recordedCost === null
 
         result = {
@@ -419,7 +408,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
           cachedInputTokens: cacheReadTokens,
           reasoningTokens,
           webSearchRequests: 0,
-          costUSD,
+          ...(recordedCost !== null
+            ? { costUSD: recordedCost, costBasis: 'measured' as const }
+            : { costBasis: 'estimated' as const }),
           costIsEstimated,
           tools,
           bashCommands,

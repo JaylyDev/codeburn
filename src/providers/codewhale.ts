@@ -4,7 +4,7 @@ import { join } from 'path'
 
 import { extractBashCommands } from '../bash-utils.js'
 import { readSessionFile } from '../fs-utils.js'
-import { calculateCost, getShortModelName } from '../models.js'
+import { getShortModelName } from '../models.js'
 import type { ToolCall } from '../types.js'
 import type { ParsedProviderCall, Provider, SessionParser, SessionSource } from './types.js'
 
@@ -390,10 +390,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       const totalTokens = safeTokenCount(metadata.total_tokens)
       const model = metadata.model ?? metadata.model_provider ?? 'unknown'
       const localCost = reportedCost(metadata.cost)
-      const costUSD = localCost.exact
-        ? localCost.value
-        : calculateCost(model, totalTokens, 0, 0, 0, 0)
-      if (totalTokens === 0 && costUSD === 0) return
+      // Match the pre-lift guard exactly: it skipped zero-token sessions whose
+      // COMPUTED cost was 0 — which included an exact recorded cost of 0.
+      if (totalTokens === 0 && (!localCost.exact || localCost.value === 0)) return
 
       const deduplicationKey = `codewhale:${metadata.id}`
       if (seenKeys.has(deduplicationKey)) return
@@ -420,7 +419,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         cachedInputTokens: 0,
         reasoningTokens: 0,
         webSearchRequests,
-        costUSD,
+        ...(localCost.exact
+          ? { costUSD: localCost.value, costBasis: 'measured' as const }
+          : { costBasis: 'estimated' as const }),
         costIsEstimated: !localCost.exact,
         tools,
         bashCommands,
