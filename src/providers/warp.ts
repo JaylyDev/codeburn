@@ -2,7 +2,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 
 import { extractBashCommands } from '../bash-utils.js'
-import { calculateCost, getShortModelName } from '../models.js'
+import { getShortModelName } from '../models.js'
 import { blobToText, getSqliteLoadError, isSqliteAvailable, openDatabase, type SqliteDatabase } from '../sqlite.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ParsedProviderCall, Provider, SessionParser, SessionSource } from './types.js'
@@ -402,7 +402,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
             cachedInputTokens: 0,
             reasoningTokens: 0,
             webSearchRequests: 0,
-            costUSD: calculateCost(model, inputTokens, 0, 0, 0, 0),
+            costBasis: 'estimated',
             costIsEstimated: true,
             tools: exchangeTools.tools,
             bashCommands: exchangeTools.bashCommands,
