@@ -5,6 +5,7 @@ import { tmpdir } from 'os'
 import { createRequire } from 'node:module'
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import { isSqliteAvailable } from '../../src/sqlite.js'
 import { createCrushProvider } from '../../src/providers/crush.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
@@ -123,7 +124,7 @@ async function writeRegistry(globalDataDir: string, entries: Record<string, { pa
 
 async function collect(parser: { parse(): AsyncGenerator<ParsedProviderCall> }): Promise<ParsedProviderCall[]> {
   const out: ParsedProviderCall[] = []
-  for await (const call of parser.parse()) out.push(call)
+  for await (const call of parser.parse()) out.push(priceProviderCall(call))
   return out
 }
 

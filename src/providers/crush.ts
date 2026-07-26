@@ -2,7 +2,6 @@ import { readFile } from 'fs/promises'
 import { join, resolve } from 'path'
 import { homedir, platform } from 'os'
 
-import { calculateCost } from '../models.js'
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, type SqliteDatabase } from '../sqlite.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
@@ -165,10 +164,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
         const model = dominantModel(db, sessionId)
         // Crush already records cost in dollars; trust it. Fall back to
-        // pricing-table calculation only when the row is missing a cost.
-        const costUSD = cost > 0
-          ? cost
-          : calculateCost(model, inputTokens, outputTokens, 0, 0, 0)
+        // host-side pricing-table calculation only when the row is missing a cost.
 
         yield {
           provider: 'crush',
@@ -180,7 +176,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           cachedInputTokens: 0,
           reasoningTokens: 0,
           webSearchRequests: 0,
-          costUSD,
+          ...(cost > 0
+            ? { costUSD: cost, costBasis: 'measured' as const }
+            : { costBasis: 'estimated' as const }),
           tools: [],
           bashCommands: [],
           timestamp: epochSecondsToIso(session.updated_at ?? session.created_at),

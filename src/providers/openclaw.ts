@@ -3,7 +3,6 @@ import { basename, join } from 'path'
 import { homedir } from 'os'
 
 import { readSessionFile } from '../fs-utils.js'
-import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
@@ -172,9 +171,6 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
         const u = call.usage
         const costFromProvider = u.cost?.total ?? 0
-        const costUSD = costFromProvider > 0
-          ? costFromProvider
-          : calculateCost(call.model, u.input, u.output, u.cacheWrite, u.cacheRead, 0)
 
         const ts = new Date(call.timestamp)
         if (isNaN(ts.getTime()) || ts.getTime() < 1_000_000_000_000) continue
@@ -189,7 +185,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           cachedInputTokens: u.cacheRead,
           reasoningTokens: 0,
           webSearchRequests: 0,
-          costUSD,
+          ...(costFromProvider > 0
+            ? { costUSD: costFromProvider, costBasis: 'measured' as const }
+            : { costBasis: 'estimated' as const }),
           tools: [...new Set(call.tools)],
           bashCommands: [...new Set(call.bashCommands)],
           timestamp: ts.toISOString(),
