@@ -18,6 +18,8 @@ import {
   toObservations,
 } from '../src/providers/claude/index.js'
 import type { JournalEntry, ToolResultMeta } from '../src/providers/claude/index.js'
+import { decodeCodex, toObservations as toCodexObservations } from '../src/providers/codex/index.js'
+import type { DecodeContext } from '../src/contracts.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const goldenEnvelope = JSON.parse(
@@ -193,6 +195,66 @@ describe('content-smuggling guardrail: real claude decode -> toObservations is s
 
   it('drops non-canonical (argument-carrying) tool names instead of emitting them', () => {
     const env = buildEnvelope()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toContain('Bash')
+    expect(allToolNames).toContain('Read')
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+})
+
+describe('content-smuggling guardrail: real codex decode -> toObservations is secret-free', () => {
+  // A hostile Codex rollout planting every secret in the free-text fields a real
+  // decode captures: the cwd (project path), the user prompt, an exec command,
+  // and an edited file path — plus a tool NAME carrying a command line. Decoding
+  // it fully and minimizing MUST surface none of them.
+  const codexContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'codex', sourceRef: 'ref' }
+
+  function decodeAndMinimize() {
+    const records = [
+      JSON.stringify({
+        type: 'session_meta',
+        timestamp: '2026-07-17T10:00:00.000Z',
+        payload: { cwd: SECRETS.absPath, originator: 'codex-cli', session_id: 'sess-hostile', model: 'gpt-5.3-codex' },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        timestamp: '2026-07-17T10:00:01.000Z',
+        payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}` }] },
+      }),
+      // A shell exec whose command carries a secret, plus a read whose path is the
+      // secret absolute path — both land in the toolSequence a real decode keeps.
+      JSON.stringify({ type: 'response_item', timestamp: '2026-07-17T10:00:02.000Z', payload: { type: 'function_call', name: 'exec_command', arguments: JSON.stringify({ command: SECRETS.commandLine }) } }),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-07-17T10:00:03.000Z', payload: { type: 'function_call', name: 'read_file', arguments: JSON.stringify({ file_path: SECRETS.absPath }) } }),
+      // A hostile tool NAME carrying a command line (spaces + slashes): it fails
+      // the canonical charset and must be dropped, not emitted.
+      JSON.stringify({ type: 'response_item', timestamp: '2026-07-17T10:00:04.000Z', payload: { type: 'function_call', name: SECRETS.commandLine } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-07-17T10:00:05.000Z', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 500, output_tokens: 200, total_tokens: 700 }, total_token_usage: { total_tokens: 700 } } } }),
+    ]
+    const { calls } = decodeCodex({ records, context: codexContext })
+    const { sessions } = toCodexObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'codex' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile rollout', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('keeps canonical tool names (Bash/Read) and drops the argument-carrying name', () => {
+    const env = decodeAndMinimize()
     const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
     expect(allToolNames).toContain('Bash')
     expect(allToolNames).toContain('Read')

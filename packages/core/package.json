@@ -34,6 +34,10 @@
     "./providers/claude": {
       "types": "./dist/providers/claude/index.d.ts",
       "import": "./dist/providers/claude/index.js"
+    },
+    "./providers/codex": {
+      "types": "./dist/providers/codex/index.d.ts",
+      "import": "./dist/providers/codex/index.js"
     }
   },
   "files": [
