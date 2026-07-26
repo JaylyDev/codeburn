@@ -4,7 +4,6 @@ import { readdir, readFile, stat } from 'fs/promises'
 import { join, basename } from 'path'
 import { homedir } from 'os'
 
-import { calculateCost } from '../models.js'
 import { openDatabase, type SqliteDatabase } from '../sqlite.js'
 import { normalizeContentBlocks } from '../content-utils.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
@@ -457,15 +456,6 @@ function createParser(
           if (seenKeys.has(deduplicationKey)) continue
           seenKeys.add(deduplicationKey)
 
-          const costUSD = calculateCost(
-            costModel(model),
-            inputTokens,
-            outputTokens + reasoningTokens,
-            0,
-            0,
-            0,
-          )
-
           yield {
             provider: 'cursor-agent',
             model,
@@ -476,7 +466,7 @@ function createParser(
             cachedInputTokens: 0,
             reasoningTokens,
             webSearchRequests: 0,
-            costUSD,
+            costBasis: 'estimated',
             tools: turn.assistant.tools,
             bashCommands: [],
             timestamp,
