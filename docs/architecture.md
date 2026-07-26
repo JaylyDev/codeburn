@@ -26,9 +26,9 @@ CodeBurn is one Node.js CLI plus two GUI clients that shell out to it.
 
 The macOS menubar (`mac/`) and the GNOME extension (`gnome/`) both invoke `codeburn status --format menubar-json --period <p>` and parse the JSON. They do not share code with the CLI; they only depend on its output contract.
 
-## CLI (`src/`)
+## CLI (`packages/cli/src/`)
 
-`src/cli.ts` is the Commander.js entry point. The bin field in `package.json` points at `dist/cli.js`. Twelve commands are registered:
+`packages/cli/src/cli.ts` is the Commander.js entry point. The bin field in `packages/cli/package.json` points at `dist/cli.js`. Twelve commands are registered:
 
 | Command | Line | Purpose |
 |---|---|---|
@@ -170,10 +170,10 @@ Plain JavaScript, no bundler. Targets GNOME Shell 45-50 (`metadata.json`).
 
 `npm run build` is two steps:
 
-1. `node scripts/bundle-litellm.mjs` fetches the latest litellm pricing JSON and writes `src/data/litellm-snapshot.json`. The bundle script keeps a manual override for MiniMax variants. Direct (un-prefixed) entries win over prefixed ones. The result is checked in so the build is reproducible.
-2. `tsup` reads `tsup.config.ts` and emits a single ESM bundle at `dist/cli.js` with a Node shebang banner. No source maps in publish builds; sourcemaps on for development.
+1. `node ../../scripts/bundle-litellm.mjs` fetches the latest litellm pricing JSON and writes `packages/cli/src/data/litellm-snapshot.json`. The bundle script keeps a manual override for MiniMax variants. Direct (un-prefixed) entries win over prefixed ones. The result is checked in so the build is reproducible.
+2. `tsup` reads `packages/cli/tsup.config.ts` and emits a single ESM bundle at `packages/cli/dist/cli.js` with a Node shebang banner. No source maps in publish builds; sourcemaps on for development.
 
-The `prepublishOnly` hook in `package.json` runs `npm run build` so `npm publish` always ships fresh code.
+The `prepublishOnly` hook in `packages/cli/package.json` runs `npm run build` so `npm publish -w codeburn` always ships fresh code.
 
 ## Tests
 

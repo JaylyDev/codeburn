@@ -6,7 +6,9 @@ on:
     paths:
       - .github/workflows/build-windows-store.yml
       - app/**
-      - src/**
+      - packages/cli/**
+      - dash/**
+      - scripts/**
       - package.json
       - package-lock.json
 

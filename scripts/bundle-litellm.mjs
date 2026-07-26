@@ -22,7 +22,7 @@ const MODELS_DEV_URL = 'https://models.dev/api.json'
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/models'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const dataDir = join(__dirname, '..', 'src', 'data')
+const dataDir = join(__dirname, '..', 'packages', 'cli', 'src', 'data')
 const snapshotPath = join(dataDir, 'litellm-snapshot.json')
 const fallbackPath = join(dataDir, 'pricing-fallback.json')
 

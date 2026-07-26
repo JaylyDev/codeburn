@@ -13,7 +13,7 @@ export default defineConfig({
     alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
   },
   build: {
-    outDir: '../dist/dash',
+    outDir: '../packages/cli/dist/dash',
     emptyOutDir: true,
   },
   server: {

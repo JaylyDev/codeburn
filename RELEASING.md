@@ -26,15 +26,15 @@ npm run build
 
 ### 1. Update the Version
 
-Edit `package.json` to bump the version number. Update both the `version` field at the top and the `package-lock.json` lockfile to match (npm handles this automatically):
+The published CLI is the `codeburn` workspace at `packages/cli`. Edit `packages/cli/package.json` to bump the `version`; the root `package-lock.json` tracks it (npm handles this automatically):
 
 ```bash
-npm version <version>
+npm version <version> -w codeburn
 ```
 
-For example, `npm version 0.9.8` updates both files and creates a commit.
+For example, `npm version 0.9.8 -w codeburn` updates the workspace package and the lockfile.
 
-Alternatively, edit `package.json` by hand and run `npm install` to regenerate the lockfile with the new version.
+Alternatively, edit `packages/cli/package.json` by hand and run `npm install` to regenerate the lockfile with the new version.
 
 ### 2. Update the Changelog
 
@@ -57,19 +57,19 @@ Edit `CHANGELOG.md`. Move all changes from the "Unreleased" section into a new s
 Commit these changes:
 
 ```bash
-git add CHANGELOG.md package.json package-lock.json
+git add CHANGELOG.md packages/cli/package.json package-lock.json
 git commit -m "chore: bump to 0.9.8"
 ```
 
 ### 3. Publish to npm
 
-There is no GitHub Actions workflow for the CLI; the maintainer runs `npm publish` from a clean working tree:
+There is no GitHub Actions workflow for the CLI; the maintainer publishes the `codeburn` workspace from a clean working tree:
 
 ```bash
-npm publish
+npm publish -w codeburn
 ```
 
-The `prepublishOnly` script in `package.json` runs `npm run build` first, which bundles the litellm pricing snapshot and then runs `tsup` to emit `dist/cli.js`.
+The `prepublishOnly` script in `packages/cli/package.json` runs `npm run build` first, which bundles the litellm pricing snapshot and then runs `tsup` to emit `packages/cli/dist/cli.js`.
 
 If publishing for the first time on a new machine, run `npm login` first.
 

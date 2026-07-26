@@ -18,7 +18,9 @@ cd codeburn
 npm install
 ```
 
-There is no separate build step required to run the dev CLI. `npm run dev` runs `tsx` against `src/cli.ts` directly.
+This is an npm-workspaces monorepo: the published CLI lives in `packages/cli`, and `@codeburn/core` (a skeleton today) in `packages/core`. Run the root scripts (`npm test`, `npm run build`, `npm run dev`) from the repo root — they forward to the `codeburn` workspace.
+
+There is no separate build step required to run the dev CLI. `npm run dev` runs `tsx` against `packages/cli/src/cli.ts` directly.
 
 ## Common Commands
 
@@ -26,8 +28,8 @@ There is no separate build step required to run the dev CLI. `npm run dev` runs 
 |---|---|
 | `npm test` | Runs the vitest suite (42 test files, 568 tests). |
 | `npm run dev -- status` | Runs the CLI in dev mode against your real data. |
-| `npm run build` | Bundles the litellm pricing snapshot, then runs `tsup` to produce `dist/cli.js`. |
-| `npm run bundle-litellm` | Refreshes `src/data/litellm-snapshot.json` from the upstream litellm repo. |
+| `npm run build` | Bundles the litellm pricing snapshot, then runs `tsup` to produce `packages/cli/dist/cli.js`. |
+| `npm run bundle-litellm` | Refreshes `packages/cli/src/data/litellm-snapshot.json` from the upstream litellm repo. |
 
 To test a specific suite, pass a path:
 
@@ -45,13 +47,16 @@ npm test -- tests/providers/codex.test.ts
 ## Project Layout
 
 ```
-src/                CLI, parsers, optimize detectors, cache layers
-src/providers/      One file per AI tool integration
-src/data/           Bundled litellm pricing snapshot
-tests/              vitest specs
-mac/                Swift menubar app
-gnome/              GNOME shell extension
-scripts/            Build helpers (litellm bundle)
+packages/cli/           The published `codeburn` CLI (npm workspace)
+packages/cli/src/       CLI, parsers, optimize detectors, cache layers
+packages/cli/src/providers/  One file per AI tool integration
+packages/cli/src/data/  Bundled litellm pricing snapshot
+packages/cli/tests/     vitest specs
+packages/core/          @codeburn/core — shared provider-agnostic core (skeleton)
+dash/                   React web dashboard (built into packages/cli/dist/dash)
+mac/                    Swift menubar app
+gnome/                  GNOME shell extension
+scripts/                Build helpers (litellm bundle)
 ```
 
 See `docs/architecture.md` for a fuller map.
@@ -59,7 +64,7 @@ See `docs/architecture.md` for a fuller map.
 ## Coding Conventions
 
 - TypeScript strict mode is on. Do not introduce `any` without a comment explaining why.
-- Avoid bracket-assign (`obj[key] = value`) on parsed user input in hot paths inside `src/providers/` and `src/parser.ts`. There is a Semgrep rule (`.semgrep/rules/no-bracket-assign-hot-paths.yml`) enforced in CI that will fail your PR if you do. Use a `Map` or an explicit allowlist instead.
+- Avoid bracket-assign (`obj[key] = value`) on parsed user input in hot paths inside `packages/cli/src/providers/` and `packages/cli/src/parser.ts`. There is a Semgrep rule (`.semgrep/rules/no-bracket-assign-hot-paths.yml`) enforced in CI that will fail your PR if you do. Use a `Map` or an explicit allowlist instead.
 - Provider parsers must be deterministic given the same input. If you read the system clock or the filesystem outside the documented session paths, add a fixture-based test.
 - New providers go through `src/providers/index.ts`. Lazy-load anything that pulls a heavy native dependency (sqlite, protobuf) so users without that provider are not slowed down.
 
