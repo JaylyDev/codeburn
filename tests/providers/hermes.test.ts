@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { calculateCost } from '../../src/models.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import { createHermesProvider } from '../../src/providers/hermes.js'
 import { isSqliteAvailable } from '../../src/sqlite.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
@@ -190,7 +191,7 @@ async function collectCalls(hermesHome: string, sourcePath: string): Promise<Par
   const provider = createHermesProvider(hermesHome)
   const calls: ParsedProviderCall[] = []
   for await (const call of provider.createSessionParser({ path: sourcePath, project: 'hermes', provider: 'hermes' }, new Set()).parse()) {
-    calls.push(call)
+    calls.push(priceProviderCall(call))
   }
   return calls
 }

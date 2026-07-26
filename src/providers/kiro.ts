@@ -5,7 +5,6 @@ import { basename, dirname, extname, join } from 'path'
 import { homedir } from 'os'
 
 import { readSessionFile } from '../fs-utils.js'
-import { calculateCost } from '../models.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ToolCall } from '../types.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
@@ -227,7 +226,6 @@ function parseChatFile(data: KiroChatFile, sessionId: string, project: string, s
 
   const outputTokens = estimateTokensFromChars(totalOutputChars)
   const inputTokens = estimateTokensFromChars(pendingUserMessage.length)
-  const costUSD = calculateCost(modelId, inputTokens, outputTokens, 0, 0, 0)
   const tsDate = parseKiroTimestamp(metadata.startTime)
   if (!tsDate) return results
   const timestamp = tsDate.toISOString()
@@ -243,7 +241,7 @@ function parseChatFile(data: KiroChatFile, sessionId: string, project: string, s
     cachedInputTokens: 0,
     reasoningTokens: 0,
     webSearchRequests: 0,
-    costUSD,
+    costBasis: 'estimated',
     costIsEstimated: true,
     tools: [...new Set(allTools)],
     bashCommands: [],
@@ -377,9 +375,6 @@ function parseModernExecution(data: KiroModernExecution, sourcePath: string, see
   // Prefer real metered credits at the public overage rate; fall back to
   // token-estimated pricing when the execution has no usage data — same
   // contract as the CLI and v2 parsers.
-  const costUSD = executionCredits > 0
-    ? executionCredits * USD_PER_KIRO_CREDIT
-    : calculateCost(modelId, inputTokens, outputTokens, 0, 0, 0)
   seenKeys.add(dedupKey)
 
   results.push({
@@ -392,7 +387,9 @@ function parseModernExecution(data: KiroModernExecution, sourcePath: string, see
     cachedInputTokens: 0,
     reasoningTokens: 0,
     webSearchRequests: 0,
-    costUSD,
+    ...(executionCredits > 0
+      ? { costUSD: executionCredits * USD_PER_KIRO_CREDIT, costBasis: 'measured' as const }
+      : { costBasis: 'estimated' as const }),
     costIsEstimated: executionCredits === 0,
     tools: [...new Set(allTools)],
     bashCommands: [],
@@ -473,9 +470,6 @@ function parseCliSession(meta: KiroCliSessionMeta, entries: KiroCliEntry[], seen
     const turnCredits = turnMeta?.metering_usage
       ? turnMeta.metering_usage.reduce((sum, m) => sum + m.value, 0)
       : 0
-    const costUSD = turnCredits > 0
-      ? turnCredits * USD_PER_KIRO_CREDIT
-      : calculateCost(modelId, inputTokens, outputTokens, 0, 0, 0)
     seenKeys.add(dedupKey)
 
     results.push({
@@ -488,7 +482,9 @@ function parseCliSession(meta: KiroCliSessionMeta, entries: KiroCliEntry[], seen
       cachedInputTokens: 0,
       reasoningTokens: 0,
       webSearchRequests: 0,
-      costUSD,
+      ...(turnCredits > 0
+        ? { costUSD: turnCredits * USD_PER_KIRO_CREDIT, costBasis: 'measured' as const }
+        : { costBasis: 'estimated' as const }),
       costIsEstimated: turnCredits === 0,
       tools: [...new Set(allTools)],
       bashCommands: [],
@@ -633,7 +629,6 @@ async function parseWorkspaceSession(record: Record<string, unknown>, source: Se
 
   const inputTokens = estimateTokensFromChars(inputChars)
   const outputTokens = estimateTokensFromChars(outputChars)
-  const costUSD = calculateCost(modelId, inputTokens, outputTokens, 0, 0, 0)
 
   results.push({
     provider: 'kiro',
@@ -645,7 +640,7 @@ async function parseWorkspaceSession(record: Record<string, unknown>, source: Se
     cachedInputTokens: 0,
     reasoningTokens: 0,
     webSearchRequests: 0,
-    costUSD,
+    costBasis: 'estimated',
     costIsEstimated: true,
     tools: [...new Set(allTools)],
     bashCommands: [],
@@ -743,9 +738,6 @@ async function parseV2Session(source: SessionSource, seenKeys: Set<string>): Pro
         // no usage_summary (e.g. still in progress or null usage). Reasoning
         // text is billed as output, so combine it for pricing only (same as
         // the codex provider).
-        const costUSD = turnCredits > 0
-          ? turnCredits * USD_PER_KIRO_CREDIT
-          : calculateCost(modelId, inputTokens, outputTokens + reasoningTokens, 0, 0, 0)
         results.push({
           provider: 'kiro',
           model: modelId,
@@ -756,7 +748,9 @@ async function parseV2Session(source: SessionSource, seenKeys: Set<string>): Pro
           cachedInputTokens: 0,
           reasoningTokens,
           webSearchRequests: 0,
-          costUSD,
+          ...(turnCredits > 0
+            ? { costUSD: turnCredits * USD_PER_KIRO_CREDIT, costBasis: 'measured' as const }
+            : { costBasis: 'estimated' as const }),
           costIsEstimated: turnCredits === 0,
           tools: [...new Set(tools)],
           bashCommands: [],

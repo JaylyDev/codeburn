@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir, homedir } from 'os'
 
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import { kiro, createKiroProvider } from '../../src/providers/kiro.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
@@ -99,7 +100,7 @@ describe('kiro provider - chat file parsing', () => {
 
     const source = { path: chatPath, project: 'myproject', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     const call = calls[0]!
@@ -123,7 +124,7 @@ describe('kiro provider - chat file parsing', () => {
 
     const source = { path: chatPath, project: 'test', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.model).toBe('kiro-auto')
@@ -158,7 +159,7 @@ describe('kiro provider - chat file parsing', () => {
 
     const source = { path: chatPath, project: 'test', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(0)
   })
@@ -174,10 +175,10 @@ describe('kiro provider - chat file parsing', () => {
     const seenKeys = new Set<string>()
 
     const calls1: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, seenKeys).parse()) calls1.push(call)
+    for await (const call of kiro.createSessionParser(source, seenKeys).parse()) calls1.push(priceProviderCall(call))
 
     const calls2: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, seenKeys).parse()) calls2.push(call)
+    for await (const call of kiro.createSessionParser(source, seenKeys).parse()) calls2.push(priceProviderCall(call))
 
     expect(calls1).toHaveLength(1)
     expect(calls2).toHaveLength(0)
@@ -186,7 +187,7 @@ describe('kiro provider - chat file parsing', () => {
   it('returns empty for missing file', async () => {
     const source = { path: '/nonexistent/test.chat', project: 'test', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
     expect(calls).toHaveLength(0)
   })
 
@@ -199,7 +200,7 @@ describe('kiro provider - chat file parsing', () => {
 
     const source = { path: chatPath, project: 'test', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
     expect(calls).toHaveLength(0)
   })
 
@@ -213,7 +214,7 @@ describe('kiro provider - chat file parsing', () => {
 
     const source = { path: chatPath, project: 'test', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.outputTokens).toBe(109)
@@ -231,7 +232,7 @@ describe('kiro provider - chat file parsing', () => {
 
     const source = { path: chatPath, project: 'test', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.model).toBe('claude-haiku-4-5')
@@ -250,7 +251,7 @@ describe('kiro provider - chat file parsing', () => {
 
     const source = { path: chatPath, project: 'test', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.sessionId).toBe('my-workflow-id')
@@ -272,7 +273,7 @@ describe('kiro provider - chat file parsing', () => {
 
     const source = { path: executionPath, project: 'test', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     const call = calls[0]!
@@ -303,7 +304,7 @@ describe('kiro provider - chat file parsing', () => {
 
     const source = { path: indexPath, project: 'test', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(0)
   })
@@ -325,7 +326,7 @@ describe('kiro provider - chat file parsing', () => {
 
     const source = { path: executionPath, project: 'test', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.model).toBe('kiro-auto')
@@ -345,7 +346,7 @@ describe('kiro provider - chat file parsing', () => {
 
     const source = { path: executionPath, project: 'test', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.timestamp).toBe('2026-04-27T23:36:40.000Z')
@@ -363,7 +364,7 @@ describe('kiro provider - chat file parsing', () => {
 
     const source = { path: executionPath, project: 'test', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.timestamp).toBe('2026-04-27T23:36:40.000Z')
@@ -421,7 +422,7 @@ describe('kiro provider - chat file parsing', () => {
 
     const source = { path: executionPath, project: 'test', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.userMessage).toBe(`request from ${key}`)
@@ -448,7 +449,7 @@ describe('kiro provider - chat file parsing', () => {
 
     const source = { path: executionPath, project: 'test', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.tools).toEqual(['Bash'])
@@ -474,7 +475,7 @@ describe('kiro provider - chat file parsing', () => {
 
     const source = { path: executionPath, project: 'test', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.tools).toEqual(['Edit'])
@@ -677,7 +678,7 @@ describe('kiro provider - CLI session discovery', () => {
 
     const source = { path: join(cliDir, `${sessionId}.jsonl`), project: 'test-project', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     const call = calls[0]!
@@ -719,7 +720,7 @@ describe('kiro provider - CLI session discovery', () => {
 
     const source = { path: join(cliDir, `${sessionId}.jsonl`), project: 'multi', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(2)
     expect(calls[0]!.userMessage).toBe('first question')
@@ -749,7 +750,7 @@ describe('kiro provider - CLI session discovery', () => {
 
     const source = { path: join(cliDir, `${sessionId}.jsonl`), project: 'test-project', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     // Token-priced at the session's real model, not $0 — same fallback
@@ -783,7 +784,7 @@ describe('kiro provider - CLI session discovery', () => {
 
     const source = { path: join(cliDir, `${sessionId}.jsonl`), project: 'test-project', provider: 'kiro' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of kiro.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.costIsEstimated).toBe(true)
@@ -839,7 +840,7 @@ describe('kiro provider - context.messages with entries', () => {
     const calls: ParsedProviderCall[] = []
     for (const source of sessions) {
       for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-        calls.push(call)
+        calls.push(priceProviderCall(call))
       }
     }
 
@@ -879,7 +880,7 @@ describe('kiro provider - context.messages with entries', () => {
     const calls: ParsedProviderCall[] = []
     for (const source of sessions) {
       for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-        calls.push(call)
+        calls.push(priceProviderCall(call))
       }
     }
 
@@ -919,7 +920,7 @@ describe('kiro provider - context.messages with entries', () => {
     const calls: ParsedProviderCall[] = []
     for (const source of sessions) {
       for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-        calls.push(call)
+        calls.push(priceProviderCall(call))
       }
     }
 
@@ -947,7 +948,7 @@ describe('kiro provider - context.messages with entries', () => {
     const calls: ParsedProviderCall[] = []
     for (const source of sessions) {
       for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-        calls.push(call)
+        calls.push(priceProviderCall(call))
       }
     }
 
@@ -996,7 +997,7 @@ describe('kiro provider - workspace-sessions format', () => {
     const calls: ParsedProviderCall[] = []
     for (const source of wsSessions) {
       for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-        calls.push(call)
+        calls.push(priceProviderCall(call))
       }
     }
 
@@ -1032,7 +1033,7 @@ describe('kiro provider - workspace-sessions format', () => {
     const calls: ParsedProviderCall[] = []
     for (const source of sessions) {
       for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-        calls.push(call)
+        calls.push(priceProviderCall(call))
       }
     }
 
@@ -1139,7 +1140,7 @@ describe('kiro provider - v2 sess_ format', () => {
 
     const calls: ParsedProviderCall[] = []
     for (const source of v2) {
-      for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+      for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(2)
@@ -1173,7 +1174,7 @@ describe('kiro provider - v2 sess_ format', () => {
     const sources = await provider.discoverSessions()
     const calls: ParsedProviderCall[] = []
     for (const source of sources) {
-      for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+      for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(2)
@@ -1199,7 +1200,7 @@ describe('kiro provider - v2 sess_ format', () => {
     const sources = await provider.discoverSessions()
     const calls: ParsedProviderCall[] = []
     for (const source of sources) {
-      for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+      for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(2)
@@ -1218,7 +1219,7 @@ describe('kiro provider - v2 sess_ format', () => {
     const sources = await provider.discoverSessions()
     const calls: ParsedProviderCall[] = []
     for (const source of sources) {
-      for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+      for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(1)
@@ -1325,7 +1326,7 @@ describe('kiro provider - mixed-format coexistence (legacy + v1 + workspace-sess
     const seenKeys = new Set<string>()
     const calls: ParsedProviderCall[] = []
     for (const source of sources) {
-      for await (const call of provider.createSessionParser(source, seenKeys).parse()) calls.push(call)
+      for await (const call of provider.createSessionParser(source, seenKeys).parse()) calls.push(priceProviderCall(call))
     }
     return calls
   }
