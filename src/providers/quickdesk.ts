@@ -2,7 +2,6 @@ import { readdir, readFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, join, resolve } from 'node:path'
 
-import { calculateCost } from '../models.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import { blobToText, isSqliteAvailable, openDatabase } from '../sqlite.js'
 import type { SqliteDatabase } from '../sqlite.js'
@@ -468,7 +467,11 @@ function createMetricsParser(source: SessionSource, seenKeys: Set<string>): Sess
           model,
           inputTokens,
           outputTokens,
-          costUSD: recordedCost ?? calculateCost(model, inputTokens, outputTokens, 0, 0, 0),
+          // Provider-reported cost passes through as 'measured'; otherwise the
+          // pricing pass computes it from the token buckets ('estimated').
+          ...(recordedCost !== undefined
+            ? { costUSD: recordedCost, costBasis: 'measured' as const }
+            : { costBasis: 'estimated' as const }),
           costIsEstimated,
           tools,
           timestamp,
@@ -510,7 +513,7 @@ function createDatabaseParser(source: SessionSource, seenKeys: Set<string>): Ses
           model,
           inputTokens,
           outputTokens,
-          costUSD: calculateCost(model, inputTokens, outputTokens, 0, 0, 0),
+          costBasis: 'estimated',
           costIsEstimated: true,
           tools: metadata.tools,
           timestamp,

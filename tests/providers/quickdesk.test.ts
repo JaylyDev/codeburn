@@ -5,6 +5,7 @@ import { join } from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { calculateCost, getShortModelName } from '../../src/models.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import { providers } from '../../src/providers/index.js'
 import { quickdesk } from '../../src/providers/quickdesk.js'
 import { isSqliteAvailable } from '../../src/sqlite.js'
@@ -99,7 +100,7 @@ async function collectCalls(sources: SessionSource[]): Promise<ParsedProviderCal
   const calls: ParsedProviderCall[] = []
   const seenKeys = new Set<string>()
   for (const source of sources) {
-    for await (const call of quickdesk.createSessionParser(source, seenKeys).parse()) calls.push(call)
+    for await (const call of quickdesk.createSessionParser(source, seenKeys).parse()) calls.push(priceProviderCall(call))
   }
   return calls
 }
