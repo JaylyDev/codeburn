@@ -39,9 +39,21 @@
       "types": "./dist/providers/claude/index.d.ts",
       "import": "./dist/providers/claude/index.js"
     },
+    "./providers/codewhale": {
+      "types": "./dist/providers/codewhale/index.d.ts",
+      "import": "./dist/providers/codewhale/index.js"
+    },
     "./providers/codex": {
       "types": "./dist/providers/codex/index.d.ts",
       "import": "./dist/providers/codex/index.js"
+    },
+    "./providers/grok": {
+      "types": "./dist/providers/grok/index.d.ts",
+      "import": "./dist/providers/grok/index.js"
+    },
+    "./providers/kimi": {
+      "types": "./dist/providers/kimi/index.d.ts",
+      "import": "./dist/providers/kimi/index.js"
     },
     "./providers/qwen": {
       "types": "./dist/providers/qwen/index.d.ts",
