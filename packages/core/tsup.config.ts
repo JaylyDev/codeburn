@@ -10,6 +10,7 @@ export default defineConfig({
     'src/diagnostics.ts',
     'src/fingerprint.ts',
     'src/contracts.ts',
+    'src/detectors/index.ts',
     'src/providers/claude/index.ts',
     'src/providers/codex/index.ts',
   ],

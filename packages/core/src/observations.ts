@@ -8,6 +8,7 @@ import {
   NonNegInt,
   NonNegUSD,
   OBSERVATION_SCHEMA_VERSION,
+  ResourceRef,
   Speed,
   TokenBuckets,
 } from './schema.js'
@@ -43,6 +44,14 @@ export const CallObservation = z
     /** Canonical tool names only — never arguments. */
     toolNames: z.array(CanonicalToolName),
     turnIndex: NonNegInt,
+
+    // Resource refs (schema 0.2.0): the fingerprinted files this call read /
+    // edited. Populated from the host's rich decode; each entry is an opaque
+    // fingerprint + coarse class, never a raw path. `resourceReads` carries only
+    // whole-file reads (Read/FileReadTool); pattern tools (Grep/Glob) target no
+    // single file and contribute nothing here.
+    resourceReads: z.array(ResourceRef).optional(),
+    resourceEdits: z.array(ResourceRef).optional(),
 
     // Rich-capture numerics: first-class optional fields.
     locAdded: NonNegInt.optional(),

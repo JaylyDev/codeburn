@@ -40,8 +40,18 @@ export interface ResourceFingerprint {
   resourceId: string
 }
 
-const DEPENDENCY_SEGMENTS = new Set(['node_modules', 'vendor', '.venv', 'site-packages'])
-const BUILD_SEGMENTS = new Set(['dist', 'build', 'out', 'target', '.next'])
+// The dependency / build / vcs segment tables are the source of truth for what
+// the junk-reads detector treats as junk. They are kept a strict SUPERSET of the
+// CLI's legacy JUNK_DIRS regex: every directory that regex named classifies here
+// as junk too (the extras — 'venv', '__pycache__', 'coverage', '.cache',
+// '.nuxt', '.output', '.svn', '.hg' — are added below), plus vendor /
+// site-packages / out / target, which the old regex missed.
+const DEPENDENCY_SEGMENTS = new Set(['node_modules', 'vendor', '.venv', 'venv', 'site-packages'])
+const BUILD_SEGMENTS = new Set([
+  'dist', 'build', 'out', 'target', '.next', '.nuxt', '.output',
+  '__pycache__', 'coverage', '.cache',
+])
+const VCS_SEGMENTS = new Set(['.git', '.svn', '.hg'])
 const CONFIG_EXTENSIONS = new Set(['json', 'yaml', 'yml', 'toml'])
 const DOC_EXTENSIONS = new Set(['md', 'txt', 'rst'])
 const SOURCE_EXTENSIONS = new Set([
@@ -92,7 +102,7 @@ export function classifyResource(absolutePath: string): ResourceClass {
     if (BUILD_SEGMENTS.has(seg)) return 'build'
   }
   for (const seg of segments) {
-    if (seg === '.git') return 'vcs'
+    if (VCS_SEGMENTS.has(seg)) return 'vcs'
   }
 
   const basename = segments[segments.length - 1] ?? ''

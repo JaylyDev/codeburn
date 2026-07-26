@@ -8,6 +8,7 @@
 import { branchRef, projectRef, sessionRef } from '../../fingerprint.js'
 import type { RecordDiagnostic } from '../../diagnostics.js'
 import type { CallObservation, SessionObservation } from '../../observations.js'
+import { extractResourceRefs } from '../resource-refs.js'
 import type { DecodedCall, DecodedTurn } from './types.js'
 
 /** One session's rich decode, as the host holds it before minimization. */
@@ -34,7 +35,7 @@ export interface ToObservationsContext {
 // enforced at the source, so the output also survives strict schema parse.
 const CANONICAL_TOOL_NAME = /^[A-Za-z0-9_.-]{1,64}$/
 
-function toCallObservation(call: DecodedCall, turnIndex: number): CallObservation {
+function toCallObservation(call: DecodedCall, turnIndex: number, privacyKey: string): CallObservation {
   return {
     provider: call.provider,
     model: call.model,
@@ -59,6 +60,7 @@ function toCallObservation(call: DecodedCall, turnIndex: number): CallObservatio
     ...(call.interrupted !== undefined ? { interrupted: call.interrupted } : {}),
     ...(call.userModified !== undefined ? { userModified: call.userModified } : {}),
     ...(call.toolErrors !== undefined ? { toolErrors: call.toolErrors } : {}),
+    ...extractResourceRefs(privacyKey, call.toolSequence),
   }
 }
 
@@ -66,7 +68,7 @@ function toSessionObservation(decode: RichSessionDecode, ctx: ToObservationsCont
   const provider = ctx.provider ?? 'claude'
   const calls: CallObservation[] = []
   decode.turns.forEach((turn, turnIndex) => {
-    for (const call of turn.assistantCalls) calls.push(toCallObservation(call, turnIndex))
+    for (const call of turn.assistantCalls) calls.push(toCallObservation(call, turnIndex, ctx.privacyKey))
   })
 
   const timestamps = calls.map(c => c.timestamp).filter(t => t.length > 0).sort()

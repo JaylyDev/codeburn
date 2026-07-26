@@ -1,0 +1,280 @@
+{
+  "$ref": "#/definitions/ObservationEnvelope",
+  "definitions": {
+    "ObservationEnvelope": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "type": "string",
+          "const": "0.2.0"
+        },
+        "generator": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "const": "@codeburn/core"
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "name",
+            "version"
+          ],
+          "additionalProperties": false
+        },
+        "sessions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "sessionRef": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{16}$"
+              },
+              "projectRef": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{16}$"
+              },
+              "providerId": {
+                "type": "string",
+                "minLength": 1
+              },
+              "startedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "endedAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "gitBranchRef": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{16}$"
+              },
+              "isSidechain": {
+                "type": "boolean"
+              },
+              "calls": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "provider": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "model": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "pricingModel": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "tokens": {
+                      "type": "object",
+                      "properties": {
+                        "input": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "output": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "reasoning": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "cacheRead": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "cacheCreate": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      },
+                      "required": [
+                        "input",
+                        "output",
+                        "reasoning",
+                        "cacheRead",
+                        "cacheCreate"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "webSearchRequests": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "speed": {
+                      "type": "string",
+                      "enum": [
+                        "standard",
+                        "fast"
+                      ]
+                    },
+                    "costBasis": {
+                      "type": "string",
+                      "enum": [
+                        "measured",
+                        "estimated"
+                      ]
+                    },
+                    "measuredCostUSD": {
+                      "type": "number",
+                      "minimum": 0
+                    },
+                    "fallbackCostUSD": {
+                      "type": "number",
+                      "minimum": 0
+                    },
+                    "timestamp": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "dedupKey": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "toolNames": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64,
+                        "pattern": "^[A-Za-z0-9_.-]+$"
+                      }
+                    },
+                    "turnIndex": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "resourceReads": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "resourceId": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{16}$"
+                          },
+                          "resourceClass": {
+                            "type": "string",
+                            "enum": [
+                              "dependency",
+                              "build",
+                              "vcs",
+                              "config",
+                              "source",
+                              "doc",
+                              "other"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "resourceId",
+                          "resourceClass"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "resourceEdits": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "resourceId": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{16}$"
+                          },
+                          "resourceClass": {
+                            "type": "string",
+                            "enum": [
+                              "dependency",
+                              "build",
+                              "vcs",
+                              "config",
+                              "source",
+                              "doc",
+                              "other"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "resourceId",
+                          "resourceClass"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "locAdded": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "locRemoved": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "interrupted": {
+                      "type": "boolean"
+                    },
+                    "userModified": {
+                      "type": "boolean"
+                    },
+                    "toolErrors": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "editFailed": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "required": [
+                    "provider",
+                    "model",
+                    "tokens",
+                    "webSearchRequests",
+                    "speed",
+                    "costBasis",
+                    "timestamp",
+                    "dedupKey",
+                    "toolNames",
+                    "turnIndex"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "turnCount": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "sessionRef",
+              "projectRef",
+              "providerId",
+              "startedAt",
+              "calls",
+              "turnCount"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "generator",
+        "sessions"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "$schema": "http://json-schema.org/draft-07/schema#"
+}
