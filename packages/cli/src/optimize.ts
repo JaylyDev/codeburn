@@ -668,6 +668,17 @@ export function loadMcpConfigs(projectCwds: Iterable<string>, homeDir = homedir(
 // existing WasteFinding display shape. Display strings, fix payloads and trend
 // stay host-derived from the CLI's own path data (D5-A); the core Finding
 // supplies the decision and the authoritative counts.
+//
+// Reverse-map contract (D5-A): the resourceId fingerprints this bridge produces
+// are one-way (HMAC) and are NEVER inverted. The "reverse map" that turns a
+// finding back into a concrete path/basename is simply the raw ToolCall[] the
+// host already holds — re-iterated in each detector below to build the display,
+// fix and trend. That array lives in memory for the process only; the envelope
+// built here is a transient local, passed straight to the pure detector and
+// discarded — it is never assigned to a field, cached, serialized, or written to
+// any payload. No structure ever stores resourceId alongside its path, so the
+// fingerprint->path mapping cannot leak. Anything a payload needs must come from
+// this raw array, not from the core Finding.
 
 const READ_RESOURCE_TOOLS = new Set(['Read', 'FileReadTool'])
 const SESSION_KEY_SEP = ''
