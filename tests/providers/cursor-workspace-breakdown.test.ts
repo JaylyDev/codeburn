@@ -11,6 +11,7 @@ import {
   clearCursorWorkspaceMapCache,
 } from '../../src/providers/cursor.js'
 import { isSqliteAvailable } from '../../src/sqlite.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 const requireForTest = createRequire(import.meta.url)
@@ -105,7 +106,7 @@ function createWorkspaceDir(hash: string, folderUri: string, composerIds: string
 
 async function collect(parser: { parse(): AsyncGenerator<ParsedProviderCall> }): Promise<ParsedProviderCall[]> {
   const out: ParsedProviderCall[] = []
-  for await (const call of parser.parse()) out.push(call)
+  for await (const call of parser.parse()) out.push(priceProviderCall(call))
   return out
 }
 
