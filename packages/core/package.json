@@ -39,6 +39,10 @@
       "types": "./dist/providers/claude/index.d.ts",
       "import": "./dist/providers/claude/index.js"
     },
+    "./providers/codebuff": {
+      "types": "./dist/providers/codebuff/index.d.ts",
+      "import": "./dist/providers/codebuff/index.js"
+    },
     "./providers/codewhale": {
       "types": "./dist/providers/codewhale/index.d.ts",
       "import": "./dist/providers/codewhale/index.js"
@@ -70,6 +74,10 @@
     "./providers/mux": {
       "types": "./dist/providers/mux/index.d.ts",
       "import": "./dist/providers/mux/index.js"
+    },
+    "./providers/openclaw": {
+      "types": "./dist/providers/openclaw/index.d.ts",
+      "import": "./dist/providers/openclaw/index.js"
     },
     "./providers/open-design": {
       "types": "./dist/providers/open-design/index.d.ts",

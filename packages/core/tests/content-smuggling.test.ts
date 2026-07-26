@@ -23,6 +23,8 @@ import { decodeQwen, toObservations as toQwenObservations } from '../src/provide
 import { decodeGrok, toObservations as toGrokObservations } from '../src/providers/grok/index.js'
 import { decodeKimi, toObservations as toKimiObservations } from '../src/providers/kimi/index.js'
 import { decodeCodeWhale, toObservations as toCodeWhaleObservations } from '../src/providers/codewhale/index.js'
+import { decodeCodebuff, toObservations as toCodebuffObservations } from '../src/providers/codebuff/index.js'
+import { decodeOpenClaw, toObservations as toOpenClawObservations } from '../src/providers/openclaw/index.js'
 import type { DecodeContext } from '../src/contracts.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -574,6 +576,114 @@ describe('content-smuggling guardrail: real codewhale decode -> toObservations i
       expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
     }
     expect(allStrings([...reads, ...edits])).not.toContain(SECRETS.absPath)
+  })
+})
+
+describe('content-smuggling guardrail: real codebuff decode -> toObservations is secret-free', () => {
+  const codebuffContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'codebuff', sourceRef: '/data/manicode/projects/hostile/chats/2026-07-17T10-00-00.000Z' }
+
+  function decodeAndMinimize() {
+    const records = [
+      {
+        id: 'u1',
+        variant: 'user',
+        content: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}`,
+        timestamp: '2026-07-17T10:00:00.000Z',
+      },
+      {
+        id: 'a1',
+        variant: 'ai',
+        timestamp: '2026-07-17T10:00:05.000Z',
+        credits: 1,
+        blocks: [
+          { type: 'tool', toolName: 'run_terminal_command', input: { command: SECRETS.commandLine } },
+          // A hostile tool NAME carrying a command line: fails canonical charset.
+          { type: 'tool', toolName: SECRETS.commandLine, input: {} },
+        ],
+      },
+    ]
+    const { calls } = decodeCodebuff({ records, context: codebuffContext })
+    const { sessions } = toCodebuffObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'codebuff' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile chat', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('keeps canonical tool names (Bash) and drops the argument-carrying name', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toContain('Bash')
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+})
+
+describe('content-smuggling guardrail: real openclaw decode -> toObservations is secret-free', () => {
+  const openclawContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'openclaw', sourceRef: '/data/agents/hostile/sessions/sess-hostile.jsonl' }
+
+  function decodeAndMinimize() {
+    const records = [
+      JSON.stringify({ type: 'session', id: 'sess-hostile', timestamp: '2026-07-17T10:00:00.000Z' }),
+      JSON.stringify({
+        type: 'message', id: 'u1', timestamp: '2026-07-17T10:00:01.000Z',
+        message: { role: 'user', content: [{ type: 'text', text: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}` }] },
+      }),
+      JSON.stringify({
+        type: 'message', id: 'a1', timestamp: '2026-07-17T10:00:05.000Z',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'toolCall', name: 'exec', arguments: { command: SECRETS.commandLine } },
+            // A hostile tool NAME carrying a command line: fails canonical charset.
+            { type: 'toolCall', name: SECRETS.commandLine, arguments: {} },
+          ],
+          usage: { input: 500, output: 200, cacheRead: 0, cacheWrite: 0 },
+        },
+      }),
+    ]
+    const { calls } = decodeOpenClaw({ records, context: openclawContext })
+    const { sessions } = toOpenClawObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'openclaw' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile session', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('keeps canonical tool names (Bash) and drops the argument-carrying name', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toContain('Bash')
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
   })
 })
 
