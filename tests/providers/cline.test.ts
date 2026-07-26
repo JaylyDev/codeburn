@@ -4,6 +4,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 
 import { cline, createClineProvider } from '../../src/providers/cline.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
@@ -113,7 +114,7 @@ describe('cline provider - parsing', () => {
 
     const source = { path: taskDir, project: 'Cline', provider: 'cline' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of cline.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of cline.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.provider).toBe('cline')

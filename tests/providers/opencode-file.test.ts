@@ -5,6 +5,7 @@ import { tmpdir } from 'os'
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 
 import { createOpenCodeProvider } from '../../src/providers/opencode.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
@@ -67,7 +68,7 @@ async function parseAll(seen = new Set<string>()): Promise<ParsedProviderCall[]>
   const sources = await provider.discoverSessions()
   const calls: ParsedProviderCall[] = []
   for (const source of sources) {
-    for await (const call of provider.createSessionParser(source, seen).parse()) calls.push(call)
+    for await (const call of provider.createSessionParser(source, seen).parse()) calls.push(priceProviderCall(call))
   }
   return calls
 }
@@ -275,7 +276,7 @@ describe('opencode file-based provider - env override discovery', () => {
 
     const calls: ParsedProviderCall[] = []
     for (const source of sources) {
-      for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+      for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
     }
     expect(calls).toHaveLength(1)
     expect(calls[0]!.sessionId).toBe('ses_mimo')

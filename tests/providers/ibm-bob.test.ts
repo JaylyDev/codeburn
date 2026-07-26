@@ -4,6 +4,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 
 import { ibmBob, createIBMBobProvider } from '../../src/providers/ibm-bob.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
@@ -100,7 +101,7 @@ describe('ibm-bob provider - discovery and parsing', () => {
 
     const source = { path: taskDir, project: 'IBM Bob', provider: 'ibm-bob' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of ibmBob.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of ibmBob.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!).toMatchObject({
@@ -125,7 +126,7 @@ describe('ibm-bob provider - discovery and parsing', () => {
 
     const source = { path: taskDir, project: 'IBM Bob', provider: 'ibm-bob' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of ibmBob.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of ibmBob.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.model).toBe('ibm-bob-auto')

@@ -41,6 +41,13 @@ export type ParsedProviderCall = {
   // this model instead of `model`, so the decoder no longer needs the price
   // table. Absent for every provider whose display model IS its pricing model.
   pricingModel?: string
+  // Seam extension for the pricing pass: a provider-reported dollar/credit figure
+  // used ONLY as a fallback when the 'estimated' table price computes to 0 (the
+  // model is unpriced). Preserves the "table cost preferred, provider figure only
+  // for unknown models" precedence of codebuff credits and OpenCode/Cline session
+  // cost, which is the inverse of `measured` (a figure that always wins). Ignored
+  // unless costBasis is 'estimated'.
+  fallbackCostUSD?: number
   costIsEstimated?: boolean
   tools: string[]
   bashCommands: string[]

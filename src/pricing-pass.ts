@@ -28,7 +28,7 @@ export function priceProviderCall(call: ParsedProviderCall): ParsedProviderCall 
   // display `model` differs from the model the price table is keyed by, e.g.
   // antigravity's suffix-stripped / aliased id). Falls back to `model` for
   // every provider whose display model is already its pricing model.
-  const costUSD = calculateCost(
+  let costUSD = calculateCost(
     call.pricingModel ?? call.model,
     call.inputTokens,
     outputForCost,
@@ -37,5 +37,12 @@ export function priceProviderCall(call: ParsedProviderCall): ParsedProviderCall 
     call.webSearchRequests,
     call.speed,
   )
+  // Seam extension: some decoders prefer the table price but fall back to a
+  // provider-reported dollar/credit figure when the model is unpriced (cost is
+  // 0). This preserves codebuff's credit fallback and OpenCode/Cline's
+  // session-cost fallback exactly — the inverse of `measured`, which always wins.
+  if (costUSD === 0 && call.fallbackCostUSD !== undefined && call.fallbackCostUSD > 0) {
+    costUSD = call.fallbackCostUSD
+  }
   return { ...call, costUSD }
 }
