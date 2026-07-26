@@ -1,52 +1,14 @@
 import { readdir, stat } from 'fs/promises'
-import { basename, join } from 'path'
+import { join } from 'path'
 import { homedir } from 'os'
+
+import { decodeQwen, qwenToolNameMap } from '@codeburn/core/providers/qwen'
+import type { QwenDecodedCall } from '@codeburn/core/providers/qwen'
 
 import { readSessionFile } from '../fs-utils.js'
 import { extractBashCommands } from '../bash-utils.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
-
-const toolNameMap: Record<string, string> = {
-  read_file: 'Read',
-  write_to_file: 'Write',
-  edit_file: 'Edit',
-  execute_command: 'Bash',
-  search_files: 'Grep',
-  list_files: 'LS',
-  list_directory: 'LS',
-  browser_action: 'WebFetch',
-  web_search: 'WebSearch',
-  ask_followup_question: 'AskUser',
-  attempt_completion: 'Complete',
-}
-
-type QwenPart = {
-  text?: string
-  thought?: boolean
-  functionCall?: { name?: string; args?: Record<string, unknown> }
-  functionResponse?: unknown
-}
-
-type QwenEntry = {
-  uuid: string
-  sessionId: string
-  timestamp: string
-  type: string
-  subtype?: string
-  cwd?: string
-  model?: string
-  message?: {
-    role: string
-    parts: QwenPart[]
-  }
-  usageMetadata?: {
-    promptTokenCount: number
-    candidatesTokenCount: number
-    thoughtsTokenCount: number
-    totalTokenCount: number
-    cachedContentTokenCount: number
-  }
-}
+import { createBridgedProvider } from './bridge.js'
+import type { Provider, SessionSource, ParsedProviderCall } from './types.js'
 
 function getQwenProjectsDir(): string {
   return process.env['QWEN_DATA_DIR'] ?? join(homedir(), '.qwen', 'projects')
@@ -57,99 +19,38 @@ function projectNameFromDirName(dirName: string): string {
   return parts[parts.length - 1] || dirName
 }
 
-function extractTools(parts: QwenPart[]): { tools: string[]; bashCommands: string[] } {
-  const tools: string[] = []
-  const bashCommands: string[] = []
-
-  for (const part of parts) {
-    if (part.functionCall?.name) {
-      const mapped = toolNameMap[part.functionCall.name] ?? part.functionCall.name
-      tools.push(mapped)
-      if (mapped === 'Bash' && part.functionCall.args && typeof part.functionCall.args['command'] === 'string') {
-        bashCommands.push(...extractBashCommands(part.functionCall.args['command'] as string))
-      }
-    }
-  }
-
-  return { tools, bashCommands }
-}
-
-function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+// Map one rich, cost-free decoder call into the host's ParsedProviderCall. Cost
+// re-enters here: `costBasis: 'estimated'` marks the call so the parser.ts
+// pricing pass fills `costUSD` from the token buckets (byte-identical to the
+// pre-migration in-decoder `calculateCost`, retired in Phase 0). Bash base-name
+// extraction (and its `strip-ansi` dependency) stays CLI-side: the core decoder
+// carries the raw command strings; the host reduces them to base names here.
+function toProviderCall(rich: QwenDecodedCall): ParsedProviderCall {
   return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const raw = await readSessionFile(source.path)
-      if (raw === null) return
-
-      const lines = raw.split('\n').filter(l => l.trim())
-      let pendingUserMessage = ''
-
-      for (const line of lines) {
-        let entry: QwenEntry
-        try {
-          entry = JSON.parse(line)
-        } catch {
-          continue
-        }
-
-        if (entry.type === 'user' && entry.message) {
-          const texts = (entry.message.parts ?? [])
-            .filter(p => p.text && !p.thought)
-            .map(p => p.text!)
-          if (texts.length > 0) {
-            pendingUserMessage = texts.join(' ').slice(0, 500)
-          }
-          continue
-        }
-
-        if (entry.type !== 'assistant' || !entry.usageMetadata) continue
-
-        const usage = entry.usageMetadata
-        if (usage.promptTokenCount === 0 && usage.candidatesTokenCount === 0) continue
-
-        const dedupKey = `qwen:${entry.sessionId}:${entry.uuid}`
-        if (seenKeys.has(dedupKey)) continue
-        seenKeys.add(dedupKey)
-
-        const model = entry.model || 'qwen-auto'
-        const { tools, bashCommands } = extractTools(entry.message?.parts ?? [])
-
-        const inputTokens = usage.promptTokenCount
-        const outputTokens = usage.candidatesTokenCount
-        const reasoningTokens = usage.thoughtsTokenCount ?? 0
-        const cachedTokens = usage.cachedContentTokenCount ?? 0
-
-        yield {
-          provider: 'qwen',
-          model,
-          inputTokens,
-          outputTokens,
-          cacheCreationInputTokens: 0,
-          cacheReadInputTokens: cachedTokens,
-          cachedInputTokens: cachedTokens,
-          reasoningTokens,
-          webSearchRequests: 0,
-          // Priced host-side from these buckets: reasoning tokens are billed at
-          // the output rate and cachedTokens as cache-read (see pricing-pass.ts).
-          costBasis: 'estimated',
-          tools: [...new Set(tools)],
-          bashCommands: [...new Set(bashCommands)],
-          timestamp: entry.timestamp || '',
-          speed: 'standard',
-          deduplicationKey: dedupKey,
-          userMessage: pendingUserMessage,
-          sessionId: entry.sessionId,
-        }
-
-        pendingUserMessage = ''
-      }
-    },
+    provider: 'qwen',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    costBasis: 'estimated',
+    tools: rich.tools,
+    bashCommands: [...new Set(rich.rawBashCommands.flatMap(c => extractBashCommands(c)))],
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
   }
 }
 
 export function createQwenProvider(overrideDir?: string): Provider {
   const projectsDir = overrideDir ?? getQwenProjectsDir()
 
-  return {
+  return createBridgedProvider<QwenDecodedCall>({
     name: 'qwen',
     displayName: 'Qwen',
 
@@ -158,7 +59,7 @@ export function createQwenProvider(overrideDir?: string): Provider {
     },
 
     toolDisplayName(rawTool: string): string {
-      return toolNameMap[rawTool] ?? rawTool
+      return qwenToolNameMap[rawTool] ?? rawTool
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
@@ -194,10 +95,17 @@ export function createQwenProvider(overrideDir?: string): Provider {
       return sources
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, seenKeys)
+    // I/O adapter: read the chat file and split into JSONL records. The core
+    // decoder parses each line and threads the shared dedup set.
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      const raw = await readSessionFile(source.path)
+      if (raw === null) return null
+      return raw.split('\n').filter(l => l.trim())
     },
-  }
+
+    decode: decodeQwen,
+    toProviderCall,
+  })
 }
 
 export const qwen = createQwenProvider()

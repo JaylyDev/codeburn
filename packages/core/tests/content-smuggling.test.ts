@@ -19,6 +19,7 @@ import {
 } from '../src/providers/claude/index.js'
 import type { JournalEntry, ToolResultMeta } from '../src/providers/claude/index.js'
 import { decodeCodex, toObservations as toCodexObservations } from '../src/providers/codex/index.js'
+import { decodeQwen, toObservations as toQwenObservations } from '../src/providers/qwen/index.js'
 import type { DecodeContext } from '../src/contracts.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -255,6 +256,77 @@ describe('content-smuggling guardrail: real codex decode -> toObservations is se
   }
 
   it('produces a schema-valid envelope from the hostile rollout', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('keeps canonical tool names (Bash/Read) and drops the argument-carrying name', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toContain('Bash')
+    expect(allToolNames).toContain('Read')
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+
+  it('fingerprints the read_file path into a 16-hex resourceRead, never the raw path', () => {
+    const env = decodeAndMinimize()
+    const reads = env.sessions.flatMap(s => s.calls.flatMap(c => c.resourceReads ?? []))
+    expect(reads.length).toBeGreaterThan(0)
+    for (const ref of reads) {
+      expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
+      expect(typeof ref.resourceClass).toBe('string')
+    }
+    expect(allStrings(reads)).not.toContain(SECRETS.absPath)
+  })
+})
+
+describe('content-smuggling guardrail: real qwen decode -> toObservations is secret-free', () => {
+  // A hostile Qwen chat planting every secret in the free-text fields a real
+  // decode captures: the user prompt, an execute_command shell line, and a
+  // read_file path — plus a tool NAME carrying a command line. Decoding it fully
+  // and minimizing MUST surface none of them.
+  const qwenContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'qwen', sourceRef: 'ref' }
+
+  function decodeAndMinimize() {
+    const records = [
+      JSON.stringify({
+        uuid: 'u-1', sessionId: 'sess-hostile', timestamp: '2026-07-17T10:00:00.000Z', type: 'user',
+        message: { role: 'user', parts: [{ text: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}` }] },
+      }),
+      JSON.stringify({
+        uuid: 'a-1', sessionId: 'sess-hostile', timestamp: '2026-07-17T10:00:05.000Z', type: 'assistant', model: 'qwen3-coder-plus',
+        message: {
+          role: 'assistant',
+          parts: [
+            { functionCall: { name: 'execute_command', args: { command: SECRETS.commandLine } } },
+            { functionCall: { name: 'read_file', args: { path: SECRETS.absPath } } },
+            // A hostile tool NAME carrying a command line (spaces + slashes): it
+            // fails the canonical charset and must be dropped, not emitted.
+            { functionCall: { name: SECRETS.commandLine, args: {} } },
+          ],
+        },
+        usageMetadata: { promptTokenCount: 500, candidatesTokenCount: 200, thoughtsTokenCount: 0, totalTokenCount: 700, cachedContentTokenCount: 0 },
+      }),
+    ]
+    const { calls } = decodeQwen({ records, context: qwenContext })
+    const { sessions } = toQwenObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'qwen' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile chat', () => {
     expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
   })
 

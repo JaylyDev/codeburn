@@ -120,6 +120,8 @@ const USER_MESSAGE_ALLOWLIST = new Set([
   'src/providers/claude/types.ts',
   'src/providers/codex/decode.ts',
   'src/providers/codex/types.ts',
+  'src/providers/qwen/decode.ts',
+  'src/providers/qwen/types.ts',
 ])
 
 describe('architecture gate: no classification or free text in @codeburn/core source', () => {
