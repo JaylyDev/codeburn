@@ -74,8 +74,11 @@ const TASK_CATEGORY_NAMES = [
 // `CommandFamily` coarse enum in fingerprint.ts (a bash-command bucket:
 // git/test/build/package/...), NOT the TaskCategory. It is fingerprint-layer
 // command classification, unrelated to task classification, so it is allowed.
+// `'general'` in pi/decode.ts is in a comment explaining the original provider's
+// skill-vs-read classification (from pi.ts); it's host-side logic explanation,
+// not core classification vocabulary.
 // Keyed `${name} in ${rel}`; each entry is a justified false positive.
-const CATEGORY_LITERAL_ALLOWLIST = new Set<string>(['git in src/fingerprint.ts'])
+const CATEGORY_LITERAL_ALLOWLIST = new Set<string>(['git in src/fingerprint.ts', 'general in src/providers/pi/decode.ts'])
 
 // Identifiers that would signal classification or correction logic leaking into
 // core. (Names of the CLI-only classifier/scanner surface.)
@@ -138,6 +141,12 @@ const USER_MESSAGE_ALLOWLIST = new Set([
   'src/providers/open-design/types.ts',
   'src/providers/lingtai-tui/decode.ts',
   'src/providers/lingtai-tui/types.ts',
+  'src/providers/gemini/decode.ts',
+  'src/providers/gemini/types.ts',
+  'src/providers/kimicode/decode.ts',
+  'src/providers/kimicode/types.ts',
+  'src/providers/pi/decode.ts',
+  'src/providers/pi/types.ts',
 ])
 
 describe('architecture gate: no classification or free text in @codeburn/core source', () => {

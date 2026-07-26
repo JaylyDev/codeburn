@@ -2,73 +2,12 @@ import { readdir, readFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 
+import { decodeKimicode, kimicodeToolNameMap } from '@codeburn/core/providers/kimicode'
+import type { KimicodeDecodedCall } from '@codeburn/core/providers/kimicode'
+import type { DecodeContext } from '@codeburn/core'
 import { extractBashCommands } from '../bash-utils.js'
-import type { ParsedProviderCall, ProbeRoot, Provider, SessionParser, SessionSource } from './types.js'
-
-type JsonObject = Record<string, unknown>
-
-type SessionState = {
-  createdAt?: string
-  updatedAt?: string
-  workDir?: string
-}
-
-type RequestContext = {
-  model: string
-  modelAlias: string
-  turnId: string
-  timestamp: string
-}
-
-const toolNameMap: Record<string, string> = {
-  Bash: 'Bash',
-  Shell: 'Bash',
-  bash: 'Bash',
-  shell: 'Bash',
-  Read: 'Read',
-  ReadFile: 'Read',
-  read_file: 'Read',
-  Write: 'Write',
-  WriteFile: 'Write',
-  write_file: 'Write',
-  Edit: 'Edit',
-  EditFile: 'Edit',
-  edit_file: 'Edit',
-  Grep: 'Grep',
-  grep: 'Grep',
-  Glob: 'Glob',
-  glob: 'Glob',
-  Agent: 'Agent',
-  Task: 'Agent',
-}
-
-function asObject(value: unknown): JsonObject | null {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? value as JsonObject
-    : null
-}
-
-function stringValue(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : ''
-}
-
-function nonNegativeNumber(value: unknown): number {
-  const number = typeof value === 'number'
-    ? value
-    : typeof value === 'string' && value.trim() ? Number(value) : NaN
-  return Number.isFinite(number) && number >= 0 ? Math.trunc(number) : 0
-}
-
-function timestampIso(value: unknown): string {
-  if (typeof value === 'string') {
-    const date = new Date(value)
-    return Number.isNaN(date.getTime()) ? '' : date.toISOString()
-  }
-  if (typeof value !== 'number' || !Number.isFinite(value)) return ''
-  const milliseconds = value > 1_000_000_000_000 ? value : value * 1000
-  const date = new Date(milliseconds)
-  return Number.isNaN(date.getTime()) ? '' : date.toISOString()
-}
+import { createBridgedProvider } from './bridge.js'
+import type { ParsedProviderCall, ProbeRoot, Provider, SessionSource } from './types.js'
 
 function kimicodeHomes(override?: string): string[] {
   const explicit = override || process.env['KIMI_CODE_HOME']
@@ -100,14 +39,14 @@ async function isFile(path: string): Promise<boolean> {
   }
 }
 
-async function readState(sessionDir: string): Promise<SessionState> {
+async function readState(sessionDir: string): Promise<{ createdAt?: string; updatedAt?: string; workDir?: string }> {
   try {
-    const state = asObject(JSON.parse(await readFile(join(sessionDir, 'state.json'), 'utf8')))
-    if (!state) return {}
+    const state = JSON.parse(await readFile(join(sessionDir, 'state.json'), 'utf8'))
+    if (!state || typeof state !== 'object') return {}
     return {
-      createdAt: stringValue(state['createdAt']) || undefined,
-      updatedAt: stringValue(state['updatedAt']) || undefined,
-      workDir: stringValue(state['workDir']) || undefined,
+      createdAt: typeof state.createdAt === 'string' ? state.createdAt.trim() || undefined : undefined,
+      updatedAt: typeof state.updatedAt === 'string' ? state.updatedAt.trim() || undefined : undefined,
+      workDir: typeof state.workDir === 'string' ? state.workDir.trim() || undefined : undefined,
     }
   } catch {
     return {}
@@ -168,175 +107,98 @@ function agentIdForWire(path: string): string {
   return basename(dirname(path))
 }
 
-function turnIdFromStep(value: unknown): string {
-  const turnStep = stringValue(value)
-  if (!turnStep) return ''
-  return turnStep.split('.', 1)[0] ?? ''
-}
-
-function inputText(value: unknown): string {
-  if (typeof value === 'string') return value
-  if (!Array.isArray(value)) return ''
-  return value
-    .map(part => {
-      const record = asObject(part)
-      return record?.['type'] === 'text' ? stringValue(record['text']) : ''
-    })
-    .filter(Boolean)
-    .join('\n')
-}
-
-function toolDetails(value: unknown): { name: string; bashCommands: string[] } | null {
-  const event = asObject(value)
-  if (!event || stringValue(event['type']) !== 'tool.call') return null
-  const rawName = stringValue(event['name'])
-  if (!rawName) return null
-  const name = toolNameMap[rawName] ?? rawName
-
-  let args = asObject(event['args'])
-  if (!args && typeof event['args'] === 'string') {
-    try {
-      args = asObject(JSON.parse(event['args']))
-    } catch {
-      args = null
-    }
-  }
-  const command = stringValue(args?.['command'])
+function toProviderCall(rich: KimicodeDecodedCall): ParsedProviderCall {
   return {
-    name,
-    bashCommands: name === 'Bash' && command ? extractBashCommands(command) : [],
+    provider: 'kimicode',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    costBasis: 'estimated',
+    costIsEstimated: true,
+    tools: rich.tools,
+    // Kimicode's legacy decode did NOT dedup bash commands: pendingBashCommands
+    // was a flat list of every extracted base name. Preserve that (no Set).
+    bashCommands: rich.rawBashCommands.flatMap(c => extractBashCommands(c)),
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    turnId: rich.turnId,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
+    project: rich.project,
+    projectPath: rich.projectPath,
   }
 }
 
-function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-  return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      let contents: string
-      try {
-        contents = await readFile(source.path, 'utf8')
-      } catch {
-        return
-      }
+// Host-derived scalars the pure core decode needs, packed alongside the wire
+// lines so they cross the bridge's fixed decode signature (same pattern as
+// droid). The session-state timestamps feed the decoder's last-resort timestamp
+// fallback; sessionId/agentId feed the dedup key; project/projectPath are stamped
+// onto each call.
+type KimicodeMeta = {
+  sessionId: string
+  agentId: string
+  project: string
+  projectPath?: string
+  stateUpdatedAt?: string
+  stateCreatedAt?: string
+}
+type KimicodePacked = { meta: KimicodeMeta; records: unknown[] }
 
-      const sessionDir = sessionDirForWire(source.path)
-      const sessionId = sessionIdForWire(source.path)
-      const agentId = source.sourceId || agentIdForWire(source.path)
-      const state = await readState(sessionDir)
-      const fallbackTimestamp = timestampIso(state.updatedAt) || timestampIso(state.createdAt)
-      const projectPath = state.workDir || source.sourcePath
-      const aliasModels = new Map<string, string>()
-      const prompts = new Map<string, string>()
-      let currentPrompt = ''
-      let currentRequest: RequestContext | null = null
-      let pendingTools: string[] = []
-      let pendingBashCommands: string[] = []
-      let usageOrdinal = 0
+async function readRecords(source: SessionSource): Promise<unknown[] | null> {
+  let contents: string
+  try {
+    contents = await readFile(source.path, 'utf8')
+  } catch {
+    return null
+  }
 
-      const lines = contents.split(/\r?\n/)
-      for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-        const line = lines[lineIndex]!.trim()
-        if (!line) continue
+  const sessionDir = sessionDirForWire(source.path)
+  const sessionId = sessionIdForWire(source.path)
+  const agentId = source.sourceId || agentIdForWire(source.path)
+  const state = await readState(sessionDir)
+  const projectPath = state.workDir || source.sourcePath
 
-        let record: JsonObject | null
-        try {
-          record = asObject(JSON.parse(line))
-        } catch {
-          continue
-        }
-        if (!record) continue
-
-        const type = stringValue(record['type'])
-        if (type === 'turn.prompt') {
-          pendingTools = []
-          pendingBashCommands = []
-          currentPrompt = inputText(record['input'])
-          continue
-        }
-
-        if (type === 'llm.request') {
-          const model = stringValue(record['model'])
-          const modelAlias = stringValue(record['modelAlias'])
-          const turnId = turnIdFromStep(record['turnStep'])
-          if (model && modelAlias) aliasModels.set(modelAlias, model)
-          if (turnId && currentPrompt) prompts.set(turnId, currentPrompt)
-          currentRequest = {
-            model,
-            modelAlias,
-            turnId,
-            timestamp: timestampIso(record['time']),
-          }
-          continue
-        }
-
-        if (type === 'context.append_loop_event') {
-          const tool = toolDetails(record['event'])
-          if (tool) {
-            pendingTools.push(tool.name)
-            pendingBashCommands.push(...tool.bashCommands)
-          }
-          continue
-        }
-
-        if (type !== 'usage.record') continue
-        const usage = asObject(record['usage'])
-        if (!usage) continue
-
-        const usageAlias = stringValue(record['model'])
-        const realModel = aliasModels.get(usageAlias) ?? (currentRequest?.model || 'kimicode-unknown')
-        const turnId = currentRequest?.turnId || ''
-        const inputTokens = nonNegativeNumber(usage['inputOther'])
-        const outputTokens = nonNegativeNumber(usage['output'])
-        const cacheReadInputTokens = nonNegativeNumber(usage['inputCacheRead'])
-        const cacheCreationInputTokens = nonNegativeNumber(usage['inputCacheCreation'])
-        const timestamp = timestampIso(record['time']) || currentRequest?.timestamp || fallbackTimestamp
-        if (!timestamp) {
-          pendingTools = []
-          pendingBashCommands = []
-          continue
-        }
-
-        const deduplicationKey = `kimicode:${sessionId}:${agentId}:${lineIndex + 1}:${usageOrdinal}`
-        usageOrdinal++
-        if (seenKeys.has(deduplicationKey)) {
-          pendingTools = []
-          pendingBashCommands = []
-          continue
-        }
-        seenKeys.add(deduplicationKey)
-
-        yield {
-          provider: 'kimicode',
-          model: realModel,
-          inputTokens,
-          outputTokens,
-          cacheCreationInputTokens,
-          cacheReadInputTokens,
-          cachedInputTokens: cacheReadInputTokens,
-          reasoningTokens: 0,
-          webSearchRequests: 0,
-          costBasis: 'estimated',
-          costIsEstimated: true,
-          tools: pendingTools,
-          bashCommands: pendingBashCommands,
-          timestamp,
-          speed: 'standard',
-          deduplicationKey,
-          turnId: turnId || undefined,
-          userMessage: prompts.get(turnId) ?? currentPrompt,
-          sessionId,
-          project: source.project,
-          projectPath,
-        }
-
-        pendingTools = []
-        pendingBashCommands = []
-      }
+  // Preserve legacy line indexing: the dedup key embeds `lineIndex + 1` over the
+  // raw \r?\n split (blank lines included), so do NOT filter here.
+  const lines = contents.split(/\r?\n/)
+  const packed: KimicodePacked = {
+    meta: {
+      sessionId,
+      agentId,
+      project: source.project ?? '',
+      projectPath,
+      stateUpdatedAt: state.updatedAt,
+      stateCreatedAt: state.createdAt,
     },
+    records: lines,
   }
+  return [packed]
+}
+
+function decode(input: { records: unknown[]; context: DecodeContext; seenKeys: Set<string> }): { calls: KimicodeDecodedCall[] } {
+  const packed = input.records[0] as KimicodePacked | undefined
+  if (!packed) return { calls: [] }
+  return decodeKimicode({
+    records: packed.records,
+    context: input.context,
+    seenKeys: input.seenKeys,
+    sessionId: packed.meta.sessionId,
+    agentId: packed.meta.agentId,
+    project: packed.meta.project,
+    projectPath: packed.meta.projectPath,
+    stateUpdatedAt: packed.meta.stateUpdatedAt,
+    stateCreatedAt: packed.meta.stateCreatedAt,
+  })
 }
 
 export function createKimicodeProvider(homeOverride?: string): Provider {
-  return {
+  return createBridgedProvider<KimicodeDecodedCall>({
     name: 'kimicode',
     displayName: 'Kimi Code',
 
@@ -345,7 +207,7 @@ export function createKimicodeProvider(homeOverride?: string): Provider {
     },
 
     toolDisplayName(rawTool: string): string {
-      return toolNameMap[rawTool] ?? rawTool
+      return kimicodeToolNameMap[rawTool] ?? rawTool
     },
 
     async probeRoots(): Promise<ProbeRoot[]> {
@@ -360,10 +222,13 @@ export function createKimicodeProvider(homeOverride?: string): Provider {
       return all.sort((a, b) => a.path.localeCompare(b.path))
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, seenKeys)
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      return readRecords(source)
     },
-  }
+
+    decode,
+    toProviderCall,
+  })
 }
 
 export const kimicode = createKimicodeProvider()

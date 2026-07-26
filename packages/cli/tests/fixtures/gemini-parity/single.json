@@ -1,0 +1,24 @@
+{
+  "sessionId": "gsess-1",
+  "startTime": "2026-06-01T10:00:00.000Z",
+  "messages": [
+    { "id": "u1", "type": "user", "timestamp": "2026-06-01T10:00:00.000Z", "content": "inspect the repo" },
+    {
+      "id": "g1",
+      "type": "gemini",
+      "timestamp": "2026-06-01T10:00:05.000Z",
+      "model": "gemini-3.1-pro-preview",
+      "content": "working",
+      "tokens": { "input": 120, "cached": 20, "output": 30, "thoughts": 5 },
+      "toolCalls": [
+        { "id": "t1", "name": "read_file", "args": { "path": "src/index.ts" } },
+        { "id": "t2", "name": "run_command", "args": { "command": "git status && git log" } },
+        { "id": "t3", "name": "run_command", "args": { "command": "git diff" } },
+        { "id": "t4", "name": "read_file", "args": { "path": "src/a.ts" } }
+      ]
+    },
+    { "id": "g0", "type": "gemini", "timestamp": "2026-06-01T10:00:06.000Z", "model": "gemini-2.5-pro", "content": "zero", "tokens": { "input": 0, "output": 0, "cached": 0, "thoughts": 0 } },
+    { "id": "u2", "type": "user", "timestamp": "2026-06-01T10:01:00.000Z", "content": [{ "text": "run tests" }] },
+    { "id": "g2", "type": "gemini", "timestamp": "2026-06-01T10:01:05.000Z", "model": "gemini-2.5-flash", "content": "done", "tokens": { "output": 10 } }
+  ]
+}

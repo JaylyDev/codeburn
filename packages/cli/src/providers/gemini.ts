@@ -2,208 +2,39 @@ import { readdir, stat } from 'fs/promises'
 import { join } from 'path'
 import { homedir } from 'os'
 
+import { decodeGemini, geminiToolNameMap } from '@codeburn/core/providers/gemini'
+import type { GeminiDecodedCall } from '@codeburn/core/providers/gemini'
+
 import { readSessionFile } from '../fs-utils.js'
 import { extractBashCommands } from '../bash-utils.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import { createBridgedProvider } from './bridge.js'
+import type { Provider, SessionSource, ParsedProviderCall } from './types.js'
 
-const toolNameMap: Record<string, string> = {
-  read_file: 'Read',
-  write_file: 'Write',
-  edit_file: 'Edit',
-  create_file: 'Write',
-  delete_file: 'Delete',
-  list_dir: 'LS',
-  grep_search: 'Grep',
-  search_files: 'Grep',
-  find_files: 'Glob',
-  run_command: 'Bash',
-  web_search: 'WebSearch',
-  ReadFile: 'Read',
-  WriteFile: 'Write',
-  EditFile: 'Edit',
-  ListDir: 'LS',
-  SearchText: 'Grep',
-  Shell: 'Bash',
-}
-
-type GeminiTokens = {
-  input?: number
-  output?: number
-  cached?: number
-  thoughts?: number
-  tool?: number
-  total?: number
-}
-
-type GeminiToolCall = {
-  id: string
-  name: string
-  args: Record<string, unknown>
-  status?: string
-  displayName?: string
-}
-
-type GeminiMessage = {
-  id: string
-  timestamp: string
-  type: 'user' | 'gemini' | 'info'
-  content: string | Array<{ text: string }>
-  tokens?: GeminiTokens
-  model?: string
-  toolCalls?: GeminiToolCall[]
-  thoughts?: unknown[]
-}
-
-type GeminiSession = {
-  sessionId: string
-  projectHash?: string
-  startTime: string
-  lastUpdated?: string
-  messages: GeminiMessage[]
-  kind?: string
-}
-
-function parseSession(data: GeminiSession, seenKeys: Set<string>): ParsedProviderCall[] {
-  const results: ParsedProviderCall[] = []
-
-  let lastUserMessage = ''
-  let turnOrdinal = 0
-  let currentTurnId = `${data.sessionId}:prelude`
-  let geminiOrdinal = 0
-
-  for (const msg of data.messages) {
-    if (msg.type === 'user') {
-      if (Array.isArray(msg.content)) {
-        lastUserMessage = msg.content.map(c => c.text).join(' ').slice(0, 500)
-      } else if (typeof msg.content === 'string') {
-        lastUserMessage = msg.content.slice(0, 500)
-      }
-      currentTurnId = `${data.sessionId}:turn-${turnOrdinal++}`
-      continue
-    }
-
-    if (msg.type !== 'gemini' || !msg.tokens || !msg.model) continue
-
-    const t = msg.tokens
-    const totalInput = t.input ?? 0
-    const totalOutput = t.output ?? 0
-    const totalCached = t.cached ?? 0
-    const totalThoughts = t.thoughts ?? 0
-    if (totalInput === 0 && totalOutput === 0 && totalCached === 0 && totalThoughts === 0) continue
-
-    const messageKey = msg.id || `idx-${geminiOrdinal}`
-    geminiOrdinal++
-    const dedupKey = `gemini:${data.sessionId}:${messageKey}`
-    if (seenKeys.has(dedupKey)) continue
-
-    const tools: string[] = []
-    const bashCommands: string[] = []
-
-    if (msg.toolCalls) {
-      for (const tc of msg.toolCalls) {
-        const mapped = toolNameMap[tc.displayName ?? ''] ?? toolNameMap[tc.name] ?? tc.displayName ?? tc.name
-        tools.push(mapped)
-        if (mapped === 'Bash' && tc.args && typeof tc.args.command === 'string') {
-          bashCommands.push(...extractBashCommands(tc.args.command))
-        }
-      }
-    }
-
-    // Gemini's `input` count includes `cached` tokens as a subset, so fresh
-    // input must subtract cached to avoid double-charging at both rates.
-    const freshInput = Math.max(0, totalInput - totalCached)
-
-    const tsDate = new Date(msg.timestamp || data.startTime)
-    if (isNaN(tsDate.getTime()) || tsDate.getTime() < 1_000_000_000_000) continue
-
-    seenKeys.add(dedupKey)
-
-    results.push({
-      provider: 'gemini',
-      model: msg.model,
-      inputTokens: freshInput,
-      outputTokens: totalOutput,
-      cacheCreationInputTokens: 0,
-      cacheReadInputTokens: totalCached,
-      cachedInputTokens: totalCached,
-      reasoningTokens: totalThoughts,
-      webSearchRequests: 0,
-      costBasis: 'estimated',
-      tools: [...new Set(tools)],
-      bashCommands: [...new Set(bashCommands)],
-      timestamp: tsDate.toISOString(),
-      speed: 'standard',
-      deduplicationKey: dedupKey,
-      turnId: currentTurnId,
-      userMessage: lastUserMessage,
-      sessionId: data.sessionId,
-    })
-  }
-
-  return results
-}
-
-function parseJsonl(raw: string): GeminiSession | null {
-  const lines = raw.split('\n').filter(l => l.trim())
-  if (lines.length === 0) return null
-
-  let sessionId = ''
-  let startTime = ''
-  let projectHash: string | undefined
-  let lastUpdated: string | undefined
-  let kind: string | undefined
-  const messages: GeminiMessage[] = []
-
-  for (const line of lines) {
-    let obj: Record<string, unknown>
-    try {
-      obj = JSON.parse(line)
-    } catch {
-      continue
-    }
-    if (obj['$set'] !== undefined) continue
-    if (obj['sessionId'] && obj['startTime'] && !sessionId) {
-      sessionId = obj['sessionId'] as string
-      startTime = obj['startTime'] as string
-      projectHash = obj['projectHash'] as string | undefined
-      lastUpdated = obj['lastUpdated'] as string | undefined
-      kind = obj['kind'] as string | undefined
-    } else if (obj['id'] && obj['type']) {
-      messages.push(obj as unknown as GeminiMessage)
-    }
-  }
-
-  if (!sessionId) return null
-  return { sessionId, projectHash, startTime, lastUpdated, kind, messages }
-}
-
-function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+// Map one rich, cost-free decoder call into the host's ParsedProviderCall. Cost
+// re-enters here: `costBasis: 'estimated'` marks the call so the parser.ts
+// pricing pass fills `costUSD` from the token buckets. Bash base-name
+// extraction (and its `strip-ansi` dependency) stays CLI-side: the core decoder
+// carries the raw command strings; the host reduces them to base names here.
+function toProviderCall(rich: GeminiDecodedCall): ParsedProviderCall {
   return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const raw = await readSessionFile(source.path)
-      if (raw === null) return
-
-      let data: GeminiSession | null = null
-
-      // Try single JSON first (Gemini CLI <=0.38), then JSONL (>=0.39)
-      try {
-        const parsed = JSON.parse(raw)
-        if (parsed.messages && parsed.sessionId) {
-          data = parsed
-        }
-      } catch { /* not single JSON */ }
-
-      if (!data) {
-        data = parseJsonl(raw)
-      }
-
-      if (!data?.messages || !data.sessionId) return
-
-      const calls = parseSession(data, seenKeys)
-      for (const call of calls) {
-        yield call
-      }
-    },
+    provider: 'gemini',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    costBasis: 'estimated',
+    tools: rich.tools,
+    bashCommands: [...new Set(rich.rawBashCommands.flatMap(c => extractBashCommands(c)))],
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    turnId: rich.turnId,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
   }
 }
 
@@ -245,7 +76,7 @@ async function discoverSessions(): Promise<SessionSource[]> {
 }
 
 export function createGeminiProvider(): Provider {
-  return {
+  return createBridgedProvider<GeminiDecodedCall>({
     name: 'gemini',
     displayName: 'Gemini',
 
@@ -263,17 +94,24 @@ export function createGeminiProvider(): Provider {
     },
 
     toolDisplayName(rawTool: string): string {
-      return toolNameMap[rawTool] ?? rawTool
+      return geminiToolNameMap[rawTool] ?? rawTool
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
       return discoverSessions()
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, seenKeys)
+    // I/O adapter: read the raw session file. The core decoder does its own
+    // format detection (single JSON <=0.38 vs headerless JSONL >=0.39).
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      const raw = await readSessionFile(source.path)
+      if (raw === null) return null
+      return [raw]
     },
-  }
+
+    decode: decodeGemini,
+    toProviderCall,
+  })
 }
 
 export const gemini = createGeminiProvider()

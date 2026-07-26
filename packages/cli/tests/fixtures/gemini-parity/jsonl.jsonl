@@ -1,0 +1,4 @@
+{"sessionId":"gsess-2","startTime":"2026-06-02T09:00:00.000Z","projectHash":"abc"}
+{"$set":{"foo":1}}
+{"id":"u1","type":"user","content":"hello"}
+{"id":"g1","type":"gemini","model":"gemini-auto","content":"hi","tokens":{"input":50,"output":5}}
