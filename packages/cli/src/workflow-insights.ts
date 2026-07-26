@@ -3,6 +3,11 @@ import { homedir } from 'os'
 import { EDIT_TOOLS } from './classifier.js'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 
+// D2 (#809): correction scanning is HOST-SIDE by design. It runs here in the CLI
+// over the rich decode (ParsedTurn.userMessage) and raw transcripts; task
+// category and correction signals never enter the @codeburn/core observation
+// envelope. Enforced permanently by packages/core/tests/architecture-gate.test.ts.
+//
 // User-side mirror of compare-stats.ts scanSelfCorrections (which scans the
 // assistant's own apologies). These match a *user* follow-up telling the
 // assistant it got something wrong. Deliberately conservative: bare "wrong" or
