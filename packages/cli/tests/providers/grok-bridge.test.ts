@@ -33,7 +33,9 @@ const GOLDEN: ParsedProviderCall[] = [
     subagentTypes: ['general-purpose'],
     timestamp: '2026-06-19T11:31:12.282793Z',
     speed: 'standard',
-    deduplicationKey: 'grok:/Users/torukmakto/Projects/codeburn/codeburn/.claude/worktrees/kimi-p8a/packages/cli/tests/fixtures/grok-parity/%2FUsers%2Ftest/019edf9c-0000-7000-8000-000000000001:2026-06-19T11:31:12.282793Z:019edf9c-0000-7000-8000-000000000001',
+    // The key embeds the session dir's absolute path — compute it from
+    // FIXTURE_DIR so the golden is portable across checkouts.
+    deduplicationKey: `grok:${resolve(FIXTURE_DIR, '%2FUsers%2Ftest/019edf9c-0000-7000-8000-000000000001')}:2026-06-19T11:31:12.282793Z:019edf9c-0000-7000-8000-000000000001`,
     userMessage: 'User asks about the repo',
     sessionId: '019edf9c-0000-7000-8000-000000000001',
     project: 'myproject',

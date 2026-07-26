@@ -1,0 +1,1 @@
+{"id":"c1","role":"assistant","parts":[{"type":"text","text":"sub work"}],"metadata":{"historySequence":0,"model":"anthropic:claude-sonnet-4-6","timestamp":1776023240000,"usage":{"inputTokens":500,"outputTokens":100}}}

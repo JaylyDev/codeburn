@@ -58,6 +58,26 @@
     "./providers/qwen": {
       "types": "./dist/providers/qwen/index.d.ts",
       "import": "./dist/providers/qwen/index.js"
+    },
+    "./providers/zerostack": {
+      "types": "./dist/providers/zerostack/index.d.ts",
+      "import": "./dist/providers/zerostack/index.js"
+    },
+    "./providers/droid": {
+      "types": "./dist/providers/droid/index.d.ts",
+      "import": "./dist/providers/droid/index.js"
+    },
+    "./providers/mux": {
+      "types": "./dist/providers/mux/index.d.ts",
+      "import": "./dist/providers/mux/index.js"
+    },
+    "./providers/open-design": {
+      "types": "./dist/providers/open-design/index.d.ts",
+      "import": "./dist/providers/open-design/index.js"
+    },
+    "./providers/lingtai-tui": {
+      "types": "./dist/providers/lingtai-tui/index.d.ts",
+      "import": "./dist/providers/lingtai-tui/index.js"
     }
   },
   "files": [

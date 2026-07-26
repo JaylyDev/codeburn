@@ -2,86 +2,27 @@ import { readdir, stat, readFile } from 'fs/promises'
 import { join } from 'path'
 import { homedir } from 'os'
 
+import { decodeDroid, droidToolNameMap, stripModelPrefix } from '@codeburn/core/providers/droid'
+import type { DecodeContext } from '@codeburn/core'
+import type { DroidDecodedCall, DroidJsonlEntry, DroidSettings } from '@codeburn/core/providers/droid'
+
 import { readSessionFile, readSessionLines } from '../fs-utils.js'
 import { getShortModelName } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
-import { normalizeContentBlocks } from '../content-utils.js'
-import type {
-  Provider,
-  SessionSource,
-  SessionParser,
-  ParsedProviderCall,
-} from './types.js'
+import { createBridgedProvider } from './bridge.js'
+import type { Provider, SessionSource, ParsedProviderCall } from './types.js'
 
-const toolNameMap: Record<string, string> = {
-  Read: 'Read',
-  Create: 'Create',
-  Edit: 'Edit',
-  MultiEdit: 'MultiEdit',
-  LS: 'LS',
-  Glob: 'Glob',
-  Grep: 'Grep',
-  Execute: 'Bash',
-  AskUser: 'AskUser',
-  TodoWrite: 'TodoWrite',
-  Skill: 'Skill',
-  Task: 'Agent',
-  WebSearch: 'WebSearch',
-  FetchUrl: 'FetchUrl',
-  GenerateDroid: 'GenerateDroid',
-  ExitSpecMode: 'ExitSpecMode',
-}
-
-type DroidSettings = {
-  model?: string
-  tokenUsage?: {
-    inputTokens: number
-    outputTokens: number
-    cacheCreationTokens: number
-    cacheReadTokens: number
-    thinkingTokens: number
-  }
-}
-
-type DroidContent = {
-  type: string
-  text?: string
-  name?: string
-  input?: Record<string, unknown>
-}
-
-type DroidMessage = {
-  role: string
-  content?: DroidContent[]
-}
-
-type DroidJsonlEntry = {
-  type: string
-  id?: string
-  timestamp?: string
-  message?: DroidMessage
-  title?: string
-  cwd?: string
-}
+// Host-derived scalars the pure core decode needs, packed alongside the JSONL
+// records so they cross the bridge's fixed decode signature.
+type DroidMeta = { settings: DroidSettings }
+type DroidPacked = { meta: DroidMeta; records: unknown[] }
 
 function getFactoryDir(): string {
   return process.env['FACTORY_DIR'] ?? join(homedir(), '.factory')
 }
 
-
-// Strip Droid-specific wrapper to get the model's display name.
-// e.g. "custom:GLM-5.1-[Proxy]-0" -> "GLM-5.1"
-// Cost lookup is handled by codeburn's existing calculateCost/getCanonicalName
-// which normalizes case and strips date suffixes automatically.
-function stripModelPrefix(raw: string): string {
-  return raw
-    .replace(/^custom:/, '')
-    .replace(/\[.*?\]/g, '')
-    .replace(/-\d+$/, '')
-    .replace(/-+$/, '')
-    .replace(/^-/, '')
-}
-
+// Display-name reduction (report layer). Reuses core's stripModelPrefix so the
+// wrapper-stripping logic lives in exactly one place.
 function parseModelForDisplay(raw: string): string {
   const stripped = stripModelPrefix(raw)
   const lower = stripped.toLowerCase()
@@ -97,189 +38,47 @@ function parseModelForDisplay(raw: string): string {
 }
 
 /**
- * Extract meaningful shell command names from a Droid Execute call.
- * Droid frequently passes multi-line scripts (python -c "...", heredocs, etc.)
- * where splitting on ;/&&/| produces noise tokens like '}', 'await', 'import'.
- * Instead, extract only the primary command from each logical line.
+ * Extract meaningful shell command names from a Droid Execute call. Droid
+ * frequently passes multi-line scripts (python -c "...", heredocs, etc.) where
+ * splitting on ;/&&/| produces noise tokens like '}', 'await', 'import'. Reduce
+ * to the primary command on the first logical line. Host-side (with its
+ * strip-ansi dependency); the core decoder carries the raw command strings.
  */
 function extractDroidBashCommands(command: string): string[] {
   if (!command || !command.trim()) return []
-
   const firstLine = command.split('\n')[0]!.trim()
   return extractBashCommands(firstLine)
 }
 
-function createParser(
-  source: SessionSource,
-  seenKeys: Set<string>,
-): SessionParser {
+// Map one rich, cost-free decoder call into the host's ParsedProviderCall. Cost
+// re-enters here (`costBasis: 'estimated'`); the Droid base-name extraction runs
+// on the raw command strings the decoder carried through.
+function toProviderCall(rich: DroidDecodedCall): ParsedProviderCall {
   return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const content = await readSessionFile(source.path)
-      if (content === null) return
-
-      // Read the companion settings file for token usage
-      const settingsPath = source.path.replace(/\.jsonl$/, '.settings.json')
-      let settings: DroidSettings = {}
-      try {
-        const raw = await readFile(settingsPath, 'utf-8')
-        settings = JSON.parse(raw) as DroidSettings
-      } catch {
-        // No settings file or parse error
-      }
-
-      const lines = content.split('\n').filter(l => l.trim())
-      let sessionId = ''
-      let sessionModelDisplay = settings.model ? stripModelPrefix(settings.model) : 'unknown'
-      let currentUserMessage = ''
-
-      // Collect all assistant messages with their tools
-      const assistantCalls: Array<{
-        id: string
-        timestamp: string
-        tools: string[]
-        bashCommands: string[]
-      }> = []
-
-      let pendingTools: string[] = []
-      let pendingBashCommands: string[] = []
-
-      for (const line of lines) {
-        let entry: DroidJsonlEntry
-        try {
-          entry = JSON.parse(line) as DroidJsonlEntry
-        } catch {
-          continue
-        }
-
-        if (entry.type === 'session_start') {
-          sessionId = entry.id ?? ''
-          continue
-        }
-
-        if (entry.type !== 'message' || !entry.message) continue
-
-        const msg = entry.message
-
-        if (msg.role === 'user') {
-          // Extract user text from content
-          const texts = normalizeContentBlocks(msg.content)
-            .filter(c => c.type === 'text' && c.text)
-            .map(c => c.text!)
-            .filter(Boolean)
-          // Skip system-reminder-only messages
-          const nonSystemTexts = texts.filter(t => !t.startsWith('<system-reminder>'))
-          if (nonSystemTexts.length > 0) {
-            currentUserMessage = nonSystemTexts.join(' ').slice(0, 500)
-          }
-          continue
-        }
-
-        if (msg.role === 'assistant') {
-          const toolUses = normalizeContentBlocks(msg.content).filter(c => c.type === 'tool_use')
-
-          for (const tu of toolUses) {
-            const toolName = tu.name ?? ''
-            pendingTools.push(toolNameMap[toolName] ?? toolName)
-
-            if (toolName === 'Execute' && tu.input && typeof tu.input['command'] === 'string') {
-              pendingBashCommands.push(...extractDroidBashCommands(tu.input['command'] as string))
-            }
-          }
-
-          // Check if this assistant message has any text content (non-thinking)
-          const hasText = normalizeContentBlocks(msg.content).some(c => c.type === 'text' && c.text)
-
-          // Only emit a call entry if there are tools or substantial text
-          if (pendingTools.length > 0 || hasText) {
-            assistantCalls.push({
-              id: entry.id ?? `msg-${assistantCalls.length}`,
-              timestamp: entry.timestamp ?? '',
-              tools: [...pendingTools],
-              bashCommands: [...pendingBashCommands],
-            })
-            pendingTools = []
-            pendingBashCommands = []
-          }
-          continue
-        }
-      }
-
-      if (assistantCalls.length === 0) return
-
-      // KNOWN LIMITATION: Droid records token usage only at session level
-      // (settings.tokenUsage), not per-message. We split evenly across the
-      // emitted assistant calls and price all of them at settings.model
-      // (the latest model the session used). For sessions where the user
-      // switched models mid-stream, costs are approximate — we have no
-      // ground-truth breakdown to attribute tokens per model.
-      const totalTokens = settings.tokenUsage
-      if (!totalTokens) return
-
-      const totalInput = totalTokens.inputTokens ?? 0
-      const totalOutput = totalTokens.outputTokens ?? 0
-      const totalCacheCreation = totalTokens.cacheCreationTokens ?? 0
-      const totalCacheRead = totalTokens.cacheReadTokens ?? 0
-      const totalThinking = totalTokens.thinkingTokens ?? 0
-      const numCalls = assistantCalls.length
-
-      // Distribute evenly across calls
-      const inputPerCall = Math.floor(totalInput / numCalls)
-      const outputPerCall = Math.floor(totalOutput / numCalls)
-      const cacheCreationPerCall = Math.floor(totalCacheCreation / numCalls)
-      const cacheReadPerCall = Math.floor(totalCacheRead / numCalls)
-      const thinkingPerCall = Math.floor(totalThinking / numCalls)
-
-      for (let i = 0; i < assistantCalls.length; i++) {
-        const call = assistantCalls[i]
-
-        // Assign remainder to the last call
-        const isLast = i === assistantCalls.length - 1
-        const inputTokens = isLast
-          ? totalInput - inputPerCall * (numCalls - 1)
-          : inputPerCall
-        const outputTokens = isLast
-          ? totalOutput - outputPerCall * (numCalls - 1)
-          : outputPerCall
-        const cacheCreationTokens = isLast
-          ? totalCacheCreation - cacheCreationPerCall * (numCalls - 1)
-          : cacheCreationPerCall
-        const cacheReadTokens = isLast
-          ? totalCacheRead - cacheReadPerCall * (numCalls - 1)
-          : cacheReadPerCall
-        const thinkingTokens = isLast
-          ? totalThinking - thinkingPerCall * (numCalls - 1)
-          : thinkingPerCall
-
-        const dedupKey = `droid:${sessionId}:${call.id}`
-        if (seenKeys.has(dedupKey)) continue
-        seenKeys.add(dedupKey)
-
-        // Use the call's timestamp, or session_start timestamp
-        const timestamp = call.timestamp || ''
-
-        yield {
-          provider: 'droid',
-          model: sessionModelDisplay,
-          inputTokens,
-          outputTokens,
-          cacheCreationInputTokens: cacheCreationTokens,
-          cacheReadInputTokens: cacheReadTokens,
-          cachedInputTokens: cacheReadTokens,
-          reasoningTokens: thinkingTokens,
-          webSearchRequests: 0,
-          costBasis: 'estimated',
-          tools: call.tools,
-          bashCommands: call.bashCommands,
-          timestamp,
-          speed: 'standard',
-          deduplicationKey: dedupKey,
-          userMessage: i === 0 ? currentUserMessage : '',
-          sessionId,
-        }
-      }
-    },
+    provider: 'droid',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    costBasis: 'estimated',
+    tools: rich.tools,
+    bashCommands: rich.rawBashCommands.flatMap(c => extractDroidBashCommands(c)),
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
   }
+}
+
+function decode(input: { records: unknown[]; context: DecodeContext; seenKeys: Set<string> }): { calls: DroidDecodedCall[] } {
+  const packed = input.records[0] as DroidPacked | undefined
+  if (!packed) return { calls: [] }
+  return decodeDroid({ records: packed.records, context: input.context, settings: packed.meta.settings, seenKeys: input.seenKeys })
 }
 
 function isInternalSession(cwd: string, factoryDir: string): boolean {
@@ -370,7 +169,7 @@ export function createDroidProvider(factoryDir?: string): Provider {
   const base = factoryDir ?? getFactoryDir()
   const sessionsDir = join(base, 'sessions')
 
-  return {
+  return createBridgedProvider<DroidDecodedCall>({
     name: 'droid',
     displayName: 'Droid',
 
@@ -379,20 +178,37 @@ export function createDroidProvider(factoryDir?: string): Provider {
     },
 
     toolDisplayName(rawTool: string): string {
-      return toolNameMap[rawTool] ?? rawTool
+      return droidToolNameMap[rawTool] ?? rawTool
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
       return discoverSessionsInDir(sessionsDir, base)
     },
 
-    createSessionParser(
-      source: SessionSource,
-      seenKeys: Set<string>,
-    ): SessionParser {
-      return createParser(source, seenKeys)
+    // I/O adapter: read the JSONL turns and the companion settings file (which
+    // carries session-level token usage + model). Both are packed so the pure
+    // decoder — which distributes the session token totals across calls — can
+    // consume them through the bridge.
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      const content = await readSessionFile(source.path)
+      if (content === null) return null
+
+      const settingsPath = source.path.replace(/\.jsonl$/, '.settings.json')
+      let settings: DroidSettings = {}
+      try {
+        settings = JSON.parse(await readFile(settingsPath, 'utf-8')) as DroidSettings
+      } catch {
+        // No settings file or parse error — decoder yields nothing without usage.
+      }
+
+      const lines = content.split('\n').filter(l => l.trim())
+      const packed: DroidPacked = { meta: { settings }, records: lines }
+      return [packed]
     },
-  }
+
+    decode,
+    toProviderCall,
+  })
 }
 
 export const droid = createDroidProvider()
