@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "metadata": {
+    "id": "session-full",
+    "title": "CodeWhale test session",
+    "created_at": "2026-07-14T10:00:00.000Z",
+    "updated_at": "2026-07-15T12:34:56.000Z",
+    "message_count": 6,
+    "total_tokens": 12345,
+    "model": "anthropic/claude-sonnet-4-6",
+    "model_provider": "anthropic",
+    "workspace": "/Users/alice/codewhale-demo",
+    "mode": "agent",
+    "cost": {
+      "session_cost_usd": 0.75,
+      "subagent_cost_usd": 0.20,
+      "displayed_cost_high_water_usd": 2
+    }
+  },
+  "messages": [
+    { "role": "user", "content": [{ "type": "text", "text": "Implement the parser" }] },
+    {
+      "role": "assistant",
+      "content": [
+        { "type": "thinking", "thinking": "..." },
+        { "type": "tool_use", "id": "t1", "name": "read_file", "input": { "file_path": "src/app.ts" } },
+        { "type": "tool_use", "id": "t2", "name": "exec_shell", "input": { "command": "npm test && git status && npm run build" } },
+        { "type": "tool_use", "id": "t3", "name": "edit_file", "input": { "path": "src/app.ts" } },
+        { "type": "tool_use", "id": "t3b", "name": "read_file", "input": { "file_path": "src/other.ts" } }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        { "type": "tool_use", "id": "t4", "name": "load_skill", "input": { "name": "typescript" } },
+        { "type": "tool_use", "id": "t5", "name": "agent", "input": { "type": "reviewer" } },
+        { "type": "server_tool_use", "id": "t6", "name": "web_search", "input": { "query": "CodeWhale" } }
+      ]
+    }
+  ],
+  "system_prompt": null
+}

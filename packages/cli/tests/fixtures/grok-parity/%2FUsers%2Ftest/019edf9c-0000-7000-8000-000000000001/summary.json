@@ -1,0 +1,13 @@
+{
+  "info": {
+    "id": "019edf9c-0000-7000-8000-000000000001",
+    "cwd": "/Users/test/myproject"
+  },
+  "created_at": "2026-06-19T11:20:40.686261Z",
+  "updated_at": "2026-06-19T11:31:12.282793Z",
+  "last_active_at": "2026-06-19T11:31:12.222328Z",
+  "num_messages": 42,
+  "current_model_id": "grok-build",
+  "session_summary": "User asks about the repo",
+  "generated_title": "User asks about the repo"
+}

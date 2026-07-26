@@ -1,0 +1,4 @@
+default_model = "kimi-code/k2"
+
+[models."kimi-code/k2"]
+model = "kimi-k2-thinking-turbo"

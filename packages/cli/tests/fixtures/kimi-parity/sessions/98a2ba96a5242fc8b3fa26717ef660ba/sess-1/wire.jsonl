@@ -1,0 +1,7 @@
+{"type":"metadata","protocol_version":"2"}
+{"timestamp":1776162400,"message":{"type":"TurnBegin","payload":{"user_input":"add status endpoint"}}}
+{"timestamp":1776162401,"message":{"type":"ToolCall","payload":{"type":"function","id":"call-shell","function":{"name":"Shell","arguments":"{\"command\":\"git status && npm test\"}"}}}}
+{"timestamp":1776162402,"message":{"type":"ToolCall","payload":{"type":"function","id":"call-read","function":{"name":"ReadFile","arguments":"{\"path\":\"src/index.ts\"}"}}}}
+{"timestamp":1776162403,"message":{"type":"ToolCall","payload":{"type":"function","id":"call-read2","function":{"name":"ReadFile","arguments":"{\"path\":\"src/other.ts\"}"}}}}
+{"timestamp":1776162404,"message":{"type":"ToolCall","payload":{"type":"function","id":"call-shell2","function":{"name":"Shell","arguments":"{\"command\":\"git status && npm test\"}"}}}}
+{"timestamp":1776162405,"message":{"type":"StatusUpdate","payload":{"message_id":"msg-1","token_usage":{"input_other":100,"input_cache_read":25,"input_cache_creation":10,"output":40}}}}

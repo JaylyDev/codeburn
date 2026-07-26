@@ -20,6 +20,9 @@ import {
 import type { JournalEntry, ToolResultMeta } from '../src/providers/claude/index.js'
 import { decodeCodex, toObservations as toCodexObservations } from '../src/providers/codex/index.js'
 import { decodeQwen, toObservations as toQwenObservations } from '../src/providers/qwen/index.js'
+import { decodeGrok, toObservations as toGrokObservations } from '../src/providers/grok/index.js'
+import { decodeKimi, toObservations as toKimiObservations } from '../src/providers/kimi/index.js'
+import { decodeCodeWhale, toObservations as toCodeWhaleObservations } from '../src/providers/codewhale/index.js'
 import type { DecodeContext } from '../src/contracts.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -354,6 +357,223 @@ describe('content-smuggling guardrail: real qwen decode -> toObservations is sec
       expect(typeof ref.resourceClass).toBe('string')
     }
     expect(allStrings(reads)).not.toContain(SECRETS.absPath)
+  })
+})
+
+describe('content-smuggling guardrail: real grok decode -> toObservations is secret-free', () => {
+  // A hostile Grok session planting every secret in the free-text fields the
+  // decode captures: the project path, the user message (session summary/title),
+  // a bash command, and a subagent type. Plus a tool NAME carrying a command
+  // line, which must be dropped by the canonical-name filter.
+  const grokContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'grok', sourceRef: 'ref' }
+
+  function decodeAndMinimize() {
+    const records = [
+      {
+        summary: {
+          info: { id: 'sess-hostile', cwd: SECRETS.absPath },
+          created_at: '2026-07-17T10:00:00.000Z',
+          updated_at: '2026-07-17T10:00:05.000Z',
+          session_summary: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}`,
+          generated_title: SECRETS.prompt,
+        },
+        signals: null,
+        updatesLines: [
+          JSON.stringify({
+            timestamp: '2026-07-17T10:00:05.000Z',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-hostile',
+              update: { sessionUpdate: 'tool_call', title: SECRETS.commandLine, rawInput: {} },
+            },
+          }),
+          JSON.stringify({
+            timestamp: '2026-07-17T10:00:05.000Z',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-hostile',
+              update: {
+                sessionUpdate: 'tool_call',
+                title: 'run_terminal_command',
+                rawInput: { command: SECRETS.commandLine },
+              },
+            },
+          }),
+          JSON.stringify({
+            timestamp: '2026-07-17T10:00:05.000Z',
+            method: 'session/update',
+            params: {
+              sessionId: 'sess-hostile',
+              update: {
+                sessionUpdate: 'tool_call',
+                title: 'spawn_subagent',
+                rawInput: { subagent_type: SECRETS.fileContent },
+              },
+              _meta: { totalTokens: 1000, promptId: 'p1' },
+            },
+          }),
+        ],
+        sourceDir: '/sessions/hostile',
+        sessionName: 'sess-hostile',
+        project: 'hostile-project',
+      },
+    ]
+    const { calls } = decodeGrok({ records, context: grokContext })
+    const { sessions } = toGrokObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'grok' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile session', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('drops non-canonical (argument-carrying) tool names instead of emitting them', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toContain('Bash')
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+})
+
+describe('content-smuggling guardrail: real kimi decode -> toObservations is secret-free', () => {
+  // A hostile Kimi wire log planting every secret in the free-text fields the
+  // decode captures: the user message, a Bash command, and a tool NAME carrying
+  // a command line. Minimizing MUST surface none of them.
+  const kimiContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'kimi', sourceRef: 'ref' }
+
+  function decodeAndMinimize() {
+    const records = [
+      {
+        lines: [
+          JSON.stringify({ timestamp: 1776162400, message: { type: 'TurnBegin', payload: { user_input: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}` } } }),
+          JSON.stringify({ timestamp: 1776162401, message: { type: 'ToolCall', payload: { type: 'function', id: 'call-shell', function: { name: SECRETS.commandLine, arguments: '{}' } } } }),
+          JSON.stringify({ timestamp: 1776162402, message: { type: 'ToolCall', payload: { type: 'function', id: 'call-bash', function: { name: 'Shell', arguments: JSON.stringify({ command: SECRETS.commandLine }) } } } }),
+          JSON.stringify({ timestamp: 1776162403, message: { type: 'StatusUpdate', payload: { message_id: 'msg-hostile', token_usage: { input_other: 10, output: 5 } } } }),
+        ],
+        configuredModel: 'kimi-auto',
+        sessionName: 'sess-hostile',
+      },
+    ]
+    const { calls } = decodeKimi({ records, context: kimiContext })
+    const { sessions } = toKimiObservations(
+      { sessionId: 'sess-hostile', projectPath: '', calls },
+      { privacyKey: 'test-privacy-key', provider: 'kimi' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile wire log', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('keeps canonical tool names (Bash) and drops the argument-carrying name', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toContain('Bash')
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+})
+
+describe('content-smuggling guardrail: real codewhale decode -> toObservations is secret-free', () => {
+  // A hostile CodeWhale session planting every secret in the free-text fields
+  // the decode captures: the project path, the user message, a Bash command, a
+  // read/edit file path, a skill name, a subagent type, and a tool NAME carrying
+  // a command line. Minimizing MUST surface none of them.
+  const codeWhaleContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'codewhale', sourceRef: 'ref' }
+
+  function decodeAndMinimize() {
+    const records = [
+      {
+        metadata: {
+          id: 'sess-hostile',
+          total_tokens: 1000,
+          workspace: SECRETS.absPath,
+        },
+        messages: [
+          { role: 'user', content: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}` },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'tool_use', id: 't1', name: SECRETS.commandLine, input: {} },
+              { type: 'tool_use', id: 't2', name: 'exec_shell', input: { command: SECRETS.commandLine } },
+              { type: 'tool_use', id: 't3', name: 'read_file', input: { file_path: SECRETS.absPath } },
+              { type: 'tool_use', id: 't4', name: 'edit_file', input: { path: SECRETS.absPath } },
+              { type: 'tool_use', id: 't5', name: 'load_skill', input: { name: SECRETS.fileContent } },
+              { type: 'tool_use', id: 't6', name: 'agent', input: { type: SECRETS.prompt } },
+            ],
+          },
+        ],
+        fileMtime: '2026-07-17T10:00:00.000Z',
+      },
+    ]
+    const { calls } = decodeCodeWhale({ records, context: codeWhaleContext })
+    const { sessions } = toCodeWhaleObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'codewhale' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile session', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('keeps canonical tool names (Bash/Read/Agent/Skill) and drops the argument-carrying name', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toContain('Bash')
+    expect(allToolNames).toContain('Read')
+    expect(allToolNames).toContain('Agent')
+    expect(allToolNames).toContain('Skill')
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+
+  it('fingerprints the read/edit paths into 16-hex resource refs, never the raw paths', () => {
+    const env = decodeAndMinimize()
+    const reads = env.sessions.flatMap(s => s.calls.flatMap(c => c.resourceReads ?? []))
+    const edits = env.sessions.flatMap(s => s.calls.flatMap(c => c.resourceEdits ?? []))
+    expect(reads.length).toBeGreaterThan(0)
+    expect(edits.length).toBeGreaterThan(0)
+    for (const ref of [...reads, ...edits]) {
+      expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
+    }
+    expect(allStrings([...reads, ...edits])).not.toContain(SECRETS.absPath)
   })
 })
 

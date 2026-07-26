@@ -3,54 +3,24 @@ import { readdir, readFile, stat } from 'fs/promises'
 import { basename, dirname, join } from 'path'
 import { homedir } from 'os'
 
+import { decodeKimi, kimiToolNameMap } from '@codeburn/core/providers/kimi'
+import type { KimiDecodedCall } from '@codeburn/core/providers/kimi'
+
 import { extractBashCommands } from '../bash-utils.js'
-import { readSessionLines } from '../fs-utils.js'
+import { readSessionFile } from '../fs-utils.js'
 import { getShortModelName } from '../models.js'
-import type { ParsedProviderCall, Provider, SessionParser, SessionSource } from './types.js'
+import { createBridgedProvider } from './bridge.js'
+import type { Provider, SessionSource, ParsedProviderCall } from './types.js'
 
 type JsonObject = Record<string, unknown>
 
-const toolNameMap: Record<string, string> = {
-  Shell: 'Bash',
-  Bash: 'Bash',
-  bash: 'Bash',
-  ReadFile: 'Read',
-  ReadMediaFile: 'Read',
-  WriteFile: 'Write',
-  StrReplaceFile: 'Edit',
-  Grep: 'Grep',
-  Glob: 'Glob',
-  SearchWeb: 'WebSearch',
-  FetchURL: 'WebFetch',
-  Agent: 'Agent',
-  AgentTool: 'Agent',
-  TaskList: 'Agent',
-  TaskOutput: 'Agent',
-  TaskStop: 'Agent',
-  AskUserQuestion: 'AskUser',
-  SetTodoList: 'TodoWrite',
-  Think: 'Think',
-  EnterPlanMode: 'EnterPlanMode',
-  ExitPlanMode: 'ExitPlanMode',
-  SendDMail: 'DMail',
-}
-
 function asObject(value: unknown): JsonObject | null {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as JsonObject : null
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as JsonObject) : null
 }
 
 function stringField(obj: JsonObject | null, key: string): string | undefined {
   const value = obj?.[key]
   return typeof value === 'string' ? value : undefined
-}
-
-function numericField(obj: JsonObject, ...keys: string[]): number {
-  for (const key of keys) {
-    const raw = obj[key]
-    const n = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : NaN
-    if (Number.isFinite(n) && n > 0) return Math.trunc(n)
-  }
-  return 0
 }
 
 function getShareDir(overrideDir?: string): string {
@@ -164,177 +134,38 @@ async function getConfiguredModel(shareDir: string): Promise<string> {
   return parseModelIdForKey(raw, defaultModel) ?? defaultModel
 }
 
-function parseJsonObject(text: string | undefined): JsonObject | null {
-  if (!text) return null
-  try {
-    return asObject(JSON.parse(text))
-  } catch {
-    return null
-  }
-}
-
-function extractUserText(value: unknown): string {
-  if (typeof value === 'string') return value.slice(0, 500)
-  if (!Array.isArray(value)) return ''
-
-  return value
-    .map(part => stringField(asObject(part), 'text') ?? '')
-    .filter(Boolean)
-    .join(' ')
-    .slice(0, 500)
-}
-
-function timestampToIso(value: unknown): string {
-  if (typeof value === 'string') return value
-  if (typeof value !== 'number' || !Number.isFinite(value)) return ''
-
-  const millis = value > 1_000_000_000_000 ? value : value * 1000
-  const date = new Date(millis)
-  return Number.isFinite(date.getTime()) ? date.toISOString() : ''
-}
-
-function extractEnvelope(record: JsonObject): { type: string; payload: JsonObject; timestamp: string } | null {
-  const message = asObject(record['message'])
-  const envelope = message ?? record
-  const type = stringField(envelope, 'type')
-  const payload = asObject(envelope['payload'])
-  if (!type || !payload) return null
-  return { type, payload, timestamp: timestampToIso(record['timestamp']) }
-}
-
-function extractUsage(payload: JsonObject): {
-  inputTokens: number
-  outputTokens: number
-  cacheReadInputTokens: number
-  cacheCreationInputTokens: number
-} | null {
-  const usage = asObject(payload['token_usage']) ?? asObject(payload['usage'])
-  if (!usage) return null
-
-  const cacheReadInputTokens = numericField(usage, 'input_cache_read', 'cache_read_input_tokens', 'cached_input_tokens')
-  const cacheCreationInputTokens = numericField(usage, 'input_cache_creation', 'cache_creation_input_tokens')
-  let inputTokens = numericField(usage, 'input_other', 'input_tokens')
-  if (inputTokens === 0) {
-    const totalInput = numericField(usage, 'input')
-    inputTokens = Math.max(0, totalInput - cacheReadInputTokens - cacheCreationInputTokens)
-  }
-  const outputTokens = numericField(usage, 'output', 'output_tokens')
-
-  if (inputTokens === 0 && outputTokens === 0 && cacheReadInputTokens === 0 && cacheCreationInputTokens === 0) {
-    return null
-  }
-
-  return { inputTokens, outputTokens, cacheReadInputTokens, cacheCreationInputTokens }
-}
-
-function extractTool(payload: JsonObject): { tool: string; bashCommands: string[] } | null {
-  const fn = asObject(payload['function'])
-  const rawName = stringField(fn, 'name') ?? stringField(payload, 'name')
-  if (!rawName) return null
-
-  const tool = toolNameMap[rawName] ?? rawName
-  const argsText = stringField(fn, 'arguments') ?? stringField(payload, 'arguments')
-  const args = parseJsonObject(argsText)
-  const command = stringField(args, 'command')
-  const bashCommands = tool === 'Bash' && command ? extractBashCommands(command) : []
-
-  return { tool, bashCommands }
-}
-
-function createParser(source: SessionSource, shareDir: string, seenKeys: Set<string>): SessionParser {
-  return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const configuredModel = await getConfiguredModel(shareDir)
-      const tools = new Set<string>()
-      const bashCommands = new Set<string>()
-      let currentUserMessage = ''
-      const sessionId = basename(dirname(source.path))
-      let index = 0
-
-      for await (const line of readSessionLines(source.path)) {
-        if (!line.trim()) continue
-
-        let record: JsonObject | null = null
-        try {
-          record = asObject(JSON.parse(line))
-        } catch {
-          continue
-        }
-        if (!record) continue
-
-        const envelope = extractEnvelope(record)
-        if (!envelope || envelope.type === 'metadata') continue
-
-        if (envelope.type === 'TurnBegin' || envelope.type === 'SteerInput') {
-          currentUserMessage = extractUserText(envelope.payload['user_input'])
-          continue
-        }
-
-        if (envelope.type === 'TurnEnd') {
-          currentUserMessage = ''
-          tools.clear()
-          bashCommands.clear()
-          continue
-        }
-
-        if (envelope.type === 'ToolCall' || envelope.type === 'ToolCallRequest') {
-          const extracted = extractTool(envelope.payload)
-          if (!extracted) continue
-          tools.add(extracted.tool)
-          for (const command of extracted.bashCommands) bashCommands.add(command)
-          continue
-        }
-
-        if (envelope.type !== 'StatusUpdate') continue
-
-        const usage = extractUsage(envelope.payload)
-        if (!usage) continue
-
-        const rawMessageId = stringField(envelope.payload, 'message_id')
-        const dedupKey = `kimi:${sessionId}:${rawMessageId ?? index}`
-        index++
-        if (seenKeys.has(dedupKey)) continue
-        seenKeys.add(dedupKey)
-
-        const model = stringField(envelope.payload, 'model') ?? stringField(envelope.payload, 'model_name') ?? configuredModel
-
-        yield {
-          provider: 'kimi',
-          model,
-          inputTokens: usage.inputTokens,
-          outputTokens: usage.outputTokens,
-          cacheCreationInputTokens: usage.cacheCreationInputTokens,
-          cacheReadInputTokens: usage.cacheReadInputTokens,
-          cachedInputTokens: usage.cacheReadInputTokens,
-          reasoningTokens: 0,
-          webSearchRequests: 0,
-          costBasis: 'estimated',
-          tools: [...tools],
-          bashCommands: [...bashCommands],
-          timestamp: envelope.timestamp,
-          speed: 'standard',
-          deduplicationKey: dedupKey,
-          userMessage: currentUserMessage,
-          sessionId,
-        }
-
-        tools.clear()
-        bashCommands.clear()
-      }
-    },
-  }
-}
-
 async function addWireSource(sources: SessionSource[], filePath: string, project: string): Promise<void> {
   const s = await stat(filePath).catch(() => null)
   if (!s?.isFile()) return
   sources.push({ path: filePath, project, provider: 'kimi' })
 }
 
+function toProviderCall(rich: KimiDecodedCall): ParsedProviderCall {
+  return {
+    provider: 'kimi',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    costBasis: 'estimated',
+    tools: rich.tools,
+    bashCommands: [...new Set(rich.rawBashCommands.flatMap(c => extractBashCommands(c)))],
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
+  }
+}
+
 export function createKimiProvider(overrideDir?: string): Provider {
   const shareDir = getShareDir(overrideDir)
 
-  return {
+  return createBridgedProvider<KimiDecodedCall>({
     name: 'kimi',
     displayName: 'Kimi',
 
@@ -343,7 +174,7 @@ export function createKimiProvider(overrideDir?: string): Provider {
     },
 
     toolDisplayName(rawTool: string): string {
-      return toolNameMap[rawTool] ?? rawTool
+      return kimiToolNameMap[rawTool] ?? rawTool
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
@@ -377,10 +208,22 @@ export function createKimiProvider(overrideDir?: string): Provider {
       return sources
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, shareDir, seenKeys)
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      const [configuredModel, raw] = await Promise.all([
+        getConfiguredModel(shareDir),
+        readSessionFile(source.path),
+      ])
+      if (raw === null) return null
+      return [{
+        lines: raw.split('\n').filter(l => l.trim()),
+        configuredModel,
+        sessionName: basename(dirname(source.path)),
+      }]
     },
-  }
+
+    decode: decodeKimi,
+    toProviderCall,
+  })
 }
 
 export const kimi = createKimiProvider()
