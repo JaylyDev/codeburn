@@ -25,7 +25,10 @@ import { fileURLToPath } from 'node:url'
 const here = dirname(fileURLToPath(import.meta.url)) // app/scripts
 const appDir = join(here, '..') // app
 const root = join(appDir, '..') // repo root
-const dist = join(root, 'dist')
+const cliPkg = join(root, 'packages', 'cli') // the codeburn CLI workspace
+const dist = join(cliPkg, 'dist')
+// Workspace installs hoist production deps to the repo-root node_modules, so the
+// dependency closure is copied from there.
 const rootModules = join(root, 'node_modules')
 const stage = join(appDir, 'build', 'cli')
 
@@ -38,7 +41,7 @@ for (const f of ['cli.js', 'main.js']) {
 rmSync(stage, { recursive: true, force: true })
 mkdirSync(join(stage, 'dist'), { recursive: true })
 
-copyFileSync(join(root, 'package.json'), join(stage, 'package.json'))
+copyFileSync(join(cliPkg, 'package.json'), join(stage, 'package.json'))
 copyFileSync(join(dist, 'cli.js'), join(stage, 'dist', 'cli.js'))
 copyFileSync(join(dist, 'main.js'), join(stage, 'dist', 'main.js'))
 

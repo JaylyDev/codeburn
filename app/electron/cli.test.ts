@@ -26,7 +26,7 @@ function fakeBin(name: string, body: string): string {
 /** Writes the repo CLI under this test's isolated dev-root override. */
 function fakeDevRepoCli(): string {
   const repoRoot = join(dir, 'dev-repo')
-  const p = join(repoRoot, 'dist', 'cli.js')
+  const p = join(repoRoot, 'packages', 'cli', 'dist', 'cli.js')
   mkdirSync(dirname(p), { recursive: true })
   writeFileSync(p, '#!/usr/bin/env node\n', { mode: 0o755 })
   chmodSync(p, 0o755)

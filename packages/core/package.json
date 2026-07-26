@@ -1,0 +1,32 @@
+{
+  "name": "@codeburn/core",
+  "version": "0.9.19",
+  "description": "Shared, provider-agnostic core for CodeBurn (parsing, pricing, models). Skeleton — populated in later phases of the core extraction.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "author": "AgentSeal <hello@agentseal.org>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/getagentseal/codeburn.git",
+    "directory": "packages/core"
+  }
+}

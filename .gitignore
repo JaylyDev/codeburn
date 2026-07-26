@@ -45,4 +45,4 @@ desktop/
 appstore/
 
 # WIP / not ready
-src/summit.ts
+packages/cli/src/summit.ts

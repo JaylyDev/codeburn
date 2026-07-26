@@ -1,5 +1,12 @@
 # Phase 0 fan-out recipe: lift `calculateCost` out of decoders
 
+> **Path note (Phase 1):** The CLI source has moved into the `packages/cli`
+> workspace. Every `src/...` and `tests/...` path in this document now lives
+> under `packages/cli/` (e.g. `src/pricing-pass.ts` → `packages/cli/src/pricing-pass.ts`,
+> `tests/providers/<name>.test.ts` → `packages/cli/tests/providers/<name>.test.ts`).
+> Relative import paths inside `packages/cli/src` (such as `../../src/pricing-pass.js`)
+> are unaffected because the source tree moved as a whole.
+
 Phase 0 of the `@codeburn/core` extraction (issue #809) moves cost computation
 out of the provider decoders and into a single host-side pricing pass
 (`src/pricing-pass.ts`). Decoders emit **token counts + a `costBasis` marker**;
