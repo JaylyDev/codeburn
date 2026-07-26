@@ -63,7 +63,7 @@ export type CodeburnConfig = {
   proxyPaths?: string[]
 }
 
-function getConfigDir(): string {
+export function getConfigDir(): string {
   return join(homedir(), '.config', 'codeburn')
 }
 

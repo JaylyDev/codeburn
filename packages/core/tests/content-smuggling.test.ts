@@ -200,6 +200,18 @@ describe('content-smuggling guardrail: real claude decode -> toObservations is s
     expect(allToolNames).toContain('Read')
     expect(allToolNames).not.toContain(SECRETS.commandLine)
   })
+
+  it('fingerprints the tool-sequence Read path into a 16-hex resourceRead, never the raw path', () => {
+    const env = buildEnvelope()
+    const reads = env.sessions.flatMap(s => s.calls.flatMap(c => c.resourceReads ?? []))
+    expect(reads.length).toBeGreaterThan(0)
+    for (const ref of reads) {
+      expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
+      expect(typeof ref.resourceClass).toBe('string')
+    }
+    // The planted absolute path must appear nowhere inside the refs.
+    expect(allStrings(reads)).not.toContain(SECRETS.absPath)
+  })
 })
 
 describe('content-smuggling guardrail: real codex decode -> toObservations is secret-free', () => {
@@ -259,6 +271,17 @@ describe('content-smuggling guardrail: real codex decode -> toObservations is se
     expect(allToolNames).toContain('Bash')
     expect(allToolNames).toContain('Read')
     expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+
+  it('fingerprints the read_file path into a 16-hex resourceRead, never the raw path', () => {
+    const env = decodeAndMinimize()
+    const reads = env.sessions.flatMap(s => s.calls.flatMap(c => c.resourceReads ?? []))
+    expect(reads.length).toBeGreaterThan(0)
+    for (const ref of reads) {
+      expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
+      expect(typeof ref.resourceClass).toBe('string')
+    }
+    expect(allStrings(reads)).not.toContain(SECRETS.absPath)
   })
 })
 

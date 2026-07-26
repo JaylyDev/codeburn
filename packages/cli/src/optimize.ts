@@ -4,7 +4,18 @@ import { existsSync, statSync } from 'fs'
 import { basename, join } from 'path'
 import { homedir } from 'os'
 
+import { projectRef as fingerprintProjectRef, resourceFingerprint, sessionRef as fingerprintSessionRef } from '@codeburn/core/fingerprint'
+import { OBSERVATION_SCHEMA_VERSION } from '@codeburn/core/schema'
+import type { CallObservation, ObservationEnvelope, SessionObservation } from '@codeburn/core/observations'
+import type { Finding } from '@codeburn/core/contracts'
+import {
+  contextBloatDetector,
+  duplicateReadsDetector,
+  junkReadsDetector,
+} from '@codeburn/core/detectors'
+
 import { readSessionLines, readSessionFileSync } from './fs-utils.js'
+import { getHostPrivacyKey } from './privacy-key.js'
 import { discoverAllSessions } from './providers/index.js'
 import { parseJsonlLine, shouldSkipLine } from './parser.js'
 import type { DateRange, ProjectSummary, SessionSummary } from './types.js'
@@ -43,10 +54,10 @@ const BASH_TOKENS_PER_CHAR = 0.25
 
 const CLAUDEMD_HEALTHY_LINES = 200
 const CLAUDEMD_HIGH_THRESHOLD_LINES = 400
-const MIN_JUNK_READS_TO_FLAG = 3
+// junk-reads / duplicate-reads flag thresholds now live in @codeburn/core; the
+// host keeps only the impact-tier cutoffs it needs to map a core Finding.
 const JUNK_READS_HIGH_THRESHOLD = 20
 const JUNK_READS_MEDIUM_THRESHOLD = 5
-const MIN_DUPLICATE_READS_TO_FLAG = 5
 const DUPLICATE_READS_HIGH_THRESHOLD = 30
 const DUPLICATE_READS_MEDIUM_THRESHOLD = 10
 const MIN_EDITS_FOR_RATIO = 10
@@ -646,19 +657,102 @@ export function loadMcpConfigs(projectCwds: Iterable<string>, homeDir = homedir(
 }
 
 // ============================================================================
+// Fingerprint-envelope bridge
+// ============================================================================
+//
+// The junk-reads, duplicate-reads and read-to-edit-ratio detectors live in
+// @codeburn/core and operate over an ObservationEnvelope of fingerprinted
+// resource refs — never raw paths. The host builds that envelope from its own
+// ToolCall[] (fingerprinting each read/edit's file path with the persistent host
+// privacy key), runs the core detector, and maps the returned Finding onto the
+// existing WasteFinding display shape. Display strings, fix payloads and trend
+// stay host-derived from the CLI's own path data (D5-A); the core Finding
+// supplies the decision and the authoritative counts.
+
+const READ_RESOURCE_TOOLS = new Set(['Read', 'FileReadTool'])
+const SESSION_KEY_SEP = ''
+
+// Fields the detectors never read, filled with valid placeholders so the object
+// satisfies the CallObservation/SessionObservation types. This envelope is
+// consumed in-process by the pure detectors and is never schema-parsed or
+// emitted, so these placeholders never reach a payload.
+function bridgeCall(name: string, refs: { resourceReads?: CallObservation['resourceReads']; resourceEdits?: CallObservation['resourceEdits'] }): CallObservation {
+  return {
+    provider: 'claude',
+    model: 'host',
+    tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheCreate: 0 },
+    webSearchRequests: 0,
+    speed: 'standard',
+    costBasis: 'estimated',
+    timestamp: '1970-01-01T00:00:00.000Z',
+    dedupKey: 'host',
+    toolNames: [name],
+    turnIndex: 0,
+    ...refs,
+  }
+}
+
+function buildObservationEnvelope(calls: ToolCall[]): ObservationEnvelope {
+  const privacyKey = getHostPrivacyKey()
+
+  const order: string[] = []
+  const groups = new Map<string, ToolCall[]>()
+  for (const c of calls) {
+    const key = `${c.project}${SESSION_KEY_SEP}${c.sessionId}`
+    let g = groups.get(key)
+    if (!g) { g = []; groups.set(key, g); order.push(key) }
+    g.push(c)
+  }
+
+  const sessions: SessionObservation[] = order.map(key => {
+    const groupCalls = groups.get(key)!
+    const obs = groupCalls.map(c => {
+      const filePath = typeof c.input.file_path === 'string' ? c.input.file_path : undefined
+      if (!filePath) return bridgeCall(c.name, {})
+      const fp = resourceFingerprint(privacyKey, filePath)
+      const ref = { resourceId: fp.resourceId, resourceClass: fp.resourceClass }
+      if (READ_RESOURCE_TOOLS.has(c.name)) return bridgeCall(c.name, { resourceReads: [ref] })
+      if (EDIT_TOOL_NAMES.has(c.name)) return bridgeCall(c.name, { resourceEdits: [ref] })
+      return bridgeCall(c.name, {})
+    })
+    return {
+      sessionRef: fingerprintSessionRef(privacyKey, 'claude', key),
+      projectRef: fingerprintProjectRef(privacyKey, key),
+      providerId: 'claude',
+      startedAt: '1970-01-01T00:00:00.000Z',
+      calls: obs,
+      turnCount: 1,
+    }
+  })
+
+  return {
+    schemaVersion: OBSERVATION_SCHEMA_VERSION,
+    generator: { name: '@codeburn/core', version: 'host' },
+    sessions,
+  }
+}
+
+function evidenceCount(finding: Finding, kind: string): number {
+  return finding.evidence.find(e => e.kind === kind)?.count ?? 0
+}
+
+// ============================================================================
 // Detectors
 // ============================================================================
 
 export function detectJunkReads(calls: ToolCall[], dateRange?: DateRange): WasteFinding | null {
-  const dirCounts = new Map<string, number>()
-  let totalJunkReads = 0
-  let recentJunkReads = 0
+  const findings = junkReadsDetector(buildObservationEnvelope(calls))
+  if (findings.length === 0) return null
+  const totalJunkReads = evidenceCount(findings[0], 'junk-reads')
+  const tokensSaved = evidenceCount(findings[0], 'tokens-saved')
 
+  // Display + trend stay host-derived from the raw path data (D5-A).
+  const dirCounts = new Map<string, number>()
+  let recentJunkReads = 0
   for (const call of calls) {
     if (!isReadTool(call.name)) continue
     const filePath = call.input.file_path as string | undefined
     if (!filePath || !JUNK_PATTERN.test(filePath)) continue
-    totalJunkReads++
     if (call.recent) recentJunkReads++
     for (const dir of JUNK_DIRS) {
       if (filePath.includes(`/${dir}/`)) {
@@ -668,15 +762,12 @@ export function detectJunkReads(calls: ToolCall[], dateRange?: DateRange): Waste
     }
   }
 
-  if (totalJunkReads < MIN_JUNK_READS_TO_FLAG) return null
-
   const hasRecentActivity = calls.some(c => c.recent)
   const trend = sessionTrend(recentJunkReads, totalJunkReads, dateRange, hasRecentActivity)
   if (trend === 'resolved') return null
 
   const sorted = [...dirCounts.entries()].sort((a, b) => b[1] - a[1])
   const dirList = sorted.slice(0, TOP_ITEMS_PREVIEW).map(([d, n]) => `${d}/ (${n}x)`).join(', ')
-  const tokensSaved = totalJunkReads * AVG_TOKENS_PER_READ
 
   const detected = sorted.map(([d]) => d)
   const commonDefaults = ['node_modules', '.git', 'dist', '__pycache__']
@@ -700,8 +791,13 @@ export function detectJunkReads(calls: ToolCall[], dateRange?: DateRange): Waste
 }
 
 export function detectDuplicateReads(calls: ToolCall[], dateRange?: DateRange): WasteFinding | null {
-  const sessionFiles = new Map<string, Map<string, { count: number; recent: number }>>()
+  const findings = duplicateReadsDetector(buildObservationEnvelope(calls))
+  if (findings.length === 0) return null
+  const totalDuplicates = evidenceCount(findings[0], 'duplicate-reads')
+  const tokensSaved = evidenceCount(findings[0], 'tokens-saved')
 
+  // Per-file breakdown + trend stay host-derived from the raw path data (D5-A).
+  const sessionFiles = new Map<string, Map<string, { count: number; recent: number }>>()
   for (const call of calls) {
     if (!isReadTool(call.name)) continue
     const filePath = call.input.file_path as string | undefined
@@ -715,22 +811,17 @@ export function detectDuplicateReads(calls: ToolCall[], dateRange?: DateRange): 
     fm.set(filePath, entry)
   }
 
-  let totalDuplicates = 0
   let recentDuplicates = 0
   const fileDupes = new Map<string, number>()
-
   for (const fm of sessionFiles.values()) {
     for (const [file, entry] of fm) {
       if (entry.count <= 1) continue
       const extra = entry.count - 1
-      totalDuplicates += extra
       if (entry.recent > 1) recentDuplicates += entry.recent - 1
       const name = basename(file)
       fileDupes.set(name, (fileDupes.get(name) ?? 0) + extra)
     }
   }
-
-  if (totalDuplicates < MIN_DUPLICATE_READS_TO_FLAG) return null
 
   const hasRecentActivity = calls.some(c => c.recent)
   const trend = sessionTrend(recentDuplicates, totalDuplicates, dateRange, hasRecentActivity)
@@ -741,8 +832,6 @@ export function detectDuplicateReads(calls: ToolCall[], dateRange?: DateRange): 
     .slice(0, TOP_ITEMS_PREVIEW)
     .map(([name, n]) => `${name} (${n + 1}x)`)
     .join(', ')
-
-  const tokensSaved = totalDuplicates * AVG_TOKENS_PER_READ
 
   return {
     id: 'redundant-rereads',
@@ -2191,27 +2280,25 @@ export const READ_TOOL_NAMES = new Set(['Read', 'Grep', 'Glob', 'FileReadTool', 
 export const EDIT_TOOL_NAMES = new Set(['Edit', 'Write', 'FileEditTool', 'FileWriteTool', 'NotebookEdit'])
 
 export function detectLowReadEditRatio(calls: ToolCall[]): WasteFinding | null {
-  let reads = 0
-  let edits = 0
+  const findings = contextBloatDetector(buildObservationEnvelope(calls))
+  if (findings.length === 0) return null
+  const reads = evidenceCount(findings[0], 'reads')
+  const edits = evidenceCount(findings[0], 'edits')
+  const tokensSaved = evidenceCount(findings[0], 'tokens-saved')
+  const ratio = reads / edits
+
+  // Recency (for trend) stays host-derived from the raw calls.
   let recentEdits = 0
   let recentReads = 0
   for (const call of calls) {
     if (READ_TOOL_NAMES.has(call.name)) {
-      reads++
       if (call.recent) recentReads++
     } else if (EDIT_TOOL_NAMES.has(call.name)) {
-      edits++
       if (call.recent) recentEdits++
     }
   }
 
-  if (edits < MIN_EDITS_FOR_RATIO) return null
-  const ratio = reads / edits
-  if (ratio >= HEALTHY_READ_EDIT_RATIO) return null
-
   const impact: Impact = ratio < LOW_RATIO_HIGH_THRESHOLD ? 'high' : ratio < LOW_RATIO_MEDIUM_THRESHOLD ? 'medium' : 'low'
-  const extraReadsNeeded = Math.max(Math.round(edits * HEALTHY_READ_EDIT_RATIO) - reads, 0)
-  const tokensSaved = extraReadsNeeded * AVG_TOKENS_PER_READ
 
   let trend: Trend | 'resolved' = 'active'
   if (recentEdits >= MIN_EDITS_FOR_RATIO) {

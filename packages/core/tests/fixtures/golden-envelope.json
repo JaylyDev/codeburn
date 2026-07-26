@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "0.1.0",
+  "schemaVersion": "0.2.0",
   "generator": {
     "name": "@codeburn/core",
     "version": "0.9.19"
@@ -37,7 +37,13 @@
           "locAdded": 12,
           "locRemoved": 3,
           "interrupted": false,
-          "toolErrors": 0
+          "toolErrors": 0,
+          "resourceReads": [
+            { "resourceId": "1122334455667788", "resourceClass": "source" }
+          ],
+          "resourceEdits": [
+            { "resourceId": "8877665544332211", "resourceClass": "source" }
+          ]
         },
         {
           "provider": "claude",

@@ -17,7 +17,7 @@ function readJson(rel: string): unknown {
 
 const goldenEnvelope = readJson('tests/fixtures/golden-envelope.json')
 const goldenFinding = readJson('tests/fixtures/golden-finding.json')
-const observationSchema = readJson('schemas/observation-0.1.0.json') as object
+const observationSchema = readJson('schemas/observation-0.2.0.json') as object
 const findingSchema = readJson('schemas/finding-0.1.0.json') as object
 
 // strict:false so unknown string formats (date-time) are ignored rather than

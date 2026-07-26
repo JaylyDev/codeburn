@@ -36,11 +36,11 @@ if (!/^[0-9a-f]{16}$/.test(ref)) {
 
 // Trivial schema parse.
 const env = barrel.parseObservationEnvelope({
-  schemaVersion: '0.1.0',
+  schemaVersion: '0.2.0',
   generator: { name: '@codeburn/core', version: '0.0.0-smoke' },
   sessions: [],
 })
-if (env.schemaVersion !== '0.1.0') {
+if (env.schemaVersion !== '0.2.0') {
   console.error('import-smoke: parse returned unexpected envelope')
   process.exit(5)
 }

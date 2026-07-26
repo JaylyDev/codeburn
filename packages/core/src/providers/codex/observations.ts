@@ -8,6 +8,7 @@
 import { projectRef, sessionRef } from '../../fingerprint.js'
 import type { RecordDiagnostic } from '../../diagnostics.js'
 import type { CallObservation, SessionObservation } from '../../observations.js'
+import { extractResourceRefs } from '../resource-refs.js'
 import type { CodexDecodedCall } from './types.js'
 
 /** One Codex session's rich decode, as the host holds it before minimization. */
@@ -31,7 +32,7 @@ export interface CodexToObservationsContext {
 // is dropped rather than emitted.
 const CANONICAL_TOOL_NAME = /^[A-Za-z0-9_.-]{1,64}$/
 
-function toCallObservation(call: CodexDecodedCall, turnIndex: number): CallObservation {
+function toCallObservation(call: CodexDecodedCall, turnIndex: number, privacyKey: string): CallObservation {
   return {
     provider: call.provider,
     model: call.model,
@@ -54,6 +55,7 @@ function toCallObservation(call: CodexDecodedCall, turnIndex: number): CallObser
     ...(call.locAdded !== undefined ? { locAdded: call.locAdded } : {}),
     ...(call.locRemoved !== undefined ? { locRemoved: call.locRemoved } : {}),
     ...(call.editFailed !== undefined ? { editFailed: call.editFailed } : {}),
+    ...extractResourceRefs(privacyKey, call.toolSequence),
   }
 }
 
@@ -71,7 +73,7 @@ function toSessionObservation(decode: RichCodexSessionDecode, ctx: CodexToObserv
       turnCount++
       lastTurnId = call.turnId
     }
-    calls.push(toCallObservation(call, turnIndex))
+    calls.push(toCallObservation(call, turnIndex, ctx.privacyKey))
   }
 
   const timestamps = calls.map(c => c.timestamp).filter(t => t.length > 0).sort()

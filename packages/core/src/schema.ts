@@ -3,8 +3,12 @@ import { z } from 'zod'
 /**
  * ObservationEnvelope schema version. 0.x per decision D8: the observation
  * contract is pre-stability, so consumers must treat minor bumps as breaking.
+ *
+ * 0.2.0 adds the optional per-call `resourceReads` / `resourceEdits` arrays
+ * (ResourceRef). Strictness rules are unchanged: every added field is either a
+ * fingerprint or a coarse enum, so the anti-smuggling property still holds.
  */
-export const OBSERVATION_SCHEMA_VERSION = '0.1.0'
+export const OBSERVATION_SCHEMA_VERSION = '0.2.0'
 
 /**
  * A privacy-preserving fingerprint: the first 16 hex chars of an HMAC-SHA256.
@@ -53,6 +57,36 @@ export type TokenBuckets = z.infer<typeof TokenBuckets>
 /** Inference speed tier. Matches the CLI's `'standard' | 'fast'`. */
 export const Speed = z.enum(['standard', 'fast'])
 export type Speed = z.infer<typeof Speed>
+
+/**
+ * Coarse, non-identifying bucket for a filesystem resource. Mirrors the
+ * `ResourceClass` union produced by `classifyResource` in fingerprint.ts. It is
+ * a small closed enum so it can never carry a raw path or free text.
+ */
+export const ResourceClassName = z.enum([
+  'dependency',
+  'build',
+  'vcs',
+  'config',
+  'source',
+  'doc',
+  'other',
+])
+export type ResourceClassName = z.infer<typeof ResourceClassName>
+
+/**
+ * A reference to a filesystem resource a call touched: the opaque 16-hex
+ * fingerprint of its normalised path plus its coarse class. `.strict()` blocks
+ * any extra field, so the RAW path can never ride along — the structural
+ * anti-smuggling property extended to resource refs.
+ */
+export const ResourceRef = z
+  .object({
+    resourceId: FingerprintHex,
+    resourceClass: ResourceClassName,
+  })
+  .strict()
+export type ResourceRef = z.infer<typeof ResourceRef>
 
 /**
  * How a call's cost was determined.
