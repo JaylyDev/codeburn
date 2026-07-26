@@ -4,16 +4,29 @@ import { randomBytes } from 'crypto'
 import { join } from 'path'
 import { homedir } from 'os'
 
+import type { CodexDecodeState } from '@codeburn/core/providers/codex'
+
 import type { ParsedProviderCall } from './providers/types.js'
 
 // v4: attribute MCP calls emitted as event_msg/mcp_tool_call_end (issue #478).
-// Recent Codex sessions cached under v3 dropped these, so force a re-parse.
-// v5: also attribute CLI-wrapped MCP calls (`mcp-cli call server tool`) that
-// Codex logs as a plain exec_command (issue #478 follow-up). Force a re-parse
-// so sessions cached under v4 pick up the CLI-MCP attribution.
-// v6: rich-session-capture — per-call locAdded/locRemoved/editFailed from
-// patch_apply_end. Sessions cached under v5 lack these fields; re-parse to add.
-const CODEX_CACHE_VERSION = 7
+// v5: also attribute CLI-wrapped MCP calls (`mcp-cli call server tool`).
+// v6: rich-session-capture — per-call locAdded/locRemoved/editFailed.
+// v7: (interim) unchanged decoder output shape.
+// v8 (phase 4, issue #809): the decoder moved to @codeburn/core as a pure
+// function over EXPLICIT serializable state, and cost now leaves the decoder.
+// The persisted format changes accordingly and is bumped once, deliberately:
+//   - `calls` are HOST-PRICED ParsedProviderCall (costBasis:'estimated',
+//     costUSD filled by the pricing pass) instead of self-priced decoder output.
+//   - `state` is the decoder's end-of-file CodexDecodeState (its per-session
+//     streaming locals — running token counters, mid-turn accumulators, id/turn
+//     bookkeeping). `seenKeys` is stripped: cross-file dedup is reconstructed
+//     each run from the session cache, exactly as the pre-phase-4 shared set was.
+//   - `byteOffset` is the byte position after the last complete line consumed,
+//     so a grown (appended-to) rollout resumes from `state`+`byteOffset` and
+//     decodes only the new bytes instead of re-streaming the whole file.
+// This is lossless: Codex rollout files are durable (never auto-deleted), so the
+// one-time re-derive on first run under v8 rebuilds byte-identical data.
+const CODEX_CACHE_VERSION = 8
 const CACHE_FILE = 'codex-results.json'
 
 type FileFingerprint = { mtimeMs: number; sizeBytes: number }
@@ -22,6 +35,8 @@ type FileEntry = {
   mtimeMs: number
   sizeBytes: number
   project: string
+  byteOffset: number
+  state: CodexDecodeState
   calls: ParsedProviderCall[]
 }
 
@@ -54,35 +69,32 @@ async function loadCache(): Promise<ResultCache> {
   return memCache
 }
 
-function getEntry(cache: ResultCache, filePath: string, fp: FileFingerprint): FileEntry | null {
-  if (!Object.hasOwn(cache.files, filePath)) return null
-  const entry = cache.files[filePath]
-  if (entry && entry.mtimeMs === fp.mtimeMs && entry.sizeBytes === fp.sizeBytes) {
-    return entry
-  }
-  return null
-}
-
-export async function readCachedCodexResults(
-  filePath: string,
-): Promise<ParsedProviderCall[] | null> {
-  try {
-    const s = await stat(filePath)
-    const cache = await loadCache()
-    const entry = getEntry(cache, filePath, { mtimeMs: s.mtimeMs, sizeBytes: s.size })
-    return entry?.calls ?? null
-  } catch {}
-  return null
-}
-
 export async function getCachedCodexProject(
   filePath: string,
 ): Promise<string | null> {
   try {
     const s = await stat(filePath)
     const cache = await loadCache()
-    const entry = getEntry(cache, filePath, { mtimeMs: s.mtimeMs, sizeBytes: s.size })
-    return entry?.project ?? null
+    if (!Object.hasOwn(cache.files, filePath)) return null
+    const entry = cache.files[filePath]
+    if (entry && entry.mtimeMs === s.mtimeMs && entry.sizeBytes === s.size) {
+      return entry.project
+    }
+  } catch {}
+  return null
+}
+
+// The stored decode for a file, WITHOUT fingerprint gating: the caller compares
+// the current fingerprint against `mtimeMs`/`sizeBytes` to decide exact-hit
+// (serve `calls`), append-resume (file grew — decode from `byteOffset`+`state`),
+// or cold re-decode.
+export async function readCodexCacheEntry(
+  filePath: string,
+): Promise<FileEntry | null> {
+  try {
+    const cache = await loadCache()
+    if (!Object.hasOwn(cache.files, filePath)) return null
+    return cache.files[filePath] ?? null
   } catch {}
   return null
 }
@@ -98,20 +110,13 @@ export async function fingerprintFile(
   }
 }
 
-export async function writeCachedCodexResults(
+export async function writeCodexCacheEntry(
   filePath: string,
-  project: string,
-  calls: ParsedProviderCall[],
-  fingerprint: FileFingerprint,
+  entry: FileEntry,
 ): Promise<void> {
   try {
     const cache = await loadCache()
-    cache.files[filePath] = {
-      mtimeMs: fingerprint.mtimeMs,
-      sizeBytes: fingerprint.sizeBytes,
-      project,
-      calls,
-    }
+    cache.files[filePath] = entry
   } catch {}
 }
 
@@ -148,3 +153,5 @@ export async function flushCodexCache(): Promise<void> {
     }
   } catch {}
 }
+
+export type { FileEntry as CodexCacheEntry, FileFingerprint as CodexFileFingerprint }
