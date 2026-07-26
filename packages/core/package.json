@@ -30,6 +30,10 @@
     "./contracts": {
       "types": "./dist/contracts.d.ts",
       "import": "./dist/contracts.js"
+    },
+    "./providers/claude": {
+      "types": "./dist/providers/claude/index.d.ts",
+      "import": "./dist/providers/claude/index.js"
     }
   },
   "files": [

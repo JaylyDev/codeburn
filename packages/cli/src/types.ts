@@ -1,89 +1,18 @@
-export type TokenUsage = {
-  inputTokens: number
-  outputTokens: number
-  cacheCreationInputTokens: number
-  cacheReadInputTokens: number
-  cachedInputTokens: number
-  reasoningTokens: number
-  webSearchRequests: number
-}
+// Raw Claude record types + shared token/tool shapes now live in @codeburn/core
+// (the decode layer owns them). Re-exported here so every CLI consumer keeps
+// importing them from './types.js' unchanged.
+export type {
+  TokenUsage,
+  ToolUseBlock,
+  ContentBlock,
+  ApiUsage,
+  ApiUsageIteration,
+  AssistantMessageContent,
+  JournalEntry,
+  ToolCall,
+} from '@codeburn/core/providers/claude'
 
-export type ToolUseBlock = {
-  type: 'tool_use'
-  id: string
-  name: string
-  input: Record<string, unknown>
-}
-
-export type ContentBlock =
-  | { type: 'text'; text: string }
-  | { type: 'thinking'; thinking: string }
-  | ToolUseBlock
-  | { type: string; [key: string]: unknown }
-
-export type ApiUsage = {
-  input_tokens: number
-  output_tokens: number
-  cache_creation_input_tokens?: number
-  cache_creation?: {
-    ephemeral_5m_input_tokens?: number
-    ephemeral_1h_input_tokens?: number
-  }
-  cache_read_input_tokens?: number
-  server_tool_use?: {
-    web_search_requests?: number
-    web_fetch_requests?: number
-  }
-  speed?: 'standard' | 'fast'
-  // Claude Code advisor tool (/advisor): per-turn sub-usage records. A record
-  // with type 'advisor_message' carries the advisor model's own tokens and is
-  // NOT included in the top-level totals above; type 'message' records mirror
-  // the main model and are already covered by the top-level totals.
-  iterations?: ApiUsageIteration[]
-}
-
-export type ApiUsageIteration = {
-  type?: string
-  model?: string
-  input_tokens?: number
-  output_tokens?: number
-  cache_creation_input_tokens?: number
-  cache_creation?: {
-    ephemeral_5m_input_tokens?: number
-    ephemeral_1h_input_tokens?: number
-  }
-  cache_read_input_tokens?: number
-  server_tool_use?: {
-    web_search_requests?: number
-    web_fetch_requests?: number
-  }
-  speed?: 'standard' | 'fast'
-}
-
-export type AssistantMessageContent = {
-  model: string
-  id?: string
-  type: 'message'
-  role: 'assistant'
-  content: ContentBlock[]
-  usage: ApiUsage
-  stop_reason?: string
-}
-
-export type JournalEntry = {
-  type: string
-  uuid?: string
-  parentUuid?: string | null
-  timestamp?: string
-  sessionId?: string
-  cwd?: string
-  version?: string
-  gitBranch?: string
-  promptId?: string
-  message?: AssistantMessageContent | { role: 'user'; content: string | ContentBlock[] }
-  isSidechain?: boolean
-  [key: string]: unknown
-}
+import type { TokenUsage, ToolCall } from '@codeburn/core/providers/claude'
 
 export type ParsedTurn = {
   userMessage: string
@@ -153,12 +82,6 @@ export type ParsedApiCall = {
   /// Count of this call's tool results flagged `is_error` (Claude tool_result
   /// blocks). Bash stderr alone is NOT counted (warnings go there). Omitted at 0.
   toolErrors?: number
-}
-
-export type ToolCall = {
-  tool: string
-  file?: string
-  command?: string
 }
 
 export type TaskCategory =
