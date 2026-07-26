@@ -3,7 +3,7 @@ import { basename, dirname, join, resolve } from 'path'
 import { homedir } from 'os'
 
 import { readSessionLines } from '../fs-utils.js'
-import { calculateCost, getShortModelName } from '../models.js'
+import { getShortModelName } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 import { safeNumber } from '../parser.js'
@@ -217,15 +217,6 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
             return typeof script === 'string' ? extractBashCommands(script) : []
           })
 
-        const costUSD = calculateCost(
-          model,
-          inputTokens,
-          outputTokens + reasoning,
-          cacheCreate,
-          cacheRead,
-          0,
-        )
-
         const timestamp = toIsoTimestamp(meta.timestamp, msg.createdAt)
 
         yield {
@@ -238,7 +229,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           cachedInputTokens: cacheRead,
           reasoningTokens: reasoning,
           webSearchRequests: 0,
-          costUSD,
+          costBasis: 'estimated',
           tools,
           bashCommands,
           timestamp,

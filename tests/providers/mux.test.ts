@@ -5,6 +5,7 @@ import { tmpdir } from 'os'
 
 import { createMuxProvider } from '../../src/providers/mux.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 
 let tmpDir: string
 
@@ -187,7 +188,7 @@ describe('mux provider - session discovery', () => {
     const sessions = await provider.discoverSessions()
     const calls: ParsedProviderCall[] = []
     for (const source of sessions) {
-      for await (const call of provider.createSessionParser(source, seenKeys).parse()) calls.push(call)
+      for await (const call of provider.createSessionParser(source, seenKeys).parse()) calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(2)
@@ -217,7 +218,7 @@ describe('mux provider - chat.jsonl parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'mux' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(1)
@@ -253,7 +254,7 @@ describe('mux provider - chat.jsonl parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'mux' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls[0]!.tools).toEqual(['Read', 'Edit', 'Bash'])
@@ -274,7 +275,7 @@ describe('mux provider - chat.jsonl parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'mux' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
     expect(calls).toHaveLength(0)
   })
@@ -288,7 +289,7 @@ describe('mux provider - chat.jsonl parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'mux' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
     expect(calls).toHaveLength(0)
   })
@@ -301,9 +302,9 @@ describe('mux provider - chat.jsonl parsing', () => {
     const seenKeys = new Set<string>()
 
     const first: ParsedProviderCall[] = []
-    for await (const call of provider.createSessionParser(source, seenKeys).parse()) first.push(call)
+    for await (const call of provider.createSessionParser(source, seenKeys).parse()) first.push(priceProviderCall(call))
     const second: ParsedProviderCall[] = []
-    for await (const call of provider.createSessionParser(source, seenKeys).parse()) second.push(call)
+    for await (const call of provider.createSessionParser(source, seenKeys).parse()) second.push(priceProviderCall(call))
 
     expect(first).toHaveLength(1)
     expect(second).toHaveLength(0)
@@ -320,7 +321,7 @@ describe('mux provider - chat.jsonl parsing', () => {
     const provider = createMuxProvider(tmpDir)
     const source = { path: filePath, project: 'myproject', provider: 'mux' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(2)
     expect(calls[0]!.userMessage).toBe('first question')
@@ -333,7 +334,7 @@ describe('mux provider - chat.jsonl parsing', () => {
     const provider = createMuxProvider(tmpDir)
     const source = { path: join(tmpDir, 'sessions', 'nope', 'chat.jsonl'), project: 'x', provider: 'mux' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
     expect(calls).toHaveLength(0)
   })
 
@@ -350,7 +351,7 @@ describe('mux provider - chat.jsonl parsing', () => {
     const provider = createMuxProvider(tmpDir)
     const source = { path: filePath, project: 'p', provider: 'mux' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(2)
     expect(new Set(calls.map(c => c.deduplicationKey)).size).toBe(2)
@@ -368,7 +369,7 @@ describe('mux provider - chat.jsonl parsing', () => {
     const provider = createMuxProvider(tmpDir)
     const source = { path: filePath, project: 'p', provider: 'mux' }
     const calls: ParsedProviderCall[] = []
-    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(priceProviderCall(call))
 
     expect(calls).toHaveLength(3) // none of the malformed lines aborted the parse
     expect(calls.find(c => c.deduplicationKey === 'mux:ws-abc:good')?.inputTokens).toBe(100)

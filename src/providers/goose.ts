@@ -1,7 +1,7 @@
 import { join } from 'path'
 import { homedir, platform } from 'os'
 
-import { calculateCost, getShortModelName } from '../models.js'
+import { getShortModelName } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, blobToText, type SqliteDatabase } from '../sqlite.js'
 import type { ToolCall } from '../types.js'
@@ -190,7 +190,6 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
         const config = parseModelConfig(blobToText(session.model_config_json))
         const model = config.model_name ?? 'unknown'
-        const costUSD = calculateCost(model, inputTokens, outputTokens, 0, 0, 0)
 
         const { tools, bashCommands, toolSequence } = extractToolsFromMessages(db, sessionId)
         const userMessage = getFirstUserMessage(db, sessionId)
@@ -210,7 +209,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           cachedInputTokens: 0,
           reasoningTokens: 0,
           webSearchRequests: 0,
-          costUSD,
+          costBasis: 'estimated',
           tools,
           bashCommands,
           toolSequence: toolSequence.length > 1 ? toolSequence : undefined,

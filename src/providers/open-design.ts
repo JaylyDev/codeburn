@@ -3,7 +3,6 @@ import { basename, dirname, join } from 'path'
 import { homedir, platform } from 'os'
 
 import { readSessionLines } from '../fs-utils.js'
-import { calculateCost } from '../models.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 const PROVIDER_NAME = 'open-design'
@@ -199,14 +198,6 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         seenKeys.add(dedupKey)
 
         const uncachedInputTokens = Math.max(0, usage.inputTokens - usage.cacheReadTokens)
-        const costUSD = calculateCost(
-          currentModel,
-          uncachedInputTokens,
-          usage.outputTokens + usage.reasoningTokens,
-          0,
-          usage.cacheReadTokens,
-          0,
-        )
 
         yield {
           provider: PROVIDER_NAME,
@@ -220,7 +211,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           cachedInputTokens: usage.cacheReadTokens,
           reasoningTokens: usage.reasoningTokens,
           webSearchRequests: 0,
-          costUSD,
+          costBasis: 'estimated',
           tools: [],
           bashCommands: [],
           timestamp: timestampValue(entry.timestamp),
