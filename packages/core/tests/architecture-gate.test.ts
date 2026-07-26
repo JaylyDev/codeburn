@@ -122,6 +122,16 @@ const USER_MESSAGE_ALLOWLIST = new Set([
   'src/providers/codex/types.ts',
   'src/providers/qwen/decode.ts',
   'src/providers/qwen/types.ts',
+  'src/providers/zerostack/decode.ts',
+  'src/providers/zerostack/types.ts',
+  'src/providers/droid/decode.ts',
+  'src/providers/droid/types.ts',
+  'src/providers/mux/decode.ts',
+  'src/providers/mux/types.ts',
+  'src/providers/open-design/decode.ts',
+  'src/providers/open-design/types.ts',
+  'src/providers/lingtai-tui/decode.ts',
+  'src/providers/lingtai-tui/types.ts',
 ])
 
 describe('architecture gate: no classification or free text in @codeburn/core source', () => {

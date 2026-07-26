@@ -1,0 +1,4 @@
+{"type":"session_start","id":"sess-droid","cwd":"/Users/test/projects/proj-a","title":"parity"}
+{"type":"message","id":"u1","timestamp":"2026-05-01T10:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>ignore me</system-reminder>"},{"type":"text","text":"add a feature"}]}}
+{"type":"message","id":"a1","timestamp":"2026-05-01T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Execute","input":{"command":"python3 - <<'PY'\nimport os\n}\nPY"}},{"type":"tool_use","name":"Read","input":{"file_path":"/tmp/a"}},{"type":"tool_use","name":"Task","input":{"prompt":"do work"}}]}}
+{"type":"message","id":"a2","timestamp":"2026-05-01T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"second"}]}}

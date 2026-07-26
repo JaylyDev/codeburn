@@ -2,45 +2,19 @@ import { readdir, readFile, stat } from 'fs/promises'
 import { basename, dirname, join, resolve } from 'path'
 import { homedir } from 'os'
 
+import { decodeMux, muxToolNameMap } from '@codeburn/core/providers/mux'
+import type { DecodeContext } from '@codeburn/core'
+import type { MuxDecodedCall } from '@codeburn/core/providers/mux'
+
 import { readSessionLines } from '../fs-utils.js'
 import { getShortModelName } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
-import { safeNumber } from '../parser.js'
+import { createBridgedProvider } from './bridge.js'
+import type { Provider, SessionSource, ParsedProviderCall } from './types.js'
 
-const toolNameMap: Record<string, string> = {
-  bash: 'Bash',
-  file_read: 'Read',
-  file_edit_replace_string: 'Edit',
-  file_edit_replace_lines: 'Edit',
-  file_edit_insert: 'Edit',
-  file_edit_operation: 'Edit',
-  web_fetch: 'WebFetch',
-  web_search: 'WebSearch',
-  task: 'Agent',
-  todo: 'TodoWrite',
-}
-
-type MuxPart = {
-  type?: string
-  text?: string
-  toolName?: string
-  input?: unknown
-}
-
-type MuxMessage = {
-  id?: string
-  role?: string
-  parts?: MuxPart[]
-  createdAt?: string
-  metadata?: {
-    model?: string
-    timestamp?: number
-    historySequence?: number
-    usage?: unknown
-    providerMetadata?: Record<string, unknown>
-  }
-}
+// Host-derived scalars the pure core decode needs, packed with the JSONL lines.
+type MuxMeta = { workspaceId: string }
+type MuxPacked = { meta: MuxMeta; records: unknown[] }
 
 function expandHome(p: string): string {
   if (p === '~') return homedir()
@@ -58,6 +32,7 @@ function getMuxRoot(override?: string): string {
 }
 
 // Splits on the first colon only, leaving any colon inside the id intact.
+// Display-layer only; the decoder strips the prefix for the emitted call model.
 function stripProvider(model: string): string {
   const i = model.indexOf(':')
   return i >= 0 ? model.slice(i + 1) : model
@@ -65,15 +40,6 @@ function stripProvider(model: string): string {
 
 function asRecord(v: unknown): Record<string, unknown> | undefined {
   return v !== null && typeof v === 'object' ? (v as Record<string, unknown>) : undefined
-}
-
-// Guard against non-finite / out-of-range ms, which make toISOString() throw.
-function toIsoTimestamp(ts: unknown, createdAt: unknown): string {
-  if (typeof ts === 'number' && Number.isFinite(ts)) {
-    const d = new Date(ts)
-    if (!Number.isNaN(d.getTime())) return d.toISOString()
-  }
-  return typeof createdAt === 'string' ? createdAt : ''
 }
 
 // config.json shape: { projects: [[projectPath, { workspaces: [{ id }] }], ...] }
@@ -147,108 +113,41 @@ async function discoverSessions(root: string): Promise<SessionSource[]> {
   return sources
 }
 
-function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+// Map one rich, cost-free decoder call into the host's ParsedProviderCall. Cost
+// re-enters here; extractBashCommands (with its strip-ansi dependency) runs on
+// the raw scripts the decoder carried through.
+function toProviderCall(rich: MuxDecodedCall): ParsedProviderCall {
   return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const workspaceId = basename(dirname(source.path))
-      let pendingUserMessage = ''
-      let lineIdx = 0
-
-      for await (const line of readSessionLines(source.path)) {
-        lineIdx++
-        let msg: MuxMessage
-        try {
-          msg = JSON.parse(line) as MuxMessage
-        } catch {
-          continue
-        }
-        if (!msg || typeof msg !== 'object') continue
-
-        if (msg.role === 'user') {
-          const texts = (Array.isArray(msg.parts) ? msg.parts : [])
-            .filter(p => p?.type === 'text' && typeof p.text === 'string')
-            .map(p => p.text as string)
-            .filter(Boolean)
-          if (texts.length > 0) pendingUserMessage = texts.join(' ').slice(0, 500)
-          continue
-        }
-
-        if (msg.role !== 'assistant') continue
-        const meta = msg.metadata
-        const usage = asRecord(meta?.usage)
-        if (!meta || !usage) continue
-
-        const pm = meta.providerMetadata ?? {}
-        const anthropic = asRecord(pm['anthropic'])
-
-        // mux reports inputTokens inclusive of cache read+creation and
-        // outputTokens inclusive of reasoning; decompose to codeburn's
-        // cache/reasoning-exclusive convention. Cache creation is Anthropic-only.
-        // The AI SDK v6 normalizes reasoning into usage.reasoningTokens across
-        // every provider family, so that field is the single source of truth.
-        const cacheRead = safeNumber(usage['cachedInputTokens'])
-        const cacheCreate = safeNumber(anthropic?.['cacheCreationInputTokens'])
-        const reasoning = safeNumber(usage['reasoningTokens'])
-        const inputTokens = Math.max(0, safeNumber(usage['inputTokens']) - cacheRead - cacheCreate)
-        const outputTokens = Math.max(0, safeNumber(usage['outputTokens']) - reasoning)
-
-        if (inputTokens === 0 && outputTokens === 0 && cacheRead === 0 && cacheCreate === 0 && reasoning === 0) {
-          continue
-        }
-
-        // Strip the "provider:" prefix — codeburn's getCanonicalName only strips
-        // slash prefixes, so a colon-prefixed model would price at $0.
-        const rawModel = typeof meta.model === 'string' && meta.model ? meta.model : 'unknown'
-        const model = stripProvider(rawModel)
-        const id = typeof msg.id === 'string' && msg.id ? msg.id : `L${lineIdx}`
-        const dedupKey = `mux:${workspaceId}:${id}`
-        if (seenKeys.has(dedupKey)) continue
-        seenKeys.add(dedupKey)
-
-        const toolParts = (Array.isArray(msg.parts) ? msg.parts : []).filter(
-          p => p?.type === 'dynamic-tool' && typeof p.toolName === 'string',
-        )
-        const tools = toolParts.map(p => toolNameMap[p.toolName!] ?? p.toolName!)
-        const bashCommands = toolParts
-          .filter(p => p.toolName === 'bash')
-          .flatMap(p => {
-            const input = asRecord(p.input)
-            const script = input?.['script'] ?? input?.['command']
-            return typeof script === 'string' ? extractBashCommands(script) : []
-          })
-
-        const timestamp = toIsoTimestamp(meta.timestamp, msg.createdAt)
-
-        yield {
-          provider: 'mux',
-          model,
-          inputTokens,
-          outputTokens,
-          cacheCreationInputTokens: cacheCreate,
-          cacheReadInputTokens: cacheRead,
-          cachedInputTokens: cacheRead,
-          reasoningTokens: reasoning,
-          webSearchRequests: 0,
-          costBasis: 'estimated',
-          tools,
-          bashCommands,
-          timestamp,
-          speed: 'standard',
-          deduplicationKey: dedupKey,
-          userMessage: pendingUserMessage,
-          sessionId: workspaceId,
-        }
-
-        pendingUserMessage = ''
-      }
-    },
+    provider: 'mux',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    costBasis: 'estimated',
+    tools: rich.tools,
+    bashCommands: rich.rawBashCommands.flatMap(c => extractBashCommands(c)),
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
   }
+}
+
+function decode(input: { records: unknown[]; context: DecodeContext; seenKeys: Set<string> }): { calls: MuxDecodedCall[] } {
+  const packed = input.records[0] as MuxPacked | undefined
+  if (!packed) return { calls: [] }
+  return decodeMux({ records: packed.records, context: input.context, workspaceId: packed.meta.workspaceId, seenKeys: input.seenKeys })
 }
 
 export function createMuxProvider(muxRoot?: string): Provider {
   const root = getMuxRoot(muxRoot)
 
-  return {
+  return createBridgedProvider<MuxDecodedCall>({
     name: 'mux',
     displayName: 'Mux',
 
@@ -257,17 +156,26 @@ export function createMuxProvider(muxRoot?: string): Provider {
     },
 
     toolDisplayName(rawTool: string): string {
-      return toolNameMap[rawTool] ?? rawTool
+      return muxToolNameMap[rawTool] ?? rawTool
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
       return discoverSessions(root)
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, seenKeys)
+    // I/O adapter: read the chat JSONL lines and pack the workspace id (derived
+    // from the source path) the decoder folds into dedup keys and session ids.
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      const workspaceId = basename(dirname(source.path))
+      const lines: string[] = []
+      for await (const line of readSessionLines(source.path)) lines.push(line)
+      const packed: MuxPacked = { meta: { workspaceId }, records: lines }
+      return [packed]
     },
-  }
+
+    decode,
+    toProviderCall,
+  })
 }
 
 export const mux = createMuxProvider()

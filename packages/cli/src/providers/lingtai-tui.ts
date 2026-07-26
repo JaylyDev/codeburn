@@ -2,35 +2,16 @@ import { readdir, readFile, stat } from 'fs/promises'
 import { basename, delimiter, dirname, join, resolve } from 'path'
 import { homedir } from 'os'
 
+import { decodeLingTaiTui } from '@codeburn/core/providers/lingtai-tui'
+import type { DecodeContext } from '@codeburn/core'
+import type { LingTaiTuiDecodedCall, LingTaiAgentManifest } from '@codeburn/core/providers/lingtai-tui'
+
 import { readSessionLines } from '../fs-utils.js'
 import { getShortModelName } from '../models.js'
-import type { ParsedProviderCall, Provider, SessionParser, SessionSource } from './types.js'
+import { createBridgedProvider } from './bridge.js'
+import type { ParsedProviderCall, Provider, SessionSource } from './types.js'
 
 type JsonObject = Record<string, unknown>
-
-type LingTaiAgentManifest = {
-  agent_id?: string
-  agent_name?: string
-  address?: string
-  nickname?: string | null
-  llm?: {
-    model?: string
-    base_url?: string
-  }
-}
-
-type LingTaiLedgerEntry = {
-  source?: string
-  em_id?: string
-  run_id?: string
-  ts?: string | number
-  input?: number | string
-  output?: number | string
-  thinking?: number | string
-  cached?: number | string
-  model?: string
-  endpoint?: string
-}
 
 type LingTaiProviderOptions = {
   lingtaiHomeOverride?: string
@@ -43,6 +24,16 @@ type LingTaiHome = {
   path: string
   projectPrefix?: string
 }
+
+// Host-derived scalars the pure core decode needs, packed with the ledger lines.
+type LingTaiMeta = {
+  agentId: string
+  fallbackModel: string
+  fallbackEndpoint: string
+  projectPath: string
+  project: string
+}
+type LingTaiPacked = { meta: LingTaiMeta; records: unknown[] }
 
 function normalizeOptions(options?: string | LingTaiProviderOptions): LingTaiProviderOptions {
   return typeof options === 'string'
@@ -165,13 +156,6 @@ function stringField(obj: JsonObject | null, key: string): string | undefined {
   return typeof value === 'string' && value.trim() ? value : undefined
 }
 
-function numericField(obj: JsonObject, key: keyof LingTaiLedgerEntry): number {
-  const raw = obj[key]
-  const n = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : NaN
-  if (!Number.isFinite(n) || n <= 0) return 0
-  return Math.trunc(n)
-}
-
 async function readJson<T>(path: string): Promise<T | null> {
   const raw = await readFile(path, 'utf-8').catch(() => null)
   if (!raw) return null
@@ -217,64 +201,6 @@ function projectFromManifest(manifest: LingTaiAgentManifest | null, fallback: st
   return prefix ? `${prefix}-${name}` : name
 }
 
-function parseTimestamp(raw: unknown): string {
-  if (typeof raw === 'number' && Number.isFinite(raw)) {
-    const ms = raw < 1e12 ? raw * 1000 : raw
-    return new Date(ms).toISOString()
-  }
-  if (typeof raw !== 'string' || !raw.trim()) return ''
-  const d = new Date(raw)
-  return Number.isNaN(d.getTime()) ? '' : d.toISOString()
-}
-
-function parseLedgerLine(line: string | Buffer): LingTaiLedgerEntry | null {
-  const text = Buffer.isBuffer(line) ? line.toString('utf-8') : line
-  if (!text.trim()) return null
-  try {
-    const parsed = JSON.parse(text) as unknown
-    const obj = asObject(parsed)
-    return obj ? obj as LingTaiLedgerEntry : null
-  } catch {
-    return null
-  }
-}
-
-function activityForSource(sourceLabel: string): { userMessage: string; tools: string[]; subagentTypes: string[] } {
-  const normalized = sourceLabel.trim().toLowerCase()
-
-  if (normalized === 'tc_wake' || normalized.startsWith('tc_') || normalized.includes('wake')) {
-    return {
-      userMessage: 'LingTai task coordinator wake',
-      tools: ['Agent'],
-      subagentTypes: ['lingtai-task-coordinator'],
-    }
-  }
-
-  if (normalized === 'daemon') {
-    return {
-      userMessage: 'LingTai daemon task',
-      tools: ['Agent'],
-      subagentTypes: ['lingtai-daemon'],
-    }
-  }
-
-  if (normalized === 'summarize_apriori' || normalized.includes('summar')) {
-    return {
-      userMessage: 'LingTai planning summary',
-      tools: ['EnterPlanMode'],
-      subagentTypes: [],
-    }
-  }
-
-  return {
-    userMessage: normalized === 'main'
-      ? 'LingTai main conversation'
-      : `LingTai ${sourceLabel || 'main'} conversation`,
-    tools: [],
-    subagentTypes: [],
-  }
-}
-
 async function discoverLedgersInHome(home: LingTaiHome): Promise<SessionSource[]> {
   const entries = await readdir(home.path, { withFileTypes: true }).catch(() => [])
   const sources: SessionSource[] = []
@@ -313,91 +239,45 @@ async function discoverLedgers(homes: LingTaiHome[]): Promise<SessionSource[]> {
   return sources
 }
 
-function createParser(source: SessionSource): SessionParser {
+// Map one rich, cost-free decoder call into the host's ParsedProviderCall.
+// LingTai ledgers carry synthetic activity (no shell commands), so bashCommands
+// is the decoder's empty raw list.
+function toProviderCall(rich: LingTaiTuiDecodedCall): ParsedProviderCall {
   return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const agentDir = agentDirFromLedgerPath(source.path)
-      const manifest = await readAgentManifest(agentDir)
-      const agentId = manifest?.agent_id ?? basename(agentDir)
-      const fallbackModel = manifest?.llm?.model ?? 'unknown'
-      const fallbackEndpoint = manifest?.llm?.base_url ?? ''
-      const project = source.project || projectFromManifest(manifest, basename(agentDir))
-      const projectPath = agentDir
-
-      let lineNo = 0
-      for await (const line of readSessionLines(source.path)) {
-        lineNo += 1
-        const entry = parseLedgerLine(line)
-        if (!entry) continue
-
-        const obj = entry as JsonObject
-        const inputTotal = numericField(obj, 'input')
-        const outputTokens = numericField(obj, 'output')
-        const reasoningTokens = numericField(obj, 'thinking')
-        const cachedInputTokens = numericField(obj, 'cached')
-        const totalTokens = inputTotal + outputTokens + reasoningTokens + cachedInputTokens
-        if (totalTokens === 0) continue
-
-        // LingTai records provider-normalized input totals plus a separate
-        // cached count. Match CodeBurn's normal shape by billing cached tokens
-        // in cacheReadInputTokens, not again as fresh input.
-        const inputTokens = Math.max(0, inputTotal - cachedInputTokens)
-        const model = stringField(obj, 'model') ?? fallbackModel
-        const endpoint = stringField(obj, 'endpoint') ?? fallbackEndpoint
-        const timestamp = parseTimestamp(entry.ts)
-        const sourceLabel = stringField(obj, 'source') ?? 'main'
-        const emId = stringField(obj, 'em_id') ?? ''
-        const runId = stringField(obj, 'run_id') ?? ''
-        const sessionId = runId || `${agentId}:${sourceLabel}`
-        const activity = activityForSource(sourceLabel)
-        const dedupKey = [
-          'lingtai-tui',
-          source.path,
-          lineNo,
-          timestamp,
-          model,
-          endpoint,
-          sourceLabel,
-          emId,
-          runId,
-          inputTotal,
-          outputTokens,
-          reasoningTokens,
-          cachedInputTokens,
-        ].join(':')
-
-        yield {
-          provider: 'lingtai-tui',
-          model,
-          inputTokens,
-          outputTokens,
-          cacheCreationInputTokens: 0,
-          cacheReadInputTokens: cachedInputTokens,
-          cachedInputTokens,
-          reasoningTokens,
-          webSearchRequests: 0,
-          costBasis: 'estimated',
-          tools: activity.tools,
-          bashCommands: [],
-          subagentTypes: activity.subagentTypes,
-          timestamp,
-          speed: 'standard',
-          deduplicationKey: dedupKey,
-          turnId: `${sessionId}:line:${lineNo}`,
-          userMessage: activity.userMessage,
-          sessionId,
-          project,
-          projectPath,
-        }
-      }
-    },
+    provider: 'lingtai-tui',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    costBasis: 'estimated',
+    tools: rich.tools,
+    bashCommands: rich.rawBashCommands,
+    subagentTypes: rich.subagentTypes,
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    turnId: rich.turnId,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
+    projectPath: rich.projectPath,
+    ...(rich.project !== undefined ? { project: rich.project } : {}),
   }
+}
+
+function decode(input: { records: unknown[]; context: DecodeContext; seenKeys: Set<string> }): { calls: LingTaiTuiDecodedCall[] } {
+  const packed = input.records[0] as LingTaiPacked | undefined
+  if (!packed) return { calls: [] }
+  return decodeLingTaiTui({ records: packed.records, context: input.context, ...packed.meta, seenKeys: input.seenKeys })
 }
 
 export function createLingTaiTuiProvider(options?: string | LingTaiProviderOptions): Provider {
   const providerOptions = normalizeOptions(options)
 
-  return {
+  return createBridgedProvider<LingTaiTuiDecodedCall>({
     name: 'lingtai-tui',
     displayName: 'LingTai TUI',
 
@@ -413,10 +293,27 @@ export function createLingTaiTuiProvider(options?: string | LingTaiProviderOptio
       return discoverLedgers(await getLingTaiHomes(providerOptions))
     },
 
-    createSessionParser(source: SessionSource): SessionParser {
-      return createParser(source)
+    // I/O adapter: read the agent manifest (for model/endpoint/agent-id/project
+    // fallbacks) and the ledger JSONL lines, packing them for the pure decoder.
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      const agentDir = agentDirFromLedgerPath(source.path)
+      const manifest = await readAgentManifest(agentDir)
+      const meta: LingTaiMeta = {
+        agentId: manifest?.agent_id ?? basename(agentDir),
+        fallbackModel: manifest?.llm?.model ?? 'unknown',
+        fallbackEndpoint: manifest?.llm?.base_url ?? '',
+        projectPath: agentDir,
+        project: source.project || projectFromManifest(manifest, basename(agentDir)),
+      }
+      const lines: string[] = []
+      for await (const line of readSessionLines(source.path)) lines.push(line)
+      const packed: LingTaiPacked = { meta, records: lines }
+      return [packed]
     },
-  }
+
+    decode,
+    toProviderCall,
+  })
 }
 
 export const lingtaiTui = createLingTaiTuiProvider()

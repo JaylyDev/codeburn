@@ -1,0 +1,3 @@
+{"source":"main","ts":"2026-06-04T01:25:09Z","input":100,"output":20,"thinking":5,"cached":10,"model":"gpt-5.5","endpoint":"example-endpoint"}
+{"source":"tc_wake","ts":"2026-06-04T01:28:24Z","input":25,"output":5,"thinking":0,"cached":10}
+{"source":"daemon","em_id":"em-1","run_id":"run-1","ts":"2026-06-04T01:30:24Z","input":50,"output":10,"thinking":0,"cached":50}

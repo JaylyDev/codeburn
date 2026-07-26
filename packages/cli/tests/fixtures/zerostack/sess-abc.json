@@ -1,0 +1,19 @@
+{
+  "id": "sess-abc",
+  "name": "",
+  "messages": [
+    { "role": "user", "content": "hello, what is this repo about?", "estimated_tokens": 7 },
+    { "role": "assistant", "content": "It is a minimal coding agent in Rust.", "estimated_tokens": 92 }
+  ],
+  "compactions": [],
+  "created_at": "2026-06-19T11:33:34.022836+00:00",
+  "updated_at": "2026-06-19T11:34:14.140631+00:00",
+  "total_input_tokens": 34119,
+  "total_output_tokens": 961,
+  "total_cost": 0.015677835,
+  "total_estimated_tokens": 446,
+  "model": "deepseek/deepseek-v4-pro",
+  "provider": "openrouter",
+  "working_dir": "/Users/test/myproject",
+  "permission_allowlist": []
+}

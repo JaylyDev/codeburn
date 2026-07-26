@@ -1,0 +1,67 @@
+import { projectRef, sessionRef } from '../../fingerprint.js'
+import type { RecordDiagnostic } from '../../diagnostics.js'
+import type { CallObservation, SessionObservation } from '../../observations.js'
+import type { MuxDecodedCall } from './types.js'
+
+export interface RichMuxSessionDecode {
+  sessionId: string
+  projectPath: string
+  calls: MuxDecodedCall[]
+}
+
+export interface MuxToObservationsContext {
+  privacyKey: string
+  provider?: string
+}
+
+const CANONICAL_TOOL_NAME = /^[A-Za-z0-9_.-]{1,64}$/
+
+function toCallObservation(call: MuxDecodedCall, turnIndex: number, privacyKey: string): CallObservation {
+  return {
+    provider: call.provider,
+    model: call.model,
+    tokens: {
+      input: call.inputTokens,
+      output: call.outputTokens,
+      reasoning: call.reasoningTokens,
+      cacheRead: call.cacheReadInputTokens,
+      cacheCreate: call.cacheCreationInputTokens,
+    },
+    webSearchRequests: call.webSearchRequests,
+    speed: call.speed,
+    costBasis: 'estimated',
+    timestamp: call.timestamp,
+    dedupKey: call.deduplicationKey,
+    toolNames: call.tools.filter(t => CANONICAL_TOOL_NAME.test(t)),
+    turnIndex,
+  }
+}
+
+function toSessionObservation(decode: RichMuxSessionDecode, ctx: MuxToObservationsContext): SessionObservation {
+  const provider = ctx.provider ?? 'mux'
+  const calls: CallObservation[] = decode.calls.map((call, i) => toCallObservation(call, i, ctx.privacyKey))
+
+  const timestamps = calls.map(c => c.timestamp).filter(t => t.length > 0).sort()
+  const startedAt = timestamps[0] ?? ''
+  const endedAt = timestamps.length > 0 ? timestamps[timestamps.length - 1]! : ''
+
+  const session: SessionObservation = {
+    sessionRef: sessionRef(ctx.privacyKey, provider, decode.sessionId),
+    projectRef: projectRef(ctx.privacyKey, decode.projectPath),
+    providerId: provider,
+    startedAt,
+    ...(endedAt ? { endedAt } : {}),
+    calls,
+    turnCount: calls.length,
+  }
+  return session
+}
+
+export function toObservations(
+  decode: RichMuxSessionDecode | RichMuxSessionDecode[],
+  ctx: MuxToObservationsContext,
+): { sessions: SessionObservation[]; diagnostics: RecordDiagnostic[] } {
+  const decodes = Array.isArray(decode) ? decode : [decode]
+  const sessions = decodes.map(d => toSessionObservation(d, ctx))
+  return { sessions, diagnostics: [] }
+}

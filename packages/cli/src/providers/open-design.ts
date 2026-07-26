@@ -2,8 +2,13 @@ import { readdir, stat } from 'fs/promises'
 import { basename, dirname, join } from 'path'
 import { homedir, platform } from 'os'
 
+import { decodeOpenDesign } from '@codeburn/core/providers/open-design'
+import type { DecodeContext } from '@codeburn/core'
+import type { OpenDesignDecodedCall } from '@codeburn/core/providers/open-design'
+
 import { readSessionLines } from '../fs-utils.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import { createBridgedProvider } from './bridge.js'
+import type { Provider, SessionSource, ParsedProviderCall } from './types.js'
 
 const PROVIDER_NAME = 'open-design'
 const ENV_DIR = 'CODEBURN_OPEN_DESIGN_DIR'
@@ -14,65 +19,9 @@ const modelDisplayNames = new Map<string, string>([
   ['GLM-5.2', 'GLM-5.2'],
 ])
 
-type OpenDesignEntry = {
-  id?: unknown
-  event?: unknown
-  data?: unknown
-  timestamp?: unknown
-}
-
-type TokenUsage = {
-  inputTokens: number
-  outputTokens: number
-  cacheReadTokens: number
-  reasoningTokens: number
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function stringValue(value: unknown): string | undefined {
-  return typeof value === 'string' && value.length > 0 ? value : undefined
-}
-
-function tokenValue(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
-}
-
-function timestampValue(value: unknown): string {
-  const text = stringValue(value)
-  if (text) return text
-  if (typeof value !== 'number' || !Number.isFinite(value)) return ''
-
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? '' : date.toISOString()
-}
-
-function parseEvent(line: string | Buffer): OpenDesignEntry | null {
-  const text = (typeof line === 'string' ? line : line.toString('utf-8')).trim()
-  if (!text) return null
-
-  try {
-    const parsed = JSON.parse(text) as unknown
-    return isRecord(parsed) ? parsed : null
-  } catch {
-    return null
-  }
-}
-
-function parseUsage(data: unknown): TokenUsage | null {
-  if (!isRecord(data) || data['type'] !== 'usage') return null
-  const usage = data['usage']
-  if (!isRecord(usage)) return null
-
-  return {
-    inputTokens: tokenValue(usage['input_tokens']),
-    outputTokens: tokenValue(usage['output_tokens']),
-    cacheReadTokens: tokenValue(usage['cached_read_tokens']),
-    reasoningTokens: tokenValue(usage['thought_tokens']),
-  }
-}
+// Host-derived scalars the pure core decode needs, packed with the event lines.
+type OpenDesignMeta = { sessionId: string; project: string }
+type OpenDesignPacked = { meta: OpenDesignMeta; records: unknown[] }
 
 function getOpenDesignDir(): string {
   const override = process.env[ENV_DIR]
@@ -161,71 +110,39 @@ async function discoverOpenDesignSessions(baseDir: string): Promise<SessionSourc
   return dedupeSources(sources)
 }
 
-function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+// Map one rich, cost-free decoder call into the host's ParsedProviderCall. Open
+// Design records usage events only — no tools or shell commands.
+function toProviderCall(rich: OpenDesignDecodedCall): ParsedProviderCall {
   return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const sessionId = basename(dirname(source.path))
-      let currentModel = ''
-      let fallbackEventCounter = 0
-
-      for await (const line of readSessionLines(source.path)) {
-        const entry = parseEvent(line)
-        if (!entry) continue
-
-        const eventName = stringValue(entry.event)
-        const data = entry.data
-
-        if (eventName === 'start' && isRecord(data)) {
-          const model = stringValue(data['model'])
-          if (model) currentModel = model
-          continue
-        }
-
-        if (eventName !== 'agent' || !isRecord(data)) continue
-
-        if (data['type'] === 'status') {
-          const model = stringValue(data['model'])
-          if (model) currentModel = model
-          continue
-        }
-
-        const usage = parseUsage(data)
-        if (!usage || !currentModel) continue
-
-        const eventId = stringValue(entry.id) ?? `line-${fallbackEventCounter++}`
-        const dedupKey = `${PROVIDER_NAME}:${sessionId}:${eventId}`
-        if (seenKeys.has(dedupKey)) continue
-        seenKeys.add(dedupKey)
-
-        const uncachedInputTokens = Math.max(0, usage.inputTokens - usage.cacheReadTokens)
-
-        yield {
-          provider: PROVIDER_NAME,
-          sessionId,
-          project: source.project,
-          model: currentModel,
-          inputTokens: uncachedInputTokens,
-          outputTokens: usage.outputTokens,
-          cacheCreationInputTokens: 0,
-          cacheReadInputTokens: usage.cacheReadTokens,
-          cachedInputTokens: usage.cacheReadTokens,
-          reasoningTokens: usage.reasoningTokens,
-          webSearchRequests: 0,
-          costBasis: 'estimated',
-          tools: [],
-          bashCommands: [],
-          timestamp: timestampValue(entry.timestamp),
-          speed: 'standard',
-          deduplicationKey: dedupKey,
-          userMessage: '',
-        }
-      }
-    },
+    provider: PROVIDER_NAME,
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    costBasis: 'estimated',
+    tools: rich.tools,
+    bashCommands: rich.rawBashCommands,
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
+    ...(rich.project !== undefined ? { project: rich.project } : {}),
   }
 }
 
+function decode(input: { records: unknown[]; context: DecodeContext; seenKeys: Set<string> }): { calls: OpenDesignDecodedCall[] } {
+  const packed = input.records[0] as OpenDesignPacked | undefined
+  if (!packed) return { calls: [] }
+  return decodeOpenDesign({ records: packed.records, context: input.context, ...packed.meta, seenKeys: input.seenKeys })
+}
+
 export function createOpenDesignProvider(overrideDir?: string): Provider {
-  return {
+  return createBridgedProvider<OpenDesignDecodedCall>({
     name: PROVIDER_NAME,
     displayName: 'Open Design',
 
@@ -241,10 +158,20 @@ export function createOpenDesignProvider(overrideDir?: string): Provider {
       return discoverOpenDesignSessions(overrideDir ?? getOpenDesignDir())
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, seenKeys)
+    // I/O adapter: read the run's events.jsonl lines and pack the session id
+    // (derived from the run dir) plus the discovered project so the decoder can
+    // reproduce the pre-migration call shape.
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      const sessionId = basename(dirname(source.path))
+      const lines: string[] = []
+      for await (const line of readSessionLines(source.path)) lines.push(line)
+      const packed: OpenDesignPacked = { meta: { sessionId, project: source.project }, records: lines }
+      return [packed]
     },
-  }
+
+    decode,
+    toProviderCall,
+  })
 }
 
 export const openDesign = createOpenDesignProvider()
