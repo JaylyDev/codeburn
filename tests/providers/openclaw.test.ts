@@ -1,4 +1,5 @@
 import { describe, it, expect, afterAll } from 'vitest'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import { createOpenClawProvider } from '../../src/providers/openclaw.js'
 import { writeFile, mkdir, rm } from 'fs/promises'
 import { join } from 'path'
@@ -63,7 +64,7 @@ describe('openclaw provider', () => {
     const parser = provider.createSessionParser(sources[0], new Set())
     const calls: any[] = []
     for await (const call of parser.parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
     expect(calls.length).toBe(2)
     expect(calls[0].provider).toBe('openclaw')
@@ -82,7 +83,7 @@ describe('openclaw provider', () => {
     const sources = await provider.discoverSessions()
     const parser = provider.createSessionParser(sources[0], new Set())
     const calls: any[] = []
-    for await (const call of parser.parse()) calls.push(call)
+    for await (const call of parser.parse()) calls.push(priceProviderCall(call))
     expect(calls[1].costUSD).toBe(0.05)
   })
 
@@ -93,7 +94,7 @@ describe('openclaw provider', () => {
     const sources = await provider.discoverSessions()
     const parser = provider.createSessionParser(sources[0], new Set())
     const calls: any[] = []
-    for await (const call of parser.parse()) calls.push(call)
+    for await (const call of parser.parse()) calls.push(priceProviderCall(call))
     expect(calls[1].tools).toContain('Bash')
     expect(calls[1].tools).toContain('Read')
     expect(calls[1].tools).toContain('Write')
@@ -108,11 +109,11 @@ describe('openclaw provider', () => {
     const seen = new Set<string>()
     const parser1 = provider.createSessionParser(sources[0], seen)
     const calls1: any[] = []
-    for await (const c of parser1.parse()) calls1.push(c)
+    for await (const c of parser1.parse()) calls1.push(priceProviderCall(c))
     expect(calls1.length).toBe(2)
     const parser2 = provider.createSessionParser(sources[0], seen)
     const calls2: any[] = []
-    for await (const c of parser2.parse()) calls2.push(c)
+    for await (const c of parser2.parse()) calls2.push(priceProviderCall(c))
     expect(calls2.length).toBe(0)
   })
 
@@ -131,7 +132,7 @@ describe('openclaw provider', () => {
     const sources = await provider.discoverSessions()
     const parser = provider.createSessionParser(sources[0], new Set())
     const calls: any[] = []
-    for await (const c of parser.parse()) calls.push(c)
+    for await (const c of parser.parse()) calls.push(priceProviderCall(c))
     expect(calls[0].model).toBe('gpt-5.5')
   })
 
@@ -150,7 +151,7 @@ describe('openclaw provider', () => {
     const sources = await provider.discoverSessions()
     const parser = provider.createSessionParser(sources[0], new Set())
     const calls: any[] = []
-    for await (const c of parser.parse()) calls.push(c)
+    for await (const c of parser.parse()) calls.push(priceProviderCall(c))
     expect(calls[0].model).toBe('glm-5.1:cloud')
   })
 
@@ -168,7 +169,7 @@ describe('openclaw provider', () => {
     const sources = await provider.discoverSessions()
     const parser = provider.createSessionParser(sources[0], new Set())
     const calls: any[] = []
-    for await (const c of parser.parse()) calls.push(c)
+    for await (const c of parser.parse()) calls.push(priceProviderCall(c))
     expect(calls.length).toBe(0)
   })
 
