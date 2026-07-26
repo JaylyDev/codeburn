@@ -129,6 +129,60 @@ describe('provider registry', () => {
     expect(cursor.modelDisplayName('unknown-model')).toBe('unknown-model')
   })
 
+  describe('dual-registry bridge (legacy + core-migrated resolve identically)', () => {
+    // qwen is a CORE-MIGRATED provider (pure decode lives in
+    // @codeburn/core/providers/qwen, wrapped by the bridge); cline is a LEGACY
+    // in-CLI provider. Both must be indistinguishable through the public
+    // registry API — the whole point of the bridge seam.
+    const REGISTRY_SHAPE = ['name', 'displayName', 'modelDisplayName', 'toolDisplayName', 'discoverSessions', 'createSessionParser'] as const
+
+    it('a bridged (qwen) and a legacy (cline) provider expose the same Provider surface', () => {
+      const bridged = providers.find(p => p.name === 'qwen')!
+      const legacy = providers.find(p => p.name === 'cline')!
+      for (const provider of [bridged, legacy]) {
+        expect(typeof provider.name).toBe('string')
+        expect(typeof provider.displayName).toBe('string')
+        expect(typeof provider.modelDisplayName).toBe('function')
+        expect(typeof provider.toolDisplayName).toBe('function')
+        expect(typeof provider.discoverSessions).toBe('function')
+        expect(typeof provider.createSessionParser).toBe('function')
+      }
+      // The public shape a consumer relies on is identical for both.
+      for (const key of REGISTRY_SHAPE) {
+        expect(bridged).toHaveProperty(key)
+        expect(legacy).toHaveProperty(key)
+      }
+    })
+
+    it('both resolve through getProvider and back the same Provider object', async () => {
+      const bridged = await getProvider('qwen')
+      const legacy = await getProvider('cline')
+      expect(bridged).toBeDefined()
+      expect(legacy).toBeDefined()
+      expect(bridged).toBe(providers.find(p => p.name === 'qwen'))
+      expect(legacy).toBe(providers.find(p => p.name === 'cline'))
+    })
+
+    it('the bridged provider participates in discoverAllSessions like any other', async () => {
+      // An injected legacy fake and the real bridged qwen both flow through the
+      // same discovery loop; qwen's own discovery finds nothing here (no data
+      // dir), which is exactly how a legacy provider with no data behaves.
+      const fake = fakeProvider('legacy-fake', async () => [{ path: '/x.jsonl', project: 'p', provider: 'legacy-fake' }])
+      const qwen = providers.find(p => p.name === 'qwen')!
+      const sources = await discoverAllSessions('all', [qwen, fake])
+      expect(sources.map(s => s.provider)).toEqual(['legacy-fake'])
+    })
+
+    it('the bridged provider normalizes tool display names through the registry', () => {
+      const qwen = providers.find(p => p.name === 'qwen')!
+      // Delegates to the core qwenToolNameMap, resolved identically to how a
+      // legacy provider resolves its own map.
+      expect(qwen.toolDisplayName('execute_command')).toBe('Bash')
+      expect(qwen.toolDisplayName('read_file')).toBe('Read')
+      expect(qwen.toolDisplayName('unknown_tool')).toBe('unknown_tool')
+    })
+  })
+
   describe('provider-discovery isolation', () => {
     it('safeDiscoverSessions returns [] and warns once instead of propagating', async () => {
       const warn = vi.spyOn(process.stderr, 'write').mockReturnValue(true)

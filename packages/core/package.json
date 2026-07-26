@@ -42,6 +42,10 @@
     "./providers/codex": {
       "types": "./dist/providers/codex/index.d.ts",
       "import": "./dist/providers/codex/index.js"
+    },
+    "./providers/qwen": {
+      "types": "./dist/providers/qwen/index.d.ts",
+      "import": "./dist/providers/qwen/index.js"
     }
   },
   "files": [

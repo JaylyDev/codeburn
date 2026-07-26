@@ -13,6 +13,7 @@ export default defineConfig({
     'src/detectors/index.ts',
     'src/providers/claude/index.ts',
     'src/providers/codex/index.ts',
+    'src/providers/qwen/index.ts',
   ],
   format: ['esm'],
   target: 'node20',
