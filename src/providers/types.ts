@@ -24,7 +24,17 @@ export type ParsedProviderCall = {
   cachedInputTokens: number
   reasoningTokens: number
   webSearchRequests: number
-  costUSD: number
+  // Optional so a decoder converted to the host-side pricing pass (see
+  // src/pricing-pass.ts) can omit it and emit `costBasis: 'estimated'` instead;
+  // the pass fills it in from the token buckets before any consumer reads it.
+  // Unconverted decoders still set it directly.
+  costUSD?: number
+  // Set by decoders that no longer price themselves. 'estimated' => the pricing
+  // pass computes costUSD from the token buckets; 'measured' => the decoder set
+  // costUSD to a provider-reported dollar figure and the pass leaves it alone.
+  // Orthogonal to `costIsEstimated`, which flags estimated *tokens* (e.g. char
+  // counts) regardless of how the dollar amount was derived.
+  costBasis?: 'measured' | 'estimated'
   costIsEstimated?: boolean
   tools: string[]
   bashCommands: string[]

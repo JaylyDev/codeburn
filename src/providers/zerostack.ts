@@ -3,7 +3,7 @@ import { basename, join } from 'path'
 import { homedir, platform } from 'os'
 
 import { readSessionFile } from '../fs-utils.js'
-import { calculateCost, getShortModelName } from '../models.js'
+import { getShortModelName } from '../models.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 // zerostack (https://github.com/gi-dellav/zerostack) is a minimal Rust coding
@@ -100,7 +100,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         cachedInputTokens: 0,
         reasoningTokens: 0,
         webSearchRequests: 0,
-        costUSD: calculateCost(model, input, output, 0, 0, 0),
+        costBasis: 'estimated',
         // zerostack persists only final assistant text, not tool-call records,
         // so there is nothing to extract here.
         tools: [],

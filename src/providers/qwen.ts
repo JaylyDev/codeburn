@@ -3,7 +3,6 @@ import { basename, join } from 'path'
 import { homedir } from 'os'
 
 import { readSessionFile } from '../fs-utils.js'
-import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
@@ -119,8 +118,6 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         const reasoningTokens = usage.thoughtsTokenCount ?? 0
         const cachedTokens = usage.cachedContentTokenCount ?? 0
 
-        const costUSD = calculateCost(model, inputTokens, outputTokens + reasoningTokens, 0, cachedTokens, 0)
-
         yield {
           provider: 'qwen',
           model,
@@ -131,7 +128,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           cachedInputTokens: cachedTokens,
           reasoningTokens,
           webSearchRequests: 0,
-          costUSD,
+          // Priced host-side from these buckets: reasoning tokens are billed at
+          // the output rate and cachedTokens as cache-read (see pricing-pass.ts).
+          costBasis: 'estimated',
           tools: [...new Set(tools)],
           bashCommands: [...new Set(bashCommands)],
           timestamp: entry.timestamp || '',

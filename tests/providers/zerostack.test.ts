@@ -4,6 +4,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 
 import { createZerostackProvider } from '../../src/providers/zerostack.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
@@ -82,7 +83,7 @@ describe('zerostack provider - parsing', () => {
     const source = { path, project: 'myproject', provider: 'zerostack' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, seen).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
     return calls
   }

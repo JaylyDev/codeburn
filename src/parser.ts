@@ -6,6 +6,7 @@ import { calculateCost, calculateLocalModelSavings, getShortModelName, isProxied
 import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
 import { normalizeContentBlocks } from './content-utils.js'
 import { discoverAllSessions, getProvider } from './providers/index.js'
+import { priceProviderCall } from './pricing-pass.js'
 import { flushCodexCache } from './codex-cache.js'
 import { antigravityCascadeIdFromPath, flushAntigravityCache, shouldReparseAntigravitySource } from './providers/antigravity.js'
 import { getDesktopSessionsDirs } from './providers/claude.js'
@@ -2337,7 +2338,9 @@ function providerCallToTurn(call: ParsedProviderCall): ParsedTurn {
     provider: call.provider,
     model: call.model,
     usage,
-    costUSD: call.costUSD,
+    // costUSD is optional on ParsedProviderCall now (converted decoders defer it
+    // to the pricing pass); the pass has already run by the time turns are built.
+    costUSD: call.costUSD ?? 0,
     tools,
     mcpTools: extractMcpTools(tools),
     skills: call.skills ?? [],
@@ -2885,7 +2888,10 @@ async function parseProviderSources(
         for await (const call of parser.parse()) {
           providerCalls.push(call)
         }
-        const canonicalCalls = await Promise.all(providerCalls.map(canonicalizeProviderCallProject))
+        // Host-side pricing pass: fill costUSD for converted decoders (which
+        // emit tokens + costBasis) before anything is cached or aggregated.
+        const pricedCalls = providerCalls.map(priceProviderCall)
+        const canonicalCalls = await Promise.all(pricedCalls.map(canonicalizeProviderCallProject))
         const turns = providerCallsToCachedTurns(canonicalCalls)
 
         // Store/merge parsed turns into the cache.
