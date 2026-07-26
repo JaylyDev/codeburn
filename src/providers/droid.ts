@@ -3,7 +3,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 
 import { readSessionFile, readSessionLines } from '../fs-utils.js'
-import { calculateCost, getShortModelName } from '../models.js'
+import { getShortModelName } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import { normalizeContentBlocks } from '../content-utils.js'
 import type {
@@ -255,15 +255,6 @@ function createParser(
         if (seenKeys.has(dedupKey)) continue
         seenKeys.add(dedupKey)
 
-        const costUSD = calculateCost(
-          sessionModelDisplay.toLowerCase(),
-          inputTokens,
-          outputTokens + thinkingTokens,
-          cacheCreationTokens,
-          cacheReadTokens,
-          0,
-        )
-
         // Use the call's timestamp, or session_start timestamp
         const timestamp = call.timestamp || ''
 
@@ -277,7 +268,7 @@ function createParser(
           cachedInputTokens: cacheReadTokens,
           reasoningTokens: thinkingTokens,
           webSearchRequests: 0,
-          costUSD,
+          costBasis: 'estimated',
           tools: call.tools,
           bashCommands: call.bashCommands,
           timestamp,

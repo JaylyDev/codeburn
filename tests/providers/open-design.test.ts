@@ -8,6 +8,7 @@ import { clearSessionCache, filterProjectsByDateRange, parseAllSessions } from '
 import { allProviderNames } from '../../src/providers/index.js'
 import { createOpenDesignProvider } from '../../src/providers/open-design.js'
 import type { ParsedProviderCall, SessionSource } from '../../src/providers/types.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 
 const fixtureRoot = join(import.meta.dirname, '../fixtures/open-design')
 const dataDir = join(fixtureRoot, 'namespaces', 'release-stable', 'data')
@@ -19,7 +20,7 @@ let cacheDir: string | undefined
 async function collect(source: SessionSource, seenKeys = new Set<string>()): Promise<ParsedProviderCall[]> {
   const provider = createOpenDesignProvider()
   const calls: ParsedProviderCall[] = []
-  for await (const call of provider.createSessionParser(source, seenKeys).parse()) calls.push(call)
+  for await (const call of provider.createSessionParser(source, seenKeys).parse()) calls.push(priceProviderCall(call))
   return calls
 }
 

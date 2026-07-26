@@ -3,7 +3,7 @@ import { basename, delimiter, dirname, join, resolve } from 'path'
 import { homedir } from 'os'
 
 import { readSessionLines } from '../fs-utils.js'
-import { calculateCost, getShortModelName } from '../models.js'
+import { getShortModelName } from '../models.js'
 import type { ParsedProviderCall, Provider, SessionParser, SessionSource } from './types.js'
 
 type JsonObject = Record<string, unknown>
@@ -366,15 +366,6 @@ function createParser(source: SessionSource): SessionParser {
           cachedInputTokens,
         ].join(':')
 
-        const costUSD = calculateCost(
-          model,
-          inputTokens,
-          outputTokens + reasoningTokens,
-          0,
-          cachedInputTokens,
-          0,
-        )
-
         yield {
           provider: 'lingtai-tui',
           model,
@@ -385,7 +376,7 @@ function createParser(source: SessionSource): SessionParser {
           cachedInputTokens,
           reasoningTokens,
           webSearchRequests: 0,
-          costUSD,
+          costBasis: 'estimated',
           tools: activity.tools,
           bashCommands: [],
           subagentTypes: activity.subagentTypes,
