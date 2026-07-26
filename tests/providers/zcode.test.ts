@@ -6,6 +6,7 @@ import { createRequire } from 'node:module'
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { isSqliteAvailable } from '../../src/sqlite.js'
 import { createZcodeProvider } from '../../src/providers/zcode.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 const requireForTest = createRequire(import.meta.url)
@@ -86,7 +87,7 @@ function seed(dbPath: string): void {
 
 async function collect(parser: { parse(): AsyncGenerator<ParsedProviderCall> }): Promise<ParsedProviderCall[]> {
   const out: ParsedProviderCall[] = []
-  for await (const call of parser.parse()) out.push(call)
+  for await (const call of parser.parse()) out.push(priceProviderCall(call))
   return out
 }
 

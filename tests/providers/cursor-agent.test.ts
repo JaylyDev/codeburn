@@ -6,6 +6,7 @@ import { tmpdir } from 'os'
 
 import { getAllProviders } from '../../src/providers/index.js'
 import { createCursorAgentProvider } from '../../src/providers/cursor-agent.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import { estimateTokensFromChars } from '../../src/token-estimate.js'
 import type { ParsedProviderCall, Provider, SessionSource } from '../../src/providers/types.js'
 import { isSqliteAvailable } from '../../src/sqlite.js'
@@ -40,7 +41,7 @@ async function makeBaseDir(): Promise<string> {
 async function collectCalls(provider: Provider, source: SessionSource): Promise<ParsedProviderCall[]> {
   const calls: ParsedProviderCall[] = []
   for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-    calls.push(call)
+    calls.push(priceProviderCall(call))
   }
   return calls
 }

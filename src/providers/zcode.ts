@@ -1,7 +1,6 @@
 import { join } from 'path'
 import { homedir } from 'os'
 
-import { calculateCost } from '../models.js'
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, type SqliteDatabase } from '../sqlite.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
@@ -169,7 +168,6 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           }
 
           const model = row.model_id
-          const costUSD = calculateCost(model, freshInput, output, cacheCreation, cacheRead, 0)
 
           yield {
             provider: 'zcode',
@@ -181,7 +179,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
             cachedInputTokens: 0,
             reasoningTokens: reasoning,
             webSearchRequests: 0,
-            costUSD,
+            costBasis: 'estimated',
             tools,
             bashCommands: [],
             timestamp: epochMsToIso(row.completed_at ?? row.started_at),
