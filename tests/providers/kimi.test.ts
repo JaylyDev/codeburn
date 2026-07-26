@@ -5,6 +5,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 
 import { createKimiProvider } from '../../src/providers/kimi.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
@@ -44,7 +45,7 @@ async function writeSession(workDir: string, sessionId: string, lines: string[])
 async function collect(provider: ReturnType<typeof createKimiProvider>, path: string, seen = new Set<string>()): Promise<ParsedProviderCall[]> {
   const parser = provider.createSessionParser({ path, project: 'app', provider: 'kimi' }, seen)
   const calls: ParsedProviderCall[] = []
-  for await (const call of parser.parse()) calls.push(call)
+  for await (const call of parser.parse()) calls.push(priceProviderCall(call))
   return calls
 }
 

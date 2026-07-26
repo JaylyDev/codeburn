@@ -3,7 +3,6 @@ import { join } from 'path'
 import { homedir } from 'os'
 import zlib from 'zlib'
 
-import { calculateCost } from '../models.js'
 import { getSqliteLoadError, isSqliteAvailable, openDatabase, type SqliteDatabase } from '../sqlite.js'
 import type { ParsedProviderCall, Provider, SessionParser, SessionSource } from './types.js'
 
@@ -88,7 +87,7 @@ function buildCall(opts: {
     cachedInputTokens: cacheRead,
     reasoningTokens: 0,
     webSearchRequests: 0,
-    costUSD: calculateCost(opts.model, input, output, cacheWrite, cacheRead, 0),
+    costBasis: 'estimated',
     tools: [],
     bashCommands: [],
     timestamp: opts.timestamp,

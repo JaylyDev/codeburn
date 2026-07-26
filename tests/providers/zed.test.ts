@@ -7,6 +7,7 @@ import zlib from 'zlib'
 
 import { createZedProvider } from '../../src/providers/zed.js'
 import { isSqliteAvailable } from '../../src/sqlite.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 const requireForTest = createRequire(import.meta.url)
@@ -76,7 +77,7 @@ async function collectCalls(dbPath: string, seenKeys = new Set<string>()): Promi
   const calls: ParsedProviderCall[] = []
   for (const source of sources) {
     for await (const call of provider.createSessionParser(source, seenKeys).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
   }
   return calls

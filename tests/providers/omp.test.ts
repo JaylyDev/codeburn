@@ -4,6 +4,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 
 import { createOmpProvider } from '../../src/providers/pi.js'
+import { priceProviderCall } from '../../src/pricing-pass.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
@@ -149,7 +150,7 @@ describe('omp provider - JSONL parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'omp' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(1)
@@ -179,7 +180,7 @@ describe('omp provider - JSONL parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'omp' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     // cost must be calculated by codeburn, not taken from usage.cost (which is zeroed in fixture)
@@ -199,7 +200,7 @@ describe('omp provider - JSONL parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'omp' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls[0]!.tools).toEqual(['Read', 'Edit', 'Bash'])
@@ -217,7 +218,7 @@ describe('omp provider - JSONL parsing', () => {
     const source = { path: filePath, project: 'myproject', provider: 'omp' }
     const calls: ParsedProviderCall[] = []
     for await (const call of provider.createSessionParser(source, new Set()).parse()) {
-      calls.push(call)
+      calls.push(priceProviderCall(call))
     }
 
     expect(calls).toHaveLength(0)
