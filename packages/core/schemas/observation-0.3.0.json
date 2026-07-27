@@ -63,7 +63,9 @@
               },
               "providerId": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[A-Za-z0-9_.-]+$"
               },
               "startedAt": {
                 "type": "string",
@@ -87,15 +89,21 @@
                   "properties": {
                     "provider": {
                       "type": "string",
-                      "minLength": 1
+                      "minLength": 1,
+                      "maxLength": 64,
+                      "pattern": "^[A-Za-z0-9_.-]+$"
                     },
                     "model": {
                       "type": "string",
-                      "minLength": 1
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[A-Za-z0-9._:+-][A-Za-z0-9._:/+-]*$"
                     },
                     "pricingModel": {
                       "type": "string",
-                      "minLength": 1
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[A-Za-z0-9._:+-][A-Za-z0-9._:/+-]*$"
                     },
                     "tokens": {
                       "type": "object",
@@ -160,9 +168,9 @@
                       "type": "string",
                       "format": "date-time"
                     },
-                    "dedupKey": {
+                    "callRef": {
                       "type": "string",
-                      "minLength": 1
+                      "pattern": "^[0-9a-f]{32}$"
                     },
                     "toolNames": {
                       "type": "array",
@@ -266,7 +274,7 @@
                     "speed",
                     "costBasis",
                     "timestamp",
-                    "dedupKey",
+                    "callRef",
                     "toolNames",
                     "turnIndex"
                   ],

@@ -35,7 +35,7 @@
           "costBasis": "measured",
           "measuredCostUSD": 0.0123,
           "timestamp": "2026-07-17T10:00:05.000Z",
-          "dedupKey": "call-0001",
+          "callRef": "c0001000000000000000000000000000",
           "toolNames": ["Read", "Edit", "Bash"],
           "turnIndex": 0,
           "locAdded": 12,
@@ -64,7 +64,7 @@
           "costBasis": "estimated",
           "fallbackCostUSD": 0.004,
           "timestamp": "2026-07-17T10:05:00.000Z",
-          "dedupKey": "call-0002",
+          "callRef": "c0002000000000000000000000000000",
           "toolNames": ["WebSearch"],
           "turnIndex": 1
         }

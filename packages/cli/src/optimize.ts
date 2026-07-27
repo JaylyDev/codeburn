@@ -696,7 +696,10 @@ function bridgeCall(name: string, refs: { resourceReads?: CallObservation['resou
     speed: 'standard',
     costBasis: 'estimated',
     timestamp: '1970-01-01T00:00:00.000Z',
-    dedupKey: 'host',
+    // A constant placeholder ref: this in-process envelope never leaves the
+    // host and the detectors never de-duplicate on it, but the field is a
+    // 32-hex fingerprint now, so a bare 'host' would no longer type-check.
+    callRef: '0'.repeat(32),
     toolNames: [name],
     turnIndex: 0,
     ...refs,

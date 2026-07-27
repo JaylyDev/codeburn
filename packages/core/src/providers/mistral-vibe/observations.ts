@@ -4,7 +4,8 @@
 // user message and raw bash command strings, but those stay in the rich decode;
 // they are never copied into the minimized envelope.
 
-import { projectRef, sessionRef } from '../../fingerprint.js'
+import { callRef, projectRef, sessionRef } from '../../fingerprint.js'
+import { toCanonicalModelId, toCanonicalProviderId } from '../../schema.js'
 import type { RecordDiagnostic } from '../../diagnostics.js'
 import type { CallObservation, SessionObservation } from '../../observations.js'
 import type { MistralVibeDecodedCall } from './types.js'
@@ -30,10 +31,10 @@ export interface MistralVibeToObservationsContext {
 // dropped rather than emitted.
 const CANONICAL_TOOL_NAME = /^[A-Za-z0-9_.-]{1,64}$/
 
-function toCallObservation(call: MistralVibeDecodedCall, turnIndex: number): CallObservation {
+function toCallObservation(call: MistralVibeDecodedCall, turnIndex: number, privacyKey: string): CallObservation {
   return {
-    provider: call.provider,
-    model: call.model,
+    provider: toCanonicalProviderId(call.provider),
+    model: toCanonicalModelId(call.model),
     tokens: {
       input: call.inputTokens,
       output: call.outputTokens,
@@ -46,7 +47,7 @@ function toCallObservation(call: MistralVibeDecodedCall, turnIndex: number): Cal
     costBasis: 'measured',
     measuredCostUSD: call.measuredCostUSD,
     timestamp: call.timestamp,
-    dedupKey: call.deduplicationKey,
+    callRef: callRef(privacyKey, call.provider, call.deduplicationKey),
     toolNames: call.tools.filter(t => CANONICAL_TOOL_NAME.test(t)),
     turnIndex,
   }
@@ -57,7 +58,7 @@ function toSessionObservation(
   ctx: MistralVibeToObservationsContext,
 ): SessionObservation {
   const provider = ctx.provider ?? 'mistral-vibe'
-  const calls: CallObservation[] = decode.calls.map((call, i) => toCallObservation(call, i))
+  const calls: CallObservation[] = decode.calls.map((call, i) => toCallObservation(call, i, ctx.privacyKey))
 
   const timestamps = calls.map(c => c.timestamp).filter(t => t.length > 0).sort()
   const startedAt = timestamps[0] ?? ''

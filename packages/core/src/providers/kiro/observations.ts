@@ -3,7 +3,8 @@
 // names cross into the output — never the user message, project path, or raw
 // tool names.
 
-import { projectRef, sessionRef } from '../../fingerprint.js'
+import { callRef, projectRef, sessionRef } from '../../fingerprint.js'
+import { toCanonicalModelId, toCanonicalProviderId } from '../../schema.js'
 import type { RecordDiagnostic } from '../../diagnostics.js'
 import type { CallObservation, SessionObservation } from '../../observations.js'
 import type { KiroDecodedCall } from './types.js'
@@ -28,10 +29,10 @@ export interface KiroToObservationsContext {
 // This filter is the containment boundary for kiro's arbitrary tool names.
 const CANONICAL_TOOL_NAME = /^[A-Za-z0-9_.-]{1,64}$/
 
-function toCallObservation(call: KiroDecodedCall, turnIndex: number): CallObservation {
+function toCallObservation(call: KiroDecodedCall, turnIndex: number, privacyKey: string): CallObservation {
   return {
-    provider: call.provider,
-    model: call.model,
+    provider: toCanonicalProviderId(call.provider),
+    model: toCanonicalModelId(call.model),
     tokens: {
       input: call.inputTokens,
       output: call.outputTokens,
@@ -43,7 +44,7 @@ function toCallObservation(call: KiroDecodedCall, turnIndex: number): CallObserv
     speed: call.speed,
     costBasis: call.credits > 0 ? 'measured' : 'estimated',
     timestamp: call.timestamp,
-    dedupKey: call.deduplicationKey,
+    callRef: callRef(privacyKey, call.provider, call.deduplicationKey),
     toolNames: call.tools.filter(t => CANONICAL_TOOL_NAME.test(t)),
     turnIndex,
   }
@@ -51,7 +52,7 @@ function toCallObservation(call: KiroDecodedCall, turnIndex: number): CallObserv
 
 function toSessionObservation(decode: RichKiroSessionDecode, ctx: KiroToObservationsContext): SessionObservation {
   const provider = ctx.provider ?? 'kiro'
-  const calls: CallObservation[] = decode.calls.map((call, i) => toCallObservation(call, i))
+  const calls: CallObservation[] = decode.calls.map((call, i) => toCallObservation(call, i, ctx.privacyKey))
 
   const timestamps = calls.map(c => c.timestamp).filter(t => t.length > 0).sort()
   const startedAt = timestamps[0] ?? ''

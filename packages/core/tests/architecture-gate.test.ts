@@ -323,12 +323,11 @@ const MACHINE_ID_ALLOWLIST = new Set<string>([
   'observation-0.2.0#ObservationEnvelope/sessions/items/calls/items/model',
   'observation-0.2.0#ObservationEnvelope/sessions/items/calls/items/pricingModel',
   'observation-0.2.0#ObservationEnvelope/sessions/items/calls/items/dedupKey',
+  // 0.3.0 leaves only the generator version unbounded — it is a semver string
+  // the host stamps, not a decoded value. `providerId` / `provider` / `model` /
+  // `pricingModel` are now length- and charset-capped, and the raw `dedupKey`
+  // is gone entirely, replaced by the fingerprinted `callRef`.
   'observation-0.3.0#ObservationEnvelope/generator/version',
-  'observation-0.3.0#ObservationEnvelope/sessions/items/providerId',
-  'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/provider',
-  'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/model',
-  'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/pricingModel',
-  'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/dedupKey',
 ])
 
 // The complete, frozen surface of string-typed schema properties. Regenerating
@@ -390,17 +389,17 @@ const EXPECTED_STRING_FIELDS: StringField[] = [
   { path: 'observation-0.3.0#ObservationEnvelope/fingerprints/keyId', kind: 'pattern:^[A-Za-z0-9_.-]+$' },
   { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/sessionRef', kind: 'pattern:^[0-9a-f]{32}$' },
   { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/projectRef', kind: 'pattern:^[0-9a-f]{32}$' },
-  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/providerId', kind: 'minLength-only:1' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/providerId', kind: 'pattern:^[A-Za-z0-9_.-]+$' },
   { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/startedAt', kind: 'format:date-time' },
   { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/endedAt', kind: 'format:date-time' },
   { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/gitBranchRef', kind: 'pattern:^[0-9a-f]{32}$' },
-  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/provider', kind: 'minLength-only:1' },
-  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/model', kind: 'minLength-only:1' },
-  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/pricingModel', kind: 'minLength-only:1' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/provider', kind: 'pattern:^[A-Za-z0-9_.-]+$' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/model', kind: 'pattern:^[A-Za-z0-9._:+-][A-Za-z0-9._:/+-]*$' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/pricingModel', kind: 'pattern:^[A-Za-z0-9._:+-][A-Za-z0-9._:/+-]*$' },
   { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/speed', kind: 'enum[2]' },
   { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/costBasis', kind: 'enum[2]' },
   { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/timestamp', kind: 'format:date-time' },
-  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/dedupKey', kind: 'minLength-only:1' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/callRef', kind: 'pattern:^[0-9a-f]{32}$' },
   { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/toolNames/items', kind: 'pattern:^[A-Za-z0-9_.-]+$' },
   { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/resourceReads/items/resourceId', kind: 'pattern:^[0-9a-f]{32}$' },
   { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/resourceReads/items/resourceClass', kind: 'enum[7]' },

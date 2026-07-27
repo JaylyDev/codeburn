@@ -31,7 +31,7 @@ function callWith(fields: Partial<CallObservation>): CallObservation {
     speed: 'standard',
     costBasis: 'estimated',
     timestamp: '2026-07-17T10:00:00.000Z',
-    dedupKey: `d${idSeq++}`,
+    callRef: hex32(),
     toolNames: [],
     turnIndex: 0,
     ...fields,

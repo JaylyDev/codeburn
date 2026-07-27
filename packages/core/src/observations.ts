@@ -1,6 +1,8 @@
 import { z } from 'zod'
 
 import {
+  CanonicalModelId,
+  CanonicalProviderId,
   CanonicalToolName,
   CostBasis,
   FingerprintAlgorithm,
@@ -27,9 +29,9 @@ import {
  */
 export const CallObservation = z
   .object({
-    provider: z.string().min(1),
-    model: z.string().min(1),
-    pricingModel: z.string().min(1).optional(),
+    provider: CanonicalProviderId,
+    model: CanonicalModelId,
+    pricingModel: CanonicalModelId.optional(),
 
     tokens: TokenBuckets,
     webSearchRequests: NonNegInt,
@@ -42,7 +44,16 @@ export const CallObservation = z
     fallbackCostUSD: NonNegUSD.optional(),
 
     timestamp: IsoTimestamp,
-    dedupKey: z.string().min(1),
+    /**
+     * Opaque ref for this call, replacing the raw `dedupKey` of schema 0.2.0.
+     *
+     * Provider dedup keys are built from provider-native ids and routinely
+     * embed session, message, or record ids — the very identifiers every other
+     * field fingerprints. Emitting one verbatim reopened the hole the rest of
+     * the layer closes. Hosts de-duplicate by comparing refs; the mapping is
+     * stable per privacy key, which is all de-duplication requires.
+     */
+    callRef: FingerprintHex,
     /** Canonical tool names only — never arguments. */
     toolNames: z.array(CanonicalToolName),
     turnIndex: NonNegInt,
@@ -81,7 +92,7 @@ export const SessionObservation = z
   .object({
     sessionRef: FingerprintHex,
     projectRef: FingerprintHex,
-    providerId: z.string().min(1),
+    providerId: CanonicalProviderId,
     startedAt: IsoTimestamp,
     endedAt: IsoTimestamp.optional(),
     gitBranchRef: FingerprintHex.optional(),

@@ -12,7 +12,8 @@
 // No host-held user prompt, tools, bashCommands, file paths, or command lines
 // exist at this layer.
 
-import { projectRef, sessionRef } from '../../fingerprint.js'
+import { callRef, projectRef, sessionRef } from '../../fingerprint.js'
+import { toCanonicalModelId, toCanonicalProviderId } from '../../schema.js'
 import type { RecordDiagnostic } from '../../diagnostics.js'
 import type { CallObservation, SessionObservation } from '../../observations.js'
 import type { VercelGatewayDecodedCall } from './types.js'
@@ -33,10 +34,10 @@ export interface VercelGatewayToObservationsContext {
   provider?: string
 }
 
-function toCallObservation(call: VercelGatewayDecodedCall, turnIndex: number): CallObservation {
+function toCallObservation(call: VercelGatewayDecodedCall, turnIndex: number, privacyKey: string): CallObservation {
   return {
-    provider: call.provider,
-    model: call.model,
+    provider: toCanonicalProviderId(call.provider),
+    model: toCanonicalModelId(call.model),
     tokens: {
       input: call.inputTokens,
       output: call.outputTokens,
@@ -50,7 +51,7 @@ function toCallObservation(call: VercelGatewayDecodedCall, turnIndex: number): C
     costBasis: 'measured',
     measuredCostUSD: call.costUSD,
     timestamp: call.timestamp,
-    dedupKey: call.deduplicationKey,
+    callRef: callRef(privacyKey, call.provider, call.deduplicationKey),
     toolNames: [],
     turnIndex,
   }
@@ -61,7 +62,7 @@ function toSessionObservation(
   ctx: VercelGatewayToObservationsContext,
 ): SessionObservation {
   const provider = ctx.provider ?? 'vercel-gateway'
-  const calls = decode.calls.map((call, i) => toCallObservation(call, i))
+  const calls = decode.calls.map((call, i) => toCallObservation(call, i, ctx.privacyKey))
 
   const timestamps = calls.map(c => c.timestamp).filter(t => t.length > 0).sort()
   const startedAt = timestamps[0] ?? ''

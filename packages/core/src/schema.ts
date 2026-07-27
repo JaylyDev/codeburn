@@ -74,6 +74,67 @@ export const CanonicalToolName = z
   .max(64)
   .regex(/^[A-Za-z0-9_.-]+$/, 'canonical tool names only (no args, paths, or spaces)')
 
+/**
+ * Canonical provider id (`claude`, `codex`, `vercel-gateway`). Capped and
+ * charset-restricted for the same reason as CanonicalToolName: an unbounded
+ * `z.string().min(1)` is a free-text channel, and a decoder that mistakenly
+ * assigned a title or a path to this field would pass validation.
+ */
+export const CanonicalProviderId = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[A-Za-z0-9_.-]+$/, 'canonical provider ids only (no paths, spaces, or free text)')
+
+/**
+ * Canonical model id (`claude-opus-4-8`, `anthropic/claude-sonnet-5`,
+ * `gpt-5:fast`, `us.anthropic.claude-opus-4-8-v1:0`). A wider charset than
+ * provider ids because vendors namespace with `/`, tag with `:`, and version
+ * with `+`. The leading segment may not be empty and `..` is rejected, so a
+ * filesystem path cannot masquerade as a model id.
+ *
+ * KNOWN RESIDUAL: a charset cannot separate a model id from every string that
+ * merely LOOKS like one. `sk-live-0123456789abcdef` and
+ * `feature/acme-acquisition` are shape-identical to legitimate model ids, so a
+ * malicious decoder could still route one of those here. What the constraint
+ * does guarantee is that no prose, prompt, file content, command line,
+ * whitespace, or newline reaches the field, and that its length is bounded.
+ * Tests in label-constraints.test.ts pin both the guarantee and the residual.
+ */
+export const CanonicalModelId = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9._:+-][A-Za-z0-9._:/+-]*$/, 'canonical model ids only (no spaces, free text, or leading separator)')
+  .refine((s) => !s.includes('..'), { message: 'model ids may not contain ".."' })
+  .refine((s) => !s.includes('//'), { message: 'model ids may not contain "//"' })
+
+/**
+ * Fallback emitted when a decoded label is not canonical. The decoders already
+ * use `'unknown'` for a missing model, so a non-canonical one lands in the same
+ * bucket rather than inventing a second sentinel.
+ */
+export const UNKNOWN_LABEL = 'unknown'
+
+/**
+ * Coerce a decoded provider id to the canonical charset, falling back to
+ * `'unknown'`.
+ *
+ * Adapters must call these rather than passing decoded labels straight through.
+ * A provider that ever puts free text where a model id belongs would otherwise
+ * fail envelope validation and cost the host the ENTIRE session — dropping one
+ * label is strictly better than dropping every call in it. This mirrors the
+ * existing convention for tool names, which adapters already filter.
+ */
+export function toCanonicalProviderId(raw: string | undefined | null): string {
+  return raw && CanonicalProviderId.safeParse(raw).success ? raw : UNKNOWN_LABEL
+}
+
+/** Coerce a decoded model id to the canonical charset, falling back to `'unknown'`. */
+export function toCanonicalModelId(raw: string | undefined | null): string {
+  return raw && CanonicalModelId.safeParse(raw).success ? raw : UNKNOWN_LABEL
+}
+
 /** Per-call token buckets. All five are required, non-negative integers. */
 export const TokenBuckets = z
   .object({

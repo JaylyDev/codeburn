@@ -120,13 +120,15 @@ describe('vercel-gateway observations', () => {
     expect(callCount).toBeGreaterThan(0)
   })
 
-  it('emits no free text except the model identifier (identifier-exemption convention)', () => {
+  it('emits no free text at all, including through the model identifier', () => {
     const env = buildEnvelope()
     const serialized = JSON.stringify(env)
 
-    // The model field is an API identifier and is emitted by design; the planted
-    // secret in model is therefore expected to appear there and only there.
-    expect(serialized).toContain(SECRETS.prompt)
+    // Schema 0.3.0 retired the identifier exemption. `model` is charset-capped,
+    // so a planted prompt no longer validates; the adapter degrades it to
+    // 'unknown' rather than emitting free text or failing the whole envelope.
+    expect(serialized).not.toContain(SECRETS.prompt)
+    expect(env.sessions[0]?.calls[0]?.model).toBe('unknown')
     expect(serialized).not.toContain(SECRETS.absPath)
     expect(serialized).not.toContain(SECRETS.apiKey)
     expect(serialized).not.toContain(SECRETS.commandLine)

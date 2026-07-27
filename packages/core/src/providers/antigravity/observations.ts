@@ -4,7 +4,8 @@
 // paths and has no tool calls, so projectPath is fingerprinted and toolNames is
 // always empty.
 
-import { projectRef, sessionRef } from '../../fingerprint.js'
+import { callRef, projectRef, sessionRef } from '../../fingerprint.js'
+import { toCanonicalModelId, toCanonicalProviderId } from '../../schema.js'
 import type { RecordDiagnostic } from '../../diagnostics.js'
 import type { CallObservation, SessionObservation } from '../../observations.js'
 import type { AntigravityDecodedCall } from './types.js'
@@ -24,10 +25,10 @@ export interface AntigravityToObservationsContext {
   provider?: string
 }
 
-function toCallObservation(call: AntigravityDecodedCall, turnIndex: number): CallObservation {
+function toCallObservation(call: AntigravityDecodedCall, turnIndex: number, privacyKey: string): CallObservation {
   return {
-    provider: call.provider,
-    model: call.model,
+    provider: toCanonicalProviderId(call.provider),
+    model: toCanonicalModelId(call.model),
     tokens: {
       input: call.inputTokens,
       output: call.outputTokens,
@@ -39,7 +40,7 @@ function toCallObservation(call: AntigravityDecodedCall, turnIndex: number): Cal
     speed: call.speed,
     costBasis: 'estimated',
     timestamp: call.timestamp,
-    dedupKey: call.deduplicationKey,
+    callRef: callRef(privacyKey, call.provider, call.deduplicationKey),
     // Antigravity records carry no tool calls at all, so there is nothing to
     // filter through a canonical-name gate here.
     toolNames: [],
@@ -52,7 +53,7 @@ function toSessionObservation(
   ctx: AntigravityToObservationsContext,
 ): SessionObservation {
   const provider = ctx.provider ?? 'antigravity'
-  const calls: CallObservation[] = decode.calls.map((call, i) => toCallObservation(call, i))
+  const calls: CallObservation[] = decode.calls.map((call, i) => toCallObservation(call, i, ctx.privacyKey))
 
   const timestamps = calls.map(c => c.timestamp).filter(t => t.length > 0).sort()
   const startedAt = timestamps[0] ?? ''

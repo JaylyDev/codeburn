@@ -1617,9 +1617,10 @@ describe('content-smuggling guardrail: real antigravity decode -> toObservations
   // A hostile Antigravity cascade planting secrets in every free-text field the
   // decode reads but never emits: proto attribute values other than model_enum,
   // ignored proto fields, the statusline envelope's cwd/session_id, and the RPC
-  // usage.apiProvider. Only the canonicalized model and the responseId (inside
-  // the dedupKey) are emitted by design — they are the provider's own machine
-  // identifiers, exactly like every other provider's model and dedupKey.
+  // usage.apiProvider. Only the canonicalized model is emitted by design. The
+  // responseId used to ride out inside the raw dedupKey; as of observation
+  // 0.3.0 it is fingerprinted into `callRef`, so no provider-native record id
+  // reaches the envelope at all.
   const antigravityContext: DecodeContext = {
     privacyKey: 'test-privacy-key',
     providerId: 'antigravity',
@@ -1790,11 +1791,10 @@ describe('content-smuggling guardrail: real cursor decode -> toObservations is s
   // arbitrary attacker text), an agentKv user content blob, and a Shell
   // tool-call's args.command (-> rawBashCommands). None may reach the envelope.
   //
-  // The composer id is deliberately NOT a planted vector. Composer ids and
-  // request ids are the provider's own machine identifiers: they flow into
-  // sessionId and into the dedupKey, which the envelope keeps verbatim by
-  // design — exactly like every other provider's model and dedupKey. Hashing
-  // dedup keys uniformly is a schema-wide change, not a cursor-local one.
+  // Composer ids and request ids are the provider's own machine identifiers.
+  // They used to reach the envelope verbatim through the dedupKey; observation
+  // 0.3.0 made the schema-wide change this comment once deferred, so they are
+  // now fingerprinted into `callRef` like every other identifier.
   const cursorContext: DecodeContext = {
     privacyKey: 'test-privacy-key',
     providerId: 'cursor',
@@ -2143,9 +2143,11 @@ describe('content-smuggling guardrail: real vercel-gateway decode -> toObservati
     expect(callCount).toBeGreaterThan(0)
   })
 
-  it('contains the model secret (identifier-exemption convention) and no other secrets', () => {
+  it('contains no secrets at all, the model identifier included', () => {
     const serialized = JSON.stringify(decodeAndMinimize())
-    expect(serialized).toContain(SECRETS.prompt)
+    // Schema 0.3.0 retired the identifier exemption: `model` is charset-capped,
+    // so a planted prompt degrades to 'unknown' instead of shipping.
+    expect(serialized).not.toContain(SECRETS.prompt)
     expect(serialized).not.toContain(SECRETS.absPath)
     expect(serialized).not.toContain(SECRETS.apiKey)
     expect(serialized).not.toContain(SECRETS.commandLine)

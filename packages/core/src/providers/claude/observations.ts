@@ -5,7 +5,8 @@
 // arguments. `.strict()` on the schemas rejects any extra field; this transform
 // simply never emits one.
 
-import { branchRef, projectRef, sessionRef } from '../../fingerprint.js'
+import { branchRef, callRef, projectRef, sessionRef } from '../../fingerprint.js'
+import { toCanonicalModelId, toCanonicalProviderId } from '../../schema.js'
 import type { RecordDiagnostic } from '../../diagnostics.js'
 import type { CallObservation, SessionObservation } from '../../observations.js'
 import { extractResourceRefs } from '../resource-refs.js'
@@ -37,8 +38,8 @@ const CANONICAL_TOOL_NAME = /^[A-Za-z0-9_.-]{1,64}$/
 
 function toCallObservation(call: DecodedCall, turnIndex: number, privacyKey: string): CallObservation {
   return {
-    provider: call.provider,
-    model: call.model,
+    provider: toCanonicalProviderId(call.provider),
+    model: toCanonicalModelId(call.model),
     tokens: {
       input: call.usage.inputTokens,
       output: call.usage.outputTokens,
@@ -52,7 +53,7 @@ function toCallObservation(call: DecodedCall, turnIndex: number, privacyKey: str
     // table; they carry no provider-reported dollar figure.
     costBasis: 'estimated',
     timestamp: call.timestamp,
-    dedupKey: call.deduplicationKey,
+    callRef: callRef(privacyKey, call.provider, call.deduplicationKey),
     toolNames: call.tools.filter(t => CANONICAL_TOOL_NAME.test(t)),
     turnIndex,
     ...(call.locAdded !== undefined ? { locAdded: call.locAdded } : {}),

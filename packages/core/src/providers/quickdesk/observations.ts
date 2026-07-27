@@ -3,7 +3,8 @@
 // names cross into the output — never the user message, project path, or shell
 // command.
 
-import { projectRef, sessionRef } from '../../fingerprint.js'
+import { callRef, projectRef, sessionRef } from '../../fingerprint.js'
+import { toCanonicalModelId, toCanonicalProviderId } from '../../schema.js'
 import type { RecordDiagnostic } from '../../diagnostics.js'
 import type { CallObservation, SessionObservation } from '../../observations.js'
 import type { QuickdeskDecodedCall } from './types.js'
@@ -32,8 +33,8 @@ const CANONICAL_TOOL_NAME = /^[A-Za-z0-9_.-]{1,64}$/
 function toCallObservation(call: QuickdeskDecodedCall, turnIndex: number, privacyKey: string): CallObservation {
   const measured = call.recordedCost !== undefined
   return {
-    provider: call.provider,
-    model: call.model,
+    provider: toCanonicalProviderId(call.provider),
+    model: toCanonicalModelId(call.model),
     tokens: {
       input: call.inputTokens,
       output: call.outputTokens,
@@ -46,7 +47,7 @@ function toCallObservation(call: QuickdeskDecodedCall, turnIndex: number, privac
     costBasis: measured ? 'measured' : 'estimated',
     ...(measured ? { measuredCostUSD: call.recordedCost } : {}),
     timestamp: call.timestamp,
-    dedupKey: call.deduplicationKey,
+    callRef: callRef(privacyKey, call.provider, call.deduplicationKey),
     toolNames: call.tools.filter(t => CANONICAL_TOOL_NAME.test(t)),
     turnIndex,
   }

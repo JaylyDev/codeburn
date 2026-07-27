@@ -3,7 +3,8 @@
 // names cross into the output — never the user message, project path, or tool
 // arguments.
 
-import { projectRef, sessionRef } from '../../fingerprint.js'
+import { callRef, projectRef, sessionRef } from '../../fingerprint.js'
+import { toCanonicalModelId, toCanonicalProviderId } from '../../schema.js'
 import type { RecordDiagnostic } from '../../diagnostics.js'
 import type { CallObservation, SessionObservation } from '../../observations.js'
 import type { DevinDecodedCall } from './types.js'
@@ -31,10 +32,10 @@ const CANONICAL_TOOL_NAME = /^[A-Za-z0-9_.-]{1,64}$/
 
 function toCallObservation(call: DevinDecodedCall, turnIndex: number, privacyKey: string): CallObservation {
   return {
-    provider: call.provider,
+    provider: toCanonicalProviderId(call.provider),
     // The raw model id, not the host's display name: the envelope is keyed by
     // provider ids, and display formatting lives CLI-side.
-    model: call.generationModel ?? call.modelName,
+    model: toCanonicalModelId(call.generationModel ?? call.modelName),
     tokens: {
       input: call.inputTokens,
       output: call.outputTokens,
@@ -48,7 +49,7 @@ function toCallObservation(call: DevinDecodedCall, turnIndex: number, privacyKey
     // measured so downstream passes leave costUSD untouched.
     costBasis: 'measured',
     timestamp: call.timestamp,
-    dedupKey: call.deduplicationKey,
+    callRef: callRef(privacyKey, call.provider, call.deduplicationKey),
     toolNames: call.tools.filter(t => CANONICAL_TOOL_NAME.test(t)),
     turnIndex,
   }

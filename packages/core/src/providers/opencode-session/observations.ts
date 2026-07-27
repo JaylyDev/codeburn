@@ -4,7 +4,8 @@
 // names cross into the output. The OpenCode-session decoder captures free-text
 // fields for the HOST, but they are deliberately absent here.
 
-import { projectRef, sessionRef } from '../../fingerprint.js'
+import { callRef, projectRef, sessionRef } from '../../fingerprint.js'
+import { toCanonicalModelId, toCanonicalProviderId } from '../../schema.js'
 import type { RecordDiagnostic } from '../../diagnostics.js'
 import type { CallObservation, SessionObservation } from '../../observations.js'
 import type { OpenCodeSessionDecodedCall } from './types.js'
@@ -27,10 +28,10 @@ export interface OpenCodeSessionToObservationsContext {
 
 const CANONICAL_TOOL_NAME = /^[A-Za-z0-9_.-]{1,64}$/
 
-function toCallObservation(call: OpenCodeSessionDecodedCall, turnIndex: number): CallObservation {
+function toCallObservation(call: OpenCodeSessionDecodedCall, turnIndex: number, privacyKey: string): CallObservation {
   return {
-    provider: call.provider,
-    model: call.model,
+    provider: toCanonicalProviderId(call.provider),
+    model: toCanonicalModelId(call.model),
     tokens: {
       input: call.inputTokens,
       output: call.outputTokens,
@@ -42,7 +43,7 @@ function toCallObservation(call: OpenCodeSessionDecodedCall, turnIndex: number):
     speed: call.speed,
     costBasis: 'estimated',
     timestamp: call.timestamp,
-    dedupKey: call.deduplicationKey,
+    callRef: callRef(privacyKey, call.provider, call.deduplicationKey),
     toolNames: call.tools.filter(t => CANONICAL_TOOL_NAME.test(t)),
     turnIndex,
   }
@@ -53,7 +54,7 @@ function toSessionObservation(
   ctx: OpenCodeSessionToObservationsContext,
 ): SessionObservation {
   const provider = ctx.provider ?? 'opencode'
-  const calls: CallObservation[] = decode.calls.map((call, i) => toCallObservation(call, i))
+  const calls: CallObservation[] = decode.calls.map((call, i) => toCallObservation(call, i, ctx.privacyKey))
 
   const timestamps = calls.map(c => c.timestamp).filter(t => t.length > 0).sort()
   const startedAt = timestamps[0] ?? ''
