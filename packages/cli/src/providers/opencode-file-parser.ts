@@ -1,15 +1,15 @@
 import { readdir, readFile } from 'fs/promises'
 import { join } from 'path'
 
-import { buildAssistantCall, sanitize, type MessageData, type PartData } from './session-message.js'
-import type { SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import { sanitize } from './session-message.js'
+import type { SessionSource } from './types.js'
 
 // OpenCode 1.1+ stores sessions as file-based JSON instead of a SQLite DB:
 //   storage/session/<projectID>/<sessionID>.json   session metadata
 //   storage/message/<sessionID>/<messageID>.json    one file per message
 //   storage/part/<messageID>/<partID>.json          one file per part
 // The message/part shape matches the SQLite layout, so the per-message build
-// logic is shared via buildAssistantCall.
+// logic is shared via @codeburn/core/providers/opencode-session.
 
 type SessionMeta = {
   id?: string
@@ -18,8 +18,24 @@ type SessionMeta = {
   time?: { created?: number }
 }
 
-type FileMessageData = MessageData & {
+type FileMessageData = {
   id?: string
+  role: string
+  modelID?: string
+  model?: string
+  cost?: number
+  tokens?: {
+    input?: number
+    output?: number
+    reasoning?: number
+    cache?: { read?: number; write?: number }
+  }
+  usage?: {
+    input_tokens?: number
+    output_tokens?: number
+    cache_creation_input_tokens?: number
+    cache_read_input_tokens?: number
+  }
   time?: { created?: number }
 }
 
@@ -29,23 +45,6 @@ async function readJson<T>(path: string): Promise<T | null> {
   } catch {
     return null
   }
-}
-
-async function readParts(dataDir: string, messageId: string): Promise<PartData[]> {
-  const dir = join(dataDir, 'storage', 'part', messageId)
-  let files: string[]
-  try {
-    files = (await readdir(dir)).sort()
-  } catch {
-    return []
-  }
-  const parts: PartData[] = []
-  for (const f of files) {
-    if (!f.endsWith('.json')) continue
-    const part = await readJson<PartData>(join(dir, f))
-    if (part) parts.push(part)
-  }
-  return parts
 }
 
 export async function discoverOpenCodeFileSessions(
@@ -83,72 +82,62 @@ export async function discoverOpenCodeFileSessions(
   return sources
 }
 
-export function createOpenCodeFileSessionParser(
+export async function readOpenCodeFileRecords(
   source: SessionSource,
-  seenKeys: Set<string>,
   dataDir: string,
-  providerName: string,
-): SessionParser {
-  return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const meta = await readJson<SessionMeta>(source.path)
-      if (!meta?.id) return
-      const sessionId = meta.id
+): Promise<unknown[] | null> {
+  const meta = await readJson<SessionMeta>(source.path)
+  if (!meta?.id) return null
+  const sessionId = meta.id
 
-      const messageDir = join(dataDir, 'storage', 'message', sessionId)
-      let messageFiles: string[]
-      try {
-        messageFiles = await readdir(messageDir)
-      } catch {
-        return
-      }
-
-      const messages: Array<{ id: string; data: FileMessageData }> = []
-      for (const f of messageFiles) {
-        if (!f.endsWith('.json')) continue
-        const data = await readJson<FileMessageData>(join(messageDir, f))
-        if (!data) continue
-        messages.push({ id: data.id ?? f.replace(/\.json$/, ''), data })
-      }
-      messages.sort((a, b) => {
-        const byTime = (a.data.time?.created ?? 0) - (b.data.time?.created ?? 0)
-        if (byTime !== 0) return byTime
-        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
-      })
-
-      let currentUserMessage = ''
-      for (const { id, data } of messages) {
-        if (data.role === 'user') {
-          const parts = await readParts(dataDir, id)
-          const text = parts
-            .filter((p) => p.type === 'text')
-            .map((p) => p.text ?? '')
-            .filter(Boolean)
-            .join(' ')
-          if (text) currentUserMessage = text
-          continue
-        }
-
-        if (data.role !== 'assistant' && data.role !== 'model') continue
-
-        const dedupKey = `${providerName}:${sessionId}:${id}`
-        if (seenKeys.has(dedupKey)) continue
-
-        const parts = await readParts(dataDir, id)
-        const call = buildAssistantCall({
-          providerName,
-          dedupKey,
-          sessionId,
-          data,
-          parts,
-          timeCreatedMs: data.time?.created ?? meta.time?.created ?? 0,
-          userMessage: currentUserMessage,
-        })
-        if (!call) continue
-
-        seenKeys.add(dedupKey)
-        yield call
-      }
-    },
+  const messageDir = join(dataDir, 'storage', 'message', sessionId)
+  let messageFiles: string[]
+  try {
+    messageFiles = await readdir(messageDir)
+  } catch {
+    return null
   }
+
+  // Message-file JSON.parse stays host-side here (unlike the SQLite arm, where
+  // core parses), because the message ids determine which part directories to
+  // read: the parse is a precondition of the I/O, not a step after it.
+  const messages: Array<{ id: string; data: FileMessageData }> = []
+  for (const f of messageFiles) {
+    if (!f.endsWith('.json')) continue
+    const data = await readJson<FileMessageData>(join(messageDir, f))
+    if (!data) continue
+    messages.push({ id: data.id ?? f.replace(/\.json$/, ''), data })
+  }
+
+  // Part files are read eagerly for every message. The original read them lazily
+  // only for messages that survived role and dedup checks; this is a strict
+  // superset with identical output, changing only I/O volume.
+  const partsRawByMessageId = new Map<string, string[]>()
+  for (const { id } of messages) {
+    const partDir = join(dataDir, 'storage', 'part', id)
+    let files: string[]
+    try {
+      files = (await readdir(partDir)).sort()
+    } catch {
+      continue
+    }
+    const rawParts: string[] = []
+    for (const f of files) {
+      if (!f.endsWith('.json')) continue
+      try {
+        rawParts.push(await readFile(join(partDir, f), 'utf8'))
+      } catch {
+        // skip unreadable part file
+      }
+    }
+    partsRawByMessageId.set(id, rawParts)
+  }
+
+  return [{
+    kind: 'file',
+    sessionId,
+    messages,
+    partsRawByMessageId,
+    metaTimeCreatedMs: meta.time?.created,
+  }]
 }

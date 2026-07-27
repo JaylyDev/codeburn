@@ -36,6 +36,7 @@ import { decodeQuickdesk, toObservations as toQuickdeskObservations } from '../s
 import { decodeDevin, toObservations as toDevinObservations } from '../src/providers/devin/index.js'
 import { decodeCopilot, toObservations as toCopilotObservations } from '../src/providers/copilot/index.js'
 import { decodeVscodeCline, toObservations as toVscodeClineObservations } from '../src/providers/vscode-cline/index.js'
+import { decodeOpenCodeSession, toObservations as toOpenCodeSessionObservations } from '../src/providers/opencode-session/index.js'
 import type { DecodeContext } from '../src/contracts.js'
 import type { ZedThreadRow } from '../src/providers/zed/index.js'
 
@@ -1420,3 +1421,79 @@ describe('content-smuggling guardrail: real devin decode -> toObservations is se
   })
 })
 
+
+describe('content-smuggling guardrail: real opencode-session decode -> toObservations is secret-free', () => {
+  // A hostile OpenCode-session SQLite envelope planting every secret in the
+  // free-text fields the decode captures: user message text, a bash command, a
+  // skill name, a subagent type, and a tool NAME carrying a command line.
+  // Minimizing MUST surface none of them.
+  const opencodeContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'opencode', sourceRef: 'ref' }
+
+  function decodeAndMinimize() {
+    const records = [{
+      kind: 'sqlite' as const,
+      sessionId: 'sess-hostile',
+      messages: [
+        {
+          session_id: 'sess-hostile',
+          id: 'msg-user',
+          time_created: 1700000000000,
+          data: JSON.stringify({
+            role: 'user',
+            // user message text parts carry the prompt, api key, and file content
+          }),
+        },
+        {
+          session_id: 'sess-hostile',
+          id: 'msg-assistant',
+          time_created: 1700000001000,
+          data: JSON.stringify({
+            role: 'assistant',
+            modelID: 'claude-opus-4-6',
+            cost: 0.05,
+            tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 0, write: 0 } },
+          }),
+        },
+      ],
+      parts: [
+        { message_id: 'msg-user', data: JSON.stringify({ type: 'text', text: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}` }) },
+        { message_id: 'msg-assistant', data: JSON.stringify({ type: 'tool', tool: 'bash', state: { input: { command: SECRETS.commandLine } } }) },
+        { message_id: 'msg-assistant', data: JSON.stringify({ type: 'tool', tool: 'skill', state: { input: { name: SECRETS.absPath } } }) },
+        { message_id: 'msg-assistant', data: JSON.stringify({ type: 'tool', tool: 'task', state: { input: { subagent_type: SECRETS.apiKey } } }) },
+        // A hostile tool NAME carrying a command line: normalizeToolName passes it
+        // through unchanged, so the only thing stopping it is the CANONICAL_TOOL_NAME
+        // filter in observations.ts.
+        { message_id: 'msg-assistant', data: JSON.stringify({ type: 'tool', tool: SECRETS.commandLine }) },
+      ],
+      sessionTokens: null,
+    }]
+    const { calls } = decodeOpenCodeSession({ records, context: opencodeContext })
+    const { sessions } = toOpenCodeSessionObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'opencode' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile session', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('keeps canonical tool names (Bash) and drops the argument-carrying name', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toContain('Bash')
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+})
