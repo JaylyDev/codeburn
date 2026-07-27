@@ -1,10 +1,14 @@
 import { join } from 'path'
 import { homedir } from 'os'
 
+import { decodeOpenCodeSession } from '@codeburn/core/providers/opencode-session'
+import type { OpenCodeSessionDecodedCall } from '@codeburn/core/providers/opencode-session'
 import { getShortModelName } from '../models.js'
-import { discoverSqliteSessions, createSqliteSessionParser, type SqliteProviderConfig } from './sqlite-session-parser.js'
-import { discoverOpenCodeFileSessions, createOpenCodeFileSessionParser } from './opencode-file-parser.js'
-import type { Provider, ProbeRoot, SessionSource, SessionParser } from './types.js'
+import { extractBashCommands } from '../bash-utils.js'
+import { discoverSqliteSessions, readSqliteSessionRecords, type SqliteProviderConfig } from './sqlite-session-parser.js'
+import { discoverOpenCodeFileSessions, readOpenCodeFileRecords } from './opencode-file-parser.js'
+import { createBridgedProvider } from './bridge.js'
+import type { Provider, ProbeRoot, SessionSource, ParsedProviderCall } from './types.js'
 
 const toolNameMap: Record<string, string> = {
   bash: 'Bash',
@@ -55,11 +59,41 @@ function getSqliteConfig(dataDir?: string): SqliteProviderConfig {
   }
 }
 
+export function toOpenCodeProviderCall(rich: OpenCodeSessionDecodedCall): ParsedProviderCall {
+  return {
+    provider: rich.provider,
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    costBasis: 'estimated',
+    ...(rich.fallbackCostUSD !== undefined ? { fallbackCostUSD: rich.fallbackCostUSD } : {}),
+    tools: rich.tools,
+    bashCommands: rich.rawBashCommands.flatMap(c => extractBashCommands(c)),
+    ...(rich.arm === 'session-level' ? {} : { skills: rich.skills, subagentTypes: rich.subagentTypes }),
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
+  }
+}
+
 export function createOpenCodeProvider(dataDir?: string): Provider {
   const sqliteConfig = getSqliteConfig(dataDir)
   const resolvedDataDir = getDataDir(dataDir)
 
-  return {
+  // Provider-instance-scoped handoff for the verbose-stderr counts and session
+  // id. readRecords and decode are called synchronously in sequence inside one
+  // parse() generator, so this is safe without ordering assumptions.
+  let lastSqliteCounts: { messageCount: number; partCount: number } | undefined
+  let lastSessionId: string | undefined
+
+  return createBridgedProvider<OpenCodeSessionDecodedCall>({
     name: 'opencode',
     displayName: 'OpenCode',
 
@@ -91,13 +125,43 @@ export function createOpenCodeProvider(dataDir?: string): Provider {
       return [...fileSessions, ...sqliteSessions]
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+    async readRecords(source) {
       if (source.path.endsWith('.json')) {
-        return createOpenCodeFileSessionParser(source, seenKeys, resolvedDataDir, 'opencode')
+        // Clear the SQLite handoff: the file arm has no verbose notice, and a
+        // stale count from an earlier SQLite source would make decode() emit one
+        // for a zero-yield file session.
+        lastSqliteCounts = undefined
+        lastSessionId = undefined
+        return readOpenCodeFileRecords(source, resolvedDataDir)
       }
-      return createSqliteSessionParser(source, seenKeys, sqliteConfig)
+      const result = await readSqliteSessionRecords(source, sqliteConfig)
+      if (result === null) return null
+      const envelope = result.records[0] as { sessionId: string }
+      lastSessionId = envelope.sessionId
+      lastSqliteCounts = { messageCount: result.messageCount, partCount: result.partCount }
+      return result.records
     },
-  }
+
+    decode(input) {
+      const { calls, diagnostics } = decodeOpenCodeSession(input)
+      // The pre-migration decode printed one aggregate diagnostic per zero-yield
+      // SQLite session under CODEBURN_VERBOSE. The bridge discards diagnostics, so
+      // the notice is re-emitted here rather than silently dropped.
+      if (calls.length === 0 && lastSqliteCounts && lastSqliteCounts.messageCount > 0
+          && process.env['CODEBURN_VERBOSE'] === '1' && lastSessionId) {
+        const parseFailCount = diagnostics.filter(d => d.code === 'malformed-json').length
+        const roleSkipCount = diagnostics.filter(d => d.code === 'unknown-shape').length
+        process.stderr.write(
+          `codeburn: OpenCode session ${lastSessionId} has ${lastSqliteCounts.messageCount} messages ` +
+          `(${parseFailCount} unparseable, ${roleSkipCount} non-user/assistant roles) ` +
+          `but yielded 0 calls. Parts: ${lastSqliteCounts.partCount}.\n`
+        )
+      }
+      return { calls }
+    },
+
+    toProviderCall: toOpenCodeProviderCall,
+  })
 }
 
 export const opencode = createOpenCodeProvider()

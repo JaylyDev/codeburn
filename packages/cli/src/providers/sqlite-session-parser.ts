@@ -2,11 +2,9 @@ import { readdir } from 'fs/promises'
 import { join } from 'path'
 
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, blobToText, isSqliteBusyError, type SqliteDatabase } from '../sqlite.js'
-import { buildAssistantCall, parseTimestamp, sanitize, type MessageData, type PartData } from './session-message.js'
+import { sanitize } from './session-message.js'
 import type {
   SessionSource,
-  SessionParser,
-  ParsedProviderCall,
 } from './types.js'
 
 type MessageRow = {
@@ -38,7 +36,7 @@ type SessionTokenRow = {
   model_id?: string
 }
 
-function tryQuerySessionTokens(db: SqliteDatabase, sessionId: string): {
+export function tryQuerySessionTokens(db: SqliteDatabase, sessionId: string): {
   cost: number; input: number; output: number; reasoning: number
   cacheRead: number; cacheWrite: number; model: string | undefined
 } | null {
@@ -100,173 +98,89 @@ export type SqliteProviderConfig = {
   dbFilePrefix: string
 }
 
-export function createSqliteSessionParser(
+export async function readSqliteSessionRecords(
   source: SessionSource,
-  seenKeys: Set<string>,
   config: SqliteProviderConfig,
-): SessionParser {
-  return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      if (!isSqliteAvailable()) {
-        process.stderr.write(getSqliteLoadError() + '\n')
-        return
-      }
+): Promise<{ records: unknown[]; messageCount: number; partCount: number } | null> {
+  if (!isSqliteAvailable()) {
+    process.stderr.write(getSqliteLoadError() + '\n')
+    return null
+  }
 
-      const segments = source.path.split(':')
-      const sessionId = segments[segments.length - 1]!
-      const dbPath = segments.slice(0, -1).join(':')
+  const segments = source.path.split(':')
+  const sessionId = segments[segments.length - 1]!
+  const dbPath = segments.slice(0, -1).join(':')
 
-      let db: SqliteDatabase
-      try {
-        db = openDatabase(dbPath)
-      } catch (err) {
-        process.stderr.write(`codeburn: cannot open ${config.displayName} database: ${err instanceof Error ? err.message : err}\n`)
-        return
-      }
+  let db: SqliteDatabase
+  try {
+    db = openDatabase(dbPath)
+  } catch (err) {
+    process.stderr.write(`codeburn: cannot open ${config.displayName} database: ${err instanceof Error ? err.message : err}\n`)
+    return null
+  }
 
-      try {
-        const schema = validateSchemaDetailed(db)
-        if (!schema.ok) {
-          warnUnrecognizedSchemaOnce(config.displayName, schema.missing)
-          return
-        }
+  try {
+    const schema = validateSchemaDetailed(db)
+    if (!schema.ok) {
+      warnUnrecognizedSchemaOnce(config.displayName, schema.missing)
+      return null
+    }
 
-        const messages = db.query<MessageRow>(
-          `WITH RECURSIVE session_tree(id) AS (
-            SELECT id FROM session WHERE id = ?
-            UNION
-            SELECT child.id
-            FROM session child
-            JOIN session_tree parent ON child.parent_id = parent.id
-            WHERE child.time_archived IS NULL
-          )
-          SELECT session_id, id, time_created, CAST(data AS BLOB) AS data
-          FROM message
-          WHERE session_id IN (SELECT id FROM session_tree)
-          ORDER BY time_created ASC, id ASC`,
-          [sessionId],
-        )
+    const messages = db.query<MessageRow>(
+      `WITH RECURSIVE session_tree(id) AS (
+        SELECT id FROM session WHERE id = ?
+        UNION
+        SELECT child.id
+        FROM session child
+        JOIN session_tree parent ON child.parent_id = parent.id
+        WHERE child.time_archived IS NULL
+      )
+      SELECT session_id, id, time_created, CAST(data AS BLOB) AS data
+      FROM message
+      WHERE session_id IN (SELECT id FROM session_tree)
+      ORDER BY time_created ASC, id ASC`,
+      [sessionId],
+    )
 
-        const parts = db.query<PartRow>(
-          `WITH RECURSIVE session_tree(id) AS (
-            SELECT id FROM session WHERE id = ?
-            UNION
-            SELECT child.id
-            FROM session child
-            JOIN session_tree parent ON child.parent_id = parent.id
-            WHERE child.time_archived IS NULL
-          )
-          SELECT message_id, CAST(data AS BLOB) AS data
-          FROM part
-          WHERE session_id IN (SELECT id FROM session_tree)
-          ORDER BY message_id, id`,
-          [sessionId],
-        )
+    const parts = db.query<PartRow>(
+      `WITH RECURSIVE session_tree(id) AS (
+        SELECT id FROM session WHERE id = ?
+        UNION
+        SELECT child.id
+        FROM session child
+        JOIN session_tree parent ON child.parent_id = parent.id
+        WHERE child.time_archived IS NULL
+      )
+      SELECT message_id, CAST(data AS BLOB) AS data
+      FROM part
+      WHERE session_id IN (SELECT id FROM session_tree)
+      ORDER BY message_id, id`,
+      [sessionId],
+    )
 
-        const partsByMsg = new Map<string, PartData[]>()
-        for (const part of parts) {
-          try {
-            const parsed = JSON.parse(blobToText(part.data)) as PartData
-            const list = partsByMsg.get(part.message_id) ?? []
-            list.push(parsed)
-            partsByMsg.set(part.message_id, list)
-          } catch {
-            // skip corrupt part data
-          }
-        }
+    const sessionTokens = tryQuerySessionTokens(db, sessionId)
 
-        const currentUserMessageBySession = new Map<string, string>()
-        let yieldCount = 0
-        let parseFailCount = 0
-        let roleSkipCount = 0
-
-        for (const msg of messages) {
-          let data: MessageData
-          try {
-            data = JSON.parse(blobToText(msg.data)) as MessageData
-          } catch {
-            parseFailCount++
-            continue
-          }
-
-          if (data.role === 'user') {
-            const textParts = (partsByMsg.get(msg.id) ?? [])
-              .filter((p) => p.type === 'text')
-              .map((p) => p.text ?? '')
-              .filter(Boolean)
-            if (textParts.length > 0) {
-              currentUserMessageBySession.set(msg.session_id, textParts.join(' '))
-            }
-            continue
-          }
-
-          if (data.role !== 'assistant' && data.role !== 'model') {
-            if (data.role !== 'user') roleSkipCount++
-            continue
-          }
-
-          const dedupKey = `${config.providerName}:${msg.session_id}:${msg.id}`
-          if (seenKeys.has(dedupKey)) continue
-
-          const call = buildAssistantCall({
-            providerName: config.providerName,
-            dedupKey,
-            sessionId,
-            data,
-            parts: partsByMsg.get(msg.id) ?? [],
-            timeCreatedMs: msg.time_created,
-            userMessage: currentUserMessageBySession.get(msg.session_id) ?? '',
-          })
-          if (!call) continue
-
-          seenKeys.add(dedupKey)
-          yieldCount++
-          yield call
-        }
-
-        if (yieldCount === 0 && messages.length > 0) {
-          const sessionTokens = tryQuerySessionTokens(db, sessionId)
-          if (sessionTokens && (sessionTokens.cost > 0 || sessionTokens.input > 0 || sessionTokens.output > 0)) {
-            const dedupKey = `${config.providerName}:${sessionId}:session-level`
-            if (!seenKeys.has(dedupKey)) {
-              seenKeys.add(dedupKey)
-              const model = sessionTokens.model ?? 'unknown'
-              yield {
-                provider: config.providerName,
-                model,
-                inputTokens: sessionTokens.input,
-                outputTokens: sessionTokens.output,
-                cacheCreationInputTokens: sessionTokens.cacheWrite,
-                cacheReadInputTokens: sessionTokens.cacheRead,
-                cachedInputTokens: sessionTokens.cacheRead,
-                reasoningTokens: sessionTokens.reasoning,
-                webSearchRequests: 0,
-                costBasis: 'estimated',
-                ...(sessionTokens.cost > 0 ? { fallbackCostUSD: sessionTokens.cost } : {}),
-                tools: [],
-                bashCommands: [],
-                timestamp: parseTimestamp(messages[0]!.time_created),
-                speed: 'standard',
-                deduplicationKey: dedupKey,
-                userMessage: '',
-                sessionId,
-              }
-              yieldCount++
-            }
-          }
-
-          if (yieldCount === 0 && process.env['CODEBURN_VERBOSE'] === '1') {
-            process.stderr.write(
-              `codeburn: ${config.displayName} session ${sessionId} has ${messages.length} messages ` +
-              `(${parseFailCount} unparseable, ${roleSkipCount} non-user/assistant roles) ` +
-              `but yielded 0 calls. Parts: ${parts.length}.\n`
-            )
-          }
-        }
-      } finally {
-        db.close()
-      }
-    },
+    return {
+      records: [{
+        kind: 'sqlite',
+        sessionId,
+        messages: messages.map(m => ({
+          session_id: m.session_id,
+          id: m.id,
+          time_created: m.time_created,
+          data: blobToText(m.data),
+        })),
+        parts: parts.map(p => ({
+          message_id: p.message_id,
+          data: blobToText(p.data),
+        })),
+        sessionTokens,
+      }],
+      messageCount: messages.length,
+      partCount: parts.length,
+    }
+  } finally {
+    db.close()
   }
 }
 
@@ -322,4 +236,3 @@ export async function discoverSqliteSessions(
 
   return sessions
 }
-

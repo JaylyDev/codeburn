@@ -171,6 +171,8 @@ const USER_MESSAGE_ALLOWLIST = new Set([
   'src/providers/copilot/types.ts',
   'src/providers/vscode-cline/decode.ts',
   'src/providers/vscode-cline/types.ts',
+  'src/providers/opencode-session/decode.ts',
+  'src/providers/opencode-session/types.ts',
 ])
 
 describe('architecture gate: no classification or free text in @codeburn/core source', () => {

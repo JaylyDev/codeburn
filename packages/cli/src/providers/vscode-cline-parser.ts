@@ -5,7 +5,7 @@ import { homedir } from 'os'
 import { decodeVscodeCline } from '@codeburn/core/providers/vscode-cline'
 import type { ClineRecordEnvelope, VscodeClineDecodedCall } from '@codeburn/core/providers/vscode-cline'
 
-import type { SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import type { ParsedProviderCall, SessionSource } from './types.js'
 
 export function getVSCodeGlobalStoragePaths(extensionId: string, homeDir = homedir(), platform = process.platform): string[] {
   const pathJoin = platform === 'win32' ? win32.join : posix.join
@@ -122,27 +122,5 @@ export function toClineProviderCall(rich: VscodeClineDecodedCall): ParsedProvide
     sessionId: rich.sessionId,
     project: rich.project,
     projectPath: rich.projectPath,
-  }
-}
-
-/**
- * Legacy-shaped adapter retained for kilo-code, whose second (SQLite) arm does
- * not move to core until batch S2. It is I/O + map over the core decode — no
- * decode logic lives here. Deleted once kilo-code becomes a bridged provider.
- */
-export function createClineParser(
-  source: SessionSource,
-  seenKeys: Set<string>,
-  providerName: string,
-  fallbackModel = 'cline-auto',
-): SessionParser {
-  return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const records = await readClineRecords(source)
-      if (records === null) return
-      const context = { privacyKey: '', providerId: providerName, sourceRef: source.path }
-      const { calls } = decodeVscodeCline({ records, context, seenKeys, fallbackModel })
-      for (const rich of calls) yield toClineProviderCall(rich)
-    },
   }
 }

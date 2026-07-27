@@ -146,6 +146,10 @@
     "./providers/vscode-cline": {
       "types": "./dist/providers/vscode-cline/index.d.ts",
       "import": "./dist/providers/vscode-cline/index.js"
+    },
+    "./providers/opencode-session": {
+      "types": "./dist/providers/opencode-session/index.d.ts",
+      "import": "./dist/providers/opencode-session/index.js"
     }
   },
   "files": [
