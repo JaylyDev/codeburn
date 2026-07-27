@@ -86,6 +86,18 @@
     "./providers/lingtai-tui": {
       "types": "./dist/providers/lingtai-tui/index.d.ts",
       "import": "./dist/providers/lingtai-tui/index.js"
+    },
+    "./providers/gemini": {
+      "types": "./dist/providers/gemini/index.d.ts",
+      "import": "./dist/providers/gemini/index.js"
+    },
+    "./providers/kimicode": {
+      "types": "./dist/providers/kimicode/index.d.ts",
+      "import": "./dist/providers/kimicode/index.js"
+    },
+    "./providers/pi": {
+      "types": "./dist/providers/pi/index.d.ts",
+      "import": "./dist/providers/pi/index.js"
     }
   },
   "files": [

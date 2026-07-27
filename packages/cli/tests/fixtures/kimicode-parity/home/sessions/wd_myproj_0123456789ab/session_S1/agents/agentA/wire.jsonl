@@ -1,0 +1,13 @@
+{"type":"turn.prompt","input":[{"type":"text","text":"first prompt"}]}
+{"type":"llm.request","model":"kimi-k2","modelAlias":"default","turnStep":"1.0","time":"2026-07-01T10:00:01.000Z"}
+{"type":"context.append_loop_event","event":{"type":"tool.call","name":"Bash","args":{"command":"ls -la"}}}
+{"type":"context.append_loop_event","event":{"type":"tool.call","name":"Bash","args":{"command":"ls -la"}}}
+{"type":"context.append_loop_event","event":{"type":"tool.call","name":"Read","args":{}}}
+{"type":"usage.record","model":"default","usage":{"inputOther":100,"output":40,"inputCacheRead":10,"inputCacheCreation":5},"time":"2026-07-01T10:00:02.000Z"}
+
+{"type":"turn.prompt","input":[{"type":"text","text":"second prompt"}]}
+{"type":"llm.request","model":"kimi-k2-turbo","modelAlias":"fast","turnStep":"2.5","time":"2026-07-01T10:00:03.000Z"}
+{"type":"usage.record","model":"fast","usage":{"inputOther":200,"output":80}}
+{"type":"turn.prompt","input":[{"type":"text","text":"third prompt"}]}
+{"type":"llm.request","model":"kimi-k2","modelAlias":"default","turnStep":"3.0"}
+{"type":"usage.record","model":"default","usage":{"inputOther":5,"output":5}}
