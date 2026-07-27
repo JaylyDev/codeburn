@@ -2,46 +2,13 @@ import { readdir, stat } from 'fs/promises'
 import { basename, dirname, join } from 'path'
 import { homedir } from 'os'
 
+import { decodeHermes, mapToolName } from '@codeburn/core/providers/hermes'
+import type { HermesDecodedCall, HermesMessageRow, HermesSessionRow } from '@codeburn/core/providers/hermes'
+
 import { getShortModelName } from '../models.js'
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, isSqliteBusyError, type SqliteDatabase } from '../sqlite.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
-import type { ToolCall } from '../types.js'
-
-type HermesSessionRow = {
-  id: string
-  source: string | null
-  model: string | null
-  cwd: string | null
-  billing_provider: string | null
-  input_tokens: number | null
-  output_tokens: number | null
-  cache_read_tokens: number | null
-  cache_write_tokens: number | null
-  reasoning_tokens: number | null
-  estimated_cost_usd: number | null
-  actual_cost_usd: number | null
-  api_call_count: number | null
-  tool_call_count: number | null
-  started_at: number | null
-  ended_at: number | null
-  title: string | null
-}
-
-type HermesMessageRow = {
-  id: number | null
-  role: string
-  content: string | null
-  tool_calls: string | null
-  tool_name: string | null
-  timestamp: number | null
-}
-
-type HermesToolCall = {
-  function?: {
-    name?: string
-    arguments?: string
-  }
-}
+import { createBridgedProvider } from './bridge.js'
+import type { Provider, SessionSource, ParsedProviderCall } from './types.js'
 
 type ProfileDb = {
   dbPath: string
@@ -53,35 +20,6 @@ type TableInfoRow = {
 }
 
 type TableColumn = keyof HermesSessionRow | keyof HermesMessageRow
-
-const toolNameMap: Record<string, string> = {
-  terminal: 'Bash',
-  execute_code: 'CodeExecution',
-  read_file: 'Read',
-  search_files: 'Grep',
-  write_file: 'Write',
-  patch: 'Edit',
-  browser_navigate: 'Browser',
-  browser_click: 'Browser',
-  browser_type: 'Browser',
-  browser_press: 'Browser',
-  browser_scroll: 'Browser',
-  browser_snapshot: 'Browser',
-  browser_vision: 'Vision',
-  browser_console: 'Browser',
-  browser_get_images: 'Browser',
-  web_search: 'WebSearch',
-  web_extract: 'WebFetch',
-  delegate_task: 'Agent',
-  vision_analyze: 'Vision',
-  process: 'Bash',
-  todo: 'TodoWrite',
-  skill_view: 'Skill',
-  skill_manage: 'Skill',
-  skills_list: 'Skill',
-  memory: 'Memory',
-  session_search: 'SessionSearch',
-}
 
 function getHermesHome(override?: string): string {
   return override ?? process.env['HERMES_HOME'] ?? join(homedir(), '.hermes')
@@ -146,16 +84,16 @@ function getSessionColumns(db: SqliteDatabase): Set<string> {
   return new Set(db.query<TableInfoRow>('PRAGMA table_info(sessions)').map(row => row.name))
 }
 
+function getMessageColumns(db: SqliteDatabase): Set<string> {
+  return new Set(db.query<TableInfoRow>('PRAGMA table_info(messages)').map(row => row.name))
+}
+
 function numberColumn(columns: Set<string>, name: TableColumn): string {
   return columns.has(name) ? `coalesce(${name}, 0) AS ${name}` : `0 AS ${name}`
 }
 
 function nullableColumn(columns: Set<string>, name: TableColumn): string {
   return columns.has(name) ? name : `NULL AS ${name}`
-}
-
-function getMessageColumns(db: SqliteDatabase): Set<string> {
-  return new Set(db.query<TableInfoRow>('PRAGMA table_info(messages)').map(row => row.name))
 }
 
 function usageExpression(columns: Set<string>): string {
@@ -170,96 +108,6 @@ function usageExpression(columns: Set<string>): string {
     .filter(name => columns.has(name))
     .map(name => `coalesce(${name}, 0)`)
   return parts.length > 0 ? parts.join(' + ') : '0'
-}
-
-function parseTimestamp(raw: number | null): string {
-  if (raw == null) return ''
-  const ms = raw < 1e12 ? raw * 1000 : raw
-  return new Date(ms).toISOString()
-}
-
-function firstUserMessage(messages: HermesMessageRow[]): string {
-  const msg = messages.find(m => m.role === 'user' && typeof m.content === 'string' && m.content.trim().length > 0)
-  return Array.from(msg?.content ?? '').slice(0, 500).join('')
-}
-
-function mapToolName(raw: string): string {
-  // Composio MCP tools are matched first — the generic mcp_ prefix on line
-  // below would also match composio names, so order matters here.
-  if (raw.startsWith('mcp_composio_')) return 'MCP'
-  if (raw.startsWith('mcp_') || raw.startsWith('mcp__')) return raw
-  if (raw.startsWith('browser_')) return 'Browser'
-  return toolNameMap[raw] ?? raw
-}
-
-function parseToolCalls(raw: string | null): HermesToolCall[] {
-  if (!raw) return []
-  try {
-    const parsed = JSON.parse(raw) as unknown
-    return Array.isArray(parsed) ? parsed as HermesToolCall[] : []
-  } catch {
-    return []
-  }
-}
-
-function collectTools(messages: HermesMessageRow[]): { tools: string[]; toolSequence: ToolCall[][]; bashCommands: string[] } {
-  const tools: string[] = []
-  const toolSequence: ToolCall[][] = []
-  const bashCommands: string[] = []
-
-  for (const msg of messages) {
-    if (msg.role === 'assistant') {
-      const currentTurnTools: ToolCall[] = []
-      for (const call of parseToolCalls(msg.tool_calls)) {
-        const rawName = call.function?.name ?? ''
-        if (!rawName) continue
-        const mapped = mapToolName(rawName)
-        tools.push(mapped)
-        const toolCall: ToolCall = { tool: mapped }
-        const rawArgs = call.function?.arguments
-        if (rawArgs) {
-          try {
-            const args = JSON.parse(rawArgs) as Record<string, unknown>
-            const file = args['path'] ?? args['file_path']
-            if (typeof file === 'string') toolCall.file = file
-            const command = args['command']
-            if (typeof command === 'string') {
-              toolCall.command = command
-              bashCommands.push(command)
-            }
-          } catch {
-            // Ignore malformed arguments from historical sessions.
-          }
-        }
-        currentTurnTools.push(toolCall)
-      }
-      if (currentTurnTools.length > 0) {
-        toolSequence.push(currentTurnTools)
-      }
-    } else if (msg.role === 'tool' && msg.tool_name) {
-      tools.push(mapToolName(msg.tool_name))
-    }
-  }
-
-  return {
-    tools: [...new Set(tools)],
-    toolSequence: toolSequence.length > 0 ? toolSequence : [],
-    bashCommands,
-  }
-}
-
-function inferProject(messages: HermesMessageRow[], fallback: string): { project: string; projectPath?: string } {
-  const cwdPattern = /^Current working directory:\s*([a-zA-Z]:\\[^\r\n`"]+|\/[^\r\n`"\\]+)/m
-  for (const msg of messages) {
-    if (msg.role !== 'user' && msg.role !== 'system') continue
-    const text = msg.content ?? ''
-    const match = cwdPattern.exec(text)
-    if (match?.[1]) {
-      const projectPath = match[1].trim()
-      return { project: sanitizeProject(projectPath), projectPath }
-    }
-  }
-  return { project: fallback }
 }
 
 async function discoverFromDb(dbPath: string, profile: string): Promise<SessionSource[]> {
@@ -303,16 +151,76 @@ async function discoverFromDb(dbPath: string, profile: string): Promise<SessionS
   }
 }
 
-function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: string): SessionParser {
+// Map one rich, cost-free decoder call into the host's ParsedProviderCall. Cost
+// re-enters here: a provider-recorded dollar figure becomes `costBasis: 'measured'`
+// and `costUSD`; otherwise the parser.ts pricing pass estimates from token
+// buckets (`costBasis: 'estimated'`). Bash base-name extraction (and its
+// `strip-ansi` dependency) stays CLI-side: the core decoder carries the raw
+// command strings; the host reduces them to base names here.
+function toProviderCall(rich: HermesDecodedCall): ParsedProviderCall {
+  const measured = rich.recordedCost !== undefined
   return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
+    provider: 'hermes',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    ...(measured
+      ? { costUSD: rich.recordedCost, costBasis: 'measured' as const, costIsEstimated: false }
+      : { costBasis: 'estimated' as const, costIsEstimated: true }),
+    tools: rich.tools,
+    bashCommands: rich.rawBashCommands,
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    turnId: rich.turnId,
+    toolSequence: rich.toolSequence,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
+    project: rich.project,
+    projectPath: rich.projectPath,
+  }
+}
+
+export function createHermesProvider(hermesHomeOverride?: string): Provider {
+  const hermesHome = getHermesHome(hermesHomeOverride)
+
+  return createBridgedProvider<HermesDecodedCall>({
+    name: 'hermes',
+    displayName: 'Hermes Agent',
+
+    modelDisplayName(model: string): string {
+      return getShortModelName(model)
+    },
+
+    toolDisplayName(rawTool: string): string {
+      return mapToolName(rawTool)
+    },
+
+    async discoverSessions(): Promise<SessionSource[]> {
+      if (!isSqliteAvailable()) return []
+      const dbs = await findStateDbs(hermesHome)
+      const sessions: SessionSource[] = []
+      for (const { dbPath, profile } of dbs) {
+        sessions.push(...await discoverFromDb(dbPath, profile))
+      }
+      return sessions
+    },
+
+    // I/O adapter: open the sqlite database host-side, run the session + message
+    // queries, and return the plain row objects for the core decoder.
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
       if (!isSqliteAvailable()) {
         process.stderr.write(getSqliteLoadError() + '\n')
-        return
+        return null
       }
 
       const decoded = decodeSourcePath(source.path)
-      if (!decoded) return
+      if (!decoded) return null
       const profile = parseProfileName(decoded.dbPath, hermesHome)
 
       let db: SqliteDatabase
@@ -320,12 +228,11 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
         db = openDatabase(decoded.dbPath)
       } catch (err) {
         process.stderr.write(`codeburn: cannot open Hermes database: ${err instanceof Error ? err.message : err}\n`)
-        return
+        return null
       }
 
-      let result: ParsedProviderCall | undefined
       try {
-        if (!validateSchema(db)) return
+        if (!validateSchema(db)) return null
         const columns = getSessionColumns(db)
         const rows = db.query<HermesSessionRow>(
           `SELECT id,
@@ -350,7 +257,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
           [decoded.sessionId],
         )
         const row = rows[0]
-        if (!row) return
+        if (!row) return null
 
         const messageColumns = getMessageColumns(db)
         const orderColumns = ['timestamp', 'id'].filter(name => messageColumns.has(name))
@@ -368,105 +275,21 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
           [decoded.sessionId],
         )
 
-        const inputTokens = row.input_tokens ?? 0
-        const outputTokens = row.output_tokens ?? 0
-        const cacheReadTokens = row.cache_read_tokens ?? 0
-        const cacheWriteTokens = row.cache_write_tokens ?? 0
-        const reasoningTokens = row.reasoning_tokens ?? 0
-        if (inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens + reasoningTokens === 0) return
-
-        const model = row.model ?? 'unknown'
-        const { tools, toolSequence, bashCommands } = collectTools(messages)
-        // Hermes records the session's working directory in sessions.cwd.
-        // Prefer it; fall back to scraping a "Current working directory:" line
-        // from the transcript (older builds), then to the profile name.
-        const cwd = row.cwd?.trim()
-        const projectInfo = cwd
-          ? { project: sanitizeProject(cwd), projectPath: cwd }
-          : inferProject(messages, sanitizeProject(profile))
-        const timestamp = parseTimestamp(row.started_at)
-        const dedupKey = `hermes:${profile}:${row.id}`
-        if (seenKeys.has(dedupKey)) return
-        seenKeys.add(dedupKey)
-
-        // Hermes bills reasoning tokens at the output rate (same as Gemini).
-        // When Hermes stored an actual or estimated cost, pass it as measured;
-        // otherwise the pricing pass will estimate from token buckets.
-        const recordedCost =
-          (row.actual_cost_usd ?? 0) > 0 ? row.actual_cost_usd!
-          : (row.estimated_cost_usd ?? 0) > 0 ? row.estimated_cost_usd!
-          : null
-        const costIsEstimated = recordedCost === null
-
-        result = {
-          provider: 'hermes',
-          model,
-          inputTokens,
-          outputTokens,
-          cacheCreationInputTokens: cacheWriteTokens,
-          cacheReadInputTokens: cacheReadTokens,
-          cachedInputTokens: cacheReadTokens,
-          reasoningTokens,
-          webSearchRequests: 0,
-          ...(recordedCost !== null
-            ? { costUSD: recordedCost, costBasis: 'measured' as const }
-            : { costBasis: 'estimated' as const }),
-          costIsEstimated,
-          tools,
-          bashCommands,
-          timestamp,
-          speed: 'standard',
-          deduplicationKey: dedupKey,
-          turnId: `${row.id}:session`,
-          toolSequence: toolSequence.length > 0 ? toolSequence : undefined,
-          userMessage: firstUserMessage(messages),
-          sessionId: row.id,
-          project: projectInfo.project,
-          projectPath: projectInfo.projectPath,
-        }
+        return [{ session: row, messages, profile }]
       } catch (err) {
         // A transient lock on the live state.db must propagate so the caller
         // retries, not get swallowed into an empty (negatively cached) result.
         if (isSqliteBusyError(err)) throw err
         process.stderr.write(`codeburn: error querying Hermes database: ${err instanceof Error ? err.message : err}\n`)
-        return
+        return null
       } finally {
         db.close()
       }
-
-      if (result) yield result
-    },
-  }
-}
-
-export function createHermesProvider(hermesHomeOverride?: string): Provider {
-  const hermesHome = getHermesHome(hermesHomeOverride)
-  return {
-    name: 'hermes',
-    displayName: 'Hermes Agent',
-
-    modelDisplayName(model: string): string {
-      return getShortModelName(model)
     },
 
-    toolDisplayName(rawTool: string): string {
-      return mapToolName(rawTool)
-    },
-
-    async discoverSessions(): Promise<SessionSource[]> {
-      if (!isSqliteAvailable()) return []
-      const dbs = await findStateDbs(hermesHome)
-      const sessions: SessionSource[] = []
-      for (const { dbPath, profile } of dbs) {
-        sessions.push(...await discoverFromDb(dbPath, profile))
-      }
-      return sessions
-    },
-
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, seenKeys, hermesHome)
-    },
-  }
+    decode: decodeHermes,
+    toProviderCall,
+  })
 }
 
 export const hermes = createHermesProvider()

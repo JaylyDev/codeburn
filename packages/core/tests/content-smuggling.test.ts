@@ -29,6 +29,11 @@ import { decodeOpenClaw, toObservations as toOpenClawObservations } from '../src
 import { decodeZed, toObservations as toZedObservations } from '../src/providers/zed/index.js'
 import { decodeForge, toObservations as toForgeObservations } from '../src/providers/forge/index.js'
 import { decodeGoose, toObservations as toGooseObservations } from '../src/providers/goose/index.js'
+import { decodeHermes, toObservations as toHermesObservations } from '../src/providers/hermes/index.js'
+import { decodeWarp, toObservations as toWarpObservations } from '../src/providers/warp/index.js'
+import { decodeCursorAgent, toObservations as toCursorAgentObservations } from '../src/providers/cursor-agent/index.js'
+import { decodeQuickdesk, toObservations as toQuickdeskObservations } from '../src/providers/quickdesk/index.js'
+import { decodeDevin, toObservations as toDevinObservations } from '../src/providers/devin/index.js'
 import type { DecodeContext } from '../src/contracts.js'
 import type { ZedThreadRow } from '../src/providers/zed/index.js'
 
@@ -886,3 +891,385 @@ describe('content-smuggling guardrail: diagnostic detail rejects paths', () => {
     expect(DiagnosticDetail.safeParse(SECRETS.commandLine).success).toBe(false)
   })
 })
+
+describe('content-smuggling guardrail: real hermes decode -> toObservations is secret-free', () => {
+  // A hostile Hermes sqlite session planting every secret in the free-text fields
+  // the decode captures: the user prompt, a terminal command, a read_file path,
+  // and a tool NAME carrying a command line. Decoding it fully and minimizing
+  // MUST surface none of them.
+  const hermesContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'hermes', sourceRef: 'ref' }
+
+  function decodeAndMinimize() {
+    const session = {
+      id: 'sess-hostile',
+      source: 'cli',
+      model: 'claude-sonnet-4-20250514',
+      cwd: SECRETS.absPath,
+      billing_provider: 'openai-codex',
+      input_tokens: 1000,
+      output_tokens: 200,
+      cache_read_tokens: 0,
+      cache_write_tokens: 0,
+      reasoning_tokens: 50,
+      estimated_cost_usd: null,
+      actual_cost_usd: null,
+      api_call_count: 1,
+      tool_call_count: 3,
+      started_at: 1779549200,
+      ended_at: null,
+      title: 'Hostile',
+    }
+    const messages = [
+      { id: 1, role: 'user', content: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}`, tool_calls: null, tool_name: null, timestamp: 1779549201 },
+      {
+        id: 2,
+        role: 'assistant',
+        content: null,
+        tool_calls: JSON.stringify([
+          { function: { name: 'read_file', arguments: JSON.stringify({ path: SECRETS.absPath }) } },
+          { function: { name: 'terminal', arguments: JSON.stringify({ command: SECRETS.commandLine }) } },
+          // A hostile tool NAME carrying a command line: fails canonical charset.
+          { function: { name: SECRETS.commandLine, arguments: '{}' } },
+        ]),
+        tool_name: null,
+        timestamp: 1779549202,
+      },
+    ]
+    const { calls } = decodeHermes({ records: [{ session, messages, profile: 'default' }], context: hermesContext })
+    const { sessions } = toHermesObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'hermes' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile session', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('keeps canonical tool names (Bash/Read) and drops the argument-carrying name', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toContain('Bash')
+    expect(allToolNames).toContain('Read')
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+
+  it('fingerprints the read_file path into a 16-hex resourceRead, never the raw path', () => {
+    const env = decodeAndMinimize()
+    const reads = env.sessions.flatMap(s => s.calls.flatMap(c => c.resourceReads ?? []))
+    expect(reads.length).toBeGreaterThan(0)
+    for (const ref of reads) {
+      expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
+      expect(typeof ref.resourceClass).toBe('string')
+    }
+    expect(allStrings(reads)).not.toContain(SECRETS.absPath)
+  })
+})
+
+describe('content-smuggling guardrail: real warp decode -> toObservations is secret-free', () => {
+  // A hostile Warp sqlite session planting every secret in the free-text fields
+  // the decode captures: the user prompt and the raw command block text. The
+  // working directory is also a secret path. Minimizing MUST surface none of them.
+  const warpContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'warp', sourceRef: 'ref' }
+
+  function decodeAndMinimize() {
+    const conversation: { conversation_id: string; conversation_data: string; last_modified_at: string } = {
+      conversation_id: 'sess-hostile',
+      conversation_data: JSON.stringify({
+        conversation_usage_metadata: {
+          token_usage: [
+            {
+              model_id: 'GPT-5.3 Codex (medium reasoning)',
+              warp_tokens: 100,
+              byok_tokens: 0,
+              warp_token_usage_by_category: { primary_agent: 100 },
+              byok_token_usage_by_category: {},
+            },
+          ],
+        },
+      }),
+      last_modified_at: '2026-07-17 10:10:00',
+    }
+    const exchanges = [
+      {
+        exchange_id: 'ex-hostile',
+        conversation_id: 'sess-hostile',
+        start_ts: '2026-07-17T10:00:00.000000',
+        input: JSON.stringify([{ Query: { text: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}` } }]),
+        working_directory: SECRETS.absPath,
+        output_status: '"Completed"',
+        model_id: 'auto-efficient',
+        planning_model_id: '',
+        coding_model_id: '',
+      },
+    ]
+    const blocks = [
+      {
+        block_id: 'block-hostile',
+        start_ts: '2026-07-17T10:00:01.000000',
+        stylized_command: SECRETS.commandLine,
+      },
+    ]
+    const { calls } = decodeWarp({
+      records: [{ conversationId: 'sess-hostile', conversation, exchanges, blocks, sourceProject: 'warp' }],
+      context: warpContext,
+    })
+    const { sessions } = toWarpObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'warp' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile session', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('keeps the canonical Bash tool name and never emits the raw command', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toContain('Bash')
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+})
+
+describe('content-smuggling guardrail: real cursor-agent decode -> toObservations is secret-free', () => {
+  // A hostile Cursor Agent transcript planting every secret in the free-text
+  // fields the decode captures: the user prompt, the assistant body, reasoning
+  // text, and a tool NAME carrying a command line. Minimizing MUST surface none
+  // of them.
+  const cursorAgentContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'cursor-agent', sourceRef: 'ref' }
+
+  function decodeAndMinimize() {
+    const transcript = [
+      'user:',
+      `<user_query>${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}</user_query>`,
+      'A:',
+      '[Thinking] ' + SECRETS.commandLine,
+      SECRETS.absPath,
+      '[Tool call] ' + SECRETS.commandLine,
+    ].join('\n')
+
+    const { calls } = decodeCursorAgent({
+      records: [{
+        summary: null,
+        transcript,
+        transcriptPath: SECRETS.absPath,
+        fileMtime: '2026-07-17T10:00:00.000Z',
+      }],
+      context: cursorAgentContext,
+    })
+    const { sessions } = toCursorAgentObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'cursor-agent' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile transcript', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('drops non-canonical (argument-carrying) tool names instead of emitting them', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+})
+
+describe('content-smuggling guardrail: real quickdesk decode -> toObservations is secret-free', () => {
+  // A hostile Quickdesk session planting every secret in the free-text fields the
+  // decode captures: the user prompt and tool_names (both from metrics-linked
+  // sessions and from database estimates). Minimizing MUST surface none of them.
+  const quickdeskContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'quickdesk', sourceRef: 'ref' }
+
+  function decodeAndMinimize() {
+    const sessions = new Map()
+    sessions.set('sess-hostile', {
+      id: 'sess-hostile',
+      title: 'Hostile',
+      agentMode: 'agent',
+      createdAt: 1783987200,
+      deleted: false,
+      firstUserMessage: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}`,
+      inputChars: 100,
+      outputChars: 50,
+      tools: [SECRETS.commandLine],
+    })
+
+    const metricsRecords = [
+      { record: { session_id: 'sess-hostile', ToolName: SECRETS.commandLine } },
+      {
+        record: {
+          _aws: { Timestamp: 1783987200123 },
+          session_id: 'sess-hostile',
+          Model: 'claude-sonnet-4-5',
+          InputTokens: 100,
+          OutputTokens: 50,
+        },
+      },
+    ]
+    const { calls: metricsCalls } = decodeQuickdesk({
+      records: [{
+        variant: 'metrics',
+        records: metricsRecords,
+        sessions,
+        project: 'hostile-project',
+        projectPath: SECRETS.absPath,
+        fileId: 'metrics-2026-07-17.jsonl',
+      }],
+      context: quickdeskContext,
+    })
+
+    const dbSessions = [{
+      id: 'db-hostile',
+      title: 'DB Hostile',
+      agentMode: 'agent',
+      createdAt: 1783987200,
+      deleted: false,
+      firstUserMessage: `${SECRETS.prompt} ${SECRETS.apiKey}`,
+      inputChars: 20,
+      outputChars: 10,
+      tools: [SECRETS.commandLine],
+    }]
+    const { calls: dbCalls } = decodeQuickdesk({
+      records: [{
+        variant: 'database',
+        sessions: dbSessions,
+        meteredSessionIds: new Set(),
+        project: 'hostile-project',
+        projectPath: SECRETS.absPath,
+      }],
+      context: quickdeskContext,
+    })
+
+    const allCalls = [...metricsCalls, ...dbCalls]
+    const { sessions: observed } = toQuickdeskObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls: allCalls },
+      { privacyKey: 'test-privacy-key', provider: 'quickdesk' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions: observed,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile session', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('drops non-canonical (argument-carrying) tool names instead of emitting them', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+})
+
+describe('content-smuggling guardrail: real devin decode -> toObservations is secret-free', () => {
+  // A hostile Devin transcript planting every secret in the free-text fields the
+  // decode captures: the user prompt, a tool NAME carrying a command line, and
+  // tool arguments containing a secret path. Minimizing MUST surface none of them.
+  const devinContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'devin', sourceRef: '/tmp/devin/transcripts/sess-hostile.json' }
+
+  function decodeAndMinimize() {
+    const transcript = {
+      schema_version: '1.7',
+      session_id: 'sess-hostile',
+      agent: { name: 'devin', version: '2.0', model_name: 'agent-model' },
+      steps: [
+        {
+          step_id: 1,
+          message: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}`,
+          metadata: { is_user_input: true, created_at: '2027-01-15T08:00:00.000Z' },
+        },
+        {
+          step_id: 2,
+          source: 'assistant',
+          message: 'reading file',
+          tool_calls: [
+            { tool_call_id: 'tc1', function_name: 'read_file', arguments: { path: SECRETS.absPath } },
+            // A hostile tool NAME carrying a command line (spaces + slashes): it
+            // fails the canonical charset and must be dropped, not emitted.
+            { tool_call_id: 'tc2', function_name: SECRETS.commandLine, arguments: {} },
+          ],
+          metadata: {
+            created_at: '2027-01-15T08:00:01.000Z',
+            committed_acu_cost: 0.1,
+            metrics: { input_tokens: 100 },
+          },
+        },
+      ],
+    }
+    const { calls } = decodeDevin({ records: [{ transcript, session: null, project: 'devin' }], context: devinContext })
+    const { sessions } = toDevinObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'devin' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile transcript', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('keeps canonical tool names (read_file) and drops the argument-carrying name', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toContain('read_file')
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+})
+
