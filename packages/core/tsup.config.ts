@@ -52,5 +52,8 @@ export default defineConfig({
   clean: true,
   splitting: false,
   sourcemap: true,
-  dts: true,
+  // Declarations come from `tsc -p tsconfig.build.json` instead. tsup's dts
+  // worker bundles types for all 41 entries in one pass and exhausts the heap
+  // (ERR_WORKER_OUT_OF_MEMORY) on Node 22 through 26.
+  dts: false,
 })

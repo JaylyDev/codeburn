@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "declaration": true,
+    // No declarationMap: `files` ships dist and schemas but not src, so the
+    // emitted .d.ts.map would point at sources the consumer never receives.
+    // That is 151 files and ~135 kB of maps that resolve to nothing.
+    "declarationMap": false,
+    "emitDeclarationOnly": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "sourceMap": false,
+    "noEmit": false
+  },
+  "include": ["src/**/*"],
+  "exclude": ["tests/**/*", "scripts/**/*", "dist", "node_modules"]
+}
