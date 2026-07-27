@@ -35,6 +35,9 @@ jobs:
       - name: Build core
         run: npm run build --workspace=@codeburn/core
 
+      - name: Verify every export target exists
+        run: npm run verify-dist --workspace=@codeburn/core
+
       - name: Verify package contents
         run: npm pack --workspace=@codeburn/core --dry-run
 

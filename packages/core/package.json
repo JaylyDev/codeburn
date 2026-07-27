@@ -181,7 +181,9 @@
     "build": "tsup && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "emit-schemas": "tsx scripts/emit-schemas.mts"
+    "emit-schemas": "tsx scripts/emit-schemas.mts",
+    "verify-dist": "node scripts/verify-dist.mjs",
+    "prepublishOnly": "npm run build && npm run verify-dist"
   },
   "engines": {
     "node": ">=22.13.0"
