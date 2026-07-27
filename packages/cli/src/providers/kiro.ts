@@ -4,9 +4,22 @@ import { readdir, readFile, stat } from 'fs/promises'
 import { basename, dirname, extname, join } from 'path'
 import { homedir } from 'os'
 
+import type { DecodeContext } from '@codeburn/core'
+import type {
+  KiroCliEntry,
+  KiroCliSessionMeta,
+  KiroDecodedCall,
+  KiroV2SessionMeta,
+} from '@codeburn/core/providers/kiro'
+import {
+  decodeKiroIdeFile,
+  decodeKiroCliSession,
+  decodeKiroV2Session,
+  finishKiroWorkspaceSession,
+  kiroToolNameMap,
+  prepareKiroWorkspaceSession,
+} from '@codeburn/core/providers/kiro'
 import { readSessionFile } from '../fs-utils.js'
-import { estimateTokensFromChars } from '../token-estimate.js'
-import type { ToolCall } from '../types.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 // Kiro bills in credits: individual plans are $20/mo for 1,000 credits and
@@ -14,8 +27,6 @@ import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from 
 // public overage rate (the marginal price), mirroring the Codebuff provider's
 // USD_PER_CREDIT approach, so we never understate real cost.
 const USD_PER_KIRO_CREDIT = 0.04
-const MIN_REASONABLE_TIMESTAMP_MS = 1_000_000_000_000
-const MODERN_CONVERSATION_KEYS = ['messages', 'conversation', 'chat', 'transcript', 'entries', 'events']
 
 const modelDisplayNames: Record<string, string> = {
   'claude-sonnet-4-6': 'Sonnet 4.6',
@@ -29,819 +40,73 @@ const modelDisplayNames: Record<string, string> = {
 
 const modelDisplayEntries = Object.entries(modelDisplayNames).sort((a, b) => b[0].length - a[0].length)
 
-const toolNameMap: Record<string, string> = {
-  readFile: 'Read',
-  read_file: 'Read',
-  read: 'Read',
-  writeFile: 'Edit',
-  write_file: 'Edit',
-  write: 'Edit',
-  editFile: 'Edit',
-  edit_file: 'Edit',
-  createFile: 'Write',
-  create_file: 'Write',
-  deleteFile: 'Delete',
-  listDir: 'LS',
-  list_dir: 'LS',
-  openFolders: 'LS',
-  runCommand: 'Bash',
-  run_command: 'Bash',
-  shell: 'Bash',
-  executeBash: 'Bash',
-  searchFiles: 'Grep',
-  search_files: 'Grep',
-  grep: 'Grep',
-  grepSearch: 'Grep',
-  findFiles: 'Glob',
-  find_files: 'Glob',
-  glob: 'Glob',
-  fileSearch: 'Glob',
-  webSearch: 'WebSearch',
-  web_search: 'WebSearch',
-  web_fetch: 'WebFetch',
-  fsWrite: 'Edit',
-  strReplace: 'Edit',
-  listDirectory: 'LS',
-  code: 'Read',
-  subagent: 'Agent',
-}
-
-type KiroChatMessage = {
-  role: 'human' | 'bot' | 'tool'
-  content: string
-}
-
-type KiroChatFile = {
-  executionId: string
-  actionId: string
-  chat: KiroChatMessage[]
-  metadata: {
-    modelId: string
-    modelProvider: string
-    workflow: string
-    workflowId: string
-    startTime: number
-    endTime: number
-  }
-}
-
-type KiroModernExecution = Record<string, unknown>
-
-function normalizeModelId(raw: string): string {
-  return raw.replace(/(\d+)\.(\d+)/g, '$1-$2')
-}
-
-function extractToolNames(content: string): string[] {
-  const tools: string[] = []
-  const regex = /<tool_use>\s*<name>([^<]+)<\/name>/g
-  let match
-  while ((match = regex.exec(content)) !== null) {
-    const name = match[1]!.trim()
-    tools.push(toolNameMap[name] ?? name)
-  }
-  return tools
-}
-
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
 
-function stringField(record: Record<string, unknown> | null, names: string[]): string {
-  if (!record) return ''
-  for (const name of names) {
-    const value = record[name]
-    if (typeof value === 'string' && value.trim()) return value.trim()
-  }
-  return ''
-}
-
-function timeField(record: Record<string, unknown> | null, names: string[]): number | string | undefined {
-  if (!record) return undefined
-  for (const name of names) {
-    const value = record[name]
-    if (typeof value === 'number' || typeof value === 'string') return value
-  }
-  return undefined
-}
-
-function parseKiroTimestamp(value: number | string | undefined): Date | null {
-  if (value === undefined) return null
-
-  let parsed: number | string = value
-  if (typeof value === 'string') {
-    const trimmed = value.trim()
-    if (!trimmed) return null
-    parsed = /^-?\d+(\.\d+)?$/.test(trimmed) ? Number(trimmed) : trimmed
-  }
-
-  if (typeof parsed === 'number') {
-    if (!Number.isFinite(parsed)) return null
-    const ms = parsed < MIN_REASONABLE_TIMESTAMP_MS ? parsed * 1000 : parsed
-    const date = new Date(ms)
-    return Number.isNaN(date.getTime()) || date.getTime() < MIN_REASONABLE_TIMESTAMP_MS ? null : date
-  }
-
-  const date = new Date(parsed)
-  return Number.isNaN(date.getTime()) || date.getTime() < MIN_REASONABLE_TIMESTAMP_MS ? null : date
-}
-
-function textField(record: Record<string, unknown> | null, names: string[]): string {
-  if (!record) return ''
-  for (const name of names) {
-    const text = extractText(record[name])
-    if (text) return text
-  }
-  return ''
-}
-
-function extractText(value: unknown): string {
-  if (typeof value === 'string') return value
-  if (Array.isArray(value)) return value.map(extractText).filter(Boolean).join('\n')
-  const record = asRecord(value)
-  if (!record) return ''
-  for (const key of ['content', 'text', 'message', 'value', 'parts', 'entries']) {
-    const text = extractText(record[key])
-    if (text) return text
-  }
-  return ''
-}
-
-function messageRole(value: unknown): string {
-  const record = asRecord(value)
-  if (!record) return ''
-  return stringField(record, ['role', 'type', 'author']).toLowerCase()
-}
-
-function extractStructuredToolNames(value: unknown, text: string, options: { includeDirectName?: boolean } = {}): string[] {
-  const tools = extractToolNames(text)
-  const record = asRecord(value)
-  if (!record) return tools
-
-  if (options.includeDirectName ?? true) {
-    const directName = stringField(record, ['toolName', 'name'])
-    if (directName) tools.push(toolNameMap[directName] ?? directName)
-  }
-
-  for (const key of ['toolCalls', 'tool_calls', 'tools']) {
-    const entries = record[key]
-    if (!Array.isArray(entries)) continue
-    for (const entry of entries) {
-      const name = stringField(asRecord(entry), ['name', 'toolName', 'tool_name'])
-      if (name) tools.push(toolNameMap[name] ?? name)
-    }
-  }
-
-  return tools
-}
-
-function parseChatFile(data: KiroChatFile, sessionId: string, project: string, seenKeys: Set<string>): ParsedProviderCall[] {
-  const results: ParsedProviderCall[] = []
-  const { chat, metadata } = data
-
-  let modelId = normalizeModelId(metadata.modelId ?? '')
-  if (modelId === 'auto' || !modelId) modelId = 'kiro-auto'
-
-  let pendingUserMessage = ''
-  const allTools: string[] = []
-  const toolSequence: ToolCall[][] = []
-
-  for (const msg of chat) {
-    if (msg.role === 'human') {
-      if (msg.content.startsWith('<identity>')) continue
-      pendingUserMessage = msg.content.slice(0, 500)
-    }
-    if (msg.role === 'bot') {
-      const msgTools = extractToolNames(msg.content)
-      allTools.push(...msgTools)
-      if (msgTools.length > 0) toolSequence.push(msgTools.map(t => ({ tool: t })))
-    }
-  }
-
-  const botMessages = chat.filter(m => m.role === 'bot' && m.content.length > 0)
-  const totalOutputChars = botMessages.reduce((sum, m) => sum + m.content.length, 0)
-  if (totalOutputChars === 0) return results
-
-  const dedupKey = `kiro:${sessionId}:${data.executionId}`
-  if (seenKeys.has(dedupKey)) return results
-
-  const outputTokens = estimateTokensFromChars(totalOutputChars)
-  const inputTokens = estimateTokensFromChars(pendingUserMessage.length)
-  const tsDate = parseKiroTimestamp(metadata.startTime)
-  if (!tsDate) return results
-  const timestamp = tsDate.toISOString()
-  seenKeys.add(dedupKey)
-
-  results.push({
-    provider: 'kiro',
-    model: modelId,
-    inputTokens,
-    outputTokens,
-    cacheCreationInputTokens: 0,
-    cacheReadInputTokens: 0,
-    cachedInputTokens: 0,
-    reasoningTokens: 0,
-    webSearchRequests: 0,
-    costBasis: 'estimated',
-    costIsEstimated: true,
-    tools: [...new Set(allTools)],
-    bashCommands: [],
-    toolSequence: toolSequence.length > 1 ? toolSequence : undefined,
-    timestamp,
-    speed: 'standard',
-    deduplicationKey: dedupKey,
-    userMessage: pendingUserMessage,
-    sessionId,
-  })
-
-  return results
-}
-
-function parseModernExecution(data: KiroModernExecution, sourcePath: string, seenKeys: Set<string>): ParsedProviderCall[] {
-  const results: ParsedProviderCall[] = []
-  if (Array.isArray(data['executions'])) return results
-
-  const metadata = asRecord(data['metadata'])
-  const modelObj = asRecord(data['model'])
-  let modelId = normalizeModelId(
-    stringField(data, ['modelId', 'modelID', 'modelName', 'model']) ||
-    stringField(modelObj, ['id', 'name']) ||
-    stringField(metadata, ['modelId', 'modelID', 'modelName']),
-  )
-  if (modelId === 'auto' || !modelId) modelId = 'kiro-auto'
-
-  const executionId = stringField(data, ['executionId', 'id']) || basename(sourcePath)
-  const sessionId = stringField(data, ['sessionId', 'chatSessionId', 'conversationId', 'workflowId']) ||
-    stringField(metadata, ['workflowId', 'sessionId']) ||
-    basename(dirname(sourcePath)) ||
-    executionId
-
-  let inputChars = 0
-  let outputChars = 0
-  let pendingUserMessage = ''
-  const allTools: string[] = []
-  let hasOutputActivity = false
-  const directInput = textField(data, ['prompt', 'input', 'userMessage', 'user_message', 'request'])
-  const directOutput = textField(data, ['response', 'output', 'assistantMessage', 'assistant_message', 'result'])
-  const directTools = extractStructuredToolNames(data, directOutput, { includeDirectName: false })
-
-  if (directInput) {
-    inputChars += directInput.length
-    pendingUserMessage = directInput.slice(0, 500)
-  }
-
-  if (directOutput) {
-    outputChars += directOutput.length
-    hasOutputActivity = true
-  }
-
-  if (directTools.length > 0) {
-    hasOutputActivity = true
-    allTools.push(...directTools)
-  }
-
-  // Check both data.context[key] and data[key] for conversation arrays.
-  // Kiro IDE stores messages at data.context.messages in current builds.
-  const context = asRecord(data['context'])
-  const conversationSources = context ? [context, data] : [data]
-
-  for (const source of conversationSources) {
-    let found = false
-    for (const key of MODERN_CONVERSATION_KEYS) {
-      const messages = (source as Record<string, unknown>)[key]
-      if (!Array.isArray(messages)) continue
-
-      for (const message of messages) {
-        const text = extractText(message)
-        const role = messageRole(message)
-        const tools = extractStructuredToolNames(message, text)
-
-        if (role === 'human' || role === 'user') {
-          if (!text) continue
-          inputChars += text.length
-          pendingUserMessage = text.slice(0, 500)
-        } else if (role === 'bot' || role === 'assistant' || role === 'ai' || role === 'model') {
-          if (text) outputChars += text.length
-          if (text || tools.length > 0) hasOutputActivity = true
-          allTools.push(...tools)
-        } else if (role === 'tool' || role === 'system') {
-          if (text) inputChars += text.length
-          allTools.push(...tools)
-        }
-      }
-      found = true
-      break
-    }
-    if (found) break
-  }
-
-  // Extract tools and metered credits from usageSummary (reliable structured
-  // data in current Kiro builds). usageSummary is an array of per-turn entries
-  // with optional usedTools and usage (credits, unit "credit") fields — the
-  // v1 predecessor of v2's usage_summary.promptTurnSummaries.
-  let executionCredits = 0
-  const usageSummary = data['usageSummary']
-  if (Array.isArray(usageSummary)) {
-    for (const entry of usageSummary) {
-      const rec = asRecord(entry)
-      if (!rec) continue
-      const usage = rec['usage']
-      if (typeof usage === 'number' && Number.isFinite(usage)) executionCredits += usage
-      const usedTools = rec['usedTools']
-      if (Array.isArray(usedTools)) {
-        for (const tool of usedTools) {
-          if (typeof tool === 'string' && tool) {
-            // Strip mcp_ prefix for cleaner display (e.g. mcp_aws_sentral_mcp_search_accounts -> aws_sentral_mcp_search_accounts)
-            const cleaned = tool.startsWith('mcp_') ? tool.slice(4) : tool
-            allTools.push(toolNameMap[cleaned] ?? cleaned)
-            hasOutputActivity = true
-          }
-        }
-      }
-    }
-  }
-
-  if (!hasOutputActivity) return results
-
-  const dedupKey = `kiro:${sessionId}:${executionId}`
-  if (seenKeys.has(dedupKey)) return results
-
-  const rawStartTime = timeField(data, ['startTime', 'createdAt', 'timestamp']) ??
-    timeField(metadata, ['startTime', 'createdAt', 'timestamp'])
-  const tsDate = parseKiroTimestamp(rawStartTime)
-  if (!tsDate) return results
-
-  const inputTokens = estimateTokensFromChars(inputChars)
-  const outputTokens = estimateTokensFromChars(outputChars)
-  // Prefer real metered credits at the public overage rate; fall back to
-  // token-estimated pricing when the execution has no usage data — same
-  // contract as the CLI and v2 parsers.
-  seenKeys.add(dedupKey)
-
-  results.push({
-    provider: 'kiro',
-    model: modelId,
-    inputTokens,
-    outputTokens,
-    cacheCreationInputTokens: 0,
-    cacheReadInputTokens: 0,
-    cachedInputTokens: 0,
-    reasoningTokens: 0,
-    webSearchRequests: 0,
-    ...(executionCredits > 0
-      ? { costUSD: executionCredits * USD_PER_KIRO_CREDIT, costBasis: 'measured' as const }
+export function toProviderCall(rich: KiroDecodedCall): ParsedProviderCall {
+  const base = {
+    provider: 'kiro' as const,
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    ...(rich.credits > 0
+      ? { costUSD: rich.credits * USD_PER_KIRO_CREDIT, costBasis: 'measured' as const }
       : { costBasis: 'estimated' as const }),
-    costIsEstimated: executionCredits === 0,
-    tools: [...new Set(allTools)],
-    bashCommands: [],
-    timestamp: tsDate.toISOString(),
-    speed: 'standard',
-    deduplicationKey: dedupKey,
-    userMessage: pendingUserMessage,
-    sessionId,
-  })
-
-  return results
-}
-
-// --- Kiro CLI session types & parser ---
-
-type KiroCliEntry = {
-  version: string
-  kind: 'Prompt' | 'AssistantMessage' | 'ToolResults' | 'Clear'
-  data: Record<string, unknown>
-}
-
-type KiroCliSessionMeta = {
-  session_id: string
-  cwd: string
-  created_at: string
-  updated_at: string
-  title?: string
-  session_state?: {
-    rts_model_state?: { model_info?: { model_id?: string } }
-    conversation_metadata?: {
-      user_turn_metadatas?: Array<{
-        end_timestamp?: string
-        builtin_tool_uses?: number
-        metering_usage?: Array<{ value: number; unit: string }>
-        total_request_count?: number
-      }>
-    }
+    costIsEstimated: rich.credits === 0,
+    tools: rich.tools,
+    bashCommands: rich.bashCommands,
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
   }
-}
-
-function parseCliSession(meta: KiroCliSessionMeta, entries: KiroCliEntry[], seenKeys: Set<string>): ParsedProviderCall[] {
-  const results: ParsedProviderCall[] = []
-  const sessionId = meta.session_id
-  const project = basename(meta.cwd || '')
-
-  let modelId = meta.session_state?.rts_model_state?.model_info?.model_id ?? 'auto'
-  if (modelId === 'auto' || !modelId) modelId = 'kiro-auto'
-  else modelId = normalizeModelId(modelId)
-
-  const turns = meta.session_state?.conversation_metadata?.user_turn_metadatas ?? []
-
-  // Walk through JSONL entries grouping by prompt turns
-  let turnIndex = 0
-  let pendingUserMessage = ''
-  let outputChars = 0
-  let inputChars = 0
-  const allTools: string[] = []
-  let turnStartTimestamp: string | undefined
-
-  function flushTurn() {
-    if (outputChars === 0) return
-    const turnMeta = turns[turnIndex]
-    const dedupKey = `kiro-cli:${sessionId}:${turnIndex}`
-    if (seenKeys.has(dedupKey)) { turnIndex++; return }
-
-    const timestamp = turnMeta?.end_timestamp ?? turnStartTimestamp ?? meta.created_at
-    const tsDate = parseKiroTimestamp(timestamp)
-    if (!tsDate) { turnIndex++; return }
-
-    const inputTokens = estimateTokensFromChars(inputChars)
-    const outputTokens = estimateTokensFromChars(outputChars)
-    // metering_usage values are credits (unit: "credit"), not dollars —
-    // convert at the public overage rate. Gate on credits > 0, not array
-    // presence: real sessions carry empty metering_usage arrays (turn still
-    // in flight when the meta was written), which must fall back to
-    // token-estimated pricing — same contract as the v1-execution and v2
-    // parsers.
-    const turnCredits = turnMeta?.metering_usage
-      ? turnMeta.metering_usage.reduce((sum, m) => sum + m.value, 0)
-      : 0
-    seenKeys.add(dedupKey)
-
-    results.push({
-      provider: 'kiro',
-      model: modelId,
-      inputTokens,
-      outputTokens,
-      cacheCreationInputTokens: 0,
-      cacheReadInputTokens: 0,
-      cachedInputTokens: 0,
-      reasoningTokens: 0,
-      webSearchRequests: 0,
-      ...(turnCredits > 0
-        ? { costUSD: turnCredits * USD_PER_KIRO_CREDIT, costBasis: 'measured' as const }
-        : { costBasis: 'estimated' as const }),
-      costIsEstimated: turnCredits === 0,
-      tools: [...new Set(allTools)],
-      bashCommands: [],
-      timestamp: tsDate.toISOString(),
-      speed: 'standard',
-      deduplicationKey: dedupKey,
-      userMessage: pendingUserMessage,
-      sessionId,
-      project,
-    })
-    turnIndex++
-  }
-
-  let isFirstPrompt = true
-  for (const entry of entries) {
-    if (entry.kind === 'Prompt') {
-      if (!isFirstPrompt) {
-        flushTurn()
-        pendingUserMessage = ''
-        outputChars = 0
-        inputChars = 0
-        allTools.length = 0
-      }
-      isFirstPrompt = false
-      const content = entry.data['content']
-      if (Array.isArray(content)) {
-        for (const item of content) {
-          const rec = asRecord(item)
-          if (rec && rec['kind'] === 'text' && typeof rec['data'] === 'string') {
-            pendingUserMessage = (rec['data'] as string).slice(0, 500)
-            inputChars += (rec['data'] as string).length
-          }
-        }
-      }
-      const meta2 = asRecord(entry.data['meta'])
-      if (meta2) {
-        const ts = meta2['timestamp']
-        if (typeof ts === 'number') turnStartTimestamp = new Date(ts * 1000).toISOString()
-      }
-    } else if (entry.kind === 'AssistantMessage') {
-      const content = entry.data['content']
-      if (Array.isArray(content)) {
-        for (const item of content) {
-          const rec = asRecord(item)
-          if (!rec) continue
-          if (rec['kind'] === 'text' && typeof rec['data'] === 'string') {
-            outputChars += (rec['data'] as string).length
-          } else if (rec['kind'] === 'toolUse') {
-            const toolData = asRecord(rec['data'])
-            if (toolData) {
-              const name = typeof toolData['name'] === 'string' ? toolData['name'] : ''
-              if (name) allTools.push(toolNameMap[name] ?? name)
-            }
-          }
-        }
-      }
-    } else if (entry.kind === 'ToolResults') {
-      // Tool results count as input context
-      const content = entry.data['content']
-      if (Array.isArray(content)) {
-        for (const item of content) {
-          const text = extractText(item)
-          if (text) inputChars += text.length
-        }
-      }
-    }
-  }
-  // Flush last turn
-  flushTurn()
-
-  return results
-}
-
-// --- Kiro IDE workspace-session parser (workspace-sessions/<b64>/<sessionId>.json) ---
-// Newer v1-era Kiro builds store session state here: history[] carries user prompts
-// and assistant messages, some of which are stubs referencing per-execution files
-// (parsed separately by parseModernExecution).
-async function parseWorkspaceSession(record: Record<string, unknown>, source: SessionSource, seenKeys: Set<string>): Promise<ParsedProviderCall[]> {
-  const results: ParsedProviderCall[] = []
-  const historyArr = record['history']
-  if (!Array.isArray(historyArr) || typeof record['sessionId'] !== 'string') return results
-
-  const sessionId = record['sessionId']
-  const modelRaw = stringField(record, ['selectedModel'])
-  let modelId = normalizeModelId(modelRaw)
-  if (modelId === 'auto' || !modelId) modelId = 'kiro-auto'
-
-  let inputChars = 0
-  let outputChars = 0
-  let pendingUserMessage = ''
-  const allTools: string[] = []
-  let hasExecutionRefs = false
-  let hasRealAssistantContent = false
-
-  for (const item of historyArr) {
-    const rec = asRecord(item)
-    if (!rec) continue
-
-    // Track if this session references execution files (which are parsed separately)
-    const execBacked = typeof rec['executionId'] === 'string'
-    if (execBacked) hasExecutionRefs = true
-
-    const msg = asRecord(rec['message'])
-    if (!msg) continue
-    const role = stringField(msg, ['role'])
-    const text = extractText(msg['content'])
-    if (role === 'user' && text) {
-      inputChars += text.length
-      pendingUserMessage = text.slice(0, 500)
-    } else if (role === 'assistant' && !execBacked && text && text !== 'On it.') {
-      // An item carrying an executionId is execution-backed: its content is
-      // counted from the execution file, so counting it here would double-count.
-      // 'On it.' is the observed placeholder text Kiro writes for such stubs
-      // when the executionId rides a separate history item.
-      outputChars += text.length
-      hasRealAssistantContent = true
-    }
-  }
-
-  // Skip workspace-session entries that are pure execution stubs:
-  // they reference executionIds (parsed separately as execution files)
-  // and have no real assistant content beyond "On it." placeholders.
-  // This avoids double-counting input tokens from both paths.
-  if (hasExecutionRefs && !hasRealAssistantContent) return results
-
-  // Skip sessions with no meaningful content
-  if (inputChars === 0 && outputChars === 0) return results
-
-  // Use file mtime as timestamp (workspace-session files don't carry startTime).
-  // No stat means no usable timestamp: drop the call like the other parse paths.
-  let timestamp: string
-  try {
-    const s = await stat(source.path)
-    timestamp = new Date(s.mtimeMs).toISOString()
-  } catch {
-    return results
-  }
-
-  const dedupKey = `kiro:ws-session:${sessionId}`
-  if (seenKeys.has(dedupKey)) return results
-  seenKeys.add(dedupKey)
-
-  const inputTokens = estimateTokensFromChars(inputChars)
-  const outputTokens = estimateTokensFromChars(outputChars)
-
-  results.push({
-    provider: 'kiro',
-    model: modelId,
-    inputTokens,
-    outputTokens,
-    cacheCreationInputTokens: 0,
-    cacheReadInputTokens: 0,
-    cachedInputTokens: 0,
-    reasoningTokens: 0,
-    webSearchRequests: 0,
-    costBasis: 'estimated',
-    costIsEstimated: true,
-    tools: [...new Set(allTools)],
-    bashCommands: [],
-    timestamp,
-    speed: 'standard',
-    deduplicationKey: dedupKey,
-    userMessage: pendingUserMessage,
-    sessionId,
-  })
-
-  return results
-}
-
-// --- Kiro IDE v2 session types & parser (~/.kiro/sessions/<hash>/sess_*/) ---
-// v2 is a self-contained, event-sourced store: one directory per session holding
-// session.json (metadata incl. the real modelId) + messages.jsonl (append-only
-// event log). Unlike v1 it does NOT use separate execution files — assistant
-// content is inline. Usage is billed in credits with no token counts, so tokens
-// and cost are estimated from transcript text priced at the real model.
-
-type KiroV2SessionMeta = {
-  id?: string
-  title?: string
-  modelId?: string
-  workspacePaths?: string[]
-  createdAt?: string
-  lastModifiedAt?: string
-}
-
-async function parseV2Session(source: SessionSource, seenKeys: Set<string>): Promise<ParsedProviderCall[]> {
-  const results: ParsedProviderCall[] = []
-
-  const content = await readSessionFile(source.path)
-  if (content === null) return results
-
-  // Companion session.json carries the real model + session metadata.
-  let meta: KiroV2SessionMeta = {}
-  try {
-    const raw = await readFile(join(dirname(source.path), 'session.json'), 'utf-8')
-    meta = JSON.parse(raw) as KiroV2SessionMeta
-  } catch { /* fall back to defaults below */ }
-
-  const sessionId = (typeof meta.id === 'string' && meta.id) || basename(dirname(source.path))
-  let modelId = normalizeModelId(meta.modelId ?? '')
-  if (modelId === 'auto' || !modelId) modelId = 'kiro-auto'
-
-  // In-flight turn state. A turn spans turn_start..turn_end sharing an
-  // executionId; the preceding `user` event carries its prompt.
-  let pendingUserMessage = ''
-  let pendingUserChars = 0
-
-  let inTurn = false
-  let execId = ''
-  let turnStartTs: string | undefined
-  let outputChars = 0
-  let reasoningChars = 0
-  let toolResultChars = 0
-  let turnCredits = 0
-  let turnUserMessage = ''
-  let turnUserChars = 0
-  const tools: string[] = []
-
-  const resetTurn = () => {
-    inTurn = false; execId = ''; turnStartTs = undefined
-    outputChars = 0; reasoningChars = 0; toolResultChars = 0; turnCredits = 0
-    turnUserMessage = ''; turnUserChars = 0
-    tools.length = 0
-  }
-
-  const pushTool = (raw: string) => {
-    if (!raw) return
-    // Strip mcp_ prefix for cleaner display, matching the modern-execution parser.
-    const cleaned = raw.startsWith('mcp_') ? raw.slice(4) : raw
-    tools.push(toolNameMap[cleaned] ?? cleaned)
-  }
-
-  const flushTurn = () => {
-    if (!inTurn) { resetTurn(); return }
-    const hasActivity = outputChars > 0 || reasoningChars > 0 || tools.length > 0
-    if (hasActivity) {
-      const dedupKey = `kiro-v2:${sessionId}:${execId || String(results.length)}`
-      const tsDate = parseKiroTimestamp(turnStartTs)
-      if (tsDate && !seenKeys.has(dedupKey)) {
-        seenKeys.add(dedupKey)
-        // Tool results are fed back to the model as input context, so count them
-        // toward input tokens — same treatment as the CLI parser's ToolResults.
-        const inputTokens = estimateTokensFromChars(turnUserChars + toolResultChars)
-        // outputTokens and reasoningTokens are kept disjoint — downstream
-        // aggregation (models-report, audit-report, parser) sums the two
-        // fields, so folding reasoning into outputTokens would double-count.
-        const reasoningTokens = estimateTokensFromChars(reasoningChars)
-        const outputTokens = estimateTokensFromChars(outputChars)
-        // Prefer real metered credits (converted at the public overage rate)
-        // over token estimation; fall back to token pricing when the turn has
-        // no usage_summary (e.g. still in progress or null usage). Reasoning
-        // text is billed as output, so combine it for pricing only (same as
-        // the codex provider).
-        results.push({
-          provider: 'kiro',
-          model: modelId,
-          inputTokens,
-          outputTokens,
-          cacheCreationInputTokens: 0,
-          cacheReadInputTokens: 0,
-          cachedInputTokens: 0,
-          reasoningTokens,
-          webSearchRequests: 0,
-          ...(turnCredits > 0
-            ? { costUSD: turnCredits * USD_PER_KIRO_CREDIT, costBasis: 'measured' as const }
-            : { costBasis: 'estimated' as const }),
-          costIsEstimated: turnCredits === 0,
-          tools: [...new Set(tools)],
-          bashCommands: [],
-          timestamp: tsDate.toISOString(),
-          speed: 'standard',
-          deduplicationKey: dedupKey,
-          userMessage: turnUserMessage,
-          sessionId,
-          project: source.project,
-        })
-      }
-    }
-    resetTurn()
-  }
-
-  for (const line of content.split('\n')) {
-    if (!line.trim()) continue
-    let evt: Record<string, unknown>
-    try { evt = JSON.parse(line) as Record<string, unknown> } catch { continue }
-    const payload = asRecord(evt['payload'])
-    if (!payload) continue
-    const type = stringField(payload, ['type'])
-    const ts = typeof evt['timestamp'] === 'string' ? evt['timestamp'] as string : undefined
-
-    if (type === 'user') {
-      // New prompt: close any in-flight turn defensively, then stash the text
-      // for the upcoming turn_start.
-      if (inTurn) flushTurn()
-      const text = typeof payload['content'] === 'string' ? payload['content'] as string : extractText(payload['content'])
-      pendingUserMessage = text.slice(0, 500)
-      pendingUserChars = text.length
-    } else if (type === 'turn_start') {
-      if (inTurn) flushTurn()
-      inTurn = true
-      execId = stringField(payload, ['executionId'])
-      turnStartTs = ts
-      turnUserMessage = pendingUserMessage
-      turnUserChars = pendingUserChars
-      pendingUserMessage = ''
-      pendingUserChars = 0
-    } else if (type === 'assistant') {
-      const text = typeof payload['content'] === 'string' ? payload['content'] as string : extractText(payload['content'])
-      if (stringField(payload, ['operationType']) === 'Reasoning') reasoningChars += text.length
-      else outputChars += text.length
-      if (!inTurn && text.length > 0) inTurn = true
-      if (!turnStartTs && ts) turnStartTs = ts
-    } else if (type === 'tool_call') {
-      pushTool(stringField(payload, ['toolName', 'name']))
-    } else if (type === 'tool_result') {
-      // Tool output re-enters the model as context on the next inference call.
-      // content is a plain string in observed logs; extractText covers nesting.
-      const text = typeof payload['content'] === 'string' ? payload['content'] as string : extractText(payload['content'])
-      toolResultChars += text.length
-    } else if (type === 'usage_summary') {
-      // usedTools is a reliable per-turn tool list. Credits are the real billed
-      // usage (promptTurnSummaries[].usage with unit "credit") — harvest them
-      // for credit-based cost. usage can be null on some turns.
-      const summaries = payload['promptTurnSummaries']
-      if (Array.isArray(summaries)) {
-        for (const s of summaries) {
-          const rec = asRecord(s)
-          const used = rec?.['usedTools']
-          if (Array.isArray(used)) for (const u of used) if (typeof u === 'string') pushTool(u)
-          const usage = rec?.['usage']
-          if (typeof usage === 'number' && Number.isFinite(usage)) turnCredits += usage
-        }
-      }
-    } else if (type === 'turn_end') {
-      flushTurn()
-    }
-  }
-  // Flush a trailing in-progress turn (session still active, no turn_end yet).
-  flushTurn()
-
-  return results
+  if (rich.arm === 'chat') return { ...base, toolSequence: rich.toolSequence }
+  if (rich.arm === 'cli' || rich.arm === 'v2') return { ...base, project: rich.project! }
+  return base
 }
 
 function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+  const context: DecodeContext = { privacyKey: '', providerId: 'kiro', sourceRef: source.path }
   return {
     async *parse(): AsyncGenerator<ParsedProviderCall> {
+      const path = source.path
+
       // v2 IDE store: ~/.kiro/sessions/<hash>/sess_<id>/messages.jsonl — a
       // self-contained event log. Must be checked BEFORE the generic .jsonl
       // (CLI) branch, since it also ends in .jsonl but has a different schema.
-      if (/[/\\]sess_[^/\\]+[/\\]messages\.jsonl$/.test(source.path)) {
-        for (const call of await parseV2Session(source, seenKeys)) yield call
+      if (/[/\\]sess_[^/\\]+[/\\]messages\.jsonl$/.test(path)) {
+        const content = await readSessionFile(path)
+        if (content === null) return
+
+        // Companion session.json carries the real model + session metadata.
+        let meta: KiroV2SessionMeta = {}
+        try {
+          const raw = await readFile(join(dirname(path), 'session.json'), 'utf-8')
+          meta = JSON.parse(raw) as KiroV2SessionMeta
+        } catch { /* fall back to defaults below */ }
+
+        const result = decodeKiroV2Session({
+          lines: content,
+          meta,
+          fallbackSessionId: basename(dirname(path)),
+          project: source.project,
+          context,
+          seenKeys,
+        })
+        for (const call of result.calls) yield toProviderCall(call)
         return
       }
 
       // CLI session: path points to a .jsonl file
-      if (source.path.endsWith('.jsonl')) {
-        const jsonlContent = await readSessionFile(source.path)
+      if (path.endsWith('.jsonl')) {
+        const jsonlContent = await readSessionFile(path)
         if (jsonlContent === null) return
 
         const entries: KiroCliEntry[] = []
@@ -852,24 +117,29 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         if (entries.length === 0) return
 
         // Load companion .json for metadata
-        const metaPath = source.path.replace(/\.jsonl$/, '.json')
+        const metaPath = path.replace(/\.jsonl$/, '.json')
         let meta: KiroCliSessionMeta
         try {
           const raw = await readFile(metaPath, 'utf-8')
           meta = JSON.parse(raw) as KiroCliSessionMeta
         } catch {
           // Minimal fallback
-          meta = { session_id: basename(source.path, '.jsonl'), cwd: '', created_at: '', updated_at: '' }
+          meta = { session_id: basename(path, '.jsonl'), cwd: '', created_at: '', updated_at: '' }
         }
 
-        for (const call of parseCliSession(meta, entries, seenKeys)) {
-          yield call
-        }
+        const result = decodeKiroCliSession({
+          meta,
+          entries,
+          project: basename(meta.cwd || ''),
+          context,
+          seenKeys,
+        })
+        for (const call of result.calls) yield toProviderCall(call)
         return
       }
 
       // IDE session: original path
-      const content = await readSessionFile(source.path)
+      const content = await readSessionFile(path)
       if (content === null) return
 
       let data: unknown
@@ -884,18 +154,30 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
       // Workspace-session files (newer Kiro builds): have history[] with message.role/content
       // and a top-level sessionId/selectedModel/workspaceDirectory.
-      if (Array.isArray(record['history']) && typeof record['sessionId'] === 'string') {
-        for (const call of await parseWorkspaceSession(record, source, seenKeys)) yield call
+      const prepared = prepareKiroWorkspaceSession(record)
+      if (prepared.kind === 'ready') {
+        let timestamp: string
+        try {
+          const s = await stat(source.path)
+          timestamp = new Date(s.mtimeMs).toISOString()
+        } catch {
+          return
+        }
+        const result = finishKiroWorkspaceSession(prepared.draft, { timestamp, seenKeys })
+        for (const call of result.calls) yield toProviderCall(call)
         return
       }
+      if (prepared.kind === 'empty') return
 
-      const metadata = asRecord(record['metadata'])
-      const calls = Array.isArray(record['chat']) && metadata
-        ? parseChatFile(record as unknown as KiroChatFile, stringField(metadata, ['workflowId']) || basename(source.path, '.chat'), source.project, seenKeys)
-        : parseModernExecution(record, source.path, seenKeys)
-      for (const call of calls) {
-        yield call
-      }
+      const result = decodeKiroIdeFile({
+        record,
+        fallbackChatSessionId: basename(path, '.chat'),
+        fallbackExecutionId: basename(path),
+        fallbackSessionId: basename(dirname(path)),
+        context,
+        seenKeys,
+      })
+      for (const call of result.calls) yield toProviderCall(call)
     },
   }
 }
@@ -1127,7 +409,7 @@ export function createKiroProvider(agentDirOverride?: string, workspaceStorageDi
 
     toolDisplayName(rawTool: string): string {
       if (rawTool.startsWith('mcp__')) return rawTool
-      return toolNameMap[rawTool] ?? rawTool
+      return kiroToolNameMap[rawTool] ?? rawTool
     },
 
     async discoverSessions(): Promise<SessionSource[]> {

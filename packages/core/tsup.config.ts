@@ -43,6 +43,7 @@ export default defineConfig({
     'src/providers/vscode-cline/index.ts',
     'src/providers/opencode-session/index.ts',
     'src/providers/antigravity/index.ts',
+    'src/providers/kiro/index.ts',
   ],
   format: ['esm'],
   target: 'node20',

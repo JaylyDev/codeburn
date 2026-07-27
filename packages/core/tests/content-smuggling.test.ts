@@ -45,6 +45,14 @@ import {
   decodeAntigravityStatusLine,
   toObservations as toAntigravityObservations,
 } from '../src/providers/antigravity/index.js'
+import {
+  decodeKiroChatFile,
+  decodeKiroModernExecution,
+  decodeKiroIdeFile,
+  decodeKiroCliSession,
+  decodeKiroV2Session,
+  toObservations as toKiroObservations,
+} from '../src/providers/kiro/index.js'
 import type { DecodeContext } from '../src/contracts.js'
 import type { ZedThreadRow } from '../src/providers/zed/index.js'
 import type {
@@ -1914,5 +1922,158 @@ describe('content-smuggling guardrail: real cursor decode -> toObservations is s
     expect(allToolNames).toContain('Bash')
     expect(allToolNames).not.toContain('cursor:edit')
     expect(allToolNames).not.toContain(`lang:${SECRETS.commandLine}`)
+  })
+})
+
+describe('content-smuggling guardrail: real kiro decode -> toObservations is secret-free', () => {
+  // A hostile Kiro session planting every secret in the free-text fields kiro
+  // captures: user prompts, tool names, tool_result content, session/execution
+  // ids, and the CLI cwd. The observation envelope MUST surface none of them.
+  const kiroContext: DecodeContext = {
+    privacyKey: 'test-privacy-key',
+    providerId: 'kiro',
+    sourceRef: 'ref',
+  }
+
+  function decodeAndMinimize() {
+    // 1. Chat human message carrying secrets -> userMessage (must not escape)
+    const chatCalls = decodeKiroChatFile({
+      record: {
+        executionId: 'exec-chat',
+        actionId: 'act',
+        context: [],
+        validations: {},
+        chat: [
+          { role: 'human', content: '<identity>x</identity>' },
+          { role: 'human', content: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}` },
+          { role: 'bot', content: `I will run <tool_use><name>${SECRETS.commandLine}</name></tool_use>` },
+        ],
+        metadata: {
+          modelId: 'claude-haiku-4-5',
+          modelProvider: 'qdev',
+          workflow: 'act',
+          workflowId: 'wf-chat',
+          startTime: 1777333000000,
+          endTime: 1777333010000,
+        },
+      },
+      fallbackChatSessionId: 'wf-chat',
+      context: kiroContext,
+    }).calls
+
+    // 2. Modern execution prompt and response carrying secrets
+    const modernCalls = decodeKiroModernExecution({
+      record: {
+        executionId: 'exec-modern',
+        sessionId: 'sess-modern',
+        startTime: 1777333000000,
+        modelId: 'claude-sonnet-4.5',
+        prompt: `${SECRETS.prompt} ${SECRETS.apiKey}`,
+        response: `Done. <tool_use><name>${SECRETS.commandLine}</name></tool_use>`,
+      },
+      fallbackExecutionId: 'exec-modern',
+      fallbackSessionId: 'sess-modern',
+      context: kiroContext,
+    }).calls
+
+    // 3. usageSummary usedTools entry carrying a command line (unmapped -> tools)
+    const usageCalls = decodeKiroModernExecution({
+      record: {
+        executionId: 'exec-usage',
+        sessionId: 'sess-usage',
+        startTime: 1777333000000,
+        modelId: 'claude-sonnet-4.5',
+        prompt: 'search',
+        response: 'ok',
+        usageSummary: [{ usedTools: [SECRETS.commandLine], usage: 1, unit: 'credit' }],
+      },
+      fallbackExecutionId: 'exec-usage',
+      fallbackSessionId: 'sess-usage',
+      context: kiroContext,
+    }).calls
+
+    // 4. v2 tool_result content string -> input tokens (must not escape)
+    const v2Lines = [
+      JSON.stringify({ id: 'u', timestamp: '2026-07-14T13:39:00.000Z', payload: { type: 'user', content: SECRETS.prompt } }),
+      JSON.stringify({ id: 'ts', timestamp: '2026-07-14T13:39:40.000Z', payload: { type: 'turn_start', executionId: 'exec-v2' } }),
+      JSON.stringify({ id: 'tc', timestamp: '2026-07-14T13:39:40.000Z', payload: { type: 'tool_call', toolName: SECRETS.commandLine, toolCallId: 'tc1', executionId: 'exec-v2' } }),
+      JSON.stringify({ id: 'tr', timestamp: '2026-07-14T13:39:40.000Z', payload: { type: 'tool_result', toolCallId: 'tr1', content: SECRETS.fileContent, success: true, executionId: 'exec-v2' } }),
+      JSON.stringify({ id: 'us', timestamp: '2026-07-14T13:39:40.000Z', payload: { type: 'usage_summary', promptTurnSummaries: [{ unit: 'credit', usage: 1, usedTools: [] }] } }),
+      JSON.stringify({ id: 'te', timestamp: '2026-07-14T13:39:40.000Z', payload: { type: 'turn_end', executionId: 'exec-v2' } }),
+    ].join('\n')
+    const v2Calls = decodeKiroV2Session({
+      lines: v2Lines,
+      meta: { id: 'sess-v2' },
+      fallbackSessionId: 'sess-v2',
+      project: 'kiro-v2',
+      context: kiroContext,
+    }).calls
+
+    // 5. CLI session: cwd is host-side project attribution, must not reach envelope
+    const cliCalls = decodeKiroCliSession({
+      meta: {
+        session_id: 'sess-cli',
+        cwd: SECRETS.absPath,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:01:00Z',
+      },
+      entries: [
+        { version: '1', kind: 'Prompt', data: { content: [{ kind: 'text', data: SECRETS.prompt }] } },
+        { version: '1', kind: 'AssistantMessage', data: { content: [{ kind: 'text', data: 'ok' }] } },
+      ],
+      project: 'kiro-cli',
+      context: kiroContext,
+    }).calls
+
+    const calls = [...chatCalls, ...modernCalls, ...usageCalls, ...v2Calls, ...cliCalls]
+
+    const { sessions } = toKiroObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'kiro' },
+    )
+
+    return {
+      envelope: {
+        schemaVersion: OBSERVATION_SCHEMA_VERSION,
+        generator: { name: '@codeburn/core', version: '0.0.0-test' },
+        sessions,
+      },
+      // Per-vector call counts, so a fixture that silently stops decoding is
+      // caught instead of making every "contains no secret" assertion vacuous.
+      vectors: {
+        chat: chatCalls.length,
+        modern: modernCalls.length,
+        usage: usageCalls.length,
+        v2: v2Calls.length,
+        cli: cliCalls.length,
+      },
+      total: calls.length,
+    }
+  }
+
+  it('every hostile fixture decodes to at least one call (non-vacuousness guard)', () => {
+    const { envelope, vectors, total } = decodeAndMinimize()
+    expect(vectors).toEqual({ chat: 1, modern: 1, usage: 1, v2: 1, cli: 1 })
+    expect(total).toBe(5)
+    expect(envelope.sessions[0]!.calls.length).toBe(total)
+  })
+
+  it('produces a schema-valid envelope from the hostile session', () => {
+    const { envelope } = decodeAndMinimize()
+    expect(ObservationEnvelope.safeParse(envelope).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize().envelope)
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('drops non-canonical (argument-carrying) tool names instead of emitting them', () => {
+    const { envelope } = decodeAndMinimize()
+    const allToolNames = envelope.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    // The hostile tool names fail the canonical-name regex and must be dropped.
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
   })
 })
