@@ -1,9 +1,13 @@
 import { join } from 'path'
 import { homedir } from 'os'
 
+import { decodeVscodeCline } from '@codeburn/core/providers/vscode-cline'
+import type { VscodeClineDecodedCall } from '@codeburn/core/providers/vscode-cline'
+
+import { createBridgedProvider } from './bridge.js'
 import { getShortModelName } from '../models.js'
-import { discoverClineTasksInBaseDirs, createClineParser } from './vscode-cline-parser.js'
-import type { Provider, SessionSource, SessionParser } from './types.js'
+import { discoverClineTasksInBaseDirs, readClineRecords, toClineProviderCall } from './vscode-cline-parser.js'
+import type { Provider, SessionSource } from './types.js'
 
 const PROVIDER_NAME = 'ibm-bob'
 const DISPLAY_NAME = 'IBM Bob'
@@ -33,7 +37,7 @@ export function getIBMBobGlobalStorageDirs(): string[] {
 }
 
 export function createIBMBobProvider(overrideDir?: string): Provider {
-  return {
+  return createBridgedProvider<VscodeClineDecodedCall>({
     name: PROVIDER_NAME,
     displayName: DISPLAY_NAME,
 
@@ -50,10 +54,10 @@ export function createIBMBobProvider(overrideDir?: string): Provider {
       return discoverClineTasksInBaseDirs(dirs, PROVIDER_NAME, DISPLAY_NAME)
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createClineParser(source, seenKeys, PROVIDER_NAME, FALLBACK_MODEL)
-    },
-  }
+    decode: input => decodeVscodeCline({ ...input, fallbackModel: FALLBACK_MODEL }),
+    readRecords: readClineRecords,
+    toProviderCall: toClineProviderCall,
+  })
 }
 
 export const ibmBob = createIBMBobProvider()

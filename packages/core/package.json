@@ -142,6 +142,10 @@
     "./providers/copilot": {
       "types": "./dist/providers/copilot/index.d.ts",
       "import": "./dist/providers/copilot/index.js"
+    },
+    "./providers/vscode-cline": {
+      "types": "./dist/providers/vscode-cline/index.d.ts",
+      "import": "./dist/providers/vscode-cline/index.js"
     }
   },
   "files": [

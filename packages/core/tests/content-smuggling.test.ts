@@ -35,6 +35,7 @@ import { decodeCursorAgent, toObservations as toCursorAgentObservations } from '
 import { decodeQuickdesk, toObservations as toQuickdeskObservations } from '../src/providers/quickdesk/index.js'
 import { decodeDevin, toObservations as toDevinObservations } from '../src/providers/devin/index.js'
 import { decodeCopilot, toObservations as toCopilotObservations } from '../src/providers/copilot/index.js'
+import { decodeVscodeCline, toObservations as toVscodeClineObservations } from '../src/providers/vscode-cline/index.js'
 import type { DecodeContext } from '../src/contracts.js'
 import type { ZedThreadRow } from '../src/providers/zed/index.js'
 
@@ -370,6 +371,67 @@ describe('content-smuggling guardrail: real qwen decode -> toObservations is sec
       expect(typeof ref.resourceClass).toBe('string')
     }
     expect(allStrings(reads)).not.toContain(SECRETS.absPath)
+  })
+})
+
+describe('content-smuggling guardrail: real vscode-cline decode -> toObservations is secret-free', () => {
+  // A hostile vscode-cline task planting every secret in the free-text fields the
+  // decode captures: the user message, the workspace path, and raw history text.
+  // The observation envelope MUST surface none of them.
+  const vscodeClineContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'cline', sourceRef: 'ref' }
+
+  function decodeAndMinimize() {
+    const uiRaw = JSON.stringify([
+      {
+        type: 'say',
+        say: 'text',
+        text: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}`,
+      },
+      {
+        type: 'say',
+        say: 'api_req_started',
+        text: JSON.stringify({ tokensIn: 500, tokensOut: 200 }),
+        ts: 1_700_000_000_000,
+      },
+    ])
+    const historyRaw = JSON.stringify([
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `<environment_details>\n<model>anthropic/claude-sonnet-4-6</model>\nCurrent Workspace Directory (${SECRETS.absPath})\n${SECRETS.commandLine}\n</environment_details>`,
+          },
+        ],
+      },
+    ])
+    const records = [{
+      kind: 'cline-task' as const,
+      taskId: 'sess-hostile',
+      uiRaw,
+      historyRaw,
+    }]
+    const { calls } = decodeVscodeCline({ records, context: vscodeClineContext })
+    const { sessions } = toVscodeClineObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'cline' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile task', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
   })
 })
 
