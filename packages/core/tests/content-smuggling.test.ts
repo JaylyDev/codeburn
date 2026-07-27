@@ -37,6 +37,7 @@ import { decodeDevin, toObservations as toDevinObservations } from '../src/provi
 import { decodeCopilot, toObservations as toCopilotObservations } from '../src/providers/copilot/index.js'
 import { decodeVscodeCline, toObservations as toVscodeClineObservations } from '../src/providers/vscode-cline/index.js'
 import { decodeOpenCodeSession, toObservations as toOpenCodeSessionObservations } from '../src/providers/opencode-session/index.js'
+import { decodeMistralVibe, toObservations as toMistralVibeObservations } from '../src/providers/mistral-vibe/index.js'
 import type { DecodeContext } from '../src/contracts.js'
 import type { ZedThreadRow } from '../src/providers/zed/index.js'
 
@@ -1471,6 +1472,79 @@ describe('content-smuggling guardrail: real opencode-session decode -> toObserva
     const { sessions } = toOpenCodeSessionObservations(
       { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
       { privacyKey: 'test-privacy-key', provider: 'opencode' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile session', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('keeps canonical tool names (Bash) and drops the argument-carrying name', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toContain('Bash')
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+})
+describe('content-smuggling guardrail: real mistral-vibe decode -> toObservations is secret-free', () => {
+  // A hostile Mistral Vibe session planting every secret in the free-text fields
+  // the decode captures: the user prompt, a bash command string, and a tool NAME
+  // carrying a command line. The observation envelope MUST surface none of them.
+  const mistralVibeContext: DecodeContext = {
+    privacyKey: 'test-privacy-key',
+    providerId: 'mistral-vibe',
+    sourceRef: 'ref',
+  }
+
+  function decodeAndMinimize() {
+    const records: unknown[] = [
+      {
+        metadata: {
+          session_id: 'sess-hostile',
+          start_time: '2026-07-17T10:00:00+00:00',
+          end_time: '2026-07-17T10:05:00+00:00',
+          stats: {
+            session_prompt_tokens: 500,
+            session_completion_tokens: 200,
+            session_cost: 0.05,
+          },
+          config: { active_model: 'mistral-medium-3.5', models: [] },
+          title: SECRETS.prompt,
+        },
+        sessionCost: 0.05,
+      },
+      {
+        role: 'user',
+        content: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}`,
+        message_id: 'msg-user-1',
+      },
+      {
+        role: 'assistant',
+        content: 'Done',
+        message_id: 'msg-assistant-1',
+        tool_calls: [
+          { function: { name: 'bash', arguments: JSON.stringify({ command: SECRETS.commandLine }) } },
+          // A hostile tool NAME carrying a command line: fails canonical charset.
+          { function: { name: SECRETS.commandLine, arguments: '{}' } },
+        ],
+      },
+    ]
+    const { calls } = decodeMistralVibe({ records, context: mistralVibeContext })
+    const { sessions } = toMistralVibeObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'mistral-vibe' },
     )
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,

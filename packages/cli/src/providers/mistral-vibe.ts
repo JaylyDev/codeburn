@@ -2,11 +2,15 @@ import { readdir, stat } from 'fs/promises'
 import { basename, join } from 'path'
 import { homedir } from 'os'
 
+import { decodeMistralVibe, mistralVibeToolNameMap } from '@codeburn/core/providers/mistral-vibe'
+import type { MistralVibeDecodedCall, VibeMetadata } from '@codeburn/core/providers/mistral-vibe'
+
 import { readSessionFile, readSessionLines } from '../fs-utils.js'
 import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 import { safeNumber } from '../parser.js'
+import { createBridgedProvider } from './bridge.js'
+import type { Provider, SessionSource, ParsedProviderCall } from './types.js'
 
 const METADATA_FILENAME = 'meta.json'
 const MESSAGES_FILENAME = 'messages.jsonl'
@@ -21,65 +25,11 @@ const modelDisplayNames: Record<string, string> = {
   local: 'Local',
 }
 
-const toolNameMap: Record<string, string> = {
-  bash: 'Bash',
-  read_file: 'Read',
-  write_file: 'Write',
-  search_replace: 'Edit',
-  grep: 'Grep',
-  task: 'Agent',
-  todo: 'TodoWrite',
-  skill: 'Skill',
-  web_fetch: 'WebFetch',
-  web_search: 'WebSearch',
-  ask_user_question: 'AskUser',
-  exit_plan_mode: 'ExitPlanMode',
-}
-
-type VibeStats = {
-  session_prompt_tokens?: number
-  session_completion_tokens?: number
-  session_cost?: number
-  input_price_per_million?: number
-  output_price_per_million?: number
-  tokens_per_second?: number
-}
-
 type VibeModelConfig = {
   name?: string
   alias?: string
   input_price?: number
   output_price?: number
-}
-
-type VibeMetadata = {
-  session_id?: string
-  start_time?: string
-  end_time?: string | null
-  environment?: {
-    working_directory?: string | null
-  }
-  stats?: VibeStats
-  config?: {
-    active_model?: string
-    models?: VibeModelConfig[]
-  }
-  title?: string | null
-}
-
-type VibeToolCall = {
-  function?: {
-    name?: string
-    arguments?: string | Record<string, unknown> | null
-  }
-}
-
-type VibeMessage = {
-  role?: string
-  content?: unknown
-  message_id?: string
-  timestamp?: string
-  tool_calls?: VibeToolCall[] | null
 }
 
 function getMistralVibeSessionsDir(override?: string): string {
@@ -177,16 +127,17 @@ function resolveModel(metadata: VibeMetadata): string {
   return configured?.alias ?? configured?.name ?? DEFAULT_MODEL
 }
 
-// Residual pricing-table dependency (Phase 0 misfit; revisit in Phase 8): this
-// decoder computes ONE session cost — a provider-reported `session_cost`, else
-// Vibe's own per-million prices, else the generic price table — and ALLOCATES it
-// evenly across the session's assistant messages (allocateCost). Per-call token
-// buckets therefore do not each reproduce their per-call dollar figure, so the
-// generic 'estimated' pass cannot recreate the number. The decoder's allocated
-// dollar figure is authoritative, so emitted calls are marked costBasis
-// 'measured' and the pass passes costUSD through untouched. Only the last of the
-// three branches consults the price table; lifting it out would require moving
-// allocation host-side, which is a Core-extraction concern beyond Phase 0.
+// Session-cost resolution, host-side by construction (Phase 8 resolution of the
+// Phase 0 misfit): this helper computes ONE session cost — a provider-reported
+// `session_cost`, else Vibe's own per-million prices, else the generic price
+// table — which the core decoder then ALLOCATES evenly across the session's
+// assistant messages (allocateCost). Per-call token buckets therefore do not
+// each reproduce their per-call dollar figure, so the generic 'estimated' pass
+// cannot recreate the number. The allocated dollar figure is authoritative, so
+// emitted calls are marked costBasis 'measured' and the pass passes costUSD
+// through untouched. Only the last of the three branches consults the price
+// table — which is why the whole resolution stays here: pricing tables may not
+// cross into @codeburn/core.
 function calculateSessionCost(metadata: VibeMetadata, model: string, inputTokens: number, outputTokens: number): number {
   const stats = metadata.stats ?? {}
   const sessionCost = safeNumber(stats.session_cost)
@@ -203,82 +154,13 @@ function calculateSessionCost(metadata: VibeMetadata, model: string, inputTokens
   return calculateCost(model, inputTokens, outputTokens, 0, 0, 0)
 }
 
-function normalizeContent(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    return content
-      .map(part => {
-        if (typeof part === 'string') return part
-        if (part && typeof part === 'object' && 'text' in part && typeof part.text === 'string') return part.text
-        return ''
-      })
-      .filter(Boolean)
-      .join(' ')
-  }
-  return ''
-}
-
-function parseToolArguments(raw: string | Record<string, unknown> | null | undefined): Record<string, unknown> {
-  if (!raw) return {}
-  if (typeof raw === 'object') return raw
-  try {
-    const parsed = JSON.parse(raw) as unknown
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
-  } catch {
-    return {}
-  }
-}
-
-function extractMessageTools(message: VibeMessage): { tools: string[]; bashCommands: string[] } {
-  const tools: string[] = []
-  const bashCommands: string[] = []
-
-  if (message.role !== 'assistant') return { tools, bashCommands }
-
-  for (const toolCall of message.tool_calls ?? []) {
-    const rawName = toolCall.function?.name
-    if (!rawName) continue
-
-    const mappedName = toolNameMap[rawName] ?? rawName
-    tools.push(mappedName)
-
-    if (mappedName !== 'Bash') continue
-    const args = parseToolArguments(toolCall.function?.arguments)
-    const command = args['command']
-    if (typeof command === 'string') {
-      bashCommands.push(...extractBashCommands(command))
-    }
-  }
-
-  return {
-    tools: [...new Set(tools)],
-    bashCommands: [...new Set(bashCommands)],
-  }
-}
-
-function extractTools(messages: VibeMessage[]): { tools: string[]; bashCommands: string[] } {
-  const tools: string[] = []
-  const bashCommands: string[] = []
-
-  for (const message of messages) {
-    const extracted = extractMessageTools(message)
-    tools.push(...extracted.tools)
-    bashCommands.push(...extracted.bashCommands)
-  }
-
-  return {
-    tools: [...new Set(tools)],
-    bashCommands: [...new Set(bashCommands)],
-  }
-}
-
-async function readMessages(path: string): Promise<VibeMessage[]> {
-  const messages: VibeMessage[] = []
+async function readMessages(path: string): Promise<unknown[]> {
+  const messages: unknown[] = []
   for await (const line of readSessionLines(path)) {
     if (!line.trim()) continue
     try {
       const parsed = JSON.parse(line) as unknown
-      if (parsed && typeof parsed === 'object') messages.push(parsed as VibeMessage)
+      if (parsed && typeof parsed === 'object') messages.push(parsed)
     } catch {
       continue
     }
@@ -286,130 +168,38 @@ async function readMessages(path: string): Promise<VibeMessage[]> {
   return messages
 }
 
-function firstUserMessage(messages: VibeMessage[], fallback?: string | null): string {
-  for (const message of messages) {
-    if (message.role !== 'user') continue
-    const text = normalizeContent(message.content).trim()
-    if (text) return text.slice(0, 500)
-  }
-  return (fallback ?? '').slice(0, 500)
-}
-
-function allocateInteger(total: number, index: number, count: number): number {
-  if (count <= 1) return total
-  const base = Math.floor(total / count)
-  const remainder = total % count
-  return base + (index < remainder ? 1 : 0)
-}
-
-function allocateCost(total: number, count: number): number {
-  return count <= 1 ? total : total / count
-}
-
-function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+// Map one rich, measured decoder call into the host's ParsedProviderCall. The
+// core decoder already allocated the session-level dollar figure across
+// assistant messages, so this adapter passes it through untouched with
+// `costBasis: 'measured'`.
+function toProviderCall(rich: MistralVibeDecodedCall): ParsedProviderCall {
   return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const metadataPath = join(source.path, METADATA_FILENAME)
-      const messagesPath = join(source.path, MESSAGES_FILENAME)
-      const metadata = await readJsonFile<VibeMetadata>(metadataPath)
-      if (!metadata) return
-
-      const stats = metadata.stats ?? {}
-      const inputTokens = safeNumber(stats.session_prompt_tokens)
-      const outputTokens = safeNumber(stats.session_completion_tokens)
-      if (inputTokens === 0 && outputTokens === 0) return
-
-      const sessionId = metadata.session_id || basename(source.path)
-      const messages = await readMessages(messagesPath)
-      const model = resolveModel(metadata)
-      const costUSD = calculateSessionCost(metadata, model, inputTokens, outputTokens)
-      const assistantMessages = messages.filter(m => m.role === 'assistant')
-      const fallbackTimestamp = metadata.end_time ?? metadata.start_time ?? ''
-
-      if (assistantMessages.length === 0) {
-        const deduplicationKey = `mistral-vibe:${sessionId}`
-        if (seenKeys.has(deduplicationKey)) return
-        seenKeys.add(deduplicationKey)
-        const { tools, bashCommands } = extractTools(messages)
-
-        yield {
-          provider: 'mistral-vibe',
-          model,
-          inputTokens,
-          outputTokens,
-          cacheCreationInputTokens: 0,
-          cacheReadInputTokens: 0,
-          cachedInputTokens: 0,
-          reasoningTokens: 0,
-          webSearchRequests: 0,
-          costUSD,
-          costBasis: 'measured',
-          tools,
-          bashCommands,
-          timestamp: fallbackTimestamp,
-          speed: 'standard',
-          deduplicationKey,
-          userMessage: firstUserMessage(messages, metadata.title),
-          sessionId,
-        }
-        return
-      }
-
-      let currentUserMessage = (metadata.title ?? '').slice(0, 500)
-      let turnOrdinal = 0
-      let currentTurnId = `${sessionId}:prelude`
-      let assistantOrdinal = 0
-
-      for (const message of messages) {
-        if (message.role === 'user') {
-          const text = normalizeContent(message.content).trim()
-          if (text) currentUserMessage = text.slice(0, 500)
-          currentTurnId = `${sessionId}:turn-${turnOrdinal++}`
-          continue
-        }
-
-        if (message.role !== 'assistant') continue
-
-        const messageKey = message.message_id || `idx-${assistantOrdinal}`
-        const deduplicationKey = `mistral-vibe:${sessionId}:${messageKey}`
-        const allocationIndex = assistantOrdinal
-        assistantOrdinal++
-
-        if (seenKeys.has(deduplicationKey)) continue
-        seenKeys.add(deduplicationKey)
-
-        const { tools, bashCommands } = extractMessageTools(message)
-
-        yield {
-          provider: 'mistral-vibe',
-          model,
-          inputTokens: allocateInteger(inputTokens, allocationIndex, assistantMessages.length),
-          outputTokens: allocateInteger(outputTokens, allocationIndex, assistantMessages.length),
-          cacheCreationInputTokens: 0,
-          cacheReadInputTokens: 0,
-          cachedInputTokens: 0,
-          reasoningTokens: 0,
-          webSearchRequests: 0,
-          costUSD: allocateCost(costUSD, assistantMessages.length),
-          costBasis: 'measured',
-          tools,
-          bashCommands,
-          timestamp: message.timestamp ?? fallbackTimestamp,
-          speed: 'standard',
-          deduplicationKey,
-          turnId: currentTurnId,
-          userMessage: currentUserMessage,
-          sessionId,
-        }
-      }
-    },
+    provider: 'mistral-vibe',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    costUSD: rich.measuredCostUSD,
+    costBasis: 'measured',
+    tools: rich.tools,
+    bashCommands: [...new Set(rich.rawBashCommands.flatMap(c => extractBashCommands(c)))],
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    ...(rich.turnId === undefined ? {} : { turnId: rich.turnId }),
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
   }
 }
 
 export function createMistralVibeProvider(sessionsDir?: string): Provider {
   const dir = getMistralVibeSessionsDir(sessionsDir)
 
-  return {
+  return createBridgedProvider<MistralVibeDecodedCall>({
     name: 'mistral-vibe',
     displayName: 'Mistral Vibe',
 
@@ -418,7 +208,7 @@ export function createMistralVibeProvider(sessionsDir?: string): Provider {
     },
 
     toolDisplayName(rawTool: string): string {
-      return toolNameMap[rawTool] ?? rawTool
+      return mistralVibeToolNameMap[rawTool] ?? rawTool
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
@@ -439,10 +229,30 @@ export function createMistralVibeProvider(sessionsDir?: string): Provider {
       return sources
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, seenKeys)
+    // I/O adapter: read `meta.json` and `messages.jsonl`, resolve the session-
+    // level cost host-side (including the generic price-table fallback), and hand
+    // the core decoder `[{ metadata, sessionCost, sessionIdFallback }, ...messages]`.
+    // The fallback id is the session directory's basename, which the pre-migration
+    // decode used whenever `meta.json` omitted `session_id`.
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      const metadata = await readJsonFile<VibeMetadata>(join(source.path, METADATA_FILENAME))
+      if (!metadata) return null
+
+      const stats = metadata.stats ?? {}
+      const inputTokens = safeNumber(stats.session_prompt_tokens)
+      const outputTokens = safeNumber(stats.session_completion_tokens)
+      if (inputTokens === 0 && outputTokens === 0) return []
+
+      const messages = await readMessages(join(source.path, MESSAGES_FILENAME))
+      const model = resolveModel(metadata)
+      const sessionCost = calculateSessionCost(metadata, model, inputTokens, outputTokens)
+
+      return [{ metadata, sessionCost, sessionIdFallback: basename(source.path) }, ...messages]
     },
-  }
+
+    decode: decodeMistralVibe,
+    toProviderCall,
+  })
 }
 
 export const mistralVibe = createMistralVibeProvider()
