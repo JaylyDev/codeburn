@@ -26,15 +26,22 @@ npm run build
 
 ### 1. Update the Version
 
-The published CLI is the `codeburn` workspace at `packages/cli`. Edit `packages/cli/package.json` to bump the `version`; the root `package-lock.json` tracks it (npm handles this automatically):
+Since the core extraction, a release spans THREE coupled version fields plus a pin, and
+`npm run check:workspace-versions` fails the build if they drift:
+
+- root `package.json` `version`
+- `packages/cli/package.json` `version`
+- `packages/core/package.json` `version`
+- `packages/cli/package.json` `dependencies["@codeburn/core"]` — an EXACT version pin
+  (`"0.9.21"`, never a range), which must equal the core version.
+
+`npm version -w codeburn` bumps only the CLI and will fail the gate. Instead, edit all
+four fields by hand to the same version, then regenerate the lockfile:
 
 ```bash
-npm version <version> -w codeburn
+npm install --package-lock-only --ignore-scripts
+npm run check:workspace-versions
 ```
-
-For example, `npm version 0.9.8 -w codeburn` updates the workspace package and the lockfile.
-
-Alternatively, edit `packages/cli/package.json` by hand and run `npm install` to regenerate the lockfile with the new version.
 
 ### 2. Update the Changelog
 
@@ -61,17 +68,25 @@ git add CHANGELOG.md packages/cli/package.json package-lock.json
 git commit -m "chore: bump to 0.9.8"
 ```
 
-### 3. Publish to npm
+### 3. Publish to npm — core FIRST, then the CLI
 
-There is no GitHub Actions workflow for the CLI; the maintainer publishes the `codeburn` workspace from a clean working tree:
+There is no GitHub Actions workflow for either package; the maintainer publishes from a
+clean working tree. **Order is mandatory**: the CLI's dist imports `@codeburn/core` at
+runtime under an exact version pin, so publishing the CLI before its core version exists
+on the registry makes the CLI uninstallable (`ETARGET` at install time).
 
 ```bash
+npm publish -w @codeburn/core
 npm publish -w codeburn
 ```
 
-The `prepublishOnly` script in `packages/cli/package.json` runs `npm run build` first, which bundles the litellm pricing snapshot and then runs `tsup` to emit `packages/cli/dist/cli.js`.
+Core's declarations are emitted by `tsc -p tsconfig.build.json` (tsup emits the JS); the
+package publishes publicly via its `publishConfig`. The CLI's `prepublishOnly` script
+runs `npm run build` first, which bundles the litellm pricing snapshot and then runs
+`tsup` to emit `packages/cli/dist/cli.js`.
 
-If publishing for the first time on a new machine, run `npm login` first.
+If publishing for the first time on a new machine, run `npm login` first. npm's publish
+step may prompt for browser authentication.
 
 ### 4. Tag the Release
 
