@@ -38,6 +38,7 @@ export default defineConfig({
     'src/providers/quickdesk/index.ts',
     'src/providers/devin/index.ts',
     'src/providers/copilot/index.ts',
+    'src/providers/vscode-cline/index.ts',
   ],
   format: ['esm'],
   target: 'node20',

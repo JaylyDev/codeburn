@@ -2,14 +2,10 @@ import { readdir, readFile, stat } from 'fs/promises'
 import { basename, join, posix, win32 } from 'path'
 import { homedir } from 'os'
 
-import type { SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import { decodeVscodeCline } from '@codeburn/core/providers/vscode-cline'
+import type { ClineRecordEnvelope, VscodeClineDecodedCall } from '@codeburn/core/providers/vscode-cline'
 
-type UiMessage = {
-  type?: string
-  say?: string
-  text?: string
-  ts?: number
-}
+import type { SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 export function getVSCodeGlobalStoragePaths(extensionId: string, homeDir = homedir(), platform = process.platform): string[] {
   const pathJoin = platform === 'win32' ? win32.join : posix.join
@@ -87,136 +83,66 @@ async function discoverClineTasksInBaseDir(baseDir: string, providerName: string
   return sources
 }
 
-const MODEL_TAG_RE = /<model>([^<]+)<\/model>/
-const WORKSPACE_DIR_RE = /Current Workspace Directory \(([^)]+)\)/
-
-type HistoryMeta = { model: string; workspace: string | null }
-
-function extractHistoryMeta(taskDir: string, fallbackModel: string): Promise<HistoryMeta> {
-  return readFile(join(taskDir, 'api_conversation_history.json'), 'utf-8')
-    .then(raw => {
-      const msgs = JSON.parse(raw) as Array<{ role?: string; content?: Array<{ text?: string }> }>
-      if (!Array.isArray(msgs)) return { model: fallbackModel, workspace: null }
-      let model: string | null = null
-      let workspace: string | null = null
-      for (const msg of msgs) {
-        if (msg.role !== 'user' || !Array.isArray(msg.content)) continue
-        for (const block of msg.content) {
-          if (typeof block.text !== 'string') continue
-          if (!model) {
-            const mm = MODEL_TAG_RE.exec(block.text)
-            if (mm) model = mm[1].includes('/') ? mm[1].split('/').pop()! : mm[1]
-          }
-          if (!workspace) {
-            const wm = WORKSPACE_DIR_RE.exec(block.text)
-            if (wm) workspace = wm[1]
-          }
-          if (model && workspace) break
-        }
-        if (model && workspace) break
-      }
-      return { model: model ?? fallbackModel, workspace }
-    })
-    .catch(() => ({ model: fallbackModel, workspace: null }))
+/** I/O adapter: read one task directory into the single envelope core decodes. */
+export async function readClineRecords(source: SessionSource): Promise<unknown[] | null> {
+  const taskDir = source.path
+  let uiRaw: string
+  try {
+    uiRaw = await readFile(join(taskDir, 'ui_messages.json'), 'utf-8')
+  } catch {
+    return null            // reproduces the early `return` at :133-138
+  }
+  const historyRaw = await readFile(join(taskDir, 'api_conversation_history.json'), 'utf-8')
+    .catch(() => null)     // reproduces the .catch at :120
+  const envelope: ClineRecordEnvelope = { kind: 'cline-task', taskId: basename(taskDir), uiRaw, historyRaw }
+  return [envelope]
 }
 
-function workspaceToProject(workspace: string): string {
-  return basename(workspace) || workspace
+/** Host-side map: rich call -> ParsedProviderCall. Cost re-enters here. */
+export function toClineProviderCall(rich: VscodeClineDecodedCall): ParsedProviderCall {
+  return {
+    provider: rich.provider,
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    ...(rich.measuredCostUSD !== undefined
+      ? { costUSD: rich.measuredCostUSD, costBasis: 'measured' as const }
+      : { costBasis: 'estimated' as const }),
+    tools: rich.tools,
+    bashCommands: rich.rawBashCommands,
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
+    project: rich.project,
+    projectPath: rich.projectPath,
+  }
 }
 
-export function createClineParser(source: SessionSource, seenKeys: Set<string>, providerName: string, fallbackModel = 'cline-auto'): SessionParser {
+/**
+ * Legacy-shaped adapter retained for kilo-code, whose second (SQLite) arm does
+ * not move to core until batch S2. It is I/O + map over the core decode — no
+ * decode logic lives here. Deleted once kilo-code becomes a bridged provider.
+ */
+export function createClineParser(
+  source: SessionSource,
+  seenKeys: Set<string>,
+  providerName: string,
+  fallbackModel = 'cline-auto',
+): SessionParser {
   return {
     async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const taskDir = source.path
-      const taskId = basename(taskDir)
-
-      let uiRaw: string
-      try {
-        uiRaw = await readFile(join(taskDir, 'ui_messages.json'), 'utf-8')
-      } catch {
-        return
-      }
-
-      let uiMessages: UiMessage[]
-      try {
-        uiMessages = JSON.parse(uiRaw)
-      } catch {
-        return
-      }
-
-      if (!Array.isArray(uiMessages)) return
-
-      const meta = await extractHistoryMeta(taskDir, fallbackModel)
-      const model = meta.model
-      const project = meta.workspace ? workspaceToProject(meta.workspace) : undefined
-      const projectPath = meta.workspace ?? undefined
-
-      let userMessage = ''
-      for (const msg of uiMessages) {
-        if (msg.type === 'say' && (msg.say === 'user_feedback' || msg.say === 'text')) {
-          userMessage = (msg.text ?? '').slice(0, 500)
-          break
-        }
-      }
-
-      const apiReqEntries = uiMessages.filter(m => m.type === 'say' && m.say === 'api_req_started')
-
-      for (const [index, entry] of apiReqEntries.entries()) {
-        const dedupKey = `${providerName}:${taskId}:${index}`
-        if (seenKeys.has(dedupKey)) continue
-        seenKeys.add(dedupKey)
-
-        let tokensIn = 0
-        let tokensOut = 0
-        let cacheReads = 0
-        let cacheWrites = 0
-        let cost: number | undefined
-
-        if (entry.text) {
-          try {
-            const parsed = JSON.parse(entry.text) as {
-              tokensIn?: number
-              tokensOut?: number
-              cacheReads?: number
-              cacheWrites?: number
-              cost?: number
-            }
-            tokensIn = parsed.tokensIn ?? 0
-            tokensOut = parsed.tokensOut ?? 0
-            cacheReads = parsed.cacheReads ?? 0
-            cacheWrites = parsed.cacheWrites ?? 0
-            cost = parsed.cost
-          } catch {}
-        }
-
-        if (tokensIn === 0 && tokensOut === 0) continue
-
-        const timestamp = entry.ts ? new Date(entry.ts).toISOString() : ''
-
-        yield {
-          provider: providerName,
-          model,
-          inputTokens: tokensIn,
-          outputTokens: tokensOut,
-          cacheCreationInputTokens: cacheWrites,
-          cacheReadInputTokens: cacheReads,
-          cachedInputTokens: cacheReads,
-          reasoningTokens: 0,
-          webSearchRequests: 0,
-          ...(cost != null
-            ? { costUSD: cost, costBasis: 'measured' as const }
-            : { costBasis: 'estimated' as const }),
-          tools: [],
-          bashCommands: [],
-          timestamp,
-          speed: 'standard',
-          deduplicationKey: dedupKey,
-          userMessage: index === 0 ? userMessage : '',
-          sessionId: taskId,
-          project,
-          projectPath,
-        }
-      }
+      const records = await readClineRecords(source)
+      if (records === null) return
+      const context = { privacyKey: '', providerId: providerName, sourceRef: source.path }
+      const { calls } = decodeVscodeCline({ records, context, seenKeys, fallbackModel })
+      for (const rich of calls) yield toClineProviderCall(rich)
     },
   }
 }

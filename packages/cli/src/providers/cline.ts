@@ -2,8 +2,12 @@ import { stat } from 'fs/promises'
 import { homedir } from 'os'
 import { basename, join } from 'path'
 
-import { discoverClineTasks, createClineParser, getVSCodeGlobalStoragePath } from './vscode-cline-parser.js'
-import type { Provider, SessionSource, SessionParser } from './types.js'
+import { decodeVscodeCline } from '@codeburn/core/providers/vscode-cline'
+import type { VscodeClineDecodedCall } from '@codeburn/core/providers/vscode-cline'
+
+import { createBridgedProvider } from './bridge.js'
+import { discoverClineTasks, getVSCodeGlobalStoragePath, readClineRecords, toClineProviderCall } from './vscode-cline-parser.js'
+import type { Provider, SessionSource } from './types.js'
 
 const EXTENSION_ID = 'saoudrizwan.claude-dev'
 
@@ -39,7 +43,7 @@ async function dedupeTaskSources(sources: SessionSource[]): Promise<SessionSourc
 export function createClineProvider(overrideDirs?: string | string[]): Provider {
   const configuredDirs = normalizeOverrideDirs(overrideDirs)
 
-  return {
+  return createBridgedProvider<VscodeClineDecodedCall>({
     name: 'cline',
     displayName: 'Cline',
 
@@ -64,10 +68,10 @@ export function createClineProvider(overrideDirs?: string | string[]): Provider 
       return dedupeTaskSources(sources.flat())
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createClineParser(source, seenKeys, 'cline')
-    },
-  }
+    readRecords: readClineRecords,
+    decode: input => decodeVscodeCline(input),
+    toProviderCall: toClineProviderCall,
+  })
 }
 
 export const cline = createClineProvider()

@@ -1,10 +1,14 @@
-import { discoverClineTasks, createClineParser } from './vscode-cline-parser.js'
-import type { Provider, SessionSource, SessionParser } from './types.js'
+import { decodeVscodeCline } from '@codeburn/core/providers/vscode-cline'
+import type { VscodeClineDecodedCall } from '@codeburn/core/providers/vscode-cline'
+
+import { createBridgedProvider } from './bridge.js'
+import { discoverClineTasks, readClineRecords, toClineProviderCall } from './vscode-cline-parser.js'
+import type { Provider, SessionSource } from './types.js'
 
 const EXTENSION_ID = 'rooveterinaryinc.roo-cline'
 
 export function createRooCodeProvider(overrideDir?: string | string[]): Provider {
-  return {
+  return createBridgedProvider<VscodeClineDecodedCall>({
     name: 'roo-code',
     displayName: 'Roo Code',
 
@@ -20,10 +24,10 @@ export function createRooCodeProvider(overrideDir?: string | string[]): Provider
       return discoverClineTasks(EXTENSION_ID, 'roo-code', 'Roo Code', overrideDir)
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createClineParser(source, seenKeys, 'roo-code')
-    },
-  }
+    readRecords: readClineRecords,
+    decode: input => decodeVscodeCline(input),
+    toProviderCall: toClineProviderCall,
+  })
 }
 
 export const rooCode = createRooCodeProvider()
