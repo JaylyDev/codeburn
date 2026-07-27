@@ -162,6 +162,10 @@
     "./providers/antigravity": {
       "types": "./dist/providers/antigravity/index.d.ts",
       "import": "./dist/providers/antigravity/index.js"
+    },
+    "./providers/kiro": {
+      "types": "./dist/providers/kiro/index.d.ts",
+      "import": "./dist/providers/kiro/index.js"
     }
   },
   "files": [

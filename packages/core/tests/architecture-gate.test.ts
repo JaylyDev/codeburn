@@ -78,7 +78,13 @@ const TASK_CATEGORY_NAMES = [
 // skill-vs-read classification (from pi.ts); it's host-side logic explanation,
 // not core classification vocabulary.
 // Keyed `${name} in ${rel}`; each entry is a justified false positive.
-const CATEGORY_LITERAL_ALLOWLIST = new Set<string>(['git in src/fingerprint.ts', 'general in src/providers/pi/decode.ts'])
+const CATEGORY_LITERAL_ALLOWLIST = new Set<string>([
+  'git in src/fingerprint.ts',
+  'general in src/providers/pi/decode.ts',
+  // Kiro's modern-execution parser searches record-shape keys for conversation
+  // arrays; this is a provider data key, not task classification vocabulary.
+  'conversation in src/providers/kiro/decode.ts',
+])
 
 // Identifiers that would signal classification or correction logic leaking into
 // core. (Names of the CLI-only classifier/scanner surface.)
@@ -178,6 +184,8 @@ const USER_MESSAGE_ALLOWLIST = new Set([
   'src/providers/vscode-cline/types.ts',
   'src/providers/opencode-session/decode.ts',
   'src/providers/opencode-session/types.ts',
+  'src/providers/kiro/decode.ts',
+  'src/providers/kiro/types.ts',
 ])
 
 describe('architecture gate: no classification or free text in @codeburn/core source', () => {
