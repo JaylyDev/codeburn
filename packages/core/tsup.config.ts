@@ -11,6 +11,7 @@ export default defineConfig({
     'src/fingerprint.ts',
     'src/contracts.ts',
     'src/detectors/index.ts',
+    'src/providers/registry.ts',
     'src/providers/claude/index.ts',
     'src/providers/codebuff/index.ts',
     'src/providers/codewhale/index.ts',

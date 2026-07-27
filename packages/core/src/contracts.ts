@@ -30,8 +30,18 @@ export interface DecodeContext {
 }
 
 /**
- * A decoder turns a batch of raw provider records into observations plus
- * diagnostics, threading optional streaming `state` between batches.
+ * @deprecated No shipped provider implements this shape, and none ever has.
+ *
+ * It describes a single step from raw records straight to observations. Every
+ * real provider runs TWO steps: a provider-specific rich decode
+ * (`decodeClaude`, `decodeCodex`, …) that returns a provider-shaped result,
+ * then an observation adapter (`toObservations`) that minimizes it. A consumer
+ * who typed against `Decoder` and reached for a provider function got a
+ * compile error and no explanation.
+ *
+ * Kept as an alias for one release so existing imports still resolve. Type
+ * against `RichDecoder` and `ObservationAdapter` instead, or — better — import
+ * the provider's own exported function types, which are precise.
  */
 export type Decoder<TState = unknown> = (input: {
   records: unknown[]
@@ -42,6 +52,38 @@ export type Decoder<TState = unknown> = (input: {
   diagnostics: RecordDiagnostic[]
   state?: TState
 }
+
+/**
+ * Stage 1 output: a provider-shaped rich decode plus per-record diagnostics.
+ *
+ * The rich value is deliberately unconstrained — it holds the provider's own
+ * vocabulary (user messages, paths, tool arguments) and is HOST-SIDE ONLY. It
+ * must never be serialized onto the wire; that is what stage 2 is for.
+ */
+export interface RichDecodeResult<TRich> {
+  value: TRich
+  diagnostics: RecordDiagnostic[]
+}
+
+/**
+ * Stage 1: raw provider records -> rich, provider-shaped decode.
+ *
+ * `TInput` is per-provider (each declares its own `*DecodeInput`), which is why
+ * this is a two-parameter type rather than one fixed signature. Providers whose
+ * descriptor reports `supportsIncrementalState` accept a caller-owned dedup set
+ * on that input so an incremental scan does not re-emit known calls.
+ */
+export type RichDecoder<TInput, TRich> = (input: TInput) => RichDecodeResult<TRich>
+
+/**
+ * Stage 2: rich decode -> minimized observations. This is the boundary the
+ * content-smuggling suite guards; nothing but fingerprints, enums, numbers,
+ * timestamps, and canonical labels may cross it.
+ */
+export type ObservationAdapter<TRich, TOptions> = (
+  rich: TRich,
+  options: TOptions,
+) => { sessions: SessionObservation[] }
 
 /** A detector inspects a full envelope and emits findings. */
 export type Detector = (envelope: ObservationEnvelope) => Finding[]
