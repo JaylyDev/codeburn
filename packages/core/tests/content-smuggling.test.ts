@@ -32,6 +32,7 @@ import { decodeGoose, toObservations as toGooseObservations } from '../src/provi
 import { decodeHermes, toObservations as toHermesObservations } from '../src/providers/hermes/index.js'
 import { decodeWarp, toObservations as toWarpObservations } from '../src/providers/warp/index.js'
 import { decodeCursorAgent, toObservations as toCursorAgentObservations } from '../src/providers/cursor-agent/index.js'
+import { decodeCursor, toObservations as toCursorObservations } from '../src/providers/cursor/index.js'
 import { decodeQuickdesk, toObservations as toQuickdeskObservations } from '../src/providers/quickdesk/index.js'
 import { decodeDevin, toObservations as toDevinObservations } from '../src/providers/devin/index.js'
 import { decodeCopilot, toObservations as toCopilotObservations } from '../src/providers/copilot/index.js'
@@ -46,6 +47,11 @@ import {
 } from '../src/providers/antigravity/index.js'
 import type { DecodeContext } from '../src/contracts.js'
 import type { ZedThreadRow } from '../src/providers/zed/index.js'
+import type {
+  CursorAgentKvRow,
+  CursorBubbleRow,
+  CursorUserMessageRow,
+} from '../src/providers/cursor/index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const goldenEnvelope = JSON.parse(
@@ -1744,5 +1750,169 @@ describe('content-smuggling guardrail: real antigravity decode -> toObservations
     })
     expect(calls).toHaveLength(1)
     expect(calls[0]!.model).toBe('unknown')
+  })
+})
+
+describe('content-smuggling guardrail: real cursor decode -> toObservations is secret-free', () => {
+  // A hostile Cursor database planting secrets in every free-text field the
+  // decode reads: the bubble text (-> userMessage), a codeBlocks languageId
+  // (-> the synthetic `lang:` tool name, the sharpest vector since languageId is
+  // arbitrary attacker text), an agentKv user content blob, and a Shell
+  // tool-call's args.command (-> rawBashCommands). None may reach the envelope.
+  //
+  // The composer id is deliberately NOT a planted vector. Composer ids and
+  // request ids are the provider's own machine identifiers: they flow into
+  // sessionId and into the dedupKey, which the envelope keeps verbatim by
+  // design — exactly like every other provider's model and dedupKey. Hashing
+  // dedup keys uniformly is a schema-wide change, not a cursor-local one.
+  const cursorContext: DecodeContext = {
+    privacyKey: 'test-privacy-key',
+    providerId: 'cursor',
+    sourceRef: 'ref',
+  }
+
+  function bubble(opts: Partial<CursorBubbleRow> & { bubble_key: string }): CursorBubbleRow {
+    return {
+      input_tokens: null,
+      output_tokens: null,
+      model: null,
+      created_at: '2026-07-17T10:00:00.000Z',
+      request_id: null,
+      user_text: null,
+      text_length: null,
+      bubble_type: 2,
+      code_blocks: null,
+      ...opts,
+    }
+  }
+
+  function decodeAndMinimize() {
+    const cid = 'composer-hostile'
+    const requestId = 'req-hostile'
+
+    const bubbles: CursorBubbleRow[] = [
+      bubble({
+        bubble_key: `bubbleId:${cid}:u1`,
+        bubble_type: 1,
+        text_length: 100,
+        user_text: SECRETS.prompt,
+      }),
+      bubble({
+        bubble_key: `bubbleId:${cid}:a1`,
+        bubble_type: 2,
+        text_length: 20,
+        user_text: 'reply text',
+        code_blocks: JSON.stringify([{ languageId: SECRETS.commandLine }]),
+      }),
+    ]
+
+    const userMessageRows: CursorUserMessageRow[] = [
+      { bubble_key: `bubbleId:${cid}:u1`, created_at: '2026-07-17T10:00:00.000Z', text: SECRETS.prompt },
+    ]
+
+    const agentKvRows: CursorAgentKvRow[] = [
+      { role: 'user', content: SECRETS.apiKey, request_id: requestId, model: null },
+      {
+        role: 'assistant',
+        content: JSON.stringify([{ type: 'tool-call', toolName: 'Shell', args: { command: SECRETS.commandLine } }]),
+        request_id: requestId,
+        model: null,
+      },
+      { role: 'user', content: SECRETS.fileContent, request_id: requestId, model: null },
+    ]
+
+    const { calls } = decodeCursor({
+      bubbles,
+      agentKvRows,
+      userMessageRows,
+      composerMetaRows: [],
+      agentKvTimestamp: '2026-07-17T10:00:00.000Z',
+      context: cursorContext,
+    })
+
+    const { sessions } = toCursorObservations(
+      { sessionId: cid, projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'cursor' },
+    )
+
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core' as const, version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile Cursor rows', () => {
+    const envelope = decodeAndMinimize()
+    expect(ObservationEnvelope.safeParse(envelope).success).toBe(true)
+    // Guards against a vacuous fixture: a dropped record would make the secret
+    // assertions below prove nothing. Two bubble calls plus the unjoined
+    // agentKv (arm C) call.
+    expect(envelope.sessions[0]?.calls).toHaveLength(3)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('every planted secret really did enter the decode it is guarding', () => {
+    const cid = 'composer-hostile'
+    const requestId = 'req-hostile'
+    const { calls } = decodeCursor({
+      bubbles: [
+        bubble({ bubble_key: `bubbleId:${cid}:u1`, bubble_type: 1, text_length: 100, user_text: SECRETS.prompt }),
+        bubble({
+          bubble_key: `bubbleId:${cid}:a1`,
+          bubble_type: 2,
+          text_length: 20,
+          user_text: 'reply text',
+          code_blocks: JSON.stringify([{ languageId: SECRETS.commandLine }]),
+        }),
+      ],
+      agentKvRows: [
+        { role: 'user', content: SECRETS.apiKey, request_id: requestId, model: null },
+        {
+          role: 'assistant',
+          content: JSON.stringify([{ type: 'tool-call', toolName: 'Shell', args: { command: SECRETS.commandLine } }]),
+          request_id: requestId,
+          model: null,
+        },
+        { role: 'user', content: SECRETS.fileContent, request_id: requestId, model: null },
+      ],
+      userMessageRows: [
+        { bubble_key: `bubbleId:${cid}:u1`, created_at: '2026-07-17T10:00:00.000Z', text: SECRETS.prompt },
+      ],
+      composerMetaRows: [],
+      agentKvTimestamp: '2026-07-17T10:00:00.000Z',
+      context: cursorContext,
+    })
+    const richStrings = allStrings(calls)
+    // The rich host-side decode DOES carry these; the minimizer is what
+    // contains them. Without this the secret assertions could pass simply
+    // because the fixture never reached the fields under guard.
+    expect(richStrings.some(s => s.includes(SECRETS.prompt))).toBe(true)
+    expect(richStrings).toContain(`lang:${SECRETS.commandLine}`)
+    expect(richStrings).toContain(SECRETS.commandLine)
+    // apiKey and fileContent are agentKv content: they are consumed as
+    // character counts only, so they must never appear even in the rich decode.
+    expect(richStrings.some(s => s.includes(SECRETS.apiKey))).toBe(false)
+    expect(richStrings.some(s => s.includes(SECRETS.fileContent))).toBe(false)
+    const streamCall = calls.find(c => c.sessionId === requestId)
+    expect(streamCall).toBeDefined()
+    expect(streamCall!.inputTokens).toBe(
+      Math.ceil((SECRETS.apiKey.length + SECRETS.fileContent.length) / 4),
+    )
+  })
+
+  it('drops synthetic cursor:edit / lang:* tool names and keeps canonical Bash', () => {
+    const envelope = decodeAndMinimize()
+    const allToolNames = envelope.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(envelope.sessions[0]!.calls.length).toBeGreaterThan(0)
+    expect(allToolNames).toContain('Bash')
+    expect(allToolNames).not.toContain('cursor:edit')
+    expect(allToolNames).not.toContain(`lang:${SECRETS.commandLine}`)
   })
 })

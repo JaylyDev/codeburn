@@ -36,6 +36,7 @@ export default defineConfig({
     'src/providers/hermes/index.ts',
     'src/providers/warp/index.ts',
     'src/providers/cursor-agent/index.ts',
+    'src/providers/cursor/index.ts',
     'src/providers/quickdesk/index.ts',
     'src/providers/devin/index.ts',
     'src/providers/copilot/index.ts',

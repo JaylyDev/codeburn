@@ -135,6 +135,10 @@
       "types": "./dist/providers/cursor-agent/index.d.ts",
       "import": "./dist/providers/cursor-agent/index.js"
     },
+    "./providers/cursor": {
+      "types": "./dist/providers/cursor/index.d.ts",
+      "import": "./dist/providers/cursor/index.js"
+    },
     "./providers/quickdesk": {
       "types": "./dist/providers/quickdesk/index.d.ts",
       "import": "./dist/providers/quickdesk/index.js"
