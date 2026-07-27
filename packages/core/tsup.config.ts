@@ -44,6 +44,7 @@ export default defineConfig({
     'src/providers/opencode-session/index.ts',
     'src/providers/antigravity/index.ts',
     'src/providers/kiro/index.ts',
+    'src/providers/vercel-gateway/index.ts',
   ],
   format: ['esm'],
   target: 'node20',
