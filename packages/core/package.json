@@ -154,6 +154,10 @@
     "./providers/opencode-session": {
       "types": "./dist/providers/opencode-session/index.d.ts",
       "import": "./dist/providers/opencode-session/index.js"
+    },
+    "./providers/antigravity": {
+      "types": "./dist/providers/antigravity/index.d.ts",
+      "import": "./dist/providers/antigravity/index.js"
     }
   },
   "files": [

@@ -38,6 +38,12 @@ import { decodeCopilot, toObservations as toCopilotObservations } from '../src/p
 import { decodeVscodeCline, toObservations as toVscodeClineObservations } from '../src/providers/vscode-cline/index.js'
 import { decodeOpenCodeSession, toObservations as toOpenCodeSessionObservations } from '../src/providers/opencode-session/index.js'
 import { decodeMistralVibe, toObservations as toMistralVibeObservations } from '../src/providers/mistral-vibe/index.js'
+import {
+  decodeAntigravityGenMetadata,
+  decodeAntigravityGeneratorMetadata,
+  decodeAntigravityStatusLine,
+  toObservations as toAntigravityObservations,
+} from '../src/providers/antigravity/index.js'
 import type { DecodeContext } from '../src/contracts.js'
 import type { ZedThreadRow } from '../src/providers/zed/index.js'
 
@@ -1569,5 +1575,174 @@ describe('content-smuggling guardrail: real mistral-vibe decode -> toObservation
     const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
     expect(allToolNames).toContain('Bash')
     expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+})
+
+describe('content-smuggling guardrail: real antigravity decode -> toObservations is secret-free', () => {
+  // A hostile Antigravity cascade planting secrets in every free-text field the
+  // decode reads but never emits: proto attribute values other than model_enum,
+  // ignored proto fields, the statusline envelope's cwd/session_id, and the RPC
+  // usage.apiProvider. Only the canonicalized model and the responseId (inside
+  // the dedupKey) are emitted by design — they are the provider's own machine
+  // identifiers, exactly like every other provider's model and dedupKey.
+  const antigravityContext: DecodeContext = {
+    privacyKey: 'test-privacy-key',
+    providerId: 'antigravity',
+    sourceRef: 'ref',
+  }
+
+  function varint(n: number): number[] {
+    const out: number[] = []
+    let v = n
+    while (v > 0x7f) {
+      out.push((v & 0x7f) | 0x80)
+      v = Math.floor(v / 128)
+    }
+    out.push(v)
+    return out
+  }
+
+  function tag(field: number, wire: number): number[] {
+    return varint(field * 8 + wire)
+  }
+
+  function varintField(field: number, n: number): number[] {
+    return [...tag(field, 0), ...varint(n)]
+  }
+
+  function lenField(field: number, bytes: number[]): number[] {
+    return [...tag(field, 2), ...varint(bytes.length), ...bytes]
+  }
+
+  function textField(field: number, text: string): number[] {
+    return lenField(field, [...new TextEncoder().encode(text)])
+  }
+
+  function attrField(key: string, value: string): number[] {
+    return lenField(20, [...textField(1, key), ...textField(2, value)])
+  }
+
+  function buildHostileGenMetadataRow(): { idx: number; data: Uint8Array } {
+    const chatStartMetadata = textField(4, '2026-07-17T10:00:00.000Z')
+    const usage = lenField(4, [
+      ...varintField(2, 100),
+      ...varintField(3, 50),
+      ...varintField(6, 999),
+    ])
+    const chatModel = [
+      ...usage,
+      ...lenField(9, chatStartMetadata),
+      ...textField(19, 'gemini-3-pro'),
+      ...attrField('trajectory_id', SECRETS.commandLine),
+      ...attrField('used_claude', SECRETS.apiKey),
+      ...attrField('last_step_index', SECRETS.prompt),
+    ]
+    const root = [
+      ...lenField(2, [...new TextEncoder().encode(SECRETS.fileContent)]),
+      ...lenField(4, [...new TextEncoder().encode(SECRETS.absPath)]),
+      ...lenField(1, chatModel),
+    ]
+    return { idx: 0, data: Buffer.from(root) }
+  }
+
+  function decodeAndMinimize() {
+    const genMetadataCalls = decodeAntigravityGenMetadata({
+      records: [buildHostileGenMetadataRow()],
+      context: antigravityContext,
+      cascadeId: 'sess-hostile',
+    }).calls
+
+    // The statusline decoder consumes RECORDED events (camelCase, already
+    // normalized by parseAntigravityStatusLinePayload), not the raw hook
+    // payload. `sessionId` and any stray envelope field such as `cwd` are read
+    // past but never emitted — the emitted call's sessionId is conversationId.
+    const statusLineCalls = decodeAntigravityStatusLine({
+      records: [
+        JSON.stringify({
+          at: '2026-07-17T10:00:00.000Z',
+          conversationId: 'sess-hostile-statusline',
+          sessionId: SECRETS.apiKey,
+          cwd: SECRETS.absPath,
+          model: 'gemini-3-pro',
+          usage: {
+            inputTokens: 100,
+            outputTokens: 50,
+            cacheCreationInputTokens: 0,
+            cacheReadInputTokens: 0,
+          },
+        }),
+      ],
+      context: antigravityContext,
+      seenKeys: new Set(),
+    }).calls
+
+    const rpcCalls = decodeAntigravityGeneratorMetadata({
+      records: [
+        {
+          chatModel: {
+            model: 'gemini-3-pro',
+            usage: {
+              model: 'gemini-3-pro',
+              inputTokens: '100',
+              outputTokens: '50',
+              responseOutputTokens: '50',
+              apiProvider: SECRETS.commandLine,
+              responseId: 'rpc-secret',
+            },
+            chatStartMetadata: { createdAt: '2026-07-17T10:00:00.000Z' },
+          },
+        },
+      ],
+      context: antigravityContext,
+      cascadeId: 'sess-hostile',
+      modelMap: {},
+    }).calls
+
+    const calls = [...genMetadataCalls, ...statusLineCalls, ...rpcCalls]
+
+    const { sessions } = toAntigravityObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'antigravity' },
+    )
+
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile cascade', () => {
+    const envelope = decodeAndMinimize()
+    expect(ObservationEnvelope.safeParse(envelope).success).toBe(true)
+    // Guards against a vacuous fixture: a malformed record would be dropped by
+    // its decoder and the secret assertions below would then prove nothing.
+    expect(envelope.sessions[0]?.calls).toHaveLength(3)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('emits no tool names (antigravity has no tool map)', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toEqual([])
+  })
+
+  it('a MODEL_PLACEHOLDER id with no displayName surfaces as unknown, never the raw placeholder', () => {
+    const usage = lenField(4, [...varintField(2, 10), ...varintField(3, 1)])
+    const chatModel = [...usage, ...textField(19, 'MODEL_PLACEHOLDER_HOSTILE')]
+    const row = { idx: 0, data: Buffer.from(lenField(1, chatModel)) }
+    const { calls } = decodeAntigravityGenMetadata({
+      records: [row],
+      context: antigravityContext,
+      cascadeId: 'placeholder-test',
+    })
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.model).toBe('unknown')
   })
 })
