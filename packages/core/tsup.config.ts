@@ -26,6 +26,7 @@ export default defineConfig({
     'src/providers/lingtai-tui/index.ts',
     'src/providers/gemini/index.ts',
     'src/providers/kimicode/index.ts',
+    'src/providers/mistral-vibe/index.ts',
     'src/providers/pi/index.ts',
     'src/providers/crush/index.ts',
     'src/providers/zcode/index.ts',

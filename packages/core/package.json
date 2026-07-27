@@ -95,6 +95,10 @@
       "types": "./dist/providers/kimicode/index.d.ts",
       "import": "./dist/providers/kimicode/index.js"
     },
+    "./providers/mistral-vibe": {
+      "types": "./dist/providers/mistral-vibe/index.d.ts",
+      "import": "./dist/providers/mistral-vibe/index.js"
+    },
     "./providers/pi": {
       "types": "./dist/providers/pi/index.d.ts",
       "import": "./dist/providers/pi/index.js"

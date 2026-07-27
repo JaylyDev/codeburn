@@ -149,6 +149,8 @@ const USER_MESSAGE_ALLOWLIST = new Set([
   'src/providers/gemini/types.ts',
   'src/providers/kimicode/decode.ts',
   'src/providers/kimicode/types.ts',
+  'src/providers/mistral-vibe/decode.ts',
+  'src/providers/mistral-vibe/types.ts',
   'src/providers/pi/decode.ts',
   'src/providers/pi/types.ts',
   'src/providers/zed/decode.ts',
