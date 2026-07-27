@@ -68,7 +68,7 @@ Four things version independently. Do not infer one from another.
 |---|---|---|
 | Package version | `package.json` | npm semver |
 | Observation schema | `OBSERVATION_SCHEMA_VERSION` | currently `0.3.0` |
-| Finding schema | `FINDING_SCHEMA_VERSION` | currently `0.2.0` |
+| Finding schema | `FINDING_SCHEMA_VERSION` | currently `0.3.0` |
 | Detector algorithm | `algorithmVersion` on each finding | per detector |
 
 **All four are 0.x, and a 0.x MINOR bump may break you.** That is not the usual
@@ -90,7 +90,25 @@ against a published version keeps getting the shape that version promised.
   charset-capped. A non-canonical label degrades to `'unknown'` rather than
   invalidating the whole envelope.
 
-Finding schema 0.2.0 carries the same widened refs; its shape is otherwise 0.1.0.
+Finding schema 0.2.0 carried the same widened refs and was otherwise 0.1.0.
+
+### Breaking changes in finding schema 0.3.0
+
+- `impactUSD` is removed. Core has no pricing and never measured cash.
+- Every finding names one `subject` (`{ kind, ref }`), so a host can attribute
+  it. Detectors emit at most one finding per session; project rollups are yours.
+- Confidence rationale is now controlled codes, not a sentence.
+- Evidence `kind` is a closed enum. The `tokens-saved` kind is gone — it claimed
+  an outcome nothing observed.
+- Token effects live in an optional `estimate` carrying `methodId` and
+  `methodVersion`, with a required `nonCash: true` that cannot be set false.
+- `context-bloat` is now `low-context-before-edit`, and it emits no token
+  estimate at all: the reads it counts never happened, and performing them would
+  add tokens rather than avoid them.
+
+Read every `estimate` as a model output. `fixed-read-token-assumption` charges
+every read a flat 600 tokens regardless of file size or language; a real corpus
+spans orders of magnitude around that.
 
 ## A note on what this package can and cannot prove
 
