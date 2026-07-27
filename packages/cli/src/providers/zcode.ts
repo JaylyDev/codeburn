@@ -1,8 +1,12 @@
 import { join } from 'path'
 import { homedir } from 'os'
 
+import { decodeZcode } from '@codeburn/core/providers/zcode'
+import type { ZcodeDecodedCall, ZcodeSessionRecords, ZcodeToolRow, ZcodeUsageRow } from '@codeburn/core/providers/zcode'
+
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, type SqliteDatabase } from '../sqlite.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import { createBridgedProvider } from './bridge.js'
+import type { Provider, SessionSource, ParsedProviderCall } from './types.js'
 
 /// ZCode (CLI v0.14.x) records usage in a single SQLite database at
 /// ~/.zcode/cli/db/db.sqlite. We read it because the other on-disk sources are
@@ -16,35 +20,12 @@ type SessionRow = {
   directory: string
 }
 
-type UsageRow = {
-  id: string
-  turn_id: string | null
-  model_id: string
-  input_tokens: number
-  output_tokens: number
-  reasoning_tokens: number
-  cache_creation_input_tokens: number
-  cache_read_input_tokens: number
-  started_at: number
-  completed_at: number | null
-}
-
-type ToolRow = {
-  turn_id: string | null
-  tool_name: string
-}
-
 function getDbPath(override?: string): string {
   return override ?? join(homedir(), '.zcode', 'cli', 'db', 'db.sqlite')
 }
 
 function sanitizeProject(path: string): string {
   return path.replace(/^\//, '').replace(/\//g, '-')
-}
-
-function epochMsToIso(ms: number | null): string {
-  if (ms === null || !Number.isFinite(ms) || ms <= 0) return new Date(0).toISOString()
-  return new Date(ms).toISOString()
 }
 
 function validateSchema(db: SqliteDatabase): boolean {
@@ -85,121 +66,37 @@ function discover(dbPath: string): SessionSource[] {
   }
 }
 
-function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+// Map one rich, cost-free decoder call into the host's ParsedProviderCall. Cost
+// re-enters here: `costBasis: 'estimated'` marks the call so the parser.ts
+// pricing pass fills `costUSD` from the token buckets. ZCode never captures a
+// user message, so it is hardcoded empty here rather than carried through the
+// rich decode.
+function toProviderCall(rich: ZcodeDecodedCall): ParsedProviderCall {
   return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      if (!isSqliteAvailable()) {
-        process.stderr.write(getSqliteLoadError() + '\n')
-        return
-      }
-
-      // Source paths are `<dbPath>:<sessionId>`. Split from the right so a colon
-      // in the path (Windows drive letter) doesn't corrupt the session id.
-      const segments = source.path.split(':')
-      const sessionId = segments[segments.length - 1]!
-      const dbPath = segments.slice(0, -1).join(':')
-
-      let db: SqliteDatabase
-      try {
-        db = openDatabase(dbPath)
-      } catch (err) {
-        process.stderr.write(
-          `codeburn: cannot open ZCode database: ${err instanceof Error ? err.message : err}\n`,
-        )
-        return
-      }
-
-      try {
-        if (!validateSchema(db)) return
-
-        // model_usage rows don't link to individual tool calls, only to a turn,
-        // so collect each turn's tools and attach them to one request per turn
-        // (below) to avoid double-counting across a turn's multiple requests.
-        const toolRows = db.query<ToolRow>(
-          `SELECT turn_id, tool_name FROM tool_usage
-           WHERE session_id = ? AND turn_id IS NOT NULL
-           ORDER BY started_at ASC`,
-          [sessionId],
-        )
-        const toolsByTurn = new Map<string, string[]>()
-        for (const tool of toolRows) {
-          if (!tool.turn_id) continue
-          const list = toolsByTurn.get(tool.turn_id) ?? []
-          list.push(tool.tool_name)
-          toolsByTurn.set(tool.turn_id, list)
-        }
-
-        const rows = db.query<UsageRow>(
-          `SELECT id, turn_id, model_id, input_tokens, output_tokens, reasoning_tokens,
-                  cache_creation_input_tokens, cache_read_input_tokens, started_at, completed_at
-           FROM model_usage WHERE session_id = ?
-           ORDER BY started_at ASC`,
-          [sessionId],
-        )
-
-        const turnsWithToolsEmitted = new Set<string>()
-
-        for (const row of rows) {
-          const cacheRead = row.cache_read_input_tokens ?? 0
-          const cacheCreation = row.cache_creation_input_tokens ?? 0
-          const output = row.output_tokens ?? 0
-          const reasoning = row.reasoning_tokens ?? 0
-          // ZCode folds cached tokens into input_tokens (OpenAI-style). Split
-          // them back out so fresh input bills at the input rate and cached at
-          // the cache-read rate, matching the pricing table's Anthropic-style
-          // semantics.
-          const freshInput = Math.max(0, (row.input_tokens ?? 0) - cacheRead - cacheCreation)
-
-          if (freshInput === 0 && output === 0 && reasoning === 0 && cacheRead === 0 && cacheCreation === 0) {
-            continue
-          }
-
-          const dedupKey = `zcode:${row.id}`
-          if (seenKeys.has(dedupKey)) continue
-          seenKeys.add(dedupKey)
-
-          let tools: string[] = []
-          if (row.turn_id && !turnsWithToolsEmitted.has(row.turn_id)) {
-            const turnTools = toolsByTurn.get(row.turn_id)
-            if (turnTools && turnTools.length > 0) {
-              tools = turnTools
-              turnsWithToolsEmitted.add(row.turn_id)
-            }
-          }
-
-          const model = row.model_id
-
-          yield {
-            provider: 'zcode',
-            model,
-            inputTokens: freshInput,
-            outputTokens: output,
-            cacheCreationInputTokens: cacheCreation,
-            cacheReadInputTokens: cacheRead,
-            cachedInputTokens: 0,
-            reasoningTokens: reasoning,
-            webSearchRequests: 0,
-            costBasis: 'estimated',
-            tools,
-            bashCommands: [],
-            timestamp: epochMsToIso(row.completed_at ?? row.started_at),
-            speed: 'standard',
-            deduplicationKey: dedupKey,
-            turnId: row.turn_id ?? undefined,
-            userMessage: '',
-            sessionId,
-          }
-        }
-      } finally {
-        db.close()
-      }
-    },
+    provider: 'zcode',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    costBasis: 'estimated',
+    tools: rich.tools,
+    bashCommands: [],
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    turnId: rich.turnId,
+    userMessage: '',
+    sessionId: rich.sessionId,
   }
 }
 
 export function createZcodeProvider(dbPathOverride?: string): Provider {
   const dbPath = getDbPath(dbPathOverride)
-  return {
+  return createBridgedProvider<ZcodeDecodedCall>({
     name: 'zcode',
     displayName: 'ZCode',
 
@@ -216,10 +113,63 @@ export function createZcodeProvider(dbPathOverride?: string): Provider {
       return discover(dbPath)
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, seenKeys)
+    // I/O adapter: open the db, run the model_usage and tool_usage queries for
+    // this session (both sqlite-side), and hand the core decoder one combined
+    // record bundling both row sets.
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      if (!isSqliteAvailable()) {
+        process.stderr.write(getSqliteLoadError() + '\n')
+        return null
+      }
+
+      // Source paths are `<dbPath>:<sessionId>`. Split from the right so a colon
+      // in the path (Windows drive letter) doesn't corrupt the session id.
+      const segments = source.path.split(':')
+      const sessionId = segments[segments.length - 1]!
+      const readDbPath = segments.slice(0, -1).join(':')
+
+      let db: SqliteDatabase
+      try {
+        db = openDatabase(readDbPath)
+      } catch (err) {
+        process.stderr.write(
+          `codeburn: cannot open ZCode database: ${err instanceof Error ? err.message : err}\n`,
+        )
+        return null
+      }
+
+      try {
+        if (!validateSchema(db)) return null
+
+        // model_usage rows don't link to individual tool calls, only to a turn,
+        // so collect each turn's tools and attach them to one request per turn
+        // (in the decoder) to avoid double-counting across a turn's multiple
+        // requests.
+        const toolRows = db.query<ZcodeToolRow>(
+          `SELECT turn_id, tool_name FROM tool_usage
+           WHERE session_id = ? AND turn_id IS NOT NULL
+           ORDER BY started_at ASC`,
+          [sessionId],
+        )
+
+        const usageRows = db.query<ZcodeUsageRow>(
+          `SELECT id, turn_id, model_id, input_tokens, output_tokens, reasoning_tokens,
+                  cache_creation_input_tokens, cache_read_input_tokens, started_at, completed_at
+           FROM model_usage WHERE session_id = ?
+           ORDER BY started_at ASC`,
+          [sessionId],
+        )
+
+        const record: ZcodeSessionRecords = { sessionId, usageRows, toolRows }
+        return [record]
+      } finally {
+        db.close()
+      }
     },
-  }
+
+    decode: decodeZcode,
+    toProviderCall,
+  })
 }
 
 export const zcode = createZcodeProvider()

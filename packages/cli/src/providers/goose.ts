@@ -1,13 +1,16 @@
 import { join } from 'path'
 import { homedir, platform } from 'os'
 
+import { decodeGoose, gooseToolNameMap } from '@codeburn/core/providers/goose'
+import type { GooseDecodedCall, GooseMessageRow, GooseSessionRecords, GooseSessionRow } from '@codeburn/core/providers/goose'
+
 import { getShortModelName } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, blobToText, type SqliteDatabase } from '../sqlite.js'
-import type { ToolCall } from '../types.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import { createBridgedProvider } from './bridge.js'
+import type { Provider, SessionSource, ParsedProviderCall } from './types.js'
 
-type SessionRow = {
+type RawSessionRow = {
   id: string
   name: string
   working_dir: string | null
@@ -17,33 +20,6 @@ type SessionRow = {
   accumulated_output_tokens: number | null
   provider_name: string | null
   model_config_json: Uint8Array | string | null
-}
-
-type ModelConfig = {
-  model_name?: string
-  reasoning?: boolean
-}
-
-type MessageRow = {
-  message_id: string
-  role: string
-  content_json: Uint8Array | string
-  created_timestamp: number
-}
-
-type ContentItem = {
-  type: string
-  toolCall?: { value?: { name?: string; arguments?: Record<string, unknown> } }
-}
-
-const toolNameMap: Record<string, string> = {
-  developer__shell: 'Bash',
-  developer__text_editor: 'Edit',
-  developer__read_file: 'Read',
-  developer__write_file: 'Write',
-  developer__list_directory: 'LS',
-  developer__search_files: 'Grep',
-  computercontroller__shell: 'Bash',
 }
 
 function sanitize(dir: string): string {
@@ -72,157 +48,37 @@ function validateSchema(db: SqliteDatabase): boolean {
   }
 }
 
-function parseModelConfig(raw: string | null): ModelConfig {
-  if (!raw) return {}
-  try {
-    return JSON.parse(raw) as ModelConfig
-  } catch {
-    return {}
-  }
-}
+const SESSION_COLUMNS = 'id, name, working_dir, created_at, updated_at, accumulated_input_tokens, accumulated_output_tokens, provider_name, CAST(model_config_json AS BLOB) AS model_config_json'
 
-function extractToolsFromMessages(db: SqliteDatabase, sessionId: string): { tools: string[]; bashCommands: string[]; toolSequence: ToolCall[][] } {
-  const tools: string[] = []
-  const bashCommands: string[] = []
-  const seen = new Set<string>()
-  const toolSequence: ToolCall[][] = []
-
-  try {
-    const rows = db.query<{ content_json: Uint8Array | string }>(
-      "SELECT CAST(content_json AS BLOB) AS content_json FROM messages WHERE session_id = ? AND role = 'assistant' AND content_json LIKE '%toolRequest%' ORDER BY created_timestamp ASC",
-      [sessionId],
-    )
-
-    for (const row of rows) {
-      let items: ContentItem[]
-      try {
-        items = JSON.parse(blobToText(row.content_json)) as ContentItem[]
-      } catch {
-        continue
-      }
-      const msgCalls: ToolCall[] = []
-      for (const item of items) {
-        if (item.type !== 'toolRequest') continue
-        const rawName = item.toolCall?.value?.name ?? ''
-        if (!rawName) continue
-        const mapped = toolNameMap[rawName] ?? rawName.split('__').pop() ?? rawName
-        if (!seen.has(mapped)) {
-          seen.add(mapped)
-          tools.push(mapped)
-        }
-        const call: ToolCall = { tool: mapped }
-        const args = item.toolCall?.value?.arguments
-        if (args && typeof args === 'object') {
-          const fp = (args as Record<string, unknown>)['file_path']
-          if (typeof fp === 'string') call.file = fp
-          const cmd = (args as Record<string, unknown>)['command']
-          if (typeof cmd === 'string') call.command = cmd
-        }
-        msgCalls.push(call)
-        if (mapped === 'Bash') {
-          const cmd = item.toolCall?.value?.arguments?.command
-          if (typeof cmd === 'string') {
-            for (const c of extractBashCommands(cmd)) {
-              if (!bashCommands.includes(c)) bashCommands.push(c)
-            }
-          }
-        }
-      }
-      if (msgCalls.length > 0) toolSequence.push(msgCalls)
-    }
-  } catch { /* best-effort */ }
-
-  return { tools, bashCommands, toolSequence }
-}
-
-function getFirstUserMessage(db: SqliteDatabase, sessionId: string): string {
-  try {
-    const rows = db.query<{ content_json: Uint8Array | string }>(
-      "SELECT CAST(content_json AS BLOB) AS content_json FROM messages WHERE session_id = ? AND role = 'user' ORDER BY created_timestamp ASC LIMIT 1",
-      [sessionId],
-    )
-    if (rows.length === 0) return ''
-    const items = JSON.parse(blobToText(rows[0]!.content_json)) as ContentItem[]
-    const text = items.find(i => i.type === 'text') as { text?: string } | undefined
-    return (text?.text ?? '').slice(0, 500)
-  } catch {
-    return ''
-  }
-}
-
-function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+// Map one rich, cost-free decoder call into the host's ParsedProviderCall. Cost
+// re-enters here: `costBasis: 'estimated'` marks the call so the parser.ts
+// pricing pass fills `costUSD` from the token buckets. Bash base-name
+// extraction (and its `strip-ansi` dependency) stays CLI-side: the core
+// decoder carries the raw command strings; the host reduces them here.
+function toProviderCall(rich: GooseDecodedCall): ParsedProviderCall {
   return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      if (!isSqliteAvailable()) {
-        process.stderr.write(getSqliteLoadError() + '\n')
-        return
-      }
-
-      const segments = source.path.split(':')
-      const sessionId = segments[segments.length - 1]!
-      const dbPath = segments.slice(0, -1).join(':')
-
-      let db: SqliteDatabase
-      try {
-        db = openDatabase(dbPath)
-      } catch (err) {
-        process.stderr.write(`codeburn: cannot open Goose database: ${err instanceof Error ? err.message : err}\n`)
-        return
-      }
-
-      try {
-        if (!validateSchema(db)) return
-
-        const rows = db.query<SessionRow>(
-          'SELECT id, name, working_dir, created_at, updated_at, accumulated_input_tokens, accumulated_output_tokens, provider_name, CAST(model_config_json AS BLOB) AS model_config_json FROM sessions WHERE id = ?',
-          [sessionId],
-        )
-        if (rows.length === 0) return
-
-        const session = rows[0]!
-        const inputTokens = session.accumulated_input_tokens ?? 0
-        const outputTokens = session.accumulated_output_tokens ?? 0
-        if (inputTokens === 0 && outputTokens === 0) return
-
-        const dedupKey = `goose:${sessionId}`
-        if (seenKeys.has(dedupKey)) return
-        seenKeys.add(dedupKey)
-
-        const config = parseModelConfig(blobToText(session.model_config_json))
-        const model = config.model_name ?? 'unknown'
-
-        const { tools, bashCommands, toolSequence } = extractToolsFromMessages(db, sessionId)
-        const userMessage = getFirstUserMessage(db, sessionId)
-
-        const raw = session.updated_at || session.created_at || ''
-        let ts = new Date(raw)
-        if (isNaN(ts.getTime())) ts = new Date(raw + 'Z')
-        if (isNaN(ts.getTime())) ts = new Date()
-
-        yield {
-          provider: 'goose',
-          model,
-          inputTokens,
-          outputTokens,
-          cacheCreationInputTokens: 0,
-          cacheReadInputTokens: 0,
-          cachedInputTokens: 0,
-          reasoningTokens: 0,
-          webSearchRequests: 0,
-          costBasis: 'estimated',
-          tools,
-          bashCommands,
-          toolSequence: toolSequence.length > 1 ? toolSequence : undefined,
-          timestamp: ts.toISOString(),
-          speed: 'standard',
-          deduplicationKey: dedupKey,
-          userMessage,
-          sessionId,
-        }
-      } finally {
-        db.close()
-      }
-    },
+    provider: 'goose',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    costBasis: 'estimated',
+    tools: rich.tools,
+    bashCommands: [...new Set(rich.rawBashCommands.flatMap(c => extractBashCommands(c)))],
+    toolSequence: rich.toolSequence,
+    // The pre-migration decode fell back to `new Date()` (the current time)
+    // when both updated_at/created_at were unparseable. That clock read can't
+    // live in the pure core decoder, so decodeGoose emits '' in that case and
+    // the fallback is applied here instead.
+    timestamp: rich.timestamp || new Date().toISOString(),
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
   }
 }
 
@@ -235,8 +91,8 @@ async function discoverFromDb(dbPath: string): Promise<SessionSource[]> {
   }
 
   try {
-    const rows = db.query<SessionRow>(
-      'SELECT id, name, working_dir, created_at, updated_at, accumulated_input_tokens, accumulated_output_tokens, provider_name, CAST(model_config_json AS BLOB) AS model_config_json FROM sessions ORDER BY updated_at DESC',
+    const rows = db.query<RawSessionRow>(
+      `SELECT ${SESSION_COLUMNS} FROM sessions ORDER BY updated_at DESC`,
     )
 
     return rows
@@ -262,7 +118,7 @@ const modelDisplayNames: Record<string, string> = {
 }
 
 export function createGooseProvider(): Provider {
-  return {
+  return createBridgedProvider<GooseDecodedCall>({
     name: 'goose',
     displayName: 'Goose',
 
@@ -271,7 +127,7 @@ export function createGooseProvider(): Provider {
     },
 
     toolDisplayName(rawTool: string): string {
-      return toolNameMap[rawTool] ?? rawTool
+      return gooseToolNameMap[rawTool] ?? rawTool
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
@@ -280,10 +136,81 @@ export function createGooseProvider(): Provider {
       return discoverFromDb(dbPath)
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, seenKeys)
+    // I/O adapter: open the db and run the session query, the assistant
+    // tool-message query, and the first-user-message query (all sqlite-side),
+    // converting each BLOB column to text (the same charset-safe conversion
+    // fs-utils performs for file reads). The core decoder gets one composite
+    // record bundling all three; JSON parsing and per-message decode are pure
+    // and happen there.
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      if (!isSqliteAvailable()) {
+        process.stderr.write(getSqliteLoadError() + '\n')
+        return null
+      }
+
+      const segments = source.path.split(':')
+      const sessionId = segments[segments.length - 1]!
+      const dbPath = segments.slice(0, -1).join(':')
+
+      let db: SqliteDatabase
+      try {
+        db = openDatabase(dbPath)
+      } catch (err) {
+        process.stderr.write(`codeburn: cannot open Goose database: ${err instanceof Error ? err.message : err}\n`)
+        return null
+      }
+
+      try {
+        if (!validateSchema(db)) return null
+
+        const rows = db.query<RawSessionRow>(
+          `SELECT ${SESSION_COLUMNS} FROM sessions WHERE id = ?`,
+          [sessionId],
+        )
+        if (rows.length === 0) return null
+        const raw = rows[0]!
+
+        const session: GooseSessionRow = {
+          id: raw.id,
+          workingDir: raw.working_dir,
+          createdAt: raw.created_at,
+          updatedAt: raw.updated_at,
+          accumulatedInputTokens: raw.accumulated_input_tokens,
+          accumulatedOutputTokens: raw.accumulated_output_tokens,
+          modelConfigJson: blobToText(raw.model_config_json) || null,
+        }
+
+        let assistantToolMessages: GooseMessageRow[] = []
+        let firstUserMessage: GooseMessageRow | null = null
+        try {
+          const toolRows = db.query<{ content_json: Uint8Array | string }>(
+            "SELECT CAST(content_json AS BLOB) AS content_json FROM messages WHERE session_id = ? AND role = 'assistant' AND content_json LIKE '%toolRequest%' ORDER BY created_timestamp ASC",
+            [sessionId],
+          )
+          assistantToolMessages = toolRows.map(r => ({ contentJson: blobToText(r.content_json) }))
+        } catch {
+          // best-effort, matches the pre-migration decode
+        }
+        try {
+          const userRows = db.query<{ content_json: Uint8Array | string }>(
+            "SELECT CAST(content_json AS BLOB) AS content_json FROM messages WHERE session_id = ? AND role = 'user' ORDER BY created_timestamp ASC LIMIT 1",
+            [sessionId],
+          )
+          if (userRows.length > 0) firstUserMessage = { contentJson: blobToText(userRows[0]!.content_json) }
+        } catch {
+          // best-effort, matches the pre-migration decode
+        }
+
+        const record: GooseSessionRecords = { sessionId, session, assistantToolMessages, firstUserMessage }
+        return [record]
+      } finally {
+        db.close()
+      }
     },
-  }
+
+    decode: decodeGoose,
+    toProviderCall,
+  })
 }
 
 export const goose = createGooseProvider()
