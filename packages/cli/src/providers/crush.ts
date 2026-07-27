@@ -2,8 +2,12 @@ import { readFile } from 'fs/promises'
 import { join, resolve } from 'path'
 import { homedir, platform } from 'os'
 
+import { decodeCrush } from '@codeburn/core/providers/crush'
+import type { CrushDecodedCall, CrushRawRecord } from '@codeburn/core/providers/crush'
+
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, type SqliteDatabase } from '../sqlite.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import { createBridgedProvider } from './bridge.js'
+import type { Provider, SessionSource, ParsedProviderCall } from './types.js'
 
 /// Crush stores per-project SQLite databases discovered through a JSON registry.
 /// We only read both. Schema source: charmbracelet/crush
@@ -93,13 +97,6 @@ function validateSchema(db: SqliteDatabase): boolean {
   }
 }
 
-function epochSecondsToIso(epochSeconds: number | null): string {
-  if (epochSeconds === null || !Number.isFinite(epochSeconds)) {
-    return new Date(0).toISOString()
-  }
-  return new Date(epochSeconds * 1000).toISOString()
-}
-
 function dominantModel(db: SqliteDatabase, sessionId: string): string {
   try {
     const rows = db.query<{ model: string | null }>(
@@ -117,80 +114,34 @@ function dominantModel(db: SqliteDatabase, sessionId: string): string {
   }
 }
 
-function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+// Map one rich, cost-free-or-measured decoder call into the host's
+// ParsedProviderCall. Crush already stores cost in dollars, so a row with
+// `measuredCostUSD` maps to `costBasis: 'measured'` (the pricing pass leaves it
+// untouched); otherwise the row falls back to token-based estimation. Crush
+// never captures a user message, so it is hardcoded empty here rather than
+// carried through the rich decode.
+function toProviderCall(rich: CrushDecodedCall): ParsedProviderCall {
+  const measured = rich.measuredCostUSD !== undefined
   return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      if (!isSqliteAvailable()) {
-        process.stderr.write(getSqliteLoadError() + '\n')
-        return
-      }
-
-      // Source paths are encoded as `<dbPath>:<sessionId>`. Split from the
-      // right because dbPath may contain a colon on Windows (drive letter).
-      const segments = source.path.split(':')
-      const sessionId = segments[segments.length - 1]!
-      const dbPath = segments.slice(0, -1).join(':')
-
-      let db: SqliteDatabase
-      try {
-        db = openDatabase(dbPath)
-      } catch (err) {
-        process.stderr.write(
-          `codeburn: cannot open Crush database: ${err instanceof Error ? err.message : err}\n`,
-        )
-        return
-      }
-
-      try {
-        if (!validateSchema(db)) return
-
-        const rows = db.query<SessionRow>(
-          `SELECT id, prompt_tokens, completion_tokens, cost, created_at, updated_at, message_count
-           FROM sessions
-           WHERE id = ? AND parent_session_id IS NULL`,
-          [sessionId],
-        )
-        if (rows.length === 0) return
-        const session = rows[0]!
-
-        const inputTokens = session.prompt_tokens ?? 0
-        const outputTokens = session.completion_tokens ?? 0
-        const cost = session.cost ?? 0
-        if (inputTokens === 0 && outputTokens === 0 && cost === 0) return
-
-        const dedupKey = `crush:${sessionId}`
-        if (seenKeys.has(dedupKey)) return
-        seenKeys.add(dedupKey)
-
-        const model = dominantModel(db, sessionId)
-        // Crush already records cost in dollars; trust it. Fall back to
-        // host-side pricing-table calculation only when the row is missing a cost.
-
-        yield {
-          provider: 'crush',
-          model,
-          inputTokens,
-          outputTokens,
-          cacheCreationInputTokens: 0,
-          cacheReadInputTokens: 0,
-          cachedInputTokens: 0,
-          reasoningTokens: 0,
-          webSearchRequests: 0,
-          ...(cost > 0
-            ? { costUSD: cost, costBasis: 'measured' as const }
-            : { costBasis: 'estimated' as const }),
-          tools: [],
-          bashCommands: [],
-          timestamp: epochSecondsToIso(session.updated_at ?? session.created_at),
-          speed: 'standard',
-          deduplicationKey: dedupKey,
-          userMessage: '',
-          sessionId,
-        }
-      } finally {
-        db.close()
-      }
-    },
+    provider: 'crush',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    ...(measured
+      ? { costUSD: rich.measuredCostUSD, costBasis: 'measured' as const }
+      : { costBasis: 'estimated' as const }),
+    tools: rich.tools,
+    bashCommands: [],
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: '',
+    sessionId: rich.sessionId,
   }
 }
 
@@ -222,7 +173,7 @@ async function discoverFromDb(dbPath: string, project: string): Promise<SessionS
 }
 
 export function createCrushProvider(): Provider {
-  return {
+  return createBridgedProvider<CrushDecodedCall>({
     name: 'crush',
     displayName: 'Crush',
 
@@ -247,10 +198,53 @@ export function createCrushProvider(): Provider {
       return sources
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, seenKeys)
+    // I/O adapter: open the db, run the session-row query and the dominant-model
+    // query (both sqlite-side), and hand the core decoder one combined record.
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      if (!isSqliteAvailable()) {
+        process.stderr.write(getSqliteLoadError() + '\n')
+        return null
+      }
+
+      // Source paths are encoded as `<dbPath>:<sessionId>`. Split from the
+      // right because dbPath may contain a colon on Windows (drive letter).
+      const segments = source.path.split(':')
+      const sessionId = segments[segments.length - 1]!
+      const dbPath = segments.slice(0, -1).join(':')
+
+      let db: SqliteDatabase
+      try {
+        db = openDatabase(dbPath)
+      } catch (err) {
+        process.stderr.write(
+          `codeburn: cannot open Crush database: ${err instanceof Error ? err.message : err}\n`,
+        )
+        return null
+      }
+
+      try {
+        if (!validateSchema(db)) return null
+
+        const rows = db.query<SessionRow>(
+          `SELECT id, prompt_tokens, completion_tokens, cost, created_at, updated_at, message_count
+           FROM sessions
+           WHERE id = ? AND parent_session_id IS NULL`,
+          [sessionId],
+        )
+        if (rows.length === 0) return null
+        const session = rows[0]!
+
+        const model = dominantModel(db, sessionId)
+        const record: CrushRawRecord = { ...session, model }
+        return [record]
+      } finally {
+        db.close()
+      }
     },
-  }
+
+    decode: decodeCrush,
+    toProviderCall,
+  })
 }
 
 export const crush = createCrushProvider()

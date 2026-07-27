@@ -151,6 +151,12 @@ const USER_MESSAGE_ALLOWLIST = new Set([
   'src/providers/kimicode/types.ts',
   'src/providers/pi/decode.ts',
   'src/providers/pi/types.ts',
+  'src/providers/zed/decode.ts',
+  'src/providers/zed/types.ts',
+  'src/providers/forge/decode.ts',
+  'src/providers/forge/types.ts',
+  'src/providers/goose/decode.ts',
+  'src/providers/goose/types.ts',
 ])
 
 describe('architecture gate: no classification or free text in @codeburn/core source', () => {

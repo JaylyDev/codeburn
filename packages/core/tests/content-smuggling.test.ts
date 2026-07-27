@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import zlib from 'node:zlib'
 
 import { describe, expect, it } from 'vitest'
 
@@ -25,7 +26,11 @@ import { decodeKimi, toObservations as toKimiObservations } from '../src/provide
 import { decodeCodeWhale, toObservations as toCodeWhaleObservations } from '../src/providers/codewhale/index.js'
 import { decodeCodebuff, toObservations as toCodebuffObservations } from '../src/providers/codebuff/index.js'
 import { decodeOpenClaw, toObservations as toOpenClawObservations } from '../src/providers/openclaw/index.js'
+import { decodeZed, toObservations as toZedObservations } from '../src/providers/zed/index.js'
+import { decodeForge, toObservations as toForgeObservations } from '../src/providers/forge/index.js'
+import { decodeGoose, toObservations as toGooseObservations } from '../src/providers/goose/index.js'
 import type { DecodeContext } from '../src/contracts.js'
+import type { ZedThreadRow } from '../src/providers/zed/index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const goldenEnvelope = JSON.parse(
@@ -684,6 +689,191 @@ describe('content-smuggling guardrail: real openclaw decode -> toObservations is
     const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
     expect(allToolNames).toContain('Bash')
     expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+})
+
+describe('content-smuggling guardrail: real zed decode -> toObservations is secret-free', () => {
+  // A hostile Zed thread planting every secret in the free-text fields the
+  // decode captures: the thread summary (user message) and the project path.
+  // Zed never records tool calls or file paths, so there is no command-line or
+  // path-fingerprint surface to probe here.
+  const zedContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'zed', sourceRef: 'ref' }
+  const zstd = (zlib as { zstdCompressSync?: (buf: Buffer) => Buffer }).zstdCompressSync
+
+  function decodeAndMinimize() {
+    const thread = {
+      model: { provider: 'anthropic', model: 'claude-opus-4-8' },
+      request_token_usage: {
+        'req-1': { input_tokens: 500, output_tokens: 200 },
+      },
+    }
+    const row: ZedThreadRow = {
+      id: 'thread-hostile',
+      summary: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}`,
+      updated_at: '2026-07-17T10:00:00.000Z',
+      data_type: 'zstd',
+      data: zstd!(Buffer.from(JSON.stringify(thread))),
+    }
+    const { calls } = decodeZed({ records: [row], context: zedContext })
+    const { sessions } = toZedObservations(
+      { sessionId: 'thread-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'zed' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it.skipIf(!zstd)('produces a schema-valid envelope from the hostile thread', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it.skipIf(!zstd)('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+})
+
+describe('content-smuggling guardrail: real forge decode -> toObservations is secret-free', () => {
+  // A hostile Forge conversation planting every secret in the free-text fields
+  // the decode captures: the user message, a Bash command, and a tool NAME
+  // carrying a command line (must fail the canonical-name filter). The `context`
+  // column arrives as a still-serialized JSON string, exactly as sqlite returns it.
+  const forgeContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'forge', sourceRef: 'ref' }
+
+  function decodeAndMinimize() {
+    const context = {
+      messages: [
+        { message: { text: { role: 'User', content: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}` } } },
+        {
+          message: {
+            text: {
+              role: 'Assistant', model: 'claude-opus-4-6',
+              tool_calls: [
+                { name: 'shell', call_id: 'call-1', arguments: { command: SECRETS.commandLine } },
+                // A hostile tool NAME carrying a command line: fails canonical charset.
+                { name: SECRETS.commandLine, call_id: 'call-2', arguments: {} },
+              ],
+            },
+          },
+          usage: { prompt_tokens: { actual: 500 }, completion_tokens: { actual: 200 } },
+        },
+      ],
+    }
+    const records = [{
+      conversation_id: 'conv-hostile',
+      title: 'hostile',
+      workspace_id: 1,
+      context: JSON.stringify(context),
+      created_at: '2026-07-17 10:00:00',
+      updated_at: '2026-07-17 10:00:05',
+    }]
+    const { calls } = decodeForge({ records, context: forgeContext })
+    const { sessions } = toForgeObservations(
+      { sessionId: 'conv-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'forge' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile conversation', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('keeps canonical tool names (Bash) and drops the argument-carrying name', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toContain('Bash')
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+})
+
+describe('content-smuggling guardrail: real goose decode -> toObservations is secret-free', () => {
+  // A hostile Goose session planting every secret in the free-text fields the
+  // decode captures: the first user message, a Bash command, a read_file path,
+  // and a tool NAME carrying a command line. BLOB columns arrive pre-converted
+  // to text (blobToText), exactly as the host hands them over.
+  const gooseContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'goose', sourceRef: 'ref' }
+
+  function decodeAndMinimize() {
+    const records = [{
+      sessionId: 'sess-hostile',
+      session: {
+        id: 'sess-hostile',
+        workingDir: SECRETS.absPath,
+        createdAt: '2026-07-17T10:00:00Z',
+        updatedAt: '2026-07-17T10:00:05Z',
+        accumulatedInputTokens: 500,
+        accumulatedOutputTokens: 200,
+        modelConfigJson: JSON.stringify({ model_name: 'gpt-5.5' }),
+      },
+      assistantToolMessages: [
+        { contentJson: JSON.stringify([
+          { type: 'toolRequest', toolCall: { value: { name: 'developer__shell', arguments: { command: SECRETS.commandLine } } } },
+          { type: 'toolRequest', toolCall: { value: { name: 'developer__read_file', arguments: { file_path: SECRETS.absPath } } } },
+          // A hostile tool NAME carrying a command line: fails canonical charset.
+          { type: 'toolRequest', toolCall: { value: { name: SECRETS.commandLine, arguments: {} } } },
+        ]) },
+        // A second turn so toolSequence (included only when it has MORE THAN ONE
+        // turn) actually reaches toObservations for fingerprinting.
+        { contentJson: JSON.stringify([
+          { type: 'toolRequest', toolCall: { value: { name: 'developer__list_directory', arguments: {} } } },
+        ]) },
+      ],
+      firstUserMessage: { contentJson: JSON.stringify([{ type: 'text', text: `${SECRETS.prompt} ${SECRETS.apiKey} ${SECRETS.fileContent}` }]) },
+    }]
+    const { calls } = decodeGoose({ records, context: gooseContext })
+    const { sessions } = toGooseObservations(
+      { sessionId: 'sess-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'goose' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile session', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('keeps canonical tool names (Bash/Read) and drops the argument-carrying name', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toContain('Bash')
+    expect(allToolNames).toContain('Read')
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+
+  it('fingerprints the read_file path into a 16-hex resourceRead, never the raw path', () => {
+    const env = decodeAndMinimize()
+    const reads = env.sessions.flatMap(s => s.calls.flatMap(c => c.resourceReads ?? []))
+    expect(reads.length).toBeGreaterThan(0)
+    for (const ref of reads) expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
+    expect(allStrings(reads)).not.toContain(SECRETS.absPath)
   })
 })
 

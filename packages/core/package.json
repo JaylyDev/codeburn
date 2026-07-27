@@ -98,6 +98,26 @@
     "./providers/pi": {
       "types": "./dist/providers/pi/index.d.ts",
       "import": "./dist/providers/pi/index.js"
+    },
+    "./providers/crush": {
+      "types": "./dist/providers/crush/index.d.ts",
+      "import": "./dist/providers/crush/index.js"
+    },
+    "./providers/zcode": {
+      "types": "./dist/providers/zcode/index.d.ts",
+      "import": "./dist/providers/zcode/index.js"
+    },
+    "./providers/zed": {
+      "types": "./dist/providers/zed/index.d.ts",
+      "import": "./dist/providers/zed/index.js"
+    },
+    "./providers/forge": {
+      "types": "./dist/providers/forge/index.d.ts",
+      "import": "./dist/providers/forge/index.js"
+    },
+    "./providers/goose": {
+      "types": "./dist/providers/goose/index.d.ts",
+      "import": "./dist/providers/goose/index.js"
     }
   },
   "files": [
