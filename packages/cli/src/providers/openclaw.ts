@@ -1,57 +1,13 @@
 import { readdir, readFile } from 'fs/promises'
-import { basename, join } from 'path'
+import { join } from 'path'
 import { homedir } from 'os'
 
+import { decodeOpenClaw, openclawToolNameMap } from '@codeburn/core/providers/openclaw'
+import type { OpenClawDecodedCall } from '@codeburn/core/providers/openclaw'
 import { readSessionFile } from '../fs-utils.js'
 import { extractBashCommands } from '../bash-utils.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
-
-const toolNameMap: Record<string, string> = {
-  bash: 'Bash',
-  exec: 'Bash',
-  read: 'Read',
-  edit: 'Edit',
-  write: 'Write',
-  glob: 'Glob',
-  grep: 'Grep',
-  task: 'Agent',
-  dispatch_agent: 'Agent',
-  fetch: 'WebFetch',
-  search: 'WebSearch',
-  todo: 'TodoWrite',
-  patch: 'Patch',
-}
-
-type OpenClawUsage = {
-  input: number
-  output: number
-  cacheRead: number
-  cacheWrite: number
-  totalTokens?: number
-  cost?: {
-    total?: number
-  }
-}
-
-type OpenClawEntry = {
-  type: string
-  customType?: string
-  id?: string
-  timestamp?: string
-  provider?: string
-  modelId?: string
-  data?: {
-    provider?: string
-    modelId?: string
-  }
-  message?: {
-    role?: string
-    content?: Array<{ type?: string; text?: string; name?: string; arguments?: Record<string, unknown> }>
-    model?: string
-    provider?: string
-    usage?: OpenClawUsage
-  }
-}
+import { createBridgedProvider } from './bridge.js'
+import type { Provider, SessionSource, ParsedProviderCall } from './types.js'
 
 type SessionIndex = Record<string, {
   sessionId: string
@@ -66,139 +22,6 @@ function getOpenClawDirs(): string[] {
     join(home, '.moltbot', 'agents'),
     join(home, '.moldbot', 'agents'),
   ]
-}
-
-function extractTools(content: Array<{ type?: string; name?: string; arguments?: Record<string, unknown> }> | undefined): { tools: string[]; bashCommands: string[] } {
-  const tools: string[] = []
-  const bashCommands: string[] = []
-  if (!content) return { tools, bashCommands }
-
-  for (const block of content) {
-    if ((block.type === 'tool_use' || block.type === 'toolCall') && block.name) {
-      const mapped = toolNameMap[block.name] ?? block.name
-      tools.push(mapped)
-      if (mapped === 'Bash' && block.arguments && typeof block.arguments.command === 'string') {
-        bashCommands.push(...extractBashCommands(block.arguments.command))
-      }
-    }
-  }
-  return { tools, bashCommands }
-}
-
-function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-  return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const raw = await readSessionFile(source.path)
-      if (raw === null) return
-
-      const lines = raw.split('\n').filter(l => l.trim())
-      let sessionId = ''
-      let sessionTimestamp = ''
-      let currentModel = ''
-
-      const calls: {
-        model: string
-        usage: OpenClawUsage
-        tools: string[]
-        bashCommands: string[]
-        timestamp: string
-        userMessage: string
-        dedupId: string
-      }[] = []
-
-      let pendingUserMessage = ''
-
-      for (const line of lines) {
-        let entry: OpenClawEntry
-        try {
-          entry = JSON.parse(line)
-        } catch {
-          continue
-        }
-
-        if (entry.type === 'session') {
-          sessionId = entry.id ?? basename(source.path, '.jsonl')
-          sessionTimestamp = entry.timestamp ?? ''
-          continue
-        }
-
-        if (entry.type === 'model_change') {
-          currentModel = entry.modelId ?? currentModel
-          continue
-        }
-
-        if (entry.type === 'custom' && entry.customType === 'model-snapshot') {
-          currentModel = entry.data?.modelId ?? currentModel
-          continue
-        }
-
-        if (entry.type !== 'message' || !entry.message) continue
-
-        const msg = entry.message
-        if (msg.role === 'user') {
-          if (!pendingUserMessage && Array.isArray(msg.content)) {
-            const textBlock = msg.content.find(c => c.type === 'text' && c.text)
-            pendingUserMessage = (textBlock?.text ?? '').slice(0, 500)
-          }
-          continue
-        }
-
-        if (msg.role !== 'assistant') continue
-
-        const model = msg.model ?? currentModel
-        if (msg.usage) {
-          const { tools, bashCommands } = extractTools(msg.content)
-          calls.push({
-            model,
-            usage: msg.usage,
-            tools,
-            bashCommands,
-            timestamp: entry.timestamp ?? sessionTimestamp,
-            userMessage: pendingUserMessage,
-            dedupId: entry.id ?? '',
-          })
-          pendingUserMessage = ''
-        }
-      }
-
-      if (!sessionId) sessionId = basename(source.path, '.jsonl')
-
-      for (let i = 0; i < calls.length; i++) {
-        const call = calls[i]
-        const dedupKey = `openclaw:${sessionId}:${call.dedupId || i}`
-        if (seenKeys.has(dedupKey)) continue
-        seenKeys.add(dedupKey)
-
-        const u = call.usage
-        const costFromProvider = u.cost?.total ?? 0
-
-        const ts = new Date(call.timestamp)
-        if (isNaN(ts.getTime()) || ts.getTime() < 1_000_000_000_000) continue
-
-        yield {
-          provider: 'openclaw',
-          model: call.model || 'openclaw-auto',
-          inputTokens: u.input,
-          outputTokens: u.output,
-          cacheCreationInputTokens: u.cacheWrite,
-          cacheReadInputTokens: u.cacheRead,
-          cachedInputTokens: u.cacheRead,
-          reasoningTokens: 0,
-          webSearchRequests: 0,
-          ...(costFromProvider > 0
-            ? { costUSD: costFromProvider, costBasis: 'measured' as const }
-            : { costBasis: 'estimated' as const }),
-          tools: [...new Set(call.tools)],
-          bashCommands: [...new Set(call.bashCommands)],
-          timestamp: ts.toISOString(),
-          speed: 'standard',
-          deduplicationKey: dedupKey,
-          userMessage: call.userMessage,
-          sessionId,
-        }
-      }
-    },
-  }
 }
 
 async function discoverInDir(agentsDir: string): Promise<SessionSource[]> {
@@ -248,8 +71,32 @@ async function discoverInDir(agentsDir: string): Promise<SessionSource[]> {
   return sources
 }
 
-export function createOpenClawProvider(overrideDir?: string): Provider {
+function toProviderCall(rich: OpenClawDecodedCall): ParsedProviderCall {
   return {
+    provider: 'openclaw',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    ...(rich.costBasis === 'measured'
+      ? { costUSD: rich.costUSD, costBasis: 'measured' as const }
+      : { costBasis: 'estimated' as const }),
+    tools: [...new Set(rich.tools)],
+    bashCommands: [...new Set(rich.rawBashCommands.flatMap(c => extractBashCommands(c)))],
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
+  }
+}
+
+export function createOpenClawProvider(overrideDir?: string): Provider {
+  return createBridgedProvider<OpenClawDecodedCall>({
     name: 'openclaw',
     displayName: 'OpenClaw',
 
@@ -258,7 +105,7 @@ export function createOpenClawProvider(overrideDir?: string): Provider {
     },
 
     toolDisplayName(rawTool: string): string {
-      return toolNameMap[rawTool] ?? rawTool
+      return openclawToolNameMap[rawTool] ?? rawTool
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
@@ -271,10 +118,15 @@ export function createOpenClawProvider(overrideDir?: string): Provider {
       return all
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, seenKeys)
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      const raw = await readSessionFile(source.path)
+      if (raw === null) return null
+      return raw.split('\n').filter(l => l.trim())
     },
-  }
+
+    decode: decodeOpenClaw,
+    toProviderCall,
+  })
 }
 
 export const openclaw = createOpenClawProvider()
