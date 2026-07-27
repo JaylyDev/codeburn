@@ -41,6 +41,7 @@ export default defineConfig({
     'src/providers/copilot/index.ts',
     'src/providers/vscode-cline/index.ts',
     'src/providers/opencode-session/index.ts',
+    'src/providers/antigravity/index.ts',
   ],
   format: ['esm'],
   target: 'node20',
