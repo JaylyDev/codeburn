@@ -177,7 +177,7 @@
     "schemas"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "emit-schemas": "tsx scripts/emit-schemas.mts"
