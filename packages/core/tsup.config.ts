@@ -37,6 +37,7 @@ export default defineConfig({
     'src/providers/cursor-agent/index.ts',
     'src/providers/quickdesk/index.ts',
     'src/providers/devin/index.ts',
+    'src/providers/copilot/index.ts',
   ],
   format: ['esm'],
   target: 'node20',

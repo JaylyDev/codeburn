@@ -34,6 +34,7 @@ import { decodeWarp, toObservations as toWarpObservations } from '../src/provide
 import { decodeCursorAgent, toObservations as toCursorAgentObservations } from '../src/providers/cursor-agent/index.js'
 import { decodeQuickdesk, toObservations as toQuickdeskObservations } from '../src/providers/quickdesk/index.js'
 import { decodeDevin, toObservations as toDevinObservations } from '../src/providers/devin/index.js'
+import { decodeCopilot, toObservations as toCopilotObservations } from '../src/providers/copilot/index.js'
 import type { DecodeContext } from '../src/contracts.js'
 import type { ZedThreadRow } from '../src/providers/zed/index.js'
 
@@ -879,6 +880,90 @@ describe('content-smuggling guardrail: real goose decode -> toObservations is se
     expect(reads.length).toBeGreaterThan(0)
     for (const ref of reads) expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
     expect(allStrings(reads)).not.toContain(SECRETS.absPath)
+  })
+})
+
+describe('content-smuggling guardrail: real copilot decode -> toObservations is secret-free', () => {
+  // A hostile Copilot session planting every secret in the free-text fields the
+  // decode captures: the user prompt (jsonl user.message), a Bash command, a
+  // hostile tool NAME carrying a command line, and a JetBrains conversation
+  // title + reply blob. The observation envelope MUST surface none of them.
+  const copilotContext: DecodeContext = { privacyKey: 'test-privacy-key', providerId: 'copilot', sourceRef: 'ref' }
+
+  function decodeAndMinimize() {
+    const jsonlEnvelope = {
+      kind: 'jsonl' as const,
+      sessionId: 'sess-hostile-jsonl',
+      lines: [
+        JSON.stringify({ type: 'user.message', timestamp: '2026-07-17T10:00:00.000Z', data: { content: SECRETS.prompt } }),
+        JSON.stringify({
+          type: 'assistant.message',
+          timestamp: '2026-07-17T10:00:05.000Z',
+          data: {
+            messageId: 'msg-hostile-1',
+            model: 'gpt-4.1',
+            outputTokens: 100,
+            toolRequests: [
+              { name: 'bash', arguments: { command: SECRETS.commandLine } },
+              // A hostile tool NAME carrying a command line: fails canonical charset.
+              { name: SECRETS.commandLine, arguments: {} },
+            ],
+          },
+        }),
+      ],
+    }
+
+    const convGuid = '11111111-1111-1111-1111-111111111111'
+    const convTitle = `${SECRETS.apiKey} ${SECRETS.fileContent}`
+    const convRecord = `$${convGuid}t\x00\x04namesq\x00\x01?@\x00\x00w\x00\x00t\x00value t\x00${convTitle}t\x00\x06sourcet\x00copilotx`
+    const innerMd = { type: 'Markdown', data: JSON.stringify({ text: `${SECRETS.apiKey} ${SECRETS.fileContent}`, annotations: [] }) }
+    const valueMap: Record<string, unknown> = {
+      'a1b2c3d4-0000-0000-0000-000000000001': { type: 'Value', value: JSON.stringify(innerMd) },
+    }
+    const blob = JSON.stringify({ __first__: { type: 'Subgraph', value: JSON.stringify(valueMap) } })
+    const raw = 'H:2,block:9,blockSize:1000,format:3\n' +
+      'com.github.copilot.agent.session.persistence.nitrite.entity.NtAgentTurn\n' +
+      convRecord + '\n' + blob + '\n'
+    const jbEnvelope = {
+      kind: 'jetbrains' as const,
+      sessionId: 'sess-hostile-jb',
+      mtime: '2026-07-17T10:00:00.000Z',
+      raw,
+      repoRootByDir: new Map<string, string>(),
+    }
+
+    const { calls: jsonlCalls } = decodeCopilot({ records: [jsonlEnvelope], context: copilotContext })
+    const { calls: jbCalls } = decodeCopilot({ records: [jbEnvelope], context: copilotContext })
+    const { sessions } = toCopilotObservations(
+      [
+        { sessionId: 'sess-hostile-jsonl', projectPath: SECRETS.absPath, calls: jsonlCalls },
+        { sessionId: 'sess-hostile-jb', projectPath: SECRETS.absPath, calls: jbCalls },
+      ],
+      { privacyKey: 'test-privacy-key', provider: 'copilot' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile copilot records', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('the serialized envelope contains none of the planted secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    for (const secret of ALL_SECRETS) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it('keeps canonical tool names (Bash) and drops the argument-carrying name', () => {
+    const env = decodeAndMinimize()
+    const allToolNames = env.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
+    expect(allToolNames).toContain('Bash')
+    expect(allToolNames).not.toContain(SECRETS.commandLine)
   })
 })
 
