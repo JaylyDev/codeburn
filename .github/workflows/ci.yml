@@ -6,6 +6,38 @@ on:
   pull_request:
 
 jobs:
+  core:
+    name: core (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.13.x', '24.x', '26.x']
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install from lockfile
+        run: npm ci
+
+      - name: Check workspace versions
+        run: npm run check:workspace-versions
+
+      - name: Typecheck core
+        run: npm run typecheck --workspace=@codeburn/core
+
+      - name: Test core
+        run: npm test --workspace=@codeburn/core
+
+      - name: Build core
+        run: npm run build --workspace=@codeburn/core
+
+      - name: Verify package contents
+        run: npm pack --workspace=@codeburn/core --dry-run
+
   semgrep:
     runs-on: ubuntu-latest
     steps:

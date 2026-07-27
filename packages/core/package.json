@@ -3,6 +3,7 @@
   "version": "0.9.20",
   "description": "Pure decode/detect engine for CodeBurn: provider session-log decoding, content-minimized observations, and detector contracts. No I/O, no pricing \u2014 hosts supply both.",
   "type": "module",
+  "sideEffects": false,
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
