@@ -5,9 +5,17 @@ import { homedir } from 'os'
 import { extractBashCommands } from '../bash-utils.js'
 import { readCachedResults, writeCachedResults } from '../cursor-cache.js'
 import { isSqliteAvailable, isSqliteBusyError, getSqliteLoadError, openDatabase, blobToText, type SqliteDatabase } from '../sqlite.js'
-import { estimateTokensFromChars } from '../token-estimate.js'
 import type { DateRange } from '../types.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import type { DecodeContext } from '@codeburn/core'
+import { decodeCursor } from '@codeburn/core/providers/cursor'
+import type {
+  CursorBubbleRow,
+  CursorAgentKvRow,
+  CursorUserMessageRow,
+  CursorComposerMetaRow,
+  CursorDecodedCall,
+} from '@codeburn/core/providers/cursor'
 
 /** Matches cli-date.ts "all" period cap (6 months). */
 const CURSOR_MAX_LOOKBACK_MONTHS = 6
@@ -41,29 +49,6 @@ const modelDisplayNames: Record<string, string> = {
   'gpt-5': 'GPT-5',
   'gpt-4.1': 'GPT-4.1',
   'cursor-auto': 'Cursor (auto)',
-}
-
-type BubbleRow = {
-  bubble_key: string
-  input_tokens: number | null
-  output_tokens: number | null
-  model: string | null
-  created_at: string | null
-  request_id: string | null
-  user_text: Uint8Array | string | null
-  text_length: number | null
-  bubble_type: number | null
-  code_blocks: Uint8Array | string | null
-  /// Only populated on the paged scan path (BUBBLE_QUERY_PAGE) used for very
-  /// large databases; undefined on the un-paged BUBBLE_QUERY_SINCE path.
-  rid?: number
-}
-
-type AgentKvRow = {
-  role: string | null
-  content: Uint8Array | string | null
-  request_id: string | null
-  model: string | null
 }
 
 // SQLITE_BUSY must reach parser.ts, whose busy path skips the source without
@@ -233,27 +218,6 @@ function loadWorkspaceMap(workspaceStorageDir: string): WorkspaceMapping {
   return result
 }
 
-/// Pulls the composer id out of a `bubbleId:<composerId>:<bubbleUuid>` key.
-/// Returns null when the composer segment contains a CR/LF, which is the
-/// signature Cursor uses for tool-call sub-composer rows in real data —
-/// e.g. `bubbleId:task-call_xxxx\nfc_yyyy:<bubbleUuid>` is one key with a
-/// literal newline between the `task-call_` and `fc_` halves. Those rows
-/// are not standalone composers and would otherwise inflate the orphan
-/// project's session count.
-function parseComposerIdFromKey(key: string | undefined): string | null {
-  if (!key) return null
-  const firstColon = key.indexOf(':')
-  if (firstColon < 0) return null
-  const secondColon = key.indexOf(':', firstColon + 1)
-  if (secondColon < 0) return null
-  const candidate = key.slice(firstColon + 1, secondColon)
-  if (!candidate) return null
-  // Reject any multi-line / control-char composer id. Real composer ids
-  // (UUIDs) and synthetic fixture ids are both single-line.
-  if (/[\r\n\x00]/.test(candidate)) return null
-  return candidate
-}
-
 // Encodes the active workspace into source.path so the parser knows which
 // composers to filter for. `#cursor-ws=` is a private separator: `state.vscdb`
 // does not contain `#` (we construct the path ourselves), and the literal
@@ -274,25 +238,6 @@ function decodeSourcePath(sourcePath: string): { dbPath: string; workspaceTag: s
   return {
     dbPath: sourcePath.slice(0, idx),
     workspaceTag: sourcePath.slice(idx + WORKSPACE_SEP.length),
-  }
-}
-
-type CodeBlock = { languageId?: string }
-
-function extractLanguages(codeBlocksJson: string | null): string[] {
-  if (!codeBlocksJson) return []
-  try {
-    const blocks = JSON.parse(codeBlocksJson) as CodeBlock[]
-    if (!Array.isArray(blocks)) return []
-    const langs = new Set<string>()
-    for (const block of blocks) {
-      if (block.languageId && block.languageId !== 'plaintext') {
-        langs.add(block.languageId)
-      }
-    }
-    return [...langs]
-  } catch {
-    return []
   }
 }
 
@@ -381,6 +326,23 @@ const BUBBLE_QUERY_PAGE = `
   LIMIT ?
 `
 
+// Cursor leaves the per-bubble tokenCount at {0,0} on current builds. The only
+// real input figure on disk is the latest context-window snapshot, which Cursor
+// records in composerData.promptTokenBreakdown.totalUsedTokens or
+// contextTokensUsed (the in-app context meter). This is not cumulative per-turn,
+// so local SQLite undercounts admin-console usage; parity requires the opt-in
+// Cursor Admin API: POST api.cursor.com/teams/filtered-usage-events.
+// The key-range predicate seeks the primary key instead of scanning the table.
+const COMPOSER_META_QUERY = `
+  SELECT
+    substr(key, length('composerData:') + 1) as composer_id,
+    json_extract(value, '$.promptTokenBreakdown.totalUsedTokens') as used,
+    json_extract(value, '$.contextTokensUsed') as ctx,
+    json_extract(value, '$.createdAt') as created_at
+  FROM cursorDiskKV
+  WHERE key >= 'composerData:' AND key < 'composerData;'
+`
+
 function validateSchema(db: SqliteDatabase): boolean {
   try {
     const rows = db.query<{ cnt: number }>(
@@ -393,48 +355,6 @@ function validateSchema(db: SqliteDatabase): boolean {
   }
 }
 
-type UserMsgRow = { bubble_key: string; created_at: string; text: Uint8Array | string }
-
-/// Per-conversation user-message buffer. We pop messages in arrival order via
-/// the `pos` cursor — a previous implementation called Array.shift() which is
-/// O(n) per call on large conversations and pinned multi-GB Cursor DBs at
-/// minutes-of-parse for power users. The cursor walk is O(1).
-type UserMessageQueue = {
-  messages: string[]
-  pos: number
-}
-
-function buildUserMessageMap(db: SqliteDatabase, timeFloor: string): Map<string, UserMessageQueue> {
-  const map = new Map<string, UserMessageQueue>()
-  try {
-    const rows = db.query<UserMsgRow>(USER_MESSAGES_QUERY, [timeFloor])
-    for (const row of rows) {
-      // Extract the composerId from the bubble key, matching parseBubbles().
-      // The JSON `conversationId` field is empty in current Cursor builds.
-      const composerId = parseComposerIdFromKey(row.bubble_key)
-      if (!composerId || !row.text) continue
-      const text = blobToText(row.text)
-      const existing = map.get(composerId)
-      if (existing) {
-        existing.messages.push(text)
-      } else {
-        map.set(composerId, { messages: [text], pos: 0 })
-      }
-    }
-  } catch (err) {
-    rethrowBusy(err)
-  }
-  return map
-}
-
-function takeUserMessage(queues: Map<string, UserMessageQueue>, conversationId: string): string {
-  const queue = queues.get(conversationId)
-  if (!queue || queue.pos >= queue.messages.length) return ''
-  const msg = queue.messages[queue.pos]
-  queue.pos += 1
-  return msg
-}
-
 /// Scans bubbles for very large DBs by paging ROWID-descending (newest first),
 /// keeping only rows within the requested window (createdAt > timeFloor), and
 /// stopping once a full page lands below the floor. A `budget` caps the number
@@ -445,16 +365,16 @@ function scanBubblesPaged(
   db: SqliteDatabase,
   timeFloor: string,
   budget: number,
-): { rows: BubbleRow[]; truncated: boolean } {
+): { rows: CursorBubbleRow[]; truncated: boolean } {
   const BATCH = 25_000
-  const collected: BubbleRow[] = []
+  const collected: CursorBubbleRow[] = []
   let beforeRowId = Number.MAX_SAFE_INTEGER
   let truncated = false
 
   paging: while (true) {
-    let batch: BubbleRow[]
+    let batch: CursorBubbleRow[]
     try {
-      batch = db.query<BubbleRow>(BUBBLE_QUERY_PAGE, [beforeRowId, BATCH])
+      batch = db.query<CursorBubbleRow>(BUBBLE_QUERY_PAGE, [beforeRowId, BATCH])
     } catch (err) {
       rethrowBusy(err)
       break
@@ -480,461 +400,31 @@ function scanBubblesPaged(
   return { rows: collected, truncated }
 }
 
-// Cursor leaves the per-bubble tokenCount at {0,0} on current builds. The only
-// real input figure on disk is the latest context-window snapshot, which Cursor
-// records in composerData.promptTokenBreakdown.totalUsedTokens or
-// contextTokensUsed (the in-app context meter). This is not cumulative per-turn,
-// so local SQLite undercounts admin-console usage; parity requires the opt-in
-// Cursor Admin API: POST api.cursor.com/teams/filtered-usage-events.
-// The key-range predicate seeks the primary key instead of scanning the table.
-const COMPOSER_META_QUERY = `
-  SELECT
-    substr(key, length('composerData:') + 1) as composer_id,
-    json_extract(value, '$.promptTokenBreakdown.totalUsedTokens') as used,
-    json_extract(value, '$.contextTokensUsed') as ctx,
-    json_extract(value, '$.createdAt') as created_at
-  FROM cursorDiskKV
-  WHERE key >= 'composerData:' AND key < 'composerData;'
-`
-
-type ComposerMeta = { tokens: number; createdAt: number | null }
-
-function loadComposerMeta(db: SqliteDatabase): Map<string, ComposerMeta> {
-  const map = new Map<string, ComposerMeta>()
-  try {
-    const rows = db.query<{ composer_id: string; used: number | null; ctx: number | null; created_at: number | null }>(COMPOSER_META_QUERY)
-    for (const r of rows) {
-      // `||` rather than `??`: a recorded-but-zero breakdown must fall through
-      // to the context meter instead of shadowing it.
-      const tokens = (r.used || r.ctx) ?? 0
-      if (r.composer_id && tokens > 0) map.set(r.composer_id, { tokens, createdAt: r.created_at ?? null })
-    }
-  } catch (err) {
-    rethrowBusy(err)
-    /* best-effort: callers fall back to the per-bubble text estimate */
+// Exported so the golden can assert the exact emitted shape directly.
+export function toProviderCall(rich: CursorDecodedCall): ParsedProviderCall {
+  return {
+    provider: 'cursor',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    speed: rich.speed,
+    // Output is a reply-text estimate and the input meter is the latest
+    // context snapshot, not a per-turn sum, so no cursor figure is exact.
+    costIsEstimated: true,
+    costBasis: 'estimated',
+    pricingModel: resolveModel(rich.rawModel),
+    tools: rich.tools,
+    bashCommands: rich.rawBashCommands.flatMap(c => extractBashCommands(c)),
+    timestamp: rich.timestamp,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
   }
-  return map
-}
-
-type AgentStream = {
-  tools: string[]
-  bash: string[]
-  userChars: number
-  contextChars: number
-  assistantChars: number
-  model: string | null
-}
-
-function newAgentStream(): AgentStream {
-  return { tools: [], bash: [], userChars: 0, contextChars: 0, assistantChars: 0, model: null }
-}
-
-// agentKv rows store content as a plain string or a block array; count only
-// the text inside blocks so the JSON envelope and non-text parts are not
-// billed as prompt characters.
-function contentTextLength(raw: string): number {
-  const trimmed = raw.trimStart()
-  if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
-    try {
-      const parsed = JSON.parse(trimmed) as unknown
-      const blocks = Array.isArray(parsed) ? parsed : [parsed]
-      let len = 0
-      for (const block of blocks) {
-        if (block == null || typeof block !== 'object') continue
-        const b = block as { text?: unknown; content?: unknown }
-        if (typeof b.text === 'string') len += b.text.length
-        else if (typeof b.content === 'string') len += b.content.length
-      }
-      return len
-    } catch {
-      return raw.length
-    }
-  }
-  return raw.length
-}
-
-// Cursor logs the agent's stream (prompt, injected context, tool calls, reply
-// deltas) in agentKv blobs keyed by requestId. Bubbles carry the same
-// requestId, so the map built from the scanned bubbles joins each request to
-// its conversation. Requests with no matching bubble are kept separately:
-// they are real sessions (background runs, older builds) that would otherwise
-// vanish from totals.
-function loadAgentStreams(
-  db: SqliteDatabase,
-  requestToComposer: Map<string, string>,
-): { byComposer: Map<string, AgentStream>; unjoined: Map<string, AgentStream> } {
-  const byComposer = new Map<string, AgentStream>()
-  const unjoined = new Map<string, AgentStream>()
-
-  let rows: AgentKvRow[]
-  try {
-    rows = db.query<AgentKvRow>(AGENTKV_QUERY)
-  } catch (err) {
-    rethrowBusy(err)
-    return { byComposer, unjoined }
-  }
-
-  const bucketFor = (requestId: string): AgentStream => {
-    const composer = requestToComposer.get(requestId)
-    const map = composer ? byComposer : unjoined
-    const key = composer ?? requestId
-    const existing = map.get(key)
-    if (existing) return existing
-    const fresh = newAgentStream()
-    map.set(key, fresh)
-    return fresh
-  }
-
-  // Only the turn-opening (user) agentKv row carries the requestId; rows that
-  // follow inherit it. Rows written BEFORE their request's id appears (the
-  // system prompt and opening user prompt at a conversation start) buffer
-  // until the next id, and a system row closes the previous request so
-  // interleaved sessions cannot inherit across a conversation boundary.
-  let currentRequestId: string | null = null
-  let pendingUserChars = 0
-  let pendingContextChars = 0
-  for (const row of rows) {
-    if (row.request_id) {
-      currentRequestId = row.request_id
-      if (pendingUserChars > 0 || pendingContextChars > 0) {
-        const bucket = bucketFor(currentRequestId)
-        bucket.userChars += pendingUserChars
-        bucket.contextChars += pendingContextChars
-        pendingUserChars = 0
-        pendingContextChars = 0
-      }
-    }
-    if (row.model && currentRequestId) {
-      const bucket = bucketFor(currentRequestId)
-      if (!bucket.model) bucket.model = row.model
-    }
-    if (!row.content) continue
-
-    if (row.role === 'system') {
-      pendingContextChars += contentTextLength(blobToText(row.content))
-      currentRequestId = null
-      continue
-    }
-    if (row.role === 'user') {
-      const len = contentTextLength(blobToText(row.content))
-      if (currentRequestId) bucketFor(currentRequestId).userChars += len
-      else pendingUserChars += len
-      continue
-    }
-    if (row.role === 'tool') {
-      if (currentRequestId) bucketFor(currentRequestId).contextChars += contentTextLength(blobToText(row.content))
-      continue
-    }
-    if (row.role !== 'assistant' || !currentRequestId) continue
-
-    let content: unknown
-    try {
-      content = JSON.parse(blobToText(row.content))
-    } catch {
-      continue
-    }
-    if (!Array.isArray(content)) continue
-    const bucket = bucketFor(currentRequestId)
-    for (const block of content as Array<{ type?: string; text?: unknown; toolName?: unknown; args?: { command?: unknown } }>) {
-      if (block == null || typeof block !== 'object') continue
-      if (typeof block.text === 'string') bucket.assistantChars += block.text.length
-      if (block.type !== 'tool-call' || typeof block.toolName !== 'string' || !block.toolName) continue
-      // Cursor's terminal tool is 'Shell'; emit the canonical 'Bash' so the
-      // cross-provider tool and command breakdowns merge.
-      bucket.tools.push(block.toolName === 'Shell' ? 'Bash' : block.toolName)
-      if (block.toolName === 'Shell' && typeof block.args?.command === 'string') {
-        bucket.bash.push(...extractBashCommands(block.args.command))
-      }
-    }
-  }
-  return { byComposer, unjoined }
-}
-
-// What drives a conversation's input figure, decided once per conversation so
-// the sources can never stack on each other:
-//   bubbleTokens - some bubble carries a real tokenCount (older builds), so
-//                  per-turn counts are authoritative and nothing is estimated.
-//   meter        - the composerData context meter exists; one conversation
-//                  record carries it.
-//   stream       - no meter, but the agent stream holds the prompt/context; one
-//                  conversation record carries the estimate.
-//   text         - only visible bubble text exists; estimated per bubble.
-type InputSource = 'bubbleTokens' | 'meter' | 'stream' | 'text'
-
-type ComposerScan = {
-  hasRealTokens: boolean
-  firstBubbleTs: string | null
-  assistantTextChars: number
-  model: string | null
-}
-
-function parseBubbles(
-  db: SqliteDatabase,
-  seenKeys: Set<string>,
-  timeFloor: string,
-  agentKvTimestamp: string,
-): { calls: ParsedProviderCall[] } {
-  const results: ParsedProviderCall[] = []
-  let skipped = 0
-
-  const composerMeta = loadComposerMeta(db)
-
-  // The bubble timestamp lives inside the JSON value (no index), so the date
-  // filter forces a full JSON decode per row. Multi-GB Cursor DBs (500k+
-  // bubbles) were producing 30s+ parse stalls, so the scan is bounded. The old
-  // approach kept only the most-recent MAX_BUBBLES by ROWID, which dropped
-  // in-range older sessions and warned even when the requested window fit
-  // comfortably. Instead, for large DBs we page the requested window
-  // (ROWID-descending, stopping past the window floor) and only fall back to a
-  // hard budget — warning — when the in-range scan genuinely exceeds it.
-  // Override the budget in tests via CODEBURN_CURSOR_MAX_BUBBLES.
-  const MAX_BUBBLES = Number(process.env['CODEBURN_CURSOR_MAX_BUBBLES']) || 250_000
-
-  let total = 0
-  try {
-    const countRows = db.query<{ cnt: number }>(
-      "SELECT COUNT(*) as cnt FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"
-    )
-    total = countRows[0]?.cnt ?? 0
-  } catch (err) {
-    rethrowBusy(err)
-  }
-
-  let rows: BubbleRow[]
-  try {
-    if (total > MAX_BUBBLES) {
-      const scan = scanBubblesPaged(db, timeFloor, MAX_BUBBLES)
-      rows = scan.rows
-      if (scan.truncated) {
-        process.stderr.write(
-          `codeburn: Cursor database has ${total.toLocaleString()} bubbles and the ` +
-          `requested range exceeds the ${MAX_BUBBLES.toLocaleString()}-bubble scan budget; ` +
-          `the oldest sessions in range may be missing from this report.\n`
-        )
-      }
-    } else {
-      rows = db.query<BubbleRow>(BUBBLE_QUERY_SINCE, [timeFloor])
-    }
-  } catch (err) {
-    rethrowBusy(err)
-    return { calls: results }
-  }
-
-  // Pre-pass: per-conversation facts the crediting decisions need, plus the
-  // requestId join for the agent stream — all from the rows already fetched,
-  // so no extra unbudgeted table scans.
-  const scans = new Map<string, ComposerScan>()
-  const requestToComposer = new Map<string, string>()
-  for (const row of rows) {
-    const cid = parseComposerIdFromKey(row.bubble_key)
-    if (!cid) continue
-    if (row.request_id) requestToComposer.set(row.request_id, cid)
-    let scan = scans.get(cid)
-    if (!scan) {
-      scan = { hasRealTokens: false, firstBubbleTs: null, assistantTextChars: 0, model: null }
-      scans.set(cid, scan)
-    }
-    if ((row.input_tokens ?? 0) > 0 || (row.output_tokens ?? 0) > 0) scan.hasRealTokens = true
-    if (!scan.firstBubbleTs && row.created_at) scan.firstBubbleTs = row.created_at
-    if (row.bubble_type !== 1) scan.assistantTextChars += row.text_length ?? 0
-    if (!scan.model && row.model) scan.model = row.model
-  }
-
-  const { byComposer: agentStreams, unjoined } = loadAgentStreams(db, requestToComposer)
-  const userMessages = buildUserMessageMap(db, timeFloor)
-  const lastUserMsg = new Map<string, string>()
-
-  const inputSource = (cid: string): InputSource => {
-    if (scans.get(cid)?.hasRealTokens) return 'bubbleTokens'
-    if (composerMeta.has(cid)) return 'meter'
-    const stream = agentStreams.get(cid)
-    if ((stream?.userChars ?? 0) + (stream?.contextChars ?? 0) > 0) return 'stream'
-    return 'text'
-  }
-
-  const emit = (call: Omit<ParsedProviderCall, 'provider' | 'speed' | 'cacheCreationInputTokens' | 'cacheReadInputTokens' | 'cachedInputTokens' | 'reasoningTokens' | 'webSearchRequests' | 'costIsEstimated'>): void => {
-    results.push({
-      provider: 'cursor',
-      cacheCreationInputTokens: 0,
-      cacheReadInputTokens: 0,
-      cachedInputTokens: 0,
-      reasoningTokens: 0,
-      webSearchRequests: 0,
-      speed: 'standard',
-      // Output is a reply-text estimate and the input meter is the latest
-      // context snapshot, not a per-turn sum, so no cursor figure is exact.
-      costIsEstimated: true,
-      ...call,
-    })
-  }
-
-  const toolsAttached = new Set<string>()
-  for (const row of rows) {
-    try {
-      // The real composerId lives in the row key `bubbleId:<composerId>:<uuid>`
-      // (the JSON conversationId field is empty in current builds).
-      // parseComposerIdFromKey returns null for non-UUID composer segments
-      // (tool-call output rows and similar shapes), which are NOT sessions.
-      const conversationId = parseComposerIdFromKey(row.bubble_key)
-      if (!conversationId) {
-        skipped++
-        continue
-      }
-      const createdAt = row.created_at
-      if (!createdAt) continue
-
-      // Pair each user turn with its own prompt (even when the turn itself
-      // emits nothing) so the assistant reply that follows classifies against
-      // the right question.
-      if (row.bubble_type === 1) {
-        lastUserMsg.set(conversationId, takeUserMessage(userMessages, conversationId))
-      }
-
-      let inputTokens = row.input_tokens ?? 0
-      let outputTokens = row.output_tokens ?? 0
-      if (inputTokens === 0 && outputTokens === 0) {
-        const textLen = row.text_length ?? 0
-        if (row.bubble_type === 1) {
-          // Conversation-level input (meter or stream) is emitted once after
-          // this loop; per-bubble text only counts when it is the
-          // conversation's best available signal.
-          if (inputSource(conversationId) === 'text' && textLen > 0) {
-            inputTokens = estimateTokensFromChars(textLen)
-          }
-        } else {
-          outputTokens = estimateTokensFromChars(textLen)
-        }
-        if (inputTokens === 0 && outputTokens === 0) continue
-      }
-
-      // Use the SQLite row key (bubbleId:<unique>) as the dedup key.
-      // Cursor mutates token counts on the row in place when streaming
-      // completes — including tokens in the dedup key (the previous
-      // implementation) caused the same bubble to be counted twice once
-      // its tokens stabilized.
-      const dedupKey = `cursor:bubble:${row.bubble_key}`
-      if (seenKeys.has(dedupKey)) continue
-      seenKeys.add(dedupKey)
-
-      // User bubbles (type=1) carry no modelInfo, so fall back to the
-      // conversation's model seen on its assistant bubbles or agent stream.
-      const effectiveModel = row.model ?? scans.get(conversationId)?.model ?? agentStreams.get(conversationId)?.model ?? null
-      const pricingModel = resolveModel(effectiveModel)
-
-      const userQuestion = lastUserMsg.get(conversationId) ?? ''
-      const assistantText = blobToText(row.user_text)
-      const userText = (userQuestion + ' ' + assistantText).trim()
-
-      const languages = extractLanguages(blobToText(row.code_blocks))
-      const hasCode = languages.length > 0
-
-      // Meter/stream conversations carry their agent tools on the synthetic
-      // conversation record below; the rest attach them to their first
-      // emitted call so they are counted exactly once.
-      let agentTurn: AgentStream | undefined
-      const source = inputSource(conversationId)
-      if ((source === 'text' || source === 'bubbleTokens') && !toolsAttached.has(conversationId)) {
-        agentTurn = agentStreams.get(conversationId)
-        if (agentTurn) toolsAttached.add(conversationId)
-      }
-
-      emit({
-        model: modelForDisplay(effectiveModel),
-        inputTokens,
-        outputTokens,
-        costBasis: 'estimated',
-        pricingModel,
-        tools: [
-          ...(hasCode ? ['cursor:edit', ...languages.map(l => `lang:${l}`)] : []),
-          ...(agentTurn?.tools ?? []),
-        ],
-        bashCommands: agentTurn?.bash ?? [],
-        timestamp: createdAt,
-        deduplicationKey: dedupKey,
-        userMessage: userText,
-        sessionId: conversationId,
-      })
-    } catch {
-      skipped++
-    }
-  }
-
-  // One conversation-level input record per metered/stream conversation,
-  // anchored to the conversation's own start (composerData.createdAt) so the
-  // credited day never depends on the parse window or cache state, and keyed
-  // by composerId so re-parses and daily-cache gap fills dedupe instead of
-  // multiplying. The meter is the LATEST context size, not a per-turn sum;
-  // growth after the anchor day is finalized stays uncounted, which keeps the
-  // documented undercount-vs-admin-console tradeoff but never double counts.
-  for (const [cid, scan] of scans) {
-    const source = inputSource(cid)
-    if (source !== 'meter' && source !== 'stream') continue
-    const stream = agentStreams.get(cid)
-    const meta = composerMeta.get(cid)
-    const inputTokens = source === 'meter'
-      ? meta?.tokens ?? 0
-      : estimateTokensFromChars((stream?.userChars ?? 0) + (stream?.contextChars ?? 0))
-    // Reply text normally lives on assistant bubbles; count the stream's
-    // reply deltas only when the bubbles carried none.
-    const outputTokens = scan.assistantTextChars > 0 ? 0 : estimateTokensFromChars(stream?.assistantChars ?? 0)
-    if (inputTokens === 0 && outputTokens === 0) continue
-
-    const dedupKey = `cursor:composer-input:${cid}`
-    if (seenKeys.has(dedupKey)) continue
-    seenKeys.add(dedupKey)
-
-    const createdAtMs = meta?.createdAt
-    const timestamp = typeof createdAtMs === 'number' && createdAtMs > 0 ? new Date(createdAtMs).toISOString() : scan.firstBubbleTs
-    if (!timestamp) continue
-
-    const effectiveModel = scan.model ?? stream?.model ?? null
-    emit({
-      model: modelForDisplay(effectiveModel),
-      inputTokens,
-      outputTokens,
-      costBasis: 'estimated',
-      pricingModel: resolveModel(effectiveModel),
-      tools: stream?.tools ?? [],
-      bashCommands: stream?.bash ?? [],
-      timestamp,
-      deduplicationKey: dedupKey,
-      userMessage: '',
-      sessionId: cid,
-    })
-  }
-
-  // Sessions recorded only in the agent stream (no bubble carries their
-  // requestId). agentKv stores no timestamps, so these reuse the DB file's
-  // mtime as a bounded "last write" time, like the pre-composer parser did.
-  for (const [requestId, stream] of unjoined) {
-    const inputTokens = estimateTokensFromChars(stream.userChars + stream.contextChars)
-    const outputTokens = estimateTokensFromChars(stream.assistantChars)
-    if (inputTokens === 0 && outputTokens === 0) continue
-
-    const dedupKey = `cursor:agentKv:${requestId}`
-    if (seenKeys.has(dedupKey)) continue
-    seenKeys.add(dedupKey)
-
-    emit({
-      model: modelForDisplay(stream.model),
-      inputTokens,
-      outputTokens,
-      costBasis: 'estimated',
-      pricingModel: resolveModel(stream.model),
-      tools: stream.tools,
-      bashCommands: stream.bash,
-      timestamp: agentKvTimestamp,
-      deduplicationKey: dedupKey,
-      userMessage: '',
-      sessionId: requestId,
-    })
-  }
-
-  if (skipped > 0) {
-    process.stderr.write(`codeburn: skipped ${skipped} unreadable Cursor entries\n`)
-  }
-
-  return { calls: results }
 }
 
 function createParser(
@@ -1011,8 +501,87 @@ function createParser(
           } catch {
             agentKvTimestamp = new Date().toISOString()
           }
-          const { calls: bubbleCalls } = parseBubbles(db, localSeen, timeFloor, agentKvTimestamp)
-          allCalls = bubbleCalls
+
+          // Query order [1]..[5] is load-bearing for failure semantics.
+          // [1]/[4]/[5] degrade to empty; [2] degrades to total=0; [3] early-
+          // returns zero calls but still writes the cache.
+
+          // [1] Composer metadata (S2).
+          let composerMetaRows: CursorComposerMetaRow[] = []
+          try {
+            composerMetaRows = db.query<CursorComposerMetaRow>(COMPOSER_META_QUERY)
+          } catch (err) {
+            rethrowBusy(err)
+            /* best-effort: callers fall back to the per-bubble text estimate */
+          }
+
+          // [2] Total bubble count for the large-DB paging decision.
+          let total = 0
+          try {
+            const countRows = db.query<{ cnt: number }>(
+              "SELECT COUNT(*) as cnt FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"
+            )
+            total = countRows[0]?.cnt ?? 0
+          } catch (err) {
+            rethrowBusy(err)
+          }
+
+          // Override the budget in tests via CODEBURN_CURSOR_MAX_BUBBLES.
+          const MAX_BUBBLES = Number(process.env['CODEBURN_CURSOR_MAX_BUBBLES']) || 250_000
+
+          // [3] Bubble rows (S1).
+          let bubbles: CursorBubbleRow[] = []
+          try {
+            if (total > MAX_BUBBLES) {
+              const scan = scanBubblesPaged(db, timeFloor, MAX_BUBBLES)
+              bubbles = scan.rows
+              if (scan.truncated) {
+                process.stderr.write(
+                  `codeburn: Cursor database has ${total.toLocaleString()} bubbles and the ` +
+                  `requested range exceeds the ${MAX_BUBBLES.toLocaleString()}-bubble scan budget; ` +
+                  `the oldest sessions in range may be missing from this report.\n`
+                )
+              }
+            } else {
+              bubbles = db.query<CursorBubbleRow>(BUBBLE_QUERY_SINCE, [timeFloor])
+            }
+          } catch (err) {
+            rethrowBusy(err)
+            await writeCachedResults(dbPath, [], timeFloor)
+            return
+          }
+
+          // [4] Agent stream rows (S3).
+          let agentKvRows: CursorAgentKvRow[] = []
+          try {
+            agentKvRows = db.query<CursorAgentKvRow>(AGENTKV_QUERY)
+          } catch (err) {
+            rethrowBusy(err)
+          }
+
+          // [5] User-message queue rows (S4).
+          let userMessageRows: CursorUserMessageRow[] = []
+          try {
+            userMessageRows = db.query<CursorUserMessageRow>(USER_MESSAGES_QUERY, [timeFloor])
+          } catch (err) {
+            rethrowBusy(err)
+          }
+
+          const { calls, skippedRecords } = decodeCursor({
+            bubbles,
+            agentKvRows,
+            userMessageRows,
+            composerMetaRows,
+            agentKvTimestamp,
+            context: { privacyKey: '', providerId: 'cursor', sourceRef: dbPath },
+            seenKeys: localSeen,
+          })
+
+          if (skippedRecords > 0) {
+            process.stderr.write(`codeburn: skipped ${skippedRecords} unreadable Cursor entries\n`)
+          }
+
+          allCalls = calls.map(toProviderCall)
           await writeCachedResults(dbPath, allCalls, timeFloor)
         } finally {
           db.close()
