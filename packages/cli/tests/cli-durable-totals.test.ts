@@ -89,8 +89,14 @@ async function seedLiveTodaySession(): Promise<void> {
   const projectDir = join(ROOT, 'home', '.claude', 'projects', 'p')
   await mkdir(projectDir, { recursive: true })
   const now = new Date()
-  const ts = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12, 0, 0).toISOString()
-  const ts2 = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12, 30, 0).toISOString()
+  // Timestamps must be today AND already in the past: the provider-filtered
+  // durable path parses a today-range ending at `now`, so a fixed clock time
+  // (e.g. noon under the suite's TZ=UTC pin) sits in the future for any run
+  // before that hour and gets range-filtered out, failing parity flakily.
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const at = (f: number) => new Date(todayStart.getTime() + (now.getTime() - todayStart.getTime()) * f)
+  const ts = at(0.4).toISOString()
+  const ts2 = at(0.6).toISOString()
   const line = (id: string, t: string): string => JSON.stringify({
     type: 'assistant',
     timestamp: t,
