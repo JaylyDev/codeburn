@@ -1,0 +1,6 @@
+{"type":"session","version":3,"id":"test-sess-1","timestamp":"2026-04-20T10:00:00.000Z","cwd":"/tmp"}
+{"type":"model_change","id":"mc1","timestamp":"2026-04-20T10:00:01.000Z","provider":"anthropic","modelId":"claude-sonnet-4-6"}
+{"type":"message","id":"u1","timestamp":"2026-04-20T10:00:02.000Z","message":{"role":"user","content":[{"type":"text","text":"hello world"}]}}
+{"type":"message","id":"a1","timestamp":"2026-04-20T10:00:03.000Z","message":{"role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text","text":"Hi!"}],"usage":{"input":500,"output":100,"cacheRead":200,"cacheWrite":50,"totalTokens":850}}}
+{"type":"message","id":"a2","timestamp":"2026-04-20T10:00:05.000Z","message":{"role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text","text":"Running command"},{"type":"toolCall","name":"exec","arguments":{"command":"ls -la"}},{"type":"tool_use","name":"write","arguments":{"path":"/tmp/y"}},{"type":"toolCall","name":"exec","arguments":{"command":"ls -la"}}],"usage":{"input":600,"output":200,"cacheRead":100,"cacheWrite":0,"totalTokens":900,"cost":{"total":0.05}}}}
+{"type":"message","id":"a1","timestamp":"2026-04-20T10:00:06.000Z","message":{"role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text","text":"Duplicate"}],"usage":{"input":10,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":20}}}

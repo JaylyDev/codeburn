@@ -121,6 +121,8 @@ const CORRECTION_PHRASES = [
 const USER_MESSAGE_ALLOWLIST = new Set([
   'src/providers/claude/decode.ts',
   'src/providers/claude/types.ts',
+  'src/providers/codebuff/decode.ts',
+  'src/providers/codebuff/types.ts',
   'src/providers/codewhale/decode.ts',
   'src/providers/codewhale/types.ts',
   'src/providers/codex/decode.ts',
@@ -137,6 +139,8 @@ const USER_MESSAGE_ALLOWLIST = new Set([
   'src/providers/droid/types.ts',
   'src/providers/mux/decode.ts',
   'src/providers/mux/types.ts',
+  'src/providers/openclaw/decode.ts',
+  'src/providers/openclaw/types.ts',
   'src/providers/open-design/decode.ts',
   'src/providers/open-design/types.ts',
   'src/providers/lingtai-tui/decode.ts',

@@ -1,0 +1,4 @@
+{"type":"session","timestamp":"2026-04-20T10:00:00.000Z"}
+{"type":"model_change","modelId":"claude-x","timestamp":"2026-04-20T10:00:01.000Z"}
+{"type":"message","id":"u1","timestamp":"2026-04-20T10:00:02.000Z","message":{"role":"user","content":[{"type":"text","text":"do work"}]}}
+{"type":"message","id":"a1","timestamp":"2026-04-20T10:00:03.000Z","message":{"role":"assistant","model":"claude-x","content":[{"type":"toolCall","name":"exec","arguments":{"command":"echo hi"}}],"usage":{"input":5,"output":5,"cacheRead":0,"cacheWrite":0}}}

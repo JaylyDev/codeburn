@@ -1,0 +1,98 @@
+[
+  {
+    "id": "msg-user-1",
+    "variant": "user",
+    "content": "implement the feature",
+    "timestamp": "2026-04-14T10:00:10.000Z"
+  },
+  {
+    "id": "a1",
+    "variant": "ai",
+    "content": "",
+    "timestamp": "2026-04-14T10:00:30.000Z",
+    "credits": 42,
+    "metadata": {
+      "runState": {
+        "sessionState": {
+          "mainAgentState": {
+            "agentType": "base2"
+          }
+        }
+      }
+    },
+    "blocks": [
+      { "type": "tool", "toolName": "read_files", "input": {} },
+      { "type": "tool", "toolName": "str_replace", "input": {} },
+      { "type": "tool", "toolName": "run_terminal_command", "input": { "command": "npm test" } },
+      { "type": "tool", "toolName": "suggest_followups", "input": {} },
+      { "type": "tool", "toolName": "read_files", "input": {} },
+      { "type": "tool", "toolName": "run_terminal_command", "input": { "command": "npm run build" } }
+    ]
+  },
+  {
+    "id": "msg-user-2",
+    "variant": "user",
+    "content": "fix the bug",
+    "timestamp": "2026-04-14T10:01:00.000Z"
+  },
+  {
+    "id": "a2",
+    "variant": "ai",
+    "content": "",
+    "timestamp": "2026-04-14T10:01:30.000Z",
+    "credits": 10,
+    "metadata": {
+      "model": "claude-haiku-4-5-20251001",
+      "usage": {
+        "inputTokens": 5000,
+        "outputTokens": 2000,
+        "cacheCreationInputTokens": 1000,
+        "cacheReadInputTokens": 500
+      }
+    }
+  },
+  {
+    "id": "a3",
+    "variant": "ai",
+    "content": "",
+    "timestamp": "2026-04-14T10:02:00.000Z",
+    "credits": 7,
+    "metadata": {
+      "runState": {
+        "sessionState": {
+          "mainAgentState": {
+            "messageHistory": [
+              { "role": "user" },
+              {
+                "role": "assistant",
+                "providerOptions": {
+                  "codebuff": {
+                    "model": "openai/gpt-4o",
+                    "usage": {
+                      "prompt_tokens": 2000,
+                      "completion_tokens": 800,
+                      "prompt_tokens_details": { "cached_tokens": 400 }
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "a1",
+    "variant": "ai",
+    "content": "",
+    "timestamp": "2026-04-14T10:02:30.000Z",
+    "credits": 5
+  },
+  {
+    "id": "a4",
+    "variant": "ai",
+    "content": "mode-divider",
+    "timestamp": "2026-04-14T10:03:00.000Z"
+  }
+]
