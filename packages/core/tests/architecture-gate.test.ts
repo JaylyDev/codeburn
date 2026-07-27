@@ -246,6 +246,7 @@ const SCHEMA_FILES = [
   'observation-0.3.0',
   'finding-0.1.0',
   'finding-0.2.0',
+  'finding-0.3.0',
 ] as const
 
 type StringField = { path: string; kind: string }
@@ -413,6 +414,23 @@ const EXPECTED_STRING_FIELDS: StringField[] = [
   { path: 'finding-0.2.0#Finding/evidence/items/kind', kind: 'maxLength:64' },
   { path: 'finding-0.2.0#Finding/evidence/items/refs/items', kind: 'pattern:^[0-9a-f]{32}$' },
   { path: 'finding-0.2.0#Finding/evidence/items/sessionRefs/items', kind: 'pattern:^[0-9a-f]{32}$' },
+  // finding 0.3.0 needs NO machine-id allowlist entries: every string field is
+  // an enum, a const, or pattern-constrained. The two that used to be merely
+  // length-capped — `detectorId` (128) and the free-text confidence `basis`
+  // (200) — are now a charset-restricted id and a closed enum respectively.
+  { path: 'finding-0.3.0#Finding/schemaVersion', kind: 'const:"0.3.0"' },
+  { path: 'finding-0.3.0#Finding/detector/id', kind: 'pattern:^[a-z0-9-]+$' },
+  { path: 'finding-0.3.0#Finding/detector/algorithmVersion', kind: 'pattern:^\\d+\\.\\d+\\.\\d+(?:[-+][0-9A-Za-z.-]+)?$' },
+  { path: 'finding-0.3.0#Finding/subject/kind', kind: 'enum[2]' },
+  { path: 'finding-0.3.0#Finding/subject/ref', kind: 'pattern:^[0-9a-f]{32}$' },
+  { path: 'finding-0.3.0#Finding/confidence/basis/items', kind: 'enum[3]' },
+  { path: 'finding-0.3.0#Finding/evidence/items/kind', kind: 'enum[5]' },
+  { path: 'finding-0.3.0#Finding/evidence/items/refs/items', kind: 'pattern:^[0-9a-f]{32}$' },
+  { path: 'finding-0.3.0#Finding/evidence/items/sessionRefs/items', kind: 'pattern:^[0-9a-f]{32}$' },
+  { path: 'finding-0.3.0#Finding/estimate/metric', kind: 'enum[2]' },
+  { path: 'finding-0.3.0#Finding/estimate/unit', kind: 'const:"tokens"' },
+  { path: 'finding-0.3.0#Finding/estimate/methodId', kind: 'pattern:^[a-z0-9-]+$' },
+  { path: 'finding-0.3.0#Finding/estimate/methodVersion', kind: 'pattern:^\\d+\\.\\d+\\.\\d+(?:[-+][0-9A-Za-z.-]+)?$' },
 ]
 
 describe('architecture gate: envelope schemas carry no free-text-capable field', () => {

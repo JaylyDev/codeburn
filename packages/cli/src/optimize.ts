@@ -9,7 +9,7 @@ import { OBSERVATION_SCHEMA_VERSION } from '@codeburn/core/schema'
 import type { CallObservation, ObservationEnvelope, SessionObservation } from '@codeburn/core/observations'
 import type { Finding } from '@codeburn/core/contracts'
 import {
-  contextBloatDetector,
+  lowContextBeforeEditDetector,
   duplicateReadsDetector,
   junkReadsDetector,
 } from '@codeburn/core/detectors'
@@ -747,8 +747,20 @@ function buildObservationEnvelope(calls: ToolCall[]): ObservationEnvelope {
   }
 }
 
-function evidenceCount(finding: Finding, kind: string): number {
-  return finding.evidence.find(e => e.kind === kind)?.count ?? 0
+// Core detectors now emit at most one finding PER SESSION rather than a single
+// aggregate, so the host sums across them. These helpers keep the CLI's existing
+// whole-corpus figures intact over the new per-session shape.
+function evidenceCount(findings: Finding[], kind: Finding['evidence'][number]['kind']): number {
+  let total = 0
+  for (const f of findings) total += f.evidence.find(e => e.kind === kind)?.count ?? 0
+  return total
+}
+
+/** Sum of the detectors' non-cash token estimates. Never a dollar figure. */
+function estimatedTokens(findings: Finding[]): number {
+  let total = 0
+  for (const f of findings) total += f.estimate?.value ?? 0
+  return total
 }
 
 // ============================================================================
@@ -758,8 +770,8 @@ function evidenceCount(finding: Finding, kind: string): number {
 export function detectJunkReads(calls: ToolCall[], dateRange?: DateRange): WasteFinding | null {
   const findings = junkReadsDetector(buildObservationEnvelope(calls))
   if (findings.length === 0) return null
-  const totalJunkReads = evidenceCount(findings[0], 'junk-reads')
-  const tokensSaved = evidenceCount(findings[0], 'tokens-saved')
+  const totalJunkReads = evidenceCount(findings, 'junk-reads')
+  const tokensSaved = estimatedTokens(findings)
 
   // Display + trend stay host-derived from the raw path data (D5-A).
   const dirCounts = new Map<string, number>()
@@ -808,8 +820,8 @@ export function detectJunkReads(calls: ToolCall[], dateRange?: DateRange): Waste
 export function detectDuplicateReads(calls: ToolCall[], dateRange?: DateRange): WasteFinding | null {
   const findings = duplicateReadsDetector(buildObservationEnvelope(calls))
   if (findings.length === 0) return null
-  const totalDuplicates = evidenceCount(findings[0], 'duplicate-reads')
-  const tokensSaved = evidenceCount(findings[0], 'tokens-saved')
+  const totalDuplicates = evidenceCount(findings, 'duplicate-reads')
+  const tokensSaved = estimatedTokens(findings)
 
   // Per-file breakdown + trend stay host-derived from the raw path data (D5-A).
   const sessionFiles = new Map<string, Map<string, { count: number; recent: number }>>()
@@ -2295,12 +2307,17 @@ export const READ_TOOL_NAMES = new Set(['Read', 'Grep', 'Glob', 'FileReadTool', 
 export const EDIT_TOOL_NAMES = new Set(['Edit', 'Write', 'FileEditTool', 'FileWriteTool', 'NotebookEdit'])
 
 export function detectLowReadEditRatio(calls: ToolCall[]): WasteFinding | null {
-  const findings = contextBloatDetector(buildObservationEnvelope(calls))
+  const findings = lowContextBeforeEditDetector(buildObservationEnvelope(calls))
   if (findings.length === 0) return null
-  const reads = evidenceCount(findings[0], 'reads')
-  const edits = evidenceCount(findings[0], 'edits')
-  const tokensSaved = evidenceCount(findings[0], 'tokens-saved')
+  const reads = evidenceCount(findings, 'reads')
+  const edits = evidenceCount(findings, 'edits')
   const ratio = reads / edits
+  // Core deliberately emits NO token estimate here: the reads a healthier ratio
+  // would have required never happened, and performing them would ADD tokens
+  // rather than avoid them. The figure below is a HOST DISPLAY heuristic for the
+  // existing CLI copy, not a claim from the engine. It should be renamed or
+  // dropped when this panel's wording is revisited.
+  const tokensSaved = Math.max(Math.round(edits * 4) - reads, 0) * 600
 
   // Recency (for trend) stays host-derived from the raw calls.
   let recentEdits = 0

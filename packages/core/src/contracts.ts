@@ -8,12 +8,20 @@ import type { ObservationEnvelope, SessionObservation } from './observations.js'
  * Finding schema version. 0.x per decision D8: pre-stability, minor bumps may
  * break consumers.
  *
- * 0.2.0 tracks the observation layer's move to 128-bit fingerprints: findings
- * carry refs drawn straight from observations, so widening those refs changes
+ * 0.2.0 tracked the observation layer's move to 128-bit fingerprints: findings
+ * carry refs drawn straight from observations, so widening those refs changed
  * this wire format too. Re-emitting under the old version would silently
  * redefine what `finding-0.1.0` means for anyone already validating against it.
+ *
+ * 0.3.0 replaces the wire contract outright:
+ *   - `impactUSD` is removed — core has no pricing and never measured cash;
+ *   - every finding names one `subject`, so a host can attribute it;
+ *   - free-text confidence rationale becomes controlled codes;
+ *   - evidence kinds become a closed enum;
+ *   - token effects move into an explicit, method-versioned `estimate` that
+ *     cannot claim to be cash.
  */
-export const FINDING_SCHEMA_VERSION = '0.2.0'
+export const FINDING_SCHEMA_VERSION = '0.3.0'
 
 // ---------------------------------------------------------------------------
 // Decoder contract (types only — implementations live in per-provider packages)
@@ -95,36 +103,115 @@ export type Detector = (envelope: ObservationEnvelope) => Finding[]
 const SEMVER = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/
 
 /**
+ * The kinds of evidence the shipped detectors emit. A closed enum rather than a
+ * bounded string: `kind` is a key consumers branch on, and a free-text kind both
+ * invites drift and is one more place prose could appear.
+ *
+ * `tokens-saved` is deliberately absent. It claimed an observed outcome the
+ * detectors never observed; token effects now live in `estimate`, which is
+ * explicitly labelled as an estimate.
+ */
+export const EvidenceKind = z.enum([
+  'duplicate-reads',
+  'junk-reads',
+  'reads',
+  'edits',
+  'read-to-edit-ratio',
+])
+export type EvidenceKind = z.infer<typeof EvidenceKind>
+
+/**
  * A single machine-readable piece of evidence. `refs`/`sessionRefs` may hold
- * ONLY fingerprints (16-char hex) — never raw ids — so a finding cannot smuggle
- * identifying data. `.strict()` blocks unknown fields.
+ * ONLY fingerprints — never raw ids — so a finding cannot smuggle identifying
+ * data. `.strict()` blocks unknown fields.
  */
 export const Evidence = z
   .object({
-    kind: z.string().min(1).max(64),
+    kind: EvidenceKind,
     count: z.number().int().nonnegative().optional(),
+    /** Permits a ratio; counts use `count`. */
+    value: z.number().nonnegative().optional(),
     refs: z.array(FingerprintHex).optional(),
     sessionRefs: z.array(FingerprintHex).optional(),
   })
   .strict()
 export type Evidence = z.infer<typeof Evidence>
 
+/**
+ * Why the detector is as confident as it is, as codes rather than prose.
+ *
+ * The old free-text `basis` was an algorithm-authored sentence — a narrative
+ * field on a wire format that otherwise admits none, and unusable for anything
+ * but display. Codes can be branched on and translated.
+ */
+export const ConfidenceBasis = z.enum([
+  /** The threshold was crossed; nothing more is claimed. */
+  'threshold-only',
+  /** Confidence scales with how far past the threshold the count sits. */
+  'count-strength',
+  /** The same signal recurs across multiple resources or calls. */
+  'repeated-evidence',
+])
+export type ConfidenceBasis = z.infer<typeof ConfidenceBasis>
+
 export const Confidence = z
   .object({
     score: z.number().min(0).max(1),
-    /** A short, algorithm-authored rationale (bounded to keep it non-narrative). */
-    basis: z.string().min(1).max(200),
+    basis: z.array(ConfidenceBasis).min(1),
   })
   .strict()
 export type Confidence = z.infer<typeof Confidence>
 
+/**
+ * What a finding is ABOUT. Previously a finding could aggregate many sessions
+ * with no single subject, so a host could not attribute it to anything without
+ * guessing. Every finding now names exactly one subject, and the host joins
+ * `sessionRef` to `projectRef` itself for rollups.
+ */
+export const FindingSubject = z
+  .object({
+    kind: z.enum(['session', 'project']),
+    ref: FingerprintHex,
+  })
+  .strict()
+export type FindingSubject = z.infer<typeof FindingSubject>
+
+/**
+ * A modelled quantity, never a measurement and never money.
+ *
+ * `impactUSD` is gone. Core has no pricing and never did; a dollar figure on a
+ * finding invited hosts to render "you wasted $X" from an assumption. Even the
+ * token figure is modelled — `methodId`/`methodVersion` name the model so a
+ * consumer can tell when the number changed because the method changed.
+ *
+ * `nonCash: true` is a required literal. It cannot be set to false, so no
+ * serialized finding can ever assert that its value is realized cash.
+ */
+export const Estimate = z
+  .object({
+    metric: z.enum(['avoidable-tokens', 'additional-context-tokens']),
+    value: z.number().nonnegative(),
+    unit: z.literal('tokens'),
+    methodId: z.string().min(1).max(64).regex(/^[a-z0-9-]+$/),
+    methodVersion: z.string().regex(SEMVER, 'must be a semver string'),
+    nonCash: z.literal(true),
+  })
+  .strict()
+export type Estimate = z.infer<typeof Estimate>
+
 export const Finding = z
   .object({
-    detectorId: z.string().min(1).max(128),
-    algorithmVersion: z.string().regex(SEMVER, 'must be a semver string'),
+    schemaVersion: z.literal(FINDING_SCHEMA_VERSION),
+    detector: z
+      .object({
+        id: z.string().min(1).max(128).regex(/^[a-z0-9-]+$/),
+        algorithmVersion: z.string().regex(SEMVER, 'must be a semver string'),
+      })
+      .strict(),
+    subject: FindingSubject,
     confidence: Confidence,
-    evidence: z.array(Evidence),
-    impactUSD: z.number().optional(),
+    evidence: z.array(Evidence).min(1),
+    estimate: Estimate.optional(),
   })
   .strict()
 export type Finding = z.infer<typeof Finding>

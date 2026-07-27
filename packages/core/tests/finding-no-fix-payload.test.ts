@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { Confidence, Evidence, Finding } from '../src/contracts.js'
+import { Confidence, Evidence, Finding, FINDING_SCHEMA_VERSION } from '../src/contracts.js'
 
 // Advisory-findings gate (decision D5-A, phase 7). The phase-6 architecture gate
 // (architecture-gate.test.ts) proves, by scanning the compiled JSON schema, that
@@ -29,12 +29,12 @@ const FORBIDDEN_KEYS = [
 ] as const
 
 const baseFinding = () => ({
-  detectorId: 'duplicate-reads',
-  algorithmVersion: '1.0.0',
-  confidence: { score: 0.5, basis: 'demo' },
+  schemaVersion: FINDING_SCHEMA_VERSION,
+  detector: { id: 'duplicate-reads', algorithmVersion: '2.0.0' },
+  subject: { kind: 'session', ref: 'a1b2c3d4e5f60718a1b2c3d4e5f60718' },
+  confidence: { score: 0.5, basis: ['threshold-only'] },
   evidence: [
     { kind: 'duplicate-reads', count: 7, refs: ['deadbeefcafe0011deadbeefcafe0011'], sessionRefs: ['a1b2c3d4e5f60718a1b2c3d4e5f60718'] },
-    { kind: 'tokens-saved', count: 3500 },
   ],
 })
 
@@ -51,7 +51,7 @@ describe('Finding contract cannot carry a fix payload (D5-A advisory gate)', () 
     // Positive lock on the entire allowed surface: if a new top-level key is
     // added it must be reviewed here, not silently accepted.
     expect(declared.sort()).toEqual(
-      ['algorithmVersion', 'confidence', 'detectorId', 'evidence', 'impactUSD'].sort(),
+      ['schemaVersion', 'detector', 'subject', 'confidence', 'evidence', 'estimate'].sort(),
     )
   })
 
@@ -73,27 +73,27 @@ describe('Finding contract cannot carry a fix payload (D5-A advisory gate)', () 
 
   it('.strict() rejects a fix-payload key smuggled onto Confidence', () => {
     for (const key of FORBIDDEN_KEYS) {
-      const evil = { score: 0.5, basis: 'demo', [key]: 'echo pwned' }
+      const evil = { score: 0.5, basis: ['threshold-only'], [key]: 'echo pwned' }
       expect(Confidence.safeParse(evil).success, `confidence "${key}" must be rejected`).toBe(false)
     }
   })
 
-  it('evidence refs and sessionRefs accept only 16-char lowercase-hex fingerprints', () => {
+  it('evidence refs and sessionRefs accept only 32-char lowercase-hex fingerprints', () => {
     const notFingerprints = [
       '/Users/torukmakto/project/src/secret.ts', // a raw path
-      'deadbeefcafe0011deadbeef', // 24 hex (too long)
-      'deadbeefcafe001', // 15 hex (too short)
-      'DEADBEEFCAFE0011', // uppercase
-      'deadbeefcafeg011', // non-hex char
+      'deadbeefcafe0011deadbeefcafe0011dead', // 36 hex (too long)
+      'deadbeefcafe0011deadbeefcafe001', // 31 hex (too short)
+      'DEADBEEFCAFE0011DEADBEEFCAFE0011', // uppercase
+      'deadbeefcafeg011deadbeefcafeg011', // non-hex char
       'src/index.ts', // arbitrary text
     ]
     for (const bad of notFingerprints) {
-      const finding = { ...baseFinding(), evidence: [{ kind: 'k', refs: [bad] }] }
+      const finding = { ...baseFinding(), evidence: [{ kind: 'duplicate-reads', refs: [bad] }] }
       expect(Finding.safeParse(finding).success, `ref "${bad}" must be rejected`).toBe(false)
-      const finding2 = { ...baseFinding(), evidence: [{ kind: 'k', sessionRefs: [bad] }] }
+      const finding2 = { ...baseFinding(), evidence: [{ kind: 'duplicate-reads', sessionRefs: [bad] }] }
       expect(Finding.safeParse(finding2).success, `sessionRef "${bad}" must be rejected`).toBe(false)
     }
-    const ok = { ...baseFinding(), evidence: [{ kind: 'k', refs: ['0f1e2d3c4b5a69780f1e2d3c4b5a6978'] }] }
+    const ok = { ...baseFinding(), evidence: [{ kind: 'duplicate-reads', refs: ['0f1e2d3c4b5a69780f1e2d3c4b5a6978'] }] }
     expect(Finding.safeParse(ok).success).toBe(true)
   })
 

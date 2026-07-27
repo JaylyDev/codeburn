@@ -52,4 +52,20 @@ describe('JSON Schema drift', () => {
     expect(root?.properties?.evidence?.items?.properties?.refs?.items?.pattern).toBe('^[0-9a-f]{16}$')
     expect(Object.keys(fresh)).not.toContain('finding-0.1.0')
   })
+
+  // 0.2.0 is the last version that carried `impactUSD` and a flat detectorId.
+  // Freeze both so the retired shape stays readable to anyone still on it.
+  it('finding-0.2.0.json remains frozen with impactUSD and a flat detectorId', () => {
+    const onDisk = JSON.parse(readFileSync(resolve(schemasDir, 'finding-0.2.0.json'), 'utf8'))
+    const root = onDisk?.definitions?.Finding ?? onDisk
+    expect(Object.keys(root?.properties ?? {})).toContain('impactUSD')
+    expect(Object.keys(root?.properties ?? {})).toContain('detectorId')
+    expect(Object.keys(fresh)).not.toContain('finding-0.2.0')
+  })
+
+  // And the current one must NOT carry money, in any spelling.
+  it('finding-0.3.0.json declares no monetary field', () => {
+    const onDisk = JSON.parse(readFileSync(resolve(schemasDir, 'finding-0.3.0.json'), 'utf8'))
+    expect(JSON.stringify(onDisk)).not.toMatch(/usd|impact|dollar/i)
+  })
 })
