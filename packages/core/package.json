@@ -166,6 +166,10 @@
     "./providers/kiro": {
       "types": "./dist/providers/kiro/index.d.ts",
       "import": "./dist/providers/kiro/index.js"
+    },
+    "./providers/vercel-gateway": {
+      "types": "./dist/providers/vercel-gateway/index.d.ts",
+      "import": "./dist/providers/vercel-gateway/index.js"
     }
   },
   "files": [

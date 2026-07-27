@@ -53,6 +53,7 @@ import {
   decodeKiroV2Session,
   toObservations as toKiroObservations,
 } from '../src/providers/kiro/index.js'
+import { decodeVercelGateway, toObservations as toVercelGatewayObservations } from '../src/providers/vercel-gateway/index.js'
 import type { DecodeContext } from '../src/contracts.js'
 import type { ZedThreadRow } from '../src/providers/zed/index.js'
 import type {
@@ -2075,5 +2076,77 @@ describe('content-smuggling guardrail: real kiro decode -> toObservations is sec
     const allToolNames = envelope.sessions.flatMap(s => s.calls.flatMap(c => c.toolNames))
     // The hostile tool names fail the canonical-name regex and must be dropped.
     expect(allToolNames).not.toContain(SECRETS.commandLine)
+  })
+})
+
+
+describe('content-smuggling guardrail: real vercel-gateway decode -> toObservations is secret-free', () => {
+  // A hostile Vercel Gateway report planting every secret in the API fields the
+  // decode sees. The only free-text-capable API field is `model`; under the
+  // identifier-exemption convention model is an API identifier emitted by design,
+  // so the secret planted there is expected to remain. Every other secret must
+  // be absent from the envelope.
+  function decodeAndMinimize() {
+    const { calls } = decodeVercelGateway({
+      records: [
+        {
+          day: '2026-07-17',
+          model: SECRETS.prompt,
+          total_cost: 1.23,
+          input_tokens: 100,
+          output_tokens: 50,
+        },
+      ],
+    })
+    const { sessions } = toVercelGatewayObservations(
+      { sessionId: 'report-hostile', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'vercel-gateway' },
+    )
+    return {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+  }
+
+  it('produces a schema-valid envelope from the hostile report', () => {
+    expect(ObservationEnvelope.safeParse(decodeAndMinimize()).success).toBe(true)
+  })
+
+  it('is non-vacuous (at least one call)', () => {
+    const env = decodeAndMinimize()
+    const callCount = env.sessions.reduce((sum, s) => sum + s.calls.length, 0)
+    expect(callCount).toBeGreaterThan(0)
+  })
+
+  it('contains the model secret (identifier-exemption convention) and no other secrets', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    expect(serialized).toContain(SECRETS.prompt)
+    expect(serialized).not.toContain(SECRETS.absPath)
+    expect(serialized).not.toContain(SECRETS.apiKey)
+    expect(serialized).not.toContain(SECRETS.commandLine)
+    expect(serialized).not.toContain(SECRETS.fileContent)
+  })
+
+  // `day` is the report's only other string field, and it is NOT sanitized: the
+  // decode splices it verbatim into the synthesized timestamp and the dedup key.
+  // The envelope's date-time constraint is the containment, not the decode — a
+  // hostile `day` fails validation and therefore never ships.
+  it('rejects the envelope when a hostile day is spliced into the timestamp', () => {
+    const { calls } = decodeVercelGateway({
+      records: [{ day: SECRETS.apiKey, model: 'openai/gpt-4o', total_cost: 1, input_tokens: 1, output_tokens: 1 }],
+    })
+    expect(calls[0]?.timestamp).toContain(SECRETS.apiKey)
+
+    const { sessions } = toVercelGatewayObservations(
+      { sessionId: 'report-hostile-day', projectPath: SECRETS.absPath, calls },
+      { privacyKey: 'test-privacy-key', provider: 'vercel-gateway' },
+    )
+    const parsed = ObservationEnvelope.safeParse({
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    })
+    expect(parsed.success).toBe(false)
   })
 })

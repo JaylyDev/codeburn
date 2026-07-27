@@ -1,20 +1,10 @@
 import type { DateRange } from '../types.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import { decodeVercelGateway } from '@codeburn/core/providers/vercel-gateway'
+import type { VercelGatewayDecodedCall, VercelGatewayReportRow } from '@codeburn/core/providers/vercel-gateway'
 import { fetchWithTimeout } from '../fetch-utils.js'
 
 const REPORT_URL = 'https://ai-gateway.vercel.sh/v1/report'
-
-type ReportRow = {
-  day?: string
-  model?: string
-  total_cost?: number
-  input_tokens?: number
-  output_tokens?: number
-  cached_input_tokens?: number
-  cache_creation_input_tokens?: number
-  reasoning_tokens?: number
-  request_count?: number
-}
 
 export function getVercelGatewayApiKey(): string | null {
   const key = process.env['AI_GATEWAY_API_KEY'] ?? process.env['VERCEL_OIDC_TOKEN']
@@ -30,7 +20,7 @@ function formatUtcDate(d: Date): string {
 
 export async function fetchVercelGatewayReport(
   dateRange: DateRange,
-): Promise<ReportRow[]> {
+): Promise<VercelGatewayReportRow[]> {
   const key = getVercelGatewayApiKey()
   if (!key) return []
 
@@ -60,7 +50,7 @@ export async function fetchVercelGatewayReport(
       return []
     }
 
-    const body = (await res.json()) as { results?: ReportRow[] }
+    const body = (await res.json()) as { results?: VercelGatewayReportRow[] }
     return body.results ?? []
   } catch (err) {
     process.stderr.write(
@@ -70,6 +60,37 @@ export async function fetchVercelGatewayReport(
   }
 }
 
+// Map one rich core call into the host's ParsedProviderCall. Unlike the
+// token-priced providers this one carries the gateway's own dollar figure, so
+// `costUSD` passes through verbatim and no `costBasis` key is emitted — that is
+// what makes parser.ts leave the value alone instead of repricing it.
+function toProviderCall(rich: VercelGatewayDecodedCall, project: string): ParsedProviderCall {
+  return {
+    provider: 'vercel-gateway',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    costUSD: rich.costUSD,
+    tools: [],
+    bashCommands: [],
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: '',
+    sessionId: rich.sessionId,
+    project,
+  }
+}
+
+// Bespoke adapter rather than createBridgedProvider: the records come from an
+// authenticated HTTP report scoped to the scan's date range, which the bridge's
+// readRecords never receives. Fetching, auth, the stderr warnings, and the
+// no-date-range gate stay here; core owns only the row -> call decode.
 function createParser(
   source: SessionSource,
   seenKeys: Set<string>,
@@ -80,38 +101,9 @@ function createParser(
       if (!dateRange) return
 
       const rows = await fetchVercelGatewayReport(dateRange)
-      for (const row of rows) {
-        const day = row.day ?? ''
-        const model = row.model ?? 'unknown'
-        const costUSD = row.total_cost ?? 0
-        const inputTokens = row.input_tokens ?? 0
-        const outputTokens = row.output_tokens ?? 0
-        if (costUSD === 0 && inputTokens === 0 && outputTokens === 0) continue
-
-        const deduplicationKey = `vercel-gateway:${day}:${model}`
-        if (seenKeys.has(deduplicationKey)) continue
-        seenKeys.add(deduplicationKey)
-
-        yield {
-          provider: 'vercel-gateway',
-          model,
-          inputTokens,
-          outputTokens,
-          cacheCreationInputTokens: row.cache_creation_input_tokens ?? 0,
-          cacheReadInputTokens: row.cached_input_tokens ?? 0,
-          cachedInputTokens: 0,
-          reasoningTokens: row.reasoning_tokens ?? 0,
-          webSearchRequests: 0,
-          costUSD,
-          tools: [],
-          bashCommands: [],
-          timestamp: day ? `${day}T12:00:00.000Z` : '',
-          speed: 'standard',
-          deduplicationKey,
-          userMessage: '',
-          sessionId: `${day}:${model}`,
-          project: source.project,
-        }
+      const { calls } = decodeVercelGateway({ records: rows, seenKeys })
+      for (const rich of calls) {
+        yield toProviderCall(rich, source.project)
       }
     },
   }
