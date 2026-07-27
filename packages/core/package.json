@@ -138,6 +138,10 @@
     "./providers/devin": {
       "types": "./dist/providers/devin/index.d.ts",
       "import": "./dist/providers/devin/index.js"
+    },
+    "./providers/copilot": {
+      "types": "./dist/providers/copilot/index.d.ts",
+      "import": "./dist/providers/copilot/index.js"
     }
   },
   "files": [
