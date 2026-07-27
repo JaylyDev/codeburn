@@ -118,6 +118,26 @@
     "./providers/goose": {
       "types": "./dist/providers/goose/index.d.ts",
       "import": "./dist/providers/goose/index.js"
+    },
+    "./providers/hermes": {
+      "types": "./dist/providers/hermes/index.d.ts",
+      "import": "./dist/providers/hermes/index.js"
+    },
+    "./providers/warp": {
+      "types": "./dist/providers/warp/index.d.ts",
+      "import": "./dist/providers/warp/index.js"
+    },
+    "./providers/cursor-agent": {
+      "types": "./dist/providers/cursor-agent/index.d.ts",
+      "import": "./dist/providers/cursor-agent/index.js"
+    },
+    "./providers/quickdesk": {
+      "types": "./dist/providers/quickdesk/index.d.ts",
+      "import": "./dist/providers/quickdesk/index.js"
+    },
+    "./providers/devin": {
+      "types": "./dist/providers/devin/index.d.ts",
+      "import": "./dist/providers/devin/index.js"
     }
   },
   "files": [

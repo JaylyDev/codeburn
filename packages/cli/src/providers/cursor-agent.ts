@@ -4,51 +4,21 @@ import { readdir, readFile, stat } from 'fs/promises'
 import { join, basename } from 'path'
 import { homedir } from 'os'
 
+import { decodeCursorAgent } from '@codeburn/core/providers/cursor-agent'
+import type { ConversationSummaryRow, CursorAgentDecodedCall } from '@codeburn/core/providers/cursor-agent'
+
 import { openDatabase, type SqliteDatabase } from '../sqlite.js'
-import { normalizeContentBlocks } from '../content-utils.js'
-import { estimateTokensFromChars } from '../token-estimate.js'
-import type {
-  Provider,
-  SessionSource,
-  SessionParser,
-  ParsedProviderCall,
-} from './types.js'
+import { createBridgedProvider } from './bridge.js'
+import type { Provider, SessionSource, ParsedProviderCall } from './types.js'
 
-type ConversationSummary = {
-  conversationId: string
-  model: string | null
-  title: string | null
-  updatedAt: string | null
-}
-
-type AssistantTurn = {
-  body: string
-  reasoning: string
-  tools: string[]
-}
-
-type ParsedTurn = {
-  userMessage: string
-  assistant: AssistantTurn
-}
-
-const CURSOR_AGENT_COST_MODEL = 'claude-sonnet-4-5'
-const MAX_USER_TEXT_LENGTH = 500
-const DIGITS_ONLY = /^\d+$/
-const UUID_LIKE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-const USER_MARKER = /^\s*user:\s*/i
-const ASSISTANT_MARKER = /^\s*A:\s*/
-const THINKING_MARKER = /^\s*\[Thinking\]\s*/
-const TOOL_CALL_MARKER = /^\s*\[Tool call\]\s*(.+?)\s*$/i
-const TOOL_RESULT_MARKER = /^\s*\[Tool result\]\b/i
-const USER_QUERY_OPEN = '<user_query>'
-const USER_QUERY_CLOSE = '</user_query>'
-const warnedUnrecognizedTranscripts = new Set<string>()
 const CONVERSATION_SUMMARY_QUERY = `
   SELECT conversationId, model, title, updatedAt
   FROM conversation_summaries
   WHERE conversationId = ?
 `
+
+const UUID_LIKE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const DIGITS_ONLY = /^\d+$/
 
 const modelDisplayNames: Record<string, string> = {
   'claude-4.5-opus-high-thinking': 'Opus 4.5 (Thinking)',
@@ -65,6 +35,8 @@ const modelDisplayNames: Record<string, string> = {
   default: 'Auto (Sonnet est.)',
 }
 
+const warnedUnrecognizedTranscripts = new Set<string>()
+
 function getCursorAgentBaseDir(baseDirOverride?: string): string {
   if (baseDirOverride) return baseDirOverride
   // Windows paths unverified; tracked as Open Question 3 in issue #55.
@@ -77,38 +49,6 @@ function getProjectsDir(baseDir: string): string {
 
 function getAttributionDbPath(baseDir: string): string {
   return join(baseDir, 'ai-tracking', 'ai-code-tracking.db')
-}
-
-function estimateTokens(charCount: number): number {
-  if (charCount <= 0) return 0
-  return estimateTokensFromChars(charCount)
-}
-
-function parseToolName(raw: string): string {
-  const clean = raw.trim()
-  if (clean.length === 0) return 'unknown'
-  return clean.toLowerCase().replace(/\s+/g, '-')
-}
-
-function normalizeTimestamp(raw: string | number | null | undefined): string | null {
-  if (raw === null || raw === undefined) return null
-  if (typeof raw === 'string') {
-    const trimmed = raw.trim()
-    if (trimmed.length === 0) return null
-    if (DIGITS_ONLY.test(trimmed)) {
-      const num = Number(trimmed)
-      if (!Number.isNaN(num)) {
-        const ms = num < 1e12 ? num * 1000 : num
-        return new Date(ms).toISOString()
-      }
-    }
-    const parsed = new Date(trimmed)
-    if (!Number.isNaN(parsed.getTime())) return parsed.toISOString()
-    return null
-  }
-
-  const ms = raw < 1e12 ? raw * 1000 : raw
-  return new Date(ms).toISOString()
 }
 
 function prettifyProjectId(raw: string): string {
@@ -127,15 +67,6 @@ function prettifyProjectId(raw: string): string {
   if (parts.length > 0) return parts[parts.length - 1]!
 
   return raw
-}
-
-function resolveModel(raw: string | null | undefined): string {
-  if (!raw || raw === 'default') return 'cursor-agent-auto'
-  return raw
-}
-
-function costModel(model: string): string {
-  return model === 'cursor-agent-auto' ? CURSOR_AGENT_COST_MODEL : model
 }
 
 function transcriptStem(transcriptPath: string): string {
@@ -215,271 +146,29 @@ async function appendTranscriptSources(
   }
 }
 
-function extractUserQuery(userBlock: string): string {
-  const chunks: string[] = []
-  let cursor = 0
-
-  while (cursor < userBlock.length) {
-    const openIndex = userBlock.indexOf(USER_QUERY_OPEN, cursor)
-    if (openIndex === -1) break
-    const start = openIndex + USER_QUERY_OPEN.length
-    const closeIndex = userBlock.indexOf(USER_QUERY_CLOSE, start)
-    if (closeIndex === -1) {
-      chunks.push(userBlock.slice(start).trim())
-      break
-    }
-    chunks.push(userBlock.slice(start, closeIndex).trim())
-    cursor = closeIndex + USER_QUERY_CLOSE.length
-  }
-
-  const combined = chunks.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim()
-  return combined.slice(0, MAX_USER_TEXT_LENGTH)
-}
-
-function parseJsonlTranscript(raw: string): { turns: ParsedTurn[]; recognized: boolean } {
-  const lines = raw.split(/\r?\n/).filter(l => l.trim())
-  if (lines.length === 0) return { turns: [], recognized: false }
-
-  const turns: ParsedTurn[] = []
-  let currentUserMessage = ''
-
-  for (const line of lines) {
-    let entry: { role?: string; message?: { content?: Array<{ type?: string; text?: string; name?: string }> } }
-    try {
-      entry = JSON.parse(line)
-    } catch {
-      continue
-    }
-
-    if (entry.role === 'user') {
-      const texts = normalizeContentBlocks(entry.message?.content)
-        .filter(c => c.type === 'text')
-        .map(c => c.text ?? '')
-      const combined = texts.join(' ')
-      currentUserMessage = extractUserQuery(combined) || combined.slice(0, MAX_USER_TEXT_LENGTH)
-      continue
-    }
-
-    if (entry.role === 'assistant' && currentUserMessage) {
-      const content = normalizeContentBlocks(entry.message?.content)
-      const bodyParts: string[] = []
-      const tools: string[] = []
-
-      for (const block of content) {
-        if (block.type === 'text' && block.text) {
-          bodyParts.push(block.text)
-        } else if (block.type === 'tool_use' && block.name) {
-          tools.push(`cursor:${block.name.toLowerCase()}`)
-        }
-      }
-
-      turns.push({
-        userMessage: currentUserMessage,
-        assistant: {
-          body: bodyParts.join('\n').trim(),
-          reasoning: '',
-          tools,
-        },
-      })
-      currentUserMessage = ''
-    }
-  }
-
-  return { turns, recognized: turns.length > 0 }
-}
-
-function parseTranscript(raw: string): { turns: ParsedTurn[]; recognized: boolean } {
-  const lines = raw.split(/\r?\n/)
-  let recognized = false
-
-  const pendingUsers: string[] = []
-  const turns: ParsedTurn[] = []
-
-  let active: 'none' | 'user' | 'assistant' = 'none'
-  let userLines: string[] = []
-  let assistantLines: string[] = []
-
-  const flushUser = () => {
-    if (userLines.length === 0) return
-    const userQuery = extractUserQuery(userLines.join('\n'))
-    if (userQuery.length > 0) pendingUsers.push(userQuery)
-    userLines = []
-  }
-
-  const flushAssistant = () => {
-    if (assistantLines.length === 0) return
-
-    let output = ''
-    let reasoning = ''
-    const toolsByTurn = new Map<string, true>()
-
-    for (const line of assistantLines) {
-      if (TOOL_RESULT_MARKER.test(line)) continue
-
-      const thinkingMatch = line.match(THINKING_MARKER)
-      if (thinkingMatch) {
-        const body = line.replace(THINKING_MARKER, '').trim()
-        if (body.length > 0) reasoning += `${body}\n`
-        continue
-      }
-
-      const toolMatch = line.match(TOOL_CALL_MARKER)
-      if (toolMatch) {
-        const parsedTool = parseToolName(toolMatch[1] ?? '')
-        const toolKey = `cursor:${parsedTool}`
-        toolsByTurn.set(toolKey, true)
-        continue
-      }
-
-      output += `${line}\n`
-    }
-
-    if (pendingUsers.length > 0) {
-      const userMessage = pendingUsers.shift()!
-      const tools = Array.from(toolsByTurn.keys())
-      turns.push({
-        userMessage,
-        assistant: {
-          body: output.trim(),
-          reasoning: reasoning.trim(),
-          tools,
-        },
-      })
-    }
-
-    assistantLines = []
-  }
-
-  for (const line of lines) {
-    if (USER_MARKER.test(line)) {
-      recognized = true
-      if (active === 'user') flushUser()
-      if (active === 'assistant') flushAssistant()
-      active = 'user'
-      userLines = [line.replace(USER_MARKER, '')]
-      continue
-    }
-
-    if (ASSISTANT_MARKER.test(line)) {
-      recognized = true
-      if (active === 'user') flushUser()
-      if (active === 'assistant') flushAssistant()
-      active = 'assistant'
-      assistantLines = [line.replace(ASSISTANT_MARKER, '')]
-      continue
-    }
-
-    if (active === 'user') {
-      userLines.push(line)
-      continue
-    }
-
-    if (active === 'assistant') {
-      assistantLines.push(line)
-    }
-  }
-
-  if (active === 'user') flushUser()
-  if (active === 'assistant') flushAssistant()
-
-  return { turns, recognized }
-}
-
-function createParser(
-  source: SessionSource,
-  seenKeys: Set<string>,
-  dbPath: string,
-  summariesByConversationId: Map<string, ConversationSummary>,
-): SessionParser {
+// Map one rich, cost-free decoder call into the host's ParsedProviderCall. Cost
+// re-enters here: `costBasis: 'estimated'` marks the call so the parser.ts
+// pricing pass fills `costUSD` from the token buckets. Cursor Agent transcripts
+// never carry shell commands, so `bashCommands` is always empty.
+function toProviderCall(rich: CursorAgentDecodedCall): ParsedProviderCall {
   return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const conversationId = toConversationId(source.path)
-
-      let summary = summariesByConversationId.get(conversationId)
-      let db: SqliteDatabase | null = null
-
-      try {
-        if (!summary) {
-          if (existsSync(dbPath)) {
-            try {
-              db = openDatabase(dbPath)
-              const rows = db.query<{
-                conversationId: string
-                model: string | null
-                title: string | null
-                updatedAt: string | number | null
-              }>(CONVERSATION_SUMMARY_QUERY, [conversationId])
-
-              if (rows.length > 0) {
-                const row = rows[0]!
-                summary = {
-                  conversationId: row.conversationId,
-                  model: row.model,
-                  title: row.title,
-                  updatedAt: normalizeTimestamp(row.updatedAt),
-                }
-                summariesByConversationId.set(conversationId, summary)
-              }
-            } catch {
-              summary = undefined
-            }
-          }
-        }
-
-        const transcript = await readFile(source.path, 'utf-8')
-        const isJsonl = source.path.endsWith('.jsonl')
-        const parsed = isJsonl ? parseJsonlTranscript(transcript) : parseTranscript(transcript)
-
-        if (!parsed.recognized) {
-          if (!warnedUnrecognizedTranscripts.has(source.path)) {
-            warnedUnrecognizedTranscripts.add(source.path)
-            process.stderr.write(`codeburn: skipped ${basename(source.path)}: unrecognized cursor-agent transcript format\n`)
-          }
-          return
-        }
-
-        let timestamp = summary?.updatedAt ?? null
-        if (!timestamp) {
-          const fileStat = await stat(source.path)
-          timestamp = fileStat.mtime.toISOString()
-        }
-
-        const model = resolveModel(summary?.model ?? null)
-
-        for (let turnIndex = 0; turnIndex < parsed.turns.length; turnIndex++) {
-          const turn = parsed.turns[turnIndex]!
-          const inputTokens = estimateTokens(turn.userMessage.length)
-          const outputTokens = estimateTokens(turn.assistant.body.length)
-          const reasoningTokens = estimateTokens(turn.assistant.reasoning.length)
-          const deduplicationKey = `cursor-agent:${conversationId}:${turnIndex}`
-
-          if (seenKeys.has(deduplicationKey)) continue
-          seenKeys.add(deduplicationKey)
-
-          yield {
-            provider: 'cursor-agent',
-            model,
-            inputTokens,
-            outputTokens,
-            cacheCreationInputTokens: 0,
-            cacheReadInputTokens: 0,
-            cachedInputTokens: 0,
-            reasoningTokens,
-            webSearchRequests: 0,
-            costBasis: 'estimated',
-            tools: turn.assistant.tools,
-            bashCommands: [],
-            timestamp,
-            speed: 'standard',
-            deduplicationKey,
-            userMessage: turn.userMessage,
-            sessionId: conversationId,
-          }
-        }
-      } finally {
-        db?.close()
-      }
-    },
+    provider: 'cursor-agent',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    costBasis: 'estimated',
+    tools: rich.tools,
+    bashCommands: [],
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
   }
 }
 
@@ -487,9 +176,9 @@ export function createCursorAgentProvider(baseDirOverride?: string): Provider {
   const baseDir = getCursorAgentBaseDir(baseDirOverride)
   const projectsDir = getProjectsDir(baseDir)
   const dbPath = getAttributionDbPath(baseDir)
-  const summariesByConversationId = new Map<string, ConversationSummary>()
+  const summariesByConversationId = new Map<string, ConversationSummaryRow>()
 
-  return {
+  return createBridgedProvider<CursorAgentDecodedCall>({
     name: 'cursor-agent',
     displayName: 'Cursor Agent',
 
@@ -527,10 +216,76 @@ export function createCursorAgentProvider(baseDirOverride?: string): Provider {
       return sources
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, seenKeys, dbPath, summariesByConversationId)
+    // I/O adapter: open the sqlite database host-side, read the conversation
+    // summary (cached per conversation id, as the pre-migration parser did),
+    // read the transcript file, and return the plain record objects for the
+    // core decoder.
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      const conversationId = toConversationId(source.path)
+
+      let summary = summariesByConversationId.get(conversationId)
+      let db: SqliteDatabase | null = null
+
+      try {
+        if (!summary && existsSync(dbPath)) {
+          try {
+            db = openDatabase(dbPath)
+            const rows = db.query<{
+              conversationId: string
+              model: string | null
+              title: string | null
+              updatedAt: string | number | null
+            }>(CONVERSATION_SUMMARY_QUERY, [conversationId])
+
+            if (rows.length > 0) {
+              const row = rows[0]!
+              summary = {
+                conversationId: row.conversationId,
+                model: row.model,
+                title: row.title,
+                updatedAt: typeof row.updatedAt === 'number'
+                  ? new Date(row.updatedAt < 1e12 ? row.updatedAt * 1000 : row.updatedAt).toISOString()
+                  : (row.updatedAt ?? null),
+              }
+              summariesByConversationId.set(conversationId, summary)
+            }
+          } catch {
+            summary = undefined
+          }
+        }
+      } finally {
+        db?.close()
+      }
+
+      const transcript = await readFile(source.path, 'utf-8')
+      const fileStat = await stat(source.path)
+
+      return [{
+        summary: summary ?? null,
+        transcript,
+        transcriptPath: source.path,
+        fileMtime: fileStat.mtime.toISOString(),
+        conversationId,
+      }]
     },
-  }
+
+    // The core decoder reports a transcript that parsed to nothing recognizable
+    // as a record diagnostic, which the bridge discards. The pre-migration
+    // decode printed one warning per such transcript path, so that notice is
+    // re-emitted here rather than silently dropped.
+    decode(input) {
+      const { calls, diagnostics } = decodeCursorAgent(input)
+      if (diagnostics.length > 0) {
+        const path = input.context.sourceRef
+        if (!warnedUnrecognizedTranscripts.has(path)) {
+          warnedUnrecognizedTranscripts.add(path)
+          process.stderr.write(`codeburn: skipped ${basename(path)}: unrecognized cursor-agent transcript format\n`)
+        }
+      }
+      return { calls }
+    },
+    toProviderCall,
+  })
 }
 
 export const cursor_agent = createCursorAgentProvider()

@@ -2,10 +2,18 @@ import { readdir, readFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, join, resolve } from 'node:path'
 
-import { estimateTokensFromChars } from '../token-estimate.js'
+import { decodeQuickdesk, quickdeskToolNameMap } from '@codeburn/core/providers/quickdesk'
+import type {
+  QuickdeskDatabaseInput,
+  QuickdeskDecodedCall,
+  QuickdeskMetricsInput,
+  QuickdeskSessionMetadata,
+} from '@codeburn/core/providers/quickdesk'
+
 import { blobToText, isSqliteAvailable, openDatabase } from '../sqlite.js'
 import type { SqliteDatabase } from '../sqlite.js'
-import type { ParsedProviderCall, ProbeRoot, Provider, SessionParser, SessionSource } from './types.js'
+import { createBridgedProvider } from './bridge.js'
+import type { ParsedProviderCall, ProbeRoot, Provider, SessionSource } from './types.js'
 
 const METRICS_FILE_RE = /^metrics-(\d{4})-(\d{2})-(\d{2})\.jsonl$/
 
@@ -14,46 +22,9 @@ const modelDisplayNames: Record<string, string> = {
   'claude-sonnet-4-6': 'Sonnet 4.6',
 }
 
-const toolNameMap: Record<string, string> = {
-  readFile: 'Read',
-  read_file: 'Read',
-  writeFile: 'Edit',
-  write_file: 'Edit',
-  editFile: 'Edit',
-  edit_file: 'Edit',
-  runCommand: 'Bash',
-  run_command: 'Bash',
-  executeBash: 'Bash',
-  shell: 'Bash',
-  grep: 'Grep',
-  searchFiles: 'Grep',
-  search_files: 'Grep',
-}
-
 type ProfileBase = {
   path: string
   profile: string
-}
-
-type MetricsRecord = {
-  record: Record<string, unknown>
-}
-
-type SessionMetadata = {
-  id: string
-  title: string
-  agentMode: string
-  createdAt?: number
-  deleted: boolean
-  firstUserMessage: string
-  inputChars: number
-  outputChars: number
-  tools: string[]
-}
-
-type DatabaseSnapshot = {
-  sessions: Map<string, SessionMetadata>
-  canEstimate: boolean
 }
 
 type SqliteMasterRow = {
@@ -97,7 +68,7 @@ function finiteNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
-function nonNegativeNumber(value: unknown): number | undefined {
+function timestampSeconds(value: unknown): number | undefined {
   const number = finiteNumber(value)
   return number !== undefined && number >= 0 ? number : undefined
 }
@@ -217,12 +188,7 @@ function toolNames(value: unknown): string[] {
 }
 
 function uniqueMappedTools(values: string[]): string[] {
-  return [...new Set(values.map(value => toolNameMap[value] ?? value).filter(Boolean))]
-}
-
-function timestampSeconds(value: unknown): number | undefined {
-  const number = finiteNumber(value)
-  return number !== undefined && number >= 0 ? number : undefined
+  return [...new Set(values.map(value => quickdeskToolNameMap[value] ?? value).filter(Boolean))]
 }
 
 function unixSecondsIso(value: number): string | null {
@@ -230,8 +196,8 @@ function unixSecondsIso(value: number): string | null {
   return Number.isNaN(date.getTime()) ? null : date.toISOString()
 }
 
-function loadDatabaseSnapshot(basePath: string): DatabaseSnapshot {
-  const empty: DatabaseSnapshot = { sessions: new Map(), canEstimate: false }
+function loadDatabaseSnapshot(basePath: string): { sessions: Map<string, QuickdeskSessionMetadata>; canEstimate: boolean } {
+  const empty: { sessions: Map<string, QuickdeskSessionMetadata>; canEstimate: boolean } = { sessions: new Map(), canEstimate: false }
   if (!isSqliteAvailable()) return empty
 
   let db: SqliteDatabase
@@ -257,7 +223,7 @@ function loadDatabaseSnapshot(basePath: string): DatabaseSnapshot {
        FROM sessions`,
     )
 
-    const sessions = new Map<string, SessionMetadata>()
+    const sessions = new Map<string, QuickdeskSessionMetadata>()
     for (const row of sessionRows) {
       const id = stringValue(row.id)
       if (!id) continue
@@ -319,7 +285,7 @@ function loadDatabaseSnapshot(basePath: string): DatabaseSnapshot {
   }
 }
 
-async function readMetricsRecords(path: string): Promise<MetricsRecord[]> {
+async function readMetricsRecords(path: string): Promise<Array<{ record: Record<string, unknown> }>> {
   let contents: string
   try {
     contents = await readFile(path, 'utf8')
@@ -327,7 +293,7 @@ async function readMetricsRecords(path: string): Promise<MetricsRecord[]> {
     return []
   }
 
-  const records: MetricsRecord[] = []
+  const records: Array<{ record: Record<string, unknown> }> = []
   const lines = contents.split(/\r?\n/)
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index]!.trim()
@@ -342,61 +308,15 @@ async function readMetricsRecords(path: string): Promise<MetricsRecord[]> {
   return records
 }
 
-function usageRecord(record: Record<string, unknown>): boolean {
-  return Boolean(stringValue(record['Model']))
-    && nonNegativeNumber(record['InputTokens']) !== undefined
-    && nonNegativeNumber(record['OutputTokens']) !== undefined
-}
-
-function sessionId(record: Record<string, unknown>): string {
-  return stringValue(record['session_id'])
-}
-
-function toolsKey(record: Record<string, unknown>): string {
-  return sessionId(record)
-}
-
-function collectMetricTools(records: MetricsRecord[]): Map<string, string[]> {
-  const tools = new Map<string, string[]>()
-  for (const { record } of records) {
-    const key = toolsKey(record)
-    const tool = stringValue(record['ToolName'])
-    if (!key || !tool) continue
-    const current = tools.get(key) ?? []
-    current.push(toolNameMap[tool] ?? tool)
-    tools.set(key, current)
-  }
-  for (const [key, values] of tools) tools.set(key, [...new Set(values)])
-  return tools
-}
-
-function fallbackTimestamp(path: string): string | null {
-  const match = METRICS_FILE_RE.exec(basename(path))
-  if (!match) return null
-  const year = Number(match[1])
-  const month = Number(match[2])
-  const day = Number(match[3])
-  const date = new Date(Date.UTC(year, month - 1, day))
-  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return null
-  return date.toISOString()
-}
-
-function metricsTimestamp(record: Record<string, unknown>, path: string): string | null {
-  const aws = asRecord(record['_aws'])
-  const timestampMs = finiteNumber(aws?.['Timestamp'])
-  if (timestampMs !== undefined) {
-    const date = new Date(timestampMs)
-    if (!Number.isNaN(date.getTime())) return date.toISOString()
-  }
-  return fallbackTimestamp(path)
-}
-
 async function metricSessionIds(basePath: string): Promise<Set<string>> {
   const ids = new Set<string>()
   for (const path of await metricsFiles(basePath)) {
     for (const { record } of await readMetricsRecords(path)) {
-      if (!usageRecord(record)) continue
-      const id = sessionId(record)
+      const model = stringValue(record['Model'])
+      const inputTokens = nonNegativeNumber(record['InputTokens'])
+      const outputTokens = nonNegativeNumber(record['OutputTokens'])
+      if (!model || inputTokens === undefined || outputTokens === undefined) continue
+      const id = stringValue(record['session_id'])
       if (id) ids.add(id)
     }
   }
@@ -416,141 +336,107 @@ function basePathFor(source: SessionSource): string {
   return resolve(source.path, '..', '..')
 }
 
-function commonCallFields(source: SessionSource, basePath: string) {
+function nonNegativeNumber(value: unknown): number | undefined {
+  const number = finiteNumber(value)
+  return number !== undefined && number >= 0 ? number : undefined
+}
+
+// Map one rich, cost-free decoder call into the host's ParsedProviderCall. Cost
+// re-enters here: a provider-reported dollar figure becomes `costBasis: 'measured'`
+// and `costUSD`; otherwise the parser.ts pricing pass estimates from token buckets
+// (`costBasis: 'estimated'`).
+function toProviderCall(rich: QuickdeskDecodedCall): ParsedProviderCall {
+  const measured = rich.recordedCost !== undefined
   return {
     provider: 'quickdesk',
-    cacheCreationInputTokens: 0,
-    cacheReadInputTokens: 0,
-    cachedInputTokens: 0,
-    reasoningTokens: 0,
-    webSearchRequests: 0,
-    bashCommands: [] as string[],
-    speed: 'standard' as const,
-    project: source.project,
-    projectPath: basePath,
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    ...(measured
+      ? { costUSD: rich.recordedCost, costBasis: 'measured' as const, costIsEstimated: false }
+      : { costBasis: 'estimated' as const, costIsEstimated: true }),
+    tools: rich.tools,
+    bashCommands: rich.rawBashCommands,
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
+    project: rich.project,
+    projectPath: rich.projectPath,
   }
 }
 
-function createMetricsParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-  return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
+function isDatabaseSource(source: SessionSource): boolean {
+  return source.sourceId === 'sessions-db' || basename(source.path) === 'sessions.db'
+}
+
+export function createQuickdeskProvider(): Provider {
+  return createBridgedProvider<QuickdeskDecodedCall>({
+    name: 'quickdesk',
+    displayName: 'Quick Desktop',
+    durableSources: true,
+
+    modelDisplayName(model: string): string {
+      if (model === 'quickdesk-auto') return 'Quick Desktop (auto)'
+      return modelDisplayNames[model] ?? model
+    },
+
+    toolDisplayName(rawTool: string): string {
+      return quickdeskToolNameMap[rawTool] ?? rawTool
+    },
+
+    async probeRoots(): Promise<ProbeRoot[]> {
+      return (await resolveProfileBases()).map(base => ({ path: base.path, label: base.profile }))
+    },
+
+    async discoverSessions(): Promise<SessionSource[]> {
+      return discoverSources()
+    },
+
+    // I/O adapter: read the discovered source host-side. Metrics files are parsed
+    // into JSONL records plus the linked sqlite snapshot; the sessions.db itself is
+    // read into plain session metadata rows. The core decoder is pure over these
+    // composites.
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      const basePath = basePathFor(source)
+      const project = source.project
+
+      if (isDatabaseSource(source)) {
+        const snapshot = loadDatabaseSnapshot(basePath)
+        if (!snapshot.canEstimate) return null
+        const meteredSessionIds = await allMetricSessionIds()
+        const input: QuickdeskDatabaseInput = {
+          variant: 'database',
+          sessions: [...snapshot.sessions.values()],
+          meteredSessionIds,
+          project,
+          projectPath: basePath,
+        }
+        return [input]
+      }
+
       const records = await readMetricsRecords(source.path)
-      const basePath = basePathFor(source)
-      const linkedTools = collectMetricTools(records)
       const snapshot = loadDatabaseSnapshot(basePath)
-      const fileId = basename(source.path)
-
-      for (const { record } of records) {
-        if (!usageRecord(record)) continue
-        const model = stringValue(record['Model'])
-        const inputTokens = nonNegativeNumber(record['InputTokens'])!
-        const outputTokens = nonNegativeNumber(record['OutputTokens'])!
-        const timestamp = metricsTimestamp(record, source.path)
-        if (!timestamp) continue
-
-        const linkedSessionId = sessionId(record)
-        const metadata = linkedSessionId ? snapshot.sessions.get(linkedSessionId) : undefined
-        if (metadata?.deleted) continue
-
-        const fallbackId = `${source.project}:${fileId}`
-        const deduplicationKey = `quickdesk:${linkedSessionId || fallbackId}:${timestamp}:${model}:${inputTokens}:${outputTokens}`
-        if (seenKeys.has(deduplicationKey)) continue
-        seenKeys.add(deduplicationKey)
-
-        const recordedCost = nonNegativeNumber(record['CostUSD'])
-        const costIsEstimated = recordedCost === undefined
-        const metricTools = linkedTools.get(toolsKey(record)) ?? []
-        const tools = uniqueMappedTools([...metricTools, ...(metadata?.tools ?? [])])
-
-        yield {
-          ...commonCallFields(source, basePath),
-          model,
-          inputTokens,
-          outputTokens,
-          // Provider-reported cost passes through as 'measured'; otherwise the
-          // pricing pass computes it from the token buckets ('estimated').
-          ...(recordedCost !== undefined
-            ? { costUSD: recordedCost, costBasis: 'measured' as const }
-            : { costBasis: 'estimated' as const }),
-          costIsEstimated,
-          tools,
-          timestamp,
-          deduplicationKey,
-          userMessage: metadata?.firstUserMessage ?? '',
-          sessionId: linkedSessionId || fileId,
-        }
+      const input: QuickdeskMetricsInput = {
+        variant: 'metrics',
+        records,
+        sessions: snapshot.sessions,
+        project,
+        projectPath: basePath,
+        fileId: basename(source.path),
       }
+      return [input]
     },
-  }
+
+    decode: decodeQuickdesk,
+    toProviderCall,
+  })
 }
 
-function createDatabaseParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-  return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const basePath = basePathFor(source)
-      const snapshot = loadDatabaseSnapshot(basePath)
-      if (!snapshot.canEstimate) return
-      const meteredSessions = await allMetricSessionIds()
-
-      for (const metadata of snapshot.sessions.values()) {
-        if (metadata.deleted || meteredSessions.has(metadata.id) || metadata.createdAt === undefined) continue
-        const createdAtSeconds = metadata.createdAt > 1_000_000_000_000
-          ? metadata.createdAt / 1000
-          : metadata.createdAt
-        const timestamp = unixSecondsIso(createdAtSeconds)
-        if (!timestamp) continue
-        const inputTokens = estimateTokensFromChars(metadata.inputChars)
-        const outputTokens = estimateTokensFromChars(metadata.outputChars)
-        if (inputTokens + outputTokens === 0) continue
-
-        const deduplicationKey = `quickdesk-est:${metadata.id}`
-        if (seenKeys.has(deduplicationKey)) continue
-        seenKeys.add(deduplicationKey)
-        const model = 'quickdesk-auto'
-
-        yield {
-          ...commonCallFields(source, basePath),
-          model,
-          inputTokens,
-          outputTokens,
-          costBasis: 'estimated',
-          costIsEstimated: true,
-          tools: metadata.tools,
-          timestamp,
-          deduplicationKey,
-          userMessage: metadata.firstUserMessage,
-          sessionId: metadata.id,
-        }
-      }
-    },
-  }
-}
-
-export const quickdesk: Provider = {
-  name: 'quickdesk',
-  displayName: 'Quick Desktop',
-  durableSources: true,
-
-  modelDisplayName(model: string): string {
-    if (model === 'quickdesk-auto') return 'Quick Desktop (auto)'
-    return modelDisplayNames[model] ?? model
-  },
-
-  toolDisplayName(rawTool: string): string {
-    return toolNameMap[rawTool] ?? rawTool
-  },
-
-  async probeRoots(): Promise<ProbeRoot[]> {
-    return (await resolveProfileBases()).map(base => ({ path: base.path, label: base.profile }))
-  },
-
-  async discoverSessions(): Promise<SessionSource[]> {
-    return discoverSources()
-  },
-
-  createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-    return source.sourceId === 'sessions-db' || basename(source.path) === 'sessions.db'
-      ? createDatabaseParser(source, seenKeys)
-      : createMetricsParser(source, seenKeys)
-  },
-}
+export const quickdesk = createQuickdeskProvider()

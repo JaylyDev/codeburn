@@ -1,76 +1,24 @@
 import { join } from 'path'
 import { homedir } from 'os'
 
+import { decodeWarp } from '@codeburn/core/providers/warp'
+import type { WarpBlockRow, WarpConversationRow, WarpDecodedCall, WarpQueryRow } from '@codeburn/core/providers/warp'
+
 import { extractBashCommands } from '../bash-utils.js'
 import { getShortModelName } from '../models.js'
 import { blobToText, getSqliteLoadError, isSqliteAvailable, openDatabase, type SqliteDatabase } from '../sqlite.js'
-import { estimateTokensFromChars } from '../token-estimate.js'
-import type { ParsedProviderCall, Provider, SessionParser, SessionSource } from './types.js'
-import { safeNumber } from '../parser.js'
+import { createBridgedProvider } from './bridge.js'
+import type { ParsedProviderCall, Provider, SessionSource } from './types.js'
 
-const WARP_GROUP_CONTAINER = '2BBY89MBSN.dev.warp'
-const WARP_STABLE_BUNDLE_ID = 'dev.warp.Warp-Stable'
-const WARP_PREVIEW_BUNDLE_ID = 'dev.warp.Warp-Preview'
-const PRIMARY_AGENT_CATEGORY = 'primary_agent'
-const modelAliases: Record<string, string> = {
-  'Claude Sonnet 4.6': 'claude-sonnet-4-6',
-  'Claude Sonnet 4.5': 'claude-sonnet-4-5',
-  'Claude Haiku 4.5': 'claude-haiku-4-5',
-  'Claude Opus 4.6': 'claude-opus-4-6',
-  'GPT-5.3 Codex (low reasoning)': 'gpt-5.3-codex',
-  'GPT-5.3 Codex (medium reasoning)': 'gpt-5.3-codex',
-  'GPT-5.3 Codex (high reasoning)': 'gpt-5.3-codex',
-  'GPT-5.3 Codex (extra high reasoning)': 'gpt-5.3-codex',
-  'auto-efficient': 'warp-auto-efficient',
-  'auto-powerful': 'warp-auto-powerful',
-}
-
-type WarpConversationRow = {
-  conversation_id: string
-  conversation_data: string
-  last_modified_at: string | null
-}
-
-type WarpQueryRow = {
-  exchange_id: string
-  conversation_id: string
-  start_ts: string
-  input: string
-  working_directory: string | null
-  output_status: string
-  model_id: string
-  planning_model_id: string
-  coding_model_id: string
-}
-
-type WarpBlockRow = {
+type RawWarpBlockRow = {
   block_id: string
   start_ts: string | null
   stylized_command: Uint8Array | string | null
 }
 
-type WarpTokenUsageEntry = {
-  model_id?: string
-  warp_tokens?: number
-  byok_tokens?: number
-  warp_token_usage_by_category?: Record<string, unknown>
-  byok_token_usage_by_category?: Record<string, unknown>
-}
-
-type WarpConversationData = {
-  conversation_usage_metadata?: {
-    token_usage?: WarpTokenUsageEntry[]
-  }
-}
-
-type ParsedExchange = WarpQueryRow & {
-  startMs: number
-}
-
-type ExchangeToolInfo = {
-  tools: string[]
-  bashCommands: string[]
-}
+const WARP_GROUP_CONTAINER = '2BBY89MBSN.dev.warp'
+const WARP_STABLE_BUNDLE_ID = 'dev.warp.Warp-Stable'
+const WARP_PREVIEW_BUNDLE_ID = 'dev.warp.Warp-Preview'
 
 function sanitizeProject(path: string): string {
   return path.replace(/^\/+/, '').replace(/\//g, '-')
@@ -95,201 +43,10 @@ function getDbCandidates(dbPathOverride?: string): string[] {
   return [warpDbPath(WARP_STABLE_BUNDLE_ID), warpDbPath(WARP_PREVIEW_BUNDLE_ID)]
 }
 
-function normalizeModel(rawModel: string): string {
-  const model = rawModel.trim()
-  if (!model) return model
-  return modelAliases[model] ?? model
-}
-
 function modelDisplayName(model: string): string {
   if (model === 'warp-auto-efficient') return 'Warp Auto (efficient)'
   if (model === 'warp-auto-powerful') return 'Warp Auto (powerful)'
   return getShortModelName(model)
-}
-
-function parseTimestamp(raw: string | null | undefined): number | null {
-  if (!raw) return null
-  const trimmed = raw.trim()
-  if (!trimmed) return null
-  const withT = trimmed.includes('T') ? trimmed : trimmed.replace(' ', 'T')
-  const lastPlus = withT.lastIndexOf('+')
-  const lastMinus = withT.lastIndexOf('-')
-  const hasOffset = lastPlus > 9 || lastMinus > 9
-  const hasTimezone = withT.endsWith('Z') || hasOffset
-  const normalized = hasTimezone ? withT : `${withT}Z`
-  const ms = Date.parse(normalized)
-  return Number.isNaN(ms) ? null : ms
-}
-
-function parseJsonString(raw: string): string {
-  try {
-    const parsed = JSON.parse(raw) as unknown
-    return typeof parsed === 'string' ? parsed : raw
-  } catch {
-    return raw
-  }
-}
-
-function isFinalStatus(rawStatus: string): boolean {
-  const status = parseJsonString(rawStatus)
-  return status === 'Completed' || status === 'Cancelled' || status === 'Failed'
-}
-
-function extractCategoryTokens(categories: Record<string, unknown> | undefined, key: string): number {
-  if (!categories) return 0
-  return safeNumber(categories[key])
-}
-
-function extractTokenBudget(rawConversationData: string): { tokenBudget: number; dominantModel: string } {
-  let conversationData: WarpConversationData
-  try {
-    conversationData = JSON.parse(rawConversationData) as WarpConversationData
-  } catch {
-    return { tokenBudget: 0, dominantModel: '' }
-  }
-
-  const entries = conversationData.conversation_usage_metadata?.token_usage ?? []
-  let primaryTotal = 0
-  let fallbackTotal = 0
-  let dominantPrimaryTokens = 0
-  let dominantFallbackTokens = 0
-  let dominantModel = ''
-
-  for (const entry of entries) {
-    const primaryTokens =
-      extractCategoryTokens(entry.warp_token_usage_by_category, PRIMARY_AGENT_CATEGORY) +
-      extractCategoryTokens(entry.byok_token_usage_by_category, PRIMARY_AGENT_CATEGORY)
-    const entryTotal = safeNumber(entry.warp_tokens) + safeNumber(entry.byok_tokens)
-
-    primaryTotal += primaryTokens
-    fallbackTotal += entryTotal
-
-    if (primaryTokens > dominantPrimaryTokens) {
-      dominantPrimaryTokens = primaryTokens
-      dominantModel = typeof entry.model_id === 'string' ? entry.model_id : dominantModel
-    }
-
-    if (dominantPrimaryTokens === 0 && entryTotal > dominantFallbackTokens) {
-      dominantFallbackTokens = entryTotal
-      dominantModel = typeof entry.model_id === 'string' ? entry.model_id : dominantModel
-    }
-  }
-
-  const tokenBudget = primaryTotal > 0 ? primaryTotal : fallbackTotal
-  return { tokenBudget: Math.max(0, Math.round(tokenBudget)), dominantModel: normalizeModel(dominantModel) }
-}
-
-function extractUserMessage(rawInput: string): string {
-  try {
-    const parsed = JSON.parse(rawInput) as unknown
-    if (!Array.isArray(parsed)) return ''
-    for (const item of parsed) {
-      if (!item || typeof item !== 'object') continue
-      const query = (item as { Query?: { text?: unknown } }).Query
-      if (!query || typeof query !== 'object') continue
-      if (typeof query.text === 'string' && query.text.trim()) return query.text
-    }
-    return ''
-  } catch {
-    return ''
-  }
-}
-
-function estimateWeight(rawInput: string): number {
-  const userMessage = extractUserMessage(rawInput)
-  const source = userMessage || rawInput
-  const tokens = estimateTokensFromChars(source.length)
-  return Math.max(1, tokens)
-}
-
-function allocateTokens(weights: number[], tokenBudget: number): number[] {
-  if (weights.length === 0) return []
-  const normalizedWeights = weights.map(w => Math.max(0, Math.round(w)))
-  const totalWeight = normalizedWeights.reduce((sum, weight) => sum + weight, 0)
-  const budget = Math.max(0, Math.round(tokenBudget))
-
-  if (budget === 0) return normalizedWeights.map(() => 0)
-  if (totalWeight === 0) {
-    const even = Math.floor(budget / normalizedWeights.length)
-    const allocated = normalizedWeights.map(() => even)
-    let remainder = budget - even * normalizedWeights.length
-    let index = 0
-    while (remainder > 0) {
-      allocated[index] = (allocated[index] ?? 0) + 1
-      remainder--
-      index = (index + 1) % normalizedWeights.length
-    }
-    return allocated
-  }
-
-  const rawAllocation = normalizedWeights.map(weight => (budget * weight) / totalWeight)
-  const allocated = rawAllocation.map(value => Math.floor(value))
-  let remainder = budget - allocated.reduce((sum, value) => sum + value, 0)
-
-  const byLargestFraction = rawAllocation
-    .map((value, index) => ({ index, fraction: value - Math.floor(value) }))
-    .sort((a, b) => b.fraction - a.fraction)
-
-  let pointer = 0
-  while (remainder > 0 && byLargestFraction.length > 0) {
-    const index = byLargestFraction[pointer]!.index
-    allocated[index] = (allocated[index] ?? 0) + 1
-    remainder--
-    pointer = (pointer + 1) % byLargestFraction.length
-  }
-
-  return allocated
-}
-
-function resolveModelForExchange(exchange: WarpQueryRow, dominantModel: string): string {
-  const candidate =
-    exchange.model_id.trim() ||
-    exchange.coding_model_id.trim() ||
-    exchange.planning_model_id.trim() ||
-    dominantModel ||
-    'warp-auto-efficient'
-  const normalized = normalizeModel(candidate)
-  if ((normalized === 'warp-auto-efficient' || normalized === 'warp-auto-powerful') && dominantModel) {
-    return dominantModel
-  }
-  return normalized
-}
-
-function assignCommandBlocksToExchanges(
-  blocks: WarpBlockRow[],
-  exchanges: ParsedExchange[],
-): Map<string, ExchangeToolInfo> {
-  const toolsByExchange = new Map<string, ExchangeToolInfo>()
-
-  function getOrCreate(exchangeId: string): ExchangeToolInfo {
-    const existing = toolsByExchange.get(exchangeId)
-    if (existing) return existing
-    const created: ExchangeToolInfo = { tools: [], bashCommands: [] }
-    toolsByExchange.set(exchangeId, created)
-    return created
-  }
-
-  for (const block of blocks) {
-    const blockStartMs = parseTimestamp(block.start_ts)
-    if (blockStartMs === null) continue
-
-    let targetExchange: ParsedExchange | null = null
-    for (const exchange of exchanges) {
-      if (exchange.startMs > blockStartMs) break
-      targetExchange = exchange
-    }
-    if (!targetExchange) continue
-
-    const info = getOrCreate(targetExchange.exchange_id)
-    if (!info.tools.includes('Bash')) info.tools.push('Bash')
-
-    const commandText = blobToText(block.stylized_command)
-    for (const command of extractBashCommands(commandText)) {
-      if (!info.bashCommands.includes(command)) info.bashCommands.push(command)
-    }
-  }
-
-  return toolsByExchange
 }
 
 function decodeSourcePath(path: string): { dbPath: string; conversationId: string } {
@@ -312,113 +69,33 @@ function validateSchema(db: SqliteDatabase): boolean {
   }
 }
 
-function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+// Map one rich, cost-free decoder call into the host's ParsedProviderCall. Cost
+// re-enters here: `costBasis: 'estimated'` marks the call so the parser.ts
+// pricing pass fills `costUSD` from the token buckets. Bash base-name
+// extraction (and its `strip-ansi` dependency) stays CLI-side: the core decoder
+// carries the raw command strings; the host reduces them to base names here.
+function toProviderCall(rich: WarpDecodedCall): ParsedProviderCall {
   return {
-    async *parse(): AsyncGenerator<ParsedProviderCall> {
-      if (!isSqliteAvailable()) {
-        process.stderr.write(getSqliteLoadError() + '\n')
-        return
-      }
-
-      const { dbPath, conversationId } = decodeSourcePath(source.path)
-      if (!conversationId) return
-
-      let db: SqliteDatabase
-      try {
-        db = openDatabase(dbPath)
-      } catch (err) {
-        process.stderr.write(`codeburn: cannot open Warp database: ${err instanceof Error ? err.message : err}\n`)
-        return
-      }
-
-      try {
-        if (!validateSchema(db)) return
-
-        const conversations = db.query<WarpConversationRow>(
-          `SELECT conversation_id, conversation_data, last_modified_at
-           FROM agent_conversations
-           WHERE conversation_id = ?
-           LIMIT 1`,
-          [conversationId],
-        )
-        if (conversations.length === 0) return
-
-        const exchanges = db.query<WarpQueryRow>(
-          `SELECT exchange_id, conversation_id, start_ts, input, working_directory, output_status, model_id, planning_model_id, coding_model_id
-           FROM ai_queries
-           WHERE conversation_id = ?
-           ORDER BY start_ts ASC`,
-          [conversationId],
-        )
-
-        const parsedExchanges: ParsedExchange[] = []
-        for (const exchange of exchanges) {
-          if (!isFinalStatus(exchange.output_status)) continue
-          const startMs = parseTimestamp(exchange.start_ts)
-          if (startMs === null) continue
-          parsedExchanges.push({ ...exchange, startMs })
-        }
-        if (parsedExchanges.length === 0) return
-
-        const blocks = db.query<WarpBlockRow>(
-          `SELECT block_id, start_ts, CAST(stylized_command AS BLOB) AS stylized_command
-           FROM blocks
-           WHERE ai_metadata IS NOT NULL
-             AND ai_metadata <> ''
-             AND json_extract(ai_metadata, '$.conversation_id') = ?
-           ORDER BY start_ts ASC`,
-          [conversationId],
-        )
-
-        const { tokenBudget, dominantModel } = extractTokenBudget(conversations[0]!.conversation_data)
-        const weights = parsedExchanges.map(exchange => estimateWeight(exchange.input))
-        const fallbackBudget = weights.reduce((sum, weight) => sum + weight, 0)
-        const allocatedTokens = allocateTokens(weights, tokenBudget > 0 ? tokenBudget : fallbackBudget)
-        const toolsByExchange = assignCommandBlocksToExchanges(blocks, parsedExchanges)
-
-        for (let index = 0; index < parsedExchanges.length; index++) {
-          const exchange = parsedExchanges[index]!
-          const deduplicationKey = `warp:${conversationId}:${exchange.exchange_id}`
-          if (seenKeys.has(deduplicationKey)) continue
-
-          const timestamp = new Date(exchange.startMs).toISOString()
-          const model = resolveModelForExchange(exchange, dominantModel)
-          const inputTokens = allocatedTokens[index] ?? 0
-          const exchangeTools = toolsByExchange.get(exchange.exchange_id) ?? { tools: [], bashCommands: [] }
-          const userMessage = extractUserMessage(exchange.input).slice(0, 500)
-          const projectPath = exchange.working_directory?.trim() || undefined
-          const project = projectPath ? sanitizeProject(projectPath) : source.project
-
-          seenKeys.add(deduplicationKey)
-          yield {
-            provider: 'warp',
-            model,
-            inputTokens,
-            // Warp exposes only conversation-level usage totals in these tables,
-            // so we cannot reliably split per-exchange input vs output tokens.
-            outputTokens: 0,
-            cacheCreationInputTokens: 0,
-            cacheReadInputTokens: 0,
-            cachedInputTokens: 0,
-            reasoningTokens: 0,
-            webSearchRequests: 0,
-            costBasis: 'estimated',
-            costIsEstimated: true,
-            tools: exchangeTools.tools,
-            bashCommands: exchangeTools.bashCommands,
-            timestamp,
-            speed: 'standard',
-            deduplicationKey,
-            userMessage,
-            sessionId: conversationId,
-            project,
-            projectPath,
-          }
-        }
-      } finally {
-        db.close()
-      }
-    },
+    provider: 'warp',
+    model: rich.model,
+    inputTokens: rich.inputTokens,
+    outputTokens: rich.outputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheReadInputTokens: rich.cacheReadInputTokens,
+    cachedInputTokens: rich.cachedInputTokens,
+    reasoningTokens: rich.reasoningTokens,
+    webSearchRequests: rich.webSearchRequests,
+    costBasis: 'estimated',
+    costIsEstimated: true,
+    tools: rich.tools,
+    bashCommands: [...new Set(rich.rawBashCommands.flatMap(c => extractBashCommands(c)))],
+    timestamp: rich.timestamp,
+    speed: rich.speed,
+    deduplicationKey: rich.deduplicationKey,
+    userMessage: rich.userMessage,
+    sessionId: rich.sessionId,
+    project: rich.project,
+    projectPath: rich.projectPath,
   }
 }
 
@@ -467,7 +144,7 @@ async function discoverFromDb(dbPath: string): Promise<SessionSource[]> {
 }
 
 export function createWarpProvider(dbPathOverride?: string): Provider {
-  return {
+  return createBridgedProvider<WarpDecodedCall>({
     name: 'warp',
     displayName: 'Warp',
 
@@ -490,10 +167,71 @@ export function createWarpProvider(dbPathOverride?: string): Provider {
       return sessions
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
-      return createParser(source, seenKeys)
+    // I/O adapter: open the sqlite database host-side, run the conversation +
+    // exchange + block queries, textualize command BLOBs, and return the plain
+    // row objects for the core decoder.
+    async readRecords(source: SessionSource): Promise<unknown[] | null> {
+      if (!isSqliteAvailable()) {
+        process.stderr.write(getSqliteLoadError() + '\n')
+        return null
+      }
+
+      const { dbPath, conversationId } = decodeSourcePath(source.path)
+      if (!conversationId) return null
+
+      let db: SqliteDatabase
+      try {
+        db = openDatabase(dbPath)
+      } catch (err) {
+        process.stderr.write(`codeburn: cannot open Warp database: ${err instanceof Error ? err.message : err}\n`)
+        return null
+      }
+
+      try {
+        if (!validateSchema(db)) return null
+
+        const conversations = db.query<WarpConversationRow>(
+          `SELECT conversation_id, conversation_data, last_modified_at
+           FROM agent_conversations
+           WHERE conversation_id = ?
+           LIMIT 1`,
+          [conversationId],
+        )
+        if (conversations.length === 0) return null
+
+        const exchanges = db.query<WarpQueryRow>(
+          `SELECT exchange_id, conversation_id, start_ts, input, working_directory, output_status, model_id, planning_model_id, coding_model_id
+           FROM ai_queries
+           WHERE conversation_id = ?
+           ORDER BY start_ts ASC`,
+          [conversationId],
+        )
+
+        const rawBlocks = db.query<RawWarpBlockRow>(
+          `SELECT block_id, start_ts, CAST(stylized_command AS BLOB) AS stylized_command
+           FROM blocks
+           WHERE ai_metadata IS NOT NULL
+             AND ai_metadata <> ''
+             AND json_extract(ai_metadata, '$.conversation_id') = ?
+           ORDER BY start_ts ASC`,
+          [conversationId],
+        )
+
+        const blocks: WarpBlockRow[] = rawBlocks.map(block => ({
+          block_id: block.block_id,
+          start_ts: block.start_ts,
+          stylized_command: blobToText(block.stylized_command),
+        }))
+
+        return [{ conversationId, conversation: conversations[0]!, exchanges, blocks, sourceProject: source.project }]
+      } finally {
+        db.close()
+      }
     },
-  }
+
+    decode: decodeWarp,
+    toProviderCall,
+  })
 }
 
 export const warp = createWarpProvider()
