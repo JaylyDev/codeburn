@@ -15,7 +15,7 @@ import {
 } from '@codeburn/core/detectors'
 
 import { readSessionLines, readSessionFileSync } from './fs-utils.js'
-import { getHostPrivacyKey } from './privacy-key.js'
+import { getHostFingerprintKeyId, getHostPrivacyKey } from './privacy-key.js'
 import { discoverAllSessions } from './providers/index.js'
 import { parseJsonlLine, shouldSkipLine } from './parser.js'
 import type { DateRange, ProjectSummary, SessionSummary } from './types.js'
@@ -739,6 +739,7 @@ function buildObservationEnvelope(calls: ToolCall[]): ObservationEnvelope {
   return {
     schemaVersion: OBSERVATION_SCHEMA_VERSION,
     generator: { name: '@codeburn/core', version: 'host' },
+    fingerprints: { algorithm: 'hmac-sha256-128', keyId: getHostFingerprintKeyId() },
     sessions,
   }
 }

@@ -9,11 +9,11 @@
     {
       "kind": "sessions-without-cache-read",
       "count": 3,
-      "sessionRefs": ["a1b2c3d4e5f60718", "0f1e2d3c4b5a6978"]
+      "sessionRefs": ["a1b2c3d4e5f60718a1b2c3d4e5f60718", "0f1e2d3c4b5a69780f1e2d3c4b5a6978"]
     },
     {
       "kind": "affected-resources",
-      "refs": ["deadbeefcafe0011"]
+      "refs": ["deadbeefcafe0011deadbeefcafe0011"]
     }
   ],
   "impactUSD": 4.21

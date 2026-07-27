@@ -3,7 +3,9 @@ import { z } from 'zod'
 import {
   CanonicalToolName,
   CostBasis,
+  FingerprintAlgorithm,
   FingerprintHex,
+  FingerprintKeyId,
   IsoTimestamp,
   NonNegInt,
   NonNegUSD,
@@ -98,6 +100,19 @@ export const ObservationEnvelope = z
       .object({
         name: z.literal('@codeburn/core'),
         version: z.string().min(1),
+      })
+      .strict(),
+    /**
+     * How the refs in this envelope were derived, and under which host key
+     * (schema 0.3.0). Without this a consumer merging two envelopes cannot tell
+     * whether their refs are comparable — refs derived under different privacy
+     * keys are unrelated values that happen to share a shape, and silently
+     * joining them fabricates sessions. Neither field carries the key itself.
+     */
+    fingerprints: z
+      .object({
+        algorithm: FingerprintAlgorithm,
+        keyId: FingerprintKeyId,
       })
       .strict(),
     sessions: z.array(SessionObservation),

@@ -7,8 +7,13 @@ import type { ObservationEnvelope, SessionObservation } from './observations.js'
 /**
  * Finding schema version. 0.x per decision D8: pre-stability, minor bumps may
  * break consumers.
+ *
+ * 0.2.0 tracks the observation layer's move to 128-bit fingerprints: findings
+ * carry refs drawn straight from observations, so widening those refs changes
+ * this wire format too. Re-emitting under the old version would silently
+ * redefine what `finding-0.1.0` means for anyone already validating against it.
  */
-export const FINDING_SCHEMA_VERSION = '0.1.0'
+export const FINDING_SCHEMA_VERSION = '0.2.0'
 
 // ---------------------------------------------------------------------------
 // Decoder contract (types only — implementations live in per-provider packages)

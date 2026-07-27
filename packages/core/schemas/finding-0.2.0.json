@@ -1,0 +1,85 @@
+{
+  "$ref": "#/definitions/Finding",
+  "definitions": {
+    "Finding": {
+      "type": "object",
+      "properties": {
+        "detectorId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "algorithmVersion": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+(?:[-+][0-9A-Za-z.-]+)?$"
+        },
+        "confidence": {
+          "type": "object",
+          "properties": {
+            "score": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "basis": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            }
+          },
+          "required": [
+            "score",
+            "basis"
+          ],
+          "additionalProperties": false
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "refs": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{32}$"
+                }
+              },
+              "sessionRefs": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{32}$"
+                }
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "impactUSD": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "detectorId",
+        "algorithmVersion",
+        "confidence",
+        "evidence"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "$schema": "http://json-schema.org/draft-07/schema#"
+}

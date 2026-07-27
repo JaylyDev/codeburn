@@ -11,7 +11,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
-import { randomBytes } from 'crypto'
+import { createHmac, randomBytes } from 'crypto'
 
 import { getConfigDir } from './config.js'
 
@@ -55,4 +55,21 @@ export function getHostPrivacyKey(): string {
   }
   cached = key
   return cached
+}
+
+/**
+ * A stable, non-secret identifier for the key currently in use (observation
+ * schema 0.3.0 requires envelopes to name it).
+ *
+ * Derived as an HMAC of a fixed label under the key itself, so it is one-way —
+ * publishing the id reveals nothing about the key — while still changing
+ * whenever the key changes. That is exactly the property a consumer needs:
+ * refs from two envelopes are comparable only if their key ids match, and a
+ * rotated key must not silently keep the old id.
+ */
+export function getHostFingerprintKeyId(): string {
+  return createHmac('sha256', getHostPrivacyKey())
+    .update('codeburn:fingerprint-key-id:v1')
+    .digest('hex')
+    .slice(0, 32)
 }

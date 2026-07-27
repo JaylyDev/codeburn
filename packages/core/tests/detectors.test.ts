@@ -13,12 +13,12 @@ import {
 // ── Envelope builders ──────────────────────────────────────────────────────
 
 let idSeq = 0
-function hex16(): string {
+function hex32(): string {
   idSeq++
-  return idSeq.toString(16).padStart(16, '0')
+  return idSeq.toString(16).padStart(32, '0')
 }
 
-function ref(resourceClass: ResourceClassName, resourceId = hex16()): ResourceRef {
+function ref(resourceClass: ResourceClassName, resourceId = hex32()): ResourceRef {
   return { resourceId, resourceClass }
 }
 
@@ -38,19 +38,19 @@ function callWith(fields: Partial<CallObservation>): CallObservation {
   }
 }
 
-// Map a short test label to a stable 16-hex sessionRef (evidence.sessionRefs
+// Map a short test label to a stable 32-hex sessionRef (evidence.sessionRefs
 // must be fingerprints, so a bare 's1' would fail Finding validation).
 const srefs = new Map<string, string>()
 function srefFor(label: string): string {
   let v = srefs.get(label)
-  if (!v) { v = hex16(); srefs.set(label, v) }
+  if (!v) { v = hex32(); srefs.set(label, v) }
   return v
 }
 
 function session(label: string, calls: CallObservation[]): SessionObservation {
   return {
     sessionRef: srefFor(label),
-    projectRef: 'aaaaaaaaaaaaaaaa',
+    projectRef: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     providerId: 'claude',
     startedAt: '2026-07-17T10:00:00.000Z',
     calls,
@@ -60,8 +60,9 @@ function session(label: string, calls: CallObservation[]): SessionObservation {
 
 function envelope(sessions: SessionObservation[]): ObservationEnvelope {
   return {
-    schemaVersion: '0.2.0',
+    schemaVersion: '0.3.0',
     generator: { name: '@codeburn/core', version: '0.0.0-test' },
+    fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
     sessions,
   }
 }
@@ -123,7 +124,7 @@ describe('junkReadsDetector', () => {
 
 describe('duplicateReadsDetector', () => {
   it('sums extra reads of the same file within a session', () => {
-    const id = hex16()
+    const id = hex32()
     const call = callWith({ toolNames: ['Read'], resourceReads: Array.from({ length: 6 }, () => ref('source', id)) })
     const findings = duplicateReadsDetector(envelope([session('s1', [call])]))
     expect(findings).toHaveLength(1)
@@ -132,22 +133,22 @@ describe('duplicateReadsDetector', () => {
   })
 
   it('does not count the same file across different sessions', () => {
-    const id = hex16()
+    const id = hex32()
     const mk = (s: string) => session(s, [callWith({ toolNames: ['Read'], resourceReads: [ref('source', id)] })])
     expect(duplicateReadsDetector(envelope([mk('s1'), mk('s2'), mk('s3')]))).toEqual([])
   })
 
   it('excludes junk-class re-reads', () => {
-    const id = hex16()
+    const id = hex32()
     const call = callWith({ toolNames: ['Read'], resourceReads: Array.from({ length: 10 }, () => ref('dependency', id)) })
     expect(duplicateReadsDetector(envelope([session('s1', [call])]))).toEqual([])
   })
 
   it('is null just below the 5-extra threshold and flags at it (boundary)', () => {
-    const idA = hex16()
+    const idA = hex32()
     const four = callWith({ toolNames: ['Read'], resourceReads: Array.from({ length: 5 }, () => ref('source', idA)) })
     expect(duplicateReadsDetector(envelope([session('s1', [four])]))).toEqual([]) // 4 extras
-    const idB = hex16()
+    const idB = hex32()
     const five = callWith({ toolNames: ['Read'], resourceReads: Array.from({ length: 6 }, () => ref('source', idB)) })
     expect(duplicateReadsDetector(envelope([session('s1', [five])]))).toHaveLength(1) // 5 extras
   })
@@ -197,7 +198,7 @@ describe('detectors registry', () => {
     const env = envelope([
       session('s1', [
         callWith({ toolNames: ['Read'], resourceReads: [ref('dependency'), ref('build'), ref('vcs')] }),
-        callWith({ toolNames: ['Read'], resourceReads: Array.from({ length: 6 }, () => ref('source', 'cccccccccccccccc')) }),
+        callWith({ toolNames: ['Read'], resourceReads: Array.from({ length: 6 }, () => ref('source', 'cccccccccccccccccccccccccccccccc')) }),
         ...Array.from({ length: 5 }, () => callWith({ toolNames: ['Read'] })),
         ...Array.from({ length: 10 }, () => callWith({ toolNames: ['Edit'] })),
       ]),

@@ -234,6 +234,7 @@ describe('vscode-cline rich decode (moved to @codeburn/core)', () => {
     const env = {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
     expect(ObservationEnvelope.safeParse(env).success).toBe(true)

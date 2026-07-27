@@ -7,17 +7,49 @@ import { z } from 'zod'
  * 0.2.0 adds the optional per-call `resourceReads` / `resourceEdits` arrays
  * (ResourceRef). Strictness rules are unchanged: every added field is either a
  * fingerprint or a coarse enum, so the anti-smuggling property still holds.
+ *
+ * 0.3.0 is BREAKING on three counts:
+ *   - every fingerprint widens from 16 to 32 hex chars (64 -> 128 bits);
+ *   - the raw per-call `dedupKey` becomes the fingerprinted `callRef`, closing
+ *     the last field that carried provider-native ids verbatim;
+ *   - envelopes now name the fingerprint algorithm and the host key id, so a
+ *     consumer can tell whether two refs are even comparable.
+ * `provider` / `model` / `pricingModel` also gain length + charset caps.
  */
-export const OBSERVATION_SCHEMA_VERSION = '0.2.0'
+export const OBSERVATION_SCHEMA_VERSION = '0.3.0'
 
 /**
- * A privacy-preserving fingerprint: the first 16 hex chars of an HMAC-SHA256.
- * Modelled as a strict 16-char lowercase-hex string so the schema can only ever
- * carry an opaque ref — never a raw id, path, or branch name (anti-smuggling).
+ * A privacy-preserving fingerprint: the first 32 hex chars (128 bits) of an
+ * HMAC-SHA256. Modelled as a strict 32-char lowercase-hex string so the schema
+ * can only ever carry an opaque ref — never a raw id, path, or branch name
+ * (anti-smuggling).
  */
 export const FingerprintHex = z
   .string()
-  .regex(/^[0-9a-f]{16}$/, 'must be a 16-char lowercase hex fingerprint')
+  .regex(/^[0-9a-f]{32}$/, 'must be a 32-char lowercase hex fingerprint')
+
+/**
+ * Names the fingerprint construction. A closed enum, so it can never carry free
+ * text, and a consumer reading an envelope can tell exactly how the refs were
+ * derived rather than inferring it from their length.
+ */
+export const FingerprintAlgorithm = z.enum(['hmac-sha256-128'])
+export type FingerprintAlgorithm = z.infer<typeof FingerprintAlgorithm>
+
+/**
+ * Identifies WHICH host-managed privacy key produced the refs in an envelope —
+ * it is emphatically NOT the key itself, and core never sees a key id and a key
+ * together in any emitted field. Refs are only comparable across envelopes that
+ * share a key id, so rotating the key must change this value.
+ *
+ * Capped and charset-restricted like every other label, so it cannot become a
+ * smuggling channel.
+ */
+export const FingerprintKeyId = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[A-Za-z0-9_.-]+$/, 'key ids only (no paths, spaces, or free text)')
 
 /** A non-negative integer (token counts, LOC deltas, error counts). */
 export const NonNegInt = z.number().int().nonnegative()

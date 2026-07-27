@@ -83,7 +83,7 @@ describe('displayed paths are host-derived (reverse map), never un-fingerprinted
     const fp = resourceFingerprint(getHostPrivacyKey(), RAW_PATH)
 
     // A well-formed one-way fingerprint (what the core detector actually sees).
-    expect(fp.resourceId).toMatch(/^[0-9a-f]{16}$/)
+    expect(fp.resourceId).toMatch(/^[0-9a-f]{32}$/)
     expect(fp.resourceId).not.toBe(RAW_PATH)
 
     // Host-derived display: the real basename appears...

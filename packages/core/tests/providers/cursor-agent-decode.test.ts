@@ -188,6 +188,7 @@ describe('cursor-agent rich decode (moved to @codeburn/core)', () => {
     const envelope = {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
 

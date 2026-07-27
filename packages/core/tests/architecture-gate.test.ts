@@ -240,7 +240,13 @@ describe('architecture gate: no classification or free text in @codeburn/core so
 
 // Every envelope schema version that has ever shipped. The gate checks all of
 // them, so a retired version can never quietly grow a free-text field either.
-const SCHEMA_FILES = ['observation-0.1.0', 'observation-0.2.0', 'finding-0.1.0'] as const
+const SCHEMA_FILES = [
+  'observation-0.1.0',
+  'observation-0.2.0',
+  'observation-0.3.0',
+  'finding-0.1.0',
+  'finding-0.2.0',
+] as const
 
 type StringField = { path: string; kind: string }
 
@@ -317,6 +323,12 @@ const MACHINE_ID_ALLOWLIST = new Set<string>([
   'observation-0.2.0#ObservationEnvelope/sessions/items/calls/items/model',
   'observation-0.2.0#ObservationEnvelope/sessions/items/calls/items/pricingModel',
   'observation-0.2.0#ObservationEnvelope/sessions/items/calls/items/dedupKey',
+  'observation-0.3.0#ObservationEnvelope/generator/version',
+  'observation-0.3.0#ObservationEnvelope/sessions/items/providerId',
+  'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/provider',
+  'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/model',
+  'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/pricingModel',
+  'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/dedupKey',
 ])
 
 // The complete, frozen surface of string-typed schema properties. Regenerating
@@ -368,6 +380,40 @@ const EXPECTED_STRING_FIELDS: StringField[] = [
   { path: 'finding-0.1.0#Finding/evidence/items/kind', kind: 'maxLength:64' },
   { path: 'finding-0.1.0#Finding/evidence/items/refs/items', kind: 'pattern:^[0-9a-f]{16}$' },
   { path: 'finding-0.1.0#Finding/evidence/items/sessionRefs/items', kind: 'pattern:^[0-9a-f]{16}$' },
+  // observation 0.3.0: every ref widens to 32 hex, and the envelope gains the
+  // two fingerprint-identity fields. Both new fields are bounded (a closed enum
+  // and a charset-capped id), so the anti-smuggling property holds.
+  { path: 'observation-0.3.0#ObservationEnvelope/schemaVersion', kind: 'const:"0.3.0"' },
+  { path: 'observation-0.3.0#ObservationEnvelope/generator/name', kind: 'const:"@codeburn/core"' },
+  { path: 'observation-0.3.0#ObservationEnvelope/generator/version', kind: 'minLength-only:1' },
+  { path: 'observation-0.3.0#ObservationEnvelope/fingerprints/algorithm', kind: 'enum[1]' },
+  { path: 'observation-0.3.0#ObservationEnvelope/fingerprints/keyId', kind: 'pattern:^[A-Za-z0-9_.-]+$' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/sessionRef', kind: 'pattern:^[0-9a-f]{32}$' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/projectRef', kind: 'pattern:^[0-9a-f]{32}$' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/providerId', kind: 'minLength-only:1' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/startedAt', kind: 'format:date-time' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/endedAt', kind: 'format:date-time' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/gitBranchRef', kind: 'pattern:^[0-9a-f]{32}$' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/provider', kind: 'minLength-only:1' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/model', kind: 'minLength-only:1' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/pricingModel', kind: 'minLength-only:1' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/speed', kind: 'enum[2]' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/costBasis', kind: 'enum[2]' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/timestamp', kind: 'format:date-time' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/dedupKey', kind: 'minLength-only:1' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/toolNames/items', kind: 'pattern:^[A-Za-z0-9_.-]+$' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/resourceReads/items/resourceId', kind: 'pattern:^[0-9a-f]{32}$' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/resourceReads/items/resourceClass', kind: 'enum[7]' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/resourceEdits/items/resourceId', kind: 'pattern:^[0-9a-f]{32}$' },
+  { path: 'observation-0.3.0#ObservationEnvelope/sessions/items/calls/items/resourceEdits/items/resourceClass', kind: 'enum[7]' },
+  // finding 0.2.0: identical shape to 0.1.0 except the refs, which widen with
+  // the observation layer they are drawn from.
+  { path: 'finding-0.2.0#Finding/detectorId', kind: 'maxLength:128' },
+  { path: 'finding-0.2.0#Finding/algorithmVersion', kind: 'pattern:^\\d+\\.\\d+\\.\\d+(?:[-+][0-9A-Za-z.-]+)?$' },
+  { path: 'finding-0.2.0#Finding/confidence/basis', kind: 'maxLength:200' },
+  { path: 'finding-0.2.0#Finding/evidence/items/kind', kind: 'maxLength:64' },
+  { path: 'finding-0.2.0#Finding/evidence/items/refs/items', kind: 'pattern:^[0-9a-f]{32}$' },
+  { path: 'finding-0.2.0#Finding/evidence/items/sessionRefs/items', kind: 'pattern:^[0-9a-f]{32}$' },
 ]
 
 describe('architecture gate: envelope schemas carry no free-text-capable field', () => {

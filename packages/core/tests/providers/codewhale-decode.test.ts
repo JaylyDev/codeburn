@@ -136,6 +136,7 @@ describe('codewhale rich decode (moved to @codeburn/core)', () => {
     const envelope = {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
     expect(ObservationEnvelope.safeParse(envelope).success).toBe(true)
@@ -143,6 +144,6 @@ describe('codewhale rich decode (moved to @codeburn/core)', () => {
     const edits = sessions.flatMap(s => s.calls.flatMap(c => c.resourceEdits ?? []))
     expect(reads.length).toBeGreaterThan(0)
     expect(edits.length).toBeGreaterThan(0)
-    for (const ref of [...reads, ...edits]) expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
+    for (const ref of [...reads, ...edits]) expect(ref.resourceId).toMatch(/^[0-9a-f]{32}$/)
   })
 })

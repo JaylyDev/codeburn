@@ -1,19 +1,27 @@
 import { createHmac } from 'node:crypto'
 
 /**
- * All fingerprints are the first 16 hex chars of an HMAC-SHA256 keyed by a
- * caller-supplied `privacyKey` (decision D1: the key is REQUIRED — core never
- * invents or persists one). HMAC-SHA256 is one-way, so a fingerprint cannot be
- * reversed to its input; and because the key is per-host, fingerprints are not
- * comparable across hosts that use different keys.
+ * All fingerprints are the first 32 hex chars (128 bits) of an HMAC-SHA256 keyed
+ * by a caller-supplied `privacyKey` (decision D1: the key is REQUIRED — core
+ * never invents or persists one). HMAC-SHA256 is one-way, so a fingerprint
+ * cannot be reversed to its input; and because the key is per-host,
+ * fingerprints are not comparable across hosts that use different keys.
+ *
+ * The truncation is 128 bits rather than 64 (observation schema 0.3.0). At 64
+ * bits a host holding ~5 billion refs expects a collision by the birthday
+ * bound, and two distinct sessions colliding silently merges their calls. 128
+ * bits puts collision probability below any realistic corpus size.
  *
  * `node:crypto` is pure computation (no I/O), so it is permitted in core.
  */
 
-const FINGERPRINT_LEN = 16
+const FINGERPRINT_LEN = 32
+
+/** Names the algorithm + truncation, stamped onto every envelope. */
+export const FINGERPRINT_ALGORITHM = 'hmac-sha256-128'
 
 /** Domain-separation prefixes so the same string in different roles differs. */
-type Domain = 'session' | 'project' | 'branch' | 'resource'
+type Domain = 'session' | 'project' | 'branch' | 'resource' | 'call'
 
 /** Field separator for composite HMAC inputs (ASCII Unit Separator). */
 const SEP = String.fromCharCode(0x1f)
@@ -133,6 +141,21 @@ export function resourceFingerprint(privacyKey: string, absolutePath: string): R
 /** Fingerprint a session id, scoped to its provider. */
 export function sessionRef(privacyKey: string, provider: string, sessionId: string): string {
   return hmac(privacyKey, 'session', provider, sessionId)
+}
+
+/**
+ * Fingerprint a provider's raw per-call deduplication key, scoped to its
+ * provider.
+ *
+ * Raw dedup keys are built from provider-native ids and routinely embed session
+ * ids, message ids, or record ids (`droid:<sessionId>:<callId>`). Those are the
+ * exact identifiers the observation layer fingerprints everywhere else, so
+ * emitting the raw key would reopen the hole the rest of the layer closes.
+ * Hosts that need to de-duplicate compare `callRef` values instead — the
+ * mapping is stable for a given privacy key, which is all de-duplication needs.
+ */
+export function callRef(privacyKey: string, provider: string, rawDedupKey: string): string {
+  return hmac(privacyKey, 'call', provider, rawDedupKey)
 }
 
 /** Fingerprint a project path (normalised first). */

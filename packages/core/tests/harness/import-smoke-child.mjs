@@ -29,18 +29,19 @@ if (!barrel) {
 
 // Trivial fingerprint (pure crypto, no I/O).
 const ref = barrel.sessionRef('smoke-key', 'claude', 'session-123')
-if (!/^[0-9a-f]{16}$/.test(ref)) {
+if (!/^[0-9a-f]{32}$/.test(ref)) {
   console.error(`import-smoke: unexpected fingerprint ${ref}`)
   process.exit(4)
 }
 
 // Trivial schema parse.
 const env = barrel.parseObservationEnvelope({
-  schemaVersion: '0.2.0',
+  schemaVersion: '0.3.0',
   generator: { name: '@codeburn/core', version: '0.0.0-smoke' },
+  fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'smoke-key' },
   sessions: [],
 })
-if (env.schemaVersion !== '0.2.0') {
+if (env.schemaVersion !== '0.3.0') {
   console.error('import-smoke: parse returned unexpected envelope')
   process.exit(5)
 }

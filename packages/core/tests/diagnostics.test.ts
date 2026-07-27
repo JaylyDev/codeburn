@@ -11,7 +11,7 @@ import type { SessionObservation } from '../src/observations.js'
 
 const fakeSession = (ref: string): SessionObservation => ({
   sessionRef: ref,
-  projectRef: '0000000000000000',
+  projectRef: '00000000000000000000000000000000',
   providerId: 'claude',
   startedAt: '2026-07-17T10:00:00.000Z',
   calls: [],

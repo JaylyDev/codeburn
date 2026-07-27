@@ -33,7 +33,7 @@ const baseFinding = () => ({
   algorithmVersion: '1.0.0',
   confidence: { score: 0.5, basis: 'demo' },
   evidence: [
-    { kind: 'duplicate-reads', count: 7, refs: ['deadbeefcafe0011'], sessionRefs: ['a1b2c3d4e5f60718'] },
+    { kind: 'duplicate-reads', count: 7, refs: ['deadbeefcafe0011deadbeefcafe0011'], sessionRefs: ['a1b2c3d4e5f60718a1b2c3d4e5f60718'] },
     { kind: 'tokens-saved', count: 3500 },
   ],
 })
@@ -93,7 +93,7 @@ describe('Finding contract cannot carry a fix payload (D5-A advisory gate)', () 
       const finding2 = { ...baseFinding(), evidence: [{ kind: 'k', sessionRefs: [bad] }] }
       expect(Finding.safeParse(finding2).success, `sessionRef "${bad}" must be rejected`).toBe(false)
     }
-    const ok = { ...baseFinding(), evidence: [{ kind: 'k', refs: ['0f1e2d3c4b5a6978'] }] }
+    const ok = { ...baseFinding(), evidence: [{ kind: 'k', refs: ['0f1e2d3c4b5a69780f1e2d3c4b5a6978'] }] }
     expect(Finding.safeParse(ok).success).toBe(true)
   })
 

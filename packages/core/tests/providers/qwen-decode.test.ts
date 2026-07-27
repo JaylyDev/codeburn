@@ -100,12 +100,13 @@ describe('qwen rich decode (moved to @codeburn/core)', () => {
     const envelope = {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
     expect(ObservationEnvelope.safeParse(envelope).success).toBe(true)
     // The read_file path is fingerprinted into a resourceRead, never emitted raw.
     const reads = sessions.flatMap(s => s.calls.flatMap(c => c.resourceReads ?? []))
     expect(reads.length).toBeGreaterThan(0)
-    for (const ref of reads) expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
+    for (const ref of reads) expect(ref.resourceId).toMatch(/^[0-9a-f]{32}$/)
   })
 })

@@ -219,6 +219,7 @@ describe('content-smuggling guardrail: real claude decode -> toObservations is s
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -247,7 +248,7 @@ describe('content-smuggling guardrail: real claude decode -> toObservations is s
     const reads = env.sessions.flatMap(s => s.calls.flatMap(c => c.resourceReads ?? []))
     expect(reads.length).toBeGreaterThan(0)
     for (const ref of reads) {
-      expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
+      expect(ref.resourceId).toMatch(/^[0-9a-f]{32}$/)
       expect(typeof ref.resourceClass).toBe('string')
     }
     // The planted absolute path must appear nowhere inside the refs.
@@ -291,6 +292,7 @@ describe('content-smuggling guardrail: real codex decode -> toObservations is se
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -319,7 +321,7 @@ describe('content-smuggling guardrail: real codex decode -> toObservations is se
     const reads = env.sessions.flatMap(s => s.calls.flatMap(c => c.resourceReads ?? []))
     expect(reads.length).toBeGreaterThan(0)
     for (const ref of reads) {
-      expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
+      expect(ref.resourceId).toMatch(/^[0-9a-f]{32}$/)
       expect(typeof ref.resourceClass).toBe('string')
     }
     expect(allStrings(reads)).not.toContain(SECRETS.absPath)
@@ -362,6 +364,7 @@ describe('content-smuggling guardrail: real qwen decode -> toObservations is sec
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -390,7 +393,7 @@ describe('content-smuggling guardrail: real qwen decode -> toObservations is sec
     const reads = env.sessions.flatMap(s => s.calls.flatMap(c => c.resourceReads ?? []))
     expect(reads.length).toBeGreaterThan(0)
     for (const ref of reads) {
-      expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
+      expect(ref.resourceId).toMatch(/^[0-9a-f]{32}$/)
       expect(typeof ref.resourceClass).toBe('string')
     }
     expect(allStrings(reads)).not.toContain(SECRETS.absPath)
@@ -442,6 +445,7 @@ describe('content-smuggling guardrail: real vscode-cline decode -> toObservation
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -524,6 +528,7 @@ describe('content-smuggling guardrail: real grok decode -> toObservations is sec
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -574,6 +579,7 @@ describe('content-smuggling guardrail: real kimi decode -> toObservations is sec
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -637,6 +643,7 @@ describe('content-smuggling guardrail: real codewhale decode -> toObservations i
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -669,7 +676,7 @@ describe('content-smuggling guardrail: real codewhale decode -> toObservations i
     expect(reads.length).toBeGreaterThan(0)
     expect(edits.length).toBeGreaterThan(0)
     for (const ref of [...reads, ...edits]) {
-      expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
+      expect(ref.resourceId).toMatch(/^[0-9a-f]{32}$/)
     }
     expect(allStrings([...reads, ...edits])).not.toContain(SECRETS.absPath)
   })
@@ -706,6 +713,7 @@ describe('content-smuggling guardrail: real codebuff decode -> toObservations is
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -760,6 +768,7 @@ describe('content-smuggling guardrail: real openclaw decode -> toObservations is
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -813,6 +822,7 @@ describe('content-smuggling guardrail: real zed decode -> toObservations is secr
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -871,6 +881,7 @@ describe('content-smuggling guardrail: real forge decode -> toObservations is se
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -936,6 +947,7 @@ describe('content-smuggling guardrail: real goose decode -> toObservations is se
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -963,7 +975,7 @@ describe('content-smuggling guardrail: real goose decode -> toObservations is se
     const env = decodeAndMinimize()
     const reads = env.sessions.flatMap(s => s.calls.flatMap(c => c.resourceReads ?? []))
     expect(reads.length).toBeGreaterThan(0)
-    for (const ref of reads) expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
+    for (const ref of reads) expect(ref.resourceId).toMatch(/^[0-9a-f]{32}$/)
     expect(allStrings(reads)).not.toContain(SECRETS.absPath)
   })
 })
@@ -1029,6 +1041,7 @@ describe('content-smuggling guardrail: real copilot decode -> toObservations is 
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -1113,6 +1126,7 @@ describe('content-smuggling guardrail: real hermes decode -> toObservations is s
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -1141,7 +1155,7 @@ describe('content-smuggling guardrail: real hermes decode -> toObservations is s
     const reads = env.sessions.flatMap(s => s.calls.flatMap(c => c.resourceReads ?? []))
     expect(reads.length).toBeGreaterThan(0)
     for (const ref of reads) {
-      expect(ref.resourceId).toMatch(/^[0-9a-f]{16}$/)
+      expect(ref.resourceId).toMatch(/^[0-9a-f]{32}$/)
       expect(typeof ref.resourceClass).toBe('string')
     }
     expect(allStrings(reads)).not.toContain(SECRETS.absPath)
@@ -1203,6 +1217,7 @@ describe('content-smuggling guardrail: real warp decode -> toObservations is sec
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -1259,6 +1274,7 @@ describe('content-smuggling guardrail: real cursor-agent decode -> toObservation
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -1355,6 +1371,7 @@ describe('content-smuggling guardrail: real quickdesk decode -> toObservations i
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions: observed,
     }
   }
@@ -1420,6 +1437,7 @@ describe('content-smuggling guardrail: real devin decode -> toObservations is se
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -1497,6 +1515,7 @@ describe('content-smuggling guardrail: real opencode-session decode -> toObserva
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -1570,6 +1589,7 @@ describe('content-smuggling guardrail: real mistral-vibe decode -> toObservation
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -1723,6 +1743,7 @@ describe('content-smuggling guardrail: real antigravity decode -> toObservations
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -1847,6 +1868,7 @@ describe('content-smuggling guardrail: real cursor decode -> toObservations is s
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core' as const, version: '0.0.0-test' },
+    fingerprints: { algorithm: 'hmac-sha256-128' as const, keyId: 'test-key' },
       sessions,
     }
   }
@@ -2037,6 +2059,7 @@ describe('content-smuggling guardrail: real kiro decode -> toObservations is sec
       envelope: {
         schemaVersion: OBSERVATION_SCHEMA_VERSION,
         generator: { name: '@codeburn/core', version: '0.0.0-test' },
+        fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
         sessions,
       },
       // Per-vector call counts, so a fixture that silently stops decoding is
@@ -2105,6 +2128,7 @@ describe('content-smuggling guardrail: real vercel-gateway decode -> toObservati
     return {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     }
   }
@@ -2145,6 +2169,7 @@ describe('content-smuggling guardrail: real vercel-gateway decode -> toObservati
     const parsed = ObservationEnvelope.safeParse({
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
       sessions,
     })
     expect(parsed.success).toBe(false)

@@ -12,7 +12,7 @@ import {
 
 const KEY = 'test-privacy-key'
 const KEY2 = 'a-different-key'
-const HEX16 = /^[0-9a-f]{16}$/
+const HEX16 = /^[0-9a-f]{32}$/
 
 describe('fingerprint shape', () => {
   it('every ref is 16 lowercase hex chars', () => {
@@ -68,7 +68,7 @@ describe('non-reversibility (sanity)', () => {
     const secret = 'super-secret-session-id'
     const ref = sessionRef(KEY, 'claude', secret)
     expect(ref).not.toContain(secret)
-    expect(ref.length).toBe(16)
+    expect(ref.length).toBe(32)
   })
 })
 

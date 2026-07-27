@@ -24,14 +24,32 @@ describe('JSON Schema drift', () => {
     })
   }
 
-  // The superseded 0.1.0 observation schema is kept as a FROZEN historical
-  // artifact: it is no longer emitted from the current zod (which is 0.2.0), so
-  // it has no fresh counterpart. Assert it stays pinned at its own version so a
-  // careless re-emit can never overwrite it with 0.2.0 content.
-  it('observation-0.1.0.json remains frozen at schemaVersion 0.1.0', () => {
-    const onDisk = JSON.parse(readFileSync(resolve(schemasDir, 'observation-0.1.0.json'), 'utf8'))
-    const root = onDisk?.definitions?.ObservationEnvelope ?? onDisk
-    expect(root?.properties?.schemaVersion?.const).toBe('0.1.0')
-    expect(Object.keys(fresh)).not.toContain('observation-0.1.0')
+  // Superseded schemas are kept as FROZEN historical artifacts: they are no
+  // longer emitted from the current zod, so they have no fresh counterpart.
+  // Assert each stays pinned at its own version so a careless re-emit can never
+  // overwrite it with current content — a consumer validating against a
+  // published version must keep getting the shape that version promised.
+  const FROZEN: [file: string, version: string, definition: string][] = [
+    ['observation-0.1.0', '0.1.0', 'ObservationEnvelope'],
+    ['observation-0.2.0', '0.2.0', 'ObservationEnvelope'],
+  ]
+
+  for (const [file, version, definition] of FROZEN) {
+    it(`${file}.json remains frozen at schemaVersion ${version}`, () => {
+      const onDisk = JSON.parse(readFileSync(resolve(schemasDir, `${file}.json`), 'utf8'))
+      const root = onDisk?.definitions?.[definition] ?? onDisk
+      expect(root?.properties?.schemaVersion?.const).toBe(version)
+      expect(Object.keys(fresh)).not.toContain(file)
+    })
+  }
+
+  // The finding schema carries no schemaVersion field of its own, so freeze it
+  // by shape instead: 0.1.0 must keep the 64-bit refs it shipped with, and must
+  // no longer be emitted.
+  it('finding-0.1.0.json remains frozen with 16-hex refs', () => {
+    const onDisk = JSON.parse(readFileSync(resolve(schemasDir, 'finding-0.1.0.json'), 'utf8'))
+    const root = onDisk?.definitions?.Finding ?? onDisk
+    expect(root?.properties?.evidence?.items?.properties?.refs?.items?.pattern).toBe('^[0-9a-f]{16}$')
+    expect(Object.keys(fresh)).not.toContain('finding-0.1.0')
   })
 })

@@ -338,6 +338,7 @@ describe('cursor core decode: toObservations minimizes correctly', () => {
     const envelope = {
       schemaVersion: OBSERVATION_SCHEMA_VERSION,
       generator: { name: '@codeburn/core' as const, version: '0.0.0-test' },
+      fingerprints: { algorithm: 'hmac-sha256-128' as const, keyId: 'test-key' },
       sessions,
     }
 
@@ -345,8 +346,8 @@ describe('cursor core decode: toObservations minimizes correctly', () => {
     expect(parsed.success).toBe(true)
 
     const session = parsed.data!.sessions[0]!
-    expect(session.sessionRef).toMatch(/^[0-9a-f]{16}$/)
-    expect(session.projectRef).toMatch(/^[0-9a-f]{16}$/)
+    expect(session.sessionRef).toMatch(/^[0-9a-f]{32}$/)
+    expect(session.projectRef).toMatch(/^[0-9a-f]{32}$/)
     expect(session.calls).toHaveLength(calls.length)
 
     for (let i = 0; i < session.calls.length; i++) {

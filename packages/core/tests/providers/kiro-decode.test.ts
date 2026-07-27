@@ -376,11 +376,12 @@ describe('kiro core decode', () => {
       const envelope = {
         schemaVersion: OBSERVATION_SCHEMA_VERSION,
         generator: { name: '@codeburn/core', version: '0.0.0-test' },
+        fingerprints: { algorithm: 'hmac-sha256-128', keyId: 'test-key' },
         sessions,
       }
       expect(ObservationEnvelope.safeParse(envelope).success).toBe(true)
-      expect(sessions[0]!.sessionRef).toMatch(/^[0-9a-f]{16}$/)
-      expect(sessions[0]!.projectRef).toMatch(/^[0-9a-f]{16}$/)
+      expect(sessions[0]!.sessionRef).toMatch(/^[0-9a-f]{32}$/)
+      expect(sessions[0]!.projectRef).toMatch(/^[0-9a-f]{32}$/)
       expect(sessions[0]!.calls[0]!.turnIndex).toBe(0)
       expect(sessions[0]!.calls[0]!.toolNames).toEqual(['Bash'])
       expect(JSON.stringify(envelope)).not.toContain('SECRET PROMPT')
