@@ -1058,10 +1058,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
                 textAttrs[.foregroundColor] = NSColor.secondaryLabelColor
             }
             composed.append(NSAttributedString(string: valueText, attributes: textAttrs))
+
+            // Combined scope, but a paired device didn't report this cycle: append
+            // a dimmed "reachable/total" so the reduced total reads as "peer
+            // unreachable" rather than a glitch (mirrors the popover's device list).
+            if let shortfall = store.menubarBadgeDeviceShortfall {
+                let marker = " · \(shortfall.reachable)/\(shortfall.total)"
+                let markerAttrs: [NSAttributedString.Key: Any] = [
+                    .font: font,
+                    .baselineOffset: -1.0,
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]
+                composed.append(NSAttributedString(string: marker, attributes: markerAttrs))
+            }
         }
 
         button.attributedTitle = composed
-        button.toolTip = "CodeBurn \(menubarPeriod.menubarMetricLabel)"
+        if let shortfall = store.menubarBadgeDeviceShortfall {
+            button.toolTip = "CodeBurn \(menubarPeriod.menubarMetricLabel) · \(shortfall.reachable) of \(shortfall.total) devices reporting"
+        } else {
+            button.toolTip = "CodeBurn \(menubarPeriod.menubarMetricLabel)"
+        }
 
         persistBadgeStatusFile()
     }

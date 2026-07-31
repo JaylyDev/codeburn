@@ -234,6 +234,63 @@ struct AppStoreRefreshRecoveryTests {
         #expect(store.menubarBadgeCombined?.cost == 75)
     }
 
+    @Test("badge reports a device shortfall when a paired peer is unreachable")
+    func menubarBadgeReportsDeviceShortfall() {
+        let store = AppStore()
+        store.suppressRefreshesForTesting()
+        let period = store.menubarPeriod
+        // Combined payload where only 1 of 2 paired devices reported this cycle
+        // (the peer is asleep/off-network), so the aggregate is degraded to local.
+        let degraded = CombinedUsage(
+            perDevice: [],
+            combined: CombinedUsageTotals(
+                cost: 30,
+                calls: 3,
+                sessions: 2,
+                inputTokens: 100,
+                outputTokens: 50,
+                cacheCreateTokens: 10,
+                cacheReadTokens: 20,
+                totalTokens: 180,
+                deviceCount: 2,
+                reachableCount: 1
+            )
+        )
+        store.setCachedPayloadForTesting(
+            menubarPayload(cost: 30, combined: degraded),
+            scope: .combined,
+            period: period,
+            provider: .all,
+            fetchedAt: Date()
+        )
+        store.selectedScope = .combined
+
+        let shortfall = store.menubarBadgeDeviceShortfall
+        #expect(shortfall?.reachable == 1)
+        #expect(shortfall?.total == 2)
+    }
+
+    @Test("badge reports no shortfall when every paired device reports")
+    func menubarBadgeNoShortfallWhenAllReachable() {
+        let store = AppStore()
+        store.suppressRefreshesForTesting()
+        let period = store.menubarPeriod
+        // combinedUsage() carries deviceCount == reachableCount == 1.
+        store.setCachedPayloadForTesting(
+            menubarPayload(cost: 30, combined: combinedUsage(cost: 30)),
+            scope: .combined,
+            period: period,
+            provider: .all,
+            fetchedAt: Date()
+        )
+        store.selectedScope = .combined
+        #expect(store.menubarBadgeDeviceShortfall == nil)
+
+        // Local scope never reports a shortfall.
+        store.selectedScope = .local
+        #expect(store.menubarBadgeDeviceShortfall == nil)
+    }
+
     @Test("menubar badge falls back to local when no combined payload is cached")
     func menubarBadgeFallsBackWhenCombinedMissing() {
         let store = AppStore()
