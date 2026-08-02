@@ -634,11 +634,18 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
       providers.push({ name: 'claude', displayName: displayNameByName.get('claude') ?? 'Claude', cost: 0 })
     }
   } else if (isAllProviders) {
-    const unfilteredProviderDays = [
-      ...(rangeStartStr <= historicalRangeEndStr ? getDaysInRange(cache, rangeStartStr, historicalRangeEndStr) : []),
-      ...(await getTodayAllDays()).filter(d => d.date >= rangeStartStr && d.date <= rangeEndStr),
-    ]
-    const allDaysForProviders = daysSelection ? unfilteredProviderDays.filter(d => daysSelection.days.has(d.date)) : unfilteredProviderDays
+    // Reuse the day set the headline was built from instead of rebuilding one
+    // straight out of the cache. The rebuilt version unioned unfiltered historical
+    // days with an already-filtered today, so per-provider costs counted every
+    // carried day whole while today honoured --project/--exclude, and the provider
+    // list could not be reconciled with the By Project panel (#865).
+    //
+    // durable.days is that same union, already narrowed by range, day selection and
+    // the project filter, which is what the comment above the buildDurablePeriod
+    // call already promised this section would use. Non-null here: this branch
+    // implies !isClaudeConfigScoped, which forces the !effectivelyScoped path that
+    // assigns it.
+    const allDaysForProviders = cacheDaysForPeriod ?? []
     const providerTotals: Record<string, number> = {}
     for (const d of allDaysForProviders) {
       for (const [name, p] of Object.entries(d.providers)) {
