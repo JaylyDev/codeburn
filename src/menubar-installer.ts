@@ -37,6 +37,32 @@ type ProxyEnv = Partial<Record<'HTTPS_PROXY' | 'https_proxy' | 'HTTP_PROXY' | 'h
 type FetchOptions = Parameters<typeof undiciFetch>[1]
 type HeaderGetter = { get(name: string): string | null }
 
+/// Only the response surface the asset downloads actually touch, so tests can inject a
+/// plain object instead of constructing a full undici Response.
+type FetchLikeResponse = {
+  ok: boolean
+  status: number
+  headers: HeaderGetter
+  body: unknown
+  text(): Promise<string>
+}
+type FetchImpl = (url: string, options?: FetchOptions) => Promise<FetchLikeResponse>
+
+/// Release-asset delivery (github.com -> Azure blob) occasionally returns a transient 5xx or
+/// drops the socket. Three attempts with a short exponential backoff (0.5s, then 1s) rides out
+/// that class of blip while adding at most ~1.5s before a genuinely broken download reports
+/// back — `codeburn menubar` is interactive, so failing fast still matters.
+const ASSET_MAX_ATTEMPTS = 3
+const ASSET_BASE_DELAY_MS = 500
+
+export type AssetFetchOptions = {
+  fetchImpl?: FetchImpl
+  sleep?: (ms: number) => Promise<void>
+  log?: (message: string) => void
+  maxAttempts?: number
+  baseDelayMs?: number
+}
+
 class HttpStatusError extends Error {
   constructor(message: string, readonly status: number) {
     super(message)
@@ -135,7 +161,7 @@ export function formatGitHubReleaseLookupError(status: number, headers?: HeaderG
   return `${base}. ${details.join(' ')}`
 }
 
-function isMissingDirectAssetError(err: unknown): boolean {
+export function isMissingDirectAssetError(err: unknown): boolean {
   return err instanceof HttpStatusError && shouldFallbackToReleaseApi(err.status)
 }
 
@@ -195,19 +221,75 @@ async function fetchLatestReleaseAssets(): Promise<ResolvedAssets> {
   return resolveLatestMenubarReleaseAssets(body)
 }
 
-async function verifyChecksum(archivePath: string, checksumUrl: string): Promise<void> {
-  const response = await fetchWithProxy(checksumUrl, {
-    headers: { 'User-Agent': 'codeburn-menubar-installer' },
-    redirect: 'follow',
-  })
-  if (!response.ok) {
-    throw new HttpStatusError(`Checksum download failed: HTTP ${response.status}`, response.status)
+/// 5xx means "GitHub/the CDN is unhappy right now" and is worth another attempt. 4xx is not:
+/// 404/410 must keep falling through to the release-API path untouched, and a 403/429 rate limit
+/// cannot clear inside a 1.5s backoff window — hammering it would only spend more of the budget,
+/// so those surface immediately with the retry-after hint instead.
+function isTransientStatus(status: number): boolean {
+  return status >= 500 && status <= 599
+}
+
+function formatAssetHttpError(label: string, url: string, response: FetchLikeResponse): string {
+  const base = `${label} failed: HTTP ${response.status} (${url})`
+  if (response.status !== 403 && response.status !== 429) return base
+  const retryAfter = response.headers.get('retry-after')
+  const hint = retryAfter
+    ? `GitHub may be rate limiting this download; retry-after=${retryAfter}.`
+    : 'GitHub may be rate limiting this download.'
+  return `${base}. ${hint}`
+}
+
+/// Fetch a release asset, retrying only transient failures. Returns the successful response;
+/// the caller consumes the body. Every thrown message carries the requested URL so the user can
+/// retry it by hand.
+async function fetchReleaseAsset(url: string, label: string, options: AssetFetchOptions): Promise<FetchLikeResponse> {
+  const doFetch = options.fetchImpl ?? fetchWithProxy
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)))
+  const log = options.log ?? console.log
+  const maxAttempts = options.maxAttempts ?? ASSET_MAX_ATTEMPTS
+  const baseDelayMs = options.baseDelayMs ?? ASSET_BASE_DELAY_MS
+
+  for (let attempt = 1; ; attempt++) {
+    const isLastAttempt = attempt >= maxAttempts
+    const delayMs = baseDelayMs * 2 ** (attempt - 1)
+    let response: FetchLikeResponse
+    try {
+      response = await doFetch(url, {
+        headers: { 'User-Agent': 'codeburn-menubar-installer' },
+        redirect: 'follow',
+      })
+    } catch (err) {
+      // Network-level failure (ECONNRESET / ETIMEDOUT / socket hang up): no status to inspect,
+      // and always transient enough to be worth one more try.
+      const reason = err instanceof Error ? err.message : String(err)
+      if (isLastAttempt) throw new Error(`${label} failed after ${maxAttempts} attempts: ${reason} (${url})`)
+      log(`${label} hit a network error (${reason}), retrying in ${delayMs}ms (attempt ${attempt + 1} of ${maxAttempts})...`)
+      await sleep(delayMs)
+      continue
+    }
+
+    if (response.ok) return response
+    if (!isTransientStatus(response.status) || isLastAttempt) {
+      throw new HttpStatusError(formatAssetHttpError(label, url, response), response.status)
+    }
+    log(`${label} failed with HTTP ${response.status}, retrying in ${delayMs}ms (attempt ${attempt + 1} of ${maxAttempts})...`)
+    await sleep(delayMs)
   }
+}
+
+export async function verifyChecksum(
+  archivePath: string,
+  checksumUrl: string,
+  options: AssetFetchOptions = {},
+): Promise<void> {
+  const response = await fetchReleaseAsset(checksumUrl, 'Checksum download', options)
   const text = await response.text()
   const expected = text.trim().split(/\s+/)[0]!.toLowerCase()
   const fileBytes = await readFile(archivePath)
   const actual = createHash('sha256').update(fileBytes).digest('hex')
   if (actual !== expected) {
+    // Deliberately outside the retry loop: retries cover transport failures only. A digest
+    // mismatch is an integrity failure and must abort immediately, never re-download.
     throw new Error(
       `Checksum mismatch for ${archivePath}.\n` +
       `  Expected: ${expected}\n` +
@@ -217,13 +299,14 @@ async function verifyChecksum(archivePath: string, checksumUrl: string): Promise
   }
 }
 
-async function downloadToFile(url: string, destPath: string): Promise<void> {
-  const response = await fetchWithProxy(url, {
-    headers: { 'User-Agent': 'codeburn-menubar-installer' },
-    redirect: 'follow',
-  })
-  if (!response.ok || response.body === null) {
-    throw new HttpStatusError(`Download failed: HTTP ${response.status}`, response.status)
+export async function downloadToFile(
+  url: string,
+  destPath: string,
+  options: AssetFetchOptions = {},
+): Promise<void> {
+  const response = await fetchReleaseAsset(url, 'Download', options)
+  if (response.body === null) {
+    throw new HttpStatusError(`Download failed: HTTP ${response.status} with an empty body (${url})`, response.status)
   }
   // fetch's ReadableStream needs to be wrapped for Node streams.
   const nodeStream = Readable.fromWeb(response.body as never)
