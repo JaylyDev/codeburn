@@ -202,6 +202,56 @@ struct AppStoreRefreshRecoveryTests {
         #expect(store.payload.combined == nil)
     }
 
+    @Test("menubar badge shows the combined total under combined scope")
+    func menubarBadgeShowsCombinedTotal() {
+        let store = AppStore()
+        store.suppressRefreshesForTesting()
+        let period = store.menubarPeriod
+        // Local badge figure and a higher cross-device combined total, both for
+        // the badge's period.
+        store.setCachedPayloadForTesting(
+            menubarPayload(cost: 30),
+            scope: .local,
+            period: period,
+            provider: .all,
+            fetchedAt: Date()
+        )
+        store.setCachedPayloadForTesting(
+            menubarPayload(cost: 30, combined: combinedUsage(cost: 75)),
+            scope: .combined,
+            period: period,
+            provider: .all,
+            fetchedAt: Date()
+        )
+
+        // Local scope: no combined total, so the badge renders the local figure.
+        store.selectedScope = .local
+        #expect(store.menubarBadgeCombined == nil)
+
+        // Combined scope: the badge total is the cross-device aggregate ($75),
+        // not the local $30 — this is the fix for the badge trailing the popover.
+        store.selectedScope = .combined
+        #expect(store.menubarBadgeCombined?.cost == 75)
+    }
+
+    @Test("menubar badge falls back to local when no combined payload is cached")
+    func menubarBadgeFallsBackWhenCombinedMissing() {
+        let store = AppStore()
+        store.suppressRefreshesForTesting()
+        let period = store.menubarPeriod
+        store.setCachedPayloadForTesting(
+            menubarPayload(cost: 30),
+            scope: .local,
+            period: period,
+            provider: .all,
+            fetchedAt: Date()
+        )
+        // Combined scope selected but no combined payload cached yet (cold cache
+        // or an unreachable peer): the badge must fall back to the local figure.
+        store.selectedScope = .combined
+        #expect(store.menubarBadgeCombined == nil)
+    }
+
     @Test("switching to combined resets selected provider to all")
     func switchingToCombinedResetsSelectedProviderToAll() {
         let store = AppStore()

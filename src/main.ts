@@ -5,6 +5,7 @@ import { exportCsv, exportJson, type PeriodExport } from './export.js'
 import { findUnpricedModels, loadPricing, setModelAliases, setPriceOverrides, setLocalModelSavings, setProxyPaths, normalizeProxyPath } from './models.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
+import { getProvider } from './providers/index.js'
 import { convertCost, formatCost } from './currency.js'
 import { renderStatusBar } from './format.js'
 import { toDateString } from './daily-cache.js'
@@ -46,6 +47,7 @@ import { createRequire } from 'node:module'
 const require = createRequire(import.meta.url)
 const { version } = require('../package.json')
 import { loadCurrency, getCurrency, isValidCurrencyCode } from './currency.js'
+import { CodexThroughputReader, newestCodexSession, renderCodexThroughput } from './codex-throughput.js'
 
 // A downstream reader that closes the pipe early (`| head`, quitting `less`, or
 // a missing command) makes stdout writes fail with EPIPE. Exit cleanly rather
@@ -66,6 +68,22 @@ function parseNumber(value: string): number {
 
 function parseInteger(value: string): number {
   return parseInt(value, 10)
+}
+
+function parseCodexTpsLimit(value: string): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 1 || parsed > 10000) {
+    throw new Error('limit must be an integer from 1 to 10000')
+  }
+  return parsed
+}
+
+function parseCodexTpsWatch(value: string): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 0 || (parsed > 0 && parsed < 1) || parsed > 3600) {
+    throw new Error('watch must be 0 or at least 1 second (up to 3600 seconds)')
+  }
+  return parsed
 }
 
 type PriceOverrideConfig = NonNullable<CodeburnConfig['priceOverrides']>[string]
@@ -497,9 +515,17 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
         if (turn.retries === 0) dailyMap[day].oneShotTurns += 1
       }
       for (const call of turn.assistantCalls) {
-        dailyMap[day].cost += call.costUSD
-        dailyMap[day].savings += call.savingsUSD ?? 0
-        dailyMap[day].calls += 1
+        // Cost/savings/calls bucket under each call's OWN day — the same
+        // per-call rule as the durable day set (day-aggregator.ts), so this
+        // fallback and durable.days never diverge on a midnight-straddling
+        // turn (issue #852). Turn counts/edit stats stay anchored on the
+        // turn's day above. An unparseable call timestamp falls back to the
+        // turn's day rather than producing a garbage date key.
+        const callDay = Number.isNaN(new Date(call.timestamp).getTime()) ? day : dateKey(call.timestamp)
+        if (!dailyMap[callDay]) { dailyMap[callDay] = { cost: 0, savings: 0, calls: 0, turns: 0, editTurns: 0, oneShotTurns: 0 } }
+        dailyMap[callDay].cost += call.costUSD
+        dailyMap[callDay].savings += call.savingsUSD ?? 0
+        dailyMap[callDay].calls += 1
       }
     }
   }
@@ -966,6 +992,7 @@ program
         cacheWriteTokens: durable.data.cacheWriteTokens,
         days: durable.days,
         carriedCostUSD: durable.carriedCostUSD,
+        unattributedCostUSD: durable.unattributedCostUSD,
       },
     }))
   })
@@ -1841,6 +1868,94 @@ program
       return
     }
     await runContextCommand(session, opts)
+  })
+
+program
+  .command('codex-tps [session]')
+  .description('Retrospective Codex generated-tokens/sec estimate from rollout checkpoints (not live decode speed)')
+  .option('--json', 'JSON output')
+  .option('--limit <n>', 'Number of recent checkpoints to scan', parseCodexTpsLimit, 10)
+  .option('--watch <seconds>', 'Refresh continuously while Codex writes checkpoints', parseCodexTpsWatch, 0)
+  .action(async (session: string | undefined, opts: { json?: boolean; limit: number; watch: number }) => {
+    const intervalMs = Math.max(0, opts.watch) * 1000
+    if (opts.json && intervalMs > 0) {
+      process.stderr.write('codeburn codex-tps: --json cannot be combined with --watch; use text watch output or one-shot JSON.\n')
+      process.exitCode = 2
+      return
+    }
+    const provider = await getProvider('codex')
+    if (!provider) {
+      process.stderr.write('codeburn codex-tps: Codex provider is unavailable.\n')
+      process.exitCode = 1
+      return
+    }
+    let cachedPath: string | undefined = session
+    let throughputReader: CodexThroughputReader | undefined
+    let lastFileState: { size: number; mtimeMs: number } | undefined
+    let lastDiscoveryMs = 0
+    let refreshInFlight = false
+    const render = async (): Promise<void> => {
+      if (refreshInFlight) return
+      refreshInFlight = true
+      try {
+        let filePath = session ?? cachedPath
+        // Keep an idle watcher on its chosen rollout. A full active+archive
+        // discovery can be hundreds of milliseconds on large histories, so
+        // only re-scan slowly to notice rotation; disappearance still triggers
+        // an immediate discovery on the next tick.
+        if (!session && (!filePath || Date.now() - lastDiscoveryMs >= 60_000)) {
+          lastDiscoveryMs = Date.now()
+          filePath = await newestCodexSession(await provider.discoverSessions())
+        }
+        if (!filePath) {
+          process.stderr.write('codeburn codex-tps: no Codex rollout sessions found.\n')
+          if (intervalMs === 0) process.exitCode = 1
+          return
+        }
+        const previousPath = cachedPath
+        cachedPath = filePath
+        if (previousPath !== filePath || !throughputReader) throughputReader = new CodexThroughputReader()
+        const fileInfo = await import('node:fs/promises').then(fs => fs.stat(filePath)).catch(() => null)
+        if (!fileInfo) {
+          process.stderr.write(`codeburn codex-tps: session file not found: ${filePath}\n`)
+          if (intervalMs === 0) process.exitCode = 1
+          if (!session) cachedPath = undefined
+          return
+        }
+        if (intervalMs > 0 && lastFileState && fileInfo.size === lastFileState.size && fileInfo.mtimeMs === lastFileState.mtimeMs) return
+        lastFileState = { size: fileInfo.size, mtimeMs: fileInfo.mtimeMs }
+        const points = await throughputReader!.update(filePath, opts.limit, intervalMs === 0)
+        if (opts.json) {
+          process.stdout.write(JSON.stringify({ session: filePath, points, live: intervalMs > 0 }, null, 2) + '\n')
+        } else {
+          if (intervalMs > 0) process.stdout.write('\x1b[2J\x1b[H')
+          process.stdout.write(renderCodexThroughput(points, filePath) + (intervalMs > 0 ? '\nWatching for new Codex checkpoints... (Ctrl-C to stop)\n' : '\n'))
+        }
+      } finally {
+        refreshInFlight = false
+      }
+    }
+    try {
+      await render()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      process.stderr.write(`codeburn codex-tps: refresh failed: ${message}\n`)
+      if (intervalMs === 0) {
+        process.exitCode = 1
+        return
+      }
+    }
+    if (intervalMs > 0) {
+      await new Promise<void>((resolve) => {
+        const timer = setInterval(() => {
+          void render().catch(error => {
+            const message = error instanceof Error ? error.message : String(error)
+            process.stderr.write(`codeburn codex-tps: refresh failed: ${message}\n`)
+          })
+        }, intervalMs)
+        process.once('SIGINT', () => { clearInterval(timer); resolve() })
+      })
+    }
   })
 
 program
