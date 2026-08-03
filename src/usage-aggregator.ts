@@ -422,9 +422,14 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
       liveProjects = daysSelection ? filterProjectsByDays(raw, daysSelection.days) : raw
       scanRange = periodInfo.range
       // A period that reaches today contains today's turns already, so derive the
-      // today slice from the same parse instead of scanning today again.
+      // today slice from the same parse instead of scanning today again. Slice it
+      // to today first (filterProjectsByDays re-anchors a midnight-straddling
+      // turn to its surviving today calls), so today's category / turn count
+      // lands on today rather than staying anchored on the turn's yesterday
+      // start. Otherwise the post-midnight half vanishes from By Activity and the
+      // JSON daily turn count while the per-call cost/calls still bucket to today.
       todayAllDays = rangeEndStr >= todayStr
-        ? aggregateProjectsIntoDays(raw).filter(d => d.date === todayStr)
+        ? aggregateProjectsIntoDays(filterProjectsByDays(raw, new Set([todayStr]))).filter(d => d.date === todayStr)
         : aggregateProjectsIntoDays(fp(await parseAllSessions(todayRange, 'all'))).filter(d => d.date === todayStr)
     }
   } else {
