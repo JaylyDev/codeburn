@@ -83,13 +83,13 @@ function carriedDayWithoutProjects(date: string): DailyEntry {
   return day
 }
 
-async function seedCache(day: DailyEntry): Promise<void> {
+async function seedCache(...days: DailyEntry[]): Promise<void> {
   const cache: DailyCache = {
     version: DAILY_CACHE_VERSION,
     savingsConfigHash: getDailyCacheConfigHash(),
     tzKey: currentTzKey(),
     lastComputedDate: daysAgoStr(1),
-    days: [day],
+    days,
     complete: true,
   }
   await writeFile(join(ROOT, 'cache', `daily-cache.v${DAILY_CACHE_VERSION}.json`), JSON.stringify(cache), 'utf-8')
@@ -100,7 +100,13 @@ async function seedLiveTodaySession(): Promise<void> {
   const projectDir = join(ROOT, 'home', '.claude', 'projects', 'live-proj')
   await mkdir(projectDir, { recursive: true })
   const now = new Date()
-  const at = (h: number, m: number): string => new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0).toISOString()
+  // Timestamps a few minutes OLD, clamped into today: a wall-clock hour (12:00)
+  // is in the future whenever the suite runs before noon, and the periods here
+  // end at `new Date()`, so a fixed hour made the live half of the union vanish
+  // for a morning run. Relative-and-clamped keeps the session inside today and
+  // in the past at every hour.
+  const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const minutesAgo = (m: number): string => new Date(Math.max(midnight, now.getTime() - m * 60_000)).toISOString()
   const line = (id: string, t: string): string => JSON.stringify({
     type: 'assistant',
     timestamp: t,
@@ -111,7 +117,7 @@ async function seedLiveTodaySession(): Promise<void> {
       usage: { input_tokens: 90000, output_tokens: 12000, cache_creation_input_tokens: 0, cache_read_input_tokens: 300000 },
     },
   })
-  await writeFile(join(projectDir, 's-today.jsonl'), [line('m1', at(12, 0)), line('m2', at(12, 30))].join('\n') + '\n', 'utf-8')
+  await writeFile(join(projectDir, 's-today.jsonl'), [line('m1', minutesAgo(10)), line('m2', minutesAgo(5))].join('\n') + '\n', 'utf-8')
 }
 
 /** What the name-filtered live parse alone reports — the By Project panel's source. */
@@ -320,13 +326,18 @@ describe('carried days with no per-project split (pre-v15)', () => {
   })
 
   it('says so in the overview instead of just showing a short total', async () => {
-    await seedCache(carriedDayWithoutProjects(daysAgoStr(10)))
+    // Two cached days: one that cannot be attributed (the footnote's subject) and
+    // one that can. The attributable day keeps the headline non-zero from the
+    // CACHE alone, so the assertion tests the footnote rather than depending on
+    // the live parse to keep renderOverview off its "No usage found" path.
+    await seedCache(carriedDayWithoutProjects(daysAgoStr(10)), carriedDayWithProjects(daysAgoStr(5)))
     await seedLiveTodaySession()
     const range = coveringRange()
 
     clearSessionCache()
     const durable = await buildDurablePeriod({ range, label: 'This month' }, { provider: 'all', exclude: ['drop-me'] })
     expect(durable.unattributedCostUSD).toBeGreaterThan(0)
+    expect(durable.data.cost).toBeGreaterThan(0)
 
     const rendered = renderOverview(durable.liveProjects, {
       label: 'This month',
