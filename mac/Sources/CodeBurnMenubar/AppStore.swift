@@ -271,6 +271,38 @@ final class AppStore {
         cache[menubarStatusKey]?.payload
     }
 
+    private var menubarCombinedKey: PayloadCacheKey {
+        PayloadCacheKey(scope: .combined, period: menubarPeriod, provider: .all, day: nil, claudeConfigSourceId: selectedClaudeConfigSourceId)
+    }
+
+    /// Cross-device totals for the menubar badge's period, used so the badge
+    /// figure matches the popover hero under combined scope. `nil` under local
+    /// scope, or when no combined payload for the badge period is cached yet
+    /// (cold start, or the peer is unreachable) — the badge then falls back to
+    /// the local figure, exactly like the popover.
+    var menubarBadgeCombined: CombinedUsageTotals? {
+        guard effectiveSelectedScope == .combined else { return nil }
+        return cache[menubarCombinedKey]?.payload.combined?.combined
+    }
+
+    /// Refresh the payloads the badge renders for `period`: always the local
+    /// figure, plus the combined cross-device total when combined scope is
+    /// active. Combined is best-effort — a slow or unreachable peer degrades to
+    /// the local figure — so the local fetch alone determines success.
+    @discardableResult
+    func refreshMenubarBadge(period: Period, force: Bool = false, qualityOfService: QualityOfService = .userInitiated) async -> Bool {
+        async let local = refreshQuietly(period: period, force: force, qualityOfService: qualityOfService)
+        guard effectiveSelectedScope == .combined else { return await local }
+        async let combined = refreshQuietly(
+            key: PayloadCacheKey(scope: .combined, period: period, provider: .all, day: nil, claudeConfigSourceId: selectedClaudeConfigSourceId),
+            includeOptimize: false,
+            force: force,
+            qualityOfService: qualityOfService
+        )
+        let (localSucceeded, _) = await (local, combined)
+        return localSucceeded
+    }
+
     /// All-provider payload for the selected period. Used by the tab strip to show
     /// per-provider costs that match the active period, not just today.
     var periodAllPayload: MenubarPayload? {
