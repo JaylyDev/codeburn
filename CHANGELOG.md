@@ -15,6 +15,7 @@
 
 ### Fixed
 - Claude Desktop and Cowork sessions are discovered for Windows Microsoft Store (MSIX) installs. (#611)
+- Cline tasks are discovered in every VS Code variant (VS Code, VS Code Insiders, VSCodium), not just stable VS Code. (#874)
 
 ## 0.9.19 - 2026-07-20
 
