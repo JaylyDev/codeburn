@@ -2,6 +2,8 @@
 
 Cline VS Code extension and Cline home-data task storage.
 
+Sessions from the Cline **command-line** agent use an unrelated layout and are handled by [Cline CLI](cline-cli.md); this provider does not see them.
+
 - **Source:** `src/providers/cline.ts`
 - **Loading:** eager (`src/providers/index.ts:2`)
 - **Test:** `tests/providers/cline.test.ts`

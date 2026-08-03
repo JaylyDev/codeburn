@@ -173,6 +173,7 @@ const TEMP_FILE_MAX_AGE_MS = 5 * 60 * 1000
 
 export const PROVIDER_ENV_VARS: Record<string, string[]> = {
   claude: ['CLAUDE_CONFIG_DIRS', 'CLAUDE_CONFIG_DIR'],
+  'cline-cli': ['CLINE_SESSION_DATA_DIR', 'CLINE_DATA_DIR', 'CLINE_DIR'],
   codewhale: ['CODEWHALE_HOME'],
   codex: ['CODEX_HOME'],
   hermes: ['HERMES_HOME'],
@@ -208,6 +209,10 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // the new optional fields.
   claude: 'advisor-usage-v1-skills-rich-capture-v1-cross-provider-pr-v1',
   cline: 'worktree-project-grouping-v1',
+  // reported-cost-v1: the CLI reports its own per-message cost, so entries
+  // cached before cline-cli joined the reported-cost allowlist in parser.ts
+  // hold costUSD: undefined and get re-priced from tokens on every read.
+  'cline-cli': 'reported-cost-v1',
   codewhale: 'aggregate-session-v1-est-cost',
   // Bump when the Codex parser changes attribution so unchanged, already-cached
   // session files re-parse (session-cache.json serves them without invoking the
