@@ -404,6 +404,54 @@ describe('codex provider - session discovery', () => {
     }
   })
 
+  it('counts a forked rollout whose timestamp is unparseable instead of throwing it to zero', async () => {
+    // A forked session with a garbage (or non-string) timestamp used to make the
+    // fork-cutoff `new Date(NaN).toISOString()` throw RangeError, sinking the
+    // whole session's usage to zero. Same unchecked-JSON.parse class as cwd.
+    await writeSession(tmpDir, '2026-04-14', 'rollout-forked-badts.jsonl', [
+      JSON.stringify({
+        type: 'session_meta',
+        timestamp: 'not-a-real-timestamp',
+        payload: { cwd: '/Users/test/fork', session_id: 'sess-fork', model: 'gpt-5.5', originator: 't3code_desktop', forked_from_id: 'parent-1' },
+      }),
+      tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 100, output: 50 }, total: { total: 150 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const sessions = await provider.discoverSessions()
+    expect(sessions).toHaveLength(1)
+
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(sessions[0]!, new Set()).parse()) calls.push(call)
+    expect(calls.length).toBeGreaterThan(0)
+  })
+
+  it('counts a rollout with a non-string model via the fallback instead of throwing', async () => {
+    // A non-string `model` used to ride sessionModel into calculateCost, which
+    // calls `.replace()` on it -> "model.replace is not a function" -> the whole
+    // session reads zero. It should fall back to a real model and be counted.
+    await writeSession(tmpDir, '2026-04-14', 'rollout-badmodel.jsonl', [
+      JSON.stringify({
+        type: 'session_meta',
+        timestamp: '2026-04-14T10:00:00Z',
+        payload: { cwd: '/Users/test/m', session_id: 'sess-badmodel', model: { name: 'gpt-5.5' }, originator: 't3code_desktop' },
+      }),
+      tokenCount({ last: { input: 100, output: 50 }, total: { total: 150 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const sessions = await provider.discoverSessions()
+    expect(sessions).toHaveLength(1)
+
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(sessions[0]!, new Set()).parse()) calls.push(call)
+    expect(calls.length).toBeGreaterThan(0)
+    for (const call of calls) {
+      expect(typeof call.model).toBe('string')
+      expect(Number.isFinite(call.costUSD)).toBe(true)
+    }
+  })
+
   it('accepts session_meta lines larger than 16 KB (Codex CLI 0.128+)', async () => {
     // Codex CLI 0.128+ embeds the full base_instructions / system prompt in the
     // first session_meta line, often pushing it past 20 KB. Regression guard
