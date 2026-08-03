@@ -62,7 +62,7 @@ struct HeatmapSection: View {
         // their own quota data sources.
         InsightMode.allCases.filter { mode in
             if mode == .plan {
-                return store.selectedProvider == .claude || store.selectedProvider == .codex
+                return store.selectedProvider == .claude || store.selectedProvider == .codex || store.selectedProvider == .kimiCode
             }
             return true
         }
@@ -80,6 +80,8 @@ struct HeatmapSection: View {
         case .plan:
             if store.selectedProvider == .codex {
                 CodexPlanInsight()
+            } else if store.selectedProvider == .kimiCode {
+                KimiPlanInsight()
             } else {
                 PlanInsight(usage: store.subscription)
             }
@@ -2065,7 +2067,7 @@ private struct CodexPlanInsight: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.primary)
                 Spacer()
-                if let resetsAt = (usage.primary ?? usage.secondary)?.resetsAt {
+                if let resetsAt = (usage.primary ?? usage.secondary)?.resetsAt ?? usage.creditLimit?.resetsAt {
                     Text("Resets \(relativeReset(resetsAt))")
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
@@ -2107,6 +2109,26 @@ private struct CodexPlanInsight: View {
                     )
                 }
             }
+            // No rate windows here, so without this row the card is empty.
+            if let credits = usage.creditLimit {
+                UtilizationRow(
+                    label: credits.displayLabel,
+                    percent: credits.usedPercent,
+                    resetsAt: credits.resetsAt,
+                    projection: pace(for: credits)
+                )
+            } else if usage.creditsUnlimited {
+                // Uncapped on purpose, not a failed fetch.
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Credits")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("Unlimited")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
             // Limit-reset credits the account is holding. Hidden at zero so
             // plans that never receive these grants see no extra row.
             if let resets = usage.resetCredits, resets.availableCount > 0 {
@@ -2145,6 +2167,25 @@ private struct CodexPlanInsight: View {
         )
     }
 
+    /// Rate-window pace math over the spend control's calendar month.
+    private func pace(for credits: CodexUsage.CreditLimit) -> WindowProjection? {
+        guard let windowSeconds = credits.windowSeconds,
+              let result = QuotaPace.evaluate(
+                  usedPercent: credits.usedPercent,
+                  resetsAt: credits.resetsAt,
+                  windowSeconds: windowSeconds
+              )
+        else { return nil }
+        return WindowProjection(
+            percent: result.projectedPercent,
+            willOverflow: result.willOverflow,
+            hitsLimitAt: result.hitsLimitAt,
+            source: .linear,
+            deltaPercent: result.deltaPercent,
+            compact: TimeInterval(windowSeconds) <= QuotaPace.etaSuppressionMaxSeconds
+        )
+    }
+
     private func resetCreditsLabel(_ resets: CodexUsage.ResetCredits) -> String {
         let count = "\(resets.availableCount) available"
         guard let next = resets.nextExpiresAt else { return count }
@@ -2155,6 +2196,117 @@ private struct CodexPlanInsight: View {
         let f = RelativeDateTimeFormatter()
         f.unitsStyle = .short
         return f.localizedString(for: date, relativeTo: Date())
+    }
+}
+
+/// Plan tab for Kimi Code. Reads the CLI credential file (no keychain, no
+/// OAuth refresh — tokens are short-lived and only the CLI renews them), so
+/// terminal failure means "run the CLI once to refresh your login".
+private struct KimiPlanInsight: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        Group {
+            switch KimiQuotaPresentation.planContent(loadState: store.kimiLoadState, hasUsage: store.kimiUsage != nil) {
+            case .noCredentials:
+                PlanNoCredentialsView(
+                    title: "No Kimi Code credentials found",
+                    message: "Sign in with the Kimi CLI first. Then click Try Again."
+                ) { Task { await store.bootstrapKimi() } }
+            case .loading:
+                PlanLoadingView(message: "Reading Kimi Code credentials...")
+            case .failed:
+                PlanFailedView(
+                    error: store.kimiError
+                ) { Task { await store.refreshKimi() } }
+            case .transientFailed:
+                PlanFailedView(
+                    error: store.kimiError ?? "Kimi temporarily unreachable — retrying."
+                ) { Task { await store.refreshKimi() } }
+            case let .reconnect(reason):
+                PlanReconnectView(
+                    title: "Refresh Kimi Code login",
+                    reason: reason,
+                    fallback: "Kimi Code tokens are short-lived. Run the Kimi CLI once to refresh your login, then click Reconnect."
+                ) { Task { await store.bootstrapKimi() } }
+            case let .usage(idle):
+                if let usage = store.kimiUsage {
+                    loadedBody(usage: usage, idle: idle)
+                } else {
+                    PlanLoadingView(message: "Reading Kimi Code credentials...")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func loadedBody(usage: KimiUsage, idle: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(usage.plan ?? "Kimi Code")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Spacer()
+                if let resetsAt = usage.primary?.resetsAt {
+                    Text("Resets \(relativeReset(resetsAt))")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if let primary = usage.primary {
+                UtilizationRow(
+                    label: "\(primary.label) window",
+                    percent: primary.usedPercent,
+                    resetsAt: primary.resetsAt,
+                    projection: nil
+                )
+            }
+            ForEach(Array(usage.details.enumerated()), id: \.offset) { _, window in
+                UtilizationRow(
+                    label: "\(window.label) window",
+                    percent: window.usedPercent,
+                    resetsAt: window.resetsAt,
+                    projection: nil
+                )
+            }
+            if let parallel = usage.parallelLimit, parallel > 0 {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Parallel sessions")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(parallel)")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if idle {
+                Text("Login idle. Run the Kimi CLI to refresh.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            if KimiQuotaPresentation.isStale(fetchedAt: usage.fetchedAt) {
+                Text("as of \(shortTime(usage.fetchedAt))")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+    }
+
+    private func relativeReset(_ date: Date) -> String {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .short
+        return f.localizedString(for: date, relativeTo: Date())
+    }
+
+    private func shortTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f.string(from: date)
     }
 }
 
