@@ -187,6 +187,19 @@ function sha256(text: string): string {
   return createHash('sha256').update(Buffer.from(text)).digest('hex')
 }
 
+/** A 200 whose body delivers `chunk`, then errors - a socket dropped mid-download. */
+function droppedStreamResponse(chunk: string, err: Error) {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) { controller.enqueue(new TextEncoder().encode(chunk)) },
+    pull(controller) { controller.error(err) },
+  })
+  return { ok: true, status: 200, headers: { get: () => null }, body, text: async () => chunk }
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  try { await readFile(path); return true } catch { return false }
+}
+
 describe('release asset download retry', () => {
   let sandbox: string
   let sleeps: number[]
@@ -350,5 +363,77 @@ describe('release asset download retry', () => {
 
     expect(calls).toBe(2)
     expect(sleeps).toEqual([10])
+  })
+
+  it('retries a socket dropped mid-download and completes on the next attempt', async () => {
+    const dest = join(sandbox, 'CodeBurnMenubar-v0.9.19.zip')
+    let calls = 0
+
+    await downloadToFile(ZIP_URL, dest, {
+      ...recorder,
+      fetchImpl: async () => {
+        calls++
+        return calls === 1
+          ? droppedStreamResponse('partial', Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }))
+          : httpResponse(200, 'zip-bytes')
+      },
+    })
+
+    expect(calls).toBe(2)
+    expect(await readFile(dest, 'utf8')).toBe('zip-bytes')
+    expect(sleeps).toEqual([500])
+    expect(logs.some(l => l.includes('stream failed'))).toBe(true)
+  })
+
+  it('gives up on a persistent mid-download failure and leaves no partial file behind', async () => {
+    const dest = join(sandbox, 'CodeBurnMenubar-v0.9.19.zip')
+    let calls = 0
+
+    await expect(downloadToFile(ZIP_URL, dest, {
+      ...recorder,
+      fetchImpl: async () => { calls++; return droppedStreamResponse('partial', new Error('socket hang up')) },
+    })).rejects.toThrow(/socket hang up/)
+
+    expect(calls).toBe(3)
+    expect(sleeps).toEqual([500, 1000])
+    expect(await fileExists(dest)).toBe(false)
+  })
+
+  it('retries a 2xx response that arrives with no body', async () => {
+    const dest = join(sandbox, 'CodeBurnMenubar-v0.9.19.zip')
+    let calls = 0
+
+    await downloadToFile(ZIP_URL, dest, {
+      ...recorder,
+      fetchImpl: async () => { calls++; return calls === 1 ? httpResponse(200) : httpResponse(200, 'zip-bytes') },
+    })
+
+    expect(calls).toBe(2)
+    expect(await readFile(dest, 'utf8')).toBe('zip-bytes')
+  })
+
+  it('clamps a non-finite attempt budget to a single attempt instead of looping', async () => {
+    let calls = 0
+
+    await expect(downloadToFile(ZIP_URL, join(sandbox, 'out.zip'), {
+      ...recorder,
+      maxAttempts: Number.POSITIVE_INFINITY,
+      fetchImpl: async () => { calls++; return httpResponse(500) },
+    })).rejects.toThrow(/HTTP 500/)
+
+    expect(calls).toBe(1)
+    expect(sleeps).toEqual([])
+  })
+
+  it('preserves the underlying error as the cause when retries are exhausted', async () => {
+    const original = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })
+    let captured: unknown
+
+    await downloadToFile(ZIP_URL, join(sandbox, 'out.zip'), {
+      ...recorder,
+      fetchImpl: async () => { throw original },
+    }).catch((err: unknown) => { captured = err })
+
+    expect((captured as Error).cause).toBe(original)
   })
 })
