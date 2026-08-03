@@ -632,7 +632,7 @@ describe('defer realized delta', () => {
     const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(off)]) })
 
     const row = report.rows[0]!
-    expect(row.status).toBe('reverted')
+    expect(row.status).toBe('pending')
     expect(row.realizedTokens ?? 0).toBe(0)
     expect(row.note).toMatch(/not yet in effect/)
     expect(report.totalRealizedTokens).toBe(0)
@@ -690,6 +690,44 @@ describe('defer realized delta', () => {
     const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(sessionsAt(5, daysAgo(5), DEFERRED))]) })
     expect(report.rows[0]!.status).toBe('measured')
     expect(report.rows[0]!.realizedTokens).toBe(20_000)
+  })
+
+  it('excludes servers an mcp-remove row already claims, so the two rows never double count', async () => {
+    const actionsDir = await writeJournal([
+      mcpRecord({ baseline: { windowDays: 14, capturedAt: daysAgo(10), estimatedTokens: 10_000, sessions: 5, metrics: { everything: 2000 } } }),
+      deferRecord(),
+    ])
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(sessionsAt(5, daysAgo(5), { mcpInventory: ['mcp__fs-tools__ls'] }))]) })
+
+    const mcpRow = report.rows.find(r => r.kind === 'mcp-remove')!
+    const deferRow = report.rows.find(r => r.kind === 'defer-enable')!
+    expect(mcpRow.status).toBe('measured')
+    expect(mcpRow.realizedTokens).toBe(10_000) // 2000 x 5 saved sessions
+    expect(deferRow.status).toBe('measured')
+    expect(deferRow.realizedTokens).toBe(10_000) // 'fs-tools' only; 'everything' is claimed by the mcp row
+    expect(report.totalRealizedTokens).toBe(20_000) // disjoint sum; without dedup it would be 30_000
+  })
+
+  it('is not measurable when every deferred server is already claimed by an MCP row', async () => {
+    const actionsDir = await writeJournal([
+      mcpRecord({ baseline: { windowDays: 14, capturedAt: daysAgo(10), estimatedTokens: 20_000, sessions: 5, metrics: { everything: 2000, 'fs-tools': 2000 } } }),
+      deferRecord(),
+    ])
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(sessionsAt(5, daysAgo(5)))]) })
+
+    const deferRow = report.rows.find(r => r.kind === 'defer-enable')!
+    expect(deferRow.status).toBe('not-measurable')
+    expect(deferRow.realizedTokens ?? 0).toBe(0)
+    expect(deferRow.note).toMatch(/already measured by an MCP remove\/scope row/)
+  })
+
+  it('surfaces the pending status to --json consumers instead of asserting a revert', async () => {
+    const actionsDir = await writeJournal([deferRecord()])
+    const off = sessionsAt(4, daysAgo(5), { mcpBreakdown: { everything: { calls: 2, savingsUSD: 0, costUSD: 0 } } })
+    const json = buildActReportJson(await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(off)]) })) as { actions: Array<{ status: string; realizedTokens: number | null; note: string }> }
+    expect(json.actions[0]!.status).toBe('pending')
+    expect(json.actions[0]!.realizedTokens).toBeNull()
+    expect(json.actions[0]!.note).toMatch(/not yet in effect/)
   })
 })
 
