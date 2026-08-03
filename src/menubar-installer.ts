@@ -239,19 +239,49 @@ function formatAssetHttpError(label: string, url: string, response: FetchLikeRes
   return `${base}. ${hint}`
 }
 
-/// Fetch a release asset, retrying only transient failures. Returns the successful response;
-/// the caller consumes the body. Every thrown message carries the requested URL so the user can
-/// retry it by hand.
-async function fetchReleaseAsset(url: string, label: string, options: AssetFetchOptions): Promise<FetchLikeResponse> {
+/// Clamp a caller-supplied attempt budget to a finite positive integer. `AssetFetchOptions` is
+/// exported, so a NaN/Infinity/0 slipping through must never turn the loop below into an unbounded
+/// (and, once `2 ** attempt` overflows to a ~1ms setTimeout, tight) retry against the same host.
+function normalizeMaxAttempts(value: number | undefined): number {
+  if (value === undefined) return ASSET_MAX_ATTEMPTS
+  if (!Number.isFinite(value) || value < 1) return 1
+  return Math.floor(value)
+}
+
+/// Release a response's body so undici can return the socket to the pool instead of holding it
+/// open until GC across a run of retries. Best effort: a missing or already-consumed body is fine.
+async function drainBody(response: FetchLikeResponse): Promise<void> {
+  const body = response.body as { cancel?: () => Promise<unknown> } | null
+  try {
+    await body?.cancel?.()
+  } catch {
+    // ignore
+  }
+}
+
+/// Fetch a release asset and hand the successful response to `consume`, retrying only transient
+/// failures: a 5xx, a network-level rejection, or a failure while consuming the body (a socket
+/// dropped mid-download). 4xx is never retried - 404/410 keep routing to the release-API fallback
+/// with their status intact, and a 403/429 rate limit cannot clear inside the backoff window.
+/// `consume` runs inside the retry, so it must clean up after itself on failure (see downloadToFile,
+/// which removes any partial file before re-throwing) and must not fold in an integrity check that
+/// has to fail closed (see verifyChecksum, which compares the digest only after this returns).
+async function fetchReleaseAsset<T>(
+  url: string,
+  label: string,
+  consume: (response: FetchLikeResponse) => Promise<T>,
+  options: AssetFetchOptions,
+): Promise<T> {
   const doFetch = options.fetchImpl ?? fetchWithProxy
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)))
   const log = options.log ?? console.log
-  const maxAttempts = options.maxAttempts ?? ASSET_MAX_ATTEMPTS
+  const maxAttempts = normalizeMaxAttempts(options.maxAttempts)
   const baseDelayMs = options.baseDelayMs ?? ASSET_BASE_DELAY_MS
 
   for (let attempt = 1; ; attempt++) {
     const isLastAttempt = attempt >= maxAttempts
     const delayMs = baseDelayMs * 2 ** (attempt - 1)
+
     let response: FetchLikeResponse
     try {
       response = await doFetch(url, {
@@ -262,18 +292,32 @@ async function fetchReleaseAsset(url: string, label: string, options: AssetFetch
       // Network-level failure (ECONNRESET / ETIMEDOUT / socket hang up): no status to inspect,
       // and always transient enough to be worth one more try.
       const reason = err instanceof Error ? err.message : String(err)
-      if (isLastAttempt) throw new Error(`${label} failed after ${maxAttempts} attempts: ${reason} (${url})`)
+      if (isLastAttempt) throw new Error(`${label} failed after ${maxAttempts} attempts: ${reason} (${url})`, { cause: err })
       log(`${label} hit a network error (${reason}), retrying in ${delayMs}ms (attempt ${attempt + 1} of ${maxAttempts})...`)
       await sleep(delayMs)
       continue
     }
 
-    if (response.ok) return response
-    if (!isTransientStatus(response.status) || isLastAttempt) {
-      throw new HttpStatusError(formatAssetHttpError(label, url, response), response.status)
+    if (!response.ok) {
+      const retryable = isTransientStatus(response.status) && !isLastAttempt
+      await drainBody(response)
+      if (!retryable) throw new HttpStatusError(formatAssetHttpError(label, url, response), response.status)
+      log(`${label} failed with HTTP ${response.status}, retrying in ${delayMs}ms (attempt ${attempt + 1} of ${maxAttempts})...`)
+      await sleep(delayMs)
+      continue
     }
-    log(`${label} failed with HTTP ${response.status}, retrying in ${delayMs}ms (attempt ${attempt + 1} of ${maxAttempts})...`)
-    await sleep(delayMs)
+
+    try {
+      return await consume(response)
+    } catch (err) {
+      // The body did not arrive in full (a dropped socket mid-stream, or a 2xx with no body).
+      // consume has cleaned up any partial artifact, so this is safe to treat as transient.
+      const reason = err instanceof Error ? err.message : String(err)
+      if (isLastAttempt) throw new Error(`${label} failed after ${maxAttempts} attempts: ${reason} (${url})`, { cause: err })
+      log(`${label} stream failed (${reason}), retrying in ${delayMs}ms (attempt ${attempt + 1} of ${maxAttempts})...`)
+      await sleep(delayMs)
+      continue
+    }
   }
 }
 
@@ -282,14 +326,13 @@ export async function verifyChecksum(
   checksumUrl: string,
   options: AssetFetchOptions = {},
 ): Promise<void> {
-  const response = await fetchReleaseAsset(checksumUrl, 'Checksum download', options)
-  const text = await response.text()
+  // Only the transport is retried. The digest comparison below is deliberately outside the retry:
+  // an integrity failure must abort on the first look and never re-download.
+  const text = await fetchReleaseAsset(checksumUrl, 'Checksum download', response => response.text(), options)
   const expected = text.trim().split(/\s+/)[0]!.toLowerCase()
   const fileBytes = await readFile(archivePath)
   const actual = createHash('sha256').update(fileBytes).digest('hex')
   if (actual !== expected) {
-    // Deliberately outside the retry loop: retries cover transport failures only. A digest
-    // mismatch is an integrity failure and must abort immediately, never re-download.
     throw new Error(
       `Checksum mismatch for ${archivePath}.\n` +
       `  Expected: ${expected}\n` +
@@ -304,13 +347,21 @@ export async function downloadToFile(
   destPath: string,
   options: AssetFetchOptions = {},
 ): Promise<void> {
-  const response = await fetchReleaseAsset(url, 'Download', options)
-  if (response.body === null) {
-    throw new HttpStatusError(`Download failed: HTTP ${response.status} with an empty body (${url})`, response.status)
-  }
-  // fetch's ReadableStream needs to be wrapped for Node streams.
-  const nodeStream = Readable.fromWeb(response.body as never)
-  await pipeline(nodeStream, createWriteStream(destPath))
+  await fetchReleaseAsset(url, 'Download', async response => {
+    // A 2xx with no body is the most retryable response there is; throw so the retry picks it up
+    // rather than writing a zero-byte file that verifyChecksum would later reject as a mismatch.
+    if (response.body === null) throw new Error('response had no body')
+    // fetch's ReadableStream needs to be wrapped for Node streams.
+    const nodeStream = Readable.fromWeb(response.body as never)
+    try {
+      await pipeline(nodeStream, createWriteStream(destPath))
+    } catch (err) {
+      // A mid-stream drop leaves a truncated file. Remove it before re-throwing so the retry
+      // starts clean and a genuine failure never leaves a partial artifact behind.
+      await rm(destPath, { force: true }).catch(() => {})
+      throw err
+    }
+  }, options)
 }
 
 async function stageMenubarApp(assets: ResolvedAssets, stagingDir: string): Promise<string> {
