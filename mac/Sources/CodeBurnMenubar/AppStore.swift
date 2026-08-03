@@ -285,6 +285,17 @@ final class AppStore {
         return cache[menubarCombinedKey]?.payload.combined?.combined
     }
 
+    /// `(reachable, total)` only when combined scope is active and fewer paired
+    /// devices reported than are paired — i.e. the badge total is degraded to
+    /// the reachable subset (a peer is asleep/off-network this cycle). The badge
+    /// shows this so a momentary drop to the local figure reads as "peer
+    /// unreachable", not a glitch. `nil` when every paired device reported (or
+    /// there is only one), and under local scope.
+    var menubarBadgeDeviceShortfall: (reachable: Int, total: Int)? {
+        guard let totals = menubarBadgeCombined, totals.reachableCount < totals.deviceCount else { return nil }
+        return (totals.reachableCount, totals.deviceCount)
+    }
+
     /// Refresh the payloads the badge renders for `period`: always the local
     /// figure, plus the combined cross-device total when combined scope is
     /// active. Combined is best-effort — a slow or unreachable peer degrades to
