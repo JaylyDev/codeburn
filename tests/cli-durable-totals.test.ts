@@ -379,6 +379,36 @@ describe('midnight-straddling turn conservation (issue #852)', () => {
     }
   }, 60_000)
 
+  it('reconciles By Activity (categories) and daily turns with the headline on the multi-day all-provider view', async () => {
+    fakeNow()
+    try {
+      await seedStraddlingClaudeTurn()
+      const [costN, costN1] = await truthCosts('claude')
+
+      const range: DateRange = { start: new Date(2026, 6, 27, 0, 0, 0), end: new Date() }
+      clearSessionCache()
+      const durable = await buildDurablePeriod({ range, label: '2d' }, { provider: 'all' })
+
+      // By Activity must sum to the whole-range headline. Before this fix the
+      // today slice came from the unsliced whole-range parse, so the straddling
+      // turn's category stayed anchored on its yesterday start and the
+      // post-midnight half vanished from By Activity while cost / calls / By
+      // Model were already correct; categories summed to only the pre-midnight
+      // cost.
+      const categoryTotal = durable.data.categories.reduce((s, c) => s + c.cost, 0)
+      expect(categoryTotal).toBeCloseTo(costN + costN1, 8)
+      expect(categoryTotal).toBeCloseTo(durable.data.cost, 8)
+
+      // Today's day entry carries its turn's category, not calls>0 with an empty
+      // category map (which rendered as `turns: 0` in the JSON daily rows).
+      const dayN1 = durable.days.find(d => d.date === DAY_N1)
+      expect(dayN1?.calls).toBe(1)
+      expect(Object.keys(dayN1?.categories ?? {}).length).toBeGreaterThan(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  }, 60_000)
+
   it('shows the post-midnight call in the today-only view on the Claude Code path', async () => {
     fakeNow()
     try {
