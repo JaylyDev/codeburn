@@ -93,12 +93,13 @@ function getOmpSessionsDir(override?: string): string {
 // OMP can write a fixed-width title metadata line (`type: "title"`) before the
 // `type: "session"` header (issue #845), and either provider may pad the
 // header with blank lines. Scan a bounded number of leading lines rather than
-// just the first one, and rather than the whole file, so discovery stays cheap
-// even when a file turns out to have no session record at all (a message-only
-// file, or a pathological run of blank/junk lines).
+// just the first one, and rather than the whole file (issue #846 read each
+// transcript in full to reach line 0), so discovery stays cheap even when a
+// file turns out to have no session record at all (a message-only file, or a
+// pathological run of blank/junk lines).
 const MAX_HEADER_LINES_SCANNED = 20
 
-async function readFirstEntry(filePath: string): Promise<PiEntry | null> {
+async function readSessionEntry(filePath: string): Promise<PiEntry | null> {
   let linesScanned = 0
   for await (const line of readSessionLines(filePath)) {
     if (linesScanned >= MAX_HEADER_LINES_SCANNED) break
@@ -143,10 +144,10 @@ async function discoverSessionsInDir(sessionsDir: string, providerName: string):
       const fileStat = await stat(filePath).catch(() => null)
       if (!fileStat?.isFile()) continue
 
-      const first = await readFirstEntry(filePath)
-      if (!first || first.type !== 'session') continue
+      const entry = await readSessionEntry(filePath)
+      if (!entry) continue
 
-      const cwd = first.cwd ?? dirName
+      const cwd = entry.cwd ?? dirName
       sources.push({ path: filePath, project: basename(cwd), provider: providerName })
     }
   }
