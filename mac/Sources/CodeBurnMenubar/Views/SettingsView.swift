@@ -58,6 +58,11 @@ private struct GeneralSettingsTab: View {
     @AppStorage(UsageRefreshCadence.defaultsKey)
     private var usageRefreshSeconds: Int = UsageRefreshCadence.default.rawValue
 
+    // Stored as the raw string so an unrecognised value (older build, manual
+    // `defaults write`) parses back to .terminal instead of failing to decode.
+    @AppStorage(PreferredTerminal.defaultsKey)
+    private var preferredTerminalRaw: String = PreferredTerminal.default.rawValue
+
     private let costPresets: Set<Double> = [25, 50, 100, 200, 500]
     private let tokenPresets: Set<Double> = [1_000_000, 5_000_000, 10_000_000, 25_000_000, 50_000_000, 100_000_000]
 
@@ -145,6 +150,22 @@ private struct GeneralSettingsTab: View {
                 }
                 .pickerStyle(.menu)
                 Text("How often the menubar figure re-reads your local session data. Auto refreshes every 30 seconds while you're plugged in and backs off on battery; Manual only refreshes when you open the popover or click Refresh Now.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Terminal") {
+                Picker("Open commands in", selection: Binding(
+                    get: { PreferredTerminal(rawValue: preferredTerminalRaw) ?? .default },
+                    set: { preferredTerminalRaw = $0.rawValue }
+                )) {
+                    ForEach(PreferredTerminal.allCases) { terminal in
+                        Text(terminal.isInstalled ? terminal.label : "\(terminal.label) (not installed)")
+                            .tag(terminal)
+                    }
+                }
+                .pickerStyle(.menu)
+                Text("Where Full Report and Optimize open. If the chosen app isn't installed CodeBurn falls back to Terminal; if that's missing too the command runs in the background. Only terminals that can script a command into a live window are listed.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
