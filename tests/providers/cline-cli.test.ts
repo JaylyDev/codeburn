@@ -447,6 +447,41 @@ describe('cline-cli provider - rollup fallback', () => {
     expect(calls.reduce((sum, c) => sum + c.inputTokens, 0)).toBe(300)
   })
 
+  it('does not fire the rollup when a duplicated session_id deduped every per-message call', async () => {
+    // A session directory copied on disk: two dirs sharing the same internal
+    // session_id and message ids, the second also carrying a metadata.usage
+    // rollup. The shared dedup suppresses the copy's per-message calls; the
+    // rollup must not then fire and re-count the session. Regression for #894.
+    for (const [dirName, withRollup] of [['aaa', false], ['bbb', true]] as const) {
+      const dir = join(tmpDir, dirName)
+      await mkdir(dir, { recursive: true })
+      const metadata: Record<string, unknown> = {}
+      if (withRollup) metadata['usage'] = { inputTokens: 100, outputTokens: 10, totalCost: 0.01 }
+      await writeFile(join(dir, `${dirName}.json`), JSON.stringify({
+        version: 1, session_id: 'shared', source: 'cli', status: 'completed',
+        provider: 'cline-pass', model: 'z-ai/glm-5.2',
+        cwd: '/Users/dev/work/my-repo', workspace_root: '/Users/dev/work/my-repo',
+        started_at: '2026-08-02T20:04:18.628Z', ended_at: '2026-08-02T20:08:27.768Z',
+        metadata, messages_path: join(dir, `${dirName}.messages.json`),
+      }))
+      await writeFile(join(dir, `${dirName}.messages.json`), JSON.stringify({
+        version: 1, sessionId: 'shared', messages: [{
+          id: 'msg_0', role: 'assistant', content: [{ type: 'text', text: 'a' }],
+          ts: 1785701064304, metrics: { inputTokens: 100, outputTokens: 10, cost: 0.01 },
+          modelInfo: { id: 'z-ai/glm-5.2', provider: 'cline-pass' },
+        }],
+      }))
+    }
+
+    const calls = await collect(tmpDir)
+
+    // Exactly one call (the first copy's msg_0); the copy is deduped and its
+    // rollup declined, so cost stays $0.01 rather than doubling to $0.02.
+    expect(calls).toHaveLength(1)
+    expect(calls.some(c => c.deduplicationKey === 'cline-cli:shared:rollup')).toBe(false)
+    expect(calls.reduce((sum, c) => sum + c.costUSD, 0)).toBeCloseTo(0.01, 7)
+  })
+
   it('keeps a metered $0 rollup reported instead of re-estimating it', async () => {
     await writeSession(tmpDir, 'sess-a', {
       omitMessagesFile: true,
