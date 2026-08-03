@@ -4,7 +4,7 @@ OpenAI Codex CLI.
 
 - **Source:** `src/providers/codex.ts`
 - **Loading:** eager (`src/providers/index.ts:2`)
-- **Test:** `tests/providers/codex.test.ts` (374 lines)
+- **Test:** `tests/providers/codex.test.ts` (1075 lines)
 
 ## Where it reads from
 
@@ -24,7 +24,11 @@ The active-session discovery walk uses strict regex (`^\d{4}$`, `^\d{2}$`) on ea
 
 ## Storage format
 
-JSONL. The first line must be a `session_meta` entry with `payload.originator` starting with `codex` (case-insensitive). Files that fail this check are silently skipped.
+JSONL. Validation of the first line is **structural**: it must parse as JSON, have `type === "session_meta"`, and carry a `payload` that is a plain object (not missing, not a scalar, not an array). Files that fail this check are silently skipped.
+
+`payload.originator` is deliberately **not** part of the check. It is a free-form client identity string, not a format marker: Codex CLI writes `codex-tui` / `codex_exec` / `codex_cli_rs`, Codex Desktop writes `Codex Desktop`, and third-party frontends driving `codex app-server` write their own values (`t3code_desktop`, `JetBrains.IntelliJ IDEA`, ...) into structurally identical rollouts. Gating discovery on the spelling silently dropped those sessions from every report and required a new allowlist entry per client (issues #626, #873). Directory ownership decides the provider instead: `codex.ts` is the only provider that reads `~/.codex`, and the walk only visits `rollout-*.jsonl` under the strict `YYYY/MM/DD` path or `archived_sessions/`. `originator` is still parsed into the session meta entry, but nothing downstream reads it.
+
+Because admission no longer implies a known client, every payload field is treated as untrusted JSON. `payload.cwd` in particular is type-guarded before it reaches `sanitizeProject` (discovery) or `projectPath`/`workingDirectory` (parse): a non-string `cwd` falls back to the `unknown` project instead of throwing out of `discoverSessions`, which `safeDiscoverSessions` would have turned into an empty session list for the *entire* provider.
 
 The first line read is capped at 1 MB (`FIRST_LINE_READ_CAP`). Codex CLI 0.128+ embeds the full system prompt in `session_meta`, which can run 20-27 KB; the cap leaves headroom while bounding memory if a corrupt file has no newline.
 
