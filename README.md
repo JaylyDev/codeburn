@@ -306,6 +306,14 @@ defaults write org.agentseal.codeburn-menubar CodeBurnMenubarRefreshSeconds -int
 
 Seconds between refreshes: `60`, `300`, or `900`; `0` is Manual and `-1` is Auto. Takes effect on the next refresh tick, no relaunch needed.
 
+**Preferred terminal** decides where Full Report and Optimize open. Set it in Settings → General → Terminal, or from Terminal:
+
+```bash
+defaults write org.agentseal.codeburn-menubar CodeBurnPreferredTerminal -string iterm2
+```
+
+Allowed values are `terminal` (macOS Terminal.app, the default) and `iterm2`. Anything else falls back to `terminal`. Only terminals that can script a command into a live window are offered; if the chosen app is missing or fails to accept the command, CodeBurn tries Terminal.app and then runs the command in the background, logging each step to Console.app. Takes effect on the next launch of a command, no relaunch needed.
+
 ### Linux (GNOME)
 
 Linux gets the same ambient view through a GNOME Shell extension (GNOME 45+): spend in the top panel, period switcher, compact mode, and daily budget alerts. It lives in [`gnome/`](gnome/):
