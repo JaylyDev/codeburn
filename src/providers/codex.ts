@@ -554,12 +554,19 @@ async function discoverSessionsInDir(codexDir: string): Promise<SessionSource[]>
   return sources
 }
 
+// The model fields come off an unchecked JSON.parse cast, so a third-party
+// rollout can carry a non-string `model`. It flows straight into calculateCost,
+// which calls `.replace()` on it, so pick the first genuine string and never let
+// a number/object/array through.
+function firstModelString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === 'string' && value) return value
+  }
+  return undefined
+}
+
 function resolveModel(info: CodexEntry['payload'], sessionModel?: string): string {
-  return info?.model
-    ?? info?.info?.model
-    ?? info?.info?.model_name
-    ?? sessionModel
-    ?? 'gpt-5'
+  return firstModelString(info?.model, info?.info?.model, info?.info?.model_name, sessionModel) ?? 'gpt-5'
 }
 
 function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
@@ -640,13 +647,17 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           if (typeof rawSessionCwd === 'string' && rawSessionCwd) sessionCwd = rawSessionCwd
           forkedFromId = entry.payload?.forked_from_id ?? ''
           if (forkedFromId && entry.timestamp) {
-            forkCutoff = new Date(new Date(entry.timestamp).getTime() + 5000).toISOString()
+            // An unparseable timestamp (a garbage string, or a non-string from
+            // the unchecked JSON.parse cast) makes `new Date(NaN).toISOString()`
+            // throw RangeError, which would sink this whole session to zero.
+            const forkBaseMs = new Date(entry.timestamp).getTime()
+            if (Number.isFinite(forkBaseMs)) forkCutoff = new Date(forkBaseMs + 5000).toISOString()
           }
-          sessionModel = entry.payload?.model ?? sessionModel
+          if (typeof entry.payload?.model === 'string') sessionModel = entry.payload.model
           continue
         }
 
-        if (entry.type === 'turn_context' && entry.payload?.model) {
+        if (entry.type === 'turn_context' && typeof entry.payload?.model === 'string') {
           sessionModel = entry.payload.model
           continue
         }
