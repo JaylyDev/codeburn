@@ -3736,15 +3736,26 @@ async function runParse(
       ? { id: s.sourceId, label: s.sourceLabel, path: s.sourcePath, kind: s.sourceKind }
       : undefined,
   }))
+  // Claude is scanned through scanProjectDirs rather than parseProviderSources, so
+  // it needs the same provider-filter guard the durable-orphan loop below applies at
+  // its own level. Without it a --provider <other> run still enters scanProjectDirs
+  // with an empty dirs list, and the orphan pass there (which reads the whole cached
+  // claude section) treats every cached file as "no longer discovered" and re-injects
+  // it into the result. Note this is deliberately NOT a `claudeDirs.length > 0` check:
+  // when claude IS in scope but every transcript has been pruned from disk, that
+  // orphan pass is exactly what keeps PR-attributed spend from vanishing.
+  const claudeInScope = !providerFilter || providerFilter === 'all' || providerFilter === 'claude'
   if (claudeSources.length > 0) emitScanProgress({ kind: 'provider', provider: 'claude', state: 'start' })
   let claudeProjects: ProjectSummary[] = []
-  try {
-    claudeProjects = await scanProjectDirs(claudeDirs, seenMsgIds, diskCache, dateRange, saveProgress, readOnly)
-    if (claudeSources.length > 0) emitScanProgress({ kind: 'provider', provider: 'claude', state: 'done', files: claudeSources.length })
-  } catch (err) {
-    if (!isPermissionError(err)) throw err
-    process.stderr.write(`codeburn: skipped claude data (permission denied; grant Full Disk Access to include it)\n`)
-    emitScanProgress({ kind: 'provider', provider: 'claude', state: 'skipped' })
+  if (claudeInScope) {
+    try {
+      claudeProjects = await scanProjectDirs(claudeDirs, seenMsgIds, diskCache, dateRange, saveProgress, readOnly)
+      if (claudeSources.length > 0) emitScanProgress({ kind: 'provider', provider: 'claude', state: 'done', files: claudeSources.length })
+    } catch (err) {
+      if (!isPermissionError(err)) throw err
+      process.stderr.write(`codeburn: skipped claude data (permission denied; grant Full Disk Access to include it)\n`)
+      emitScanProgress({ kind: 'provider', provider: 'claude', state: 'skipped' })
+    }
   }
 
   const otherProjects: ProjectSummary[] = []
