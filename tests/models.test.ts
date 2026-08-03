@@ -215,6 +215,32 @@ describe('builtin aliases - getShortModelName', () => {
   })
 })
 
+// Codex driving a Kimi backend records the model as `kimi/k3[1m]` (provider
+// prefix + context-length tag). getCanonicalName strips the prefix but the
+// `[1m]` tag used to survive, so it matched no alias and priced to $0 - the
+// Kimi-via-codex spend was silently reported as free.
+describe('codex Kimi context-tag normalization (kimi/k3[1m])', () => {
+  it('prices kimi/k3[1m] the same as canonical kimi-k3 instead of $0', () => {
+    expect(getModelCosts('kimi/k3[1m]')).not.toBeNull()
+    expect(getModelCosts('kimi/k3[1m]')).toEqual(getModelCosts('kimi-k3'))
+    expect(calculateCost('kimi/k3[1m]', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('resolves the bare k3[1m] tag too', () => {
+    expect(getModelCosts('k3[1m]')).toEqual(getModelCosts('kimi-k3'))
+  })
+
+  it('names kimi/k3[1m] as Kimi K3', () => {
+    expect(getShortModelName('kimi/k3[1m]')).toBe('Kimi K3')
+  })
+
+  it('does not strip a non-bracket suffix from an ordinary model id', () => {
+    expect(getShortModelName('gpt-5.5')).toBe('GPT-5.5')
+    expect(getModelCosts('gpt-5.5')).toEqual(getModelCosts('gpt-5.5'))
+    expect(calculateCost('gpt-5.5', 1_000_000, 100_000, 0, 0, 0)).toBeCloseTo(8, 5)
+  })
+})
+
 describe('Antigravity Gemini 3.5 Flash variants resolve to pricing', () => {
   const variants = [
     'gemini-3.5-flash',

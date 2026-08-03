@@ -593,6 +593,7 @@ function getCanonicalName(model: string): string {
     .replace(/@.*$/, '')       // strip pin: claude-sonnet-4-6@20250929 -> claude-sonnet-4-6
     .replace(/-\d{8}$/, '')   // strip date: claude-sonnet-4-20250514 -> claude-sonnet-4
     .replace(/^[^/]+\//, '') // strip provider prefix: anthropic/foo -> foo
+    .replace(/\[[^\]]*\]$/, '') // strip context tag: Codex records Kimi as k3[1m], so kimi/k3[1m] -> k3
 }
 
 function stripKnownPricingVariantSuffix(model: string): string | null {
