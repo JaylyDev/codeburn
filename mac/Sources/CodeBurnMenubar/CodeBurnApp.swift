@@ -120,6 +120,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         // interaction (popover open, wake) refreshes immediately.
 
         restorePersistedCurrency()
+        // #868 experiment: restore only the activation half of the #147 fix.
+        // Packaged builds ship LSUIElement=true, so the policy is .accessory
+        // before main() runs and never transitions (the transition is what
+        // plausibly caused the ghost item). Accessory apps can still activate,
+        // which registers the app with the window server before the status
+        // item is created - the effect #147 actually needed for #146.
+        NSApp.activate(ignoringOtherApps: true)
         setupStatusItem()
         setupPopover()
         observeStore()
