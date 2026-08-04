@@ -89,8 +89,14 @@ async function seedLiveTodaySession(): Promise<void> {
   const projectDir = join(ROOT, 'home', '.claude', 'projects', 'p')
   await mkdir(projectDir, { recursive: true })
   const now = new Date()
-  const ts = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12, 0, 0).toISOString()
-  const ts2 = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12, 30, 0).toISOString()
+  // A couple of hours ago, clamped to never precede midnight nor exceed now, so
+  // the events always land inside today's [midnight, now] window whatever time
+  // the suite runs. A fixed noon literal silently fell outside that window on a
+  // pre-noon run, so the durable today slice (which ends at now) never saw them.
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const base = Math.max(todayStart, now.getTime() - 2 * 60 * 60 * 1000)
+  const ts = new Date(base).toISOString()
+  const ts2 = new Date(Math.min(base + 60_000, now.getTime())).toISOString()
   const line = (id: string, t: string): string => JSON.stringify({
     type: 'assistant',
     timestamp: t,

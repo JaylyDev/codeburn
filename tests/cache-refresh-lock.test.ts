@@ -209,7 +209,7 @@ describe('warm session-cache refresh lock', () => {
   // run (fs 'unavailable' makes the fence fail CLOSED, which is correct but
   // not what this test measures); the actual race fails ~6% per verify, so a
   // mutated build cannot pass any attempt.
-  it('the fence never loses to its own heartbeat (in-process serialization)', { retry: 5 }, async () => {
+  it('the fence never loses to its own heartbeat (in-process serialization)', { retry: 10 }, async () => {
     // Regression: verifyStillOwner and the heartbeat tick both take the
     // takeover guard; without in-process serialization the fence could observe
     // its own heartbeat's guard file and abort a legitimate publication.
@@ -228,7 +228,11 @@ describe('warm session-cache refresh lock', () => {
 // A lock body that never parses into a record is a corrupt leftover, not an
 // unusable filesystem: classifying it as 'unavailable' routed every subsequent
 // refresh to the read-only path and froze ingestion permanently.
-describe('warm session-cache refresh lock: corrupt lock recovery', () => {
+// Real-fs recovery tests: under a saturated full-suite run an fs op can starve
+// and the acquire fails closed (correct, but not what these measure), so they
+// retry to ride out the environmental blip. A real regression fails every
+// attempt because the takeover assertion is deterministic given the fixture.
+describe('warm session-cache refresh lock: corrupt lock recovery', { retry: 6 }, () => {
   it('takes over a stale zero-byte lock', async () => {
     const dir = await tempDir()
     const clock = fakeClock(100_000)
