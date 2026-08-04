@@ -143,15 +143,16 @@ async function createJsonlSession(
   const dir = join(sessionStateDir, sessionId)
   await mkdir(dir, { recursive: true })
   await writeFile(join(dir, 'workspace.yaml'), `id: ${sessionId}\ncwd: /home/user/testproj\n`)
-  // Dated relative to now so the session stays inside the 90-day retention
-  // window whenever the suite runs; a fixed literal silently ages out (these
-  // events were `2026-05-01`, which prunes to zero once now is 90 days past it).
-  const base = Date.now() - 2 * 24 * 60 * 60 * 1000
-  const ts = (offsetSec: number) => new Date(base + offsetSec * 1000).toISOString()
+  // Relative timestamps: fixed calendar dates rot. The original '2026-05-01'
+  // crossed copilot's durable 90-day age-out on 2026-07-30, at which point the
+  // very first parse pruned the freshly-cached session and both durable tests
+  // started failing everywhere with "expected +0 to be 200".
+  const base = Date.now() - 5 * 24 * 60 * 60 * 1000
+  const at = (offsetSec: number): string => new Date(base + offsetSec * 1000).toISOString()
   const lines = [
-    JSON.stringify({ type: 'session.model_change', timestamp: ts(0), data: { newModel: 'gpt-4.1' } }),
-    JSON.stringify({ type: 'user.message', timestamp: ts(5), data: { content: 'hello', interactionId: 'int-1' } }),
-    JSON.stringify({ type: 'assistant.message', timestamp: ts(10), data: { messageId: 'msg-1', outputTokens, interactionId: 'int-1', toolRequests: [] } }),
+    JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: 'gpt-4.1' } }),
+    JSON.stringify({ type: 'user.message', timestamp: at(5), data: { content: 'hello', interactionId: 'int-1' } }),
+    JSON.stringify({ type: 'assistant.message', timestamp: at(10), data: { messageId: 'msg-1', outputTokens, interactionId: 'int-1', toolRequests: [] } }),
   ]
   await writeFile(join(dir, 'events.jsonl'), lines.join('\n') + '\n')
   return join(dir, 'events.jsonl')

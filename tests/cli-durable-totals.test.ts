@@ -89,14 +89,16 @@ async function seedLiveTodaySession(): Promise<void> {
   const projectDir = join(ROOT, 'home', '.claude', 'projects', 'p')
   await mkdir(projectDir, { recursive: true })
   const now = new Date()
-  // A couple of hours ago, clamped to never precede midnight nor exceed now, so
-  // the events always land inside today's [midnight, now] window whatever time
-  // the suite runs. A fixed noon literal silently fell outside that window on a
-  // pre-noon run, so the durable today slice (which ends at now) never saw them.
-  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
-  const base = Math.max(todayStart, now.getTime() - 2 * 60 * 60 * 1000)
-  const ts = new Date(base).toISOString()
-  const ts2 = new Date(Math.min(base + 60_000, now.getTime())).toISOString()
+  // Timestamps a few minutes OLD, clamped into today: a fixed wall-clock hour
+  // (12:00) is in the future whenever the suite runs before noon, and the
+  // instant-granular provider-filtered path drops future calls while the
+  // day-granular all-provider path keeps them, so the parity assertion failed
+  // for every before-noon run (ubuntu CI at 00:17 UTC included). Same fix as
+  // project-filter-durable-totals got in 1596220.
+  const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const minutesAgo = (m: number): string => new Date(Math.max(midnight, now.getTime() - m * 60_000)).toISOString()
+  const ts = minutesAgo(40)
+  const ts2 = minutesAgo(10)
   const line = (id: string, t: string): string => JSON.stringify({
     type: 'assistant',
     timestamp: t,
