@@ -1,0 +1,31 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.13.0
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      # The cache-refresh-lock files exercise a cross-process file lock and are
+      # parallelism-sensitive (they fail under full worker pressure and pass serially -
+      # reproduced repeatedly on unmodified main), so they run in their own serial step
+      # below instead of making every PR roll dice.
+      - name: Test suite (parallel)
+        run: npx vitest run --exclude "tests/cache-refresh-lock*"
+      # Single forked worker, so lock contention comes only from the child processes the
+      # tests spawn deliberately.
+      - name: Cache-lock suite (serial)
+        run: npx vitest run tests/cache-refresh-lock.test.ts tests/cache-refresh-lock-corrupt-body.test.ts tests/cache-refresh-lock-process.test.ts --poolOptions.forks.singleFork=true
