@@ -63,8 +63,13 @@ describe('codeburn status --format menubar-json', () => {
       await mkdir(projectDir, { recursive: true })
 
       const now = new Date()
-      const h = now.getUTCHours()
-      const base = h >= 2 ? new Date(now.getTime() - 2 * 3600_000) : new Date(now.getTime() - h * 3600_000 - 300_000)
+      // Two hours back, clamped inside the current UTC day (runCli pins
+      // TZ=UTC): a plain now-2h leaves today during the first two hours of
+      // the day, and the old hour-guard still escaped into yesterday during
+      // the first five minutes of hours 0 and 1, zeroing every "today" query
+      // on runs that started just past the top of those hours.
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
       const ts1 = base.toISOString().replace(/\.\d+Z$/, 'Z')
       const ts2 = new Date(base.getTime() + 60_000).toISOString().replace(/\.\d+Z$/, 'Z')
       const ts3 = new Date(base.getTime() + 120_000).toISOString().replace(/\.\d+Z$/, 'Z')
@@ -425,8 +430,13 @@ describe('codeburn status --format menubar-json', () => {
       }))
 
       const now = new Date()
-      const h = now.getUTCHours()
-      const base = h >= 2 ? new Date(now.getTime() - 2 * 3600_000) : new Date(now.getTime() - h * 3600_000 - 300_000)
+      // Two hours back, clamped inside the current UTC day (runCli pins
+      // TZ=UTC): a plain now-2h leaves today during the first two hours of
+      // the day, and the old hour-guard still escaped into yesterday during
+      // the first five minutes of hours 0 and 1, zeroing every "today" query
+      // on runs that started just past the top of those hours.
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
       const ts1 = base.toISOString().replace(/\.\d+Z$/, 'Z')
       const ts2 = new Date(base.getTime() + 60_000).toISOString().replace(/\.\d+Z$/, 'Z')
       const ts3 = new Date(base.getTime() + 120_000).toISOString().replace(/\.\d+Z$/, 'Z')
@@ -483,8 +493,13 @@ describe('codeburn status --format menubar-json', () => {
       await mkdir(projectDir, { recursive: true })
 
       const now = new Date()
-      const h = now.getUTCHours()
-      const base = h >= 2 ? new Date(now.getTime() - 2 * 3600_000) : new Date(now.getTime() - h * 3600_000 - 300_000)
+      // Two hours back, clamped inside the current UTC day (runCli pins
+      // TZ=UTC): a plain now-2h leaves today during the first two hours of
+      // the day, and the old hour-guard still escaped into yesterday during
+      // the first five minutes of hours 0 and 1, zeroing every "today" query
+      // on runs that started just past the top of those hours.
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
       const ts1 = base.toISOString().replace(/\.\d+Z$/, 'Z')
       const ts2 = new Date(base.getTime() + 60_000).toISOString().replace(/\.\d+Z$/, 'Z')
 
@@ -641,8 +656,13 @@ describe('codeburn status --format menubar-json', () => {
       const projectDir = join(home, '.claude', 'projects', 'myapp')
       await mkdir(projectDir, { recursive: true })
       const now = new Date()
-      const h = now.getUTCHours()
-      const base = h >= 2 ? new Date(now.getTime() - 2 * 3600_000) : new Date(now.getTime() - h * 3600_000 - 300_000)
+      // Two hours back, clamped inside the current UTC day (runCli pins
+      // TZ=UTC): a plain now-2h leaves today during the first two hours of
+      // the day, and the old hour-guard still escaped into yesterday during
+      // the first five minutes of hours 0 and 1, zeroing every "today" query
+      // on runs that started just past the top of those hours.
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
       const ts1 = base.toISOString().replace(/\.\d+Z$/, 'Z')
       const ts2 = new Date(base.getTime() + 60_000).toISOString().replace(/\.\d+Z$/, 'Z')
       await writeFile(join(projectDir, 'session.jsonl'), [userLine('s1', ts1), assistantLine('s1', ts2, 'msg-1')].join('\n'))
