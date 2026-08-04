@@ -607,34 +607,65 @@ async function retryCacheFileMutation(operation: () => Promise<void>): Promise<b
 // append-only transcripts keep changing. Fixing this properly means
 // multi-file fingerprints per source.
 
+// SQLite database files by extension. Bare-db sources (copilot's
+// agent-traces.db) and the virtual-suffix bases below all match one of these.
+const SQLITE_DB_PATH = /\.(db|sqlite3?|vscdb)$/i
+
+/// Fingerprint a SQLite database file together with its `-wal` sibling.
+///
+/// A database in WAL mode parks committed writes in `<db>-wal`; the main
+/// file's stat only moves on checkpoint, and a long-lived writer connection
+/// (hermes, cursor and opencode keep their state DBs open for the life of
+/// the agent process) can defer checkpoints for hours or days. A fingerprint
+/// built from the main file alone then (a) carries an mtime older than the
+/// newest committed data, so the date-range mtime pre-filter in
+/// parseProviderSources skips the source and sessions committed after the
+/// last checkpoint never parse (issue #913: today's Hermes sessions missing
+/// from every report), and (b) does not change between checkpoints, so
+/// reconcileFile keeps serving stale cached turns for sessions that grew.
+/// Folding the WAL sibling in fixes both: the newest mtime wins, and the
+/// sizes add so both WAL growth and a checkpoint (db grows, wal truncates)
+/// move the fingerprint. `-shm` is deliberately ignored — it mutates on
+/// reads too and would churn the fingerprint without any data change.
+async function fingerprintSqliteFile(dbPath: string): Promise<FileFingerprint | null> {
+  try {
+    const s = await stat(dbPath)
+    const wal = await stat(dbPath + '-wal').catch(() => null)
+    return {
+      dev: s.dev,
+      ino: s.ino,
+      mtimeMs: wal ? Math.max(s.mtimeMs, wal.mtimeMs) : s.mtimeMs,
+      sizeBytes: s.size + (wal?.size ?? 0),
+    }
+  } catch {
+    return null
+  }
+}
+
 export async function fingerprintFile(filePath: string): Promise<FileFingerprint | null> {
   try {
     const s = await stat(filePath)
+    // A source path that IS a SQLite database (copilot OTel's agent-traces.db)
+    // needs the same WAL fold as the virtual-suffix forms below.
+    if (SQLITE_DB_PATH.test(filePath)) return fingerprintSqliteFile(filePath)
     return { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, sizeBytes: s.size }
   } catch {
     // Providers encode extra context into source paths using virtual suffixes:
     // - Cursor: `<dbPath>#cursor-ws=<workspace>` (workspace-aware routing)
     // - OpenCode: `<dbPath>:<sessionId>` (session scoping)
+    // - Hermes: `<dbPath>#hermes-session=<sessionId>` (session scoping)
     // These compound paths don't exist on disk; strip the suffix to stat the
-    // underlying file. Try `#` first (rare in real paths), then `:` (must use
-    // lastIndexOf to tolerate Windows drive letters like C:\...).
+    // underlying database. Try `#` first (rare in real paths), then `:` (must
+    // use lastIndexOf to tolerate Windows drive letters like C:\...).
     const hashIdx = filePath.indexOf('#')
     if (hashIdx > 0) {
-      try {
-        const s = await stat(filePath.slice(0, hashIdx))
-        return { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, sizeBytes: s.size }
-      } catch {
-        // fall through to colon check
-      }
+      const fp = await fingerprintSqliteFile(filePath.slice(0, hashIdx))
+      if (fp) return fp
+      // fall through to colon check
     }
     const colonIdx = filePath.lastIndexOf(':')
     if (colonIdx > 0) {
-      try {
-        const s = await stat(filePath.slice(0, colonIdx))
-        return { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, sizeBytes: s.size }
-      } catch {
-        return null
-      }
+      return fingerprintSqliteFile(filePath.slice(0, colonIdx))
     }
     return null
   }
