@@ -23,8 +23,12 @@ jobs:
       # parallelism-sensitive (they fail under full worker pressure and pass serially -
       # reproduced repeatedly on unmodified main), so they run in their own serial step
       # below instead of making every PR roll dice.
+      # Scoped to tests/: the Electron app's renderer tests under app/ carry
+      # their own vitest config and jsdom dependency (app/node_modules) and
+      # cannot run from the root install - the root default glob picking them
+      # up is exactly what failed run #2 with ERR_MODULE_NOT_FOUND: jsdom.
       - name: Test suite (parallel)
-        run: npx vitest run --exclude "tests/cache-refresh-lock*"
+        run: npx vitest run tests --exclude "tests/cache-refresh-lock*"
       # Single forked worker, so lock contention comes only from the child processes the
       # tests spawn deliberately.
       - name: Cache-lock suite (serial)
