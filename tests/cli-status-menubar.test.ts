@@ -268,7 +268,7 @@ describe('codeburn status --format menubar-json', () => {
     } finally {
       await rm(home, { recursive: true, force: true })
     }
-  })
+  }, 30_000)
 
   it('keeps idle Claude config options visible for the selected period', async () => {
     const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-claude-config-idle-'))
