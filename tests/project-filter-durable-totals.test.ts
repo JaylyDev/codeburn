@@ -4,7 +4,7 @@ import { existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
-import { DAILY_CACHE_VERSION, currentTzKey, type DailyCache, type DailyEntry } from '../src/daily-cache.js'
+import { DAILY_CACHE_VERSION, currentTzKey, type DailyCache, type DailyEntry, type ProjectDayStats, type ProviderDaySlice } from '../src/daily-cache.js'
 import { loadPricing } from '../src/models.js'
 import { buildDurablePeriod, buildMenubarPayloadForRange, buildPeriodData, getDailyCacheConfigHash } from '../src/usage-aggregator.js'
 import { parseAllSessions, filterProjectsByName, clearSessionCache } from '../src/parser.js'
@@ -80,6 +80,34 @@ function carriedDayWithoutProjects(date: string): DailyEntry {
   const day = carriedDayWithProjects(date)
   delete day.projects
   delete day.providers['claude']!.projects
+  return day
+}
+
+/**
+ * A carried day whose two providers own disjoint projects: claude spent only on
+ * `keep-me`, codex only on `drop-me`. Filtering `drop-me` out must therefore take
+ * codex's whole contribution with it, which is what makes the provider list's
+ * project slicing observable.
+ */
+function carriedDayTwoProviders(date: string): DailyEntry {
+  const day = carriedDayWithProjects(date)
+  const keepProjects = { 'keep-me': { cost: KEEP.cost, calls: KEEP.calls, savingsUSD: 0, sessions: KEEP.sessions, path: '/Users/gone/keep-me' } }
+  const dropProjects = { 'drop-me': { cost: DROP.cost, calls: DROP.calls, savingsUSD: 0, sessions: DROP.sessions, path: '/Users/gone/drop-me' } }
+  const slice = (
+    stats: { cost: number; calls: number; sessions: number },
+    projects: Record<string, ProjectDayStats>,
+  ): ProviderDaySlice => ({
+    calls: stats.calls, cost: stats.cost, savingsUSD: 0, sessions: stats.sessions,
+    inputTokens: 2500, outputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0,
+    editTurns: 2, oneShotTurns: 1,
+    models: { 'Opus 4.8': { calls: stats.calls, cost: stats.cost, savingsUSD: 0, inputTokens: 2500, outputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+    categories: { coding: { turns: 5, cost: stats.cost, savingsUSD: 0, editTurns: 2, oneShotTurns: 1 } },
+    projects,
+  })
+  day.providers = {
+    claude: slice(KEEP, keepProjects),
+    codex: slice(DROP, dropProjects),
+  }
   return day
 }
 
@@ -275,6 +303,36 @@ describe('durable headline honours --project / --exclude on carried days', () =>
     expect(menubar.current.cost).toBe(durable.data.cost)
     expect(menubar.current.calls).toBe(durable.data.calls)
     expect(menubar.current.inputTokens).toBe(durable.data.inputTokens)
+  })
+
+  it('slices the provider list by the project filter so it reconciles with the headline', async () => {
+    await seedCache(carriedDayTwoProviders(daysAgoStr(10)))
+    const range = coveringRange()
+
+    clearSessionCache()
+    const menubar = await buildMenubarPayloadForRange({ range, label: 'p' }, { provider: 'all', exclude: ['drop-me'], optimize: false, timeline: false })
+
+    const providers = menubar.current.providers
+    const providerSum = Object.values(providers).reduce((a, b) => a + b, 0)
+
+    // The headline already honours the filter; the provider list used to be built
+    // from unfiltered cache days, so it kept reporting codex's excluded spend.
+    expect(menubar.current.cost).toBeCloseTo(KEEP.cost, 6)
+    expect(providerSum).toBeCloseTo(menubar.current.cost, 6)
+    expect(providers['claude']).toBeCloseTo(KEEP.cost, 6)
+    expect(providers['codex'] ?? 0).toBeCloseTo(0, 6)
+  })
+
+  it('leaves the provider list untouched when no project filter is given', async () => {
+    await seedCache(carriedDayTwoProviders(daysAgoStr(10)))
+    const range = coveringRange()
+
+    clearSessionCache()
+    const menubar = await buildMenubarPayloadForRange({ range, label: 'p' }, { provider: 'all', optimize: false, timeline: false })
+
+    expect(menubar.current.providers['claude']).toBeCloseTo(KEEP.cost, 6)
+    expect(menubar.current.providers['codex']).toBeCloseTo(DROP.cost, 6)
+    expect(menubar.current.cost).toBeCloseTo(DAY_COST, 6)
   })
 
   it('leaves the unfiltered headline exactly as it was', async () => {
