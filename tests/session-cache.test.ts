@@ -6,6 +6,7 @@ import { basename, join } from 'path'
 
 import {
   CACHE_VERSION,
+  PROVIDER_ENV_VARS,
   type CachedCall,
   type CachedFile,
   type CachedTurn,
@@ -362,18 +363,44 @@ describe('provider env overrides invalidate the fingerprint (#920)', () => {
   // declaring any CODEBURN_COPILOT_* var would force a re-parse that destroys
   // conversations Copilot has since pruned from the DB, which only the cache
   // still holds. The fingerprint must therefore NOT move when one is set.
-  // This reads as intent, not as an oversight.
-  it('does not move the copilot fingerprint when CODEBURN_COPILOT_OTEL_DB is set (deliberately undeclared)', () => {
-    const prev = process.env['CODEBURN_COPILOT_OTEL_DB']
-    try {
-      const before = computeEnvFingerprint('copilot')
-      process.env['CODEBURN_COPILOT_OTEL_DB'] = '/tmp/codeburn-copilot-otel'
-      expect(computeEnvFingerprint('copilot')).toBe(before)
-      delete process.env['CODEBURN_COPILOT_OTEL_DB']
-      expect(computeEnvFingerprint('copilot')).toBe(before)
-    } finally {
-      if (prev === undefined) delete process.env['CODEBURN_COPILOT_OTEL_DB']
-      else process.env['CODEBURN_COPILOT_OTEL_DB'] = prev
+  // This reads as intent, not as an oversight — and the assertions below pin
+  // the WHOLE invariant (no entry at all, plus every one of the nine deferred
+  // reads), so a future "completing" edit fails a test instead of silently
+  // re-opening the durable history-loss path.
+  describe('copilot is deliberately undeclared in PROVIDER_ENV_VARS', () => {
+    it('has no PROVIDER_ENV_VARS entry at all', () => {
+      expect(PROVIDER_ENV_VARS['copilot']).toBeUndefined()
+    })
+
+    // The nine reads copilot.ts performs whose declaration is deferred (each
+    // is allowlisted in tests/provider-env-declarations.test.ts): setting any
+    // of them must leave the copilot fingerprint untouched.
+    const DEFERRED_COPILOT_VARS = [
+      'CODEBURN_COPILOT_SESSION_STATE_DIR',
+      'CODEBURN_COPILOT_OTEL_DB',
+      'CODEBURN_COPILOT_JETBRAINS_DIR',
+      'CODEBURN_COPILOT_WS_STORAGE_DIR',
+      'CODEBURN_COPILOT_GLOBAL_STORAGE_DIR',
+      'CODEBURN_COPILOT_DISABLE_OTEL',
+      'APPDATA',
+      'LOCALAPPDATA',
+      'XDG_CONFIG_HOME',
+    ]
+
+    for (const varName of DEFERRED_COPILOT_VARS) {
+      it(`does not move the copilot fingerprint when ${varName} is set (deliberately undeclared)`, () => {
+        const prev = process.env[varName]
+        try {
+          const before = computeEnvFingerprint('copilot')
+          process.env[varName] = `/tmp/codeburn-copilot-920/${varName}`
+          expect(computeEnvFingerprint('copilot')).toBe(before)
+          delete process.env[varName]
+          expect(computeEnvFingerprint('copilot')).toBe(before)
+        } finally {
+          if (prev === undefined) delete process.env[varName]
+          else process.env[varName] = prev
+        }
+      })
     }
   })
 })
