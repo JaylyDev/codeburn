@@ -5,6 +5,12 @@
 // sessions parse but is not fingerprinted means the cache section survives
 // the change and serves silently stale numbers, exactly the defect class #920
 // reported (nine providers slipped through it).
+//
+// Scoping rule for the allowlist: an entry is keyed '<file>.ts:<VAR>' and
+// silences exactly one var in exactly one file. The same var read in any
+// other file is checked against the declarations like every other read, so an
+// entry can never mask a second file's undeclared read — the failure mode the
+// original global-keyed allowlist had (Ruling 4 of lane 04).
 import { describe, expect, it } from 'vitest'
 import { readdirSync, readFileSync } from 'fs'
 import { dirname, join } from 'path'
@@ -30,8 +36,7 @@ const FILE_PROVIDERS: Record<string, string[]> = {
   'droid.ts': ['droid'],
   'hermes.ts': ['hermes'],
   'lingtai-tui.ts': ['lingtai-tui'],
-  // Its only literal read is CODEBURN_CURSOR_MAX_BUBBLES (cursor.ts:692);
-  // XDG_DATA_HOME is declared for cursor but not read literally in this file.
+  // Its only literal read is CODEBURN_CURSOR_MAX_BUBBLES (cursor.ts:692).
   'cursor.ts': ['cursor'],
   // The ENV_DIR const (open-design.ts:10) resolves to CODEBURN_OPEN_DESIGN_DIR.
   'open-design.ts': ['open-design'],
@@ -55,25 +60,41 @@ const FILE_PROVIDERS: Record<string, string[]> = {
   // opencode.ts. Its single read (CODEBURN_VERBOSE) is allowlisted, so this
   // entry is informational — but required, because the file has reads.
   'sqlite-session-parser.ts': ['kilo-code', 'opencode'],
-  // Registered (lazy) network provider; its credential reads are allowlisted
-  // (see below) because network sources are re-fetched on every run.
+  // Registered (lazy) network provider; its credential reads are declared in
+  // PROVIDER_ENV_VARS (session-cache.ts) so a read-only refresh that serves
+  // the cached report (parser.ts:2875/2888) cannot keep serving the previous
+  // account's usage after a swap.
   'vercel-gateway.ts': ['vercel-gateway'],
 }
 
 // ── Allowlisted reads ────────────────────────────────────────────────────
 // Reads that must NOT invalidate a cache section, one-line reason each.
-// If you add an entry here, the guard goes silent for that var — so the
-// reason must say exactly why a change to it cannot make a cached section
-// stale.
+// Scoping rule: a key is '<file>.ts:<VAR>' — it silences exactly one var in
+// exactly one file, and a read of the same var anywhere else is still checked
+// against the declarations (see the header comment). If you add an entry here,
+// the guard goes silent for that var in that file — the reason must say
+// exactly why a change to it cannot make a cached section stale.
+// Reason shared by every copilot.ts entry (Ruling 1 of lane 04): copilot is
+// deliberately undeclared in PROVIDER_ENV_VARS. Declaring any of its reads
+// would change the copilot fingerprint, and on a fingerprint change
+// getOrCreateProviderSection (src/parser.ts:2650) keeps only cached entries
+// whose source path no longer exists — but OTel discovery returns one source
+// per DB file ({ path: dbPath }, copilot.ts:1935) and that DB keeps existing,
+// so the cached entry is dropped and re-parsed, destroying conversations
+// Copilot has since pruned from the DB that only the cache still holds.
+// Deferred until the durable carry-forward learns to merge instead of drop.
+const COPILOT_DEFERRED = 'deferred (Ruling 1): declaring it would force the durable re-parse that loses pruned OTel history'
 const ALLOWLIST: Record<string, string> = {
-  CODEBURN_VERBOSE: 'sqlite-session-parser.ts:276 — logging verbosity only; changes no discovered path and no parsed value',
-  // vercel-gateway is a registered (lazy) provider — not "not a provider" —
-  // but it is network:true (vercel-gateway.ts:123): its single synthetic
-  // source is re-fetched on every run and never served from the cached
-  // section, because parser.ts:2888 short-circuits network providers past the
-  // fingerprint compare. No fingerprint of it can therefore go stale.
-  AI_GATEWAY_API_KEY: 'vercel-gateway.ts:20 — network credential; parser.ts:2888 re-fetches every run',
-  VERCEL_OIDC_TOKEN: 'vercel-gateway.ts:20 — network credential; parser.ts:2888 re-fetches every run',
+  'sqlite-session-parser.ts:CODEBURN_VERBOSE': 'sqlite-session-parser.ts:276 — logging verbosity only; changes no discovered path and no parsed value',
+  'copilot.ts:CODEBURN_COPILOT_SESSION_STATE_DIR': COPILOT_DEFERRED,
+  'copilot.ts:CODEBURN_COPILOT_OTEL_DB': COPILOT_DEFERRED,
+  'copilot.ts:CODEBURN_COPILOT_JETBRAINS_DIR': COPILOT_DEFERRED,
+  'copilot.ts:CODEBURN_COPILOT_WS_STORAGE_DIR': COPILOT_DEFERRED,
+  'copilot.ts:CODEBURN_COPILOT_GLOBAL_STORAGE_DIR': COPILOT_DEFERRED,
+  'copilot.ts:CODEBURN_COPILOT_DISABLE_OTEL': COPILOT_DEFERRED,
+  'copilot.ts:APPDATA': COPILOT_DEFERRED,
+  'copilot.ts:XDG_CONFIG_HOME': COPILOT_DEFERRED,
+  'copilot.ts:LOCALAPPDATA': COPILOT_DEFERRED,
 }
 
 // ── Static extraction ───────────────────────────────────────────────────
@@ -166,11 +187,14 @@ describe('provider env declarations (#920)', () => {
       }
 
       for (const { varName, line } of reads) {
-        if (ALLOWLIST[varName]) continue
+        // File-scoped: an allowlist entry silences this var in this file only
+        // (see the header comment); a read of the same var in another file
+        // must be declared or allowlisted there.
+        if (ALLOWLIST[`${entry.name}:${varName}`]) continue
         for (const provider of served) {
           if (!(PROVIDER_ENV_VARS[provider] ?? []).includes(varName)) {
             problems.push(
-              `provider '${provider}' reads process.env['${varName}'] at src/providers/${entry.name}:${line} but it is not declared in PROVIDER_ENV_VARS['${provider}'] — declare it there (it changes what the provider discovers or how its sessions parse) or add it to ALLOWLIST with a reason.`,
+              `provider '${provider}' reads process.env['${varName}'] at src/providers/${entry.name}:${line} but it is not declared in PROVIDER_ENV_VARS['${provider}'] — declare it there (it changes what the provider discovers or how its sessions parse) or add '${entry.name}:${varName}' to ALLOWLIST with a reason.`,
             )
           }
         }
@@ -191,6 +215,38 @@ describe('provider env declarations (#920)', () => {
         problems.push(`PROVIDER_ENV_VARS key '${key}' is not a registered provider name — a typo'd key declares nothing and fails silently.`)
       }
     }
+    failWith(problems)
+    expect(problems).toEqual([])
+  })
+
+  it('allowlist entries are file-scoped: every key is <file>.ts:<VAR> shaped, names a real file, and names a var that file actually reads', () => {
+    const problems: string[] = []
+    const providerFiles = new Set(
+      readdirSync(PROVIDERS_DIR, { withFileTypes: true })
+        .filter(e => e.isFile() && e.name.endsWith('.ts'))
+        .map(e => e.name),
+    )
+
+    for (const key of Object.keys(ALLOWLIST)) {
+      const match = /^([A-Za-z0-9._-]+\.ts):([A-Z0-9_]+)$/.exec(key)
+      if (!match) {
+        // A global-keyed entry would mask an undeclared read of the same var
+        // in any other file (the pre-lane-04 failure mode). Reject it here so
+        // the scoping rule is enforced, not just documented.
+        problems.push(`ALLOWLIST key '${key}' is not '<file>.ts:<VAR>' shaped — an allowlist entry must silence exactly one var in exactly one file.`)
+        continue
+      }
+      const [, fileName, varName] = match
+      if (!providerFiles.has(fileName!)) {
+        problems.push(`ALLOWLIST key '${key}' names '${fileName}', which is not a file in src/providers — the entry silences nothing and must be removed.`)
+        continue
+      }
+      const { reads } = extractEnvReads(readFileSync(join(PROVIDERS_DIR, fileName!), 'utf8'))
+      if (!reads.some(r => r.varName === varName)) {
+        problems.push(`ALLOWLIST key '${key}' names var '${varName}' but src/providers/${fileName} never reads it — dead entry; remove it.`)
+      }
+    }
+
     failWith(problems)
     expect(problems).toEqual([])
   })

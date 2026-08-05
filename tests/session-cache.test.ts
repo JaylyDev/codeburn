@@ -338,6 +338,44 @@ describe('provider env overrides invalidate the fingerprint (#920)', () => {
       expect(computeEnvFingerprint(provider)).toBe(unset)
     })
   }
+
+  it('changes the vercel-gateway fingerprint when AI_GATEWAY_API_KEY is set', () => {
+    const prev = process.env['AI_GATEWAY_API_KEY']
+    try {
+      const unset = computeEnvFingerprint('vercel-gateway')
+      process.env['AI_GATEWAY_API_KEY'] = 'sk-live-secret-abc'
+      const set = computeEnvFingerprint('vercel-gateway')
+      expect(set).not.toBe(unset)
+      delete process.env['AI_GATEWAY_API_KEY']
+      expect(computeEnvFingerprint('vercel-gateway')).toBe(unset)
+    } finally {
+      if (prev === undefined) delete process.env['AI_GATEWAY_API_KEY']
+      else process.env['AI_GATEWAY_API_KEY'] = prev
+    }
+  })
+
+  // Copilot is deliberately NOT declared in PROVIDER_ENV_VARS (Ruling 1 of
+  // lane 04): its OTel discovery returns one source per DB file
+  // ({ path: dbPath }, src/providers/copilot.ts:1935), and the durable
+  // carry-forward in getOrCreateProviderSection (src/parser.ts:2650) drops
+  // every cached entry whose source still exists on a fingerprint change — so
+  // declaring any CODEBURN_COPILOT_* var would force a re-parse that destroys
+  // conversations Copilot has since pruned from the DB, which only the cache
+  // still holds. The fingerprint must therefore NOT move when one is set.
+  // This reads as intent, not as an oversight.
+  it('does not move the copilot fingerprint when CODEBURN_COPILOT_OTEL_DB is set (deliberately undeclared)', () => {
+    const prev = process.env['CODEBURN_COPILOT_OTEL_DB']
+    try {
+      const before = computeEnvFingerprint('copilot')
+      process.env['CODEBURN_COPILOT_OTEL_DB'] = '/tmp/codeburn-copilot-otel'
+      expect(computeEnvFingerprint('copilot')).toBe(before)
+      delete process.env['CODEBURN_COPILOT_OTEL_DB']
+      expect(computeEnvFingerprint('copilot')).toBe(before)
+    } finally {
+      if (prev === undefined) delete process.env['CODEBURN_COPILOT_OTEL_DB']
+      else process.env['CODEBURN_COPILOT_OTEL_DB'] = prev
+    }
+  })
 })
 
 // ── fingerprintFile ────────────────────────────────────────────────────

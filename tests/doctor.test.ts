@@ -5,6 +5,7 @@ import { tmpdir } from 'os'
 
 import { collectDoctorReport, renderDoctorTable, renderDoctorJson } from '../src/doctor.js'
 import { createCodexProvider } from '../src/providers/codex.js'
+import { createOpenCodeProvider } from '../src/providers/opencode.js'
 import { emptyCache, type SessionCache } from '../src/session-cache.js'
 import type { Provider, ProbeRoot, SessionSource } from '../src/providers/types.js'
 
@@ -139,6 +140,71 @@ describe('collectDoctorReport - env override', () => {
     } finally {
       if (prev === undefined) delete process.env['CODEX_HOME']
       else process.env['CODEX_HOME'] = prev
+    }
+  })
+
+  it('names a deliberate XDG_DATA_HOME override pointing at a missing dir, blaming the override not the install (opencode)', async () => {
+    const prev = process.env['XDG_DATA_HOME']
+    const bogus = join(tmpDir, 'xdg-missing')
+    process.env['XDG_DATA_HOME'] = bogus
+    try {
+      // Construct after setting env so the provider resolves XDG_DATA_HOME
+      // (src/providers/opencode.ts:38 reads it to resolve the data dir).
+      const provider = createOpenCodeProvider()
+      const report = await collectDoctorReport('all', { providers: [provider], cache: emptyCache() })
+      const r = only(report, 'opencode')
+
+      expect(r.envOverrides).toContainEqual({ name: 'XDG_DATA_HOME', value: bogus })
+      expect(r.status).toBe('empty')
+      // Regression (Ruling 3 of lane 04): with XDG_DATA_HOME treated as an
+      // ambient OS var, doctor skipped it and the verdict blamed the install
+      // ("tool likely not installed") instead of the override the user set.
+      expect(r.verdict).toContain('override XDG_DATA_HOME set')
+      expect(r.verdict).toContain('does not exist')
+    } finally {
+      if (prev === undefined) delete process.env['XDG_DATA_HOME']
+      else process.env['XDG_DATA_HOME'] = prev
+    }
+  })
+
+  it('does not name APPDATA as an override for a provider that declares it', async () => {
+    const prev = process.env['APPDATA']
+    process.env['APPDATA'] = join(tmpDir, 'appdata')
+    try {
+      const provider = fakeProvider({ name: 'claude', displayName: 'Claude' })
+      const report = await collectDoctorReport('all', { providers: [provider], cache: emptyCache() })
+      const r = only(report, 'claude')
+
+      // Windows sets APPDATA for every process, so it carries no user intent:
+      // it is fingerprinted (a change moves the discovery root) but must never
+      // be named as a deliberate override (Ruling 3 of lane 04).
+      expect(r.envOverrides.some(o => o.name === 'APPDATA')).toBe(false)
+    } finally {
+      if (prev === undefined) delete process.env['APPDATA']
+      else process.env['APPDATA'] = prev
+    }
+  })
+
+  it('redacts credential values (AI_GATEWAY_API_KEY) from overrides, the table render, and the JSON report', async () => {
+    const secret = 'sk-live-very-secret-value-12345'
+    const prev = process.env['AI_GATEWAY_API_KEY']
+    process.env['AI_GATEWAY_API_KEY'] = secret
+    try {
+      const provider = fakeProvider({ name: 'vercel-gateway', displayName: 'Vercel AI Gateway', network: true })
+      const report = await collectDoctorReport('all', { providers: [provider], cache: emptyCache() })
+      const r = only(report, 'vercel-gateway')
+
+      // The "is this credential set?" diagnostic is useful; the value is a
+      // live secret and must never leave doctor (Ruling 2 of lane 04).
+      expect(r.envOverrides).toContainEqual({ name: 'AI_GATEWAY_API_KEY', value: '<set>' })
+      expect(r.envOverrides.some(o => o.value.includes(secret))).toBe(false)
+      const table = renderDoctorTable(report, { color: false })
+      expect(table).toContain('AI_GATEWAY_API_KEY=<set>')
+      expect(table).not.toContain(secret)
+      expect(renderDoctorJson(report)).not.toContain(secret)
+    } finally {
+      if (prev === undefined) delete process.env['AI_GATEWAY_API_KEY']
+      else process.env['AI_GATEWAY_API_KEY'] = prev
     }
   })
 })

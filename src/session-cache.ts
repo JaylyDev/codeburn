@@ -175,23 +175,32 @@ const TEMP_FILE_MAX_AGE_MS = 5 * 60 * 1000
 // computeEnvFingerprint hashes exactly these to decide when a provider's cache
 // section is stale; a var read by the provider but missing here means changing
 // it serves the old section silently, reporting nothing from the new root.
-// Two reads in src/providers/ are deliberately absent: CODEBURN_VERBOSE
-// (sqlite-session-parser.ts) only changes logging verbosity, never parsed
-// output, and AI_GATEWAY_API_KEY / VERCEL_OIDC_TOKEN (vercel-gateway.ts) are
-// network credentials — vercel-gateway is network:true, and parser.ts:2888
-// short-circuits it past the fingerprint compare, re-fetching its synthetic
-// source every run, so no cached section of it can go stale.
+// One read in src/providers/ is deliberately absent: CODEBURN_VERBOSE
+// (sqlite-session-parser.ts:276) only changes logging verbosity, never parsed
+// output.
+//
+// Copilot is deliberately NOT declared here. Declaring any CODEBURN_COPILOT_*
+// var would change its fingerprint, and on a fingerprint change
+// getOrCreateProviderSection (src/parser.ts:2650) keeps only the cached
+// entries whose source path no longer exists — but copilot's OTel discovery
+// returns one source per DB file ({ path: dbPath }, src/providers/copilot.ts:1935)
+// and that DB keeps existing, so its cached entry would be dropped and
+// re-parsed, destroying conversations Copilot has since pruned from the DB
+// that only the cache still holds (see DURABLE_PROVIDER_NAMES below). Do not
+// "complete" the map for copilot until the durable carry-forward learns to
+// merge instead of drop.
 export const PROVIDER_ENV_VARS: Record<string, string[]> = {
   claude: ['CLAUDE_CONFIG_DIRS', 'CLAUDE_CONFIG_DIR', 'CODEBURN_DESKTOP_SESSIONS_DIR', 'APPDATA', 'LOCALAPPDATA'],
   'cline-cli': ['CLINE_SESSION_DATA_DIR', 'CLINE_DATA_DIR', 'CLINE_DIR'],
   codebuff: ['CODEBUFF_DATA_DIR'],
   codewhale: ['CODEWHALE_HOME'],
   codex: ['CODEX_HOME'],
-  copilot: ['CODEBURN_COPILOT_SESSION_STATE_DIR', 'CODEBURN_COPILOT_OTEL_DB', 'CODEBURN_COPILOT_JETBRAINS_DIR', 'CODEBURN_COPILOT_WS_STORAGE_DIR', 'CODEBURN_COPILOT_GLOBAL_STORAGE_DIR', 'CODEBURN_COPILOT_DISABLE_OTEL', 'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME'],
   hermes: ['HERMES_HOME'],
   'lingtai-tui': ['LINGTAI_HOME', 'LINGTAI_TUI_HOME', 'LINGTAI_TUI_GLOBAL_DIR'],
   droid: ['FACTORY_DIR'],
-  cursor: ['XDG_DATA_HOME', 'CODEBURN_CURSOR_MAX_BUBBLES'],
+  cursor: ['CODEBURN_CURSOR_MAX_BUBBLES'],
+  // XDG_DATA_HOME is stale here (cursor-agent never reads it) but deliberately
+  // kept: removing it would force a re-parse to fix nothing.
   'cursor-agent': ['XDG_DATA_HOME'],
   'open-design': ['CODEBURN_OPEN_DESIGN_DIR', 'APPDATA'],
   opencode: ['XDG_DATA_HOME', 'OPENCODE_DATA_DIR', 'OPENCODE_DB_PREFIX'],
@@ -210,6 +219,13 @@ export const PROVIDER_ENV_VARS: Record<string, string[]> = {
   quickdesk: ['QUICKWORK_HOME'],
   kimicode: ['KIMI_CODE_HOME'],
   zerostack: ['ZS_DATA_DIR', 'XDG_DATA_HOME'],
+  // The gateway credential is a deliberate user override and MUST move the
+  // fingerprint: a read-only refresh (the refresh-lock fallback) serves the
+  // cached report straight from the section (parser.ts:2875 seeds servedSources
+  // before the network re-fetch at parser.ts:2888, which only runs when
+  // !readOnly), so an undeclared credential would keep serving the previous
+  // account's usage after a swap — the exact #920 defect.
+  'vercel-gateway': ['AI_GATEWAY_API_KEY', 'VERCEL_OIDC_TOKEN'],
 }
 
 // Names of providers whose cache entries are never evicted when source files

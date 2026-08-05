@@ -105,11 +105,23 @@ const PARSE_SPAWNS = new Set(['antigravity'])
 const NON_DISCOVERY_ENV_VARS = new Set(['CODEBURN_CACHE_DIR'])
 
 // Ambient platform paths (set by the OS or desktop session for everyone), not
-// deliberate user overrides: they are fingerprinted (a change to them does
-// move the discovery root, so the cache must invalidate) but doctor must not
-// name them as an override, because the probed paths it already prints show
-// exactly where CodeBurn looked.
-const AMBIENT_ENV_VARS = new Set(['APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME'])
+// deliberate user overrides: Windows sets APPDATA and LOCALAPPDATA for every
+// process, so they carry no user intent and doctor must not name them as an
+// override. The XDG_* vars are the opposite — they are opt-in on Linux, so a
+// set value IS a deliberate user override and stays visible: with XDG_DATA_HOME
+// pointed at a missing dir, blaming the install instead of the override
+// (the pre-#920 behavior) told the user the tool was missing when they had
+// deliberately relocated it. All of them are still fingerprinted — a change
+// to any of them does move the discovery root, so the cache must invalidate —
+// and the probed paths doctor already prints show exactly where CodeBurn
+// looked.
+const AMBIENT_ENV_VARS = new Set(['APPDATA', 'LOCALAPPDATA'])
+
+// Credential names whose VALUE must never be printed: knowing whether the
+// credential is set is a useful diagnostic, but the value is a live secret.
+// Redact at collect time so BOTH the text render and the JSON report are
+// covered, and doctor can never leak a key into a bug report or a paste.
+const SECRET_ENV_VARS = new Set(['AI_GATEWAY_API_KEY', 'VERCEL_OIDC_TOKEN'])
 
 // ── Collect (pure, testable) ─────────────────────────────────────────────
 
@@ -119,7 +131,9 @@ function collectEnvOverrides(providerName: string): DoctorEnvOverride[] {
   for (const name of vars) {
     if (AMBIENT_ENV_VARS.has(name)) continue
     const value = process.env[name]
-    if (value !== undefined && value !== '') out.push({ name, value })
+    if (value !== undefined && value !== '') {
+      out.push(SECRET_ENV_VARS.has(name) ? { name, value: '<set>' } : { name, value })
+    }
   }
   return out
 }
