@@ -171,25 +171,45 @@ const CACHE_FILE = `session-cache.v${CACHE_VERSION}.json`
 const LEGACY_CACHE_FILE = 'session-cache.json'
 const TEMP_FILE_MAX_AGE_MS = 5 * 60 * 1000
 
+// Env vars that change what a provider discovers or how its sessions parse.
+// computeEnvFingerprint hashes exactly these to decide when a provider's cache
+// section is stale; a var read by the provider but missing here means changing
+// it serves the old section silently, reporting nothing from the new root.
+// Two reads in src/providers/ are deliberately absent: CODEBURN_VERBOSE
+// (sqlite-session-parser.ts) only changes logging verbosity, never parsed
+// output, and AI_GATEWAY_API_KEY / VERCEL_OIDC_TOKEN (vercel-gateway.ts) are
+// network credentials — vercel-gateway is network:true, and parser.ts:2888
+// short-circuits it past the fingerprint compare, re-fetching its synthetic
+// source every run, so no cached section of it can go stale.
 export const PROVIDER_ENV_VARS: Record<string, string[]> = {
-  claude: ['CLAUDE_CONFIG_DIRS', 'CLAUDE_CONFIG_DIR'],
+  claude: ['CLAUDE_CONFIG_DIRS', 'CLAUDE_CONFIG_DIR', 'CODEBURN_DESKTOP_SESSIONS_DIR', 'APPDATA', 'LOCALAPPDATA'],
   'cline-cli': ['CLINE_SESSION_DATA_DIR', 'CLINE_DATA_DIR', 'CLINE_DIR'],
+  codebuff: ['CODEBUFF_DATA_DIR'],
   codewhale: ['CODEWHALE_HOME'],
   codex: ['CODEX_HOME'],
+  copilot: ['CODEBURN_COPILOT_SESSION_STATE_DIR', 'CODEBURN_COPILOT_OTEL_DB', 'CODEBURN_COPILOT_JETBRAINS_DIR', 'CODEBURN_COPILOT_WS_STORAGE_DIR', 'CODEBURN_COPILOT_GLOBAL_STORAGE_DIR', 'CODEBURN_COPILOT_DISABLE_OTEL', 'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME'],
   hermes: ['HERMES_HOME'],
   'lingtai-tui': ['LINGTAI_HOME', 'LINGTAI_TUI_HOME', 'LINGTAI_TUI_GLOBAL_DIR'],
   droid: ['FACTORY_DIR'],
-  cursor: ['XDG_DATA_HOME'],
+  cursor: ['XDG_DATA_HOME', 'CODEBURN_CURSOR_MAX_BUBBLES'],
   'cursor-agent': ['XDG_DATA_HOME'],
+  'open-design': ['CODEBURN_OPEN_DESIGN_DIR', 'APPDATA'],
   opencode: ['XDG_DATA_HOME', 'OPENCODE_DATA_DIR', 'OPENCODE_DB_PREFIX'],
-  goose: ['XDG_DATA_HOME'],
-  crush: ['XDG_DATA_HOME'],
+  goose: ['XDG_DATA_HOME', 'GOOSE_PATH_ROOT'],
+  grok: ['GROK_HOME'],
+  crush: ['XDG_DATA_HOME', 'CRUSH_GLOBAL_DATA', 'LOCALAPPDATA'],
   warp: ['WARP_DB_PATH'],
   antigravity: ['CODEBURN_CACHE_DIR'],
+  'kilo-code': ['XDG_DATA_HOME'],
+  kimi: ['KIMI_SHARE_DIR', 'KIMI_MODEL_NAME'],
+  kiro: ['KIRO_HOME'],
+  'mistral-vibe': ['VIBE_HOME'],
+  mux: ['MUX_ROOT', 'CODEBURN_MUX_DIR'],
   qwen: ['QWEN_DATA_DIR'],
-  'ibm-bob': ['XDG_CONFIG_HOME'],
+  'ibm-bob': ['XDG_CONFIG_HOME', 'APPDATA'],
   quickdesk: ['QUICKWORK_HOME'],
   kimicode: ['KIMI_CODE_HOME'],
+  zerostack: ['ZS_DATA_DIR', 'XDG_DATA_HOME'],
 }
 
 // Names of providers whose cache entries are never evicted when source files

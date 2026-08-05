@@ -104,12 +104,20 @@ const PARSE_SPAWNS = new Set(['antigravity'])
 // in a NOTHING FOUND hint.
 const NON_DISCOVERY_ENV_VARS = new Set(['CODEBURN_CACHE_DIR'])
 
+// Ambient platform paths (set by the OS or desktop session for everyone), not
+// deliberate user overrides: they are fingerprinted (a change to them does
+// move the discovery root, so the cache must invalidate) but doctor must not
+// name them as an override, because the probed paths it already prints show
+// exactly where CodeBurn looked.
+const AMBIENT_ENV_VARS = new Set(['APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME'])
+
 // ── Collect (pure, testable) ─────────────────────────────────────────────
 
 function collectEnvOverrides(providerName: string): DoctorEnvOverride[] {
   const vars = PROVIDER_ENV_VARS[providerName] ?? []
   const out: DoctorEnvOverride[] = []
   for (const name of vars) {
+    if (AMBIENT_ENV_VARS.has(name)) continue
     const value = process.env[name]
     if (value !== undefined && value !== '') out.push({ name, value })
   }
