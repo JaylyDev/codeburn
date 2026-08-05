@@ -25,6 +25,7 @@ import { spawn, type ChildProcess } from 'child_process'
 import { existsSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
+import { fileURLToPath } from 'url'
 
 import { getHostPrivacyKey, getPersistedHostPrivacyKey } from '../src/privacy-key.js'
 import { buildOtlpPayload, deriveDeviceId, type CallWithSession } from '../src/sync/otlp.js'
@@ -255,10 +256,16 @@ async function waitFor(path: string, timeoutMs = 5_000): Promise<void> {
   }
 }
 
+// Fixture path anchored to THIS file, not process.cwd(): vitest workers run
+// with the invocation cwd (repo root under `--root packages/cli`), so a
+// cwd-relative path silently points at a nonexistent file and the worker
+// exits before ever writing its ready file.
+const FIRST_USE_WORKER = fileURLToPath(new URL('./fixtures/privacy-key-first-use-worker.ts', import.meta.url))
+
 function firstUseWorker(goFile: string, readyFile: string, homeDir: string): ChildProcess {
   return spawn(
     process.execPath,
-    ['--import', 'tsx', join(process.cwd(), 'tests/fixtures/privacy-key-first-use-worker.ts'), goFile, readyFile],
+    ['--import', 'tsx', FIRST_USE_WORKER, goFile, readyFile],
     { cwd: process.cwd(), env: { ...process.env, HOME: homeDir }, stdio: ['ignore', 'pipe', 'pipe'] }
   )
 }

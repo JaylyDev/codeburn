@@ -61,6 +61,27 @@ function sleepSync(ms: number): void {
 }
 
 /**
+ * Bounded wait for a concurrent first-use winner's key to land. The winner's
+ * create (open) and write are separate syscalls — between them the file exists
+ * but is empty — and under scheduler pressure that gap can exceed the 50ms the
+ * original EEXIST loop allowed. 500ms keeps the wait bounded (a crashed winner
+ * leaves an empty file forever, so the corruption refusal stays reachable)
+ * while making adoption robust on a loaded machine.
+ */
+const ADOPTION_WAIT_MS = 500
+const ADOPTION_POLL_MS = 50
+
+function awaitValidKey(path: string): string | null {
+  const deadline = Date.now() + ADOPTION_WAIT_MS
+  while (Date.now() < deadline) {
+    const state = readKeyFileState(path)
+    if (state.kind === 'valid') return state.key
+    sleepSync(ADOPTION_POLL_MS)
+  }
+  return null
+}
+
+/**
  * Outcome of an exclusive first-use create.
  */
 type FirstUseOutcome =
@@ -86,11 +107,10 @@ function createKeyFileExclusive(path: string): FirstUseOutcome {
     if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
       return { kind: 'write-failed' }
     }
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const state = readKeyFileState(path)
-      if (state.kind === 'valid') return { kind: 'key', key: state.key }
-      sleepSync(10)
-    }
+    // Loser of the create race: adopt the winner's key once its write lands
+    // (the file exists but may still be empty; see awaitValidKey).
+    const adopted = awaitValidKey(path)
+    if (adopted) return { kind: 'key', key: adopted }
     return { kind: 'invalid-existing' }
   }
 }
@@ -178,6 +198,16 @@ export function getPersistedHostPrivacyKey(): string {
     )
   }
   if (state.kind === 'invalid') {
+    // A concurrent first use may be mid-write (file created, key not yet
+    // written): wait a bounded window and ADOPT the winner's key when it
+    // lands — the loser never mints its own. A file that stays invalid (a
+    // crash, a truncated write) still gets the refusal below; nothing is
+    // ever overwritten.
+    const adopted = awaitValidKey(path)
+    if (adopted) {
+      cached = adopted
+      return cached
+    }
     throw new Error(
       `Host privacy key at ${path} is corrupted (expected 64 hex chars). ` +
       'Refusing to overwrite it: that would silently re-key every id and orphan ' +
