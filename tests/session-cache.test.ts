@@ -281,6 +281,65 @@ describe('computeEnvFingerprint', () => {
   })
 })
 
+// ── provider env overrides invalidate the fingerprint (#920) ─────────────
+
+describe('provider env overrides invalidate the fingerprint (#920)', () => {
+  // Nine providers honored an env var that relocates where discovery looks
+  // without the var being declared in PROVIDER_ENV_VARS, so
+  // computeEnvFingerprint did not hash it and the cache section survived the
+  // change: sessions parsed from the old root kept being reported and the new
+  // root was never read. Each pair below must change the fingerprint when the
+  // var is set. codex/CODEX_HOME is the control — it already worked and must
+  // keep working.
+  const CASES: Array<[provider: string, varName: string]> = [
+    ['kiro', 'KIRO_HOME'],
+    ['grok', 'GROK_HOME'],
+    ['kimi', 'KIMI_SHARE_DIR'],
+    ['mux', 'MUX_ROOT'],
+    ['mistral-vibe', 'VIBE_HOME'],
+    ['zerostack', 'ZS_DATA_DIR'],
+    ['codebuff', 'CODEBUFF_DATA_DIR'],
+    ['goose', 'GOOSE_PATH_ROOT'],
+    ['crush', 'CRUSH_GLOBAL_DATA'],
+    ['codex', 'CODEX_HOME'],
+  ]
+  const VARS = CASES.map(([, varName]) => varName)
+
+  // Save and restore every var we touch (beforeEach/afterEach), so a leaked
+  // env var never breaks unrelated tests in the same worker — and an ambient
+  // value never makes the "unset" case a lie.
+  const saved = new Map<string, string | undefined>()
+
+  beforeEach(() => {
+    for (const varName of VARS) {
+      saved.set(varName, process.env[varName])
+      delete process.env[varName]
+    }
+  })
+
+  afterEach(() => {
+    for (const varName of VARS) {
+      const original = saved.get(varName)
+      if (original === undefined) delete process.env[varName]
+      else process.env[varName] = original
+    }
+  })
+
+  for (const [provider, varName] of CASES) {
+    it(`changes the ${provider} fingerprint when ${varName} is set`, () => {
+      const unset = computeEnvFingerprint(provider)
+      process.env[varName] = '/tmp/codeburn-920-override'
+      const set = computeEnvFingerprint(provider)
+      expect(set).not.toBe(unset)
+      // Round trip: restoring the variable to its original state restores the
+      // original fingerprint, so the hash is a pure function of the
+      // environment.
+      delete process.env[varName]
+      expect(computeEnvFingerprint(provider)).toBe(unset)
+    })
+  }
+})
+
 // ── fingerprintFile ────────────────────────────────────────────────────
 
 describe('fingerprintFile', () => {
