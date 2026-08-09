@@ -85,4 +85,4 @@ The ledger is append-only, so line number is stable for normal operation.
 
 1. Prefer a minimal redacted `token_ledger.jsonl` fixture over full `chat_history.jsonl`.
 2. Check whether a daemon entry is already mirrored into the parent ledger before adding new discovery paths.
-3. Run `npm test -- tests/providers/lingtai-tui.test.ts --run`.
+3. Run `npx vitest run tests/providers/lingtai-tui.test.ts`.

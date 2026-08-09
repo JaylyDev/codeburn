@@ -24,16 +24,23 @@ There is no separate build step required to run the dev CLI. `npm run dev` runs 
 
 | Command | What it does |
 |---|---|
-| `npm test` | Runs the vitest suite (42 test files, 568 tests). |
+| `npm test` | Runs the vitest suite under `tests/` (189 of the 192 files, 2,494 tests). |
+| `npm run test:locks` | Runs the three parallelism-sensitive `cache-refresh-lock` suites serially. |
+| `npm run test:watch` | Same scope as `npm test`, in watch mode. |
 | `npm run dev -- status` | Runs the CLI in dev mode against your real data. |
 | `npm run build` | Bundles the litellm pricing snapshot, then runs `tsup` to produce `dist/cli.js`. |
 | `npm run bundle-litellm` | Refreshes `src/data/litellm-snapshot.json` from the upstream litellm repo. |
 
-To test a specific suite, pass a path:
+To test a specific suite, run vitest directly with a path:
 
 ```bash
-npm test -- tests/providers/codex.test.ts
+npx vitest run tests/providers/codex.test.ts
 ```
+
+`npm test` is scoped to `tests/` on purpose. The Electron app under `app/` carries its
+own vitest config and its own `jsdom` dependency in `app/node_modules`; letting vitest's
+default glob reach those specs from a root install fails with
+`ERR_MODULE_NOT_FOUND: jsdom`. To run the app's tests, install and run them from `app/`.
 
 ## What to Read Before Editing
 
@@ -65,9 +72,14 @@ See `docs/architecture.md` for a fuller map.
 
 ## Tests
 
-- Each new provider should ship with a fixture-based test under `tests/providers/`. The five providers without test files today (claude, gemini, goose, qwen, antigravity) are a known gap; new code should not add to that list.
+- Each new provider should ship with a fixture-based test under `tests/providers/`. The three providers without test files today (claude, goose, qwen) are a known gap; new code should not add to that list.
 - Each new optimize detector in `src/optimize.ts` needs at least one positive and one negative case in `tests/optimize.test.ts`.
 - If your change affects the menubar JSON contract, update `tests/menubar-json.test.ts`.
+- A new test that exercises the cross-process refresh lock must be named
+  `tests/cache-refresh-lock-<what>.test.ts` **and** added to the `test:locks` script in
+  `package.json`. `npm test` excludes that prefix, so a lock test placed anywhere else
+  runs under the full worker pool and fails intermittently; one that matches the prefix
+  but is missing from `test:locks` never runs at all.
 
 ## Commit Message Format
 
