@@ -227,6 +227,21 @@ struct CurrentBlock: Codable, Sendable {
     var workflow: WorkflowBlock? = nil
     /// Files most reworked by edit-family calls. Empty on older CLIs.
     var topReworkedFiles: [ReworkedFileEntry] = []
+    /// Attributed pull-request spend for the period (all-provider payloads
+    /// only). Optional so payloads from older CLIs still decode; absent or
+    /// empty -> the Pull requests section hides.
+    var pullRequests: PullRequestsBlock? = nil
+}
+
+struct PullRequestsBlock: Codable, Sendable {
+    let rows: [PullRequestRow]
+}
+
+struct PullRequestRow: Codable, Sendable {
+    let url: String
+    let label: String
+    let cost: Double
+    let sessions: Int
 }
 
 extension CurrentBlock {
@@ -235,7 +250,7 @@ extension CurrentBlock {
              cacheHitPercent, codexCredits, topActivities, topModels, localModelSavings, providers, topProjects,
              modelEfficiency, topSessions, retryTax, routingWaste,
              tools, skills, subagents, mcpServers,
-             workflow, topReworkedFiles
+             workflow, topReworkedFiles, pullRequests
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -263,6 +278,7 @@ extension CurrentBlock {
         mcpServers = try c.decodeIfPresent([McpServerEntry].self, forKey: .mcpServers) ?? []
         workflow = try c.decodeIfPresent(WorkflowBlock.self, forKey: .workflow)
         topReworkedFiles = try c.decodeIfPresent([ReworkedFileEntry].self, forKey: .topReworkedFiles) ?? []
+        pullRequests = try c.decodeIfPresent(PullRequestsBlock.self, forKey: .pullRequests)
     }
 }
 

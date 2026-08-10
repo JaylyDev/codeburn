@@ -329,6 +329,11 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
       catch (error) { return { ok: false, error: { kind: 'nonzero', message: sanitizeError(error) } } }
     },
     'codeburn:getOverview': getOverview,
+    // Timeline variant for the Spend punchcard only: identical payload WITH
+    // history.timeline (every other fetch keeps --no-timeline lean).
+    'codeburn:getTimeline': run((period: string, provider: string, range?: DateRange) => [
+      'status', '--format', 'menubar-json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
+    ]),
     'codeburn:getPlans': run((period: string) => ['status', '--format', 'json', '--period', vPeriod(period)]),
     'codeburn:getActReport': run(() => ['act', 'report', '--json']),
     'codeburn:getModels': run((period: string, provider: string, byTask: boolean, range?: DateRange) => [

@@ -267,6 +267,9 @@ export type MenubarPayload = {
   }
   history: {
     daily: DailyHistoryEntry[]
+    // Granular per-bucket timeline. Present only on the punchcard's dedicated
+    // fetch (every other payload passes --no-timeline).
+    timeline?: { bucketMinutes: number; points: Array<{ timestamp: string; cost: number }> }
   }
   // Active display currency. Payload costs are raw USD; the renderer multiplies by
   // `rate` and prefixes `symbol` at display time. Optional: older CLIs omit it.
@@ -644,6 +647,7 @@ export interface CodeburnBridge {
   // `scope` selects local-device usage ('local', default) or paired-device
   // aggregate ('combined'); optional so an older preload degrades to local.
   getOverview(period: Period, provider: string, range?: DateRange, configSource?: string | null, background?: boolean, scope?: string): Promise<MenubarPayload>
+  getTimeline(period: Period, provider: string, range?: DateRange): Promise<MenubarPayload>
   getPlans(period: Period): Promise<StatusJson>
   getActReport(): Promise<ActReportJson>
   readonly platform: string
