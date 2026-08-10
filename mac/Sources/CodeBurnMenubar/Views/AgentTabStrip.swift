@@ -497,6 +497,7 @@ extension ProviderFilter {
         case .kimiCode: return Color(red: 0xA3/255.0, green: 0xE6/255.0, blue: 0x35/255.0)
         case .lingtaiTui: return Color(red: 0x22/255.0, green: 0xA7/255.0, blue: 0xA0/255.0)
         case .openclaw: return Color(red: 0xDA/255.0, green: 0x70/255.0, blue: 0x56/255.0)
+        case .openclaude: return Color(red: 0xC2/255.0, green: 0x41/255.0, blue: 0x6B/255.0)
         case .opencode: return Color(red: 0x5B/255.0, green: 0x83/255.0, blue: 0x5B/255.0)
         case .pi: return Color(red: 0xB2/255.0, green: 0x6B/255.0, blue: 0x3D/255.0)
         case .qwen: return Color(red: 0x61/255.0, green: 0x5E/255.0, blue: 0xEB/255.0)
