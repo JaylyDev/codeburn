@@ -96,7 +96,10 @@ export function Punchcard({ timeline }: { timeline: Timeline }) {
                 const track = (event: React.MouseEvent) => {
                   if (!cell.covered || !wrapRef.current) return
                   const r = wrapRef.current.getBoundingClientRect()
-                  setHover({ x: event.clientX - r.left, y: event.clientY - r.top, wd, h })
+                  // Clamp x so the centered tooltip never crops at the strip's
+                  // edges; the y flip below handles the top rows.
+                  const x = Math.min(Math.max(event.clientX - r.left, 70), r.width - 70)
+                  setHover({ x, y: event.clientY - r.top, wd, h })
                 }
                 return (
                   <div key={h} style={{ aspectRatio: '1', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 2 }} onMouseEnter={track} onMouseMove={track}>
@@ -118,8 +121,12 @@ export function Punchcard({ timeline }: { timeline: Timeline }) {
           ))}
           {hover && hovered && (
             <div style={{
-              pointerEvents: 'none', position: 'absolute', zIndex: 10, left: hover.x, top: hover.y - 8,
-              transform: 'translate(-50%, -100%)', borderRadius: 8, border: '1px solid var(--line)',
+              pointerEvents: 'none', position: 'absolute', zIndex: 10, left: hover.x,
+              // Top rows flip the tooltip BELOW the cursor: the scroll
+              // container clips anything above its own top edge.
+              top: hover.y < 56 ? hover.y + 14 : hover.y - 8,
+              transform: hover.y < 56 ? 'translate(-50%, 0)' : 'translate(-50%, -100%)',
+              borderRadius: 8, border: '1px solid var(--line)',
               background: 'var(--bg)', padding: '5px 10px', fontSize: 'var(--fs-meta)', boxShadow: 'var(--card-shadow)',
             }}>
               <div style={{ fontWeight: 'var(--fw-medium)' as never, color: 'var(--ink)' }}>{WEEKDAYS_FULL[hover.wd]} {String(hover.h).padStart(2, '0')}:00</div>

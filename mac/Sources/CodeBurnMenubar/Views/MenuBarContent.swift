@@ -36,7 +36,6 @@ struct MenuBarContent: View {
                             ActivitySection()
                             Divider().opacity(0.5)
                             ModelsSection()
-                            WorkflowSection()
                             PullRequestsSection()
                             Divider().opacity(0.5)
                             ToolingSection()
