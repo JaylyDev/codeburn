@@ -123,6 +123,15 @@ struct DataClient {
         subcommand: [String],
         qualityOfService: QualityOfService = .userInitiated
     ) async throws -> ProcessResult {
+        // Serve fast path: a warm resident `codeburn serve` child answers the
+        // status payload without a spawn (no node boot, no session-cache
+        // reload). Any serve failure falls back to the spawn path below, so
+        // this is strictly an optimization; it also takes no spawn slot.
+        if ServeConnection.isEligible(subcommand) {
+            if let stdout = try? await ServeConnection.shared.requestIfWarm(args: subcommand) {
+                return ProcessResult(stdout: stdout, stderr: "", exitCode: 0)
+            }
+        }
         await spawnLimiter.acquire()
         defer { Task { await spawnLimiter.release() } }
         let process = CodeburnCLI.makeProcess(subcommand: subcommand, qualityOfService: qualityOfService)

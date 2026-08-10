@@ -83,6 +83,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     private var refreshLoopHeartbeatAt: Date = .distantPast
 
     func applicationWillTerminate(_ notification: Notification) {
+        Task { await ServeConnection.shared.shutdown() }
         if let monitor = rightClickMonitor {
             NSEvent.removeMonitor(monitor)
             rightClickMonitor = nil
@@ -126,6 +127,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         // interaction (popover open, wake) refreshes immediately.
 
         restorePersistedCurrency()
+        // Resident serve child: payload fetches answer from a warm CLI once
+        // its warm-up completes; until then (and on any failure) fetches keep
+        // the spawn path. See ServeConnection.
+        Task { await ServeConnection.shared.ensureStarted() }
         // #868 experiment: restore only the activation half of the #147 fix.
         // Packaged builds ship LSUIElement=true, so the policy is .accessory
         // before main() runs and never transitions (the transition is what
