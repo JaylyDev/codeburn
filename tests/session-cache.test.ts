@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { readFile, rm, writeFile, mkdir } from 'fs/promises'
+import { readFile, rm, utimes, writeFile, mkdir } from 'fs/promises'
 import { existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { basename, join } from 'path'
 
 import {
   CACHE_VERSION,
+  PROVIDER_ENV_VARS,
   type CachedCall,
   type CachedFile,
   type CachedTurn,
@@ -281,6 +282,129 @@ describe('computeEnvFingerprint', () => {
   })
 })
 
+// ── provider env overrides invalidate the fingerprint (#920) ─────────────
+
+describe('provider env overrides invalidate the fingerprint (#920)', () => {
+  // Nine providers honored an env var that relocates where discovery looks
+  // without the var being declared in PROVIDER_ENV_VARS, so
+  // computeEnvFingerprint did not hash it and the cache section survived the
+  // change: sessions parsed from the old root kept being reported and the new
+  // root was never read. Each pair below must change the fingerprint when the
+  // var is set. codex/CODEX_HOME is the control — it already worked and must
+  // keep working.
+  const CASES: Array<[provider: string, varName: string]> = [
+    ['kiro', 'KIRO_HOME'],
+    ['grok', 'GROK_HOME'],
+    ['kimi', 'KIMI_SHARE_DIR'],
+    ['mux', 'MUX_ROOT'],
+    ['mistral-vibe', 'VIBE_HOME'],
+    ['zerostack', 'ZS_DATA_DIR'],
+    ['codebuff', 'CODEBUFF_DATA_DIR'],
+    ['goose', 'GOOSE_PATH_ROOT'],
+    ['crush', 'CRUSH_GLOBAL_DATA'],
+    ['codex', 'CODEX_HOME'],
+  ]
+  const VARS = CASES.map(([, varName]) => varName)
+
+  // Save and restore every var we touch (beforeEach/afterEach), so a leaked
+  // env var never breaks unrelated tests in the same worker — and an ambient
+  // value never makes the "unset" case a lie.
+  const saved = new Map<string, string | undefined>()
+
+  beforeEach(() => {
+    for (const varName of VARS) {
+      saved.set(varName, process.env[varName])
+      delete process.env[varName]
+    }
+  })
+
+  afterEach(() => {
+    for (const varName of VARS) {
+      const original = saved.get(varName)
+      if (original === undefined) delete process.env[varName]
+      else process.env[varName] = original
+    }
+  })
+
+  for (const [provider, varName] of CASES) {
+    it(`changes the ${provider} fingerprint when ${varName} is set`, () => {
+      const unset = computeEnvFingerprint(provider)
+      process.env[varName] = '/tmp/codeburn-920-override'
+      const set = computeEnvFingerprint(provider)
+      expect(set).not.toBe(unset)
+      // Round trip: restoring the variable to its original state restores the
+      // original fingerprint, so the hash is a pure function of the
+      // environment.
+      delete process.env[varName]
+      expect(computeEnvFingerprint(provider)).toBe(unset)
+    })
+  }
+
+  it('changes the vercel-gateway fingerprint when AI_GATEWAY_API_KEY is set', () => {
+    const prev = process.env['AI_GATEWAY_API_KEY']
+    try {
+      const unset = computeEnvFingerprint('vercel-gateway')
+      process.env['AI_GATEWAY_API_KEY'] = 'sk-live-secret-abc'
+      const set = computeEnvFingerprint('vercel-gateway')
+      expect(set).not.toBe(unset)
+      delete process.env['AI_GATEWAY_API_KEY']
+      expect(computeEnvFingerprint('vercel-gateway')).toBe(unset)
+    } finally {
+      if (prev === undefined) delete process.env['AI_GATEWAY_API_KEY']
+      else process.env['AI_GATEWAY_API_KEY'] = prev
+    }
+  })
+
+  // Copilot is deliberately NOT declared in PROVIDER_ENV_VARS (Ruling 1 of
+  // lane 04): its OTel discovery returns one source per DB file
+  // ({ path: dbPath }, src/providers/copilot.ts:1935), and the durable
+  // carry-forward in getOrCreateProviderSection (src/parser.ts:2650) drops
+  // every cached entry whose source still exists on a fingerprint change — so
+  // declaring any CODEBURN_COPILOT_* var would force a re-parse that destroys
+  // conversations Copilot has since pruned from the DB, which only the cache
+  // still holds. The fingerprint must therefore NOT move when one is set.
+  // This reads as intent, not as an oversight — and the assertions below pin
+  // the WHOLE invariant (no entry at all, plus every one of the nine deferred
+  // reads), so a future "completing" edit fails a test instead of silently
+  // re-opening the durable history-loss path.
+  describe('copilot is deliberately undeclared in PROVIDER_ENV_VARS', () => {
+    it('has no PROVIDER_ENV_VARS entry at all', () => {
+      expect(PROVIDER_ENV_VARS['copilot']).toBeUndefined()
+    })
+
+    // The nine reads copilot.ts performs whose declaration is deferred (each
+    // is allowlisted in tests/provider-env-declarations.test.ts): setting any
+    // of them must leave the copilot fingerprint untouched.
+    const DEFERRED_COPILOT_VARS = [
+      'CODEBURN_COPILOT_SESSION_STATE_DIR',
+      'CODEBURN_COPILOT_OTEL_DB',
+      'CODEBURN_COPILOT_JETBRAINS_DIR',
+      'CODEBURN_COPILOT_WS_STORAGE_DIR',
+      'CODEBURN_COPILOT_GLOBAL_STORAGE_DIR',
+      'CODEBURN_COPILOT_DISABLE_OTEL',
+      'APPDATA',
+      'LOCALAPPDATA',
+      'XDG_CONFIG_HOME',
+    ]
+
+    for (const varName of DEFERRED_COPILOT_VARS) {
+      it(`does not move the copilot fingerprint when ${varName} is set (deliberately undeclared)`, () => {
+        const prev = process.env[varName]
+        try {
+          const before = computeEnvFingerprint('copilot')
+          process.env[varName] = `/tmp/codeburn-copilot-920/${varName}`
+          expect(computeEnvFingerprint('copilot')).toBe(before)
+          delete process.env[varName]
+          expect(computeEnvFingerprint('copilot')).toBe(before)
+        } finally {
+          if (prev === undefined) delete process.env[varName]
+          else process.env[varName] = prev
+        }
+      })
+    }
+  })
+})
+
 // ── fingerprintFile ────────────────────────────────────────────────────
 
 describe('fingerprintFile', () => {
@@ -336,6 +460,78 @@ describe('fingerprintFile', () => {
     const fp = await fingerprintFile(`${filePath}#cursor-ws=ws:extra-colon`)
     expect(fp).not.toBeNull()
     expect(fp!.sizeBytes).toBe(9)
+  })
+
+  // SQLite WAL mode parks committed writes in `<db>-wal`; the main file's
+  // stat only moves on checkpoint, which a long-lived writer defers for
+  // hours. A fingerprint from the main file alone reports data older than
+  // what is really committed (issue #913). The WAL sibling must be folded in.
+  it('folds -wal sibling into a # compound fingerprint (Hermes session)', async () => {
+    await mkdir(TMP_DIR, { recursive: true })
+    const dbPath = join(TMP_DIR, 'state.db')
+    await writeFile(dbPath, 'main-db')
+    const past = new Date(Date.now() - 48 * 3600 * 1000)
+    await utimes(dbPath, past, past)
+    await writeFile(`${dbPath}-wal`, 'wal-frames')
+
+    const fp = await fingerprintFile(`${dbPath}#hermes-session=abc`)
+    expect(fp).not.toBeNull()
+    // mtime: the fresh WAL wins over the checkpoint-stale main file.
+    expect(fp!.mtimeMs).toBeGreaterThan(past.getTime() + 3600 * 1000)
+    // size: main + wal, so WAL growth alone changes the fingerprint.
+    expect(fp!.sizeBytes).toBe('main-db'.length + 'wal-frames'.length)
+  })
+
+  it('folds -wal sibling into a : compound fingerprint (OpenCode session)', async () => {
+    await mkdir(TMP_DIR, { recursive: true })
+    const dbPath = join(TMP_DIR, 'opencode.db')
+    await writeFile(dbPath, 'oc-db')
+    const past = new Date(Date.now() - 48 * 3600 * 1000)
+    await utimes(dbPath, past, past)
+    await writeFile(`${dbPath}-wal`, 'oc-wal')
+
+    const fp = await fingerprintFile(`${dbPath}:ses_abc123`)
+    expect(fp).not.toBeNull()
+    expect(fp!.mtimeMs).toBeGreaterThan(past.getTime() + 3600 * 1000)
+    expect(fp!.sizeBytes).toBe('oc-db'.length + 'oc-wal'.length)
+  })
+
+  it('folds -wal sibling into a bare SQLite path (copilot agent-traces.db)', async () => {
+    await mkdir(TMP_DIR, { recursive: true })
+    const dbPath = join(TMP_DIR, 'agent-traces.db')
+    await writeFile(dbPath, 'traces')
+    const past = new Date(Date.now() - 48 * 3600 * 1000)
+    await utimes(dbPath, past, past)
+    await writeFile(`${dbPath}-wal`, 'traces-wal')
+
+    const fp = await fingerprintFile(dbPath)
+    expect(fp).not.toBeNull()
+    expect(fp!.mtimeMs).toBeGreaterThan(past.getTime() + 3600 * 1000)
+    expect(fp!.sizeBytes).toBe('traces'.length + 'traces-wal'.length)
+  })
+
+  it('keeps compound fingerprints working when no -wal sibling exists', async () => {
+    await mkdir(TMP_DIR, { recursive: true })
+    const dbPath = join(TMP_DIR, 'state.db')
+    await writeFile(dbPath, 'main-only')
+
+    const fp = await fingerprintFile(`${dbPath}#hermes-session=abc`)
+    expect(fp).not.toBeNull()
+    expect(fp!.sizeBytes).toBe('main-only'.length)
+  })
+
+  it('does not fold sibling files into non-SQLite fingerprints', async () => {
+    await mkdir(TMP_DIR, { recursive: true })
+    const filePath = join(TMP_DIR, 'session.jsonl')
+    await writeFile(filePath, 'jsonl-data')
+    // A stray neighbor that happens to match the -wal naming must not leak
+    // into a transcript fingerprint (offset-based append detection relies on
+    // sizeBytes being the transcript's real byte length).
+    await writeFile(`${filePath}-wal`, 'stray')
+
+    const fp = await fingerprintFile(filePath)
+    expect(fp).not.toBeNull()
+    expect(fp!.sizeBytes).toBe('jsonl-data'.length)
   })
 })
 

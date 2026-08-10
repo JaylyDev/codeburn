@@ -520,6 +520,49 @@ describe('Overview', () => {
     expect(screen.queryByText('Saved to date')).not.toBeInTheDocument()
   })
 
+  it('shows paired-device aggregate totals in the hero under combined scope', async () => {
+    const now = new Date()
+    const payload = makePayload(now)
+    // Local device: $312.40 / 4200 calls / 88 sessions (from makePayload).
+    // Combined swaps the hero to the cross-device aggregate and lists devices.
+    payload.combined = {
+      perDevice: [
+        { id: 'local', name: 'laptop', local: true, cost: 312.4, calls: 4200, sessions: 88, inputTokens: 0, outputTokens: 0, cacheCreateTokens: 0, cacheReadTokens: 0, totalTokens: 0 },
+        { id: 'fp-workstation', name: 'workstation', local: false, cost: 187.6, calls: 2100, sessions: 40, inputTokens: 0, outputTokens: 0, cacheCreateTokens: 0, cacheReadTokens: 0, totalTokens: 0 },
+      ],
+      combined: { cost: 500, calls: 6300, sessions: 128, inputTokens: 0, outputTokens: 0, cacheCreateTokens: 0, cacheReadTokens: 0, totalTokens: 0, deviceCount: 2, reachableCount: 2 },
+    }
+
+    const { container } = render(<OverviewContent period="30days" provider="all" overview={polled(payload)} scope="combined" />)
+
+    const kpis = container.querySelector('.ov-hero-main') as HTMLElement
+    // Hero cost is the combined $500, not the local $312.40.
+    expect(within(kpis).getByText('$500.00')).toBeInTheDocument()
+    expect(within(kpis).getByText(/6,300 calls · 128 sessions/)).toBeInTheDocument()
+    expect(within(kpis).getByText('Combined · Last 30 days')).toBeInTheDocument()
+    expect(within(kpis).getByText('2 of 2 devices')).toBeInTheDocument()
+    expect(within(kpis).getByText('workstation')).toBeInTheDocument()
+    expect(within(kpis).getByText('laptop · this device')).toBeInTheDocument()
+    // Combined mode hides the local savings lines (they are device-specific).
+    expect(within(kpis).queryByText('Saved via local models')).not.toBeInTheDocument()
+  })
+
+  it('keeps local hero totals when scope is local even if a combined payload is present', async () => {
+    const now = new Date()
+    const payload = makePayload(now)
+    payload.combined = {
+      perDevice: [],
+      combined: { cost: 999, calls: 1, sessions: 1, inputTokens: 0, outputTokens: 0, cacheCreateTokens: 0, cacheReadTokens: 0, totalTokens: 0, deviceCount: 2, reachableCount: 2 },
+    }
+
+    const { container } = render(<OverviewContent period="30days" provider="all" overview={polled(payload)} scope="local" />)
+
+    const kpis = container.querySelector('.ov-hero-main') as HTMLElement
+    expect(within(kpis).getByText('$312.40')).toBeInTheDocument()
+    expect(within(kpis).queryByText('$999.00')).not.toBeInTheDocument()
+    expect(within(kpis).queryByText(/devices/)).not.toBeInTheDocument()
+  })
+
   it('shows a stale banner when last-good data is present but the latest poll failed', async () => {
     const now = new Date()
     const overview: Polled<MenubarPayload> = {
@@ -698,5 +741,115 @@ describe('Overview', () => {
     const outcome = (await screen.findByText('Cost per outcome')).closest('.ov-panel') as HTMLElement
     expect(within(outcome).getByText('€22.50')).toBeInTheDocument()
     expect(within(outcome).getByText('€36.00')).toBeInTheDocument()
+  })
+})
+
+type WorkflowOverrides = {
+  workflow?: MenubarPayload['current']['workflow']
+  topReworkedFiles?: MenubarPayload['current']['topReworkedFiles']
+  pricingCoverage?: MenubarPayload['current']['pricingCoverage']
+}
+
+function workflowPayload(now: Date, over: WorkflowOverrides): MenubarPayload {
+  const base = makePayload(now)
+  return { ...base, current: { ...base.current, ...over } }
+}
+
+describe('Overview workflow card', () => {
+  beforeEach(() => {
+    setActiveCurrency({ code: 'USD', symbol: '$', rate: 1 })
+    getOverview.mockReset()
+    getActReport.mockReset()
+    getYield.mockReset()
+    getActReport.mockResolvedValue({ totals: { realizedCostUSD: 0, measuredActions: 0 } })
+    getYield.mockResolvedValue(makeYieldReport())
+  })
+  afterEach(() => vi.useRealTimers())
+
+  function workflowRegion(): HTMLElement {
+    return screen.getByRole('heading', { name: 'Workflow' }).closest('.ov-workflow-widget') as HTMLElement
+  }
+
+  it('renders correction rate, time to first edit, top rework, coverage chip, and a coaching note', async () => {
+    const now = new Date()
+    getOverview.mockResolvedValue(workflowPayload(now, {
+      workflow: { corrections: 7, correctionRate: 0.2, medianTimeToFirstEditMs: 45_000 },
+      topReworkedFiles: [{ path: 'parser.ts', sessions: 4, edits: 12 }],
+      pricingCoverage: 0.92,
+    }))
+
+    render(<Overview period="30days" provider="all" />)
+
+    const card = await waitFor(() => workflowRegion())
+    expect(within(card).getByText('Correction rate')).toBeInTheDocument()
+    expect(within(card).getByText('20%')).toBeInTheDocument()
+    expect(within(card).getByText('7 corrections')).toBeInTheDocument()
+    expect(within(card).getByText('Time to first edit')).toBeInTheDocument()
+    // Under 60s renders as seconds, not minutes.
+    expect(within(card).getByText('45s')).toBeInTheDocument()
+    expect(within(card).getByText(/Top rework:/)).toHaveTextContent('Top rework: parser.ts · 4 sessions · 12 edits')
+    // pricingCoverage 0.92 → a "92% priced" caveat chip.
+    expect(within(card).getByText('92% priced')).toBeInTheDocument()
+    // Corrections clears its bar first, so its coaching line wins.
+    expect(within(card).getByText(/You corrected the assistant on 20% of prompts \(7 times\)/)).toBeInTheDocument()
+  })
+
+  it('does not render at all when the payload carries no workflow signal', async () => {
+    const now = new Date()
+    // makePayload omits workflow/topReworkedFiles/pricingCoverage entirely.
+    getOverview.mockResolvedValue(makePayload(now))
+
+    render(<Overview period="30days" provider="all" />)
+
+    await screen.findByText('$312.40')
+    expect(screen.queryByRole('heading', { name: 'Workflow' })).not.toBeInTheDocument()
+  })
+
+  it('stays hidden when workflow exists but every metric is empty', async () => {
+    const now = new Date()
+    getOverview.mockResolvedValue(workflowPayload(now, {
+      workflow: { corrections: 0, correctionRate: null, medianTimeToFirstEditMs: null },
+      topReworkedFiles: [],
+      pricingCoverage: 1,
+    }))
+
+    render(<Overview period="30days" provider="all" />)
+
+    await screen.findByText('$312.40')
+    expect(screen.queryByRole('heading', { name: 'Workflow' })).not.toBeInTheDocument()
+  })
+
+  it('picks the churn note and formats minutes when corrections are below the bar', async () => {
+    const now = new Date()
+    getOverview.mockResolvedValue(workflowPayload(now, {
+      workflow: { corrections: 1, correctionRate: 0.05, medianTimeToFirstEditMs: 8 * 60 * 1000 },
+      topReworkedFiles: [{ path: 'router.ts', sessions: 5, edits: 30 }],
+      pricingCoverage: null,
+    }))
+
+    render(<Overview period="30days" provider="all" />)
+
+    const card = await waitFor(() => workflowRegion())
+    // >= 60s renders as whole minutes.
+    expect(within(card).getByText('8m')).toBeInTheDocument()
+    // Corrections (5%) is below 0.15, so the churn note wins over TTFE.
+    expect(within(card).getByText(/router\.ts was reworked across 5 sessions \(30 edits\)/)).toBeInTheDocument()
+    // pricingCoverage null → no chip.
+    expect(within(card).queryByText(/priced/)).not.toBeInTheDocument()
+  })
+
+  it('falls back to a neutral caption and hides the chip at full coverage when no note fires', async () => {
+    const now = new Date()
+    getOverview.mockResolvedValue(workflowPayload(now, {
+      workflow: { corrections: 1, correctionRate: 0.05, medianTimeToFirstEditMs: 30_000 },
+      topReworkedFiles: [{ path: 'small.ts', sessions: 1, edits: 2 }],
+      pricingCoverage: 1,
+    }))
+
+    render(<Overview period="30days" provider="all" />)
+
+    const card = await waitFor(() => workflowRegion())
+    expect(within(card).getByText('Corrections, first-edit latency, and file churn across your sessions.')).toBeInTheDocument()
+    expect(within(card).queryByText(/priced/)).not.toBeInTheDocument()
   })
 })

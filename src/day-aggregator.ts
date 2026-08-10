@@ -26,6 +26,23 @@ export function dateKey(iso: string): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
+/// Bucket an ISO timestamp under an explicit IANA timezone instead of the
+/// machine's local one. `en-CA` emits the ISO-ish YYYY-MM-DD layout directly,
+/// so formatToParts under the given `timeZone` yields exactly that shape. Used
+/// to re-aggregate the same parse under a cache's OLD tzKey when a timezone
+/// change forces a full re-derive (issue #770): comparing that bucketing to the
+/// fresh one shows exactly which turns re-bucketed across local midnight.
+export function dateKeyInTz(iso: string, tz: string): string {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(iso))
+  let year = '', month = '', day = ''
+  for (const p of parts) {
+    if (p.type === 'year') year = p.value
+    else if (p.type === 'month') month = p.value
+    else if (p.type === 'day') day = p.value
+  }
+  return `${year}-${month}-${day}`
+}
+
 function emptySlice(): ProviderDaySlice {
   return {
     calls: 0, cost: 0, savingsUSD: 0,
@@ -34,7 +51,7 @@ function emptySlice(): ProviderDaySlice {
   }
 }
 
-export function aggregateProjectsIntoDays(projects: ProjectSummary[]): DailyEntry[] {
+export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn: (iso: string) => string = dateKey): DailyEntry[] {
   const byDate = new Map<string, DailyEntry>()
   const ensure = (date: string): DailyEntry => {
     let d = byDate.get(date)
@@ -61,7 +78,7 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[]): DailyEntr
 
   for (const project of projects) {
     for (const session of project.sessions) {
-      const sessionDate = dateKey(session.firstTimestamp)
+      const sessionDate = dateKeyFn(session.firstTimestamp)
       const sessionDay = ensure(sessionDate)
       sessionDay.sessions += 1
       ensureProject(sessionDay, session.project, project.projectPath).sessions += 1
@@ -75,15 +92,26 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[]): DailyEntr
 
       for (const turn of session.turns) {
         if (turn.assistantCalls.length === 0) continue
-        // Turn-anchored bucketing: attribute the WHOLE turn — every one of its
-        // calls — to the day of the turn's user-message timestamp, matching the
-        // live headline/report rollup (main.ts daily). Falls back to the first
-        // assistant-call timestamp when the user line is missing (continuation
-        // sessions that begin mid-conversation). Previously the calls were
-        // bucketed per-call by each call's own timestamp, so a midnight-
-        // straddling turn split across two days and history.daily / the provider
-        // breakdown never reconciled to current.cost (a constant offset).
-        const turnDate = dateKey(turn.timestamp || turn.assistantCalls[0]!.timestamp)
+        // Two bucketing rules, deliberately different per level:
+        // - Turn-level judgments (category, editTurns, oneShotTurns) stay
+        //   anchored to the turn's day (its timestamp — the user-message time,
+        //   or the re-anchored first surviving call when the parser sliced
+        //   the turn to a range, and falling back to the first assistant call
+        //   when the user line is missing). They describe the whole exchange,
+        //   not a per-call sum, so a sliced straddling turn reports them on
+        //   each side's anchor day — summed across days they inflate, which
+        //   is the accepted, documented semantics (see review on #852).
+        // - Call-derived values (cost/savings/calls/tokens and the model,
+        //   project, and provider-slice rollups built from them) bucket under
+        //   EACH CALL's own local day (the per-call loop below). The parser
+        //   slices straddling turns per range (issue #852), so every parse
+        //   only holds in-range calls and per-call bucketing keeps day-N +
+        //   day-N+1 equal to the whole range — and history.daily reconciled
+        //   to the headline built from the same days. (Before the parser
+        //   sliced per call, per-call bucketing here was what caused the
+        //   constant offset against the whole-turn headline; the slice is
+        //   what makes it exact now.)
+        const turnDate = dateKeyFn(turn.timestamp || turn.assistantCalls[0]!.timestamp)
         const turnDay = ensure(turnDate)
 
         const editTurns = turn.hasEdits ? 1 : 0
@@ -140,21 +168,26 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[]): DailyEntr
 
         for (const call of turn.assistantCalls) {
           const callSavings = call.savingsUSD ?? 0
+          // Call-derived values bucket under the call's OWN day (see the
+          // two-rule comment above). An unparseable call timestamp falls back
+          // to the turn's anchor day rather than producing a garbage date key.
+          const callDate = Number.isNaN(new Date(call.timestamp).getTime()) ? turnDate : dateKeyFn(call.timestamp)
+          const callDay = ensure(callDate)
 
-          turnDay.cost += call.costUSD
-          turnDay.savingsUSD += callSavings
-          turnDay.calls += 1
-          turnDay.inputTokens += call.usage.inputTokens
-          turnDay.outputTokens += call.usage.outputTokens
-          turnDay.cacheReadTokens += call.usage.cacheReadInputTokens
-          turnDay.cacheWriteTokens += call.usage.cacheCreationInputTokens
+          callDay.cost += call.costUSD
+          callDay.savingsUSD += callSavings
+          callDay.calls += 1
+          callDay.inputTokens += call.usage.inputTokens
+          callDay.outputTokens += call.usage.outputTokens
+          callDay.cacheReadTokens += call.usage.cacheReadInputTokens
+          callDay.cacheWriteTokens += call.usage.cacheCreationInputTokens
 
-          const dayProject = ensureProject(turnDay, session.project, project.projectPath)
+          const dayProject = ensureProject(callDay, session.project, project.projectPath)
           dayProject.cost += call.costUSD
           dayProject.calls += 1
           dayProject.savingsUSD += callSavings
 
-          const model = turnDay.models[call.model] ?? {
+          const model = callDay.models[call.model] ?? {
             calls: 0, cost: 0, savingsUSD: 0,
             inputTokens: 0, outputTokens: 0,
             cacheReadTokens: 0, cacheWriteTokens: 0,
@@ -166,9 +199,9 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[]): DailyEntr
           model.outputTokens += call.usage.outputTokens
           model.cacheReadTokens += call.usage.cacheReadInputTokens
           model.cacheWriteTokens += call.usage.cacheCreationInputTokens
-          turnDay.models[call.model] = model
+          callDay.models[call.model] = model
 
-          const slice = ensureSlice(turnDay, call.provider)
+          const slice = ensureSlice(callDay, call.provider)
           slice.calls += 1
           slice.cost += call.costUSD
           slice.savingsUSD += callSavings

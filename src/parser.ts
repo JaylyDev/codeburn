@@ -3,11 +3,12 @@ import { lstat, readFile, readdir, stat } from 'fs/promises'
 import { basename, dirname, join, resolve, sep } from 'path'
 import { readSessionLines } from './fs-utils.js'
 import { calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash } from './models.js'
+import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
 import { normalizeContentBlocks } from './content-utils.js'
 import { discoverAllSessions, getProvider } from './providers/index.js'
 import { flushCodexCache } from './codex-cache.js'
 import { antigravityCascadeIdFromPath, flushAntigravityCache, shouldReparseAntigravitySource } from './providers/antigravity.js'
-import { getDesktopSessionsDir } from './providers/claude.js'
+import { getDesktopSessionsDirs } from './providers/claude.js'
 import { isSqliteBusyError } from './sqlite.js'
 import {
   type CachedCall,
@@ -26,6 +27,7 @@ import {
   saveCache,
 } from './session-cache.js'
 import { acquireCacheRefreshLock, type RefreshLockHandle } from './cache-refresh-lock.js'
+import { dateKey } from './day-aggregator.js'
 import type { ParsedProviderCall, SessionSource } from './providers/types.js'
 import type {
   ApiUsageIteration,
@@ -80,9 +82,13 @@ function projectNameFromPath(projectPath: string, fallback: string): string {
 // In both cases the grouping key comes from the Cowork space name resolved in
 // claude.ts::discoverSessions().
 function isCoworkSession(cwd: string, filePath: string): boolean {
-  const base = resolve(getDesktopSessionsDir())
-  const inBase = (p: string) => p.startsWith(base + sep) || p.startsWith(base + '/')
-  return inBase(resolve(cwd)) || inBase(resolve(filePath))
+  const resolvedCwd = resolve(cwd)
+  const resolvedFilePath = resolve(filePath)
+  return getDesktopSessionsDirs().some(base => {
+    const resolvedBase = resolve(base)
+    const inBase = (p: string) => p.startsWith(resolvedBase + sep) || p.startsWith(resolvedBase + '/')
+    return inBase(resolvedCwd) || inBase(resolvedFilePath)
+  })
 }
 
 async function resolveCanonicalProjectPath(cwd: string): Promise<{ path: string; isWorktree: boolean }> {
@@ -912,6 +918,12 @@ export function compactEntry(raw: JournalEntry): JournalEntry {
   if (raw.cwd !== undefined) entry.cwd = raw.cwd
   // Preserved so groupIntoTurns can stamp each turn's git branch (rich capture).
   if (typeof raw.gitBranch === 'string' && raw.gitBranch) entry.gitBranch = raw.gitBranch
+  // Preserved so groupIntoTurns can attribute each PR reference to its turn.
+  // Only `pr-link` entries carry `prUrl`; every other field of theirs is dropped.
+  if (raw.type === 'pr-link') {
+    const prUrl = (raw as Record<string, unknown>)['prUrl']
+    if (typeof prUrl === 'string' && prUrl) (entry as Record<string, unknown>)['prUrl'] = prUrl
+  }
 
   const att = (raw as Record<string, unknown>)['attachment']
   if (att && typeof att === 'object') {
@@ -1182,10 +1194,21 @@ export type SessionMeta = {
   title?: string
   prLinks: string[]
   isSidechain: boolean
+  // Sidechain side: the parent session id (a sidechain entry's internal
+  // `sessionId`, which is the spawning session). First non-empty value wins.
+  parentSessionId?: string
+  // Parent side: agentId -> the `tool_use` id of the `Agent`/`Task` block that
+  // spawned it, read from the spawn result's `toolUseResult.agentId`. First value
+  // per agentId wins. Empty for sessions that spawned no completed subagent.
+  agentSpawnLinks: Record<string, string>
+  // Parent side: agent ids whose spawn result named them but whose exact launching
+  // tool_use could not be paired (an ambiguous multi-result record). Drives the
+  // grace-window fallback for a late child. Deduped.
+  ambiguousSpawnAgentIds: string[]
 }
 
 export function emptySessionMeta(): SessionMeta {
-  return { prLinks: [], isSidechain: false }
+  return { prLinks: [], isSidechain: false, agentSpawnLinks: {}, ambiguousSpawnAgentIds: [] }
 }
 
 // Count added/removed lines from a Claude `toolUseResult.structuredPatch`. Each
@@ -1243,7 +1266,50 @@ export function collectSessionMeta(entry: JournalEntry, meta: SessionMeta): void
     const url = (entry as Record<string, unknown>)['prUrl']
     if (typeof url === 'string' && url && !meta.prLinks.includes(url)) meta.prLinks.push(url)
   }
-  if (entry.isSidechain === true) meta.isSidechain = true
+  if (entry.isSidechain === true) {
+    meta.isSidechain = true
+    // A sidechain entry's own `sessionId` is the id of the session that spawned
+    // it (32/32 on real data; cross-checked against the owning directory at
+    // stamp time). First value wins; every entry in the file carries the same id.
+    const sid = (entry as Record<string, unknown>)['sessionId']
+    if (!meta.parentSessionId && typeof sid === 'string' && sid) meta.parentSessionId = sid
+  }
+  // Parent side: the `Agent`/`Task` spawn result records the spawned agent's id in
+  // `toolUseResult.agentId`; pair it with the `tool_result` block's `tool_use_id`
+  // (the spawn's `tool_use` id) so a child can be folded into the launching turn.
+  // Read from the RAW entry (compaction strips `toolUseResult`).
+  const tur = (entry as Record<string, unknown>)['toolUseResult']
+  if (tur && typeof tur === 'object') {
+    const agentId = (tur as Record<string, unknown>)['agentId']
+    if (typeof agentId === 'string' && agentId && !(agentId in meta.agentSpawnLinks)) {
+      const msg = entry.message
+      const content = msg && typeof msg === 'object' ? (msg as { content?: unknown }).content : undefined
+      if (Array.isArray(content)) {
+        const results = content.filter((b): b is Record<string, unknown> =>
+          !!b && typeof b === 'object' && (b as { type?: unknown }).type === 'tool_result'
+          && typeof (b as { tool_use_id?: unknown }).tool_use_id === 'string' && !!(b as { tool_use_id?: unknown }).tool_use_id)
+        let spawnId: string | undefined
+        if (results.length === 1) {
+          spawnId = results[0]!['tool_use_id'] as string
+        } else if (results.length > 1) {
+          // Several batched tool results share one entry: pair the agentId with the
+          // block whose `content` is the spawn result (equals `toolUseResult.content`),
+          // so an unrelated sibling block cannot capture the id. When the match is
+          // ambiguous (identical blocks, or none match) the spawn link is left
+          // unset ON PURPOSE: the child then folds via the timestamp-bucket fallback
+          // in resolveChild rather than risk pairing with the wrong id.
+          const turContent = JSON.stringify((tur as Record<string, unknown>)['content'])
+          const matches = results.filter(b => JSON.stringify(b['content']) === turContent)
+          if (matches.length === 1) spawnId = matches[0]!['tool_use_id'] as string
+        }
+        if (spawnId) meta.agentSpawnLinks[agentId] = spawnId
+        // We know this parent spawned `agentId` (its result named it) but could not
+        // pair the exact tool_use: record it as an AMBIGUOUS pairing so a late child
+        // can still fold via the grace window. Not the same as an absent spawn.
+        else if (!meta.ambiguousSpawnAgentIds.includes(agentId)) meta.ambiguousSpawnAgentIds.push(agentId)
+      }
+    }
+  }
 }
 
 export function parseApiCall(entry: JournalEntry, toolResultMeta?: Map<string, ToolResultMeta>): ParsedApiCall | null {
@@ -1282,6 +1348,13 @@ export function parseApiCall(entry: JournalEntry, toolResultMeta?: Map<string, T
   )
 
   const bashCmds = extractBashCommandsFromContent(contentBlocks)
+
+  // Subagent-spawn `tool_use` ids in this message (`Agent`/`Task` blocks). Kept so
+  // groupIntoTurns can attach them to the turn and by-PR attribution can fold each
+  // spawned sidechain back into the turn that launched it.
+  const spawnIds = contentBlocks
+    .filter((b): b is ToolUseBlock => b.type === 'tool_use' && (b.name === 'Agent' || b.name === 'Task') && !!b.id)
+    .map(b => b.id)
 
   const toolSeq: ToolCall[][] = contentBlocks
     .filter((b): b is ToolUseBlock => b.type === 'tool_use')
@@ -1331,6 +1404,7 @@ export function parseApiCall(entry: JournalEntry, toolResultMeta?: Map<string, T
     deduplicationKey: msg.id ?? `claude:${entry.timestamp}`,
     cacheCreationOneHourTokens: cacheCreation.oneHourTokens || undefined,
     toolSequence: toolSeq.length > 0 ? toolSeq : undefined,
+    ...(spawnIds.length > 0 ? { spawnToolUseIds: spawnIds } : {}),
     ...(locAdded ? { locAdded } : {}),
     ...(locRemoved ? { locRemoved } : {}),
     ...(interrupted ? { interrupted: true } : {}),
@@ -1440,6 +1514,13 @@ export function groupIntoTurns(entries: JournalEntry[], seenMsgIds: Set<string>,
   // from the user entry (gitBranch is on every user/assistant entry); a
   // continuation turn with no leading user text falls back to its first call.
   let currentBranch: string | undefined
+  // GitHub PR URLs referenced within the turn currently being accumulated. A
+  // `pr-link` entry is emitted after the assistant creates/references a PR, so it
+  // lands inside the same turn (before the next user message) and attaches here.
+  let currentPrRefs: string[] = []
+  // Subagent-spawn `tool_use` ids emitted within the current turn (deduped),
+  // carried from each call's `spawnToolUseIds`.
+  let currentSpawnIds: string[] = []
 
   for (const entry of entries) {
     const entryBranch = typeof entry.gitBranch === 'string' && entry.gitBranch ? entry.gitBranch : undefined
@@ -1453,6 +1534,8 @@ export function groupIntoTurns(entries: JournalEntry[], seenMsgIds: Set<string>,
             timestamp: currentTimestamp,
             sessionId: currentSessionId,
             ...(currentBranch ? { gitBranch: currentBranch } : {}),
+            ...(currentPrRefs.length > 0 ? { prRefs: [...currentPrRefs].sort() } : {}),
+            ...(currentSpawnIds.length > 0 ? { spawnToolUseIds: currentSpawnIds } : {}),
           })
         }
         currentUserMessage = text
@@ -1460,6 +1543,8 @@ export function groupIntoTurns(entries: JournalEntry[], seenMsgIds: Set<string>,
         currentTimestamp = entry.timestamp ?? ''
         currentSessionId = entry.sessionId ?? ''
         currentBranch = entryBranch
+        currentPrRefs = extractPrUrlsFromText(text)
+        currentSpawnIds = []
       }
     } else if (entry.type === 'assistant') {
       if (entryBranch && !currentBranch) currentBranch = entryBranch
@@ -1467,8 +1552,14 @@ export function groupIntoTurns(entries: JournalEntry[], seenMsgIds: Set<string>,
       if (msgId && seenMsgIds.has(msgId)) continue
       if (msgId) seenMsgIds.add(msgId)
       const call = parseApiCall(entry, toolResultMeta)
-      if (call) currentCalls.push(call)
+      if (call) {
+        currentCalls.push(call)
+        if (call.spawnToolUseIds) for (const id of call.spawnToolUseIds) if (!currentSpawnIds.includes(id)) currentSpawnIds.push(id)
+      }
       for (const advisorCall of parseAdvisorCalls(entry)) currentCalls.push(advisorCall)
+    } else if (entry.type === 'pr-link') {
+      const url = (entry as Record<string, unknown>)['prUrl']
+      if (typeof url === 'string' && url && !currentPrRefs.includes(url)) currentPrRefs.push(url)
     }
   }
 
@@ -1479,10 +1570,28 @@ export function groupIntoTurns(entries: JournalEntry[], seenMsgIds: Set<string>,
       timestamp: currentTimestamp,
       sessionId: currentSessionId,
       ...(currentBranch ? { gitBranch: currentBranch } : {}),
+      ...(currentPrRefs.length > 0 ? { prRefs: [...currentPrRefs].sort() } : {}),
+      ...(currentSpawnIds.length > 0 ? { spawnToolUseIds: currentSpawnIds } : {}),
     })
   }
 
   return turns
+}
+
+// Map each subagent-spawn `tool_use` id to the PR set active at the turn that
+// emitted it, walking the FULL turn list in order. A turn's own `prRefs` apply to
+// spawns within it; otherwise the carried set does. First occurrence of a spawn id
+// wins deterministically (tool_use ids are unique in practice; this only guards a
+// pathological restatement). Drives cross-range subagent PR attribution.
+export function buildSpawnPrSets(turns: Array<{ prRefs?: string[]; spawnToolUseIds?: string[] }>): Record<string, string[]> {
+  const out: Record<string, string[]> = {}
+  let cur: string[] = []
+  for (const turn of turns) {
+    const active = turn.prRefs?.length ? turn.prRefs : cur
+    for (const id of turn.spawnToolUseIds ?? []) if (!(id in out)) out[id] = active
+    if (turn.prRefs?.length) cur = turn.prRefs
+  }
+  return out
 }
 
 /**
@@ -1626,6 +1735,11 @@ function buildSessionSummary(
       modelBreakdown[modelKey].tokens.cacheReadInputTokens += call.usage.cacheReadInputTokens
       modelBreakdown[modelKey].tokens.cacheCreationInputTokens += call.usage.cacheCreationInputTokens
       modelBreakdown[modelKey].tokens.reasoningTokens += call.usage.reasoningTokens
+      if (call.activeDurationMs !== undefined) {
+        modelBreakdown[modelKey].activeDurationMs = (modelBreakdown[modelKey].activeDurationMs ?? 0) + call.activeDurationMs
+        modelBreakdown[modelKey].activeGeneratedTokens = (modelBreakdown[modelKey].activeGeneratedTokens ?? 0) + (call.activeGeneratedTokens ?? call.usage.outputTokens + call.usage.reasoningTokens)
+        modelBreakdown[modelKey].toolWaitMs = (modelBreakdown[modelKey].toolWaitMs ?? 0) + (call.toolWaitMs ?? 0)
+      }
 
       for (const tool of extractCoreTools(call.tools)) {
         toolBreakdown[tool] = toolBreakdown[tool] ?? { calls: 0 }
@@ -1823,6 +1937,7 @@ async function scanProjectDirs(
       const cached = section.files[filePath]
       const action = reconcileFile(fp, cached)
       if (cached && (readOnly || action.action === 'unchanged')) {
+        if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
         unchangedFiles.push({ filePath, dirName, source, cached: section.files[filePath]! })
       } else if (!readOnly) {
         if (action.action === 'appended') {
@@ -1834,6 +1949,10 @@ async function scanProjectDirs(
           continue
         }
         changedFiles.push({ filePath, info: { dirName, fp, source } })
+      } else {
+        // Read-only with no cache entry at all: this file is dropped from what
+        // we serve, so the snapshot under-reports whatever days it covers.
+        readOnlyServedStale = true
       }
     }
     dirsDone++
@@ -1841,14 +1960,19 @@ async function scanProjectDirs(
   }
   discoverProgress.finish()
 
-  if (readOnly) {
-    for (const [filePath, cached] of Object.entries(section.files)) {
-      if (allDiscoveredFiles.has(filePath)) continue
-      const dirName = cached.canonicalProjectName
-        ?? cached.turns[0]?.calls[0]?.project
-        ?? basename(dirname(filePath))
-      unchangedFiles.push({ filePath, dirName, cached })
-    }
+  // Orphans: cached sessions whose source file is no longer discovered. In
+  // read-only mode surface them all (the snapshot is authoritative, nothing is
+  // being pruned). In write mode surface only PR-bearing orphans: their transcript
+  // is gone and can never re-parse, but they carry attributable PR spend the by-PR
+  // report must keep (as a legacy even-split); the eviction below preserves the
+  // same set so `section.files` still holds them when summaries are built.
+  for (const [filePath, cached] of Object.entries(section.files)) {
+    if (allDiscoveredFiles.has(filePath)) continue
+    if (!readOnly && !cached.prLinks?.length) continue
+    const dirName = cached.canonicalProjectName
+      ?? cached.turns[0]?.calls[0]?.project
+      ?? basename(dirname(filePath))
+    unchangedFiles.push({ filePath, dirName, cached })
   }
 
   // Pre-seed dedup set from cached (unchanged) files
@@ -1907,6 +2031,14 @@ async function scanProjectDirs(
             if (!newTurns[0]!.userMessage.trim() && mergedTurns.length > 0) {
               const last = mergedTurns[mergedTurns.length - 1]!
               last.calls = mergeBoundaryCalls(last.calls, newTurns[0]!.calls)
+              // A PR referenced in the appended continuation belongs to this same
+              // turn: union its refs in so the shortcut matches a full re-parse.
+              const refs = Array.from(new Set([...(last.prRefs ?? []), ...(newTurns[0]!.prRefs ?? [])])).sort()
+              if (refs.length > 0) last.prRefs = refs
+              // A subagent spawned in the appended continuation belongs to this
+              // same turn: union its spawn ids in for the same reason.
+              const spawnIds = Array.from(new Set([...(last.spawnToolUseIds ?? []), ...(newTurns[0]!.spawnToolUseIds ?? [])]))
+              if (spawnIds.length > 0) last.spawnToolUseIds = spawnIds
               startIdx = 1
             }
             for (let i = startIdx; i < newTurns.length; i++) mergedTurns.push(newTurns[i]!)
@@ -1921,8 +2053,10 @@ async function scanProjectDirs(
           // one was resolved there; only re-derive if the cached region had none.
           let canonicalCwd = cached.canonicalCwd
           let canonicalProjectName = cached.canonicalProjectName
+          let workingDirectory = cached.workingDirectory
           if (canonicalCwd === undefined && newEntries) {
             const cwd = extractCanonicalCwd(newEntries)
+            workingDirectory = workingDirectory ?? cwd
             const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
             canonicalCwd = canonical?.path
             canonicalProjectName = canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined
@@ -1935,14 +2069,20 @@ async function scanProjectDirs(
 
           // Session meta merges across the append boundary: title is last-wins
           // (prefer the newly-parsed tail), PR links union, isSidechain is sticky.
+          // parentSessionId is sticky (cached-first, it is the earliest region);
+          // agentSpawnLinks union (cached-first, first-seen spawn id per agent wins).
           const mergedTitle = sessionMeta.title ?? cached.title
           const mergedPrLinks = Array.from(new Set([...(cached.prLinks ?? []), ...sessionMeta.prLinks]))
           const mergedSidechain = cached.isSidechain === true || sessionMeta.isSidechain
+          const mergedParentSessionId = cached.parentSessionId ?? sessionMeta.parentSessionId
+          const mergedSpawnLinks = { ...sessionMeta.agentSpawnLinks, ...cached.agentSpawnLinks }
+          const mergedAmbiguousIds = Array.from(new Set([...(cached.ambiguousSpawnAgentIds ?? []), ...sessionMeta.ambiguousSpawnAgentIds]))
 
           section.files[filePath] = {
             fingerprint: info.fp,
             lastCompleteLineOffset: tracker.lastCompleteLineOffset,
             canonicalCwd,
+            ...(workingDirectory ? { workingDirectory } : {}),
             canonicalProjectName,
             mcpInventory,
             turns: mergedTurns,
@@ -1950,6 +2090,9 @@ async function scanProjectDirs(
             ...(mergedTitle ? { title: mergedTitle } : {}),
             ...(mergedPrLinks.length > 0 ? { prLinks: mergedPrLinks } : {}),
             ...(mergedSidechain ? { isSidechain: true } : {}),
+            ...(mergedParentSessionId ? { parentSessionId: mergedParentSessionId } : {}),
+            ...(Object.keys(mergedSpawnLinks).length > 0 ? { agentSpawnLinks: mergedSpawnLinks } : {}),
+            ...(mergedAmbiguousIds.length > 0 ? { ambiguousSpawnAgentIds: mergedAmbiguousIds } : {}),
           }
           ;(diskCache as { _dirty?: boolean })._dirty = true
           filesDone++
@@ -1976,6 +2119,7 @@ async function scanProjectDirs(
         fingerprint: info.fp,
         lastCompleteLineOffset: tracker.lastCompleteLineOffset,
         canonicalCwd: canonical?.path,
+        ...(cwd ? { workingDirectory: cwd } : {}),
         canonicalProjectName: canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined,
         mcpInventory: extractMcpInventory(entries),
         turns: parsedTurnsToCachedTurns(turns),
@@ -1983,6 +2127,9 @@ async function scanProjectDirs(
         ...(sessionMeta.title ? { title: sessionMeta.title } : {}),
         ...(sessionMeta.prLinks.length > 0 ? { prLinks: sessionMeta.prLinks } : {}),
         ...(sessionMeta.isSidechain ? { isSidechain: true } : {}),
+        ...(sessionMeta.parentSessionId ? { parentSessionId: sessionMeta.parentSessionId } : {}),
+        ...(Object.keys(sessionMeta.agentSpawnLinks).length > 0 ? { agentSpawnLinks: sessionMeta.agentSpawnLinks } : {}),
+        ...(sessionMeta.ambiguousSpawnAgentIds.length > 0 ? { ambiguousSpawnAgentIds: sessionMeta.ambiguousSpawnAgentIds } : {}),
       }
       ;(diskCache as { _dirty?: boolean })._dirty = true
     } catch (err) {
@@ -2008,14 +2155,16 @@ async function scanProjectDirs(
 
   if (!readOnly && dirs.length > 0) {
     for (const cachedPath of Object.keys(section.files)) {
-      if (!allDiscoveredFiles.has(cachedPath)) {
-        delete section.files[cachedPath]
-        ;(diskCache as { _dirty?: boolean })._dirty = true
-      }
+      if (allDiscoveredFiles.has(cachedPath)) continue
+      // Keep PR-bearing orphans: their transcript is gone and can never re-parse,
+      // but they carry attributable PR spend (surfaced above as a legacy split).
+      if (section.files[cachedPath]?.prLinks?.length) continue
+      delete section.files[cachedPath]
+      ;(diskCache as { _dirty?: boolean })._dirty = true
     }
   }
 
-  const projectMap = new Map<string, { project: string; projectPath: string; sessions: SessionSummary[]; dirNames: Set<string> }>()
+  const projectMap = new Map<string, { project: string; projectPath: string; sessions: SessionSummary[]; anchors: SessionSummary[]; dirNames: Set<string> }>()
 
   const allFiles = [
     ...unchangedFiles.map(f => ({ filePath: f.filePath, dirName: f.dirName, source: f.source })),
@@ -2026,40 +2175,103 @@ async function scanProjectDirs(
     const cachedFile = section.files[filePath]
     if (!cachedFile || cachedFile.turns.length === 0) continue
 
-    let classifiedTurns = cachedFile.turns.map(cachedTurnToClassified)
+    // Carry the git branch forward BEFORE the date filter below: the cache
+    // stores a turn's branch only when it changes, so resolving here (over the
+    // full ordered turn list) means a later date slice can drop the anchor turn
+    // without the surviving turns losing their branch.
+    let carriedBranch: string | undefined
+    // The PR set active going into the report range: carried across the FULL turn
+    // list, frozen the moment the first in-range turn is reached. Lets per-turn PR
+    // attribution seed from a reference made before the window (see
+    // attributeSessionPrSpend); the branch carry above solves the same problem.
+    let carriedPrRefs: string[] | undefined
+    let prRefsAtRangeStart: string[] | undefined
+    let frozePrRefs = !dateRange
+    let classifiedTurns = cachedFile.turns.map(turn => {
+      if (turn.gitBranch) carriedBranch = turn.gitBranch
+      if (dateRange && !frozePrRefs) {
+        const firstTs = turn.calls[0]?.timestamp
+        if (firstTs && new Date(firstTs) >= dateRange.start) {
+          prRefsAtRangeStart = carriedPrRefs
+          frozePrRefs = true
+        }
+      }
+      if (turn.prRefs?.length) carriedPrRefs = turn.prRefs
+      return cachedTurnToClassified(turn, carriedBranch)
+    })
+    // Captured from the FULL turn list, before the date slice below can drop the
+    // turn a branch was first seen on. Lets the by-branch report keep this
+    // session's in-range unbranched spend as `null` instead of discarding it.
+    const everHadBranch = carriedBranch !== undefined
+
+    // Built from the FULL (pre-slice) turn list: each subagent-spawn tool_use id ->
+    // the PR set active at the turn that emitted it. Lets a subagent fold into the
+    // right PR even when its launching turn is later sliced out of range. Only for
+    // sessions that both spawned subagents and referenced a PR.
+    const spawnPrSets = cachedFile.prLinks?.length ? buildSpawnPrSets(cachedFile.turns) : {}
 
     if (dateRange) {
-      classifiedTurns = classifiedTurns.filter(turn => {
-        if (turn.assistantCalls.length === 0) return false
-        const firstCallTs = turn.assistantCalls[0]!.timestamp
-        if (!firstCallTs) return false
-        const ts = new Date(firstCallTs)
-        return ts >= dateRange.start && ts <= dateRange.end
+      // Slice rather than drop: a turn spanning local midnight would otherwise
+      // lose every call that lands in the requested day (issue #852). Only
+      // `assistantCalls`/`timestamp` are touched — see classifiedTurnSlicedToRange.
+      classifiedTurns = classifiedTurns.flatMap(turn => {
+        const sliced = classifiedTurnSlicedToRange(turn, dateRange)
+        return sliced ? [sliced] : []
       })
     }
 
-    if (classifiedTurns.length === 0) continue
+    // A PR-linked parent that spawned subagents is kept even when its OWN turns all
+    // fall out of range, as a 0-cost fold ANCHOR: an in-range child (an async agent
+    // that outlived the parent's last in-range turn) still needs the parent's
+    // `prLinks` / `spawnPrSets` to attribute. An anchor carries no in-range spend
+    // and is stored OUTSIDE `sessions` (see subagentAnchors) so it never
+    // contaminates session counts, averages, or any other per-session report.
+    const isSpawnAnchor = Object.keys(spawnPrSets).length > 0 && cachedFile.isSidechain !== true
+    const anchorOnly = classifiedTurns.length === 0 && isSpawnAnchor
+    if (classifiedTurns.length === 0 && !isSpawnAnchor) continue
 
     const sessionId = basename(filePath, '.jsonl')
     const projectPath = cachedFile.canonicalCwd ?? claudeSlugFallbackPath(dirName)
     const projectName = cachedFile.canonicalProjectName ?? dirName
     const mcpInv = cachedFile.mcpInventory.length > 0 ? cachedFile.mcpInventory : undefined
     const session = buildSessionSummary(sessionId, projectName, classifiedTurns, mcpInv, source)
+    if (cachedFile.workingDirectory) session.workingDirectory = cachedFile.workingDirectory
     session.agentType = cachedFile.agentType
-    if (cachedFile.prLinks?.length) session.prLinks = [...new Set(cachedFile.prLinks)].sort()
+    if (everHadBranch) session.everHadBranch = true
+    const observedPrLinks = new Set(classifiedTurns.flatMap(turn => turn.prRefs ?? []))
+    for (const link of cachedFile.prLinks ?? []) observedPrLinks.add(link)
+    if (observedPrLinks.size) {
+      session.prLinks = [...observedPrLinks].sort()
+      session.prAttributionSource = cachedFile.prLinks?.length ? 'transcript' : 'explicit-reference'
+    }
+    if (prRefsAtRangeStart?.length) session.prRefsAtRangeStart = prRefsAtRangeStart
     if (cachedFile.title) session.title = cachedFile.title
+    // Sidechain linkage: carry the parent id (the transcript's internal
+    // `sessionId`, authoritative even when it disagrees with the owning directory
+    // on a resumed session) and derive the agent id from the `agent-<agentId>`
+    // filename. A sidechain whose parent id was never captured stays standalone.
+    if (cachedFile.isSidechain) {
+      if (cachedFile.parentSessionId) session.parentSessionId = cachedFile.parentSessionId
+      session.agentId = sessionId.startsWith('agent-') ? sessionId.slice('agent-'.length) : sessionId
+    }
+    // Parent linkage maps (only present on sessions that spawned subagents).
+    if (cachedFile.agentSpawnLinks && Object.keys(cachedFile.agentSpawnLinks).length > 0) {
+      session.agentSpawnLinks = cachedFile.agentSpawnLinks
+    }
+    if (cachedFile.ambiguousSpawnAgentIds?.length) session.ambiguousSpawnAgentIds = cachedFile.ambiguousSpawnAgentIds
+    if (Object.keys(spawnPrSets).length > 0) session.spawnPrSets = spawnPrSets
 
-    if (session.apiCalls > 0) {
+    if (session.apiCalls > 0 || anchorOnly) {
       const projectKey = cachedFile.canonicalCwd
         ? normalizeProjectPathKey(cachedFile.canonicalCwd)
         : `slug:${dirName}`
       const existing = projectMap.get(projectKey)
-      if (existing) {
-        existing.sessions.push(session)
-        existing.dirNames.add(dirName)
-      } else {
-        projectMap.set(projectKey, { project: projectName, projectPath, sessions: [session], dirNames: new Set([dirName]) })
-      }
+      // An anchor (no in-range spend) goes into a separate bucket, never `sessions`.
+      const target = existing ?? { project: projectName, projectPath, sessions: [], anchors: [], dirNames: new Set([dirName]) }
+      if (anchorOnly) target.anchors.push(session)
+      else target.sessions.push(session)
+      target.dirNames.add(dirName)
+      if (!existing) projectMap.set(projectKey, target)
     }
   }
 
@@ -2077,12 +2289,13 @@ async function scanProjectDirs(
     if (!cwdKey) continue
     const target = projectMap.get(cwdKey)!
     target.sessions.push(...entry.sessions)
+    target.anchors.push(...entry.anchors)
     projectMap.delete(key)
   }
 
   const projects: ProjectSummary[] = []
-  for (const { project, projectPath, sessions } of projectMap.values()) {
-    projects.push(summarizeProject(project, projectPath, sessions))
+  for (const { project, projectPath, sessions, anchors } of projectMap.values()) {
+    projects.push(summarizeProject(project, projectPath, sessions, anchors))
   }
 
   return projects
@@ -2095,7 +2308,7 @@ async function scanProjectDirs(
 /// `totalProxiedCostUSD` (subscription-covered). All ProjectSummary callers go
 /// through here so the rule stays consistent across the fresh, cached, and
 /// date/day-filtered paths.
-function summarizeProject(project: string, projectPath: string, sessions: SessionSummary[]): ProjectSummary {
+function summarizeProject(project: string, projectPath: string, sessions: SessionSummary[], anchors: SessionSummary[] = []): ProjectSummary {
   const totalCostUSD = sessions.reduce((s, sess) => s + sess.totalCostUSD, 0)
   return {
     project,
@@ -2106,7 +2319,17 @@ function summarizeProject(project: string, projectPath: string, sessions: Sessio
     totalEstimatedCostUSD: sessions.reduce((s, sess) => s + (sess.totalEstimatedCostUSD ?? 0), 0),
     totalApiCalls: sessions.reduce((s, sess) => s + sess.apiCalls, 0),
     totalProxiedCostUSD: isProxiedPath(projectPath) ? totalCostUSD : 0,
+    // Fold anchors travel separately (0-cost, out of every per-session total).
+    ...(anchors.length > 0 ? { subagentAnchors: anchors } : {}),
   }
+}
+
+// Provider-neutral explicit-reference capture. Every saved provider session
+// passes through this boundary. Full URLs only: a bare "#123" is repository-
+// ambiguous and must never silently move spend between repositories.
+const PR_URL_IN_TEXT_RE = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/g
+export function extractPrUrlsFromText(text: string): string[] {
+  return [...new Set(text.match(PR_URL_IN_TEXT_RE) ?? [])].sort()
 }
 
 function providerCallToTurn(call: ParsedProviderCall): ParsedTurn {
@@ -2139,11 +2362,13 @@ function providerCallToTurn(call: ParsedProviderCall): ParsedTurn {
     isEstimated: call.costIsEstimated,
   })
 
+  const prRefs = extractPrUrlsFromText(call.userMessage)
   return {
     userMessage: call.userMessage,
     assistantCalls: [apiCall],
     timestamp: call.timestamp,
     sessionId: call.sessionId,
+    ...(prRefs.length ? { prRefs } : {}),
   }
 }
 
@@ -2163,7 +2388,7 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
       webSearchRequests: call.webSearchRequests,
       cacheCreationOneHourTokens: 0,
     },
-    costUSD: (call.provider === 'mistral-vibe' || call.provider === 'antigravity' || call.provider === 'devin' || call.provider === 'vercel-gateway' || call.provider === 'hermes' || call.provider === 'kiro' || call.provider === 'codewhale' || call.provider === 'quickdesk') ? call.costUSD : undefined,
+    costUSD: (call.provider === 'mistral-vibe' || call.provider === 'antigravity' || call.provider === 'devin' || call.provider === 'vercel-gateway' || call.provider === 'hermes' || call.provider === 'kiro' || call.provider === 'codewhale' || call.provider === 'quickdesk' || call.provider === 'cline-cli') ? call.costUSD : undefined,
     isEstimated: call.costIsEstimated || undefined,
     speed: call.speed,
     timestamp: call.timestamp,
@@ -2174,10 +2399,14 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
     deduplicationKey: call.deduplicationKey,
     project: call.project,
     projectPath: call.projectPath,
+    workingDirectory: call.workingDirectory,
     toolSequence: call.toolSequence,
     ...(call.locAdded ? { locAdded: call.locAdded } : {}),
     ...(call.locRemoved ? { locRemoved: call.locRemoved } : {}),
     ...(call.editFailed ? { editFailed: call.editFailed } : {}),
+    activeDurationMs: call.activeDurationMs,
+    activeGeneratedTokens: call.activeGeneratedTokens,
+    toolWaitMs: call.toolWaitMs,
   }
 }
 
@@ -2185,10 +2414,11 @@ async function canonicalizeProviderCallProject(call: ParsedProviderCall): Promis
   if (!call.projectPath) return call
 
   const canonical = await resolveCanonicalProjectPath(call.projectPath)
-  if (!canonical.isWorktree) return call
+  if (!canonical.isWorktree) return { ...call, workingDirectory: call.workingDirectory ?? call.projectPath }
 
   return {
     ...call,
+    workingDirectory: call.workingDirectory ?? call.projectPath,
     project: projectNameFromPath(canonical.path, call.project ?? canonical.path),
     projectPath: canonical.path,
   }
@@ -2213,6 +2443,9 @@ function apiCallToCachedCall(call: ParsedApiCall): CachedCall {
     ...(call.interrupted ? { interrupted: true } : {}),
     ...(call.userModified ? { userModified: true } : {}),
     ...(call.toolErrors ? { toolErrors: call.toolErrors } : {}),
+    activeDurationMs: call.activeDurationMs,
+    activeGeneratedTokens: call.activeGeneratedTokens,
+    toolWaitMs: call.toolWaitMs,
   }
 }
 
@@ -2222,6 +2455,10 @@ function parsedTurnToCachedTurn(turn: ParsedTurn): CachedTurn {
     sessionId: turn.sessionId,
     userMessage: turn.userMessage.slice(0, 2000),
     calls: turn.assistantCalls.map(apiCallToCachedCall),
+    // Stored per-turn directly (already sorted/deduped in groupIntoTurns), unlike
+    // gitBranch's change-detection dedup, so each turn's refs are self-contained.
+    ...(turn.prRefs?.length ? { prRefs: turn.prRefs } : {}),
+    ...(turn.spawnToolUseIds?.length ? { spawnToolUseIds: turn.spawnToolUseIds } : {}),
   }
 }
 
@@ -2243,11 +2480,13 @@ export function parsedTurnsToCachedTurns(turns: ParsedTurn[]): CachedTurn[] {
 }
 
 function providerCallToCachedTurn(call: ParsedProviderCall): CachedTurn {
+  const prRefs = extractPrUrlsFromText(call.userMessage)
   return {
     timestamp: call.timestamp,
     sessionId: call.sessionId,
     userMessage: call.userMessage.slice(0, 2000),
     calls: [providerCallToCachedCall(call)],
+    ...(prRefs.length ? { prRefs } : {}),
   }
 }
 
@@ -2264,16 +2503,20 @@ function providerCallsToCachedTurns(calls: ParsedProviderCall[]): CachedTurn[] {
     const key = `${call.sessionId}\0${call.turnId}`
     let turn = grouped.get(key)
     if (!turn) {
+      const prRefs = extractPrUrlsFromText(call.userMessage)
       turn = {
         timestamp: call.timestamp,
         sessionId: call.sessionId,
         userMessage: call.userMessage.slice(0, 2000),
         calls: [],
+        ...(prRefs.length ? { prRefs } : {}),
       }
       grouped.set(key, turn)
       turns.push(turn)
     }
     turn.calls.push(providerCallToCachedCall(call))
+    const refs = extractPrUrlsFromText(call.userMessage)
+    if (refs.length) turn.prRefs = [...new Set([...(turn.prRefs ?? []), ...refs])].sort()
   }
 
   return turns
@@ -2315,15 +2558,28 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
     deduplicationKey: call.deduplicationKey,
     cacheCreationOneHourTokens: u.cacheCreationOneHourTokens || undefined,
     toolSequence: call.toolSequence,
+    activeDurationMs: call.activeDurationMs,
+    activeGeneratedTokens: call.activeGeneratedTokens,
+    toolWaitMs: call.toolWaitMs,
   })
 }
 
-function cachedTurnToClassified(turn: CachedTurn): ClassifiedTurn {
+// `resolvedBranch` restores the turn's git branch after the cache's per-turn
+// dedup (branch stored only when it changes). Callers that serve a full session's
+// turns in order carry the last stored value forward and pass it here, so each
+// reconstructed turn regains the "branch active for this turn" the cache elided —
+// and downstream date/day filtering can slice turns without losing the anchor.
+function cachedTurnToClassified(turn: CachedTurn, resolvedBranch?: string): ClassifiedTurn {
+  const branch = turn.gitBranch ?? resolvedBranch
+  const prRefs = turn.prRefs?.length ? turn.prRefs : extractPrUrlsFromText(turn.userMessage)
   const parsed: ParsedTurn = {
     userMessage: turn.userMessage,
     assistantCalls: turn.calls.map(cachedCallToApiCall),
     timestamp: turn.timestamp,
     sessionId: turn.sessionId,
+    ...(branch ? { gitBranch: branch } : {}),
+    ...(prRefs.length ? { prRefs } : {}),
+    ...(turn.spawnToolUseIds?.length ? { spawnToolUseIds: turn.spawnToolUseIds } : {}),
   }
   return classifyTurn(parsed)
 }
@@ -2550,6 +2806,59 @@ export function createScanProgress(label: string, total: number) {
   }
 }
 
+// Shared by the turn-range slicers below: which of a turn's calls actually
+// fall inside dateRange. Returns null when none do (the turn should be dropped
+// entirely, not kept with an empty call list).
+function callsInRange<T extends { timestamp: string }>(calls: T[], dateRange: DateRange): T[] | null {
+  const inRange = calls.filter(c => {
+    const ts = new Date(c.timestamp)
+    return !Number.isNaN(ts.getTime()) && ts >= dateRange.start && ts <= dateRange.end
+  })
+  return inRange.length > 0 ? inRange : null
+}
+
+// A turn can span local midnight (e.g. a long-running autonomous Codex
+// session): dropping the whole turn because its FIRST call falls outside
+// dateRange discards every later call that lands in the requested day (issue
+// #852). Instead, keep only the calls actually inside the range. `timestamp`
+// is re-anchored to the first surviving call so downstream turn-anchored
+// bucketing (session day, report rollups) keys the slice under the day its
+// retained calls actually fall in, not the pre-slice turn's original
+// (possibly prior-day) start. Returns null when no call is in range.
+function turnSlicedToRange(turn: CachedTurn, dateRange: DateRange): CachedTurn | null {
+  const inRangeCalls = callsInRange(turn.calls, dateRange)
+  if (!inRangeCalls) return null
+  if (inRangeCalls.length === turn.calls.length) return turn
+  return { ...turn, calls: inRangeCalls, timestamp: inRangeCalls[0]!.timestamp }
+}
+
+// Same slice, applied post-classification (scanProjectDirs classifies every
+// turn from its FULL call list up front, before date filtering — see the
+// carriedBranch/carriedPrRefs comments in scanProjectDirs — so this only
+// trims `assistantCalls` and re-anchors `timestamp`; `category`/`subCategory`/
+// `retries`/`hasEdits` stay exactly as classified from the complete turn.
+// Those are turn-level judgments about the whole exchange, not a per-call
+// sum, so they aren't recomputed from the partial call list.
+function classifiedTurnSlicedToRange(turn: ClassifiedTurn, dateRange: DateRange): ClassifiedTurn | null {
+  const inRangeCalls = callsInRange(turn.assistantCalls, dateRange)
+  if (!inRangeCalls) return null
+  if (inRangeCalls.length === turn.assistantCalls.length) return turn
+  return { ...turn, assistantCalls: inRangeCalls, timestamp: inRangeCalls[0]!.timestamp }
+}
+
+// Day-set variant of classifiedTurnSlicedToRange for the menubar/history day
+// selection: keep only the calls whose own local day is selected and
+// re-anchor `timestamp` to the first survivor — the same split rule.
+function classifiedTurnSlicedToDays(turn: ClassifiedTurn, days: Set<string>): ClassifiedTurn | null {
+  const inRangeCalls = turn.assistantCalls.filter(c => {
+    const ts = new Date(c.timestamp)
+    return !Number.isNaN(ts.getTime()) && days.has(dateKey(c.timestamp))
+  })
+  if (inRangeCalls.length === 0) return null
+  if (inRangeCalls.length === turn.assistantCalls.length) return turn
+  return { ...turn, assistantCalls: inRangeCalls, timestamp: inRangeCalls[0]!.timestamp }
+}
+
 async function parseProviderSources(
   providerName: string,
   sources: SessionSource[],
@@ -2590,9 +2899,13 @@ async function parseProviderSources(
     // re-read a file that already threw and hasn't changed. It re-parses only
     // when the file changes (then `reconcileFile` reports non-'unchanged').
     if (cached && (readOnly || (action.action === 'unchanged' && (cached.failed || !cachedFileNeedsProviderReparse(providerName, source.path, cached))))) {
+      if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
       unchangedSources.push({ source, cached })
     } else if (!readOnly) {
       changedSources.push({ source, fp })
+    } else {
+      // Read-only with no cache entry at all — see scanProjectDirs.
+      readOnlyServedStale = true
     }
   }
 
@@ -2745,7 +3058,7 @@ async function parseProviderSources(
 
   // Query-time: derive SessionSummary from all cached turns.
   // Uses seenKeys (shared across providers) for cross-provider dedup.
-  const sessionMap = new Map<string, { project: string; projectPath?: string; turns: ClassifiedTurn[]; prLinks?: Set<string>; title?: string }>()
+  const sessionMap = new Map<string, { project: string; projectPath?: string; workingDirectory?: string; turns: ClassifiedTurn[]; prLinks?: Set<string>; title?: string }>()
 
   for (const source of servedSources) {
     const cachedFile = section.files[source.path]
@@ -2757,23 +3070,32 @@ async function parseProviderSources(
 
       for (const c of turn.calls) seenKeys.add(c.deduplicationKey)
 
+      let slicedTurn = turn
       if (dateRange) {
-        const callTs = turn.calls[0]?.timestamp
-        if (!callTs) continue
-        const ts = new Date(callTs)
-        if (ts < dateRange.start || ts > dateRange.end) continue
+        const sliced = turnSlicedToRange(turn, dateRange)
+        if (!sliced) continue
+        slicedTurn = sliced
       }
 
-      const classified = cachedTurnToClassified(turn)
-      const project = turn.calls[0]?.project ?? source.project
+      // Classify the FULL turn, then keep only the in-range calls: category /
+      // hasEdits / retries are whole-exchange judgments, not per-call sums, so a
+      // midnight-straddling turn is classified identically to the Claude path
+      // (scanProjectDirs) rather than being re-derived from a partial slice.
+      // Cost/calls come from the retained calls, unchanged.
+      const classifiedFull = cachedTurnToClassified(turn)
+      const classified = dateRange
+        ? (classifiedTurnSlicedToRange(classifiedFull, dateRange) ?? classifiedFull)
+        : classifiedFull
+      const project = slicedTurn.calls[0]?.project ?? source.project
       const key = `${providerName}:${turn.sessionId}:${project}`
 
       const existing = sessionMap.get(key)
       if (existing) {
         existing.turns.push(classified)
-        if (!existing.projectPath && turn.calls[0]?.projectPath) {
-          existing.projectPath = turn.calls[0]!.projectPath
+        if (!existing.projectPath && slicedTurn.calls[0]?.projectPath) {
+          existing.projectPath = slicedTurn.calls[0]!.projectPath
         }
+        if (!existing.workingDirectory && slicedTurn.calls[0]?.workingDirectory) existing.workingDirectory = slicedTurn.calls[0].workingDirectory
         if (cachedFile.prLinks?.length) {
           const links = (existing.prLinks ??= new Set())
           for (const link of cachedFile.prLinks) links.add(link)
@@ -2782,7 +3104,8 @@ async function parseProviderSources(
       } else {
         sessionMap.set(key, {
           project,
-          projectPath: turn.calls[0]?.projectPath,
+          projectPath: slicedTurn.calls[0]?.projectPath,
+          workingDirectory: slicedTurn.calls[0]?.workingDirectory,
           turns: [classified],
           ...(cachedFile.prLinks?.length ? { prLinks: new Set(cachedFile.prLinks) } : {}),
           ...(cachedFile.title ? { title: cachedFile.title } : {}),
@@ -2804,35 +3127,47 @@ async function parseProviderSources(
 
         for (const c of turn.calls) seenKeys.add(c.deduplicationKey)
 
+        let slicedTurn = turn
         if (dateRange) {
-          const callTs = turn.calls[0]?.timestamp
-          if (!callTs) continue
-          const ts = new Date(callTs)
-          if (ts < dateRange.start || ts > dateRange.end) continue
+          const sliced = turnSlicedToRange(turn, dateRange)
+          if (!sliced) continue
+          slicedTurn = sliced
         }
 
-        const classified = cachedTurnToClassified(turn)
-        const project = turn.calls[0]?.project ?? providerName
+        // Classify the FULL turn, then keep only the in-range calls (same rule
+        // as the loop above and the Claude path): whole-exchange judgments stay
+        // whole-turn; cost/calls come from the retained calls.
+        const classifiedFull = cachedTurnToClassified(turn)
+        const classified = dateRange
+          ? (classifiedTurnSlicedToRange(classifiedFull, dateRange) ?? classifiedFull)
+          : classifiedFull
+        const project = slicedTurn.calls[0]?.project ?? providerName
         const key = `${providerName}:${turn.sessionId}:${project}`
 
         const existingEntry = sessionMap.get(key)
         if (existingEntry) {
           existingEntry.turns.push(classified)
-          if (!existingEntry.projectPath && turn.calls[0]?.projectPath) {
-            existingEntry.projectPath = turn.calls[0]!.projectPath
+          if (!existingEntry.projectPath && slicedTurn.calls[0]?.projectPath) {
+            existingEntry.projectPath = slicedTurn.calls[0]!.projectPath
           }
         } else {
-          sessionMap.set(key, { project, projectPath: turn.calls[0]?.projectPath, turns: [classified] })
+          sessionMap.set(key, { project, projectPath: slicedTurn.calls[0]?.projectPath, workingDirectory: slicedTurn.calls[0]?.workingDirectory, turns: [classified] })
         }
       }
     }
   }
 
   const projectMap = new Map<string, { projectPath?: string; sessions: SessionSummary[] }>()
-  for (const [key, { project, projectPath, turns, prLinks, title }] of sessionMap) {
+  for (const [key, { project, projectPath, workingDirectory, turns, prLinks, title }] of sessionMap) {
     const sessionId = key.split(':')[1] ?? key
     const session = buildSessionSummary(sessionId, project, turns)
-    if (prLinks?.size) session.prLinks = [...prLinks].sort()
+    const explicitLinks = new Set(turns.flatMap(turn => turn.prRefs ?? []))
+    for (const link of prLinks ?? []) explicitLinks.add(link)
+    if (explicitLinks.size) {
+      session.prLinks = [...explicitLinks].sort()
+      session.prAttributionSource = prLinks?.size ? 'transcript' : 'explicit-reference'
+    }
+    if (workingDirectory) session.workingDirectory = workingDirectory
     if (title) session.title = title
     if (session.apiCalls > 0) {
       const existing = projectMap.get(project)
@@ -2909,14 +3244,6 @@ export function filterProjectsByName(
   return result
 }
 
-function turnIsInDateRange(turn: ClassifiedTurn, dateRange: DateRange): boolean {
-  if (turn.assistantCalls.length === 0) return false
-  const firstCallTs = turn.assistantCalls[0]!.timestamp
-  if (!firstCallTs) return false
-  const ts = new Date(firstCallTs)
-  return ts >= dateRange.start && ts <= dateRange.end
-}
-
 function turnDayString(turn: ClassifiedTurn): string | null {
   if (turn.assistantCalls.length === 0) return null
   const ts = turn.assistantCalls[0]!.timestamp
@@ -2928,20 +3255,147 @@ function turnDayString(turn: ClassifiedTurn): string | null {
   return `${y}-${m}-${day}`
 }
 
+// A spawn parent (has spawnPrSets + prLinks) counts as a fold ANCHOR. Kept
+// verbatim (not rebuilt) so its spawnPrSets / prLinks / agentSpawnLinks survive.
+function isSpawnParent(session: SessionSummary): boolean {
+  return !!session.spawnPrSets && !!session.prLinks?.length
+}
+
+// buildSessionSummary rolls up ONLY turn-derived fields, so a rebuilt (date/day/
+// source-filtered) session loses its session-level PR + subagent-linkage metadata.
+// Carry those across so by-PR attribution and subagent folding still work on a
+// filtered slice (without this, a filtered CHILD loses its parentSessionId and can
+// never be linked, and a filtered parent loses its prLinks).
+function carryLinkageFields(rebuilt: SessionSummary, original: SessionSummary): void {
+  if (original.everHadBranch) rebuilt.everHadBranch = true
+  if (original.prLinks?.length) rebuilt.prLinks = original.prLinks
+  if (original.prAttributionSource) rebuilt.prAttributionSource = original.prAttributionSource
+  if (original.workingDirectory) rebuilt.workingDirectory = original.workingDirectory
+  // prRefsAtRangeStart is NOT copied here: a narrower slice needs it recomputed at
+  // the new boundary (see recomputeRangeStartPrRefs), not the wide range's value.
+  if (original.parentSessionId) rebuilt.parentSessionId = original.parentSessionId
+  if (original.agentId) rebuilt.agentId = original.agentId
+  if (original.agentSpawnLinks) rebuilt.agentSpawnLinks = original.agentSpawnLinks
+  if (original.spawnPrSets) rebuilt.spawnPrSets = original.spawnPrSets
+  if (original.ambiguousSpawnAgentIds?.length) rebuilt.ambiguousSpawnAgentIds = original.ambiguousSpawnAgentIds
+  if (original.title) rebuilt.title = original.title
+  if (original.agentType) rebuilt.agentType = original.agentType
+}
+
+// The "PR active entering this slice", recomputed by replaying the ORIGINAL full
+// turn sequence up to `sliceStartMs`, seeded from the original range-start state.
+// A narrower filter must NOT reuse the wide range's range-start PR: a PR switch
+// between the wide start and the slice start would otherwise be lost, mis-seeding
+// both spend attribution and the subagent grace fallback. A turn exactly ON the
+// boundary stays in the slice and applies its own prRefs there, so the walk stops
+// strictly before it.
+function recomputeRangeStartPrRefs(original: SessionSummary, sliceStartMs: number): string[] | undefined {
+  // The carried PR is the refs of the LATEST turn (by timestamp) strictly before the
+  // slice that referenced any PR; a turn exactly on the boundary is inside the slice
+  // and applies its own refs there. Selected by timestamp, not array position, so
+  // the result does not depend on turn ordering. When two PR-bearing turns share the
+  // exact same millisecond (a degenerate case), break the tie deterministically by
+  // the lexicographically-LAST sorted-join of their refs, so the seed is stable
+  // regardless of input order (arbitrary but stable, not order-dependent). Falls back
+  // to the original range-start state when nothing referenced a PR before the slice.
+  let current = original.prRefsAtRangeStart
+  let bestMs = -Infinity
+  let bestKey = ''
+  for (const turn of original.turns) {
+    if (!turn.prRefs?.length) continue
+    const ts = turn.assistantCalls[0]?.timestamp
+    if (!ts) continue
+    const tMs = new Date(ts).getTime()
+    if (Number.isNaN(tMs) || tMs >= sliceStartMs) continue
+    const key = [...turn.prRefs].sort().join(',')
+    if (tMs > bestMs || (tMs === bestMs && key > bestKey)) { bestMs = tMs; bestKey = key; current = turn.prRefs }
+  }
+  return current
+}
+
+// Apply a recomputed range-start PR state to a rebuilt session (or clear it).
+function applyRecomputedRangeStart(rebuilt: SessionSummary, original: SessionSummary, sliceStartMs: number): void {
+  const rs = recomputeRangeStartPrRefs(original, sliceStartMs)
+  if (rs?.length) rebuilt.prRefsAtRangeStart = rs
+  else delete rebuilt.prRefsAtRangeStart
+}
+
+// Local-midnight epoch of the EARLIEST selected day, used to seed the very-first
+// turn and the pre-first-turn grace fallback. Per-day seeding (below) handles every
+// later day, so non-contiguous selections are also correct.
+function earliestDayStartMs(days: Set<string>): number {
+  const earliest = [...days].sort()[0]
+  return earliest ? new Date(`${earliest}T00:00:00`).getTime() : NaN
+}
+
+// Per-day seeding for a (possibly non-contiguous) day selection. For the FIRST
+// in-slice turn of each selected day that does not already reference a PR, inject the
+// PR carried into that day, recomputed from the ORIGINAL full turn sequence up to the
+// day's local-midnight start. A PR switch on an UNSELECTED day between two selected
+// days is thus captured for the later day; a contiguous run is the special case and
+// stays correct. Turn order is preserved.
+function seedFilteredTurnsPerDay(original: SessionSummary, filteredTurns: ClassifiedTurn[]): ClassifiedTurn[] {
+  const out: ClassifiedTurn[] = []
+  let lastDay: string | null = null
+  for (const turn of filteredTurns) {
+    const day = turnDayString(turn)
+    if (day !== null && day !== lastDay) {
+      lastDay = day
+      if (!turn.prRefs?.length) {
+        const carried = recomputeRangeStartPrRefs(original, new Date(`${day}T00:00:00`).getTime())
+        if (carried?.length) { out.push({ ...turn, prRefs: carried }); continue }
+      }
+    }
+    out.push(turn)
+  }
+  return out
+}
+
+// An anchor is a duplicate of a surviving session ONLY when they share the full
+// provider-aware, fingerprint-qualified identity (a proven-identical record). A
+// different-provider session that shares a raw id, or a same-id/different-record
+// collision that SHOULD stay to trigger the neither-fold guard, is not dropped.
+function dedupeAnchors(anchors: SessionSummary[], survivingIdentities: Set<string>): SessionSummary[] {
+  if (survivingIdentities.size === 0) return anchors
+  return anchors.filter(a => !survivingIdentities.has(sessionIdentity(a)))
+}
+
 export function filterProjectsByDays(projects: ProjectSummary[], days: Set<string>): ProjectSummary[] {
+  const sliceStartMs = earliestDayStartMs(days)
   const filtered: ProjectSummary[] = []
   for (const project of projects) {
     const sessions: SessionSummary[] = []
+    // Existing anchors are date-EXEMPT (carried unchanged); a spawn parent whose
+    // OWN in-range turns all fall outside the day subset is CONVERTED to an anchor
+    // so its surviving in-range child still resolves. The anchor contributes no
+    // own spend either way.
+    const anchors: SessionSummary[] = [...(project.subagentAnchors ?? [])]
+    const survivingIdentities = new Set<string>()
     for (const session of project.sessions) {
-      const turns = session.turns.filter(turn => {
-        const ds = turnDayString(turn)
-        return ds !== null && days.has(ds)
+      // Slice turns per call by the selected days (not whole-turn keep/drop):
+      // a midnight-straddling turn contributes the calls that actually
+      // happened on each selected day (issue #852, same split rule as the
+      // range slicers — see classifiedTurnSlicedToDays).
+      const turns = session.turns.flatMap(turn => {
+        const sliced = classifiedTurnSlicedToDays(turn, days)
+        return sliced ? [sliced] : []
       })
-      if (turns.length === 0) continue
-      sessions.push(buildSessionSummary(session.sessionId, session.project, turns, session.mcpInventory, session.source))
+      if (turns.length === 0) {
+        if (isSpawnParent(session)) anchors.push(session)
+        continue
+      }
+      const seeded = seedFilteredTurnsPerDay(session, turns)
+      const rebuilt = buildSessionSummary(session.sessionId, session.project, seeded, session.mcpInventory, session.source)
+      carryLinkageFields(rebuilt, session)
+      if (!Number.isNaN(sliceStartMs)) applyRecomputedRangeStart(rebuilt, session, sliceStartMs)
+      // Identity of the ORIGINAL (pre-filter) session: a duplicate anchor matches the
+      // session as it appeared in the input, not the narrowed rebuild.
+      survivingIdentities.add(sessionIdentity(session))
+      sessions.push(rebuilt)
     }
-    if (sessions.length === 0) continue
-    filtered.push(summarizeProject(project.project, project.projectPath, sessions))
+    const dedupedAnchors = dedupeAnchors(anchors, survivingIdentities)
+    if (sessions.length === 0 && dedupedAnchors.length === 0) continue
+    filtered.push(summarizeProject(project.project, project.projectPath, sessions, dedupedAnchors))
   }
   return filtered.sort((a, b) => b.totalCostUSD - a.totalCostUSD)
 }
@@ -2964,6 +3418,7 @@ export function mergeProjectsByCrossProviderKey(projects: ProjectSummary[]): Map
     const existing = mergedMap.get(key)
     if (existing) {
       existing.sessions.push(...p.sessions)
+      if (p.subagentAnchors?.length) existing.subagentAnchors = [...(existing.subagentAnchors ?? []), ...p.subagentAnchors]
       existing.totalCostUSD += p.totalCostUSD
       existing.totalEstimatedCostUSD = (existing.totalEstimatedCostUSD ?? 0) + (p.totalEstimatedCostUSD ?? 0)
       existing.totalApiCalls += p.totalApiCalls
@@ -2974,6 +3429,134 @@ export function mergeProjectsByCrossProviderKey(projects: ProjectSummary[]): Map
   return mergedMap
 }
 
+function summaryProvider(session: SessionSummary): string {
+  return session.turns.flatMap(t => t.assistantCalls)[0]?.provider ?? 'unknown'
+}
+
+function normalizedWorkingDirectory(path: string | undefined): string | null {
+  if (!path?.trim()) return null
+  return path.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+}
+
+function normalizedPrompt(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+function assignCorrelatedPrs(
+  session: SessionSummary,
+  urls: readonly string[],
+  source: 'working-directory' | 'launcher-prompt',
+): void {
+  if (session.prLinks?.length || urls.length === 0) return
+  const refs = [...new Set(urls)].sort()
+  session.prLinks = refs
+  session.prAttributionSource = source
+  // Seed the first turn so the existing carry-forward state machine attributes
+  // every later turn precisely. This is not the legacy whole-session split.
+  if (session.turns[0] && !session.turns[0].prRefs?.length) session.turns[0].prRefs = refs
+}
+
+/**
+ * Correlate saved sessions across AI providers without timestamp guessing.
+ *
+ * Evidence, strongest first:
+ *  1. exact launch-prompt text embedded in a PR-linked session's shell command;
+ *  2. exact provider-recorded cwd shared with one unambiguous PR.
+ *
+ * Timestamps only narrow prompt comparisons for performance; they can never
+ * create attribution. Conflicting PR evidence is deliberately left unassigned.
+ */
+export function correlateCrossProviderPrSessions(projects: ProjectSummary[]): void {
+  const sessions = projects.flatMap(p => p.sessions)
+  const linked = sessions.filter(s => s.prLinks?.length)
+  // Claude sidechains retain their existing fold semantics. They may provide
+  // evidence for a tool they launched, but must not become standalone PR rows.
+  const candidates = sessions.filter(s => !s.prLinks?.length && !s.parentSessionId)
+  const evidence = new Map<SessionSummary, string[]>(linked.map(s => [s, s.prLinks!]))
+
+  // Resolve Claude's native parent->sidechain linkage as evidence without
+  // mutating the child. This lets a Codex/Gemini/etc. review launched inside a
+  // Claude subagent inherit the parent turn's PR while the subagent itself still
+  // folds exactly once under the existing accounting model.
+  for (const resolved of resolveSubagentAttribution(projects).values()) {
+    for (const child of resolved) {
+      // A multi-PR spawn set is valid for folding the child's own cost, but is
+      // too broad to identify which PR an independently saved nested review was
+      // about. Require one PR for cross-provider propagation.
+      if (child.unlinked || child.prSet?.length !== 1) continue
+      const matches = sessions.filter(s => !s.prLinks?.length && s.agentId === child.fold.agentId)
+      if (matches.length === 1) evidence.set(matches[0]!, child.prSet)
+    }
+  }
+
+  type Launch = { atMs: number; provider: string; refs: string[]; commands: string[] }
+  const launches: Launch[] = []
+  for (const [session, evidenceRefs] of evidence) {
+    // A native PR-linked session's session-level union is NOT the active PR at
+    // its beginning; only a range-start seed or a turn ref establishes that.
+    // Sidechain evidence has already been resolved to its launching parent turn,
+    // so it is safe to seed the otherwise ref-less child with that exact set.
+    let active = session.prLinks?.length ? (session.prRefsAtRangeStart ?? []) : evidenceRefs
+    for (const turn of session.turns) {
+      if (turn.prRefs?.length) active = turn.prRefs
+      if (active.length === 0) continue
+      for (const call of turn.assistantCalls) {
+        const commands = (call.toolSequence ?? [])
+          .flat()
+          .map(tool => typeof tool.command === 'string' ? normalizedPrompt(tool.command) : '')
+          .filter(command => command.length > 0)
+        if (commands.length === 0) continue
+        const atMs = Date.parse(call.timestamp || turn.timestamp)
+        if (Number.isFinite(atMs)) launches.push({ atMs, provider: call.provider, refs: active, commands })
+      }
+    }
+  }
+
+  const PROMPT_PREFIX = 160
+  const PROMPT_MIN = 80
+  const LAUNCH_WINDOW_MS = 15 * 60 * 1000
+  for (const session of candidates) {
+    const provider = summaryProvider(session)
+    const prompt = session.turns
+      .map(t => normalizedPrompt(t.userMessage))
+      .find(text => text.length >= PROMPT_MIN)
+    if (!prompt) continue
+    const prefix = prompt.slice(0, PROMPT_PREFIX)
+    const startedMs = Date.parse(session.firstTimestamp)
+    if (!Number.isFinite(startedMs)) continue
+    const matches = launches.filter(launch =>
+      launch.provider !== provider
+      && Math.abs(launch.atMs - startedMs) <= LAUNCH_WINDOW_MS
+      && launch.commands.some(command => command.includes(prefix))
+    )
+    const refSets = new Map(matches.map(m => [m.refs.slice().sort().join('\0'), m.refs]))
+    if (refSets.size === 1) {
+      assignCorrelatedPrs(session, [...refSets.values()][0]!, 'launcher-prompt')
+      if (session.prLinks?.length) evidence.set(session, session.prLinks)
+    }
+  }
+
+  // Prompt-linked sessions become valid cwd anchors too. Attribute only when an
+  // exact cwd maps to one PR set; a main checkout used for multiple PRs remains
+  // intentionally ambiguous.
+  const refsByCwd = new Map<string, Map<string, string[]>>()
+  for (const [session, evidenceRefs] of evidence) {
+    const cwd = normalizedWorkingDirectory(session.workingDirectory)
+    if (!cwd || evidenceRefs.length !== 1) continue
+    const refs = evidenceRefs.slice().sort()
+    const sets = refsByCwd.get(cwd) ?? new Map<string, string[]>()
+    sets.set(refs.join('\0'), refs)
+    refsByCwd.set(cwd, sets)
+  }
+  for (const session of sessions) {
+    if (session.prLinks?.length || session.parentSessionId) continue
+    const cwd = normalizedWorkingDirectory(session.workingDirectory)
+    if (!cwd) continue
+    const sets = refsByCwd.get(cwd)
+    if (sets?.size === 1) assignCorrelatedPrs(session, [...sets.values()][0]!, 'working-directory')
+  }
+}
+
 export function filterProjectsByClaudeConfigSource(projects: ProjectSummary[], sourceId: string): ProjectSummary[] {
   const filtered: ProjectSummary[] = []
   for (const project of projects) {
@@ -2982,23 +3565,46 @@ export function filterProjectsByClaudeConfigSource(projects: ProjectSummary[], s
     const sessions = project.sessions.filter(session =>
       session.source?.id === sourceId
     )
-    if (sessions.length === 0) continue
-    filtered.push(summarizeProject(project.project, project.projectPath, sessions))
+    // Anchors get the SAME source scoping as sessions (a config-source filter is a
+    // provenance filter, not a date filter), so an anchor stays only with its own
+    // config's children.
+    const anchors = (project.subagentAnchors ?? []).filter(anchor => anchor.source?.id === sourceId)
+    if (sessions.length === 0 && anchors.length === 0) continue
+    filtered.push(summarizeProject(project.project, project.projectPath, sessions, anchors))
   }
   return filtered.sort((a, b) => b.totalCostUSD - a.totalCostUSD)
 }
 
 export function filterProjectsByDateRange(projects: ProjectSummary[], dateRange: DateRange): ProjectSummary[] {
+  const sliceStartMs = dateRange.start.getTime()
   const filtered: ProjectSummary[] = []
   for (const project of projects) {
     const sessions: SessionSummary[] = []
+    // Carry existing anchors and convert a spawn parent whose in-range turns are all
+    // filtered out into one (see filterProjectsByDays).
+    const anchors: SessionSummary[] = [...(project.subagentAnchors ?? [])]
+    const survivingIdentities = new Set<string>()
     for (const session of project.sessions) {
-      const turns = session.turns.filter(turn => turnIsInDateRange(turn, dateRange))
-      if (turns.length === 0) continue
-      sessions.push(buildSessionSummary(session.sessionId, session.project, turns, session.mcpInventory, session.source))
+      // Slice turns per call (not whole-turn keep/drop) so a midnight-
+      // straddling turn keeps the calls that landed inside the range — the
+      // same split rule as the parse-time slicers (issue #852).
+      const turns = session.turns.flatMap(turn => {
+        const sliced = classifiedTurnSlicedToRange(turn, dateRange)
+        return sliced ? [sliced] : []
+      })
+      if (turns.length === 0) {
+        if (isSpawnParent(session)) anchors.push(session)
+        continue
+      }
+      const rebuilt = buildSessionSummary(session.sessionId, session.project, turns, session.mcpInventory, session.source)
+      carryLinkageFields(rebuilt, session)
+      applyRecomputedRangeStart(rebuilt, session, sliceStartMs)
+      survivingIdentities.add(sessionIdentity(session))
+      sessions.push(rebuilt)
     }
-    if (sessions.length === 0) continue
-    filtered.push(summarizeProject(project.project, project.projectPath, sessions))
+    const dedupedAnchors = dedupeAnchors(anchors, survivingIdentities)
+    if (sessions.length === 0 && dedupedAnchors.length === 0) continue
+    filtered.push(summarizeProject(project.project, project.projectPath, sessions, dedupedAnchors))
   }
   return filtered.sort((a, b) => b.totalCostUSD - a.totalCostUSD)
 }
@@ -3011,6 +3617,15 @@ let sessionHydrationComplete = false
 export function isSessionHydrationComplete(): boolean {
   return sessionHydrationComplete
 }
+
+// Set by the read-only serving paths when the snapshot they served did NOT
+// match what is on disk: in read-only mode a changed file is served at its
+// stale fingerprint and a file with no cache entry is skipped entirely. A
+// read-only run under which nothing changed is equivalent to a full parse and
+// stays trustworthy; one that skipped real data is a PARTIAL hydration, and
+// finalizing daily history off it freezes the days it never saw out of the
+// chart (gapStart = lastComputedDate + 1 never looks back at them).
+let readOnlyServedStale = false
 
 export async function parseAllSessions(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
   const key = cacheKey(dateRange, providerFilter)
@@ -3081,6 +3696,7 @@ async function runParse(
   options: RunParseOptions = {},
 ): Promise<ProjectSummary[]> {
   const { isCold = false, readOnly = false, refreshLock } = options
+  readOnlyServedStale = false
   const seenMsgIds = new Set<string>()
   const seenKeys = new Set<string>()
   const allSources = await discoverAllSessions(providerFilter)
@@ -3120,15 +3736,26 @@ async function runParse(
       ? { id: s.sourceId, label: s.sourceLabel, path: s.sourcePath, kind: s.sourceKind }
       : undefined,
   }))
+  // Claude is scanned through scanProjectDirs rather than parseProviderSources, so
+  // it needs the same provider-filter guard the durable-orphan loop below applies at
+  // its own level. Without it a --provider <other> run still enters scanProjectDirs
+  // with an empty dirs list, and the orphan pass there (which reads the whole cached
+  // claude section) treats every cached file as "no longer discovered" and re-injects
+  // it into the result. Note this is deliberately NOT a `claudeDirs.length > 0` check:
+  // when claude IS in scope but every transcript has been pruned from disk, that
+  // orphan pass is exactly what keeps PR-attributed spend from vanishing.
+  const claudeInScope = !providerFilter || providerFilter === 'all' || providerFilter === 'claude'
   if (claudeSources.length > 0) emitScanProgress({ kind: 'provider', provider: 'claude', state: 'start' })
   let claudeProjects: ProjectSummary[] = []
-  try {
-    claudeProjects = await scanProjectDirs(claudeDirs, seenMsgIds, diskCache, dateRange, saveProgress, readOnly)
-    if (claudeSources.length > 0) emitScanProgress({ kind: 'provider', provider: 'claude', state: 'done', files: claudeSources.length })
-  } catch (err) {
-    if (!isPermissionError(err)) throw err
-    process.stderr.write(`codeburn: skipped claude data (permission denied; grant Full Disk Access to include it)\n`)
-    emitScanProgress({ kind: 'provider', provider: 'claude', state: 'skipped' })
+  if (claudeInScope) {
+    try {
+      claudeProjects = await scanProjectDirs(claudeDirs, seenMsgIds, diskCache, dateRange, saveProgress, readOnly)
+      if (claudeSources.length > 0) emitScanProgress({ kind: 'provider', provider: 'claude', state: 'done', files: claudeSources.length })
+    } catch (err) {
+      if (!isPermissionError(err)) throw err
+      process.stderr.write(`codeburn: skipped claude data (permission denied; grant Full Disk Access to include it)\n`)
+      emitScanProgress({ kind: 'provider', provider: 'claude', state: 'skipped' })
+    }
   }
 
   const otherProjects: ProjectSummary[] = []
@@ -3185,7 +3812,10 @@ async function runParse(
       if (refreshLock) throw new RefreshPublicationUnavailableError()
     }
   }
-  sessionHydrationComplete = true
+  // Assigned, not forced true: a read-only run that had to skip or stale real
+  // files reached the end of the scan without hydrating everything, and the
+  // daily backfill must not finalize history off it.
+  sessionHydrationComplete = !readOnly || !readOnlyServedStale
 
   // Merge across providers by normalised project path so the same repository
   // is not double-counted when it was worked on with more than one tool
@@ -3224,6 +3854,7 @@ async function runParse(
   }
 
   const result = Array.from(mergedMap.values()).sort((a, b) => b.totalCostUSD - a.totalCostUSD)
+  correlateCrossProviderPrSessions(result)
   cachePut(key, result)
   return result
 }

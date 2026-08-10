@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtemp, mkdir, writeFile, appendFile, readFile, rm, stat, unlink } from 'fs/promises'
+import { mkdtemp, mkdir, writeFile, appendFile, readFile, rename, rm, stat, unlink } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
@@ -77,6 +77,10 @@ function asstLine(
 const readBlock = (file: string) => ({ type: 'tool_use', name: 'Read', input: { file_path: file } })
 const bashBlock = (cmd: string) => ({ type: 'tool_use', name: 'Bash', input: { command: cmd } })
 
+function prLinkLine(ts: string, url: string): string {
+  return JSON.stringify({ type: 'pr-link', sessionId: 'sess-1', timestamp: ts, cwd: CWD, prUrl: url })
+}
+
 // A representative multi-turn session: MCP inventory, tools, bash, and a
 // streaming re-emit of one assistant message (same id, updated usage) inside a
 // turn — exercises dedup, breakdowns, and turn assembly.
@@ -150,6 +154,97 @@ describe('incremental append parsing', () => {
     await rm(warmCache, { recursive: true, force: true })
   })
 
+  it('PR-REFS: survive the incremental append path (continuation merge unions refs)', async () => {
+    const warmCache = await mkdtemp(join(tmpdir(), 'incr-pr-'))
+    // Base: one turn that creates PR-1.
+    await writeFile(sessionPath,
+      userLine('2026-05-01T10:00:01.000Z', 'ship PR one') + '\n' +
+      asstLine('msg-a', '2026-05-01T10:00:02.000Z', { input_tokens: 100, output_tokens: 20 }, [bashBlock('gh pr create')]) + '\n' +
+      prLinkLine('2026-05-01T10:00:03.000Z', 'https://github.com/o/r/pull/1') + '\n')
+    await parseWith(warmCache)
+
+    // Append a continuation of that same turn (no leading user message) that
+    // references PR-2, then a fresh turn that references PR-3.
+    await appendFile(sessionPath,
+      asstLine('msg-b', '2026-05-01T10:00:04.000Z', { input_tokens: 50, output_tokens: 10 }, [bashBlock('gh pr create')]) + '\n' +
+      prLinkLine('2026-05-01T10:00:05.000Z', 'https://github.com/o/r/pull/2') + '\n' +
+      userLine('2026-05-01T10:10:00.000Z', 'ship PR three') + '\n' +
+      asstLine('msg-c', '2026-05-01T10:10:02.000Z', { input_tokens: 80, output_tokens: 20 }, [bashBlock('gh pr create')]) + '\n' +
+      prLinkLine('2026-05-01T10:10:03.000Z', 'https://github.com/o/r/pull/3') + '\n')
+
+    readLineCalls.length = 0
+    const warm = await parseWith(warmCache)
+    expect(offsetsFor(sessionPath).some(o => o !== undefined && o > 0)).toBe(true) // took the append path
+    const cold = await coldFullReparse()
+    expect(warm).toEqual(cold)
+
+    const turns = warm[0]!.sessions[0]!.turns
+    expect(turns[0]!.prRefs).toEqual(['https://github.com/o/r/pull/1', 'https://github.com/o/r/pull/2'])
+    expect(turns[1]!.prRefs).toEqual(['https://github.com/o/r/pull/3'])
+    await rm(warmCache, { recursive: true, force: true })
+  })
+
+  it('PR-REFS: survive when a straddled append falls back to a full re-parse', async () => {
+    const warmCache = await mkdtemp(join(tmpdir(), 'incr-pr2-'))
+    await writeFile(sessionPath,
+      userLine('2026-05-01T10:00:01.000Z', 'ship PR one') + '\n' +
+      asstLine('msg-a', '2026-05-01T10:00:02.000Z', { input_tokens: 100, output_tokens: 20 }, [bashBlock('gh pr create')]) + '\n' +
+      prLinkLine('2026-05-01T10:00:03.000Z', 'https://github.com/o/r/pull/1') + '\n')
+    await parseWith(warmCache)
+
+    // Re-emit msg-a (an id already committed in the cached prefix) -> straddle ->
+    // the shortcut is abandoned and the file re-parses from byte 0.
+    await appendFile(sessionPath,
+      asstLine('msg-a', '2026-05-01T10:00:02.500Z', { input_tokens: 100, output_tokens: 40 }, [bashBlock('gh pr create')]) + '\n' +
+      prLinkLine('2026-05-01T10:00:06.000Z', 'https://github.com/o/r/pull/2') + '\n')
+
+    const warm = await parseWith(warmCache)
+    const cold = await coldFullReparse()
+    expect(warm).toEqual(cold)
+    expect(warm[0]!.sessions[0]!.turns[0]!.prRefs).toEqual([
+      'https://github.com/o/r/pull/1', 'https://github.com/o/r/pull/2',
+    ])
+    await rm(warmCache, { recursive: true, force: true })
+  })
+
+  it('SUBAGENT-LINKS: spawnToolUseIds + agentSpawnLinks survive the incremental append path', async () => {
+    const warmCache = await mkdtemp(join(tmpdir(), 'incr-spawn-'))
+    const agentBlock = (id: string) => ({ type: 'tool_use', name: 'Agent', id, input: {} })
+    const spawnResultLine = (ts: string, toolUseId: string, agentId: string): string =>
+      JSON.stringify({
+        type: 'user', sessionId: 'sess-1', timestamp: ts, cwd: CWD,
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseId, content: 'agent done' }] },
+        toolUseResult: { status: 'completed', agentId },
+      })
+    // Base: one turn spawns agent1; its result records the agentId->tool_use link.
+    await writeFile(sessionPath,
+      userLine('2026-05-01T10:00:01.000Z', 'launch a reviewer') + '\n' +
+      asstLine('msg-a', '2026-05-01T10:00:02.000Z', { input_tokens: 100, output_tokens: 20 }, [agentBlock('toolu_a1')]) + '\n' +
+      spawnResultLine('2026-05-01T10:00:03.000Z', 'toolu_a1', 'agent1') + '\n')
+    await parseWith(warmCache)
+
+    // Append: a continuation of that same turn spawns agent2 (merged into turn 0),
+    // then a fresh turn spawns agent3.
+    await appendFile(sessionPath,
+      asstLine('msg-b', '2026-05-01T10:00:04.000Z', { input_tokens: 50, output_tokens: 10 }, [agentBlock('toolu_a2')]) + '\n' +
+      spawnResultLine('2026-05-01T10:00:05.000Z', 'toolu_a2', 'agent2') + '\n' +
+      userLine('2026-05-01T10:10:00.000Z', 'launch another') + '\n' +
+      asstLine('msg-c', '2026-05-01T10:10:02.000Z', { input_tokens: 80, output_tokens: 20 }, [agentBlock('toolu_a3')]) + '\n' +
+      spawnResultLine('2026-05-01T10:10:03.000Z', 'toolu_a3', 'agent3') + '\n')
+
+    readLineCalls.length = 0
+    const warm = await parseWith(warmCache)
+    expect(offsetsFor(sessionPath).some(o => o !== undefined && o > 0)).toBe(true) // took the append path
+    const cold = await coldFullReparse()
+    expect(warm).toEqual(cold)
+
+    const session = warm[0]!.sessions[0]!
+    expect(session.turns[0]!.spawnToolUseIds).toEqual(['toolu_a1', 'toolu_a2'])
+    expect(session.turns[1]!.spawnToolUseIds).toEqual(['toolu_a3'])
+    expect(session.agentSpawnLinks).toEqual({ agent1: 'toolu_a1', agent2: 'toolu_a2', agent3: 'toolu_a3' })
+    await rm(warmCache, { recursive: true, force: true })
+  })
+
   it('EDGE: append after a previously-torn line completes still equals cold', async () => {
     const warmCache = await mkdtemp(join(tmpdir(), 'incr-warm2-'))
 
@@ -191,14 +286,19 @@ describe('incremental append parsing', () => {
     await parseWith(warmCache)
     const inoBefore = (await stat(sessionPath)).ino
 
-    // Replace the file (new inode) with different, LARGER content.
-    await unlink(sessionPath)
+    // Replace the file (new inode) with different, LARGER content. The
+    // replacement is created BESIDE the original and renamed over it: an
+    // unlink-then-create lets ext4 hand the freed inode straight back, which
+    // broke the new-inode premise on Linux CI. Two files alive at once are
+    // guaranteed distinct inodes, and rename keeps the replacement's.
     const replaced = [
       ...baseLines(),
       userLine('2026-05-01T12:00:00.000Z', 'brand new task'),
       asstLine('msg-z', '2026-05-01T12:00:02.000Z', { input_tokens: 500, output_tokens: 120 }, [readBlock('/z.ts')]),
     ].join('\n') + '\n'
-    await writeFile(sessionPath, replaced)
+    const replacementPath = sessionPath + '.replacement'
+    await writeFile(replacementPath, replaced)
+    await rename(replacementPath, sessionPath)
     expect((await stat(sessionPath)).ino).not.toBe(inoBefore)
 
     readLineCalls.length = 0

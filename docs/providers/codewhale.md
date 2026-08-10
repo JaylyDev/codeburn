@@ -104,5 +104,5 @@ parser key is `codewhale:<session-id>`.
 1. Reproduce with a minimal real-shape saved-session JSON fixture.
 2. Verify aggregate tokens and parent-plus-subagent cost before checking UI
    totals; do not infer an input/output split CodeWhale does not store.
-3. Run `npm test -- tests/providers/codewhale.test.ts --run` and
-   `npm test -- tests/provider-registry.test.ts tests/session-cache.test.ts --run`.
+3. Run `npx vitest run tests/providers/codewhale.test.ts` and
+   `npx vitest run tests/provider-registry.test.ts tests/session-cache.test.ts`.

@@ -164,7 +164,11 @@ function safePerTokenRate(n: number | undefined): number | null {
   return n
 }
 
-function parseLiteLLMEntry(entry: LiteLLMEntry): ModelCosts | null {
+export function parseLiteLLMEntry(entry: LiteLLMEntry): ModelCosts | null {
+  // The live LiteLLM map is remote JSON; a null (or non-object) value for a
+  // model would make the field reads below throw and abort the whole pricing
+  // load. Treat it as unparseable, like any other bad entry.
+  if (!entry || typeof entry !== 'object') return null
   const inputCost = safePerTokenRate(entry.input_cost_per_token)
   const outputCost = safePerTokenRate(entry.output_cost_per_token)
   if (inputCost === null || outputCost === null) return null
@@ -290,6 +294,12 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'kimi-auto':                     'kimi-k2-thinking',
   'kimi-code':                     'kimi-k2-thinking',
   'kimi-for-coding':               'kimi-k2-thinking',
+  // Kimi Code wires report the bare `k3` id in llm.request.model; without an
+  // alias those calls priced at $0 and the provider looked absent in the UI.
+  'k3':                            'kimi-k3',
+  // Kimi desktop/IDE embedded runtime serves `k3-agent` / `k2d6-agent`.
+  'k3-agent':                      'kimi-k3',
+  'k2d6-agent':                    'kimi-k2p6',
   'mimo-v2-flash':                 'xiaomi/mimo-v2-flash',
   'kat-coder-pro-v1':              'kwaipilot/kat-coder-pro',
   // Cursor emits dot-version tier-last names plus tier/reasoning suffixes
@@ -587,6 +597,7 @@ function getCanonicalName(model: string): string {
     .replace(/@.*$/, '')       // strip pin: claude-sonnet-4-6@20250929 -> claude-sonnet-4-6
     .replace(/-\d{8}$/, '')   // strip date: claude-sonnet-4-20250514 -> claude-sonnet-4
     .replace(/^[^/]+\//, '') // strip provider prefix: anthropic/foo -> foo
+    .replace(/\[[^\]]*\]$/, '') // strip context tag: Codex records Kimi as k3[1m], so kimi/k3[1m] -> k3
 }
 
 function stripKnownPricingVariantSuffix(model: string): string | null {
@@ -879,6 +890,8 @@ const SHORT_NAMES: Record<string, string> = {
   'gemini-2.5-flash': 'Gemini 2.5 Flash',
   'kimi-k2-thinking-turbo': 'Kimi K2 Thinking Turbo',
   'kimi-k2-thinking': 'Kimi K2 Thinking',
+  'kimi-k3': 'Kimi K3',
+  'kimi-k2p6': 'Kimi K2.6',
   'kimi-thinking-preview': 'Kimi Thinking',
   'kimi-k2.6': 'Kimi K2.6',
   'kimi-k2.5': 'Kimi K2.5',
@@ -905,6 +918,35 @@ const SHORT_NAMES: Record<string, string> = {
   'glm-5p1': 'GLM-5.2',                               // ZCode/Hermes run GLM-5.2 (priced as the GLM-5.1 sibling)
   'grok-build-0.1': 'Grok Build',                     // Grok Build prices through the 0.1 sibling
   'grok-composer-2.5-fast': 'Grok Composer 2.5 Fast',
+  // Fireworks-hosted fleet models arrive as `accounts/fireworks/models/<slug>`;
+  // getShortModelName's path fallback strips to the bare slug and re-resolves it
+  // through this table. Display-only — getModelCosts prices off the full path,
+  // so these entries do not move any dollar amounts. (deepseek-v4-pro/-flash
+  // already have entries above and resolve the same way.)
+  'glm-5p2': 'GLM-5.2',
+  'qwen3p7-plus': 'Qwen 3.7 Plus',
+  'kimi-k2p7-code': 'Kimi K2.7 Code',
+  // Ids that price correctly but had no display entry, so reports showed the
+  // raw slug. All display-only. The GPT-5.6 variants are listed individually
+  // rather than as a bare `gpt-5.6`: a base entry would swallow every future
+  // `gpt-5.6-*` via the prefix match and hide the variant, which is exactly
+  // what getShortModelName's version-boundary rule is there to prevent.
+  'gpt-5.6-sol': 'GPT-5.6 Sol',
+  'gpt-5.6-terra': 'GPT-5.6 Terra',
+  'gpt-5.6-luna': 'GPT-5.6 Luna',
+  // The Grok Build harness reports the model it runs (`grok-4.5`), so this is
+  // the model's own name; `grok-build*` ids still resolve to "Grok Build".
+  'grok-4.5': 'Grok 4.5',
+  // ClinePass routes models as `cline-pass/<slug>`; getShortModelName's path
+  // fallback strips the prefix and re-resolves the bare slug through this
+  // table, the same way it handles `accounts/fireworks/models/<slug>`.
+  'qwen3.7-max': 'Qwen 3.7 Max',
+  'mimo-v2.5-pro': 'MiMo v2.5 Pro',
+  // Both spellings occur in the wild: OpenRouter gap-filled keys are lowercase
+  // slugs while sessions report the capitalized name (see the case-insensitive
+  // pricing index above). SHORT_NAMES matching is case-sensitive, so map both.
+  'minimax-m3': 'MiniMax M3',
+  'MiniMax-M3': 'MiniMax M3',
 }
 
 // Sorted longest-first so more-specific prefixes match before shorter ones.
@@ -937,8 +979,14 @@ export function getShortModelName(model: string): string {
     if (canonical === key || canonical.startsWith(key + '-')) return name
   }
   // getCanonicalName only strips the leading provider prefix, so a raw
-  // path-style id (e.g. fireworks/routers/glm-fast-latest) still has slashes
-  // here. Fall back to the last path segment rather than showing the path.
-  if (canonical.includes('/')) return canonical.slice(canonical.lastIndexOf('/') + 1)
+  // path-style id (e.g. accounts/fireworks/models/glm-5p2) still has slashes
+  // here. Take the last path segment and re-resolve it: the segment may itself
+  // be a known model slug (Fireworks fleet ids), earning a friendly name; a
+  // genuinely unmapped slug resolves to itself, preserving the raw-segment
+  // fallback for everything else.
+  if (canonical.includes('/')) {
+    const segment = canonical.slice(canonical.lastIndexOf('/') + 1)
+    return segment ? getShortModelName(segment) : canonical
+  }
   return canonical
 }

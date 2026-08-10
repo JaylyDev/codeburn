@@ -36,6 +36,7 @@ export type CachedCall = {
   deduplicationKey: string
   project?: string
   projectPath?: string
+  workingDirectory?: string
   toolSequence?: ToolCall[][]
   // Rich-session-capture (capture-only; no report consumes these yet). All
   // optional and omitted at zero/false to keep the per-call cache cost minimal.
@@ -50,6 +51,9 @@ export type CachedCall = {
   toolErrors?: number
   // Codex: count of this call's patch applications with success === false.
   editFailed?: number
+  activeDurationMs?: number
+  activeGeneratedTokens?: number
+  toolWaitMs?: number
 }
 
 export type CachedTurn = {
@@ -61,6 +65,14 @@ export type CachedTurn = {
   // previous turn's branch (a report carries the last stored value forward).
   // Rich-session-capture; optional, Claude only.
   gitBranch?: string
+  // GitHub PR URLs referenced during this turn, sorted and deduplicated. Claude
+  // can provide native links; all providers can provide explicit URLs from the
+  // saved user message. Stored directly so each turn's refs are self-contained.
+  prRefs?: string[]
+  // Claude: `tool_use` ids of the `Agent`/`Task` subagent spawns in this turn.
+  // A spawned sidechain session is folded into the launching turn by matching its
+  // resolved spawn id against these. Stored per-turn directly. Optional.
+  spawnToolUseIds?: string[]
 }
 
 export type FileFingerprint = {
@@ -74,6 +86,8 @@ export type CachedFile = {
   fingerprint: FileFingerprint
   lastCompleteLineOffset?: number
   canonicalCwd?: string
+  // Original cwd before linked-worktree canonicalization.
+  workingDirectory?: string
   canonicalProjectName?: string
   mcpInventory: string[]
   turns: CachedTurn[]
@@ -94,6 +108,17 @@ export type CachedFile = {
   title?: string
   prLinks?: string[]
   isSidechain?: boolean
+  // Subagent-attribution linkage (Claude only). On a SIDECHAIN file,
+  // `parentSessionId` is the spawning session's id (the transcript's internal
+  // `sessionId`). On a PARENT file, `agentSpawnLinks` maps each spawned subagent
+  // id to the `tool_use` id of the `Agent`/`Task` block that launched it. Both
+  // optional; a file is typically one or the other (a nested agent can be both).
+  parentSessionId?: string
+  agentSpawnLinks?: Record<string, string>
+  // Parent file: agent ids whose spawn result named them but whose exact launching
+  // tool_use could not be paired (ambiguous multi-result record). Drives a
+  // grace-window fallback for a late child. Absent when no pairing was ambiguous.
+  ambiguousSpawnAgentIds?: string[]
 }
 
 export type ProviderSection = {
@@ -123,7 +148,16 @@ export type SessionCache = {
 // Cached kiro entries from v4 carry costUSD: undefined and would keep being
 // re-priced from estimated tokens forever, since historical session files
 // never change. Bump forces a one-time re-parse so metered credit costs land.
-export const CACHE_VERSION = 5
+// v6: per-turn `prRefs` capture for turn-level PR spend attribution. Existing
+// cache turns carry no prRefs; bumping forces a one-time re-parse so surviving
+// transcripts populate the field. (Daily-cache versioning is untouched.)
+// v7: sidechain->parent linkage - per-turn `spawnToolUseIds`, per-file
+// `parentSessionId` / `agentSpawnLinks` - so subagent spend folds into the parent
+// turn's PR set. v6 never shipped, so users cross v5->v7 in a single combined bump.
+// INVARIANT: a version bump must extend `PRIOR_CACHE_VERSIONS` (the adoption path
+// below) to EVERY prior version that can still exist on disk, or expired-PR
+// history from the immediately preceding build silently vanishes.
+export const CACHE_VERSION = 7
 
 // The cache filename is version-suffixed so different binaries (e.g. an old
 // launchd menubar on a prior release and a newer desktop app) each own a
@@ -137,24 +171,62 @@ const CACHE_FILE = `session-cache.v${CACHE_VERSION}.json`
 const LEGACY_CACHE_FILE = 'session-cache.json'
 const TEMP_FILE_MAX_AGE_MS = 5 * 60 * 1000
 
+// Env vars that change what a provider discovers or how its sessions parse.
+// computeEnvFingerprint hashes exactly these to decide when a provider's cache
+// section is stale; a var read by the provider but missing here means changing
+// it serves the old section silently, reporting nothing from the new root.
+// One read in src/providers/ is deliberately absent: CODEBURN_VERBOSE
+// (sqlite-session-parser.ts:276) only changes logging verbosity, never parsed
+// output.
+//
+// Copilot is deliberately NOT declared here. Declaring any CODEBURN_COPILOT_*
+// var would change its fingerprint, and on a fingerprint change
+// getOrCreateProviderSection (src/parser.ts:2650) keeps only the cached
+// entries whose source path no longer exists — but copilot's OTel discovery
+// returns one source per DB file ({ path: dbPath }, src/providers/copilot.ts:1935)
+// and that DB keeps existing, so its cached entry would be dropped and
+// re-parsed, destroying conversations Copilot has since pruned from the DB
+// that only the cache still holds (see DURABLE_PROVIDER_NAMES below). Do not
+// "complete" the map for copilot until the durable carry-forward learns to
+// merge instead of drop.
 export const PROVIDER_ENV_VARS: Record<string, string[]> = {
-  claude: ['CLAUDE_CONFIG_DIRS', 'CLAUDE_CONFIG_DIR'],
+  claude: ['CLAUDE_CONFIG_DIRS', 'CLAUDE_CONFIG_DIR', 'CODEBURN_DESKTOP_SESSIONS_DIR', 'APPDATA', 'LOCALAPPDATA'],
+  'cline-cli': ['CLINE_SESSION_DATA_DIR', 'CLINE_DATA_DIR', 'CLINE_DIR'],
+  codebuff: ['CODEBUFF_DATA_DIR'],
   codewhale: ['CODEWHALE_HOME'],
   codex: ['CODEX_HOME'],
   hermes: ['HERMES_HOME'],
   'lingtai-tui': ['LINGTAI_HOME', 'LINGTAI_TUI_HOME', 'LINGTAI_TUI_GLOBAL_DIR'],
   droid: ['FACTORY_DIR'],
-  cursor: ['XDG_DATA_HOME'],
+  cursor: ['CODEBURN_CURSOR_MAX_BUBBLES'],
+  // XDG_DATA_HOME is stale here (cursor-agent never reads it) but deliberately
+  // kept: removing it would force a re-parse to fix nothing.
   'cursor-agent': ['XDG_DATA_HOME'],
+  'open-design': ['CODEBURN_OPEN_DESIGN_DIR', 'APPDATA'],
+  openclaude: ['CODEBURN_OPENCLAUDE_DIR'],
   opencode: ['XDG_DATA_HOME', 'OPENCODE_DATA_DIR', 'OPENCODE_DB_PREFIX'],
-  goose: ['XDG_DATA_HOME'],
-  crush: ['XDG_DATA_HOME'],
+  goose: ['XDG_DATA_HOME', 'GOOSE_PATH_ROOT'],
+  grok: ['GROK_HOME'],
+  crush: ['XDG_DATA_HOME', 'CRUSH_GLOBAL_DATA', 'LOCALAPPDATA'],
   warp: ['WARP_DB_PATH'],
   antigravity: ['CODEBURN_CACHE_DIR'],
+  'kilo-code': ['XDG_DATA_HOME'],
+  kimi: ['KIMI_SHARE_DIR', 'KIMI_MODEL_NAME'],
+  kiro: ['KIRO_HOME'],
+  'mistral-vibe': ['VIBE_HOME'],
+  mux: ['MUX_ROOT', 'CODEBURN_MUX_DIR'],
   qwen: ['QWEN_DATA_DIR'],
-  'ibm-bob': ['XDG_CONFIG_HOME'],
+  'ibm-bob': ['XDG_CONFIG_HOME', 'APPDATA'],
   quickdesk: ['QUICKWORK_HOME'],
   kimicode: ['KIMI_CODE_HOME'],
+  zerostack: ['ZS_DATA_DIR', 'XDG_DATA_HOME'],
+  // The gateway credential is a deliberate user override and MUST move the
+  // fingerprint: a read-only refresh (the refresh-lock fallback) serves the
+  // cached report straight from the section (parser.ts:2875 seeds servedSources
+  // before the network re-fetch at parser.ts:2888, which only runs when
+  // !readOnly), so an undeclared credential would keep serving the previous
+  // account's usage after a swap — the exact #920 defect.
+  'vercel-gateway': ['AI_GATEWAY_API_KEY', 'VERCEL_OIDC_TOKEN'],
 }
 
 // Names of providers whose cache entries are never evicted when source files
@@ -172,8 +244,12 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // LOC deltas / interruptions / userModified / toolErrors, and session-level
   // title / prLinks / isSidechain. Forces one re-parse so cached sessions gain
   // the new optional fields.
-  claude: 'advisor-usage-v1-skills-rich-capture-v1',
+  claude: 'advisor-usage-v1-skills-rich-capture-v1-cross-provider-pr-v1',
   cline: 'worktree-project-grouping-v1',
+  // reported-cost-v1: the CLI reports its own per-message cost, so entries
+  // cached before cline-cli joined the reported-cost allowlist in parser.ts
+  // hold costUSD: undefined and get re-priced from tokens on every read.
+  'cline-cli': 'reported-cost-v1',
   codewhale: 'aggregate-session-v1-est-cost',
   // Bump when the Codex parser changes attribution so unchanged, already-cached
   // session files re-parse (session-cache.json serves them without invoking the
@@ -182,18 +258,22 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // rich-session-capture-v1: per-call LOC deltas + editFailed from
   // patch_apply_end. (The codex-results.json CODEX_CACHE_VERSION is bumped in
   // lockstep so the pre-session-cache layer re-parses too.)
-  codex: 'mcp-attribution-v2-est-cost-rich-capture-v1',
+  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1',
   cursor: 'composer-anchored-crediting-v1-est-cost',
   'cursor-agent': 'workspaceless-transcript-v1',
-  copilot: 'cli-shutdown-cost-v1-skills',
+  // source-provenance-v1 (#944): CLI sessions were misread as VS Code
+  // transcripts (both carry producer 'copilot-agent'), skipping the shutdown
+  // input/cache rollup; this bump re-parses them so the missing tokens land.
+  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1',
   grok: 'estimated-cost-v1',
   hermes: 'reasoning-output-accounting-v1-est-cost',
   'lingtai-tui': 'token-ledger-registry-activity-v3',
   'ibm-bob': 'worktree-project-grouping-v1',
   kiro: 'ide-parsing-v1-est-cost',
+  opencode: 'session-model-v1',
   quickdesk: 'emf-sqlite-v2-est-cost',
   kimicode: 'wire-usage-v1-est-cost',
-  'kilo-code': 'worktree-project-grouping-v1',
+  'kilo-code': 'worktree-project-grouping-v1-session-model-v1',
   'roo-code': 'worktree-project-grouping-v1',
   warp: 'worktree-project-grouping-v1-est-cost',
   antigravity: 'worktree-project-grouping-v5',
@@ -261,6 +341,14 @@ function isOptionalBool(v: unknown): boolean {
   return v === undefined || typeof v === 'boolean'
 }
 
+// A plain object whose every value is a string (or undefined). Used for the
+// sidechain `agentSpawnLinks` map (agentId -> spawn tool_use id).
+function isOptionalStringRecord(v: unknown): boolean {
+  if (v === undefined) return true
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false
+  return Object.values(v as Record<string, unknown>).every(e => typeof e === 'string')
+}
+
 function isToolCall(v: unknown): boolean {
   if (!v || typeof v !== 'object') return false
   const o = v as Record<string, unknown>
@@ -298,12 +386,16 @@ function validateCall(c: unknown): c is CachedCall {
     && (o['speed'] === 'standard' || o['speed'] === 'fast')
     && isOptionalNum(o['costUSD'])
     && isOptionalBool(o['isEstimated'])
+    && isOptionalNum(o['activeDurationMs'])
+    && isOptionalNum(o['activeGeneratedTokens'])
+    && isOptionalNum(o['toolWaitMs'])
     && isStringArray(o['tools'])
     && isStringArray(o['bashCommands'])
     && isStringArray(o['skills'])
     && (o['subagentTypes'] === undefined || isStringArray(o['subagentTypes']))
     && isOptionalString(o['project'])
     && isOptionalString(o['projectPath'])
+    && isOptionalString(o['workingDirectory'])
     && (o['toolSequence'] === undefined || (Array.isArray(o['toolSequence']) && (o['toolSequence'] as unknown[]).every(s => isToolCallArray(s))))
     && isOptionalNum(o['locAdded'])
     && isOptionalNum(o['locRemoved'])
@@ -321,6 +413,8 @@ function validateTurn(t: unknown): t is CachedTurn {
     && typeof o['sessionId'] === 'string'
     && typeof o['userMessage'] === 'string'
     && isOptionalString(o['gitBranch'])
+    && (o['prRefs'] === undefined || isStringArray(o['prRefs']))
+    && (o['spawnToolUseIds'] === undefined || isStringArray(o['spawnToolUseIds']))
     && Array.isArray(o['calls'])
     && (o['calls'] as unknown[]).every(validateCall)
 }
@@ -331,11 +425,17 @@ function validateCachedFile(f: unknown): f is CachedFile {
   return validateFingerprint(o['fingerprint'])
     && isOptionalNum(o['lastCompleteLineOffset'])
     && isOptionalString(o['canonicalCwd'])
+    && isOptionalString(o['workingDirectory'])
     && isOptionalString(o['canonicalProjectName'])
     && isStringArray(o['mcpInventory'])
     && isOptionalString(o['title'])
     && (o['prLinks'] === undefined || isStringArray(o['prLinks']))
     && isOptionalBool(o['isSidechain'])
+    && isOptionalString(o['agentType'])
+    && isOptionalBool(o['failed'])
+    && isOptionalString(o['parentSessionId'])
+    && isOptionalStringRecord(o['agentSpawnLinks'])
+    && (o['ambiguousSpawnAgentIds'] === undefined || isStringArray(o['ambiguousSpawnAgentIds']))
     && Array.isArray(o['turns'])
     && (o['turns'] as unknown[]).every(validateTurn)
 }
@@ -356,19 +456,112 @@ function validateCache(raw: unknown): raw is SessionCache {
   return Object.values(o['providers'] as Record<string, unknown>).every(validateProviderSection)
 }
 
+// Every prior versioned cache file that can still exist on disk from a shipped or
+// dev build, NEWEST first. On a bump we adopt the newest one present: its
+// expired-source PR orphans (transcripts since deleted) hold attributable spend
+// that can never be re-parsed, and each newer version already carried the older
+// versions' orphans forward, so the newest is a superset. INVARIANT: a
+// CACHE_VERSION bump MUST extend this list to every prior version that can still
+// exist on disk, or that history silently vanishes. (v5 was missed on the 5->6
+// bump; v6 on the 6->7 bump; both are listed here.)
+const PRIOR_CACHE_VERSIONS = [6, 5] as const
+
+function priorCacheFile(version: number): string {
+  return `session-cache.v${version}.json`
+}
+
+// Lightweight top-level check: a specific prior-version cache envelope with a
+// providers object. Files are validated per-entry in adoptPriorCache so one
+// corrupt entry cannot drop every valid expired-transcript PR session.
+function isCacheEnvelope(raw: unknown, version: number): raw is { version: number; providers: Record<string, unknown> } {
+  if (!raw || typeof raw !== 'object') return false
+  const o = raw as Record<string, unknown>
+  return o['version'] === version
+    && !!o['providers'] && typeof o['providers'] === 'object' && !Array.isArray(o['providers'])
+}
+
+// One-time migration on a version bump: carry forward exactly the prior-version
+// entries whose source no longer exists AND that carry prLinks (they can never
+// re-parse, but they hold attributable PR spend); present sources are dropped so
+// they re-parse fresh under the new version and gain the new fields. Each file is
+// validated individually, so a single corrupt entry is skipped rather than
+// discarding the whole cache. Each carried section takes the CURRENT
+// envFingerprint so the scan reuses it and appends the freshly-parsed present
+// sources. The daily cache (durable cost history) is not touched.
+async function adoptPriorCache(version: number): Promise<SessionCache | null> {
+  try {
+    const raw = await readFile(join(getCacheDir(), priorCacheFile(version)), 'utf-8')
+    const parsed = JSON.parse(raw)
+    if (!isCacheEnvelope(parsed, version)) return null
+    const migrated: SessionCache = { version: CACHE_VERSION, providers: {}, complete: false }
+    for (const [provider, section] of Object.entries(parsed.providers)) {
+      if (!section || typeof section !== 'object') continue
+      const rawFiles = (section as Record<string, unknown>)['files']
+      const files: Record<string, CachedFile> = {}
+      if (rawFiles && typeof rawFiles === 'object' && !Array.isArray(rawFiles)) {
+        for (const [path, file] of Object.entries(rawFiles as Record<string, unknown>)) {
+          if (!validateCachedFile(file)) continue
+          if (!existsSync(path) && file.prLinks?.length) files[path] = file
+        }
+      }
+      migrated.providers[provider] = {
+        envFingerprint: computeEnvFingerprint(provider),
+        files,
+        ...((section as Record<string, unknown>)['durable'] ? { durable: true } : {}),
+      }
+    }
+    return migrated
+  } catch {
+    return null
+  }
+}
+
+// Adopt EVERY prior versioned cache present on disk, migrating OLDEST first and
+// merging per source path so a newer version wins per entry. Returning the newest
+// alone would be wrong: a sparse or partial newer file (e.g. v6 holding only some
+// orphans) would mask older-only orphans that still hold attributable spend. Newer
+// entries overwrite older ones for the same path; entries unique to an older
+// version survive.
+async function adoptNewestPriorCache(): Promise<SessionCache | null> {
+  const oldestFirst = [...PRIOR_CACHE_VERSIONS].sort((a, b) => a - b)
+  let merged: SessionCache | null = null
+  for (const version of oldestFirst) {
+    const adopted = await adoptPriorCache(version)
+    if (!adopted) continue
+    if (!merged) { merged = adopted; continue }
+    for (const [provider, section] of Object.entries(adopted.providers)) {
+      const existing = merged.providers[provider]
+      if (!existing) { merged.providers[provider] = section; continue }
+      // Newer version's entries overwrite older ones for the same source path.
+      Object.assign(existing.files, section.files)
+      if (section.durable) existing.durable = true
+    }
+  }
+  return merged
+}
+
 export async function loadCache(): Promise<SessionCache> {
   try {
     const raw = await readFile(getCachePath(), 'utf-8')
     const parsed = JSON.parse(raw)
-    if (!validateCache(parsed)) return emptyCache()
+    if (!validateCache(parsed)) return afterMissingVersionedCache()
     return parsed
   } catch {
-    // Versioned file absent/unreadable: try a one-time adoption of the legacy
-    // unversioned file. validateCache requires version === CACHE_VERSION, so a
-    // different-version legacy file is ignored (left intact). We copy it into the
-    // versioned file once via saveCache; the legacy file is never modified.
-    return adoptLegacyCache()
+    return afterMissingVersionedCache()
   }
+}
+
+// The current versioned file is absent/unreadable. Prefer adopting the newest
+// prior versioned file's expired-source PR orphans (v6 before v5); failing that,
+// fall back to the legacy unversioned file. Either way the versioned file is
+// minted on the next save.
+async function afterMissingVersionedCache(): Promise<SessionCache> {
+  const prior = await adoptNewestPriorCache()
+  if (prior) return prior
+  // validateCache requires version === CACHE_VERSION, so a different-version
+  // legacy file is ignored (left intact). We copy it into the versioned file once
+  // via saveCache; the legacy file is never modified.
+  return adoptLegacyCache()
 }
 
 async function adoptLegacyCache(): Promise<SessionCache> {
@@ -454,34 +647,65 @@ async function retryCacheFileMutation(operation: () => Promise<void>): Promise<b
 // append-only transcripts keep changing. Fixing this properly means
 // multi-file fingerprints per source.
 
+// SQLite database files by extension. Bare-db sources (copilot's
+// agent-traces.db) and the virtual-suffix bases below all match one of these.
+const SQLITE_DB_PATH = /\.(db|sqlite3?|vscdb)$/i
+
+/// Fingerprint a SQLite database file together with its `-wal` sibling.
+///
+/// A database in WAL mode parks committed writes in `<db>-wal`; the main
+/// file's stat only moves on checkpoint, and a long-lived writer connection
+/// (hermes, cursor and opencode keep their state DBs open for the life of
+/// the agent process) can defer checkpoints for hours or days. A fingerprint
+/// built from the main file alone then (a) carries an mtime older than the
+/// newest committed data, so the date-range mtime pre-filter in
+/// parseProviderSources skips the source and sessions committed after the
+/// last checkpoint never parse (issue #913: today's Hermes sessions missing
+/// from every report), and (b) does not change between checkpoints, so
+/// reconcileFile keeps serving stale cached turns for sessions that grew.
+/// Folding the WAL sibling in fixes both: the newest mtime wins, and the
+/// sizes add so both WAL growth and a checkpoint (db grows, wal truncates)
+/// move the fingerprint. `-shm` is deliberately ignored — it mutates on
+/// reads too and would churn the fingerprint without any data change.
+async function fingerprintSqliteFile(dbPath: string): Promise<FileFingerprint | null> {
+  try {
+    const s = await stat(dbPath)
+    const wal = await stat(dbPath + '-wal').catch(() => null)
+    return {
+      dev: s.dev,
+      ino: s.ino,
+      mtimeMs: wal ? Math.max(s.mtimeMs, wal.mtimeMs) : s.mtimeMs,
+      sizeBytes: s.size + (wal?.size ?? 0),
+    }
+  } catch {
+    return null
+  }
+}
+
 export async function fingerprintFile(filePath: string): Promise<FileFingerprint | null> {
   try {
     const s = await stat(filePath)
+    // A source path that IS a SQLite database (copilot OTel's agent-traces.db)
+    // needs the same WAL fold as the virtual-suffix forms below.
+    if (SQLITE_DB_PATH.test(filePath)) return fingerprintSqliteFile(filePath)
     return { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, sizeBytes: s.size }
   } catch {
     // Providers encode extra context into source paths using virtual suffixes:
     // - Cursor: `<dbPath>#cursor-ws=<workspace>` (workspace-aware routing)
     // - OpenCode: `<dbPath>:<sessionId>` (session scoping)
+    // - Hermes: `<dbPath>#hermes-session=<sessionId>` (session scoping)
     // These compound paths don't exist on disk; strip the suffix to stat the
-    // underlying file. Try `#` first (rare in real paths), then `:` (must use
-    // lastIndexOf to tolerate Windows drive letters like C:\...).
+    // underlying database. Try `#` first (rare in real paths), then `:` (must
+    // use lastIndexOf to tolerate Windows drive letters like C:\...).
     const hashIdx = filePath.indexOf('#')
     if (hashIdx > 0) {
-      try {
-        const s = await stat(filePath.slice(0, hashIdx))
-        return { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, sizeBytes: s.size }
-      } catch {
-        // fall through to colon check
-      }
+      const fp = await fingerprintSqliteFile(filePath.slice(0, hashIdx))
+      if (fp) return fp
+      // fall through to colon check
     }
     const colonIdx = filePath.lastIndexOf(':')
     if (colonIdx > 0) {
-      try {
-        const s = await stat(filePath.slice(0, colonIdx))
-        return { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, sizeBytes: s.size }
-      } catch {
-        return null
-      }
+      return fingerprintSqliteFile(filePath.slice(0, colonIdx))
     }
     return null
   }

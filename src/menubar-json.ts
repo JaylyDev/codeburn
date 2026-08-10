@@ -42,6 +42,36 @@ export type PeriodData = {
   topReworkedFiles?: ReworkedFile[]
   /// Share (0-1) of cost-bearing calls that resolved a price.
   pricingCoverage?: number
+  /// Spend attributed by referenced pull request (from Claude session
+  /// transcripts), at turn granularity. Rows carry attributed cost/calls and ARE
+  /// summable; `attributedCost`/`unattributedCost` split the PR-linked spend.
+  /// Absent when no PR links were observed.
+  pullRequests?: PullRequestsPayload
+  /// Per-branch spend, last-seen branch carried forward across each session's
+  /// turns. A `null` branch is unbranched spend inside a branch-bearing session.
+  /// Rows are by-reference (a session that switched branches counts toward each),
+  /// so never sum them. Absent when no branch data was observed.
+  byBranch?: BranchRow[]
+}
+
+export type PullRequestsPayload = {
+  /// Every attributed PR row, cost-descending.
+  rows: PrRow[]
+  /// PR-linked spend, now INCLUDING the subagent runs folded into those sessions
+  /// (so it can exceed the parents' own spend). Equals `attributedCost +
+  /// unattributedCost`; kept for backward compatibility.
+  distinctCost: number
+  /// Count of distinct PR-linked PARENT sessions.
+  distinctSessions: number
+  /// Count of subagent (sidechain) runs whose spend was folded into those parent
+  /// sessions. Each remains a standalone row in the sessions list; here it only
+  /// explains why the totals exceed the parents' own spend. 0 when none folded.
+  subagentSessions?: number
+  /// Sum of every PR's attributed cost.
+  attributedCost: number
+  /// PR-linked spend not tied to any specific PR (pre-reference session
+  /// overhead). `attributedCost + unattributedCost === distinctCost`.
+  unattributedCost: number
 }
 
 export type ProviderCost = {
@@ -54,7 +84,9 @@ export type ProviderCost = {
 import type { OptimizeResult } from './optimize.js'
 import { getCurrency } from './currency.js'
 import type { GranularHistory } from './granular-history.js'
+import { getShortModelName } from './models.js'
 import type { ReworkedFile } from './workflow-insights.js'
+import type { PrRow, BranchRow } from './sessions-report.js'
 
 const TOP_ACTIVITIES_LIMIT = 20
 const TOP_MODELS_LIMIT = 20
@@ -272,6 +304,15 @@ export type MenubarPayload = {
     skills: Array<{ name: string; turns: number; cost: number }>
     subagents: Array<{ name: string; calls: number; cost: number }>
     mcpServers: Array<{ name: string; calls: number }>
+    /// Every pull request with attributed spend, cost-descending, plus the
+    /// multi-link-safe distinct total. Absent when no PR links were observed and
+    /// on payloads produced before the field existed.
+    pullRequests?: PullRequestsPayload
+    /// Per-branch spend (top 15 by cost), last-seen branch carried forward across
+    /// each session's turns; a `null` branch is unbranched spend inside a
+    /// branch-bearing session. By-reference like the PR rows. Absent when no
+    /// branch data was observed, and on payloads produced before the field.
+    byBranch?: BranchRow[]
   }
   optimize: {
     findingCount: number
@@ -329,10 +370,24 @@ function buildTopActivities(categories: PeriodData['categories']): MenubarPayloa
 }
 
 function buildTopModels(models: PeriodData['models']): MenubarPayload['current']['topModels'] {
-  return models
-    .filter(m => m.name !== SYNTHETIC_MODEL_NAME)
+  // Day entries key models by the raw provider id (day-aggregator), so resolve
+  // display names here — the menubar shows "Kimi K3" rather than "k3". Ids that
+  // collapse to one display name (e.g. k3 and kimi-k3) merge into a single row.
+  const merged = new Map<string, { cost: number; calls: number; savingsUSD: number; estimatedCostUSD: number }>()
+  for (const m of models) {
+    if (m.name === SYNTHETIC_MODEL_NAME) continue
+    const name = getShortModelName(m.name)
+    const acc = merged.get(name) ?? { cost: 0, calls: 0, savingsUSD: 0, estimatedCostUSD: 0 }
+    acc.cost += m.cost
+    acc.calls += m.calls
+    acc.savingsUSD += m.savingsUSD ?? 0
+    acc.estimatedCostUSD += m.estimatedCostUSD ?? 0
+    merged.set(name, acc)
+  }
+  return [...merged.entries()]
+    .sort(([, a], [, b]) => b.cost - a.cost)
     .slice(0, TOP_MODELS_LIMIT)
-    .map(m => ({ name: m.name, cost: m.cost, calls: m.calls, savingsUSD: m.savingsUSD, savingsBaselineModel: '', estimatedCostUSD: m.estimatedCostUSD ?? 0 }))
+    .map(([name, d]) => ({ name, cost: d.cost, calls: d.calls, savingsUSD: d.savingsUSD, savingsBaselineModel: '', estimatedCostUSD: d.estimatedCostUSD }))
 }
 
 function buildOptimize(optimize: OptimizeResult | null): MenubarPayload['optimize'] {
@@ -486,6 +541,11 @@ export function buildMenubarPayload(
       skills: breakdowns?.skills ?? [],
       subagents: breakdowns?.subagents ?? [],
       mcpServers: breakdowns?.mcpServers ?? [],
+      // Add-only: emitted only when the producer computed them (all-provider
+      // path), omitted otherwise so the schema stays stable for consumers that
+      // predate the fields.
+      ...(current.pullRequests ? { pullRequests: current.pullRequests } : {}),
+      ...(current.byBranch ? { byBranch: current.byBranch } : {}),
     },
     optimize: buildOptimize(optimize),
     history: buildHistory(dailyHistory, granularHistory),

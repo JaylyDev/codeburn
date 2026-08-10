@@ -1,0 +1,36 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.13.0
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      # The cache-refresh-lock files exercise a cross-process file lock and are
+      # parallelism-sensitive (they fail under full worker pressure and pass serially -
+      # reproduced repeatedly on unmodified main), so they run in their own serial step
+      # below instead of making every PR roll dice.
+      # Scoping (tests/ only, app/ excluded) lives in the package.json test
+      # script since #948, so CI and a contributor's `npm test` can never drift.
+      - name: Test suite (parallel)
+        run: npm test
+      # Single forked worker, so lock contention comes only from the child processes the
+      # tests spawn deliberately. Quarantined (reports, never gates): the process
+      # suite still races its own takeover window even serially on slow runners -
+      # tracked in #904; drop continue-on-error once that race is settled.
+      - name: Cache-lock suite (serial, quarantined)
+        continue-on-error: true
+        run: npm run test:locks
