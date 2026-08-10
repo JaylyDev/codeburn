@@ -14,7 +14,12 @@ Run the test suite to catch any regressions:
 
 ```bash
 npm test
+npm run test:locks
 ```
+
+`npm test` covers `tests/`. `npm run test:locks` runs the three parallelism-sensitive
+`cache-refresh-lock` suites serially; CI treats them as reporting-only, so check them by
+hand here.
 
 Verify that the build completes without errors:
 

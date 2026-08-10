@@ -177,13 +177,21 @@ The `prepublishOnly` hook in `package.json` runs `npm run build` so `npm publish
 
 ## Tests
 
-`npm test` runs vitest. Forty-two test files live under `tests/`:
+`npm test` runs vitest, scoped to `tests/`. 192 test files live there:
 
-- `tests/` root (27 files) covers CLI, parser, optimize, cache, format, models, plans.
+- `tests/` root (141 files) covers CLI, parser, optimize, cache, format, models, plans.
 - `tests/security/` (1 file) covers prototype-pollution guards.
-- `tests/providers/` (15 files) covers per-provider parsing.
+- `tests/providers/` (44 files) covers per-provider parsing.
+- `tests/sharing/` (6 files) covers the share/export surface.
+- `tests/setup/` holds the env-isolation setup file, not specs.
 - `tests/fixtures/` holds redacted real-world session data.
 
-Five providers ship without dedicated test files today: `antigravity`, `claude`, `gemini`, `goose`, `qwen`. Closing this gap is a standing good-first-issue.
+The scope is deliberate: the Electron app under `app/` has its own vitest config and its
+own `jsdom` dependency, so vitest's default glob must not reach it from a root install.
+The three `cache-refresh-lock` suites are excluded from `npm test` and run serially via
+`npm run test:locks`, because they exercise a cross-process file lock and fail under full
+worker pressure.
 
-CI runs Semgrep against `.semgrep/rules/no-bracket-assign-hot-paths.yml` over `src/providers/` and `src/parser.ts` (`.github/workflows/ci.yml`). It does not run vitest in CI today; tests run locally before publish.
+Three providers ship without dedicated test files today: `claude`, `goose`, `qwen`. Closing this gap is a standing good-first-issue.
+
+CI runs Semgrep against `.semgrep/rules/no-bracket-assign-hot-paths.yml` over `src/providers/` and `src/parser.ts` (`.github/workflows/ci.yml`). The vitest suite runs in CI too, via `.github/workflows/tests.yml`, on every pull request and every push to `main`.

@@ -21,6 +21,10 @@ struct SettingsView: View {
                 .tabItem { Label("Codex", systemImage: "chevron.left.forwardslash.chevron.right") }
                 .tag("codex")
 
+            KimiSettingsTab()
+                .tabItem { Label("Kimi", systemImage: "moon.stars") }
+                .tag("kimi")
+
             DevinSettingsTab()
                 .tabItem { Label("Devin", systemImage: "flame.fill") }
                 .tag("devin")
@@ -29,7 +33,9 @@ struct SettingsView: View {
                 .tabItem { Label("About", systemImage: "info.circle") }
                 .tag("about")
         }
-        .frame(width: 520, height: 430)
+        // 6 tabs need ~600pt to render as a visible tab bar; narrower widths
+        // make SwiftUI collapse the tab bar into a ">>" overflow menu.
+        .frame(width: 600, height: 430)
     }
 }
 
@@ -51,6 +57,11 @@ private struct GeneralSettingsTab: View {
     // label would never reflect the selection even though the value landed.
     @AppStorage(UsageRefreshCadence.defaultsKey)
     private var usageRefreshSeconds: Int = UsageRefreshCadence.default.rawValue
+
+    // Stored as the raw string so an unrecognised value (older build, manual
+    // `defaults write`) parses back to .terminal instead of failing to decode.
+    @AppStorage(PreferredTerminal.defaultsKey)
+    private var preferredTerminalRaw: String = PreferredTerminal.default.rawValue
 
     private let costPresets: Set<Double> = [25, 50, 100, 200, 500]
     private let tokenPresets: Set<Double> = [1_000_000, 5_000_000, 10_000_000, 25_000_000, 50_000_000, 100_000_000]
@@ -139,6 +150,22 @@ private struct GeneralSettingsTab: View {
                 }
                 .pickerStyle(.menu)
                 Text("How often the menubar figure re-reads your local session data. Auto refreshes every 30 seconds while you're plugged in and backs off on battery; Manual only refreshes when you open the popover or click Refresh Now.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Terminal") {
+                Picker("Open commands in", selection: Binding(
+                    get: { PreferredTerminal(rawValue: preferredTerminalRaw) ?? .default },
+                    set: { preferredTerminalRaw = $0.rawValue }
+                )) {
+                    ForEach(PreferredTerminal.allCases) { terminal in
+                        Text(terminal.isInstalled ? terminal.label : "\(terminal.label) (not installed)")
+                            .tag(terminal)
+                    }
+                }
+                .pickerStyle(.menu)
+                Text("Where Full Report and Optimize open. If the chosen app isn't installed CodeBurn falls back to Terminal; if that's missing too the command runs in the background. Only terminals that can script a command into a live window are listed.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -481,7 +508,7 @@ private struct CodexSettingsTab: View {
                 CodexConnectionRow()
             }
             Section {
-                Text("Codex live-quota tracking reads `~/.codex/auth.json` once on Connect, then keeps a local copy under Application Support so subsequent quota fetches don't re-read the original. Only ChatGPT-mode auth (Plus / Pro / Team / Business) is supported — API-key users are billed per request and have a different reporting surface.")
+                Text("Codex live-quota tracking reads `~/.codex/auth.json` once on Connect, then keeps a local copy under Application Support so subsequent quota fetches don't re-read the original. Only ChatGPT-mode auth (Plus / Pro / Team / Business / Edu / Enterprise) is supported. API-key users are billed per request and have a different reporting surface. Credit-metered workspaces report no rate-limit windows, so their monthly credit allowance is shown instead.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             } header: {
@@ -599,6 +626,131 @@ private struct CodexConnectionRow: View {
                 .buttonStyle(.borderedProminent)
         case .notBootstrapped:
             Button("Connect") { Task { await store.bootstrapCodex() } }
+                .buttonStyle(.borderedProminent)
+        case .bootstrapping:
+            ProgressView().controlSize(.small)
+        }
+    }
+}
+
+// MARK: - Kimi Code
+
+private struct KimiSettingsTab: View {
+    var body: some View {
+        Form {
+            Section("Connection") {
+                KimiConnectionRow()
+            }
+            Section {
+                Text("Kimi Code live-quota tracking reads `~/.kimi-code/credentials/kimi-code.json` directly — nothing is copied or stored. Access tokens are short-lived (~15 minutes) and only the Kimi CLI refreshes them, so if the connection shows as expired, run the Kimi CLI once and click Reconnect.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("How it works")
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+}
+
+private struct KimiConnectionRow: View {
+    @Environment(AppStore.self) private var store
+    @State private var showDisconnectConfirm = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: stateIcon)
+                .font(.system(size: 18))
+                .foregroundStyle(stateTint)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(stateTitle)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(stateDetail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+            actionButton
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var stateIcon: String {
+        switch store.kimiLoadState {
+        case .loaded: return "checkmark.circle.fill"
+        case .terminalFailure: return "exclamationmark.triangle.fill"
+        case .transientFailure: return "clock.arrow.circlepath"
+        case .bootstrapping, .loading: return "ellipsis.circle"
+        case .notBootstrapped, .dormant, .noCredentials: return "link.circle"
+        case .failed: return "xmark.circle"
+        }
+    }
+
+    private var stateTint: Color {
+        switch store.kimiLoadState {
+        case .loaded: return .green
+        case .terminalFailure, .failed: return .red
+        case .transientFailure: return .orange
+        default: return .secondary
+        }
+    }
+
+    private var stateTitle: String {
+        switch store.kimiLoadState {
+        case .loaded: return "Connected"
+        case let .terminalFailure(reason): return reason ?? "Login refresh required"
+        case .transientFailure: return "Backing off"
+        case .bootstrapping: return "Connecting…"
+        case .loading: return "Refreshing…"
+        case .dormant: return "Ready"
+        case .notBootstrapped, .noCredentials: return "Not connected"
+        case .failed: return "Couldn't load Kimi quota"
+        }
+    }
+
+    private var stateDetail: String {
+        switch store.kimiLoadState {
+        case .loaded:
+            return "Live quota tracked from api.kimi.com."
+        case .terminalFailure:
+            return "Run the Kimi CLI once to refresh your login, then click Reconnect."
+        case .transientFailure: return store.kimiError ?? "Kimi rate-limited; auto-retrying."
+        case .bootstrapping: return "Reading ~/.kimi-code credentials."
+        case .loading: return "Background refresh in progress."
+        case .dormant: return "Tap Load Quota to fetch live usage from api.kimi.com."
+        case .notBootstrapped, .noCredentials:
+            return "Sign in with the Kimi CLI first, then click Connect."
+        case .failed: return store.kimiError ?? ""
+        }
+    }
+
+    @ViewBuilder
+    private var actionButton: some View {
+        switch store.kimiLoadState {
+        case .loaded, .transientFailure, .loading:
+            Button("Disconnect") { showDisconnectConfirm = true }
+                .confirmationDialog(
+                    "Disconnect Kimi Code?",
+                    isPresented: $showDisconnectConfirm
+                ) {
+                    Button("Disconnect", role: .destructive) {
+                        store.disconnectKimi()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("CodeBurn will stop tracking Kimi Code quota. Your ~/.kimi-code credentials are untouched — the Kimi CLI keeps working.")
+                }
+        case .terminalFailure, .noCredentials, .failed:
+            Button("Reconnect") { Task { await store.bootstrapKimi() } }
+                .buttonStyle(.borderedProminent)
+        case .dormant:
+            Button("Load Quota") { Task { await store.bootstrapKimi() } }
+                .buttonStyle(.borderedProminent)
+        case .notBootstrapped:
+            Button("Connect") { Task { await store.bootstrapKimi() } }
                 .buttonStyle(.borderedProminent)
         case .bootstrapping:
             ProgressView().controlSize(.small)

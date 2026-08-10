@@ -20,7 +20,12 @@ export const USER_CORRECTION_PATTERNS: RegExp[] = [
   /\byou (?:missed|forgot|misunderstood|broke)\b/i,
   /\brevert (?:that|it|this|your|the last|the change)\b/i,
   /\bundo (?:that|it|this|your|the last|the change)\b/i,
-  /\bwrong (?:file|approach|place|method|function|answer|way|direction)\b/i,
+  // "answer" is deliberately absent from the noun list: injected skill/system
+  // prose lands in the user-message slot and reads as ordinary writing where
+  // "the wrong answer" is an idiom ("a well-composed page is never the wrong
+  // answer" counted 4 phantom corrections on real data). The other nouns are
+  // concrete work artifacts that prose rarely uses with "wrong".
+  /\bwrong (?:file|approach|place|method|function|way|direction)\b/i,
   /\bstill (?:wrong|broken|failing|not working)\b/i,
 ]
 

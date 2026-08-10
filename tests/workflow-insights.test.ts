@@ -119,10 +119,23 @@ describe('scanUserCorrections', () => {
       'undo the migration when done',
       'the build is failing, can you fix it',
       'what went wrong here',
+      // Verbatim from an injected skill prompt that counted 4 phantom
+      // corrections on real data: "wrong answer" is prose idiom, not a
+      // correction, which is why "answer" is not in the wrong-<noun> list.
+      'When unsure: a well-composed page is never the wrong answer; an over-designed visual identity sometimes is.',
     ]
     const p = project([session('s1', phrases.map(m => turn({ userMessage: m })))])
     const r = scanUserCorrections([p])
     expect(r.corrections).toBe(0)
+  })
+
+  it('still flags concrete wrong-<artifact> follow-ups', () => {
+    const p = project([session('s1', [
+      turn({ userMessage: 'rename the helper' }),
+      turn({ userMessage: 'you edited the wrong file' }),
+      turn({ userMessage: "that's the wrong approach, use the cache" }),
+    ])])
+    expect(scanUserCorrections([p]).corrections).toBe(2)
   })
 
   it('ignores continuation turns with no fresh prompt', () => {

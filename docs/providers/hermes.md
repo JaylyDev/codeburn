@@ -62,6 +62,6 @@ The shared session cache fingerprints Hermes state DB files. `HERMES_HOME` is in
 ## When fixing a bug here
 
 1. Reproduce against a real Hermes `state.db` or a minimal SQLite fixture.
-2. Run `npm test -- tests/providers/hermes.test.ts --run`.
+2. Run `npx vitest run tests/providers/hermes.test.ts`.
 3. For local smoke testing, use an isolated cache directory, for example:
    `CODEBURN_CACHE_DIR=/tmp/codeburn-hermes-cache node --import tsx -e "import { parseAllSessions } from './src/parser.ts'; console.log(await parseAllSessions(undefined, 'hermes'))"`.

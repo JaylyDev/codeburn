@@ -3,8 +3,9 @@ import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
 import { findUnpricedModels, loadPricing, setModelAliases, setPriceOverrides, setLocalModelSavings, setProxyPaths, normalizeProxyPath } from './models.js'
-import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache } from './parser.js'
+import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
+import { getProvider } from './providers/index.js'
 import { convertCost, formatCost } from './currency.js'
 import { renderStatusBar } from './format.js'
 import { toDateString } from './daily-cache.js'
@@ -46,6 +47,7 @@ import { createRequire } from 'node:module'
 const require = createRequire(import.meta.url)
 const { version } = require('../package.json')
 import { loadCurrency, getCurrency, isValidCurrencyCode } from './currency.js'
+import { CodexThroughputReader, newestCodexSession, renderCodexThroughput } from './codex-throughput.js'
 
 // A downstream reader that closes the pipe early (`| head`, quitting `less`, or
 // a missing command) makes stdout writes fail with EPIPE. Exit cleanly rather
@@ -66,6 +68,22 @@ function parseNumber(value: string): number {
 
 function parseInteger(value: string): number {
   return parseInt(value, 10)
+}
+
+function parseCodexTpsLimit(value: string): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 1 || parsed > 10000) {
+    throw new Error('limit must be an integer from 1 to 10000')
+  }
+  return parsed
+}
+
+function parseCodexTpsWatch(value: string): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 0 || (parsed > 0 && parsed < 1) || parsed > 3600) {
+    throw new Error('watch must be 0 or at least 1 second (up to 3600 seconds)')
+  }
+  return parsed
 }
 
 type PriceOverrideConfig = NonNullable<CodeburnConfig['priceOverrides']>[string]
@@ -497,9 +515,17 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
         if (turn.retries === 0) dailyMap[day].oneShotTurns += 1
       }
       for (const call of turn.assistantCalls) {
-        dailyMap[day].cost += call.costUSD
-        dailyMap[day].savings += call.savingsUSD ?? 0
-        dailyMap[day].calls += 1
+        // Cost/savings/calls bucket under each call's OWN day — the same
+        // per-call rule as the durable day set (day-aggregator.ts), so this
+        // fallback and durable.days never diverge on a midnight-straddling
+        // turn (issue #852). Turn counts/edit stats stay anchored on the
+        // turn's day above. An unparseable call timestamp falls back to the
+        // turn's day rather than producing a garbage date key.
+        const callDay = Number.isNaN(new Date(call.timestamp).getTime()) ? day : dateKey(call.timestamp)
+        if (!dailyMap[callDay]) { dailyMap[callDay] = { cost: 0, savings: 0, calls: 0, turns: 0, editTurns: 0, oneShotTurns: 0 } }
+        dailyMap[callDay].cost += call.costUSD
+        dailyMap[callDay].savings += call.savingsUSD ?? 0
+        dailyMap[callDay].calls += 1
       }
     }
   }
@@ -746,7 +772,7 @@ program
   .option('--format <format>', 'Output format: tui, json', 'tui')
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
-  .option('--refresh <seconds>', 'Auto-refresh interval in seconds (0 to disable)', parseInteger, 30)
+  .option('--refresh <seconds>', 'Auto-refresh interval in seconds (minimum 60; 0 to disable)', parseInteger, 60)
   .action(async (opts) => {
     assertFormat(opts.format, ['tui', 'json'], 'report')
     assertProvider(opts.provider, 'report')
@@ -966,6 +992,7 @@ program
         cacheWriteTokens: durable.data.cacheWriteTokens,
         days: durable.days,
         carriedCostUSD: durable.carriedCostUSD,
+        unattributedCostUSD: durable.unattributedCostUSD,
       },
     }))
   })
@@ -1176,7 +1203,7 @@ program
   .option('--format <format>', 'Output format: tui, json', 'tui')
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
-  .option('--refresh <seconds>', 'Auto-refresh interval in seconds (0 to disable)', parseInteger, 30)
+  .option('--refresh <seconds>', 'Auto-refresh interval in seconds (minimum 60; 0 to disable)', parseInteger, 60)
   .action(async (opts) => {
     assertFormat(opts.format, ['tui', 'json'], 'today')
     assertProvider(opts.provider, 'today')
@@ -1194,7 +1221,7 @@ program
   .option('--format <format>', 'Output format: tui, json', 'tui')
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
-  .option('--refresh <seconds>', 'Auto-refresh interval in seconds (0 to disable)', parseInteger, 30)
+  .option('--refresh <seconds>', 'Auto-refresh interval in seconds (minimum 60; 0 to disable)', parseInteger, 60)
   .action(async (opts) => {
     assertFormat(opts.format, ['tui', 'json'], 'month')
     assertProvider(opts.provider, 'month')
@@ -1844,6 +1871,94 @@ program
   })
 
 program
+  .command('codex-tps [session]')
+  .description('Retrospective Codex generated-tokens/sec estimate from rollout checkpoints (not live decode speed)')
+  .option('--json', 'JSON output')
+  .option('--limit <n>', 'Number of recent checkpoints to scan', parseCodexTpsLimit, 10)
+  .option('--watch <seconds>', 'Refresh continuously while Codex writes checkpoints', parseCodexTpsWatch, 0)
+  .action(async (session: string | undefined, opts: { json?: boolean; limit: number; watch: number }) => {
+    const intervalMs = Math.max(0, opts.watch) * 1000
+    if (opts.json && intervalMs > 0) {
+      process.stderr.write('codeburn codex-tps: --json cannot be combined with --watch; use text watch output or one-shot JSON.\n')
+      process.exitCode = 2
+      return
+    }
+    const provider = await getProvider('codex')
+    if (!provider) {
+      process.stderr.write('codeburn codex-tps: Codex provider is unavailable.\n')
+      process.exitCode = 1
+      return
+    }
+    let cachedPath: string | undefined = session
+    let throughputReader: CodexThroughputReader | undefined
+    let lastFileState: { size: number; mtimeMs: number } | undefined
+    let lastDiscoveryMs = 0
+    let refreshInFlight = false
+    const render = async (): Promise<void> => {
+      if (refreshInFlight) return
+      refreshInFlight = true
+      try {
+        let filePath = session ?? cachedPath
+        // Keep an idle watcher on its chosen rollout. A full active+archive
+        // discovery can be hundreds of milliseconds on large histories, so
+        // only re-scan slowly to notice rotation; disappearance still triggers
+        // an immediate discovery on the next tick.
+        if (!session && (!filePath || Date.now() - lastDiscoveryMs >= 60_000)) {
+          lastDiscoveryMs = Date.now()
+          filePath = await newestCodexSession(await provider.discoverSessions())
+        }
+        if (!filePath) {
+          process.stderr.write('codeburn codex-tps: no Codex rollout sessions found.\n')
+          if (intervalMs === 0) process.exitCode = 1
+          return
+        }
+        const previousPath = cachedPath
+        cachedPath = filePath
+        if (previousPath !== filePath || !throughputReader) throughputReader = new CodexThroughputReader()
+        const fileInfo = await import('node:fs/promises').then(fs => fs.stat(filePath)).catch(() => null)
+        if (!fileInfo) {
+          process.stderr.write(`codeburn codex-tps: session file not found: ${filePath}\n`)
+          if (intervalMs === 0) process.exitCode = 1
+          if (!session) cachedPath = undefined
+          return
+        }
+        if (intervalMs > 0 && lastFileState && fileInfo.size === lastFileState.size && fileInfo.mtimeMs === lastFileState.mtimeMs) return
+        lastFileState = { size: fileInfo.size, mtimeMs: fileInfo.mtimeMs }
+        const points = await throughputReader!.update(filePath, opts.limit, intervalMs === 0)
+        if (opts.json) {
+          process.stdout.write(JSON.stringify({ session: filePath, points, live: intervalMs > 0 }, null, 2) + '\n')
+        } else {
+          if (intervalMs > 0) process.stdout.write('\x1b[2J\x1b[H')
+          process.stdout.write(renderCodexThroughput(points, filePath) + (intervalMs > 0 ? '\nWatching for new Codex checkpoints... (Ctrl-C to stop)\n' : '\n'))
+        }
+      } finally {
+        refreshInFlight = false
+      }
+    }
+    try {
+      await render()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      process.stderr.write(`codeburn codex-tps: refresh failed: ${message}\n`)
+      if (intervalMs === 0) {
+        process.exitCode = 1
+        return
+      }
+    }
+    if (intervalMs > 0) {
+      await new Promise<void>((resolve) => {
+        const timer = setInterval(() => {
+          void render().catch(error => {
+            const message = error instanceof Error ? error.message : String(error)
+            process.stderr.write(`codeburn codex-tps: refresh failed: ${message}\n`)
+          })
+        }, intervalMs)
+        process.once('SIGINT', () => { clearInterval(timer); resolve() })
+      })
+    }
+  })
+
+program
   .command('compare')
   .description('Compare two AI models side-by-side')
   .option('-p, --period <period>', 'Analysis period: today, week, 30days, month, all, lifetime', 'all')
@@ -1857,7 +1972,7 @@ program
     await loadPricing()
     const { range, label } = getDateRange(opts.period)
     if (opts.format === 'json') {
-      const { aggregateModelStats, buildCompareJson, renderCompareJson, scanSelfCorrections } = await import('./compare-stats.js')
+      const { aggregateModelStats, buildCompareJson, findModelStat, renderCompareJson, scanSelfCorrections } = await import('./compare-stats.js')
       const projects = await parseAllSessions(range, opts.provider)
       const models = aggregateModelStats(projects)
 
@@ -1880,8 +1995,8 @@ program
         process.stderr.write('codeburn compare: --model-a and --model-b must be provided together.\n')
         process.exit(1)
       }
-      const modelA = models.find(model => model.model === opts.modelA)
-      const modelB = models.find(model => model.model === opts.modelB)
+      const modelA = findModelStat(models, opts.modelA)
+      const modelB = findModelStat(models, opts.modelB)
       if (!modelA) {
         process.stderr.write(`codeburn compare: model not found: "${opts.modelA}".\n`)
         process.exit(1)
@@ -1893,7 +2008,13 @@ program
       process.stdout.write(renderCompareJson(buildCompareJson(projects, modelA, modelB, label, opts.provider)) + '\n')
       return
     }
-    await renderCompare(range, opts.provider)
+    if (opts.modelA || opts.modelB) {
+      if (!opts.modelA || !opts.modelB) {
+        process.stderr.write('codeburn compare: --model-a and --model-b must be provided together.\n')
+        process.exit(1)
+      }
+    }
+    await renderCompare(range, opts.provider, opts.modelA, opts.modelB)
   })
 
 program
@@ -2008,10 +2129,13 @@ program
   .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, cursor)', 'all')
   .option('--format <format>', 'Output format: table, json', 'table')
   .option('--by-pr', 'Group spend by the pull requests each session referenced')
+  .option('--no-pager', 'Print the complete table directly instead of opening the interactive browser')
   .action(async (opts) => {
     assertProvider(opts.provider, 'sessions')
     assertFormat(opts.format, ['table', 'json'], 'sessions')
-    const { aggregateSessions, aggregateByPr, prLinkedTotals, renderJson, renderTable } = await import('./sessions-report.js')
+    const { aggregateSessions, buildPrAttribution, renderJson, renderTable } = await import('./sessions-report.js')
+    const wantsInteractive = opts.format === 'table' && !opts.byPr && opts.pager !== false && process.stdin.isTTY === true && process.stdout.isTTY === true
+    if (wantsInteractive) setInteractiveScanUI()
     await loadPricing()
 
     let range
@@ -2028,17 +2152,19 @@ program
 
     const projects = await parseAllSessions(range, opts.provider)
     if (opts.byPr) {
-      const prRows = aggregateByPr(projects)
+      const { rows: prRows, totals } = buildPrAttribution(projects)
       if (opts.format === 'json') {
-        process.stdout.write(JSON.stringify({ prs: prRows, distinct: prLinkedTotals(projects) }, null, 2) + '\n')
+        process.stdout.write(JSON.stringify({ prs: prRows, distinct: totals }, null, 2) + '\n')
         return
       }
       if (prRows.length === 0) {
         process.stdout.write('No sessions with captured PR links in this period. Links are captured as sessions are parsed; older transcripts gain them on their next re-parse.\n')
         return
       }
-      const { cost, sessions } = prLinkedTotals(projects)
+      const { unattributedCost, sessions, subagentSessions } = totals
       const { renderTable: renderTextTable } = await import('./text-table.js')
+      const modelsCell = (models: string[]): string =>
+        models.length === 0 ? '' : models.slice(0, 2).join(', ') + (models.length > 2 ? ` +${models.length - 2}` : '')
       const table = renderTextTable(
         [
           { header: 'PR' },
@@ -2046,25 +2172,45 @@ program
           { header: 'Saved', right: true },
           { header: 'Sessions', right: true },
           { header: 'Calls', right: true },
+          { header: 'Models' },
           { header: 'First' },
           { header: 'Last' },
         ],
         prRows.map(r => [
           r.label,
-          `$${r.cost.toFixed(2)}`,
+          `${r.approx ? '~' : ''}$${r.cost.toFixed(2)}`,
           `$${r.savingsUSD.toFixed(2)}`,
           String(r.sessions),
           String(r.calls),
+          modelsCell(r.models),
           r.firstStarted.slice(0, 10),
           r.lastEnded.slice(0, 10),
         ]),
       )
-      process.stdout.write(table + `\nDistinct PR-linked spend: $${cost.toFixed(2)} across ${sessions} session${sessions === 1 ? '' : 's'}. A session referencing several PRs counts toward each, so rows exceed this total when links overlap.\n`)
+      // Footer reconciles to the ROUNDED row values actually printed (not the
+      // exact float sum), so the visible column adds up to the stated total.
+      const shownAttributed = prRows.reduce((sum, r) => sum + Number(r.cost.toFixed(2)), 0)
+      const approxNote = prRows.some(r => r.approx)
+        ? ' ~ marks rows estimated from a whole-session even split (transcript expired before per-turn capture).'
+        : ''
+      const subagentNote = subagentSessions > 0
+        ? ` + ${subagentSessions} folded-in subagent run${subagentSessions === 1 ? '' : 's'}`
+        : ''
+      process.stdout.write(table + `\nRows sum to $${shownAttributed.toFixed(2)} attributed across ${sessions} PR-linked session${sessions === 1 ? '' : 's'}${subagentNote}. $${unattributedCost.toFixed(2)} of that spend was not tied to a specific PR.${approxNote}\n`)
       return
     }
     const rows = aggregateSessions(projects)
-    const output = opts.format === 'json' ? renderJson(rows) : renderTable(rows)
-    process.stdout.write(output + '\n')
+    if (opts.format === 'json') {
+      process.stdout.write(renderJson(rows) + '\n')
+      return
+    }
+
+    if (wantsInteractive) {
+      const { runSessionsTui } = await import('./sessions-tui.js')
+      await runSessionsTui(rows, { period: opts.from || opts.to ? formatDateRangeLabel(opts.from, opts.to) : opts.period, provider: opts.provider })
+      return
+    }
+    process.stdout.write(renderTable(rows) + '\n')
   })
 
 program

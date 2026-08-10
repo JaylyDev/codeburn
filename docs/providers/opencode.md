@@ -57,6 +57,6 @@ Per `<sessionId>:<messageId>`.
 
 ## When fixing a bug here
 
-1. The 558-line test suite catches a lot. Run `npm test -- tests/providers/opencode.test.ts` before and after any change.
+1. The 558-line test suite catches a lot. Run `npx vitest run tests/providers/opencode.test.ts` before and after any change.
 2. If the bug is "missing table" warning, do not catch and silence it. Either upgrade the version expectation in the parser or document the breaking schema change.
 3. If the bug is "reasoning tokens off by one", check the parts index ordering.

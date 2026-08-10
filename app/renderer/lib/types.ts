@@ -6,6 +6,10 @@
 
 export type Period = 'today' | 'week' | '30days' | 'month' | 'all' | 'lifetime'
 
+// Dashboard usage scope: this device only ('local') or the aggregate across
+// every paired device ('combined'). Mirrors the macOS menubar's Scope setting.
+export type Scope = 'local' | 'combined'
+
 export type DateRange = { from: string; to: string }
 
 export type CliErrorKind = 'not-found' | 'nonzero' | 'bad-json' | 'timeout' | 'too-large' | 'bad-args'
@@ -178,6 +182,20 @@ export type MenubarPayload = {
       calls: number
       date: string
     }>
+    // Workflow-intelligence rollups (src/menubar-json.ts buildWorkflow /
+    // buildTopReworkedFiles). Optional: older CLIs omit them, so the Overview
+    // workflow card renders only when they are present with real signal.
+    workflow?: {
+      corrections: number
+      correctionRate: number | null
+      medianTimeToFirstEditMs: number | null
+    }
+    // Files most reworked by edit-family calls, basename-only, ranked by
+    // distinct sessions then edits (src/menubar-json.ts buildTopReworkedFiles).
+    topReworkedFiles?: Array<{ path: string; sessions: number; edits: number }>
+    // Share (0-1) of cost-bearing calls that resolved a price. Below 1 means some
+    // usage priced against no table entry; null when not computable.
+    pricingCoverage?: number | null
     retryTax: {
       totalUSD: number
       retries: number
@@ -206,6 +224,37 @@ export type MenubarPayload = {
     skills: Array<{ name: string; turns: number; cost: number }>
     subagents: Array<{ name: string; calls: number; cost: number }>
     mcpServers: Array<{ name: string; calls: number }>
+    // Spend by referenced pull request (every PR, cost-descending), attributed at turn
+    // granularity. Optional: older CLIs omit it, and it is absent when no PR links
+    // were observed. Rows carry attributed cost/calls and ARE summable;
+    // `attributedCost + unattributedCost === distinctCost`. `approx` marks a row
+    // fed by the legacy whole-session even split (transcript expired). `models` is
+    // the short model names that processed the PR (cost-desc); `categories` is the
+    // per-task-category attributed cost (cost-desc), omitted for legacy rows.
+    // `attributedCost`/`unattributedCost` are optional so a payload from an older
+    // CLI (by-reference rows, not summable) still type-checks and can be detected.
+    pullRequests?: {
+      rows: Array<{
+        url: string
+        label: string
+        cost: number
+        savingsUSD: number
+        sessions: number
+        calls: number
+        firstStarted: string
+        lastEnded: string
+        approx?: boolean
+        models?: string[]
+        categories?: Array<{ name: string; cost: number }>
+      }>
+      distinctCost: number
+      distinctSessions: number
+      // Count of subagent (sidechain) runs folded into the PR-linked parent
+      // sessions. Optional (absent when none folded, or from an older producer).
+      subagentSessions?: number
+      attributedCost?: number
+      unattributedCost?: number
+    }
   }
   optimize: {
     findingCount: number
@@ -421,6 +470,10 @@ export type ActReportJson = {
 // ————— src/sessions-report.ts —————
 export type SessionRow = {
   sessionId: string
+  // Captured human title (src/sessions-report.ts). Empty string when the
+  // transcript produced none; optional so older CLIs that predate the field
+  // render unchanged (the row falls back to the project as its primary label).
+  title?: string
   project: string
   provider: string
   models: string[]
@@ -588,7 +641,9 @@ export interface CodeburnBridge {
   getQuota(force?: boolean): Promise<QuotaProvider[]>
   // `background` (prefetch only) requests background CLI-spawn priority; optional
   // so an older preload that ignores it degrades to interactive priority.
-  getOverview(period: Period, provider: string, range?: DateRange, configSource?: string | null, background?: boolean): Promise<MenubarPayload>
+  // `scope` selects local-device usage ('local', default) or paired-device
+  // aggregate ('combined'); optional so an older preload degrades to local.
+  getOverview(period: Period, provider: string, range?: DateRange, configSource?: string | null, background?: boolean, scope?: string): Promise<MenubarPayload>
   getPlans(period: Period): Promise<StatusJson>
   getActReport(): Promise<ActReportJson>
   readonly platform: string

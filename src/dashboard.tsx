@@ -1,15 +1,17 @@
 import { homedir } from 'os'
 
-import React, { useState, useCallback, useEffect, useRef } from 'react'
-import { render, Box, Text, useInput, useApp, useWindowSize } from 'ink'
+import React, { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
+import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, type DOMElement } from 'ink'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
-import { formatCost, formatTokens, markEstimated } from './format.js'
+import { formatCost, formatTokens, markEstimated, carriedCostNote } from './format.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
 import { parseAllSessions, filterProjectsByDateRange, filterProjectsByName, setInteractiveScanUI } from './parser.js'
-import { findUnpricedModels, loadPricing } from './models.js'
+import { findUnpricedModels, isExpectedFreeModel, loadPricing } from './models.js'
+import { aggregateModelTotals } from './model-breakdown.js'
 import { buildDurablePeriod } from './usage-aggregator.js'
 import { getAllProviders } from './providers/index.js'
 import { scanAndDetect, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
+import { aggregateFileChurn, buildCoachingNotes, computePricingCoverage, medianTimeToFirstEditMs, scanUserCorrections, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 import { estimateContextBudget, type ContextBudget } from './context-budget.js'
 import { dateKey } from './day-aggregator.js'
 import { CompareView } from './compare.js'
@@ -26,6 +28,15 @@ export type DailyActivityRow = {
   calls: number
 }
 
+export const DAILY_ACTIVITY_PAGE_SIZE = 10
+export const INTERACTIVE_RENDER_OPTIONS = { alternateScreen: true } as const
+
+export function getDailyActivityPageSize(columnCount: 1 | 2 | 3, projectRows: number, activityRows: number, dayMode = false): number {
+  if (dayMode) return 1
+  if (columnCount === 1) return DAILY_ACTIVITY_PAGE_SIZE
+  return Math.max(DAILY_ACTIVITY_PAGE_SIZE, projectRows, columnCount === 3 ? activityRows : 0)
+}
+
 export function pageHistoryCursor(cursor: number, direction: -1 | 1, pageSize: number, rowCount: number): number {
   const maxCursor = Math.max(0, rowCount - pageSize)
   return Math.max(0, Math.min(cursor + direction * pageSize, maxCursor))
@@ -34,6 +45,16 @@ export function pageHistoryCursor(cursor: number, direction: -1 | 1, pageSize: n
 export function scrollHistoryCursor(cursor: number, direction: -1 | 1, pageSize: number, rowCount: number): number {
   const maxCursor = Math.max(0, rowCount - pageSize)
   return Math.max(0, Math.min(cursor + direction, maxCursor))
+}
+
+// The Daily Activity panel's row count comes from a bounded live scan (see
+// getDashboardScanRange), which can undercount vs. the durable-cache-backed
+// Overview headline for the same period (expired session files aren't in the
+// live scan but are still in the durable cache). "days scanned" names that
+// population so the two counts read as different questions, not a
+// contradiction.
+export function dailyActivityFooter(cursor: number, days: number, rowCount: number): string {
+  return `Showing ${cursor + 1}–${Math.min(cursor + days, rowCount)} of ${rowCount} days scanned · newest first`
 }
 
 // Scrollable mode keeps the dashboard up when only the selected period is
@@ -46,6 +67,7 @@ export function showEmptyState(projectCount: number, scrollableHistory: boolean,
 }
 
 const MIN_WIDE = 90
+const MAX_DASHBOARD_WIDTH = 256
 const ORANGE = '#FF8C42'
 const DIM = '#555555'
 const GOLD = '#FFD700'
@@ -72,6 +94,7 @@ const PANEL_COLORS = {
   mcp: '#F55BE0',
   bash: '#F5A05B',
   skills: '#7B68EE',
+  workflow: '#B39DFF',
 }
 
 const PROVIDER_COLORS: Record<string, string> = {
@@ -82,6 +105,7 @@ const PROVIDER_COLORS: Record<string, string> = {
   opencode: '#A78BFA',
   pi: '#F472B6',
   kimi: '#B6E34A',
+  kimicode: '#A3E635',
   all: '#FF8C42',
 }
 
@@ -141,6 +165,11 @@ export type DurableOverview = {
   outputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
+  // Cost from days whose session logs have since expired, carried forward
+  // from the daily cache. Surfaced so the Overview headline can explain why
+  // its total may exceed what the (live-scan-bounded) Daily Activity panel
+  // below can show. See carriedCostNote in format.ts.
+  carriedCostUSD: number
 }
 
 async function computeDurableOverview(
@@ -152,7 +181,7 @@ async function computeDurableOverview(
   day: string | null,
 ): Promise<DurableOverview> {
   const range = day ? getDayRange(day) : customRange ?? getPeriodRange(period)
-  const { data } = await buildDurablePeriod(
+  const { data, carriedCostUSD } = await buildDurablePeriod(
     { range, label: PERIOD_LABELS[period] },
     { provider, project: projectFilter ?? [], exclude: excludeFilter ?? [] },
   )
@@ -165,6 +194,7 @@ async function computeDurableOverview(
     outputTokens: data.outputTokens,
     cacheReadTokens: data.cacheReadTokens,
     cacheWriteTokens: data.cacheWriteTokens,
+    carriedCostUSD,
   }
 }
 
@@ -194,16 +224,20 @@ function nextTick(): Promise<void> {
   return new Promise(resolve => setImmediate(resolve))
 }
 
-type Layout = { dashWidth: number; wide: boolean; halfWidth: number; barWidth: number }
+export type Layout = { dashWidth: number; columnCount: 1 | 2 | 3; panelWidth: number; barWidth: number }
 
-function getLayout(columns?: number): Layout {
+export function getLayout(columns?: number, maxContentWidth = MAX_DASHBOARD_WIDTH): Layout {
   const termWidth = columns || parseInt(process.env['COLUMNS'] ?? '') || 80
-  const dashWidth = Math.min(160, termWidth)
-  const wide = dashWidth >= MIN_WIDE
-  const halfWidth = wide ? Math.floor(dashWidth / 2) : dashWidth
-  const inner = halfWidth - 4
-  const barWidth = Math.max(6, Math.min(10, inner - 30))
-  return { dashWidth, wide, halfWidth, barWidth }
+  const dashWidth = Math.min(MAX_DASHBOARD_WIDTH, maxContentWidth, termWidth)
+  const columnCount = dashWidth >= 135 ? 3 : dashWidth >= MIN_WIDE ? 2 : 1
+  const panelWidth = Math.floor(dashWidth / columnCount)
+  const inner = panelWidth - 4
+  const barWidth = Math.max(6, Math.min(10, Math.floor(inner / 6)))
+  return { dashWidth, columnCount, panelWidth, barWidth }
+}
+
+export function getRefreshIntervalMs(seconds: number): number {
+  return seconds <= 0 ? 0 : Math.max(60, seconds) * 1000
 }
 
 function HBar({ value, max, width }: { value: number; max: number; width: number }) {
@@ -234,6 +268,55 @@ function Panel({ title, color, children, width }: { title: string; color: string
 
 function fit(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) : s.padEnd(n)
+}
+
+type MetricCell = { text: string; color?: string; dimColor?: boolean }
+
+function getMetricWidths(headers: string[], rows: string[][]): number[] {
+  return headers.map((header, index) => Math.max(header.length, ...rows.map(row => row[index]?.length ?? 0)))
+}
+
+function getMetricGroupWidth(metricWidths: number[]): number {
+  return metricWidths.reduce((sum, width) => sum + width, 0) + Math.max(0, metricWidths.length - 1)
+}
+
+function getDataRowLayout(panelWidth: number, requestedBarWidth: number, metricWidths: number[]) {
+  const innerWidth = panelWidth - PANEL_CHROME
+  const metricsWidth = getMetricGroupWidth(metricWidths)
+  const barWidth = Math.max(1, Math.min(requestedBarWidth, innerWidth - metricsWidth - 3))
+  const labelWidth = Math.max(1, innerWidth - barWidth - metricsWidth - 2)
+  return { innerWidth, barWidth, labelWidth }
+}
+
+function DataRow({ panelWidth, barWidth: requestedBarWidth, label, metrics, metricWidths, bar, labelColor, dimColor }: {
+  panelWidth: number
+  barWidth: number
+  label: string
+  metrics: MetricCell[]
+  metricWidths: number[]
+  bar?: { value: number; max: number }
+  labelColor?: string
+  dimColor?: boolean
+}) {
+  const { innerWidth, barWidth, labelWidth } = getDataRowLayout(panelWidth, requestedBarWidth, metricWidths)
+  const labelNode = <Text color={labelColor} dimColor={dimColor} wrap="truncate-end">{fit(label, labelWidth)}</Text>
+  const barNode = bar ? <HBar value={bar.value} max={bar.max} width={barWidth} /> : <Text>{' '.repeat(barWidth)}</Text>
+  return (
+    <Box width={innerWidth}>
+      {barNode}<Text> </Text>{labelNode}
+      <Text> </Text>
+      <Box>
+        {metrics.map((metric, index) => (
+          <React.Fragment key={index}>
+            {index > 0 && <Text> </Text>}
+            <Box width={metricWidths[index]} justifyContent="flex-end" flexShrink={0}>
+              <Text color={metric.color} dimColor={metric.dimColor} wrap="truncate-end">{metric.text}</Text>
+            </Box>
+          </React.Fragment>
+        ))}
+      </Box>
+    </Box>
+  )
 }
 
 function renderPlanBar(percentUsed: number, width: number): string {
@@ -313,6 +396,9 @@ function Overview({ projects, label, width, planUsages, durable }: { projects: P
           <Text dimColor> saved by local models</Text>
         </Text>
       )}
+      {durable && carriedCostNote(durable.carriedCostUSD) && (
+        <Text dimColor wrap="truncate-end">  {carriedCostNote(durable.carriedCostUSD)}</Text>
+      )}
       {activePlanUsages.length > 0 && (
         <>
           {activePlanUsages.map(planUsage => {
@@ -361,23 +447,30 @@ function DailyActivity({ projects, days = 14, pw, bw, scrollable = false, cursor
   const orderedRows = scrollable ? [...allRows].reverse() : allRows
   const rows = scrollable ? orderedRows.slice(cursor, cursor + days) : orderedRows.slice(-days)
   const maxCost = Math.max(0, ...(scrollable ? orderedRows : rows).map(row => row.cost))
+  const headers = ['cost', 'calls']
+  const values = rows.map(row => [formatCost(row.cost), String(row.calls)])
+  const metricWidths = getMetricWidths(headers, values)
 
   return (
     <Panel title="Daily Activity" color={PANEL_COLORS.daily} width={pw}>
       {loading
         ? <Text dimColor>Loading daily history...</Text>
         : <>
-            <Text dimColor wrap="truncate-end">{''.padEnd((scrollable ? 11 : 6) + bw)}{'cost'.padStart(8)}{'calls'.padStart(6)}</Text>
-            {rows.map(row => (
-              <Text key={row.day} wrap="truncate-end">
-                <Text dimColor>{scrollable ? row.day : row.day.slice(5)} </Text>
-                <HBar value={row.cost} max={maxCost} width={bw} />
-                <Text color={GOLD}>{formatCost(row.cost).padStart(8)}</Text>
-                <Text>{String(row.calls).padStart(6)}</Text>
-              </Text>
+            <DataRow panelWidth={pw} barWidth={bw} label="" dimColor metrics={headers.map(text => ({ text, dimColor: true }))} metricWidths={metricWidths} />
+            {rows.map((row, index) => (
+              <DataRow
+                key={row.day}
+                panelWidth={pw}
+                barWidth={bw}
+                label={scrollable ? row.day : row.day.slice(5)}
+                labelColor={DIM}
+                bar={{ value: row.cost, max: maxCost }}
+                metrics={[{ text: values[index]![0]!, color: GOLD }, { text: values[index]![1]! }]}
+                metricWidths={metricWidths}
+              />
             ))}
             {scrollable && orderedRows.length > 0 && (
-              <Text dimColor wrap="truncate-end">Showing {cursor + 1}–{Math.min(cursor + days, orderedRows.length)} of {orderedRows.length} · newest first</Text>
+              <Text dimColor wrap="truncate-end">{dailyActivityFooter(cursor, days, orderedRows.length)}</Text>
             )}
           </>}
     </Panel>
@@ -387,7 +480,14 @@ function DailyActivity({ projects, days = 14, pw, bw, scrollable = false, cursor
 const _home = homedir()
 const _homePrefix = _home.endsWith('/') ? _home : _home + '/'
 
-export function shortProject(absPath: string): string {
+function ellipsizeEnd(value: string, width: number): string {
+  if (value.length <= width) return value
+  if (width <= 0) return ''
+  if (width === 1) return '…'
+  return `${value.slice(0, width - 1)}…`
+}
+
+export function shortProject(absPath: string, width = Infinity): string {
   const normalized = absPath.replace(/\\/g, '/')
   let path: string
   if (normalized === _home) path = ''
@@ -397,68 +497,129 @@ export function shortProject(absPath: string): string {
   path = path.replace(/^private\/tmp\/[^/]+\/[^/]+\//, '').replace(/^private\/tmp\//, '').replace(/^tmp\//, '')
   if (!path) return 'home'
   const parts = path.split('/').filter(Boolean)
-  if (parts.length <= 3) return parts.join('/')
-  return parts.slice(-3).join('/')
+  const visible = parts.length <= 3 ? parts : parts.slice(-3)
+  const full = visible.join('/')
+  if (full.length <= width) return full
+
+  const title = visible.at(-1)!
+  const date = visible.slice(0, -1).find(part => /^\d{4}-\d{2}-\d{2}$/.test(part))
+  const folderElided = date ? `…/${date}/${title}` : `…/${title}`
+  if (folderElided.length <= width) return folderElided
+
+  const dateElided = date ? `…/…${date.slice(4)}/${title}` : folderElided
+  if (dateElided.length <= width) return dateElided
+
+  const prefix = date ? `…/…${date.slice(4)}/` : '…/'
+  if (width > prefix.length) return prefix + ellipsizeEnd(title, width - prefix.length)
+
+  const compactPrefix = '…/…/'
+  if (width > compactPrefix.length) return compactPrefix + ellipsizeEnd(title, width - compactPrefix.length)
+  return ellipsizeEnd(title, width)
 }
 
-const PROJECT_COL_AVG = 7
-const PROJECT_COL_BASE_WIDTH = 30
-const PROJECT_COL_WITH_OVERHEAD_WIDTH = 40
+export function getDashboardMaxWidth(projects: ProjectSummary[], budgets?: Map<string, ContextBudget>, activeProvider?: string): number {
+  const sessions = projects.flatMap(project => project.sessions)
+  const longest = (values: string[]) => Math.max(1, ...values.map(value => value.length))
+  const rowWidth = (labels: string[], metricCount: number, metricWidth = 7) =>
+    PANEL_CHROME + 10 + 1 + longest(labels) + metricCount * metricWidth
+  const modelTotals = aggregateModelTotals(projects)
+  const modelMetricWidth = Math.max(7, ...Object.values(modelTotals).map(model =>
+    markEstimated(formatCost(model.costUSD), model.estimatedCostUSD > 0).length
+  ))
+  const categoryLabels = sessions.flatMap(session => Object.keys(session.categoryBreakdown).map(category => CATEGORY_LABELS[category as TaskCategory] ?? category))
+  const skillLabels = sessions.flatMap(session => Object.keys(session.skillBreakdown))
+  const agentLabels = sessions.flatMap(session => Object.keys(session.subagentBreakdown))
+  const widestPanel = Math.max(
+    rowWidth(['2026-00-00'], 2),
+    rowWidth(projects.map(project => shortProject(project.projectPath)), budgets?.size ? 4 : 3, budgets?.size ? 9 : 7),
+    rowWidth(Object.keys(modelTotals), 5, modelMetricWidth),
+    rowWidth([...categoryLabels, ...skillLabels.map(skill => `  /${skill}`)], 3),
+    rowWidth(sessions.flatMap(session => Object.keys(session.mcpBreakdown)), 1),
+    rowWidth(sessions.flatMap(session => Object.keys(session.toolBreakdown).filter(tool => activeProvider === 'cursor' ? tool.startsWith('lang:') : !tool.startsWith('lang:'))), 1),
+    rowWidth(sessions.flatMap(session => Object.keys(session.bashBreakdown)), 1),
+    rowWidth([...skillLabels, ...agentLabels], 2),
+  )
+  return Math.min(MAX_DASHBOARD_WIDTH, Math.max(135, widestPanel * 3))
+}
+
+function getProjectBreakdownRowLimit(period: Period, dayMode = false): number {
+  return dayMode ? 8 : period === 'all' || period === 'lifetime' || period === 'month' || period === '30days' ? 14 : 8
+}
 
 function ProjectBreakdown({ projects, pw, bw, budgets, rows = 14 }: { projects: ProjectSummary[]; pw: number; bw: number; budgets?: Map<string, ContextBudget>; rows?: number }) {
   const maxCost = Math.max(...projects.map(p => p.totalCostUSD))
   const hasBudgets = budgets && budgets.size > 0
-  const nw = Math.max(8, pw - bw - (hasBudgets ? PROJECT_COL_WITH_OVERHEAD_WIDTH : PROJECT_COL_BASE_WIDTH))
+  const headers = ['cost', 'avg/s', 'session', ...(hasBudgets ? ['overhead'] : [])]
+  const visibleProjects = projects.slice(0, rows)
+  const values = visibleProjects.map(project => {
+    const budget = budgets?.get(project.project)
+    return [
+      formatCost(project.totalCostUSD),
+      project.sessions.length > 0 ? formatCost(project.totalCostUSD / project.sessions.length) : '-',
+      String(project.sessions.length),
+      ...(hasBudgets ? [budget ? formatTokens(budget.total) : '-'] : []),
+    ]
+  })
+  const metricWidths = getMetricWidths(headers, values)
+  const desiredLabelWidth = 8
+  const projectBarWidth = Math.max(1, Math.min(bw, pw - PANEL_CHROME - getMetricGroupWidth(metricWidths) - 2 - desiredLabelWidth))
+  const { labelWidth } = getDataRowLayout(pw, projectBarWidth, metricWidths)
   return (
     <Panel title="By Project" color={PANEL_COLORS.project} width={pw}>
-      <Text dimColor wrap="truncate-end">
-        {''.padEnd(bw + 1 + nw)}{'cost'.padStart(8)}{'avg/s'.padStart(PROJECT_COL_AVG)}{'sess'.padStart(6)}{hasBudgets ? 'overhead'.padStart(10) : ''}
-      </Text>
-      {projects.slice(0, rows).map((project, i) => {
-        const budget = budgets?.get(project.project)
-        const avgCost = project.sessions.length > 0
-          ? formatCost(project.totalCostUSD / project.sessions.length)
-          : '-'
+      <DataRow panelWidth={pw} barWidth={projectBarWidth} label="" metrics={headers.map(text => ({ text, dimColor: true }))} metricWidths={metricWidths} />
+      {visibleProjects.map((project, i) => {
+        const row = values[i]!
         return (
-          <Text key={`${project.project}-${i}`} wrap="truncate-end">
-            <HBar value={project.totalCostUSD} max={maxCost} width={bw} />
-            <Text dimColor> {fit(shortProject(project.projectPath), nw)}</Text>
-            <Text color={GOLD}>{formatCost(project.totalCostUSD).padStart(8)}</Text>
-            <Text color={GOLD}>{avgCost.padStart(PROJECT_COL_AVG)}</Text>
-            <Text>{String(project.sessions.length).padStart(6)}</Text>
-            {hasBudgets && <Text color="#7B9EF5">{(budget ? formatTokens(budget.total) : '-').padStart(10)}</Text>}
-          </Text>
+          <DataRow
+            key={`${project.project}-${i}`}
+            panelWidth={pw}
+            barWidth={projectBarWidth}
+            label={shortProject(project.projectPath, labelWidth)}
+            labelColor={DIM}
+            bar={{ value: project.totalCostUSD, max: maxCost }}
+            metrics={[
+              { text: row[0]!, color: GOLD },
+              { text: row[1]!, color: GOLD },
+              { text: row[2]! },
+              ...(hasBudgets ? [{ text: row[3]!, color: '#7B9EF5' }] : []),
+            ]}
+            metricWidths={metricWidths}
+          />
         )
       })}
     </Panel>
   )
 }
 
-const MODEL_COL_COST = 8
-const MODEL_COL_CACHE = 7
-const MODEL_COL_CALLS = 7
-const MODEL_COL_ONESHOT = 7
-const MODEL_NAME_WIDTH = 14
 const MIN_EDIT_TURNS_FOR_RATE = 5
 
 function ModelBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: number; bw: number }) {
-  const modelTotals: Record<string, { calls: number; costUSD: number; estimatedCostUSD: number; freshInput: number; cacheRead: number; cacheWrite: number }> = {}
+  // Keyed by friendly display name so mixed-vintage cache keys that resolve to
+  // the same model merge into one row (see aggregateModelTotals).
+  const modelTotals = aggregateModelTotals(projects)
   const modelEfficiency = aggregateModelEfficiency(projects)
-  for (const project of projects) {
-    for (const session of project.sessions) {
-      for (const [model, data] of Object.entries(session.modelBreakdown)) {
-        if (!modelTotals[model]) modelTotals[model] = { calls: 0, costUSD: 0, estimatedCostUSD: 0, freshInput: 0, cacheRead: 0, cacheWrite: 0 }
-        modelTotals[model].calls += data.calls
-        modelTotals[model].costUSD += data.costUSD
-        modelTotals[model].estimatedCostUSD += data.estimatedCostUSD ?? 0
-        modelTotals[model].freshInput += data.tokens.inputTokens
-        modelTotals[model].cacheRead += data.tokens.cacheReadInputTokens
-        modelTotals[model].cacheWrite += data.tokens.cacheCreationInputTokens
-      }
-    }
-  }
   const anyEstimated = Object.values(modelTotals).some(d => d.estimatedCostUSD > 0)
   const sorted = Object.entries(modelTotals).sort(([, a], [, b]) => b.costUSD - a.costUSD)
+  const costLabels = sorted.map(([, data]) => markEstimated(formatCost(data.costUSD), data.estimatedCostUSD > 0))
+  const headers = ['cost', 'cache', 'calls', '1-shot', 'Tok/s']
+  const values = sorted.map(([model, data], index) => {
+    const totalInput = data.freshInput + data.cacheRead + data.cacheWrite
+    const efficiency = modelEfficiency.get(model)
+    return [
+      costLabels[index]!,
+      totalInput > 0 ? `${((data.cacheRead / totalInput) * 100).toFixed(1)}%` : '-',
+      String(data.calls),
+      efficiency && efficiency.editTurns >= MIN_EDIT_TURNS_FOR_RATE && efficiency.oneShotRate !== null
+        ? `${efficiency.oneShotRate.toFixed(1)}%`
+        : '-',
+      data.activeDurationMs > 0 && data.activeGeneratedTokens > 0
+        ? (data.activeGeneratedTokens / (data.activeDurationMs / 1000)).toFixed(1)
+        : '-',
+    ]
+  })
+  const metricWidths = getMetricWidths(headers, values)
+  const desiredLabelWidth = 5
+  const modelBarWidth = Math.max(1, Math.min(bw, pw - PANEL_CHROME - getMetricGroupWidth(metricWidths) - 2 - desiredLabelWidth))
   const maxCost = sorted[0]?.[1]?.costUSD ?? 0
   const unpriced = findUnpricedModels(Object.entries(modelTotals).map(([model, d]) => ({
     model,
@@ -469,24 +630,25 @@ function ModelBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: 
 
   return (
     <Panel title="By Model" color={PANEL_COLORS.model} width={pw}>
-      <Text dimColor wrap="truncate-end">{''.padEnd(bw + 1 + MODEL_NAME_WIDTH)}{'cost'.padStart(MODEL_COL_COST)}{'cache'.padStart(MODEL_COL_CACHE)}{'calls'.padStart(MODEL_COL_CALLS)}{'1-shot'.padStart(MODEL_COL_ONESHOT)}</Text>
+      <DataRow panelWidth={pw} barWidth={modelBarWidth} label="" metrics={headers.map(text => ({ text, dimColor: true }))} metricWidths={metricWidths} />
       {sorted.map(([model, data], i) => {
-        const totalInput = data.freshInput + data.cacheRead + data.cacheWrite
-        const cacheHit = totalInput > 0 ? (data.cacheRead / totalInput) * 100 : 0
-        const cacheLabel = totalInput > 0 ? `${cacheHit.toFixed(1)}%` : '-'
-        const efficiency = modelEfficiency.get(model)
-        const oneShotLabel = efficiency && efficiency.editTurns >= MIN_EDIT_TURNS_FOR_RATE && efficiency.oneShotRate !== null
-          ? `${efficiency.oneShotRate.toFixed(1)}%`
-          : '-'
+        const row = values[i]!
         return (
-          <Text key={`${model}-${i}`} wrap="truncate-end">
-            <HBar value={data.costUSD} max={maxCost} width={bw} />
-            <Text> {fit(model, MODEL_NAME_WIDTH)}</Text>
-            <Text color={GOLD}>{markEstimated(formatCost(data.costUSD), data.estimatedCostUSD > 0).padStart(MODEL_COL_COST)}</Text>
-            <Text>{cacheLabel.padStart(MODEL_COL_CACHE)}</Text>
-            <Text>{String(data.calls).padStart(MODEL_COL_CALLS)}</Text>
-            <Text>{oneShotLabel.padStart(MODEL_COL_ONESHOT)}</Text>
-          </Text>
+          <DataRow
+            key={`${model}-${i}`}
+            panelWidth={pw}
+            barWidth={modelBarWidth}
+            label={model}
+            bar={{ value: data.costUSD, max: maxCost }}
+            metrics={[
+              { text: row[0]!, color: GOLD },
+              { text: row[1]! },
+              { text: row[2]! },
+              { text: row[3]! },
+              { text: row[4]! },
+            ]}
+            metricWidths={metricWidths}
+          />
         )
       })}
       {unpriced.length > 0 && (
@@ -497,13 +659,14 @@ function ModelBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: 
       {anyEstimated && (
         <Text dimColor wrap="truncate-end">~ estimated cost (priced from estimated tokens)</Text>
       )}
+      <Text dimColor wrap="truncate-end">~ Tok/s: generated tokens / active time; tool wait excluded</Text>
     </Panel>
   )
 }
 
 const SKILL_SUB_ROWS_LIMIT = 5
 
-function ActivityBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: number; bw: number }) {
+function aggregateActivityBreakdown(projects: ProjectSummary[]) {
   const categoryTotals: Record<string, { turns: number; costUSD: number; editTurns: number; oneShotTurns: number }> = {}
   const skillTotals: Record<string, { turns: number; costUSD: number; editTurns: number; oneShotTurns: number }> = {}
   for (const project of projects) {
@@ -526,32 +689,58 @@ function ActivityBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; p
   }
   const sorted = Object.entries(categoryTotals).sort(([, a], [, b]) => b.costUSD - a.costUSD)
   const sortedSkills = Object.entries(skillTotals).sort(([, a], [, b]) => b.costUSD - a.costUSD).slice(0, SKILL_SUB_ROWS_LIMIT)
+  return { sorted, sortedSkills }
+}
+
+function getActivityBreakdownRowCount(projects: ProjectSummary[]): number {
+  const { sorted, sortedSkills } = aggregateActivityBreakdown(projects)
+  return sorted.length + (sorted.some(([category]) => category === 'general') ? sortedSkills.length : 0)
+}
+
+function ActivityBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: number; bw: number }) {
+  const { sorted, sortedSkills } = aggregateActivityBreakdown(projects)
   const maxCost = sorted[0]?.[1]?.costUSD ?? 0
+  const headers = ['cost', 'turns', '1-shot']
+  const values = [
+    ...sorted.map(([, data]) => [formatCost(data.costUSD), String(data.turns), data.editTurns > 0 ? `${Math.round((data.oneShotTurns / data.editTurns) * 100)}%` : '-']),
+    ...sortedSkills.map(([, data]) => [formatCost(data.costUSD), String(data.turns), data.editTurns > 0 ? `${Math.round((data.oneShotTurns / data.editTurns) * 100)}%` : '-']),
+  ]
+  const metricWidths = getMetricWidths(headers, values)
   return (
     <Panel title="By Activity" color={PANEL_COLORS.activity} width={pw}>
-      <Text dimColor wrap="truncate-end">{''.padEnd(bw + 14)}{'cost'.padStart(8)}{'turns'.padStart(6)}{'1-shot'.padStart(7)}</Text>
+      <DataRow panelWidth={pw} barWidth={bw} label="" metrics={headers.map(text => ({ text, dimColor: true }))} metricWidths={metricWidths} />
       {sorted.flatMap(([cat, data]) => {
         const oneShotPct = data.editTurns > 0 ? Math.round((data.oneShotTurns / data.editTurns) * 100) + '%' : '-'
-        const rows = [
-          <Text key={cat} wrap="truncate-end">
-            <HBar value={data.costUSD} max={maxCost} width={bw} />
-            <Text color={CATEGORY_COLORS[cat as TaskCategory] ?? '#666666'}> {fit(CATEGORY_LABELS[cat as TaskCategory] ?? cat, 13)}</Text>
-            <Text color={GOLD}>{formatCost(data.costUSD).padStart(8)}</Text>
-            <Text>{String(data.turns).padStart(6)}</Text>
-            <Text color={data.editTurns === 0 ? DIM : oneShotPct === '100%' ? '#5BF58C' : ORANGE}>{String(oneShotPct).padStart(7)}</Text>
-          </Text>,
+        const rows: React.ReactNode[] = [
+          <DataRow
+            key={cat}
+            panelWidth={pw}
+            barWidth={bw}
+            label={CATEGORY_LABELS[cat as TaskCategory] ?? cat}
+            labelColor={CATEGORY_COLORS[cat as TaskCategory] ?? '#666666'}
+            bar={{ value: data.costUSD, max: maxCost }}
+            metrics={[
+              { text: formatCost(data.costUSD), color: GOLD },
+              { text: String(data.turns) },
+              { text: oneShotPct, color: data.editTurns === 0 ? DIM : oneShotPct === '100%' ? '#5BF58C' : ORANGE },
+            ]}
+            metricWidths={metricWidths}
+          />,
         ]
         if (cat === 'general' && sortedSkills.length > 0) {
           for (const [skill, sd] of sortedSkills) {
             const subPct = sd.editTurns > 0 ? Math.round((sd.oneShotTurns / sd.editTurns) * 100) + '%' : '-'
             rows.push(
-              <Text key={`${cat}:${skill}`} wrap="truncate-end" dimColor>
-                <HBar value={sd.costUSD} max={maxCost} width={bw} />
-                <Text> {fit(`  /${skill}`, 13)}</Text>
-                <Text>{formatCost(sd.costUSD).padStart(8)}</Text>
-                <Text>{String(sd.turns).padStart(6)}</Text>
-                <Text>{String(subPct).padStart(7)}</Text>
-              </Text>,
+              <DataRow
+                key={`${cat}:${skill}`}
+                panelWidth={pw}
+                barWidth={bw}
+                label={`  /${skill}`}
+                dimColor
+                bar={{ value: sd.costUSD, max: maxCost }}
+                metrics={[{ text: formatCost(sd.costUSD), dimColor: true }, { text: String(sd.turns), dimColor: true }, { text: subPct, dimColor: true }]}
+                metricWidths={metricWidths}
+              />,
             )
           }
         }
@@ -573,19 +762,15 @@ function ToolBreakdown({ projects, pw, bw, title, filterPrefix }: { projects: Pr
   }
   const sorted = Object.entries(toolTotals).sort(([, a], [, b]) => b - a)
   const maxCalls = sorted[0]?.[1] ?? 0
-  const nw = Math.max(6, pw - bw - 15)
+  const metricWidths = getMetricWidths(['calls'], sorted.map(([, calls]) => [String(calls)]))
   return (
     <Panel title={title ?? 'Core Tools'} color={PANEL_COLORS.tools} width={pw}>
-      <Text dimColor wrap="truncate-end">{''.padEnd(bw + 1 + nw)}{'calls'.padStart(7)}</Text>
+      <DataRow panelWidth={pw} barWidth={bw} label="" metrics={[{ text: 'calls', dimColor: true }]} metricWidths={metricWidths} />
       {sorted.slice(0, 10).map(([tool, calls]) => {
         const raw = filterPrefix ? tool.slice(filterPrefix.length) : tool
         const display = filterPrefix ? (LANG_DISPLAY_NAMES[raw] ?? raw) : raw
         return (
-          <Text key={tool} wrap="truncate-end">
-            <HBar value={calls} max={maxCalls} width={bw} />
-            <Text> {fit(display, nw)}</Text>
-            <Text>{String(calls).padStart(7)}</Text>
-          </Text>
+          <DataRow key={tool} panelWidth={pw} barWidth={bw} label={display} bar={{ value: calls, max: maxCalls }} metrics={[{ text: String(calls) }]} metricWidths={metricWidths} />
         )
       })}
     </Panel>
@@ -599,12 +784,12 @@ function McpBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: nu
   const sorted = Object.entries(mcpTotals).sort(([, a], [, b]) => b - a)
   if (sorted.length === 0) return <Panel title="MCP Servers" color={PANEL_COLORS.mcp} width={pw}><Text dimColor>No MCP usage</Text></Panel>
   const maxCalls = sorted[0]?.[1] ?? 0
-  const nw = Math.max(6, pw - bw - 15)
+  const metricWidths = getMetricWidths(['calls'], sorted.map(([, calls]) => [String(calls)]))
   return (
     <Panel title="MCP Servers" color={PANEL_COLORS.mcp} width={pw}>
-      <Text dimColor wrap="truncate-end">{''.padEnd(bw + 1 + nw)}{'calls'.padStart(6)}</Text>
+      <DataRow panelWidth={pw} barWidth={bw} label="" metrics={[{ text: 'calls', dimColor: true }]} metricWidths={metricWidths} />
       {sorted.slice(0, 8).map(([server, calls]) => (
-        <Text key={server} wrap="truncate-end"><HBar value={calls} max={maxCalls} width={bw} /><Text> {fit(server, nw)}</Text><Text>{String(calls).padStart(6)}</Text></Text>
+        <DataRow key={server} panelWidth={pw} barWidth={bw} label={server} bar={{ value: calls, max: maxCalls }} metrics={[{ text: String(calls) }]} metricWidths={metricWidths} />
       ))}
     </Panel>
   )
@@ -616,12 +801,12 @@ function BashBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: n
   const sorted = Object.entries(bashTotals).sort(([, a], [, b]) => b - a)
   if (sorted.length === 0) return <Panel title="Shell Commands" color={PANEL_COLORS.bash} width={pw}><Text dimColor>No shell commands</Text></Panel>
   const maxCalls = sorted[0]?.[1] ?? 0
-  const nw = Math.max(6, pw - bw - 15)
+  const metricWidths = getMetricWidths(['calls'], sorted.map(([, calls]) => [String(calls)]))
   return (
     <Panel title="Shell Commands" color={PANEL_COLORS.bash} width={pw}>
-      <Text dimColor wrap="truncate-end">{''.padEnd(bw + 1 + nw)}{'calls'.padStart(7)}</Text>
+      <DataRow panelWidth={pw} barWidth={bw} label="" metrics={[{ text: 'calls', dimColor: true }]} metricWidths={metricWidths} />
       {sorted.slice(0, 10).map(([cmd, calls]) => (
-        <Text key={cmd} wrap="truncate-end"><HBar value={calls} max={maxCalls} width={bw} /><Text> {fit(cmd, nw)}</Text><Text>{String(calls).padStart(7)}</Text></Text>
+        <DataRow key={cmd} panelWidth={pw} barWidth={bw} label={cmd} bar={{ value: calls, max: maxCalls }} metrics={[{ text: String(calls) }]} metricWidths={metricWidths} />
       ))}
     </Panel>
   )
@@ -636,12 +821,13 @@ function SkillsAndAgents({ projects, pw, bw }: { projects: ProjectSummary[]; pw:
   const sorted = Object.entries(merged).sort(([, a], [, b]) => b.cost - a.cost)
   if (sorted.length === 0) return <Panel title="Skills & Agents" color={PANEL_COLORS.skills} width={pw}><Text dimColor>No skill/agent usage</Text></Panel>
   const maxCost = sorted[0]?.[1]?.cost ?? 0
-  const nw = Math.max(6, pw - bw - 22)
+  const headers = ['uses', 'cost']
+  const metricWidths = getMetricWidths(headers, sorted.map(([, data]) => [String(data.uses), formatCost(data.cost)]))
   return (
     <Panel title="Skills & Agents" color={PANEL_COLORS.skills} width={pw}>
-      <Text dimColor wrap="truncate-end">{''.padEnd(bw + 1 + nw)}{'uses'.padStart(6)}{'cost'.padStart(8)}</Text>
+      <DataRow panelWidth={pw} barWidth={bw} label="" metrics={headers.map(text => ({ text, dimColor: true }))} metricWidths={metricWidths} />
       {sorted.slice(0, 10).map(([name, d]) => (
-        <Text key={name} wrap="truncate-end"><HBar value={d.cost} max={maxCost} width={bw} /><Text> {fit(name, nw)}</Text><Text>{String(d.uses).padStart(6)}</Text><Text color={GOLD}>{formatCost(d.cost).padStart(8)}</Text></Text>
+        <DataRow key={name} panelWidth={pw} barWidth={bw} label={name} bar={{ value: d.cost, max: maxCost }} metrics={[{ text: String(d.uses) }, { text: formatCost(d.cost), color: GOLD }]} metricWidths={metricWidths} />
       ))}
     </Panel>
   )
@@ -660,12 +846,151 @@ function ClaudeAgentTypes({ projects, pw, bw }: { projects: ProjectSummary[]; pw
   const sorted = Object.entries(merged).sort(([, a], [, b]) => b.cost - a.cost)
   if (sorted.length === 0) return null
   const maxCost = sorted[0]?.[1]?.cost ?? 0
-  const nw = Math.max(6, pw - bw - 22)
+  const headers = ['calls', 'cost']
+  const metricWidths = getMetricWidths(headers, sorted.map(([, data]) => [String(data.uses), formatCost(data.cost)]))
   return (
     <Panel title="Claude Agent Types" color={PANEL_COLORS.skills} width={pw}>
-      <Text dimColor wrap="truncate-end">{''.padEnd(bw + 1 + nw)}{'calls'.padStart(6)}{'cost'.padStart(8)}</Text>
+      <DataRow panelWidth={pw} barWidth={bw} label="" metrics={headers.map(text => ({ text, dimColor: true }))} metricWidths={metricWidths} />
       {sorted.slice(0, 10).map(([name, d]) => (
-        <Text key={name} wrap="truncate-end"><HBar value={d.cost} max={maxCost} width={bw} /><Text> {fit(name, nw)}</Text><Text>{String(d.uses).padStart(6)}</Text><Text color={GOLD}>{formatCost(d.cost).padStart(8)}</Text></Text>
+        <DataRow key={name} panelWidth={pw} barWidth={bw} label={name} bar={{ value: d.cost, max: maxCost }} metrics={[{ text: String(d.uses) }, { text: formatCost(d.cost), color: GOLD }]} metricWidths={metricWidths} />
+      ))}
+    </Panel>
+  )
+}
+
+/// Workflow-intelligence figures for the compact Workflow panel. Derived from
+/// the already-parsed projects the other panels render (no re-parse), mirroring
+/// the same helpers `optimize` and the report use so the numbers agree.
+export type WorkflowPanelData = {
+  correctionRate: number | null
+  corrections: number
+  userTurns: number
+  medianTimeToFirstEditMs: number | null
+  topReworkedFile: ReworkedFile | null
+  /// Share (0-1) of cost-bearing calls that resolved a price, or null when there
+  /// is nothing to price. Null omits the Coverage row entirely (never renders a
+  /// hollow 100%).
+  coverage: number | null
+}
+
+/// Pricing coverage over the shown projects, replicating usage-aggregator's
+/// cost-bearing/unpriced tally so the dashboard figure matches the report.
+/// Returns null when there are no cost-bearing calls (nothing to price).
+function workflowCoverage(projects: ProjectSummary[]): number | null {
+  const totals: Record<string, { calls: number; cost: number; tokens: number }> = {}
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      for (const [model, d] of Object.entries(session.modelBreakdown)) {
+        const t = totals[model] ?? { calls: 0, cost: 0, tokens: 0 }
+        t.calls += d.calls
+        t.cost += d.costUSD
+        t.tokens += d.tokens.inputTokens + d.tokens.cacheReadInputTokens + d.tokens.cacheCreationInputTokens
+        totals[model] = t
+      }
+    }
+  }
+  const costBearing = Object.entries(totals).reduce((s, [model, d]) => s + (model === '<synthetic>' || isExpectedFreeModel(model) ? 0 : d.calls), 0)
+  if (costBearing <= 0) return null
+  const unpricedCalls = findUnpricedModels(Object.entries(totals).map(([model, d]) => ({ model, calls: d.calls, cost: d.cost, tokens: d.tokens }))).reduce((s, m) => s + m.calls, 0)
+  return computePricingCoverage(costBearing, unpricedCalls)
+}
+
+export function computeWorkflowPanelData(projects: ProjectSummary[]): WorkflowPanelData {
+  const corrections = scanUserCorrections(projects)
+  const churn = aggregateFileChurn(projects)
+  return {
+    correctionRate: corrections.correctionRate,
+    corrections: corrections.corrections,
+    userTurns: corrections.userTurns,
+    medianTimeToFirstEditMs: medianTimeToFirstEditMs(projects),
+    topReworkedFile: churn[0] ?? null,
+    coverage: workflowCoverage(projects),
+  }
+}
+
+/// True when there is any workflow signal to show. Hidden otherwise: a brand-new
+/// user with no user prompts and no file churn gets no empty panel.
+export function hasWorkflowData(data: WorkflowPanelData): boolean {
+  return data.userTurns > 0 || data.topReworkedFile != null
+}
+
+function formatCorrectionsValue(rate: number | null, count: number): string {
+  if (rate == null) return '-'
+  return `${Math.round(rate * 100)}% (${count})`
+}
+
+// median time to first edit: seconds under a minute, whole minutes above.
+function formatFirstEditValue(ms: number | null): string {
+  if (ms == null) return '-'
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`
+  return `${Math.round(ms / 60_000)}m`
+}
+
+function reworkBasename(path: string): string {
+  const parts = path.replace(/[\\/]+$/, '').split(/[\\/]/)
+  return parts[parts.length - 1] || path
+}
+
+function formatReworkValue(file: ReworkedFile | null): string {
+  if (!file) return '-'
+  return `${reworkBasename(file.path)} ×${file.sessions}`
+}
+
+function formatCoverageValue(coverage: number): string {
+  // Floor, never round: 99.6% coverage with unpriced calls outstanding must
+  // not render as the "100%" the panel reserves for genuinely complete
+  // pricing (observed live: 107 unpriced calls rendering as 100% while the
+  // model panel warned about them on the same screen).
+  return `${Math.floor(coverage * 100)}%`
+}
+
+export type WorkflowRow = { label: string; value: string }
+
+/// The Workflow panel's four label/value rows. Coverage is dropped when null so
+/// the panel never shows a placeholder 100%.
+export function buildWorkflowRows(data: WorkflowPanelData): WorkflowRow[] {
+  const rows: WorkflowRow[] = [
+    { label: 'Corrections', value: formatCorrectionsValue(data.correctionRate, data.corrections) },
+    { label: 'First edit', value: formatFirstEditValue(data.medianTimeToFirstEditMs) },
+    { label: 'Rework', value: formatReworkValue(data.topReworkedFile) },
+  ]
+  if (data.coverage != null) rows.push({ label: 'Coverage', value: formatCoverageValue(data.coverage) })
+  return rows
+}
+
+/// Coaching notes for the footer, over the same inputs as the report's workflow
+/// section. Empty when no signal crosses a threshold.
+export function computeCoachingNotes(projects: ProjectSummary[]): string[] {
+  const corrections = scanUserCorrections(projects)
+  const churn = aggregateFileChurn(projects)
+  return buildCoachingNotes({
+    worstOneShot: worstOneShotCategory(projects),
+    corrections: corrections.corrections,
+    correctionRate: corrections.correctionRate,
+    topReworkedFile: churn[0] ?? null,
+    medianTimeToFirstEditMs: medianTimeToFirstEditMs(projects),
+  })
+}
+
+/// Picks the note to show for a rotation tick. Null when there are no notes.
+export function selectRotatingNote(notes: string[], tick: number): string | null {
+  if (notes.length === 0) return null
+  return notes[((tick % notes.length) + notes.length) % notes.length] ?? null
+}
+
+const WORKFLOW_LABEL_WIDTH = 12
+
+function WorkflowInsights({ projects, pw }: { projects: ProjectSummary[]; pw: number }) {
+  const data = useMemo(() => computeWorkflowPanelData(projects), [projects])
+  if (!hasWorkflowData(data)) return null
+  const rows = buildWorkflowRows(data)
+  return (
+    <Panel title="Workflow" color={PANEL_COLORS.workflow} width={pw}>
+      {rows.map(row => (
+        <Text key={row.label} wrap="truncate-end">
+          <Text dimColor>{row.label.padEnd(WORKFLOW_LABEL_WIDTH)}</Text>
+          <Text>{row.value}</Text>
+        </Text>
       ))}
     </Panel>
   )
@@ -680,6 +1005,7 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   opencode: 'OpenCode',
   pi: 'Pi',
   kimi: 'Kimi',
+  kimicode: 'Kimi Code',
 }
 function getProviderDisplayName(name: string): string { return PROVIDER_DISPLAY_NAMES[name] ?? name }
 
@@ -835,28 +1161,25 @@ function StatusBar({ width, showProvider, view, findingCount, optimizeAvailable,
         )}
         {!isOptimize && !customRange && !dayMode && view === 'dashboard' && (
           <>
-            <Text dimColor>   </Text><Text color={PANEL_COLORS.daily} bold>↑</Text><Text dimColor>/</Text><Text color={PANEL_COLORS.daily} bold>↓</Text><Text dimColor> daily   </Text>
-            <Text color={PANEL_COLORS.daily} bold>PgUp</Text><Text dimColor>/</Text><Text color={PANEL_COLORS.daily} bold>PgDn</Text><Text dimColor> page</Text>
+            <Text dimColor>   </Text><Text color={PANEL_COLORS.daily} bold>j</Text><Text dimColor>/</Text><Text color={PANEL_COLORS.daily} bold>k</Text><Text dimColor> daily   </Text>
+            <Text color={PANEL_COLORS.daily} bold>Space</Text><Text dimColor> daily page</Text>
           </>
         )}
         {showProvider && (<><Text dimColor>   </Text><Text color={ORANGE} bold>p</Text><Text dimColor> provider</Text></>)}
+        <Text dimColor>   </Text><Text color={ORANGE} bold>↑</Text><Text dimColor>/</Text><Text color={ORANGE} bold>↓</Text><Text dimColor> scroll   </Text>
+        <Text color={ORANGE} bold>PgUp</Text><Text dimColor>/</Text><Text color={ORANGE} bold>PgDn</Text><Text dimColor> page</Text>
       </Text>
     </Box>
   )
 }
 
-function Row({ wide, width, children }: { wide: boolean; width: number; children: React.ReactNode }) {
-  if (wide) return <Box width={width}>{children}</Box>
-  return <>{children}</>
-}
-
-function DashboardContent({ projects, period, columns, activeProvider, budgets, planUsages, label, dayMode, dailyHistoryProjects, scrollableDailyHistory = false, dailyHistoryCursor = 0, dailyHistoryLoading = false, durable }: { projects: ProjectSummary[]; period: Period; columns?: number; activeProvider?: string; budgets?: Map<string, ContextBudget>; planUsages?: PlanUsage[]; label?: string; dayMode?: boolean; dailyHistoryProjects?: ProjectSummary[]; scrollableDailyHistory?: boolean; dailyHistoryCursor?: number; dailyHistoryLoading?: boolean; durable?: DurableOverview }) {
-  const { dashWidth, wide, halfWidth, barWidth } = getLayout(columns)
+function DashboardContent({ projects, period, columns, maxContentWidth, activeProvider, budgets, planUsages, label, dayMode, dailyHistoryProjects, dailyHistoryPageSize, scrollableDailyHistory = false, dailyHistoryCursor = 0, dailyHistoryLoading = false, durable }: { projects: ProjectSummary[]; period: Period; columns?: number; maxContentWidth: number; activeProvider?: string; budgets?: Map<string, ContextBudget>; planUsages?: PlanUsage[]; label?: string; dayMode?: boolean; dailyHistoryProjects?: ProjectSummary[]; dailyHistoryPageSize?: number; scrollableDailyHistory?: boolean; dailyHistoryCursor?: number; dailyHistoryLoading?: boolean; durable?: DurableOverview }) {
+  const { dashWidth, columnCount, panelWidth, barWidth } = getLayout(columns, maxContentWidth)
   const isCursor = activeProvider === 'cursor'
   const activeLabel = label ?? PERIOD_LABELS[period]
   if (showEmptyState(projects.length, scrollableDailyHistory, (dailyHistoryProjects ?? []).length, dailyHistoryLoading)) return <Panel title="CodeBurn" color={ORANGE} width={dashWidth}><Text dimColor>No usage data found for {activeLabel}.</Text></Panel>
-  const pw = wide ? halfWidth : dashWidth
-  const days = dayMode ? 1 : (period === 'month' || period === '30days' ? 31 : 14)
+  const projectRows = Math.min(projects.length, getProjectBreakdownRowLimit(period, dayMode))
+  const days = dailyHistoryPageSize ?? getDailyActivityPageSize(columnCount, projectRows, getActivityBreakdownRowCount(projects), dayMode)
   // A provider-scoped plan (e.g. SuperGrok) only makes sense on its own
   // provider tab, where the shown cost matches the plan's spend. Hide it on
   // every other tab, including All, so its budget isn't compared to spend it
@@ -865,18 +1188,97 @@ function DashboardContent({ projects, period, columns, activeProvider, budgets, 
   return (
     <Box flexDirection="column" width={dashWidth}>
       <Overview projects={projects} label={activeLabel} width={dashWidth} planUsages={visiblePlanUsages} durable={durable} />
-      <Row wide={wide} width={dashWidth}><DailyActivity projects={scrollableDailyHistory ? (dailyHistoryProjects ?? []) : projects} days={days} pw={pw} bw={barWidth} scrollable={scrollableDailyHistory} cursor={dailyHistoryCursor} loading={dailyHistoryLoading} /><ProjectBreakdown projects={projects} pw={pw} bw={barWidth} budgets={budgets} rows={dayMode ? 8 : period === 'all' || period === 'lifetime' ? 14 : period === 'month' || period === '30days' ? 14 : 8} /></Row>
-      <Row wide={wide} width={dashWidth}><ActivityBreakdown projects={projects} pw={pw} bw={barWidth} /><ModelBreakdown projects={projects} pw={pw} bw={barWidth} /></Row>
-      {isCursor ? (
-        <ToolBreakdown projects={projects} pw={dashWidth} bw={barWidth} title="Languages" filterPrefix="lang:" />
-      ) : (
-        <><Row wide={wide} width={dashWidth}><ToolBreakdown projects={projects} pw={pw} bw={barWidth} /><BashBreakdown projects={projects} pw={pw} bw={barWidth} /></Row><Row wide={wide} width={dashWidth}><SkillsAndAgents projects={projects} pw={pw} bw={barWidth} /><McpBreakdown projects={projects} pw={pw} bw={barWidth} /></Row><Row wide={wide} width={dashWidth}><ClaudeAgentTypes projects={projects} pw={pw} bw={barWidth} /></Row></>
-      )}
+      <Box flexWrap="wrap" width={dashWidth}>
+        <DailyActivity projects={scrollableDailyHistory ? (dailyHistoryProjects ?? []) : projects} days={days} pw={panelWidth} bw={barWidth} scrollable={scrollableDailyHistory} cursor={dailyHistoryCursor} loading={dailyHistoryLoading} />
+        <ProjectBreakdown projects={projects} pw={panelWidth} bw={barWidth} budgets={budgets} rows={getProjectBreakdownRowLimit(period, dayMode)} />
+        <ActivityBreakdown projects={projects} pw={panelWidth} bw={barWidth} />
+        <ModelBreakdown projects={projects} pw={panelWidth} bw={barWidth} />
+        {isCursor
+          ? <><ToolBreakdown projects={projects} pw={panelWidth} bw={barWidth} title="Languages" filterPrefix="lang:" /><WorkflowInsights projects={projects} pw={panelWidth} /></>
+          : <>
+              <McpBreakdown projects={projects} pw={panelWidth} bw={barWidth} />
+              <ToolBreakdown projects={projects} pw={panelWidth} bw={barWidth} />
+              <BashBreakdown projects={projects} pw={panelWidth} bw={barWidth} />
+              <SkillsAndAgents projects={projects} pw={panelWidth} bw={barWidth} />
+              <WorkflowInsights projects={projects} pw={panelWidth} />
+              <ClaudeAgentTypes projects={projects} pw={panelWidth} bw={barWidth} />
+            </>}
+      </Box>
     </Box>
   )
 }
 
-function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, initialPeriod, initialProvider, initialPlanUsages, initialDurable, refreshSeconds, projectFilter, excludeFilter, customRange, customRangeLabel, initialDay }: {
+/// Sum of wheel scroll deltas in a raw stdin chunk under SGR mouse reporting
+/// (DECSET 1006): button 64 is wheel-up, 65 wheel-down, three lines per tick.
+/// Every other mouse event (clicks, drags, wheel with modifiers) contributes
+/// nothing. Exported for tests.
+export function wheelDelta(chunk: string): number {
+  let delta = 0
+  for (const m of chunk.matchAll(/\x1b\[<(64|65);\d+;\d+[Mm]/g)) {
+    delta += m[1] === '64' ? -WHEEL_LINES_PER_TICK : WHEEL_LINES_PER_TICK
+  }
+  return delta
+}
+
+const WHEEL_LINES_PER_TICK = 3
+const MOUSE_TRACKING_ON = '\x1b[?1000h\x1b[?1006h'
+const MOUSE_TRACKING_OFF = '\x1b[?1006l\x1b[?1000l'
+
+function ScrollableViewport({ children, width, lineScroll = true }: { children: React.ReactNode; width: number; lineScroll?: boolean }) {
+  const { rows } = useWindowSize()
+  const height = Math.max(1, rows - 1)
+  const contentRef = useRef<DOMElement>(null)
+  const [maxOffset, setMaxOffset] = useState(0)
+  const [offset, setOffset] = useState(0)
+  // The stdin listener below outlives renders; it reads the current bound
+  // through a ref so scrolling never re-subscribes (and never re-emits the
+  // tracking enable sequence).
+  const maxOffsetRef = useRef(0)
+  maxOffsetRef.current = maxOffset
+
+  useLayoutEffect(() => {
+    if (!contentRef.current) return
+    const nextMaxOffset = Math.max(0, measureElement(contentRef.current).height - height)
+    setMaxOffset(current => current === nextMaxOffset ? current : nextMaxOffset)
+    setOffset(current => Math.min(current, nextMaxOffset))
+  })
+
+  // Mouse-wheel scrolling via SGR mouse reporting. Known tradeoff: while
+  // tracking is on, click-drag text selection needs Shift held in most
+  // terminals. Tracking is disabled again on unmount (view switches, q).
+  useEffect(() => {
+    if (!process.stdout.isTTY || !process.stdin.isTTY) return
+    process.stdout.write(MOUSE_TRACKING_ON)
+    const onData = (data: Buffer) => {
+      const delta = wheelDelta(data.toString('utf8'))
+      if (delta !== 0) setOffset(current => Math.max(0, Math.min(current + delta, maxOffsetRef.current)))
+    }
+    process.stdin.on('data', onData)
+    return () => {
+      process.stdin.off('data', onData)
+      process.stdout.write(MOUSE_TRACKING_OFF)
+    }
+  }, [])
+
+  useInput((_input, key) => {
+    if (lineScroll && key.downArrow) setOffset(current => Math.min(current + 1, maxOffset))
+    else if (lineScroll && key.upArrow) setOffset(current => Math.max(current - 1, 0))
+    else if (key.pageDown) setOffset(current => Math.min(current + height, maxOffset))
+    else if (key.pageUp) setOffset(current => Math.max(current - height, 0))
+    else if (key.home) setOffset(0)
+    else if (key.end) setOffset(maxOffset)
+  })
+
+  return (
+    <Box width={width} height={height} overflowY="hidden">
+      <Box ref={contentRef} flexDirection="column" position="absolute" top={-Math.min(offset, maxOffset)} left={0}>
+        {children}
+      </Box>
+    </Box>
+  )
+}
+
+export function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, initialPeriod, initialProvider, initialPlanUsages, initialDurable, refreshSeconds, projectFilter, excludeFilter, customRange, customRangeLabel, initialDay, windowColumns }: {
   initialProjects: ProjectSummary[]
   initialDailyHistoryProjects?: ProjectSummary[]
   initialPeriod: Period
@@ -889,6 +1291,7 @@ function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, in
   customRange?: DateRange | null
   customRangeLabel?: string
   initialDay?: string
+  windowColumns: number
 }) {
   const { exit } = useApp()
   const [period, setPeriod] = useState<Period>(initialPeriod)
@@ -909,12 +1312,24 @@ function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, in
   // leaves the optimize view OR the underlying findings change so a long
   // findings list never strands the user past the new array length.
   const [findingsCursor, setFindingsCursor] = useState(0)
+  // Which coaching note the footer shows; advanced on a slow interval so the
+  // whole set rotates through without demanding attention.
+  const [noteTick, setNoteTick] = useState(0)
   const isDayMode = dayDate != null
   const isCustomRange = customRange != null && !isDayMode
   const scrollableDailyHistory = !isCustomRange && !isDayMode
-  const { columns } = useWindowSize()
-  const { dashWidth } = getLayout(columns)
-  const dailyHistoryPageSize = isDayMode ? 1 : (period === 'month' || period === '30days' ? 31 : 14)
+  const columns = windowColumns
+  const maxContentWidth = useMemo(
+    () => getDashboardMaxWidth(projects, projectBudgets, activeProvider),
+    [projects, projectBudgets, activeProvider],
+  )
+  const { dashWidth, columnCount } = getLayout(columns, maxContentWidth)
+  const dailyHistoryPageSize = getDailyActivityPageSize(
+    columnCount,
+    Math.min(projects.length, getProjectBreakdownRowLimit(period, isDayMode)),
+    getActivityBreakdownRowCount(projects),
+    isDayMode,
+  )
   const dailyHistoryRowCount = getDailyActivityRows(dailyHistoryProjects).length
   const dailyHistoryMaxCursor = Math.max(0, dailyHistoryRowCount - dailyHistoryPageSize)
   const multipleProviders = detectedProviders.length > 1
@@ -923,12 +1338,21 @@ function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, in
     projects.flatMap(p => p.sessions.flatMap(s => Object.keys(s.modelBreakdown)))
   ).size
   const compareAvailable = modelCount >= 2
+  const viewRef = useRef(view)
+  viewRef.current = view
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const reloadGenerationRef = useRef(0)
   const reloadInFlightRef = useRef(false)
   const currentReloadRef = useRef<{ period: Period; provider: string; day: string | null } | null>(null)
-  const pendingReloadRef = useRef<{ period: Period; provider: string; day: string | null } | null>(null)
+  const pendingReloadRef = useRef<{ period: Period; provider: string; day: string | null; background: boolean } | null>(null)
   const findingCount = optimizeResult?.findings.length ?? 0
+  const coachingNotes = useMemo(() => computeCoachingNotes(projects), [projects])
+
+  useEffect(() => {
+    if (coachingNotes.length <= 1) return
+    const id = setInterval(() => setNoteTick(t => t + 1), 12000)
+    return () => clearInterval(id)
+  }, [coachingNotes.length])
 
   useEffect(() => {
     let cancelled = false
@@ -956,7 +1380,7 @@ function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, in
     return () => { cancelled = true }
   }, [projects])
 
-  const reloadData = useCallback(async (p: Period, prov: string, day: string | null = null) => {
+  const reloadData = useCallback(async (p: Period, prov: string, day: string | null = null, background = false) => {
     if (reloadInFlightRef.current) {
       const current = currentReloadRef.current
       if (current?.period === p && current.provider === prov && current.day === day) {
@@ -964,18 +1388,20 @@ function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, in
         return
       }
       reloadGenerationRef.current++
-      pendingReloadRef.current = { period: p, provider: prov, day }
+      pendingReloadRef.current = { period: p, provider: prov, day, background }
       return
     }
     reloadInFlightRef.current = true
     currentReloadRef.current = { period: p, provider: prov, day }
     const shouldLoadHistory = !day && customRange == null
     const generation = ++reloadGenerationRef.current
-    setLoading(true)
-    setOptimizeLoading(false)
-    setOptimizeResult(null)
+    if (!background) {
+      setLoading(true)
+      setOptimizeLoading(false)
+      setOptimizeResult(null)
+    }
     try {
-      if (!day && isHeavyPeriod(p)) {
+      if (!background && !day && isHeavyPeriod(p)) {
         setProjects([])
         setProjectBudgets(new Map())
         // Drop the previous period's durable headline so it can't flash on the
@@ -991,21 +1417,24 @@ function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, in
       const filteredProjects = filterProjectsByName(data, projectFilter, excludeFilter)
       if (reloadGenerationRef.current !== generation) return
 
-      if (shouldLoadHistory) setDailyHistoryProjects(filteredProjects)
-      setProjects(selectDashboardPeriodProjects(filteredProjects, p, shouldLoadHistory))
+      const selectedProjects = selectDashboardPeriodProjects(filteredProjects, p, shouldLoadHistory)
       // Durable headline totals (carry-forward cache + today), matching the
-      // menubar/report. Computed after the live parse so the panel paints
-      // immediately; the durable figure replaces the live one when it resolves.
+      // menubar/report.
       const durableTotals = await computeDurableOverview(p, prov, projectFilter, excludeFilter, customRange, day)
       if (reloadGenerationRef.current !== generation) return
-      setDurable(durableTotals)
       const usage = await getPlanUsages()
       if (reloadGenerationRef.current !== generation) return
+      if (background && viewRef.current !== 'dashboard') return
+
+      if (shouldLoadHistory) setDailyHistoryProjects(filteredProjects)
+      setProjects(selectedProjects)
+      setDurable(durableTotals)
       setPlanUsages(usage)
+      if (background) setOptimizeResult(null)
     } catch (error) {
       console.error(error)
     } finally {
-      if (reloadGenerationRef.current === generation) {
+      if (!background && reloadGenerationRef.current === generation) {
         setLoading(false)
       }
       reloadInFlightRef.current = false
@@ -1013,7 +1442,7 @@ function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, in
       const pending = pendingReloadRef.current
       pendingReloadRef.current = null
       if (pending) {
-        void reloadData(pending.period, pending.provider, pending.day)
+        void reloadData(pending.period, pending.provider, pending.day, pending.background)
       }
     }
   }, [projectFilter, excludeFilter, customRange])
@@ -1041,11 +1470,13 @@ function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, in
   }, [optimizeAvailable, projects, currentRange, optimizeLoading, optimizeResult])
 
   useEffect(() => {
-    if (!refreshSeconds || refreshSeconds <= 0) return
+    const refreshIntervalMs = getRefreshIntervalMs(refreshSeconds ?? 0)
+    if (refreshIntervalMs === 0) return
+    if (view !== 'dashboard') return
     if (!dayDate && isHeavyPeriod(period)) return
-    const id = setInterval(() => { void reloadData(period, activeProvider, dayDate) }, refreshSeconds * 1000)
+    const id = setInterval(() => { void reloadData(period, activeProvider, dayDate, true) }, refreshIntervalMs)
     return () => clearInterval(id)
-  }, [refreshSeconds, period, activeProvider, dayDate, reloadData])
+  }, [refreshSeconds, period, activeProvider, dayDate, reloadData, view])
 
   const switchPeriod = useCallback((np: Period) => {
     if (np === period && !dayDate) return
@@ -1099,17 +1530,17 @@ function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, in
     if (view === 'optimize') {
       const total = optimizeResult?.findings.length ?? 0
       const maxStart = Math.max(0, total - FINDINGS_WINDOW_SIZE)
-      if (input === 'j' || key.downArrow) { setFindingsCursor(c => Math.min(c + 1, maxStart)); return }
-      if (input === 'k' || key.upArrow)   { setFindingsCursor(c => Math.max(c - 1, 0)); return }
+      if (input === 'j') { setFindingsCursor(c => Math.min(c + 1, maxStart)); return }
+      if (input === 'k') { setFindingsCursor(c => Math.max(c - 1, 0)); return }
       return
     }
     if (input === 'c' && compareAvailable && view === 'dashboard') { setView('compare'); return }
     if ((input === 'b' || key.escape) && view === 'compare') { setView('dashboard'); return }
     if (view === 'dashboard' && scrollableDailyHistory) {
-      if (key.pageDown || (input === ' ' && !key.shift)) { setDailyHistoryCursor(c => pageHistoryCursor(c, 1, dailyHistoryPageSize, dailyHistoryRowCount)); return }
-      if (key.pageUp || (input === ' ' && key.shift)) { setDailyHistoryCursor(c => pageHistoryCursor(c, -1, dailyHistoryPageSize, dailyHistoryRowCount)); return }
-      if (input === 'j' || key.downArrow) { setDailyHistoryCursor(c => scrollHistoryCursor(c, 1, dailyHistoryPageSize, dailyHistoryRowCount)); return }
-      if (input === 'k' || key.upArrow) { setDailyHistoryCursor(c => scrollHistoryCursor(c, -1, dailyHistoryPageSize, dailyHistoryRowCount)); return }
+      if (input === ' ' && !key.shift) { setDailyHistoryCursor(c => pageHistoryCursor(c, 1, dailyHistoryPageSize, dailyHistoryRowCount)); return }
+      if (input === ' ' && key.shift) { setDailyHistoryCursor(c => pageHistoryCursor(c, -1, dailyHistoryPageSize, dailyHistoryRowCount)); return }
+      if (input === 'j') { setDailyHistoryCursor(c => scrollHistoryCursor(c, 1, dailyHistoryPageSize, dailyHistoryRowCount)); return }
+      if (input === 'k') { setDailyHistoryCursor(c => scrollHistoryCursor(c, -1, dailyHistoryPageSize, dailyHistoryRowCount)); return }
       if (input === 'g') { setDailyHistoryCursor(0); return }
       if (input === 'G') { setDailyHistoryCursor(dailyHistoryMaxCursor); return }
     }
@@ -1165,9 +1596,10 @@ function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, in
   })
 
   const headerLabel = dayDate ? formatDayRangeLabel(dayDate) : customRangeLabel ?? PERIOD_LABELS[period]
+  const coachingNote = view === 'dashboard' ? selectRotatingNote(coachingNotes, noteTick) : null
 
-  if (loading || optimizeLoading) {
-    return (
+  const content = loading || optimizeLoading
+    ? (
       <Box flexDirection="column" width={dashWidth}>
         {!isCustomRange && !isDayMode && <PeriodTabs active={period} providerName={activeProvider} showProvider={view !== 'compare' && multipleProviders} />}
         {isDayMode && <DayBanner label={headerLabel} width={dashWidth} />}
@@ -1186,20 +1618,33 @@ function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, in
         {view !== 'compare' && <StatusBar width={dashWidth} showProvider={multipleProviders} view={view} findingCount={0} optimizeAvailable={false} compareAvailable={false} customRange={isCustomRange} dayMode={isDayMode} />}
       </Box>
     )
-  }
+    : (
+      <Box flexDirection="column" width={dashWidth}>
+        {!isCustomRange && !isDayMode && <PeriodTabs active={period} providerName={activeProvider} showProvider={multipleProviders && view !== 'compare'} />}
+        {isDayMode && <DayBanner label={headerLabel} width={dashWidth} />}
+        {isCustomRange && <CustomRangeBanner label={headerLabel} width={dashWidth} />}
+        {view === 'compare'
+          ? <CompareView projects={projects} onBack={() => setView('dashboard')} />
+          : view === 'optimize' && optimizeResult
+            ? <OptimizeView findings={optimizeResult.findings} costRate={optimizeResult.costRate} projects={projects} label={headerLabel} width={dashWidth} healthScore={optimizeResult.healthScore} healthGrade={optimizeResult.healthGrade} cursor={findingsCursor} />
+            : <DashboardContent projects={projects} period={period} columns={columns} maxContentWidth={maxContentWidth} activeProvider={activeProvider} budgets={projectBudgets} planUsages={planUsages} label={headerLabel} dayMode={isDayMode} dailyHistoryProjects={dailyHistoryProjects} dailyHistoryPageSize={dailyHistoryPageSize} scrollableDailyHistory={scrollableDailyHistory} dailyHistoryCursor={Math.min(dailyHistoryCursor, dailyHistoryMaxCursor)} durable={durable} />}
+        {coachingNote && (
+          <Box width={dashWidth} paddingX={1}>
+            <Text wrap="truncate-end"><Text color={ORANGE} bold>tip </Text><Text dimColor>{coachingNote}</Text></Text>
+          </Box>
+        )}
+        {view !== 'compare' && <StatusBar width={dashWidth} showProvider={multipleProviders} view={view} findingCount={findingCount} optimizeAvailable={optimizeAvailable} compareAvailable={compareAvailable} customRange={isCustomRange} dayMode={isDayMode} />}
+      </Box>
+    )
 
   return (
-    <Box flexDirection="column" width={dashWidth}>
-      {!isCustomRange && !isDayMode && <PeriodTabs active={period} providerName={activeProvider} showProvider={multipleProviders && view !== 'compare'} />}
-      {isDayMode && <DayBanner label={headerLabel} width={dashWidth} />}
-      {isCustomRange && <CustomRangeBanner label={headerLabel} width={dashWidth} />}
-      {view === 'compare'
-        ? <CompareView projects={projects} onBack={() => setView('dashboard')} />
-        : view === 'optimize' && optimizeResult
-          ? <OptimizeView findings={optimizeResult.findings} costRate={optimizeResult.costRate} projects={projects} label={headerLabel} width={dashWidth} healthScore={optimizeResult.healthScore} healthGrade={optimizeResult.healthGrade} cursor={findingsCursor} />
-          : <DashboardContent projects={projects} period={period} columns={columns} activeProvider={activeProvider} budgets={projectBudgets} planUsages={planUsages} label={headerLabel} dayMode={isDayMode} dailyHistoryProjects={dailyHistoryProjects} scrollableDailyHistory={scrollableDailyHistory} dailyHistoryCursor={Math.min(dailyHistoryCursor, dailyHistoryMaxCursor)} durable={durable} />}
-      {view !== 'compare' && <StatusBar width={dashWidth} showProvider={multipleProviders} view={view} findingCount={findingCount} optimizeAvailable={optimizeAvailable} compareAvailable={compareAvailable} customRange={isCustomRange} dayMode={isDayMode} />}
-    </Box>
+    <ScrollableViewport
+      key={`${view}:${period}:${activeProvider}:${dayDate ?? ''}:${customRangeLabel ?? ''}`}
+      width={dashWidth}
+      lineScroll={view !== 'compare'}
+    >
+      {content}
+    </ScrollableViewport>
   )
 }
 
@@ -1222,11 +1667,12 @@ function CustomRangeBanner({ label, width }: { label: string; width: number }) {
 
 function StaticDashboard({ projects, period, activeProvider, planUsages, label, dayMode, durable }: { projects: ProjectSummary[]; period: Period; activeProvider?: string; planUsages?: PlanUsage[]; label?: string; dayMode?: boolean; durable?: DurableOverview }) {
   const { columns } = useWindowSize()
-  const { dashWidth } = getLayout(columns)
+  const maxContentWidth = getDashboardMaxWidth(projects, undefined, activeProvider)
+  const { dashWidth } = getLayout(columns, maxContentWidth)
   return (
     <Box flexDirection="column" width={dashWidth}>
       {dayMode ? <DayBanner label={label ?? PERIOD_LABELS[period]} width={dashWidth} /> : <PeriodTabs active={period} />}
-      <DashboardContent projects={projects} period={period} columns={columns} activeProvider={activeProvider} planUsages={planUsages} label={label} dayMode={dayMode} durable={durable} />
+      <DashboardContent projects={projects} period={period} columns={columns} maxContentWidth={maxContentWidth} activeProvider={activeProvider} planUsages={planUsages} label={label} dayMode={dayMode} durable={durable} />
     </Box>
   )
 }
@@ -1234,7 +1680,7 @@ function StaticDashboard({ projects, period, activeProvider, planUsages, label, 
 export async function renderDashboard(period: Period = 'week', provider: string = 'all', refreshSeconds?: number, projectFilter?: string[], excludeFilter?: string[], customRange?: DateRange | null, customRangeLabel?: string, initialDay?: string): Promise<void> {
   // Interactive Ink UI: it renders to the same terminal and has its own in-frame
   // loading state, so the CLI scan-progress line must stay silent for its whole
-  // lifetime (initial scan and every 30s auto-refresh, including the
+  // lifetime (initial scan and every enabled auto-refresh, including the
   // getPlanUsages → parseAllSessions path). Plain CLI commands are unaffected.
   setInteractiveScanUI()
   await loadPricing()
@@ -1252,10 +1698,24 @@ export async function renderDashboard(period: Period = 'week', provider: string 
   const label = initialDay ? formatDayRangeLabel(initialDay) : customRangeLabel
   patchStdoutForWindows()
   if (isTTY) {
-    const { waitUntilExit } = render(
-      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={period} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} />
+    let windowColumns = process.stdout.columns
+    const dashboard = () => (
+      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={period} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={windowColumns} />
     )
-    await waitUntilExit()
+    const app = render(
+      dashboard(),
+      INTERACTIVE_RENDER_OPTIONS,
+    )
+    const resize = () => {
+      windowColumns = process.stdout.columns
+      app.rerender(dashboard())
+    }
+    process.stdout.prependListener('resize', resize)
+    try {
+      await app.waitUntilExit()
+    } finally {
+      process.stdout.off('resize', resize)
+    }
   } else {
     const { unmount } = render(<StaticDashboard projects={filteredProjects} period={period} activeProvider={provider} planUsages={planUsages} label={label} dayMode={initialDay != null} durable={initialDurable} />, { patchConsole: false })
     // Non-interactive one-shot output: ink schedules the frame through a

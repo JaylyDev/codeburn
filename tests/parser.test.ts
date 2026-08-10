@@ -143,10 +143,16 @@ async function createJsonlSession(
   const dir = join(sessionStateDir, sessionId)
   await mkdir(dir, { recursive: true })
   await writeFile(join(dir, 'workspace.yaml'), `id: ${sessionId}\ncwd: /home/user/testproj\n`)
+  // Relative timestamps: fixed calendar dates rot. The original '2026-05-01'
+  // crossed copilot's durable 90-day age-out on 2026-07-30, at which point the
+  // very first parse pruned the freshly-cached session and both durable tests
+  // started failing everywhere with "expected +0 to be 200".
+  const base = Date.now() - 5 * 24 * 60 * 60 * 1000
+  const at = (offsetSec: number): string => new Date(base + offsetSec * 1000).toISOString()
   const lines = [
-    JSON.stringify({ type: 'session.model_change', timestamp: '2026-05-01T10:00:00Z', data: { newModel: 'gpt-4.1' } }),
-    JSON.stringify({ type: 'user.message', timestamp: '2026-05-01T10:00:05Z', data: { content: 'hello', interactionId: 'int-1' } }),
-    JSON.stringify({ type: 'assistant.message', timestamp: '2026-05-01T10:00:10Z', data: { messageId: 'msg-1', outputTokens, interactionId: 'int-1', toolRequests: [] } }),
+    JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: 'gpt-4.1' } }),
+    JSON.stringify({ type: 'user.message', timestamp: at(5), data: { content: 'hello', interactionId: 'int-1' } }),
+    JSON.stringify({ type: 'assistant.message', timestamp: at(10), data: { messageId: 'msg-1', outputTokens, interactionId: 'int-1', toolRequests: [] } }),
   ]
   await writeFile(join(dir, 'events.jsonl'), lines.join('\n') + '\n')
   return join(dir, 'events.jsonl')
@@ -486,5 +492,190 @@ describe('(g) skill attribution is independent of turn category', () => {
     expect(session!.turns[0]!.subCategory).toBe('telemetry-review')
     expect(session!.categoryBreakdown.coding.turns).toBe(1)
     expect(session!.skillBreakdown['telemetry-review']?.turns).toBe(1)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// (h) Provider filter isolates claude: a --provider <other> run must not
+//     re-surface cached claude sessions through the orphan pass, while a run
+//     that DOES include claude still preserves PR-bearing orphans.
+// ═══════════════════════════════════════════════════════════════════════════
+describe('(h) provider filter excludes claude from the orphan pass', () => {
+  const SYNTH_SOURCE = (path: string): SessionSource[] =>
+    [{ path, project: 'synth-proj', provider: 'test-synthetic' }]
+
+  // The provider lives on each parsed call, not on SessionSummary.
+  const providersOf = (projects: Awaited<ReturnType<typeof parseAllSessions>>): Set<string> =>
+    new Set(projects
+      .flatMap(p => p.sessions)
+      .flatMap(s => s.turns)
+      .flatMap(t => t.assistantCalls)
+      .map(c => c.provider))
+
+  const SYNTH_CALL: ParsedProviderCall = {
+    provider: 'test-synthetic', model: 'gpt-4o',
+    inputTokens: 10, outputTokens: 5,
+    cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+    cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0,
+    costUSD: 0.25, tools: [], bashCommands: [],
+    skills: [],
+    timestamp: '2026-07-18T12:00:00.000Z',
+    speed: 'standard',
+    deduplicationKey: 'synth-isolation-call',
+    userMessage: '', sessionId: 'synth-isolation-session',
+  }
+
+  // A claude transcript carrying a pr-link: `prLinks` is exactly what lets a
+  // cached entry survive the write-mode orphan gate, so it is the shape that
+  // leaks. Cost is deliberately far larger than the synthetic call's, so a leak
+  // is unmistakable rather than a rounding difference.
+  async function writeClaudeSessionWithPrLink(): Promise<string> {
+    const projectDir = join(tmpHome, '.claude', 'projects', 'leaky-app')
+    await mkdir(projectDir, { recursive: true })
+    const filePath = join(projectDir, 'session.jsonl')
+    await writeFile(filePath, [
+      JSON.stringify({
+        type: 'user', sessionId: 'claude-leak-1', timestamp: '2026-07-18T12:00:00.000Z',
+        message: { role: 'user', content: 'ship it' },
+      }),
+      JSON.stringify({
+        type: 'assistant', sessionId: 'claude-leak-1', timestamp: '2026-07-18T12:00:10.000Z',
+        message: {
+          id: 'msg-leak-1', type: 'message', role: 'assistant', model: 'claude-sonnet-4-5',
+          content: [{ type: 'text', text: 'done' }],
+          usage: { input_tokens: 900_000, output_tokens: 90_000 },
+        },
+      }),
+      JSON.stringify({
+        type: 'pr-link', sessionId: 'claude-leak-1', timestamp: '2026-07-18T12:00:20.000Z',
+        prUrl: 'https://github.com/getagentseal/codeburn/pull/1',
+      }),
+    ].join('\n') + '\n')
+    return filePath
+  }
+
+  it('does not surface cached claude sessions when filtering to another provider', async () => {
+    const synthFile = join(tmpHome, 'synth-isolation.txt')
+    await writeFile(synthFile, 'placeholder')
+    await writeClaudeSessionWithPrLink()
+
+    _synthSources = SYNTH_SOURCE(synthFile)
+    _synthYields = [SYNTH_CALL]
+
+    // Baseline: what the synthetic provider costs on its own, before anything
+    // claude-shaped has ever entered the session cache. Self-calibrating, since
+    // cost is re-derived from tokens by the pricing engine.
+    const baseline = await parseAllSessions(undefined, 'test-synthetic')
+    const synthOnlyCost = totalCost(baseline)
+    expect([...providersOf(baseline)]).toEqual(['test-synthetic'])
+    clearSessionCache()
+
+    // Warm the session cache so the claude file is persisted WITH its prLinks.
+    const all = await parseAllSessions(undefined, 'all')
+    expect(providersOf(all)).toContain('claude')
+    expect(totalCost(all)).toBeGreaterThan(synthOnlyCost)
+
+    clearSessionCache()
+
+    // Filtering to the synthetic provider must yield ONLY its own spend. Before
+    // the fix, claudeDirs was empty yet scanProjectDirs still ran, so every
+    // cached PR-bearing claude file was treated as a pruned orphan and re-added.
+    const filtered = await parseAllSessions(undefined, 'test-synthetic')
+
+    expect([...providersOf(filtered)]).toEqual(['test-synthetic'])
+    expect(totalCost(filtered)).toBeCloseTo(synthOnlyCost, 10)
+  })
+
+  it('still preserves a PR-bearing claude orphan when claude IS in scope', async () => {
+    const filePath = await writeClaudeSessionWithPrLink()
+    _synthSources = []
+    _synthYields = []
+
+    const before = await parseAllSessions(undefined, 'all')
+    const costBefore = totalCost(before)
+    expect(costBefore).toBeGreaterThan(0)
+
+    // Every claude transcript disappears from disk. Claude is still in scope, so
+    // the orphan pass must keep the PR-attributed spend alive — this is the case
+    // a naive `claudeDirs.length > 0` guard would silently break.
+    await unlink(filePath)
+    clearSessionCache()
+
+    const after = await parseAllSessions(undefined, 'all')
+    expect(totalCost(after)).toBeCloseTo(costBefore, 10)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// (f) Growing resumed CLI session: durable merge appends only the new leg
+// ═══════════════════════════════════════════════════════════════════════════
+// Resumed Copilot CLI sessions append one CUMULATIVE session.shutdown per leg
+// (#944). The parser emits per-leg deltas keyed by occurrence; this exercises
+// the PRODUCTION merge path — the durable union-by-dedup-key merge against the
+// on-disk cache when the file grows between parses — which the unit tests
+// (which pre-seed seenKeys) cannot reach.
+describe('(f) growing resumed CLI session durable merge', () => {
+  it('totals equal the final cumulative rollup after the file grows a leg', async () => {
+    const sessionStateDir = join(tmpHome, 'session-state')
+    await mkdir(sessionStateDir, { recursive: true })
+    vi.stubEnv('CODEBURN_COPILOT_SESSION_STATE_DIR', sessionStateDir)
+    vi.stubEnv('CODEBURN_COPILOT_DISABLE_OTEL', '1')
+    vi.stubEnv('CODEBURN_COPILOT_WS_STORAGE_DIR', join(tmpHome, 'no-ws'))
+    vi.stubEnv('CODEBURN_COPILOT_GLOBAL_STORAGE_DIR', join(tmpHome, 'no-global'))
+    vi.stubEnv('CODEBURN_COPILOT_JETBRAINS_DIR', join(tmpHome, 'no-jb'))
+
+    const base = Date.now() - 5 * 24 * 60 * 60 * 1000
+    const at = (offsetSec: number): string => new Date(base + offsetSec * 1000).toISOString()
+    const dir = join(sessionStateDir, 'sess-grow')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'workspace.yaml'), 'id: sess-grow\ncwd: /home/user/testproj\n')
+    const eventsPath = join(dir, 'events.jsonl')
+
+    // Cumulative rollups from a real resumed CLI 1.0.78 session.
+    const shutdown = (ts: string, inputTokens: number, cacheReadTokens: number, cacheWriteTokens: number, outputTokens: number) =>
+      JSON.stringify({
+        type: 'session.shutdown',
+        timestamp: ts,
+        data: {
+          shutdownType: 'routine',
+          modelMetrics: {
+            'claude-sonnet-4-5': {
+              requests: { count: 1, cost: 1 },
+              usage: { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens: 0 },
+            },
+          },
+        },
+      })
+    const leg1 = [
+      JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: 'claude-sonnet-4-5' } }),
+      JSON.stringify({ type: 'assistant.message', timestamp: at(10), data: { messageId: 'msg-1', outputTokens: 17, toolRequests: [] } }),
+      shutdown(at(20), 24672, 0, 24670, 17),
+    ]
+    await writeFile(eventsPath, leg1.join('\n') + '\n')
+
+    const sumUsage = (projects: Awaited<ReturnType<typeof parseAllSessions>>) => {
+      const calls = projects.flatMap(p => p.sessions).flatMap(s => s.turns).flatMap(t => t.assistantCalls)
+      return {
+        input: calls.reduce((s, c) => s + c.usage.inputTokens, 0),
+        cacheRead: calls.reduce((s, c) => s + c.usage.cacheReadInputTokens, 0),
+        cacheWrite: calls.reduce((s, c) => s + c.usage.cacheCreationInputTokens, 0),
+      }
+    }
+
+    const first = sumUsage(await parseAllSessions(undefined, 'copilot'))
+    expect(first).toEqual({ input: 2, cacheRead: 0, cacheWrite: 24670 })
+
+    // The session resumes: leg 2 appends per-turn events plus a CUMULATIVE
+    // rollup. The cached leg-1 delta must be kept once and only the leg-2
+    // delta appended — totals equal the final cumulative rollup exactly.
+    clearSessionCache()
+    await writeFile(eventsPath, [
+      ...leg1,
+      JSON.stringify({ type: 'assistant.message', timestamp: at(100), data: { messageId: 'msg-2', outputTokens: 132, toolRequests: [] } }),
+      shutdown(at(120), 74463, 49489, 24968, 149),
+    ].join('\n') + '\n')
+
+    const second = sumUsage(await parseAllSessions(undefined, 'copilot'))
+    expect(second).toEqual({ input: 74463 - 49489 - 24968, cacheRead: 49489, cacheWrite: 24968 })
   })
 })
