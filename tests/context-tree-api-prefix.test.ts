@@ -56,8 +56,12 @@ describe('web dashboard /api/context/tree: session id prefix', () => {
 
   afterEach(async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()))
-    await rm(homeDir, { recursive: true, force: true })
-    await rm(cacheDir, { recursive: true, force: true })
+    // close() only stops new connections; a request handler's fire-and-forget
+    // cache save can still land a file mid-recursive-rm, which surfaces as
+    // ENOTEMPTY on slower runners. fs.rm's built-in retries absorb exactly
+    // that window.
+    await rm(homeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
+    await rm(cacheDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   })
 
   it('resolves a full session id (control case)', async () => {

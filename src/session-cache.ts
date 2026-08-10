@@ -171,26 +171,62 @@ const CACHE_FILE = `session-cache.v${CACHE_VERSION}.json`
 const LEGACY_CACHE_FILE = 'session-cache.json'
 const TEMP_FILE_MAX_AGE_MS = 5 * 60 * 1000
 
+// Env vars that change what a provider discovers or how its sessions parse.
+// computeEnvFingerprint hashes exactly these to decide when a provider's cache
+// section is stale; a var read by the provider but missing here means changing
+// it serves the old section silently, reporting nothing from the new root.
+// One read in src/providers/ is deliberately absent: CODEBURN_VERBOSE
+// (sqlite-session-parser.ts:276) only changes logging verbosity, never parsed
+// output.
+//
+// Copilot is deliberately NOT declared here. Declaring any CODEBURN_COPILOT_*
+// var would change its fingerprint, and on a fingerprint change
+// getOrCreateProviderSection (src/parser.ts:2650) keeps only the cached
+// entries whose source path no longer exists — but copilot's OTel discovery
+// returns one source per DB file ({ path: dbPath }, src/providers/copilot.ts:1935)
+// and that DB keeps existing, so its cached entry would be dropped and
+// re-parsed, destroying conversations Copilot has since pruned from the DB
+// that only the cache still holds (see DURABLE_PROVIDER_NAMES below). Do not
+// "complete" the map for copilot until the durable carry-forward learns to
+// merge instead of drop.
 export const PROVIDER_ENV_VARS: Record<string, string[]> = {
-  claude: ['CLAUDE_CONFIG_DIRS', 'CLAUDE_CONFIG_DIR'],
+  claude: ['CLAUDE_CONFIG_DIRS', 'CLAUDE_CONFIG_DIR', 'CODEBURN_DESKTOP_SESSIONS_DIR', 'APPDATA', 'LOCALAPPDATA'],
   'cline-cli': ['CLINE_SESSION_DATA_DIR', 'CLINE_DATA_DIR', 'CLINE_DIR'],
+  codebuff: ['CODEBUFF_DATA_DIR'],
   codewhale: ['CODEWHALE_HOME'],
   codex: ['CODEX_HOME'],
   hermes: ['HERMES_HOME'],
   'lingtai-tui': ['LINGTAI_HOME', 'LINGTAI_TUI_HOME', 'LINGTAI_TUI_GLOBAL_DIR'],
   droid: ['FACTORY_DIR'],
-  cursor: ['XDG_DATA_HOME'],
+  cursor: ['CODEBURN_CURSOR_MAX_BUBBLES'],
+  // XDG_DATA_HOME is stale here (cursor-agent never reads it) but deliberately
+  // kept: removing it would force a re-parse to fix nothing.
   'cursor-agent': ['XDG_DATA_HOME'],
+  'open-design': ['CODEBURN_OPEN_DESIGN_DIR', 'APPDATA'],
   openclaude: ['CODEBURN_OPENCLAUDE_DIR'],
   opencode: ['XDG_DATA_HOME', 'OPENCODE_DATA_DIR', 'OPENCODE_DB_PREFIX'],
-  goose: ['XDG_DATA_HOME'],
-  crush: ['XDG_DATA_HOME'],
+  goose: ['XDG_DATA_HOME', 'GOOSE_PATH_ROOT'],
+  grok: ['GROK_HOME'],
+  crush: ['XDG_DATA_HOME', 'CRUSH_GLOBAL_DATA', 'LOCALAPPDATA'],
   warp: ['WARP_DB_PATH'],
   antigravity: ['CODEBURN_CACHE_DIR'],
+  'kilo-code': ['XDG_DATA_HOME'],
+  kimi: ['KIMI_SHARE_DIR', 'KIMI_MODEL_NAME'],
+  kiro: ['KIRO_HOME'],
+  'mistral-vibe': ['VIBE_HOME'],
+  mux: ['MUX_ROOT', 'CODEBURN_MUX_DIR'],
   qwen: ['QWEN_DATA_DIR'],
-  'ibm-bob': ['XDG_CONFIG_HOME'],
+  'ibm-bob': ['XDG_CONFIG_HOME', 'APPDATA'],
   quickdesk: ['QUICKWORK_HOME'],
   kimicode: ['KIMI_CODE_HOME'],
+  zerostack: ['ZS_DATA_DIR', 'XDG_DATA_HOME'],
+  // The gateway credential is a deliberate user override and MUST move the
+  // fingerprint: a read-only refresh (the refresh-lock fallback) serves the
+  // cached report straight from the section (parser.ts:2875 seeds servedSources
+  // before the network re-fetch at parser.ts:2888, which only runs when
+  // !readOnly), so an undeclared credential would keep serving the previous
+  // account's usage after a swap — the exact #920 defect.
+  'vercel-gateway': ['AI_GATEWAY_API_KEY', 'VERCEL_OIDC_TOKEN'],
 }
 
 // Names of providers whose cache entries are never evicted when source files
@@ -225,7 +261,10 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1',
   cursor: 'composer-anchored-crediting-v1-est-cost',
   'cursor-agent': 'workspaceless-transcript-v1',
-  copilot: 'cli-shutdown-cost-v1-skills',
+  // source-provenance-v1 (#944): CLI sessions were misread as VS Code
+  // transcripts (both carry producer 'copilot-agent'), skipping the shutdown
+  // input/cache rollup; this bump re-parses them so the missing tokens land.
+  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1',
   grok: 'estimated-cost-v1',
   hermes: 'reasoning-output-accounting-v1-est-cost',
   'lingtai-tui': 'token-ledger-registry-activity-v3',
@@ -608,34 +647,65 @@ async function retryCacheFileMutation(operation: () => Promise<void>): Promise<b
 // append-only transcripts keep changing. Fixing this properly means
 // multi-file fingerprints per source.
 
+// SQLite database files by extension. Bare-db sources (copilot's
+// agent-traces.db) and the virtual-suffix bases below all match one of these.
+const SQLITE_DB_PATH = /\.(db|sqlite3?|vscdb)$/i
+
+/// Fingerprint a SQLite database file together with its `-wal` sibling.
+///
+/// A database in WAL mode parks committed writes in `<db>-wal`; the main
+/// file's stat only moves on checkpoint, and a long-lived writer connection
+/// (hermes, cursor and opencode keep their state DBs open for the life of
+/// the agent process) can defer checkpoints for hours or days. A fingerprint
+/// built from the main file alone then (a) carries an mtime older than the
+/// newest committed data, so the date-range mtime pre-filter in
+/// parseProviderSources skips the source and sessions committed after the
+/// last checkpoint never parse (issue #913: today's Hermes sessions missing
+/// from every report), and (b) does not change between checkpoints, so
+/// reconcileFile keeps serving stale cached turns for sessions that grew.
+/// Folding the WAL sibling in fixes both: the newest mtime wins, and the
+/// sizes add so both WAL growth and a checkpoint (db grows, wal truncates)
+/// move the fingerprint. `-shm` is deliberately ignored — it mutates on
+/// reads too and would churn the fingerprint without any data change.
+async function fingerprintSqliteFile(dbPath: string): Promise<FileFingerprint | null> {
+  try {
+    const s = await stat(dbPath)
+    const wal = await stat(dbPath + '-wal').catch(() => null)
+    return {
+      dev: s.dev,
+      ino: s.ino,
+      mtimeMs: wal ? Math.max(s.mtimeMs, wal.mtimeMs) : s.mtimeMs,
+      sizeBytes: s.size + (wal?.size ?? 0),
+    }
+  } catch {
+    return null
+  }
+}
+
 export async function fingerprintFile(filePath: string): Promise<FileFingerprint | null> {
   try {
     const s = await stat(filePath)
+    // A source path that IS a SQLite database (copilot OTel's agent-traces.db)
+    // needs the same WAL fold as the virtual-suffix forms below.
+    if (SQLITE_DB_PATH.test(filePath)) return fingerprintSqliteFile(filePath)
     return { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, sizeBytes: s.size }
   } catch {
     // Providers encode extra context into source paths using virtual suffixes:
     // - Cursor: `<dbPath>#cursor-ws=<workspace>` (workspace-aware routing)
     // - OpenCode: `<dbPath>:<sessionId>` (session scoping)
+    // - Hermes: `<dbPath>#hermes-session=<sessionId>` (session scoping)
     // These compound paths don't exist on disk; strip the suffix to stat the
-    // underlying file. Try `#` first (rare in real paths), then `:` (must use
-    // lastIndexOf to tolerate Windows drive letters like C:\...).
+    // underlying database. Try `#` first (rare in real paths), then `:` (must
+    // use lastIndexOf to tolerate Windows drive letters like C:\...).
     const hashIdx = filePath.indexOf('#')
     if (hashIdx > 0) {
-      try {
-        const s = await stat(filePath.slice(0, hashIdx))
-        return { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, sizeBytes: s.size }
-      } catch {
-        // fall through to colon check
-      }
+      const fp = await fingerprintSqliteFile(filePath.slice(0, hashIdx))
+      if (fp) return fp
+      // fall through to colon check
     }
     const colonIdx = filePath.lastIndexOf(':')
     if (colonIdx > 0) {
-      try {
-        const s = await stat(filePath.slice(0, colonIdx))
-        return { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, sizeBytes: s.size }
-      } catch {
-        return null
-      }
+      return fingerprintSqliteFile(filePath.slice(0, colonIdx))
     }
     return null
   }
