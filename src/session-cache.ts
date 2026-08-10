@@ -203,6 +203,7 @@ export const PROVIDER_ENV_VARS: Record<string, string[]> = {
   // kept: removing it would force a re-parse to fix nothing.
   'cursor-agent': ['XDG_DATA_HOME'],
   'open-design': ['CODEBURN_OPEN_DESIGN_DIR', 'APPDATA'],
+  openclaude: ['CODEBURN_OPENCLAUDE_DIR'],
   opencode: ['XDG_DATA_HOME', 'OPENCODE_DATA_DIR', 'OPENCODE_DB_PREFIX'],
   goose: ['XDG_DATA_HOME', 'GOOSE_PATH_ROOT'],
   grok: ['GROK_HOME'],

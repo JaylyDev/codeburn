@@ -40,6 +40,7 @@ const FILE_PROVIDERS: Record<string, string[]> = {
   'cursor.ts': ['cursor'],
   // The ENV_DIR const (open-design.ts:10) resolves to CODEBURN_OPEN_DESIGN_DIR.
   'open-design.ts': ['open-design'],
+  'openclaude.ts': ['openclaude'],
   'opencode.ts': ['opencode'],
   'goose.ts': ['goose'],
   'grok.ts': ['grok'],
