@@ -1067,12 +1067,33 @@ function DashboardContent({ projects, period, columns, maxContentWidth, activePr
   )
 }
 
+/// Sum of wheel scroll deltas in a raw stdin chunk under SGR mouse reporting
+/// (DECSET 1006): button 64 is wheel-up, 65 wheel-down, three lines per tick.
+/// Every other mouse event (clicks, drags, wheel with modifiers) contributes
+/// nothing. Exported for tests.
+export function wheelDelta(chunk: string): number {
+  let delta = 0
+  for (const m of chunk.matchAll(/\x1b\[<(64|65);\d+;\d+[Mm]/g)) {
+    delta += m[1] === '64' ? -WHEEL_LINES_PER_TICK : WHEEL_LINES_PER_TICK
+  }
+  return delta
+}
+
+const WHEEL_LINES_PER_TICK = 3
+const MOUSE_TRACKING_ON = '\x1b[?1000h\x1b[?1006h'
+const MOUSE_TRACKING_OFF = '\x1b[?1006l\x1b[?1000l'
+
 function ScrollableViewport({ children, width, lineScroll = true }: { children: React.ReactNode; width: number; lineScroll?: boolean }) {
   const { rows } = useWindowSize()
   const height = Math.max(1, rows - 1)
   const contentRef = useRef<DOMElement>(null)
   const [maxOffset, setMaxOffset] = useState(0)
   const [offset, setOffset] = useState(0)
+  // The stdin listener below outlives renders; it reads the current bound
+  // through a ref so scrolling never re-subscribes (and never re-emits the
+  // tracking enable sequence).
+  const maxOffsetRef = useRef(0)
+  maxOffsetRef.current = maxOffset
 
   useLayoutEffect(() => {
     if (!contentRef.current) return
@@ -1080,6 +1101,23 @@ function ScrollableViewport({ children, width, lineScroll = true }: { children: 
     setMaxOffset(current => current === nextMaxOffset ? current : nextMaxOffset)
     setOffset(current => Math.min(current, nextMaxOffset))
   })
+
+  // Mouse-wheel scrolling via SGR mouse reporting. Known tradeoff: while
+  // tracking is on, click-drag text selection needs Shift held in most
+  // terminals. Tracking is disabled again on unmount (view switches, q).
+  useEffect(() => {
+    if (!process.stdout.isTTY || !process.stdin.isTTY) return
+    process.stdout.write(MOUSE_TRACKING_ON)
+    const onData = (data: Buffer) => {
+      const delta = wheelDelta(data.toString('utf8'))
+      if (delta !== 0) setOffset(current => Math.max(0, Math.min(current + delta, maxOffsetRef.current)))
+    }
+    process.stdin.on('data', onData)
+    return () => {
+      process.stdin.off('data', onData)
+      process.stdout.write(MOUSE_TRACKING_OFF)
+    }
+  }, [])
 
   useInput((_input, key) => {
     if (lineScroll && key.downArrow) setOffset(current => Math.min(current + 1, maxOffset))
