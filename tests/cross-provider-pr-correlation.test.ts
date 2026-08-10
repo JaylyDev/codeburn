@@ -106,3 +106,28 @@ describe('cross-provider PR correlation', () => {
     expect(codex.prAttributionSource).toBe('launcher-prompt')
   })
 })
+
+describe('working-directory correlation is time-bounded (eywa#160 regression)', () => {
+  it('attributes a same-cwd session inside the evidence window, never one weeks later', () => {
+    // One session in the repo genuinely produced the PR link. A tool session
+    // an hour later in the same checkout is PR work; a session three weeks
+    // later in the same checkout is just... work. Before the bound, the
+    // later session (and 128 real siblings) inherited the PR, attributing a
+    // month of unrelated spend ($7.4K observed) to a single PR row.
+    const linked = session({ id: 'anchor', provider: 'claude', timestamp: '2026-07-11T10:00:00Z', message: 'open the PR', refs: [A], cwd: '/repo/eywa' })
+    const nearby = session({ id: 'nearby', provider: 'codex', timestamp: '2026-07-11T11:30:00Z', message: 'run the review suite for the change', cwd: '/repo/eywa' })
+    const weeksLater = session({ id: 'later', provider: 'codex', timestamp: '2026-08-02T09:00:00Z', message: 'completely unrelated feature work', cwd: '/repo/eywa' })
+    correlateCrossProviderPrSessions([project([linked, nearby, weeksLater])])
+    expect(nearby.prLinks).toEqual([A])
+    expect(nearby.prAttributionSource).toBe('working-directory')
+    expect(weeksLater.prLinks).toBeUndefined()
+  })
+
+  it('widens the window across multiple evidence sessions for the same PR', () => {
+    const early = session({ id: 'e1', provider: 'claude', timestamp: '2026-07-11T10:00:00Z', message: 'open', refs: [A], cwd: '/repo/eywa' })
+    const late = session({ id: 'e2', provider: 'claude', timestamp: '2026-07-14T10:00:00Z', message: 'follow-up', refs: [A], cwd: '/repo/eywa' })
+    const between = session({ id: 'mid', provider: 'codex', timestamp: '2026-07-12T12:00:00Z', message: 'work in between the two linked sessions', cwd: '/repo/eywa' })
+    correlateCrossProviderPrSessions([project([early, late, between])])
+    expect(between.prLinks).toEqual([A])
+  })
+})
