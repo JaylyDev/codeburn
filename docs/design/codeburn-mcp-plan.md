@@ -184,7 +184,7 @@ Keep `main.ts:477–484` (the `daysSelection`/`customRange`/`daySelection`/`peri
 
 - [ ] **Step 4: Typecheck + parity test**
 
-Run: `npx tsc --noEmit && npm test -- cli-status-menubar`
+Run: `npx tsc --noEmit && npx vitest run cli-status-menubar`
 Expected: clean typecheck; `tests/cli-status-menubar.test.ts` passes — i.e. `status --format menubar-json` output is unchanged (parity).
 
 - [ ] **Step 5: Add a direct unit test for the aggregator**
@@ -207,7 +207,7 @@ describe('buildMenubarPayloadForRange', () => {
 })
 ```
 
-Run: `npm test -- usage-aggregator`
+Run: `npx vitest run usage-aggregator`
 Expected: PASS (uses the empty real environment; `scanAndDetect` not called because `optimize:false`).
 
 - [ ] **Step 6: Commit**
@@ -272,7 +272,7 @@ describe('redact', () => {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `npm test -- mcp-redact`
+Run: `npx vitest run mcp-redact`
 Expected: FAIL ("Cannot find module '../src/mcp/redact.js'").
 
 - [ ] **Step 3: Implement**
@@ -302,7 +302,7 @@ export function redactProjectNames(payload: MenubarPayload, includeNames: boolea
 
 - [ ] **Step 4: Run to verify pass**
 
-Run: `npm test -- mcp-redact`
+Run: `npx vitest run mcp-redact`
 Expected: PASS (3 tests).
 
 - [ ] **Step 5: Commit**
@@ -370,7 +370,7 @@ describe('tables', () => {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `npm test -- mcp-tables`
+Run: `npx vitest run mcp-tables`
 Expected: FAIL ("Cannot find module '../src/mcp/tables.js'").
 
 - [ ] **Step 3: Implement**
@@ -434,7 +434,7 @@ export function renderSavingsTable(p: MenubarPayload): string {
 
 - [ ] **Step 4: Run to verify pass**
 
-Run: `npm test -- mcp-tables`
+Run: `npx vitest run mcp-tables`
 Expected: PASS (4 tests).
 
 - [ ] **Step 5: Commit**
@@ -521,7 +521,7 @@ describe('mcp server', () => {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `npm test -- mcp-server`
+Run: `npx vitest run mcp-server`
 Expected: FAIL ("Cannot find module '../src/mcp/server.js'").
 
 - [ ] **Step 3: Implement the server**
@@ -660,7 +660,7 @@ export async function startStdioServer(version: string): Promise<void> {
 
 - [ ] **Step 4: Run to verify pass**
 
-Run: `npm test -- mcp-server`
+Run: `npx vitest run mcp-server`
 Expected: PASS (5 tests).
 
 - [ ] **Step 5: Commit**
