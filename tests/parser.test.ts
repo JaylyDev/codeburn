@@ -679,3 +679,50 @@ describe('(f) growing resumed CLI session durable merge', () => {
     expect(second).toEqual({ input: 74463 - 49489 - 24968, cacheRead: 49489, cacheWrite: 24968 })
   })
 })
+
+// ═══════════════════════════════════════════════════════════════════════════
+// (q) Burst reuse: a through-now range re-anchored seconds later reuses the
+//     previous parse instead of re-running discovery (serve fast-path)
+// ═══════════════════════════════════════════════════════════════════════════
+describe('(q) parse burst reuse (CODEBURN_PARSE_BURST_MS)', () => {
+  it('serves a re-anchored range from the previous parse inside the window, never outside it', async () => {
+    vi.stubEnv('CODEBURN_PARSE_BURST_MS', '10000')
+    clearSessionCache()
+    const start = new Date(Date.now() - 60 * 60 * 1000)
+    const ts = new Date(Date.now() - 10 * 60 * 1000).toISOString()
+    const synthFile = join(tmpHome, 'synth-burst.txt')
+    await writeFile(synthFile, 'placeholder')
+    _synthSources = [{ path: synthFile, project: 'p', provider: 'test-synthetic' }]
+    _synthYields = [{
+      provider: 'test-synthetic', model: 'synth-model',
+      inputTokens: 1, outputTokens: 5, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0,
+      costUSD: 0, costIsEstimated: false, tools: [], bashCommands: [], skills: [],
+      timestamp: ts, speed: 'standard', deduplicationKey: 'synth-burst-1', userMessage: 'hi', sessionId: 'sb-1',
+    }] as never
+
+    const first = await parseAllSessions({ start, end: new Date() }, 'test-synthetic')
+    expect(totalOutput(first)).toBe(5)
+
+    // The world changes (a second call appears), but a burst-window re-anchor
+    // must serve the PREVIOUS parse: same data, no re-discovery.
+    _synthYields = [..._synthYields, {
+      ...( _synthYields[0] as object ), deduplicationKey: 'synth-burst-2', outputTokens: 7,
+    }] as never
+    const second = await parseAllSessions({ start, end: new Date(Date.now() + 1000) }, 'test-synthetic')
+    expect(totalOutput(second)).toBe(5)
+
+    // Outside the window (env cleared = burst disabled), the fresh parse sees
+    // the new call: proof the reuse was the burst path, not staleness. The
+    // source file must actually change, or the fingerprint-keyed disk cache
+    // (correctly) serves the old turns.
+    vi.stubEnv('CODEBURN_PARSE_BURST_MS', '0')
+    await writeFile(synthFile, 'placeholder v2 with a second call')
+    clearSessionCache()
+    const third = await parseAllSessions({ start, end: new Date(Date.now() + 2000) }, 'test-synthetic')
+    expect(totalOutput(third)).toBe(12)
+    vi.unstubAllEnvs()
+    _synthSources = []
+    _synthYields = []
+  })
+})

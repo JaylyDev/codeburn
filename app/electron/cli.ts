@@ -104,6 +104,8 @@ function releaseSlot(): void {
 /** SIGKILL every in-flight child and cancel anything still queued for a slot.
  *  Wired to Electron's `before-quit`. */
 export function killAll(): void {
+  serveClient?.destroy()
+  serveClient = null
   for (const child of activeChildren) child.kill('SIGKILL')
   activeChildren.clear()
   // A queued waiter has no child to reap, so releaseSlot never fires for it;
@@ -388,6 +390,132 @@ function runCli(spec: SpawnSpec, cmdLabel: string, timeoutMs: number, onStderr?:
  * Read-only, so concurrent identical calls share one child and a 5s result cache
  * absorbs same-cadence pollers. Never use this for config-mutating commands.
  */
+// ── Resident serve child ────────────────────────────────────────────────
+// The heavy read queries (one per panel) each pay seconds of CLI startup on
+// a large corpus: node boot + a 100MB+ session-cache JSON.parse before any
+// query work. `codeburn serve` is the same CLI kept warm: requests go over
+// stdio and the cache stays parsed in the child. Routing rules keep this
+// strictly an optimization:
+//  - only SERVE_ROUTED commands (the app's JSON panel queries) are eligible;
+//  - requests route through serve only once the child is READY AND WARM, so
+//    the cold-start path keeps its spawn (with its stderr progress events);
+//  - any serve failure falls back to a normal spawn for that call;
+//  - three child deaths permanently disable serve for this app run.
+const SERVE_ROUTED = new Set(['status', 'models', 'sessions', 'compare', 'yield', 'spend', 'optimize', 'audit'])
+const SERVE_REQUEST_TIMEOUT_MS = 60_000
+const SERVE_MAX_RESTARTS = 3
+
+class ServeClient {
+  private child: ReturnType<typeof spawn> | null = null
+  private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>()
+  private nextId = 1
+  private ready = false
+  private warm = false
+  private deaths = 0
+  private buffer = ''
+
+  constructor(private readonly spec: SpawnSpec) {}
+
+  isWarmAndReady(): boolean { return this.ready && this.warm && this.child !== null }
+  disabled(): boolean { return this.deaths >= SERVE_MAX_RESTARTS }
+
+  start(): void {
+    if (this.child || this.disabled()) return
+    const child = spawn(this.spec.bin, [...this.spec.args], { shell: false, stdio: ['pipe', 'pipe', 'ignore'], env: this.spec.env })
+    this.child = child
+    child.stdout!.setEncoding('utf8')
+    child.stdout!.on('data', (chunk: string) => this.onData(chunk))
+    const onGone = () => this.onDeath()
+    child.on('exit', onGone)
+    child.on('error', onGone)
+    // Background warm-up: one cheap query makes the child parse the session
+    // cache once; every later panel fetch reuses the in-memory copy.
+    void this.request(['status', '--format', 'menubar-json', '--period', 'today'], SERVE_REQUEST_TIMEOUT_MS)
+      .then(() => { this.warm = true })
+      .catch(() => { /* warm-up failure just leaves routing on the spawn path */ })
+  }
+
+  private onData(chunk: string): void {
+    this.buffer += chunk
+    let idx: number
+    while ((idx = this.buffer.indexOf('\n')) >= 0) {
+      const line = this.buffer.slice(0, idx).trim()
+      this.buffer = this.buffer.slice(idx + 1)
+      if (!line) continue
+      let msg: { id?: number; ready?: boolean; ok?: boolean; refused?: boolean; output?: string; error?: string }
+      try { msg = JSON.parse(line) } catch { continue }
+      if (msg.ready) { this.ready = true; continue }
+      if (typeof msg.id !== 'number') continue
+      const waiter = this.pending.get(msg.id)
+      if (!waiter) continue
+      this.pending.delete(msg.id)
+      clearTimeout(waiter.timer)
+      if (msg.ok && typeof msg.output === 'string') {
+        try { waiter.resolve(JSON.parse(msg.output)) }
+        catch { waiter.reject(new CliError('bad-json', 'codeburn produced output that was not valid JSON')) }
+      } else {
+        waiter.reject(new CliError('nonzero', msg.error ?? 'serve request failed'))
+      }
+    }
+  }
+
+  private onDeath(): void {
+    const child = this.child
+    this.child = null
+    this.ready = false
+    this.warm = false
+    this.deaths += 1
+    if (child) activeChildren.delete(child as never)
+    for (const [, waiter] of this.pending) {
+      clearTimeout(waiter.timer)
+      waiter.reject(new CliError('nonzero', 'codeburn serve exited'))
+    }
+    this.pending.clear()
+  }
+
+  request(args: string[], timeoutMs: number): Promise<unknown> {
+    const child = this.child
+    if (!child?.stdin) return Promise.reject(new CliError('nonzero', 'serve not running'))
+    const id = this.nextId++
+    return new Promise<unknown>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        // A hung request would block the serialized queue behind it; kill the
+        // child so everything falls back to spawns and a fresh serve restarts.
+        this.pending.delete(id)
+        reject(new CliError('timeout', 'codeburn serve timed out'))
+        child.kill('SIGKILL')
+      }, timeoutMs)
+      this.pending.set(id, { resolve, reject, timer })
+      child.stdin!.write(JSON.stringify({ id, args }) + '\n', (err) => {
+        if (err) {
+          this.pending.delete(id)
+          clearTimeout(timer)
+          reject(new CliError('nonzero', 'serve write failed'))
+        }
+      })
+    })
+  }
+
+  destroy(): void {
+    this.deaths = SERVE_MAX_RESTARTS
+    this.child?.kill('SIGKILL')
+    this.onDeath()
+  }
+}
+
+let serveClient: ServeClient | null = null
+
+/** Start the resident serve child and its warm-up query. Called once from app
+ *  startup (never from the spawn path, so unit tests of the scheduler and the
+ *  cold-start flow are byte-identical without it). Safe to call repeatedly. */
+export function startServeWarmup(): void {
+  const target = resolveTarget()
+  if (!target) return
+  if (serveClient?.disabled()) return
+  if (!serveClient) serveClient = new ServeClient(spawnSpecFor(target, ['serve', '--stdio']))
+  serveClient.start()
+}
+
 export function spawnCli(
   args: string[],
   opts: { timeoutMs?: number; onStderr?: (chunk: string) => void; extraEnv?: NodeJS.ProcessEnv; priority?: SpawnPriority } = {},
@@ -405,6 +533,21 @@ export function spawnCli(
   // in-flight child (which already carries onStderr); no second cold parse.
   // Coalesce/cache hits settle here, BEFORE queueing, so they never hold a slot.
   if (existing) return existing
+
+  // Serve fast-path: warm resident child answers the panel query without a
+  // spawn. The child is started once at app startup (startServeWarmup); until
+  // it is warm, every call keeps the plain spawn path.
+  if (SERVE_ROUTED.has(args[0] ?? '') && !opts.extraEnv) {
+    const serve = serveClient
+    if (serve?.isWarmAndReady()) {
+      const flight = serve.request(args, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+        .catch(() => runCli(spec, args[0] ?? '', opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, opts.onStderr))
+        .then(value => { readCache.set(key, { at: Date.now(), value }); return value })
+        .finally(() => { readInflight.delete(key) })
+      readInflight.set(key, flight)
+      return flight
+    }
+  }
 
   const priority = opts.priority ?? 'interactive'
   const flight = (async () => {

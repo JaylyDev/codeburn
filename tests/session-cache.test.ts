@@ -13,6 +13,7 @@ import {
   type FileFingerprint,
   type SessionCache,
   cleanupOrphanedTempFiles,
+  clearLoadCacheMemo,
   computeEnvFingerprint,
   emptyCache,
   fingerprintFile,
@@ -880,5 +881,31 @@ describe('cleanupOrphanedTempFiles', () => {
   it('does not fail when cache dir does not exist', async () => {
     process.env['CODEBURN_CACHE_DIR'] = '/no/such/dir'
     await cleanupOrphanedTempFiles()
+  })
+})
+
+// ── loadCache memo (serve fast-path) ─────────────────────────────────────
+
+describe('loadCache memo', () => {
+  it('returns the identical object while the file is unchanged, reloads on rewrite', async () => {
+    clearLoadCacheMemo()
+    const cache = emptyCache()
+    cache.providers['memo-test'] = { envFingerprint: 'x', files: {} }
+    await saveCache(cache)
+
+    // saveCache write-through: the very object just published is served back.
+    const first = await loadCache()
+    expect(first).toBe(cache)
+    const second = await loadCache()
+    expect(second).toBe(first)
+
+    // An external rewrite (another process) moves mtime/size: fresh parse.
+    const external = emptyCache()
+    external.providers['memo-test-2'] = { envFingerprint: 'y', files: {} }
+    await saveCache(external)
+    const third = await loadCache()
+    expect(third).toBe(external)
+    expect(third).not.toBe(first)
+    clearLoadCacheMemo()
   })
 })

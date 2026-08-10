@@ -540,11 +540,30 @@ async function adoptNewestPriorCache(): Promise<SessionCache | null> {
   return merged
 }
 
+// In-process memo of the parsed cache, keyed by the file identity that last
+// produced it. On a 100MB+ corpus the JSON.parse of the session cache is
+// seconds of work per load; a resident process (codeburn serve) pays it once
+// and revalidates with a stat() per request. A rewrite by ANOTHER process
+// moves mtime/size and forces a reload, so cross-process freshness is
+// preserved; saveCache updates the memo write-through so the object handed
+// out stays the canonical one after a refresh.
+let cacheMemo: { path: string; mtimeMs: number; size: number; cache: SessionCache } | null = null
+
+export function clearLoadCacheMemo(): void {
+  cacheMemo = null
+}
+
 export async function loadCache(): Promise<SessionCache> {
+  const path = getCachePath()
   try {
-    const raw = await readFile(getCachePath(), 'utf-8')
+    const info = await stat(path)
+    if (cacheMemo && cacheMemo.path === path && cacheMemo.mtimeMs === info.mtimeMs && cacheMemo.size === info.size) {
+      return cacheMemo.cache
+    }
+    const raw = await readFile(path, 'utf-8')
     const parsed = JSON.parse(raw)
     if (!validateCache(parsed)) return afterMissingVersionedCache()
+    cacheMemo = { path, mtimeMs: info.mtimeMs, size: info.size, cache: parsed }
     return parsed
   } catch {
     return afterMissingVersionedCache()
@@ -614,6 +633,15 @@ export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Pr
       }
     }
     if (!renamed) throw new Error('session cache rename failed')
+    // Write-through: the object just published IS the freshest state; capture
+    // the post-rename file identity so the next loadCache in this process
+    // reuses it instead of re-parsing what it just wrote.
+    try {
+      const info = await stat(finalPath)
+      cacheMemo = { path: finalPath, mtimeMs: info.mtimeMs, size: info.size, cache }
+    } catch {
+      cacheMemo = null
+    }
     return true
   } catch (err) {
     await retryCacheFileMutation(() => unlink(tempPath))
