@@ -3205,6 +3205,20 @@ function parseBurstWindowMs(): number {
   return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 60_000) : 0
 }
 
+// A resident process (codeburn serve) can install a validator that answers
+// "has any watched session root changed since this timestamp?" — typically
+// backed by fs.watch over every provider's probeRoots(). While the validator
+// reports clean, a previous parse stays reusable well past the burst window,
+// bounded by a hard cap so a missed filesystem event self-heals instead of
+// pinning stale data forever. Null (the default everywhere but serve) keeps
+// reuse strictly inside the burst window.
+let parseReuseValidator: ((sinceTs: number) => boolean) | null = null
+const VALIDATED_REUSE_CAP_MS = 5 * 60 * 1000
+
+export function setParseReuseValidator(validator: ((sinceTs: number) => boolean) | null): void {
+  parseReuseValidator = validator
+}
+
 function burstReuse(dateRange: DateRange, sig: string): ProjectSummary[] | null {
   const windowMs = parseBurstWindowMs()
   if (windowMs <= 0) return null
@@ -3213,8 +3227,11 @@ function burstReuse(dateRange: DateRange, sig: string): ProjectSummary[] | null 
   const endMs = dateRange.end.getTime()
   for (const entry of sessionCache.values()) {
     if (entry.sig !== sig || entry.startMs !== startMs || entry.endMs === undefined) continue
-    if (now - entry.ts > windowMs) continue
-    if (endMs < entry.endMs || endMs - entry.endMs > windowMs) continue
+    const age = now - entry.ts
+    const insideBurst = age <= windowMs
+    const validatedClean = parseReuseValidator !== null && age <= VALIDATED_REUSE_CAP_MS && parseReuseValidator(entry.ts)
+    if (!insideBurst && !validatedClean) continue
+    if (endMs < entry.endMs || endMs - entry.endMs > Math.max(windowMs, validatedClean ? VALIDATED_REUSE_CAP_MS : 0)) continue
     return filterProjectsByDateRange(entry.data, dateRange)
   }
   return null
