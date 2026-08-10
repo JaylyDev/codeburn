@@ -3190,7 +3190,35 @@ async function parseProviderSources(
 
 const CACHE_TTL_MS = 180_000
 const MAX_CACHE_ENTRIES = 10
-const sessionCache = new Map<string, { data: ProjectSummary[]; ts: number }>()
+const sessionCache = new Map<string, { data: ProjectSummary[]; ts: number; startMs?: number; endMs?: number; sig?: string }>()
+
+// Burst reuse for a resident process (codeburn serve). Every payload command
+// anchors its range end at its own `new Date()`, so two panel fetches issued
+// milliseconds apart carry different end timestamps and the exact-key memo
+// above never hits in real traffic — each fetch re-runs the full discovery +
+// fingerprint sweep. Within this window, a parse whose range differs ONLY by
+// a through-now end within the window is served by trimming the previous
+// parse instead. Staleness is bounded by the window; 0 (the default outside
+// serve) disables it, so one-shot CLI runs are byte-exact as ever.
+function parseBurstWindowMs(): number {
+  const raw = Number(process.env['CODEBURN_PARSE_BURST_MS'] ?? '0')
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 60_000) : 0
+}
+
+function burstReuse(dateRange: DateRange, sig: string): ProjectSummary[] | null {
+  const windowMs = parseBurstWindowMs()
+  if (windowMs <= 0) return null
+  const now = Date.now()
+  const startMs = dateRange.start.getTime()
+  const endMs = dateRange.end.getTime()
+  for (const entry of sessionCache.values()) {
+    if (entry.sig !== sig || entry.startMs !== startMs || entry.endMs === undefined) continue
+    if (now - entry.ts > windowMs) continue
+    if (endMs < entry.endMs || endMs - entry.endMs > windowMs) continue
+    return filterProjectsByDateRange(entry.data, dateRange)
+  }
+  return null
+}
 
 function cacheKey(dateRange?: DateRange, providerFilter?: string): string {
   const s = dateRange ? `${dateRange.start.getTime()}:${dateRange.end.getTime()}` : 'none'
@@ -3216,7 +3244,15 @@ function cachePut(key: string, data: ProjectSummary[]) {
     const oldest = [...sessionCache.entries()].sort((a, b) => a[1].ts - b[1].ts)[0]
     if (oldest) sessionCache.delete(oldest[0])
   }
-  sessionCache.set(key, { data, ts: now })
+  sessionCache.set(key, { data, ts: now, ...(putMeta ?? {}) })
+  putMeta = null
+}
+
+// Range metadata for the entry cachePut is about to store, set by the one
+// parseAllSessions call path right before it saves its result.
+let putMeta: { startMs: number; endMs: number; sig: string } | null = null
+export function setCachePutMeta(meta: { startMs: number; endMs: number; sig: string } | null): void {
+  putMeta = meta
 }
 
 export function filterProjectsByName(
@@ -3631,6 +3667,13 @@ export async function parseAllSessions(dateRange?: DateRange, providerFilter?: s
   const key = cacheKey(dateRange, providerFilter)
   const cached = sessionCache.get(key)
   if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.data
+  // The signature is the key minus the range: what must match for a burst
+  // reuse (provider, config env, proxy hash) regardless of the now-anchor.
+  const burstSig = cacheKey(undefined, providerFilter)
+  if (dateRange) {
+    const reused = burstReuse(dateRange, burstSig)
+    if (reused) return reused
+  }
 
   let diskCache = await loadCache()
   await cleanupOrphanedTempFiles()
@@ -3855,6 +3898,7 @@ async function runParse(
 
   const result = Array.from(mergedMap.values()).sort((a, b) => b.totalCostUSD - a.totalCostUSD)
   correlateCrossProviderPrSessions(result)
+  if (dateRange) setCachePutMeta({ startMs: dateRange.start.getTime(), endMs: dateRange.end.getTime(), sig: cacheKey(undefined, providerFilter) })
   cachePut(key, result)
   return result
 }

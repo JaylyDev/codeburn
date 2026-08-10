@@ -1,7 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 
-import { CliError, killAll, resolveCodeburnPath, spawnCli, spawnCliAction, type ActionResult, type SpawnPriority } from './cli'
+import { CliError, killAll, resolveCodeburnPath, spawnCli, spawnCliAction, startServeWarmup, type ActionResult, type SpawnPriority } from './cli'
 import { getQuota, sanitizeError } from './quota'
 import { Telemetry } from './telemetry'
 import { createUpdateChecker, type UpdateChecker, type UpdateStatus } from './updates'
@@ -564,6 +564,10 @@ function bootstrap(): void {
   }))
 
   void app.whenReady().then(() => {
+    // Start the resident serve child early so its warm-up (one cache parse)
+    // finishes during the first panels' cold spawns; every fetch after that
+    // answers from the warm child in milliseconds.
+    startServeWarmup()
     // Consent-gated anonymous telemetry (desktop only). Nothing transmits until
     // the onboarding consent screen is completed and the toggle is on; EU/EEA/
     // UK/CH installs default the toggle off. Dev builds never send.

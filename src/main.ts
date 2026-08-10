@@ -428,6 +428,12 @@ function assertScope(value: string, allowed: readonly string[], command: string)
   }
 }
 
+// Wrapped in a factory because commander option state is sticky across
+// parses: `codeburn serve` executes many requests in one process and must
+// build a FRESH program per request or one request's --period would leak
+// into the next one's defaults. The normal CLI path builds it exactly once.
+function buildProgram(): Command {
+
 async function runJsonReport(period: Period, provider: string, project: string[], exclude: string[]): Promise<void> {
   await loadPricing()
   const { range, label } = getDateRange(period)
@@ -2339,4 +2345,22 @@ registerActCommands(program)
 registerGuardCommands(program)
 registerSyncCommands(program)
 
-program.parse()
+program
+  .command('serve')
+  .description('Run a resident query server over stdio (used by the desktop app to avoid per-fetch CLI startup cost)')
+  .option('--stdio', 'Serve JSON requests over stdin/stdout (the only mode)')
+  .action(() => {
+    // Never reached: the serve entry is dispatched before commander parses,
+    // because serving needs the buildProgram factory itself. Registered so
+    // `codeburn serve` appears in help and never falls through to `report`.
+  })
+
+return program
+}
+
+if (process.argv[2] === 'serve') {
+  const { runStdioServe } = await import('./serve.js')
+  await runStdioServe(buildProgram)
+} else {
+  buildProgram().parse()
+}
