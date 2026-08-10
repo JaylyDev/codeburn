@@ -1,3 +1,5 @@
+import { watch, type FSWatcher } from 'fs'
+import { stat } from 'fs/promises'
 import { createInterface } from 'readline'
 
 import type { Command } from 'commander'
@@ -88,12 +90,69 @@ async function runCaptured(buildProgram: () => Command, args: string[]): Promise
   }
 }
 
+/// Watch every provider's probe roots (the same paths codeburn doctor reports
+/// as "where discovery looks") so the parse-reuse validator can answer "did
+/// any session data change since T?" without a stat sweep. macOS fs.watch
+/// rides FSEvents and supports recursive directory watches; a root that fails
+/// to watch is simply not covered, which only shortens reuse (the burst
+/// window and the hard cap still apply), never staleness.
+async function startRootWatchers(): Promise<{ startedAt: number; lastEventAt: () => number; close: () => void }> {
+  let lastEventAt = 0
+  const startedAt = Date.now()
+  const watchers: FSWatcher[] = []
+  try {
+    const { getAllProviders } = await import('./providers/index.js')
+    const providers = await getAllProviders()
+    const roots = new Set<string>()
+    for (const provider of providers) {
+      if (!provider.probeRoots) continue
+      try {
+        for (const root of await provider.probeRoots()) roots.add(root.path)
+      } catch { /* a failing probe just goes unwatched */ }
+    }
+    for (const root of roots) {
+      try {
+        const info = await stat(root)
+        const watcher = watch(root, { recursive: info.isDirectory() }, () => { lastEventAt = Date.now() })
+        watcher.on('error', () => { /* dropped watcher = shorter reuse, never staleness */ })
+        watchers.push(watcher)
+      } catch { /* nonexistent root: nothing to watch */ }
+    }
+  } catch { /* watcherless serve still works via the burst window */ }
+  return {
+    startedAt,
+    lastEventAt: () => lastEventAt,
+    close: () => { for (const w of watchers) w.close() },
+  }
+}
+
 export async function runStdioServe(buildProgram: () => Command): Promise<void> {
   // Panel bursts (the app fetching every panel for one period) reuse a parse
   // whose through-now range end differs by less than this window, instead of
   // re-running the discovery sweep per panel. Serve-only: one-shot CLI runs
   // never set this, so their results stay byte-exact.
   if (!process.env['CODEBURN_PARSE_BURST_MS']) process.env['CODEBURN_PARSE_BURST_MS'] = '10000'
+  // Event-driven reuse: while no watched session root has changed, a previous
+  // parse stays valid past the burst window (capped in parser.ts, so a missed
+  // filesystem event self-heals within minutes). This is what turns a warm
+  // no-change fetch into a no-op instead of a stat sweep.
+  let rootsQuietSince: ((sinceTs: number) => boolean) | null = null
+  void startRootWatchers().then(async (w) => {
+    const { setParseReuseValidator } = await import('./parser.js')
+    // Clean means: the watchers were already armed when the parse happened,
+    // and no filesystem event has landed since. lastEventAt of 0 is a quiet
+    // system (clean for anything parsed after arming), not an unknown.
+    const quiet = (sinceTs: number): boolean => sinceTs >= w.startedAt && w.lastEventAt() < sinceTs
+    rootsQuietSince = quiet
+    setParseReuseValidator(quiet)
+  }).catch(() => { /* watcherless serve still works via the burst window */ })
+
+  // Output-level memo: an identical panel query while the roots are quiet
+  // returns the previous stdout verbatim - the aggregation work is skipped
+  // too, not just the parse. Invalidation is the same event-or-cap rule the
+  // parse reuse uses.
+  const OUTPUT_MEMO_CAP_MS = 5 * 60 * 1000
+  const outputMemo = new Map<string, { at: number; output: string }>()
   if (process.stdin.isTTY) {
     process.stderr.write('codeburn serve speaks JSON over stdio and exists for the desktop app to hold warm.\nNothing interactive happens here; press Ctrl+C to exit.\n')
   }
@@ -124,9 +183,22 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
         write({ id: request.id, ok: false, refused: true, error: 'command not served' })
         return
       }
+      const memoKey = request.args.join('\u0000')
+      const memoHit = outputMemo.get(memoKey)
+      if (memoHit && Date.now() - memoHit.at < OUTPUT_MEMO_CAP_MS && rootsQuietSince?.(memoHit.at)) {
+        write({ id: request.id, ok: true, output: memoHit.output })
+        return
+      }
       try {
         const { output, code } = await runCaptured(buildProgram, request.args)
-        if (code === 0) write({ id: request.id, ok: true, output })
+        if (code === 0) {
+          outputMemo.set(memoKey, { at: Date.now(), output })
+          if (outputMemo.size > 32) {
+            const oldest = [...outputMemo.entries()].sort((a, b) => a[1].at - b[1].at)[0]
+            if (oldest) outputMemo.delete(oldest[0])
+          }
+          write({ id: request.id, ok: true, output })
+        }
         else write({ id: request.id, ok: false, error: `exit ${code}`, output })
       } catch (err) {
         write({ id: request.id, ok: false, error: err instanceof Error ? err.message : String(err) })

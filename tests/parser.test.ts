@@ -13,7 +13,7 @@ import { join } from 'path'
 import { createRequire } from 'node:module'
 
 import { isSqliteAvailable } from '../src/sqlite.js'
-import { clearSessionCache, parseAllSessions } from '../src/parser.js'
+import { clearSessionCache, parseAllSessions, setParseReuseValidator } from '../src/parser.js'
 import { loadCache, saveCache, sessionCachePath } from '../src/session-cache.js'
 import type { SessionSource, SessionParser, ParsedProviderCall } from '../src/providers/types.js'
 
@@ -721,6 +721,47 @@ describe('(q) parse burst reuse (CODEBURN_PARSE_BURST_MS)', () => {
     clearSessionCache()
     const third = await parseAllSessions({ start, end: new Date(Date.now() + 2000) }, 'test-synthetic')
     expect(totalOutput(third)).toBe(12)
+    vi.unstubAllEnvs()
+    _synthSources = []
+    _synthYields = []
+  })
+})
+
+describe('(r) validated parse reuse (setParseReuseValidator)', () => {
+  it('reuses past the burst window while the validator reports quiet, never when dirty', async () => {
+    vi.stubEnv('CODEBURN_PARSE_BURST_MS', '1')
+    clearSessionCache()
+    const start = new Date(Date.now() - 60 * 60 * 1000)
+    const ts = new Date(Date.now() - 10 * 60 * 1000).toISOString()
+    const synthFile = join(tmpHome, 'synth-validated.txt')
+    await writeFile(synthFile, 'placeholder')
+    _synthSources = [{ path: synthFile, project: 'p', provider: 'test-synthetic' }]
+    _synthYields = [{
+      provider: 'test-synthetic', model: 'synth-model',
+      inputTokens: 1, outputTokens: 5, cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0,
+      costUSD: 0, costIsEstimated: false, tools: [], bashCommands: [], skills: [],
+      timestamp: ts, speed: 'standard', deduplicationKey: 'synth-val-1', userMessage: 'hi', sessionId: 'sv-1',
+    }] as never
+
+    const first = await parseAllSessions({ start, end: new Date() }, 'test-synthetic')
+    expect(totalOutput(first)).toBe(5)
+
+    // 1ms burst window has certainly elapsed; with a quiet validator the
+    // previous parse is still served (world changed, result must not).
+    await new Promise(r => setTimeout(r, 5))
+    setParseReuseValidator(() => true)
+    _synthYields = [..._synthYields, { ...( _synthYields[0] as object ), deduplicationKey: 'synth-val-2', outputTokens: 7 }] as never
+    await writeFile(synthFile, 'placeholder v2')
+    const second = await parseAllSessions({ start, end: new Date(Date.now() + 500) }, 'test-synthetic')
+    expect(totalOutput(second)).toBe(5)
+
+    // A dirty validator ends the reuse: fresh parse sees the new call.
+    setParseReuseValidator(() => false)
+    const third = await parseAllSessions({ start, end: new Date(Date.now() + 1000) }, 'test-synthetic')
+    expect(totalOutput(third)).toBe(12)
+
+    setParseReuseValidator(null)
     vi.unstubAllEnvs()
     _synthSources = []
     _synthYields = []
