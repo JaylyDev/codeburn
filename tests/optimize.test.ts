@@ -234,6 +234,30 @@ describe('detectDuplicateReads', () => {
 })
 
 describe('detectLowReadEditRatio', () => {
+  it('counts read-shaped bash commands as reads (#941)', () => {
+    // 10 edits with 40 rg/cat/git-log lookups through the shell: a healthy
+    // 4:1 workflow that previously read as 0 reads and fired at high impact.
+    const calls = [
+      ...Array.from({ length: 20 }, () => call('Bash', { command: 'rg -n "pattern" src/' })),
+      ...Array.from({ length: 10 }, () => call('Bash', { command: 'cat src/parser.ts | head -50' })),
+      ...Array.from({ length: 10 }, () => call('Bash', { command: 'git log --oneline -5' })),
+      ...Array.from({ length: 10 }, () => call('Edit', {})),
+    ]
+    expect(detectLowReadEditRatio(calls)).toBeNull()
+  })
+
+  it('does not count mutating or unclassifiable bash as reads (#941)', () => {
+    const calls = [
+      ...Array.from({ length: 20 }, () => call('Bash', { command: 'npm test' })),
+      ...Array.from({ length: 10 }, () => call('Bash', { command: 'cat notes.md && sed -i s/a/b/ src/x.ts' })),
+      ...Array.from({ length: 10 }, () => call('Bash', {})),
+      ...Array.from({ length: 10 }, () => call('Edit', {})),
+    ]
+    const finding = detectLowReadEditRatio(calls)
+    expect(finding).not.toBeNull()
+    expect(finding!.explanation).toContain('0 reads')
+  })
+
   it('returns null below minimum edit count', () => {
     const calls = [
       call('Edit', {}),

@@ -1,4 +1,5 @@
 import chalk from 'chalk'
+import { isReadShapedBashCommand } from './bash-utils.js'
 import { readdir, stat } from 'fs/promises'
 import { existsSync, statSync } from 'fs'
 import { basename, join } from 'path'
@@ -382,6 +383,10 @@ function compactOptimizeInput(name: string, input: unknown): Record<string, unkn
   if (isReadTool(name)) {
     const filePath = cappedString(raw['file_path'], OPTIMIZE_TEXT_CAP)
     return filePath ? { file_path: filePath } : {}
+  }
+  if (BASH_TOOL_NAMES.has(name)) {
+    const command = cappedString(raw['command'], OPTIMIZE_TEXT_CAP)
+    return command ? { command } : {}
   }
   if (name === 'Agent' || name === 'Task') {
     const subagentType = cappedString(raw['subagent_type'])
@@ -2189,6 +2194,7 @@ export function detectBloatedClaudeMd(projectCwds: Set<string>): WasteFinding | 
 
 export const READ_TOOL_NAMES = new Set(['Read', 'Grep', 'Glob', 'FileReadTool', 'GrepTool', 'GlobTool'])
 export const EDIT_TOOL_NAMES = new Set(['Edit', 'Write', 'FileEditTool', 'FileWriteTool', 'NotebookEdit'])
+export const BASH_TOOL_NAMES = new Set(['Bash', 'BashTool', 'PowerShellTool'])
 
 export function detectLowReadEditRatio(calls: ToolCall[]): WasteFinding | null {
   let reads = 0
@@ -2197,6 +2203,12 @@ export function detectLowReadEditRatio(calls: ToolCall[]): WasteFinding | null {
   let recentReads = 0
   for (const call of calls) {
     if (READ_TOOL_NAMES.has(call.name)) {
+      reads++
+      if (call.recent) recentReads++
+    } else if (BASH_TOOL_NAMES.has(call.name) && typeof call.input['command'] === 'string' && isReadShapedBashCommand(call.input['command'])) {
+      // A session that looks things up with rg/cat/git log IS reading (#941):
+      // ignoring shell reads scored disciplined rg-first workflows as
+      // reckless editors (90%+ of real reads were invisible to this ratio).
       reads++
       if (call.recent) recentReads++
     } else if (EDIT_TOOL_NAMES.has(call.name)) {
