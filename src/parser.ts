@@ -3595,13 +3595,31 @@ export function correlateCrossProviderPrSessions(projects: ProjectSummary[]): vo
   // Prompt-linked sessions become valid cwd anchors too. Attribute only when an
   // exact cwd maps to one PR set; a main checkout used for multiple PRs remains
   // intentionally ambiguous.
-  const refsByCwd = new Map<string, Map<string, string[]>>()
+  //
+  // Time-bounded (the eywa#160 lesson): cwd evidence also carries the evidence
+  // sessions' own activity window, and only sessions OVERLAPPING that window
+  // (plus a pad) inherit the PR. Without the bound, a repo whose only captured
+  // PR link was pasted once became a black hole — every session ever run in
+  // that checkout, a month of unrelated work included, was attributed to it
+  // (129 of 131 sessions, ~$7.4K direct, observed on real data). The rule's
+  // charter is "a tool session launched around PR work in this checkout",
+  // which is inherently a same-working-stretch claim.
+  const CWD_WINDOW_PAD_MS = 6 * 60 * 60 * 1000
+  type CwdAnchor = { refs: string[]; startMs: number; endMs: number }
+  const refsByCwd = new Map<string, Map<string, CwdAnchor>>()
   for (const [session, evidenceRefs] of evidence) {
     const cwd = normalizedWorkingDirectory(session.workingDirectory)
     if (!cwd || evidenceRefs.length !== 1) continue
+    const startMs = Date.parse(session.firstTimestamp)
+    const endMs = Date.parse(session.lastTimestamp)
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) continue
     const refs = evidenceRefs.slice().sort()
-    const sets = refsByCwd.get(cwd) ?? new Map<string, string[]>()
-    sets.set(refs.join('\0'), refs)
+    const key = refs.join('\0')
+    const sets = refsByCwd.get(cwd) ?? new Map<string, CwdAnchor>()
+    const existing = sets.get(key)
+    sets.set(key, existing
+      ? { refs, startMs: Math.min(existing.startMs, startMs), endMs: Math.max(existing.endMs, endMs) }
+      : { refs, startMs, endMs })
     refsByCwd.set(cwd, sets)
   }
   for (const session of sessions) {
@@ -3609,7 +3627,13 @@ export function correlateCrossProviderPrSessions(projects: ProjectSummary[]): vo
     const cwd = normalizedWorkingDirectory(session.workingDirectory)
     if (!cwd) continue
     const sets = refsByCwd.get(cwd)
-    if (sets?.size === 1) assignCorrelatedPrs(session, [...sets.values()][0]!, 'working-directory')
+    if (sets?.size !== 1) continue
+    const anchor = [...sets.values()][0]!
+    const sessionStart = Date.parse(session.firstTimestamp)
+    const sessionEnd = Date.parse(session.lastTimestamp)
+    if (!Number.isFinite(sessionStart) || !Number.isFinite(sessionEnd)) continue
+    if (sessionEnd < anchor.startMs - CWD_WINDOW_PAD_MS || sessionStart > anchor.endMs + CWD_WINDOW_PAD_MS) continue
+    assignCorrelatedPrs(session, anchor.refs, 'working-directory')
   }
 }
 
