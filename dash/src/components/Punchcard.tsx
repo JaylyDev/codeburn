@@ -123,12 +123,12 @@ export function Punchcard({ timeline }: { timeline: GranularHistory }) {
                     onMouseEnter={(e) => {
                       if (!cell.covered || !wrapRef.current) return
                       const r = wrapRef.current.getBoundingClientRect()
-                      setHover({ x: e.clientX - r.left, y: e.clientY - r.top, wd, h })
+                      setHover({ x: Math.min(Math.max(e.clientX - r.left, 70), r.width - 70), y: e.clientY - r.top, wd, h })
                     }}
                     onMouseMove={(e) => {
                       if (!cell.covered || !wrapRef.current) return
                       const r = wrapRef.current.getBoundingClientRect()
-                      setHover({ x: e.clientX - r.left, y: e.clientY - r.top, wd, h })
+                      setHover({ x: Math.min(Math.max(e.clientX - r.left, 70), r.width - 70), y: e.clientY - r.top, wd, h })
                     }}
                   >
                     <div
@@ -158,8 +158,10 @@ export function Punchcard({ timeline }: { timeline: GranularHistory }) {
 
           {hover && hovered && (
             <div
-              className="pointer-events-none absolute z-10 -translate-x-1/2 -translate-y-full rounded-lg border border-border bg-popover px-2.5 py-1.5 text-xs shadow-xl ring-1 ring-black/5"
-              style={{ left: hover.x, top: hover.y - 8 }}
+              className="pointer-events-none absolute z-10 -translate-x-1/2 rounded-lg border border-border bg-popover px-2.5 py-1.5 text-xs shadow-xl ring-1 ring-black/5"
+              // Top rows flip the tooltip below the cursor; the overflow
+              // container clips anything above its own top edge.
+              style={{ left: hover.x, top: hover.y < 56 ? hover.y + 14 : hover.y - 8, transform: hover.y < 56 ? 'translateX(-50%)' : 'translate(-50%, -100%)' }}
             >
               <div className="font-medium text-foreground">
                 {WEEKDAYS_FULL[hover.wd]} {pad2(hover.h)}:00
