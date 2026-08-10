@@ -34,6 +34,12 @@ describe('buildWorkflowRows', () => {
     expect(buildWorkflowRows(data({ coverage: 1 }))[3]).toEqual({ label: 'Coverage', value: '100%' })
   })
 
+  it('floors near-complete coverage so 100% is reserved for genuinely complete pricing', () => {
+    // Observed live: 99.59% (107 unpriced calls) rendered as 100% while the
+    // model panel warned about the unpriced model on the same screen.
+    expect(buildWorkflowRows(data({ coverage: 0.9959 }))[3]).toEqual({ label: 'Coverage', value: '99%' })
+  })
+
   it('formats the first-edit median as seconds under a minute and whole minutes above', () => {
     expect(buildWorkflowRows(data({ medianTimeToFirstEditMs: 45_000 }))[1]!.value).toBe('45s')
     expect(buildWorkflowRows(data({ medianTimeToFirstEditMs: 60_000 }))[1]!.value).toBe('1m')

@@ -752,7 +752,11 @@ function formatReworkValue(file: ReworkedFile | null): string {
 }
 
 function formatCoverageValue(coverage: number): string {
-  return `${Math.round(coverage * 100)}%`
+  // Floor, never round: 99.6% coverage with unpriced calls outstanding must
+  // not render as the "100%" the panel reserves for genuinely complete
+  // pricing (observed live: 107 unpriced calls rendering as 100% while the
+  // model panel warned about them on the same screen).
+  return `${Math.floor(coverage * 100)}%`
 }
 
 export type WorkflowRow = { label: string; value: string }
