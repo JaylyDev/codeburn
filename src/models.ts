@@ -514,6 +514,15 @@ export function getLocalModelSavingsConfigHash(): string {
   return parts.join('\u0002')
 }
 
+/// Stable hash of the model-alias map, for the same staleness class as the
+/// hashes below: a resident process (codeburn serve) must not serve memoized
+/// parse results priced under aliases the user has since changed.
+export function getModelAliasesConfigHash(): string {
+  const keys = Object.keys(userAliases).sort()
+  if (keys.length === 0) return ''
+  return keys.map(k => `${k}\u0001${userAliases[k]}`).join('\u0002')
+}
+
 export function getPriceOverridesConfigHash(): string {
   // The builtin overrides participate so editing BUILTIN_PRICE_OVERRIDES in a
   // release invalidates cached daily costs the same way a user override does.

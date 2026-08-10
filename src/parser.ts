@@ -2,7 +2,7 @@ import { existsSync } from 'fs'
 import { lstat, readFile, readdir, stat } from 'fs/promises'
 import { basename, dirname, join, resolve, sep } from 'path'
 import { readSessionLines } from './fs-utils.js'
-import { calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash } from './models.js'
+import { calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
 import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
 import { normalizeContentBlocks } from './content-utils.js'
 import { discoverAllSessions, getProvider } from './providers/index.js'
@@ -3228,7 +3228,10 @@ function cacheKey(dateRange?: DateRange, providerFilter?: string): string {
   const claudeEnv = (process.env['CLAUDE_CONFIG_DIRS'] ?? '') + '|' + (process.env['CLAUDE_CONFIG_DIR'] ?? '')
   // Proxy attribution (totalProxiedCostUSD) is computed live from proxyPaths and
   // then cached, so the key must change when that config changes.
-  return `${s}:${providerFilter ?? 'all'}:${claudeEnv}:${getProxyPathsConfigHash()}`
+  // Pricing-affecting config participates so a memoized parse (exact-key or
+  // burst-reused in a resident serve process) can never present costs priced
+  // under aliases/overrides/savings the user has since changed.
+  return `${s}:${providerFilter ?? 'all'}:${claudeEnv}:${getProxyPathsConfigHash()}:${getModelAliasesConfigHash()}:${getPriceOverridesConfigHash()}:${getLocalModelSavingsConfigHash()}`
 }
 
 export function clearSessionCache(): void {
