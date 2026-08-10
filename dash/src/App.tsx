@@ -172,7 +172,10 @@ function DeviceView({ payload, isRemote, unit }: { payload?: Payload; isRemote: 
             rows={(c?.modelEfficiency ?? []).slice(0, 10).map((m) => ({
               name: m.name,
               costPerEdit: usd(m.costPerEdit),
-              oneShot: `${Math.round(m.oneShotRate * 100)}%`,
+              // modelEfficiency.oneShotRate arrives as a PERCENT (0-100),
+              // unlike current.oneShotRate which is a fraction - the TUI and
+              // menubar render it verbatim; multiplying again showed 10000%.
+              oneShot: `${Math.round(m.oneShotRate)}%`,
             }))}
           />
         </Panel>
