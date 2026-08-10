@@ -90,9 +90,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
-        // Set accessory policy before the app's focus chain forms. On macOS Tahoe
-        // (26.x), setting it after didFinishLaunching causes ghost status items
-        // because the policy gets baked into the initial focus chain.
+        // Belt-and-suspenders for dev runs only: packaged builds ship
+        // LSUIElement=true (package-app.sh / build-local.sh), so LaunchServices
+        // starts the process at .accessory before main() runs and this call is
+        // a measured no-op there (returns false, no state change — #868
+        // analysis). What actually matters is that the policy NEVER
+        // transitions while a live NSStatusItem exists: the .regular →
+        // .accessory dance from #147 is what plausibly caused the ghost item
+        // that 85b5728 fixed. Keep the policy pinned; see the activate() call
+        // in applicationDidFinishLaunching for the other half of the story.
         NSApp.setActivationPolicy(.accessory)
     }
 
