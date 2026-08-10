@@ -19,6 +19,7 @@ vi.stubGlobal('localStorage', {
 const mocks = vi.hoisted(() => ({
   getOverview: vi.fn<(period: string, provider: string, range?: DateRange, configSource?: string | null, background?: boolean, scope?: string) => Promise<MenubarPayload>>(),
   getSpendFlow: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<SpendFlow>>(),
+  getTimeline: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<MenubarPayload>>(),
   getOptimizeReport: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<OptimizeJsonReport>>(),
   getModels: vi.fn(),
   getSessions: vi.fn(),
@@ -130,6 +131,7 @@ function withConfigs(payload: MenubarPayload): MenubarPayload {
 function installDefaultMocks() {
   for (const mock of Object.values(mocks)) mock.mockReset()
   mocks.getOverview.mockResolvedValue(overviewPayload())
+  mocks.getTimeline.mockResolvedValue(overviewPayload())
   mocks.getSpendFlow.mockResolvedValue({ period: { label: 'Last 30 days', start: '', end: '' }, models: [], projects: [], links: [] })
   mocks.getOptimizeReport.mockResolvedValue({
     period: { label: 'Last 30 days', start: null, end: null },

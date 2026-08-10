@@ -6,13 +6,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { MenubarPayload, SpendFlow } from '../lib/types'
 import { Spend } from './Spend'
 
-const { getOverview, getSpendFlow } = vi.hoisted(() => ({
+const { getOverview, getSpendFlow, getTimeline } = vi.hoisted(() => ({
   getOverview: vi.fn<(period: string, provider: string) => Promise<MenubarPayload>>(),
   getSpendFlow: vi.fn<(period: string, provider: string) => Promise<SpendFlow>>(),
+  getTimeline: vi.fn<(period: string, provider: string) => Promise<MenubarPayload>>(),
 }))
 vi.mock('../lib/ipc', async orig => {
   const actual = await orig<typeof import('../lib/ipc')>()
-  return { ...actual, codeburn: { getOverview, getSpendFlow } }
+  return { ...actual, codeburn: { getOverview, getSpendFlow, getTimeline } }
 })
 
 function daily(date: string, cost: number, models: Array<{ name: string; cost: number }>) {
@@ -139,6 +140,7 @@ describe('Spend', () => {
   it('zero-fills a contiguous 15-day calendar window with a real date axis, projects, and Sankey ribbons', async () => {
     getOverview.mockResolvedValue(makePayload(new Date()))
     getSpendFlow.mockResolvedValue(makeFlow())
+    getTimeline.mockResolvedValue(makePayload(new Date()))
 
     const { container } = render(<Spend period="week" provider="all" />)
 
@@ -165,6 +167,7 @@ describe('Spend', () => {
   it('renders the chart, projects, Sankey, and all non-empty breakdowns on one page', async () => {
     getOverview.mockResolvedValue(makePayload(new Date()))
     getSpendFlow.mockResolvedValue(makeFlow())
+    getTimeline.mockResolvedValue(makePayload(new Date()))
 
     render(<Spend period="week" provider="all" />)
     expect(await screen.findByLabelText('Daily spend by model')).toBeInTheDocument()
@@ -195,6 +198,7 @@ describe('Spend', () => {
     }
     getOverview.mockResolvedValue(payload)
     getSpendFlow.mockResolvedValue(makeFlow())
+    getTimeline.mockResolvedValue(makePayload(new Date()))
 
     render(<Spend period="week" provider="all" />)
     expect(await screen.findByText('codeburn')).toBeInTheDocument()
@@ -210,6 +214,7 @@ describe('Spend', () => {
     payload.current.subagents = []
     getOverview.mockResolvedValue(payload)
     getSpendFlow.mockResolvedValue(makeFlow())
+    getTimeline.mockResolvedValue(makePayload(new Date()))
 
     render(<Spend period="week" provider="all" />)
 
@@ -223,6 +228,7 @@ describe('Spend', () => {
   it('does not render the removed lens tabs', async () => {
     getOverview.mockResolvedValue(makePayload(new Date()))
     getSpendFlow.mockResolvedValue(makeFlow())
+    getTimeline.mockResolvedValue(makePayload(new Date()))
 
     render(<Spend period="week" provider="all" />)
     expect(await screen.findByText('codeburn')).toBeInTheDocument()
@@ -235,6 +241,7 @@ describe('Spend', () => {
   it('groups the top panels and breakdown panels in their page grids', async () => {
     getOverview.mockResolvedValue(makePayload(new Date()))
     getSpendFlow.mockResolvedValue(makeFlow())
+    getTimeline.mockResolvedValue(makePayload(new Date()))
 
     const { container } = render(<Spend period="week" provider="all" />)
     expect(await screen.findByText('codeburn')).toBeInTheDocument()
@@ -289,6 +296,7 @@ describe('Spend', () => {
     ]
     getOverview.mockResolvedValue(payload)
     getSpendFlow.mockResolvedValue(makeFlow())
+    getTimeline.mockResolvedValue(makePayload(new Date()))
 
     const { container } = render(<Spend period="week" provider="all" />)
     expect(await screen.findByLabelText('Daily spend by model')).toBeInTheDocument()
@@ -312,6 +320,7 @@ describe('Spend', () => {
   it('renders Sankey ribbons with model gradients, neutral other nodes, and shortened labels', async () => {
     getOverview.mockResolvedValue(makePayload(new Date()))
     getSpendFlow.mockResolvedValue(makeFlow())
+    getTimeline.mockResolvedValue(makePayload(new Date()))
 
     const { container } = render(<Spend period="week" provider="all" />)
 
@@ -354,6 +363,7 @@ describe('Spend', () => {
     ]
     getOverview.mockResolvedValue(payload)
     getSpendFlow.mockResolvedValue(makeFlow())
+    getTimeline.mockResolvedValue(makePayload(new Date()))
 
     render(<Spend period="week" provider="all" />)
 

@@ -35,6 +35,7 @@ function fakeSpawn(result: unknown = { current: { cost: 12.34 } }) {
 // must spawn. cliStatus is the one channel that resolves without spawning.
 const CHANNELS = [
   'codeburn:getOverview',
+  'codeburn:getTimeline',
   'codeburn:getQuota',
   'codeburn:getPlans',
   'codeburn:getActReport',
