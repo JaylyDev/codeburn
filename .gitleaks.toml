@@ -11,6 +11,7 @@ useDefault = true
 description = "Test fixtures: obviously-fake API keys used as parser/validator input."
 # sk-live-0123456789abcdef... and sk-live-AKIA1234567890SECRETKEY live in
 # packages/core and root test suites purely as decode/redaction fixtures.
+condition = "AND"
 regexes = [
   '''sk-live-0123456789abcdef''',
   '''sk-live-AKIA1234567890SECRETKEY''',
@@ -29,5 +30,12 @@ regexes = [
 [[allowlists]]
 description = "Non-secret identifiers the generic-api-key rule mis-fires on."
 # e.g. dedup keys like 'synth-retain-89d' in parser fixtures.
+condition = "AND"
 regexes = ['''synth-[a-z0-9-]+''']
+paths = ['''(^|/)tests?/''']
+
+[[allowlists]]
+description = "Canonical example JWT header used as a redaction/parse fixture (decodes to {\"alg\":\"HS256\",\"typ\":\"JWT\"}, carries no claims or signature)."
+condition = "AND"
+regexes = ['''eyJhbGciOiJIUzI1NiIsIn''']
 paths = ['''(^|/)tests?/''']
