@@ -62,3 +62,54 @@ export function extractBashCommands(rawCommand: string): string[] {
 
   return commands
 }
+
+// Read-shaped shell commands: they inspect state and cannot modify the
+// worktree, so (1) the read-edit-ratio detector counts them as reads and
+// (2) retry detection does NOT treat them as a verification step between two
+// edits of the same file (#941 — both detectors previously disagreed about
+// the same Bash call, scoring rg-first workflows as reckless AND reworked).
+const READ_ONLY_BASH = new Set([
+  'rg', 'grep', 'egrep', 'fgrep', 'ag',
+  'cat', 'head', 'tail', 'less', 'more',
+  'ls', 'find', 'fd', 'tree',
+  'wc', 'stat', 'file', 'du', 'df',
+  'which', 'type', 'pwd', 'printenv', 'env',
+  'readlink', 'realpath', 'basename', 'dirname',
+  'jq', 'diff',
+])
+
+// git subcommands that only inspect history/state. Deliberately excludes
+// anything that can create or mutate under any flag (branch, tag, stash,
+// remote), so a mutation is never misread as a read.
+const GIT_READ_SUBCOMMANDS = new Set([
+  'log', 'diff', 'status', 'show', 'blame', 'grep',
+  'shortlog', 'describe', 'rev-parse', 'ls-files',
+])
+
+/// True when EVERY segment of the raw command line (split on &&, ;, |) is a
+/// read-only inspection command. A single mutating segment makes the whole
+/// call non-read (`cat x && sed -i ...` edits). Unknown commands are
+/// non-read: the conservative default both call sites want.
+export function isReadShapedBashCommand(rawCommand: string): boolean {
+  if (!rawCommand || !rawCommand.trim()) return false
+  const stripped = stripQuotedStrings(stripAnsi(rawCommand))
+  const segments = stripped.split(/\s*(?:&&|;|\|)\s*/)
+  let sawCommand = false
+  for (const segment of segments) {
+    const trimmed = segment.trim()
+    if (!trimmed) continue
+    const tokens = trimmed.split(/\s+/)
+    let i = 0
+    while (i < tokens.length && (/^\w+=/.test(tokens[i]!) || COMMAND_PREFIXES.has(basename(tokens[i]!)))) i++
+    const base = i < tokens.length ? basename(tokens[i]!) : ''
+    if (!base) continue
+    sawCommand = true
+    if (base === 'git') {
+      const sub = tokens[i + 1]
+      if (!sub || !GIT_READ_SUBCOMMANDS.has(sub)) return false
+      continue
+    }
+    if (!READ_ONLY_BASH.has(base)) return false
+  }
+  return sawCommand
+}

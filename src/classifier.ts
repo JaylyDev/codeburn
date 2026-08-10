@@ -1,4 +1,5 @@
 import type { ClassifiedTurn, ParsedTurn, TaskCategory, ToolCall } from './types.js'
+import { isReadShapedBashCommand } from './bash-utils.js'
 
 const TEST_PATTERNS = /\b(test|pytest|vitest|jest|mocha|spec|coverage|npm\s+test|npx\s+vitest|npx\s+jest)\b/i
 const GIT_PATTERNS = /\bgit\s+(push|pull|commit|merge|rebase|checkout|branch|stash|log|diff|status|add|reset|cherry-pick|tag)\b/i
@@ -170,7 +171,13 @@ function countRetries(turn: ParsedTurn): number {
   steps.forEach((step, i) => {
     for (const call of step) {
       if (BASH_TOOLS.has(call.tool)) {
-        lastVerifyStep = i
+        // A read-shaped shell command (rg/cat/git log) is a lookup, not a
+        // verification of the previous edit: edit -> grep -> edit is research,
+        // and counting it as a retry penalized bash-first workflows (#941).
+        // A command we cannot classify keeps the old behavior.
+        if (!call.command || !isReadShapedBashCommand(call.command)) {
+          lastVerifyStep = i
+        }
       }
       if (EDIT_TOOLS.has(call.tool)) {
         const fileKey = call.file ?? '__no_file__'

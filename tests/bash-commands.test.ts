@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { extractBashCommands } from '../src/bash-utils.js'
+import { extractBashCommands, isReadShapedBashCommand } from '../src/bash-utils.js'
 import { BASH_TOOLS } from '../src/classifier.js'
 
 describe('extractBashCommands', () => {
@@ -116,4 +116,34 @@ describe('BASH_TOOLS', () => {
   it('recognizes Bash', () => { expect(BASH_TOOLS.has('Bash')).toBe(true) })
   it('recognizes BashTool', () => { expect(BASH_TOOLS.has('BashTool')).toBe(true) })
   it('rejects unknown tools', () => { expect(BASH_TOOLS.has('Read')).toBe(false) })
+})
+
+describe('isReadShapedBashCommand (#941)', () => {
+  it('accepts single read commands and read-only git subcommands', () => {
+    expect(isReadShapedBashCommand('rg -n "x" src/')).toBe(true)
+    expect(isReadShapedBashCommand('cat file.ts')).toBe(true)
+    expect(isReadShapedBashCommand('git log --oneline -5')).toBe(true)
+    expect(isReadShapedBashCommand('git diff HEAD~1')).toBe(true)
+    expect(isReadShapedBashCommand('VAR=1 sudo head -c 100 f')).toBe(true)
+  })
+
+  it('accepts pipelines where every segment reads', () => {
+    expect(isReadShapedBashCommand('grep -r "x" src | head -20')).toBe(true)
+    expect(isReadShapedBashCommand('git log --oneline && git status')).toBe(true)
+  })
+
+  it('rejects any mutating or unknown segment', () => {
+    expect(isReadShapedBashCommand('npm test')).toBe(false)
+    expect(isReadShapedBashCommand('sed -i s/a/b/ x.ts')).toBe(false)
+    expect(isReadShapedBashCommand('cat x && rm -rf dist')).toBe(false)
+    expect(isReadShapedBashCommand('git commit -m "x"')).toBe(false)
+    expect(isReadShapedBashCommand('git branch new-branch')).toBe(false)
+    expect(isReadShapedBashCommand('git')).toBe(false)
+    expect(isReadShapedBashCommand('')).toBe(false)
+    expect(isReadShapedBashCommand('   ')).toBe(false)
+  })
+
+  it('is not fooled by read-command names inside quoted strings', () => {
+    expect(isReadShapedBashCommand('echo "cat file"')).toBe(false)
+  })
 })
