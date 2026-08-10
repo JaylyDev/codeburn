@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.20 - 2026-08-10
+
 ### Added
 - **Desktop panel fetches drop from seconds to milliseconds.** The app, the web dashboard and the macOS menubar now hold one resident `codeburn serve` process instead of spawning a fresh CLI per panel: the parsed session cache stays warm in memory, panel bursts share one parse, filesystem watches over every provider's discovery roots let a no-change fetch skip the scan entirely, and the web dashboard prefetches every period tab at startup. Cold start, mixed CLI versions and any serve failure all fall back to the exact spawn behavior shipped today, and one-shot CLI output is byte-identical. (#956, #957, #959, #960)
 - **Spend punchcard in the desktop app.** The hour-of-day × weekday spend matrix from the web dashboard, on the Spend page, fed by a dedicated timeline fetch so every other panel keeps its lean payload. (#962)

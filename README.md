@@ -18,19 +18,19 @@
     <a href="https://github.com/sponsors/iamtoruk"><img src="https://img.shields.io/badge/sponsor-♥-F97316?logo=github" alt="Sponsor" /></a>
 </p>
 
-<p align="center">If CodeBurn shows you something your bill never did, <a href="https://github.com/getagentseal/codeburn/stargazers">star the repo</a> so other developers find it, and consider <a href="https://github.com/sponsors/iamtoruk">sponsoring</a> to keep 36 integrations honest.</p>
+<p align="center">If CodeBurn shows you something your bill never did, <a href="https://github.com/getagentseal/codeburn/stargazers">star the repo</a> so other developers find it, and consider <a href="https://github.com/sponsors/iamtoruk">sponsoring</a> to keep 40 integrations honest.</p>
 
 <table align="center">
   <tr>
     <td align="center" width="50%">
       <strong>Desktop</strong><br/>
       <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/desktop.jpg" alt="CodeBurn Desktop" /><br/>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.19/CodeBurn-0.9.19-arm64.dmg"><img src="https://img.shields.io/badge/macOS-Apple_Silicon-F97316?logo=apple&logoColor=white" alt="Download for macOS (Apple Silicon)" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.19/CodeBurn-0.9.19.dmg"><img src="https://img.shields.io/badge/macOS-Intel-F97316?logo=apple&logoColor=white" alt="Download for macOS (Intel)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.20/CodeBurn-0.9.20-arm64.dmg"><img src="https://img.shields.io/badge/macOS-Apple_Silicon-F97316?logo=apple&logoColor=white" alt="Download for macOS (Apple Silicon)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.20/CodeBurn-0.9.20.dmg"><img src="https://img.shields.io/badge/macOS-Intel-F97316?logo=apple&logoColor=white" alt="Download for macOS (Intel)" /></a>
       <a href="https://apps.microsoft.com/detail/9P0R4ZL5XMB8"><img src="https://img.shields.io/badge/Windows-Microsoft_Store-F97316?logo=microsoft&logoColor=white" alt="Get CodeBurn from the Microsoft Store" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.19/codeburn-desktop_0.9.19_amd64.deb"><img src="https://img.shields.io/badge/Linux-.deb-F97316?logo=debian&logoColor=white" alt="Download for Linux (.deb)" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.19/codeburn-desktop-0.9.19.x86_64.rpm"><img src="https://img.shields.io/badge/Linux-.rpm-F97316?logo=redhat&logoColor=white" alt="Download for Linux (.rpm)" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.19/CodeBurn-0.9.19.AppImage"><img src="https://img.shields.io/badge/Linux-AppImage-F97316?logo=linux&logoColor=white" alt="Download for Linux (AppImage)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.20/codeburn-desktop_0.9.20_amd64.deb"><img src="https://img.shields.io/badge/Linux-.deb-F97316?logo=debian&logoColor=white" alt="Download for Linux (.deb)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.20/codeburn-desktop-0.9.20.x86_64.rpm"><img src="https://img.shields.io/badge/Linux-.rpm-F97316?logo=redhat&logoColor=white" alt="Download for Linux (.rpm)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.20/CodeBurn-0.9.20.AppImage"><img src="https://img.shields.io/badge/Linux-AppImage-F97316?logo=linux&logoColor=white" alt="Download for Linux (AppImage)" /></a>
     </td>
     <td align="center" width="50%">
       <strong>Web</strong><br/>
@@ -54,11 +54,11 @@
 
 <p align="center"><em>Four surfaces, one source of truth: everything reads the session files already on your disk.</em></p>
 
-**CodeBurn is a free, open-source, local-first tool that tracks AI coding token usage and cost across 36 tools and agents (Claude Code, Cursor, Codex, Gemini, Grok and more), broken down by model, project, and task.**
+**CodeBurn is a free, open-source, local-first tool that tracks AI coding token usage and cost across 40 tools and agents (Claude Code, Cursor, Codex, Gemini, Grok and more), broken down by model, project, and task.**
 
 You pay for Claude, Codex, Cursor, and a stack of other AI tools. The bill tells you the total. It never tells you that half of it went to conversation instead of code, or that an expensive model burned your budget on work a cheaper one would have one-shot.
 
-CodeBurn does. It reads the session files your tools already write to disk and breaks down every token and dollar by **task, model, tool, and project**, across **36 AI tools**.
+CodeBurn does. It reads the session files your tools already write to disk and breaks down every token and dollar by **task, model, tool, and project**, across **40 AI tools**.
 
 Everything runs locally. No wrapper, no proxy, no API keys, nothing leaves your machine. Pricing comes from [LiteLLM](https://github.com/BerriAI/litellm), refreshed daily.
 
@@ -715,12 +715,12 @@ CodeBurn deduplicates messages (by API message ID for Claude, by cumulative toke
 
 CodeBurn is free, runs entirely on your machine, and exists to cut your AI bill. If it has already saved you more than a sponsorship costs, consider sending a little of that back.
 
-Keeping 36 integrations accurate is constant work. The tools underneath change every week: Cursor reshapes its database, Claude moves a config path, new models ship at new prices. Sponsorship keeps CodeBurn current with all of it, so the numbers you see are always the real ones.
+Keeping 40 integrations accurate is constant work. The tools underneath change every week: Cursor reshapes its database, Claude moves a config path, new models ship at new prices. Sponsorship keeps CodeBurn current with all of it, so the numbers you see are always the real ones.
 
 Where your sponsorship goes:
 
 - **Honest numbers.** New models and price changes are mapped quickly, so your cost is the real cost, not a guess.
-- **More tools.** Every one of the 36 providers started as a single file. Sponsorship funds the next one.
+- **More tools.** Every one of the 40 providers started as a single file. Sponsorship funds the next one.
 - **Fast fixes.** When a vendor breaks something, paid time is what gets it patched now instead of someday.
 
 Sponsoring as a team or company? Your logo lands right here, in front of every developer who opens the repo. The first sponsor gets it to themselves until the next one shows up.
