@@ -82,7 +82,10 @@ export function WorkflowPanel({ current }: { current: Current }) {
           <Row
             label="Pricing coverage"
             hint="Share of cost-bearing calls with a resolved price"
-            value={<span className="font-medium text-foreground">{Math.round(coverage * 100)}%</span>}
+            // Floor, never round: near-complete coverage with unpriced calls
+            // outstanding must not render as the 100% reserved for genuinely
+            // complete pricing.
+            value={<span className="font-medium text-foreground">{Math.floor(coverage * 100)}%</span>}
           />
         )}
       </div>
