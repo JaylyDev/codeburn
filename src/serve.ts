@@ -30,6 +30,11 @@ import type { Command } from 'commander'
 // every config mutation (currency, model-alias set, budget, price-override,
 // proxy-path, plan), export (writes files), share/devices (network + pairing
 // state), menubar/web/mcp/guard/sync/act (process management or writes).
+// Past this resident-set size the serve loop drops its in-memory memos and
+// re-parses on the next request. 3GB leaves generous room for the largest
+// observed corpora while bounding a pathological one.
+const SERVE_MAX_RSS_BYTES = 3 * 1024 * 1024 * 1024
+
 const SERVE_COMMANDS = new Set(['status', 'overview', 'models', 'sessions', 'compare', 'yield', 'spend', 'optimize', 'audit'])
 
 type ServeRequest = { id: string | number; args: string[] }
@@ -89,6 +94,9 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
   // re-running the discovery sweep per panel. Serve-only: one-shot CLI runs
   // never set this, so their results stay byte-exact.
   if (!process.env['CODEBURN_PARSE_BURST_MS']) process.env['CODEBURN_PARSE_BURST_MS'] = '10000'
+  if (process.stdin.isTTY) {
+    process.stderr.write('codeburn serve speaks JSON over stdio and exists for the desktop app to hold warm.\nNothing interactive happens here; press Ctrl+C to exit.\n')
+  }
   const write = (value: unknown): void => { process.stdout.write(JSON.stringify(value) + '\n') }
   write({ ready: true, pid: process.pid })
 
@@ -122,6 +130,19 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
         else write({ id: request.id, ok: false, error: `exit ${code}`, output })
       } catch (err) {
         write({ id: request.id, ok: false, error: err instanceof Error ? err.message : String(err) })
+      }
+      // Memory guard: a resident process accumulates parse memos that a
+      // one-shot CLI never lives long enough to hold (up to 10 entries of
+      // full ProjectSummary trees plus the parsed cache object). Past the
+      // threshold, drop the in-memory memos — the next request re-parses
+      // once (seconds), which beats an ever-growing child. The child itself
+      // never exits here, so the client's death counter is untouched.
+      if (process.memoryUsage().rss > SERVE_MAX_RSS_BYTES) {
+        const { clearSessionCache } = await import('./parser.js')
+        const { clearLoadCacheMemo } = await import('./session-cache.js')
+        clearSessionCache()
+        clearLoadCacheMemo()
+        if (typeof globalThis.gc === 'function') globalThis.gc()
       }
     })
   })

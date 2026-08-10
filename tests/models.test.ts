@@ -14,6 +14,7 @@ import {
   setLocalModelSavings,
   getLocalModelSavingsConfigHash,
   getPriceOverridesConfigHash,
+  getModelAliasesConfigHash,
   parseLiteLLMEntry,
 } from '../src/models.js'
 import { getDailyCacheConfigHash } from '../src/usage-aggregator.js'
@@ -879,5 +880,21 @@ describe('parseLiteLLMEntry hardening', () => {
   it('still parses a valid entry', () => {
     const costs = parseLiteLLMEntry({ input_cost_per_token: 0.000003, output_cost_per_token: 0.000015 } as Parameters<typeof parseLiteLLMEntry>[0])
     expect(costs).not.toBeNull()
+  })
+})
+
+describe('getModelAliasesConfigHash', () => {
+  it('is empty for no aliases, changes with content, ignores insertion order', () => {
+    setModelAliases({})
+    expect(getModelAliasesConfigHash()).toBe('')
+    setModelAliases({ 'my-model': 'claude-opus-4-6' })
+    const one = getModelAliasesConfigHash()
+    expect(one).not.toBe('')
+    setModelAliases({ 'b-model': 'gpt-5', 'my-model': 'claude-opus-4-6' })
+    const two = getModelAliasesConfigHash()
+    expect(two).not.toBe(one)
+    setModelAliases({ 'my-model': 'claude-opus-4-6', 'b-model': 'gpt-5' })
+    expect(getModelAliasesConfigHash()).toBe(two)
+    setModelAliases({})
   })
 })
