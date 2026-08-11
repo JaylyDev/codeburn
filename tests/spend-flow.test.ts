@@ -7,6 +7,13 @@ import { describe, expect, it, vi } from 'vitest'
 
 import type { DateRange, ProjectSummary, SessionSummary, TokenUsage } from '../src/types.js'
 
+// These specs spawn the real CLI (tsx compile + full parse) per test, which
+// blows the 5s default under full parallel suite load while passing cleanly
+// in isolation — the exact flake class #948 documented and CI has hit
+// (cli-emitters timed out on a green PR). Same file-level remedy as
+// cli-status-menubar.test.ts: a 30s ceiling for spawn-heavy suites only.
+vi.setConfig({ testTimeout: 30_000 })
+
 const parserMock = vi.hoisted(() => ({
   parseAllSessions: vi.fn(),
 }))
