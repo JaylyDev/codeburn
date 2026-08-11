@@ -2,7 +2,7 @@
   "name": "codeburn-desktop",
   "private": true,
   "version": "0.9.20",
-  "description": "CodeBurn Desktop — Electron app fed by the codeburn CLI",
+  "description": "CodeBurn Desktop \u2014 Electron app fed by the codeburn CLI",
   "main": "dist/electron/main.js",
   "scripts": {
     "build:electron": "tsc -p tsconfig.electron.json",
@@ -17,7 +17,8 @@
     "package:x64": "npm run stage-cli && npm run build && electron-builder --mac --x64",
     "package:win": "npm run stage-cli && npm run build && electron-builder --win",
     "package:store": "npm run stage-cli && npm run build && electron-builder --win appx --x64",
-    "package:linux": "npm run stage-cli && npm run build && electron-builder --linux"
+    "package:linux": "npm run stage-cli && npm run build && electron-builder --linux",
+    "package:snap": "npm run stage-cli && npm run build && electron-builder --linux snap --x64"
   },
   "dependencies": {
     "@gsap/react": "^2.1.2",
@@ -140,6 +141,12 @@
       "icon": "build/icon.png",
       "maintainer": "AgentSeal <hello@agentseal.org>",
       "executableName": "codeburn"
+    },
+    "snap": {
+      "confinement": "classic",
+      "grade": "stable",
+      "summary": "See where your AI coding spend actually goes",
+      "artifactName": "codeburn_${version}_${arch}.${ext}"
     }
   },
   "homepage": "https://github.com/getagentseal/codeburn",
