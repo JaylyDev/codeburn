@@ -7,7 +7,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, renameSync } from 'fs'
 import { join } from 'path'
-import { homedir } from 'os'
+import { getCodeburnCacheDir } from '../cache-dir.js'
 
 export interface LedgerEntry {
   key: string  // deduplicationKey
@@ -16,15 +16,21 @@ export interface LedgerEntry {
 
 const SIX_MONTHS_MS = 180 * 24 * 60 * 60 * 1000
 
-function cacheDir(): string {
-  // Honor XDG_CACHE_HOME — the ledger is reconstructible state, not config
+function ledgerCacheDir(): string {
+  const explicit = process.env.CODEBURN_CACHE_DIR
+  if (explicit?.trim()) return explicit
+
+  // The sync ledger historically honored XDG_CACHE_HOME. Preserve that path
+  // so upgrades do not forget 180 days of sent keys and re-upload old calls;
+  // the ordinary CLI/desktop cache still shares the resolver below.
   const xdg = process.env.XDG_CACHE_HOME
-  const base = xdg && xdg.trim() ? xdg : join(homedir(), '.cache')
-  return join(base, 'codeburn')
+  if (xdg?.trim()) return join(xdg, 'codeburn')
+
+  return getCodeburnCacheDir()
 }
 
 function ledgerPath(): string {
-  return join(cacheDir(), 'sync-ledger.json')
+  return join(ledgerCacheDir(), 'sync-ledger.json')
 }
 
 export function readLedger(): LedgerEntry[] {
@@ -43,7 +49,7 @@ export function readLedger(): LedgerEntry[] {
 }
 
 export function writeLedger(entries: LedgerEntry[]): void {
-  const dir = cacheDir()
+  const dir = ledgerCacheDir()
   mkdirSync(dir, { recursive: true })
   // Atomic write: a crash mid-write must not corrupt the ledger — a corrupt
   // ledger reads as empty and the next push re-sends the whole window.

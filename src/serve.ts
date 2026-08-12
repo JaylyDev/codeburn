@@ -1,8 +1,10 @@
 import { watch, type FSWatcher } from 'fs'
-import { stat } from 'fs/promises'
+import { readFile, stat } from 'fs/promises'
+import { createHash } from 'crypto'
 import { createInterface } from 'readline'
 
 import type { Command } from 'commander'
+import { getConfigFilePath } from './config.js'
 
 // ---------------------------------------------------------------------------
 // codeburn serve --stdio: a resident query server for the desktop app.
@@ -60,20 +62,44 @@ class ExitSignal extends Error {
   constructor(public readonly code: number) { super(`exit ${code}`) }
 }
 
-/// Run one argv through a fresh program, capturing everything the command
-/// writes to stdout. process.exit inside a handler is converted to a thrown
-/// ExitSignal so a failing request can never take the server down.
-async function runCaptured(buildProgram: () => Command, args: string[]): Promise<{ output: string; code: number }> {
+function chunkToString(chunk: unknown, encoding: unknown): string {
+  if (typeof chunk === 'string') return chunk
+  if (chunk instanceof Uint8Array) {
+    return Buffer.from(chunk).toString(typeof encoding === 'string' ? encoding as BufferEncoding : 'utf8')
+  }
+  return String(chunk)
+}
+
+function finishWrite(rest: unknown[]): void {
+  const callback = rest[rest.length - 1]
+  if (typeof callback === 'function') (callback as () => void)()
+}
+
+/// Run one argv through a fresh program, capturing command stdout for the
+/// final response and forwarding command stderr as progress. process.exit
+/// inside a handler is converted to a thrown ExitSignal so a failing request
+/// can never take the server down.
+async function runCaptured(
+  buildProgram: () => Command,
+  args: string[],
+  onProgress: (progress: string) => void,
+): Promise<{ output: string; code: number }> {
   const chunks: string[] = []
   const originalWrite = process.stdout.write.bind(process.stdout)
+  const originalErrorWrite = process.stderr.write.bind(process.stderr)
   const originalExit = process.exit.bind(process)
 
   process.stdout.write = ((chunk: unknown, ...rest: unknown[]) => {
-    chunks.push(typeof chunk === 'string' ? chunk : String(chunk))
-    const last = rest[rest.length - 1]
-    if (typeof last === 'function') (last as () => void)()
+    chunks.push(chunkToString(chunk, rest[0]))
+    finishWrite(rest)
     return true
   }) as typeof process.stdout.write
+  process.stderr.write = ((chunk: unknown, ...rest: unknown[]) => {
+    const progress = chunkToString(chunk, rest[0])
+    if (progress) onProgress(progress)
+    finishWrite(rest)
+    return true
+  }) as typeof process.stderr.write
   process.exit = ((code?: number) => { throw new ExitSignal(code ?? 0) }) as typeof process.exit
 
   try {
@@ -86,7 +112,25 @@ async function runCaptured(buildProgram: () => Command, args: string[]): Promise
     throw err
   } finally {
     process.stdout.write = originalWrite
+    process.stderr.write = originalErrorWrite
     process.exit = originalExit
+  }
+}
+
+/// A cheap per-request fingerprint for the configuration that affects query
+/// rendering and aggregation. Hashing the small config file tracks effective
+/// content rather than filesystem churn: a byte-identical rewrite keeps the
+/// memo hot, while any real change invalidates immediately. A missing config
+/// is a stable state; every other read failure fails closed (no memo reuse).
+async function getConfigFingerprint(): Promise<string | null> {
+  const path = getConfigFilePath()
+  try {
+    const content = await readFile(path)
+    const digest = createHash('sha256').update(content).digest('hex')
+    return `${path}\u0000sha256:${digest}`
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return `${path}\u0000missing`
+    return null
   }
 }
 
@@ -149,14 +193,20 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
 
   // Output-level memo: an identical panel query while the roots are quiet
   // returns the previous stdout verbatim - the aggregation work is skipped
-  // too, not just the parse. Invalidation is the same event-or-cap rule the
-  // parse reuse uses.
+  // too, not just the parse. Session data uses the same event-or-cap rule as
+  // parse reuse; config.json is fingerprinted on every request because it can
+  // change rendering without touching a provider root.
   const OUTPUT_MEMO_CAP_MS = 5 * 60 * 1000
-  const outputMemo = new Map<string, { at: number; output: string }>()
+  const outputMemo = new Map<string, { at: number; output: string; configFingerprint: string }>()
+  let observedConfigFingerprint: string | null | undefined
   if (process.stdin.isTTY) {
     process.stderr.write('codeburn serve speaks JSON over stdio and exists for the desktop app to hold warm.\nNothing interactive happens here; press Ctrl+C to exit.\n')
   }
-  const write = (value: unknown): void => { process.stdout.write(JSON.stringify(value) + '\n') }
+  // Keep the protocol transport anchored to the real stdout. runCaptured()
+  // temporarily replaces process.stdout.write to collect command output; a
+  // dynamic lookup here would swallow progress frames into the final payload.
+  const protocolWrite = process.stdout.write.bind(process.stdout)
+  const write = (value: unknown): void => { protocolWrite(JSON.stringify(value) + '\n') }
   write({ ready: true, pid: process.pid })
 
   // Strict serialization: each request chains on the previous one.
@@ -183,16 +233,36 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
         write({ id: request.id, ok: false, refused: true, error: 'command not served' })
         return
       }
+      const configFingerprint = await getConfigFingerprint()
+      if (observedConfigFingerprint !== undefined && configFingerprint !== observedConfigFingerprint) {
+        outputMemo.clear()
+      }
+      observedConfigFingerprint = configFingerprint
+      // A permission or transient read failure must shorten reuse, never make
+      // an old result look current.
+      if (configFingerprint === null) outputMemo.clear()
+
       const memoKey = request.args.join('\u0000')
       const memoHit = outputMemo.get(memoKey)
-      if (memoHit && Date.now() - memoHit.at < OUTPUT_MEMO_CAP_MS && rootsQuietSince?.(memoHit.at)) {
+      if (
+        configFingerprint !== null
+        && memoHit?.configFingerprint === configFingerprint
+        && Date.now() - memoHit.at < OUTPUT_MEMO_CAP_MS
+        && rootsQuietSince?.(memoHit.at)
+      ) {
         write({ id: request.id, ok: true, output: memoHit.output })
         return
       }
       try {
-        const { output, code } = await runCaptured(buildProgram, request.args)
+        const { output, code } = await runCaptured(
+          buildProgram,
+          request.args,
+          progress => write({ id: request.id, progress }),
+        )
         if (code === 0) {
-          outputMemo.set(memoKey, { at: Date.now(), output })
+          if (configFingerprint !== null) {
+            outputMemo.set(memoKey, { at: Date.now(), output, configFingerprint })
+          }
           if (outputMemo.size > 32) {
             const oldest = [...outputMemo.entries()].sort((a, b) => a[1].at - b[1].at)[0]
             if (oldest) outputMemo.delete(oldest[0])

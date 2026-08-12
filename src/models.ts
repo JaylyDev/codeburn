@@ -1,6 +1,7 @@
 import { readFile, writeFile, mkdir } from 'fs/promises'
 import { join } from 'path'
-import { homedir } from 'os'
+
+import { getCodeburnCacheDir } from './cache-dir.js'
 import snapshotData from './data/litellm-snapshot.json'
 import fallbackData from './data/pricing-fallback.json'
 import { fetchWithTimeout } from './fetch-utils.js'
@@ -143,13 +144,8 @@ function getLowercasePricingIndex(): Map<string, ModelCosts> {
   return lowercasePricingIndex
 }
 
-function getCacheDir(): string {
-  if (process.env['CODEBURN_CACHE_DIR']) return process.env['CODEBURN_CACHE_DIR']
-  return join(homedir(), '.cache', 'codeburn')
-}
-
 function getCachePath(): string {
-  return join(getCacheDir(), 'litellm-pricing.json')
+  return join(getCodeburnCacheDir(), 'litellm-pricing.json')
 }
 
 /// Clamp a per-token rate to a sane non-negative value. Defense in depth
@@ -202,7 +198,7 @@ async function fetchAndCachePricing(): Promise<Map<string, ModelCosts>> {
     if (stripped !== name && !pricing.has(stripped)) pricing.set(stripped, costs)
   }
 
-  await mkdir(getCacheDir(), { recursive: true })
+  await mkdir(getCodeburnCacheDir(), { recursive: true })
   await writeFile(getCachePath(), JSON.stringify({
     timestamp: Date.now(),
     data: Object.fromEntries(pricing),

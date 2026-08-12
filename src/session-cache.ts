@@ -2,8 +2,8 @@ import { readFile, stat, open, rename, unlink, readdir, mkdir } from 'fs/promise
 import { existsSync, readFileSync, unlinkSync } from 'fs'
 import { createHash, randomBytes } from 'crypto'
 import { join } from 'path'
-import { homedir } from 'os'
 
+import { getCodeburnCacheDir } from './cache-dir.js'
 import type { ToolCall } from './types.js'
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -279,18 +279,12 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   antigravity: 'worktree-project-grouping-v5',
 }
 
-// ── Cache Dir ──────────────────────────────────────────────────────────
-
-function getCacheDir(): string {
-  return process.env['CODEBURN_CACHE_DIR'] ?? join(homedir(), '.cache', 'codeburn')
-}
-
 function getCachePath(): string {
-  return join(getCacheDir(), CACHE_FILE)
+  return join(getCodeburnCacheDir(), CACHE_FILE)
 }
 
 function getLegacyCachePath(): string {
-  return join(getCacheDir(), LEGACY_CACHE_FILE)
+  return join(getCodeburnCacheDir(), LEGACY_CACHE_FILE)
 }
 
 /** Absolute path of the active (version-suffixed) session cache file. */
@@ -490,7 +484,7 @@ function isCacheEnvelope(raw: unknown, version: number): raw is { version: numbe
 // sources. The daily cache (durable cost history) is not touched.
 async function adoptPriorCache(version: number): Promise<SessionCache | null> {
   try {
-    const raw = await readFile(join(getCacheDir(), priorCacheFile(version)), 'utf-8')
+    const raw = await readFile(join(getCodeburnCacheDir(), priorCacheFile(version)), 'utf-8')
     const parsed = JSON.parse(raw)
     if (!isCacheEnvelope(parsed, version)) return null
     const migrated: SessionCache = { version: CACHE_VERSION, providers: {}, complete: false }
@@ -596,7 +590,7 @@ async function adoptLegacyCache(): Promise<SessionCache> {
 }
 
 export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Promise<boolean>): Promise<boolean> {
-  const dir = getCacheDir()
+  const dir = getCodeburnCacheDir()
   if (!existsSync(dir)) await mkdir(dir, { recursive: true })
 
   const finalPath = getCachePath()
@@ -800,7 +794,7 @@ export function mergeCallByDedupKey(
 // ── Temp Cleanup ───────────────────────────────────────────────────────
 
 export async function cleanupOrphanedTempFiles(): Promise<void> {
-  const dir = getCacheDir()
+  const dir = getCodeburnCacheDir()
   if (!existsSync(dir)) return
 
   try {
@@ -844,7 +838,7 @@ export type HydrationHandle = { waited: boolean; release: () => Promise<void> }
 const NOOP_HANDLE: HydrationHandle = { waited: false, release: async () => {} }
 
 function lockPath(): string {
-  return join(getCacheDir(), HYDRATION_LOCK_FILE)
+  return join(getCodeburnCacheDir(), HYDRATION_LOCK_FILE)
 }
 
 // Our own pid never counts as a foreign holder: a same-process lock is either
@@ -867,7 +861,7 @@ async function readLockRecord(): Promise<LockRecord | null> {
 
 async function writeOurLock(): Promise<boolean> {
   try {
-    const dir = getCacheDir()
+    const dir = getCodeburnCacheDir()
     if (!existsSync(dir)) await mkdir(dir, { recursive: true })
     const handle = await open(lockPath(), 'wx', 0o600)
     try { await handle.writeFile(JSON.stringify({ pid: process.pid, at: Date.now() }), { encoding: 'utf-8' }) }

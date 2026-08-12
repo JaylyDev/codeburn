@@ -123,13 +123,24 @@ struct DataClient {
         subcommand: [String],
         qualityOfService: QualityOfService = .userInitiated
     ) async throws -> ProcessResult {
-        // Serve fast path: a warm resident `codeburn serve` child answers the
-        // status payload without a spawn (no node boot, no session-cache
-        // reload). Any serve failure falls back to the spawn path below, so
-        // this is strictly an optimization; it also takes no spawn slot.
+        // Serve path: the first real status payload warms the resident child,
+        // then later payloads reuse it (no node boot or session-cache reload).
+        // Any serve failure falls back to the spawn path below, so this remains
+        // strictly an optimization and takes no spawn slot.
         if ServeConnection.isEligible(subcommand) {
-            if let stdout = try? await ServeConnection.shared.requestIfWarm(args: subcommand) {
+            do {
+                let stdout = try await ServeConnection.shared.request(args: subcommand)
                 return ProcessResult(stdout: stdout, stderr: "", exitCode: 0)
+            } catch let error as CancellationError {
+                // Cancellation is control flow from the refresh owner. Starting
+                // a fallback process here would turn cancelled work into a new
+                // expensive cold parse and delay task teardown.
+                throw error
+            } catch {
+                // Resident serve is only an optimization. Protocol, child, and
+                // timeout failures retain the established one-shot fallback,
+                // unless a sibling teardown raced this task's cancellation.
+                try Task.checkCancellation()
             }
         }
         await spawnLimiter.acquire()

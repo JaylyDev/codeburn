@@ -6,6 +6,7 @@ import { homedir } from 'os'
 import { fileURLToPath } from 'url'
 import https from 'https'
 
+import { getCodeburnCacheDir } from '../cache-dir.js'
 import { calculateCost } from '../models.js'
 import { isSqliteAvailable, isSqliteBusyError, openDatabase } from '../sqlite.js'
 import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
@@ -175,16 +176,12 @@ function getAgent(): https.Agent {
   return httpsAgent
 }
 
-function getCacheDir(): string {
-  return process.env['CODEBURN_CACHE_DIR'] ?? join(homedir(), '.cache', 'codeburn')
-}
-
 function getCachePath(): string {
-  return join(getCacheDir(), 'antigravity-results.json')
+  return join(getCodeburnCacheDir(), 'antigravity-results.json')
 }
 
 export function getAntigravityStatusLineEventsPath(): string {
-  return join(getCacheDir(), 'antigravity-statusline.jsonl')
+  return join(getCodeburnCacheDir(), 'antigravity-statusline.jsonl')
 }
 
 function execFileText(command: string, args: string[], timeout = 3000): Promise<string> {
@@ -355,7 +352,7 @@ async function flushCache(liveCascadeIds?: Set<string>): Promise<void> {
   if (!cacheDirty) return
   try {
 
-    const dir = getCacheDir()
+    const dir = getCodeburnCacheDir()
     await mkdir(dir, { recursive: true })
     const finalPath = getCachePath()
     const tempPath = `${finalPath}.${randomBytes(8).toString('hex')}.tmp`
@@ -1009,7 +1006,7 @@ export async function recordAntigravityStatusLinePayload(input: unknown): Promis
   if (!event) return false
 
   const path = getAntigravityStatusLineEventsPath()
-  await mkdir(getCacheDir(), { recursive: true, mode: 0o700 })
+  await mkdir(getCodeburnCacheDir(), { recursive: true, mode: 0o700 })
   const fd = await open(path, 'a', 0o600)
   try {
     await fd.appendFile(`${JSON.stringify(event)}\n`, { encoding: 'utf-8' })

@@ -2,8 +2,8 @@ import { readFile, mkdir, stat, open, rename, unlink } from 'fs/promises'
 import { existsSync } from 'fs'
 import { randomBytes } from 'crypto'
 import { join } from 'path'
-import { homedir } from 'os'
 
+import { getCodeburnCacheDir } from './cache-dir.js'
 import type { ParsedProviderCall } from './providers/types.js'
 
 // v4: attribute MCP calls emitted as event_msg/mcp_tool_call_end (issue #478).
@@ -31,12 +31,8 @@ type ResultCache = {
   files: Record<string, FileEntry>
 }
 
-function getCacheDir(): string {
-  return process.env['CODEBURN_CACHE_DIR'] ?? join(homedir(), '.cache', 'codeburn')
-}
-
 function getCachePath(): string {
-  return join(getCacheDir(), CACHE_FILE)
+  return join(getCodeburnCacheDir(), CACHE_FILE)
 }
 
 let memCache: ResultCache | null = null
@@ -129,7 +125,7 @@ export async function flushCodexCache(): Promise<void> {
       }
     }
 
-    const dir = getCacheDir()
+    const dir = getCodeburnCacheDir()
     if (!existsSync(dir)) await mkdir(dir, { recursive: true })
     const finalPath = getCachePath()
     const tempPath = `${finalPath}.${randomBytes(8).toString('hex')}.tmp`

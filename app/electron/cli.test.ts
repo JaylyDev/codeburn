@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync 
 import { tmpdir } from 'node:os'
 import { dirname, join, isAbsolute, relative, win32, posix } from 'node:path'
 
-import { spawnCli, spawnCliAction, spawnEnvFor, spawnSpecFor, killAll, CliError, nodeManagerDirs, notFoundStage, resolveCodeburnPath, resolveTarget } from './cli'
+import { spawnCli, spawnCliAction, spawnEnvFor, spawnSpecFor, startServe, killAll, shutdownAll, CliError, nodeManagerDirs, notFoundStage, resolveCodeburnPath, resolveTarget } from './cli'
 
 let dir: string
 const originalBin = process.env.CODEBURN_BIN
@@ -23,6 +23,53 @@ function fakeBin(name: string, body: string): string {
   return p
 }
 
+function readMaybe(path: string): string {
+  try { return readFileSync(path, 'utf8') } catch { return '' }
+}
+
+/** A protocol-faithful fake CLI whose serve child accepts requests before its
+ * delayed ready frame. Files expose process starts and heavy request executions
+ * without relying on timing or private ServeClient internals. */
+function fakeResidentBin(): {
+  startsFile: string
+  heavyFile: string
+  oneShotsFile: string
+  actionsFile: string
+  serveEnvFile: string
+} {
+  const startsFile = join(dir, 'serve-starts')
+  const heavyFile = join(dir, 'heavy-requests')
+  const oneShotsFile = join(dir, 'one-shot-reads')
+  const actionsFile = join(dir, 'actions')
+  const serveEnvFile = join(dir, 'serve-progress-env')
+  fakeBin(
+    'resident.js',
+    `const fs = require('node:fs'); const readline = require('node:readline');
+     const command = process.argv[2];
+     if (command === 'serve') {
+       fs.appendFileSync(${JSON.stringify(startsFile)}, 's');
+       const generation = fs.readFileSync(${JSON.stringify(startsFile)}, 'utf8').length;
+       fs.writeFileSync(${JSON.stringify(serveEnvFile)}, process.env.CODEBURN_PROGRESS || '');
+       const rl = readline.createInterface({ input: process.stdin });
+       rl.on('line', line => {
+         const request = JSON.parse(line);
+         fs.appendFileSync(${JSON.stringify(heavyFile)}, 'h');
+         const progress = 'CODEBURN_PROGRESS ' + JSON.stringify({ kind: 'provider', provider: 'claude', state: 'start', generation }) + '\\n';
+         process.stdout.write(JSON.stringify({ id: request.id, progress }) + '\\n');
+         process.stdout.write(JSON.stringify({ id: request.id, ok: true, output: JSON.stringify({ via: 'serve', generation, args: request.args }) }) + '\\n');
+       });
+       setTimeout(() => process.stdout.write(JSON.stringify({ ready: true, pid: process.pid }) + '\\n'), 100);
+     } else if (command === 'currency') {
+       fs.appendFileSync(${JSON.stringify(actionsFile)}, 'a');
+       process.stdout.write('currency updated');
+     } else {
+       fs.appendFileSync(${JSON.stringify(oneShotsFile)}, 'o');
+       process.stdout.write(JSON.stringify({ via: 'spawn', command }));
+     }`,
+  )
+  return { startsFile, heavyFile, oneShotsFile, actionsFile, serveEnvFile }
+}
+
 /** Writes the repo CLI under this test's isolated dev-root override. */
 function fakeDevRepoCli(): string {
   const repoRoot = join(dir, 'dev-repo')
@@ -39,6 +86,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  killAll()
   if (originalBin === undefined) delete process.env.CODEBURN_BIN
   else process.env.CODEBURN_BIN = originalBin
   if (originalPathDirs === undefined) delete process.env.CODEBURN_PATH_DIRS
@@ -389,6 +437,287 @@ describe('spawnCli coalescing (read-only)', () => {
   })
 })
 
+describe('resident serve single-flight', () => {
+  it('startServe is idempotent and creates only one resident child', async () => {
+    const files = fakeResidentBin()
+    startServe()
+    startServe()
+
+    const result = await spawnCli(['status', '--double-start'], { timeoutMs: 5_000 }) as { generation: number }
+
+    expect(result.generation).toBe(1)
+    expect(readMaybe(files.startsFile)).toBe('s')
+    expect(readMaybe(files.heavyFile)).toBe('h')
+  })
+
+  it('lazily starts a new resident after an unexpected death and one-shot fallback', async () => {
+    const startsFile = join(dir, 'serve-starts')
+    const oneShotsFile = join(dir, 'one-shot-reads')
+    fakeBin(
+      'dies-once-resident.js',
+      `const fs = require('node:fs'); const readline = require('node:readline');
+       const command = process.argv[2];
+       if (command === 'serve') {
+         fs.appendFileSync(${JSON.stringify(startsFile)}, 's');
+         const generation = fs.readFileSync(${JSON.stringify(startsFile)}, 'utf8').length;
+         const rl = readline.createInterface({ input: process.stdin });
+         rl.once('line', line => {
+           const request = JSON.parse(line);
+           if (generation === 1) process.exit(1);
+           process.stdout.write(JSON.stringify({ id: request.id, ok: true, output: JSON.stringify({ via: 'serve', generation }) }) + '\\n');
+         });
+       } else {
+         fs.appendFileSync(${JSON.stringify(oneShotsFile)}, 'o');
+         process.stdout.write(JSON.stringify({ via: 'spawn' }));
+       }`,
+    )
+    startServe()
+
+    await expect(spawnCli(['status', '--first'], { timeoutMs: 5_000 }))
+      .resolves.toEqual({ via: 'spawn' })
+    await expect(spawnCli(['models', '--second'], { timeoutMs: 5_000 }))
+      .resolves.toEqual({ via: 'serve', generation: 2 })
+
+    expect(readMaybe(startsFile)).toBe('ss')
+    expect(readMaybe(oneShotsFile)).toBe('o')
+  })
+
+  it('gives the first resident status request the power-user cold timeout floor', async () => {
+    fakeBin(
+      'slow-cold-resident.js',
+      `const readline = require('node:readline');
+       if (process.argv[2] === 'serve') {
+         const rl = readline.createInterface({ input: process.stdin });
+         rl.on('line', line => {
+           const request = JSON.parse(line);
+           setTimeout(() => process.stdout.write(JSON.stringify({ id: request.id, ok: true, output: JSON.stringify({ via: 'serve' }) }) + '\\n'), 80);
+         });
+       } else {
+         process.stdout.write(JSON.stringify({ via: 'spawn' }));
+       }`,
+    )
+    startServe()
+
+    await expect(spawnCli(['status', '--cold-floor'], { timeoutMs: 20 }))
+      .resolves.toEqual({ via: 'serve' })
+  })
+
+  it('starts a queued resident timeout only after the request ahead settles', async () => {
+    fakeBin(
+      'serial-resident.js',
+      `const readline = require('node:readline');
+       if (process.argv[2] === 'serve') {
+         const rl = readline.createInterface({ input: process.stdin });
+         (async () => {
+           for await (const line of rl) {
+             const request = JSON.parse(line);
+             if (request.args.includes('--slow')) await new Promise(resolve => setTimeout(resolve, 400));
+             process.stdout.write(JSON.stringify({ id: request.id, ok: true, output: JSON.stringify({ via: 'serve', args: request.args }) }) + '\\n');
+           }
+         })();
+       } else {
+         process.stdout.write(JSON.stringify({ via: 'spawn' }));
+       }`,
+    )
+    startServe()
+    await expect(spawnCli(['status', '--warm'], { timeoutMs: 5_000 }))
+      .resolves.toMatchObject({ via: 'serve' })
+
+    const slow = spawnCli(['sessions', '--slow'], { timeoutMs: 1_000 })
+    const queued = spawnCli(['models', '--queued'], { timeoutMs: 200 })
+    const [slowResult, queuedResult] = await Promise.all([slow, queued])
+
+    expect(slowResult).toMatchObject({ via: 'serve' })
+    expect(queuedResult).toMatchObject({ via: 'serve' })
+  })
+
+  it('uses the first real request as the only heavy execution, even before ready', async () => {
+    const files = fakeResidentBin()
+    startServe()
+
+    const result = await spawnCli(['status', '--format', 'menubar-json'], {
+      timeoutMs: 5_000,
+      extraEnv: { CODEBURN_PROGRESS: '1' },
+    }) as { via: string; generation: number }
+
+    expect(result).toMatchObject({ via: 'serve', generation: 1 })
+    expect(readMaybe(files.startsFile)).toBe('s')
+    expect(readMaybe(files.heavyFile)).toBe('h')
+    expect(readMaybe(files.oneShotsFile)).toBe('')
+    expect(readMaybe(files.serveEnvFile)).toBe('1')
+  })
+
+  it('forwards serve progress frames through the read onStderr callback', async () => {
+    fakeResidentBin()
+    startServe()
+    const chunks: string[] = []
+
+    await spawnCli(['status'], {
+      timeoutMs: 5_000,
+      extraEnv: { CODEBURN_PROGRESS: '1' },
+      onStderr: chunk => { chunks.push(chunk) },
+    })
+
+    expect(chunks.join('')).toBe('CODEBURN_PROGRESS {"kind":"provider","provider":"claude","state":"start","generation":1}\n')
+  })
+
+  it('keeps requests with any non-progress env override on the one-shot path', async () => {
+    const files = fakeResidentBin()
+    startServe()
+
+    const result = await spawnCli(['status'], {
+      timeoutMs: 5_000,
+      extraEnv: { CODEBURN_PROGRESS: '1', CODEBURN_TEST_MODE: 'isolated' },
+    }) as { via: string }
+
+    expect(result.via).toBe('spawn')
+    expect(readMaybe(files.heavyFile)).toBe('')
+    expect(readMaybe(files.oneShotsFile)).toBe('o')
+  })
+
+  it('treats empty and undefined-only env overrides as serve-compatible', async () => {
+    const files = fakeResidentBin()
+    startServe()
+
+    const empty = await spawnCli(['status', '--empty-env'], {
+      timeoutMs: 5_000,
+      extraEnv: {},
+    }) as { via: string }
+    const undefinedOnly = await spawnCli(['models', '--undefined-env'], {
+      timeoutMs: 5_000,
+      extraEnv: { CODEBURN_PROGRESS: undefined },
+    }) as { via: string }
+
+    expect(empty.via).toBe('serve')
+    expect(undefinedOnly.via).toBe('serve')
+    expect(readMaybe(files.heavyFile)).toBe('hh')
+    expect(readMaybe(files.oneShotsFile)).toBe('')
+  })
+
+  it('restarts the resident child after a successful config mutation', async () => {
+    const files = fakeResidentBin()
+    startServe()
+
+    const before = await spawnCli(['status'], { timeoutMs: 5_000 }) as { generation: number }
+    const action = await spawnCliAction(['currency', 'EUR'], { timeoutMs: 5_000 })
+    const after = await spawnCli(['status'], { timeoutMs: 5_000 }) as { generation: number }
+
+    expect(action).toMatchObject({ ok: true, stdout: 'currency updated', code: 0 })
+    expect(before.generation).toBe(1)
+    expect(after.generation).toBe(2)
+    expect(readMaybe(files.startsFile)).toBe('ss')
+    expect(readMaybe(files.heavyFile)).toBe('hh')
+    expect(readMaybe(files.actionsFile)).toBe('a')
+  })
+
+  it('preserves the unexpected-death budget across mutation restarts', async () => {
+    const startsFile = join(dir, 'serve-starts')
+    const oneShotsFile = join(dir, 'one-shot-reads')
+    fakeBin(
+      'crashing-resident.js',
+      `const fs = require('node:fs'); const readline = require('node:readline');
+       const command = process.argv[2];
+       if (command === 'serve') {
+         fs.appendFileSync(${JSON.stringify(startsFile)}, 's');
+         const rl = readline.createInterface({ input: process.stdin });
+         rl.once('line', () => process.exit(1));
+       } else if (command === 'currency') {
+         process.stdout.write('currency updated');
+       } else {
+         fs.appendFileSync(${JSON.stringify(oneShotsFile)}, 'o');
+         process.stdout.write(JSON.stringify({ via: 'spawn' }));
+       }`,
+    )
+    startServe()
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await expect(spawnCli(['status', '--attempt', String(attempt)], { timeoutMs: 5_000 }))
+        .resolves.toEqual({ via: 'spawn' })
+      await expect(spawnCliAction(['currency', attempt % 2 === 0 ? 'EUR' : 'USD'], { timeoutMs: 5_000 }))
+        .resolves.toMatchObject({ ok: true })
+    }
+
+    // A mutation may replace a healthy child, but it must not erase real crash
+    // history and resurrect serve after the third unexpected death.
+    expect(readMaybe(startsFile)).toBe('sss')
+    await expect(spawnCli(['status', '--after-budget'], { timeoutMs: 5_000 }))
+      .resolves.toEqual({ via: 'spawn' })
+    expect(readMaybe(startsFile)).toBe('sss')
+    expect(readMaybe(oneShotsFile)).toBe('oooo')
+  })
+
+  it('stops lazy crash recovery after three consecutive resident deaths', async () => {
+    const startsFile = join(dir, 'serve-starts')
+    const oneShotsFile = join(dir, 'one-shot-reads')
+    fakeBin(
+      'always-crashing-resident.js',
+      `const fs = require('node:fs'); const readline = require('node:readline');
+       if (process.argv[2] === 'serve') {
+         fs.appendFileSync(${JSON.stringify(startsFile)}, 's');
+         const rl = readline.createInterface({ input: process.stdin });
+         rl.once('line', () => process.exit(1));
+       } else {
+         fs.appendFileSync(${JSON.stringify(oneShotsFile)}, 'o');
+         process.stdout.write(JSON.stringify({ via: 'spawn' }));
+       }`,
+    )
+    startServe()
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await expect(spawnCli(['status', '--lazy-crash', String(attempt)], { timeoutMs: 5_000 }))
+        .resolves.toEqual({ via: 'spawn' })
+    }
+
+    expect(readMaybe(startsFile)).toBe('sss')
+    expect(readMaybe(oneShotsFile)).toBe('oooo')
+  })
+
+  it('does not spawn a one-shot fallback after killAll destroys serve', async () => {
+    const requestSeenFile = join(dir, 'request-seen')
+    const oneShotsFile = join(dir, 'one-shot-reads')
+    fakeBin(
+      'shutdown-resident.js',
+      `const fs = require('node:fs'); const readline = require('node:readline');
+       if (process.argv[2] === 'serve') {
+         const rl = readline.createInterface({ input: process.stdin });
+         rl.once('line', () => { fs.writeFileSync(${JSON.stringify(requestSeenFile)}, '1'); });
+       } else {
+         fs.appendFileSync(${JSON.stringify(oneShotsFile)}, 'o');
+         process.stdout.write('{}');
+       }`,
+    )
+    startServe()
+    const pending = spawnCli(['status', '--shutdown'], { timeoutMs: 60_000 })
+    for (let attempt = 0; attempt < 400 && !readMaybe(requestSeenFile); attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    const requestSeen = readMaybe(requestSeenFile)
+    killAll()
+
+    expect(requestSeen).toBe('1')
+    await expect(pending).rejects.toMatchObject({ kind: 'nonzero' })
+    await new Promise(resolve => setTimeout(resolve, 25))
+    expect(readMaybe(oneShotsFile)).toBe('')
+  })
+
+  it('keeps the warm resident child after a successful export', async () => {
+    const files = fakeResidentBin()
+    startServe()
+
+    const before = await spawnCli(['status'], { timeoutMs: 5_000 }) as { generation: number }
+    const action = await spawnCliAction(['export', '-f', 'json', '-o', join(dir, 'usage.json')], { timeoutMs: 5_000 })
+    // Different argv bypasses the 5s result cache and proves which resident
+    // generation actually handled the next served read.
+    const after = await spawnCli(['models', '--format', 'json'], { timeoutMs: 5_000 }) as { generation: number }
+
+    expect(action.ok).toBe(true)
+    expect(before.generation).toBe(1)
+    expect(after.generation).toBe(1)
+    expect(readMaybe(files.startsFile)).toBe('s')
+    expect(readMaybe(files.heavyFile)).toBe('hh')
+  })
+})
+
 describe('killAll', () => {
   it('reaps an in-flight child so its promise settles', async () => {
     fakeBin('hang-kill.js', 'setInterval(() => {}, 1000)')
@@ -397,6 +726,23 @@ describe('killAll', () => {
     await new Promise(resolve => setTimeout(resolve, 50))
     killAll()
     await expect(pending).rejects.toMatchObject({ kind: 'nonzero' })
+  })
+
+  it('terminal shutdown rejects new read and action races without spawning', async () => {
+    const startsFile = join(dir, 'starts')
+    fakeBin(
+      'shutdown-guard.js',
+      `require('node:fs').appendFileSync(${JSON.stringify(startsFile)}, 'x'); process.stdout.write('{}')`,
+    )
+
+    shutdownAll()
+    startServe()
+
+    await expect(spawnCli(['status', '--after-shutdown']))
+      .rejects.toMatchObject({ kind: 'nonzero' })
+    await expect(spawnCliAction(['currency', 'EUR']))
+      .resolves.toMatchObject({ ok: false, code: null })
+    expect(readMaybe(startsFile)).toBe('')
   })
 })
 
