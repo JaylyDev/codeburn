@@ -269,7 +269,12 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   hermes: 'reasoning-output-accounting-v1-est-cost',
   'lingtai-tui': 'token-ledger-registry-activity-v3',
   'ibm-bob': 'worktree-project-grouping-v1',
-  kiro: 'ide-parsing-v1-est-cost',
+  // project-path-v1: the parser now records the session's full working
+  // directory as projectPath (CLI meta.cwd, v2 workspacePaths[0], workspace
+  // sessions' workspaceDirectory), which sync attribution needs to resolve
+  // the git repo. Cached entries from before the bump lack projectPath and
+  // would serve attribution-blind sessions forever without a re-parse.
+  kiro: 'ide-parsing-v1-est-cost-project-path-v1',
   opencode: 'session-model-v1',
   quickdesk: 'emf-sqlite-v2-est-cost',
   kimicode: 'wire-usage-v1-est-cost',

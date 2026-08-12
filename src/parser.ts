@@ -91,7 +91,24 @@ function isCoworkSession(cwd: string, filePath: string): boolean {
   })
 }
 
+// Memoizes resolveCanonicalProjectPath: every ParsedProviderCall with a
+// projectPath pays the .git-marker directory walk (one lstat per ancestor
+// level), and a session's calls all share one cwd — without this cache a
+// cold parse re-walks the same few directories thousands of times
+// (measured ~+5% cold-parse time for a large kiro store). Filesystem facts
+// can go stale in a long-lived process (a dir converted to a worktree
+// mid-run), so the cache is cleared with the session cache.
+const canonicalPathCache = new Map<string, { path: string; isWorktree: boolean }>()
+
 async function resolveCanonicalProjectPath(cwd: string): Promise<{ path: string; isWorktree: boolean }> {
+  const cached = canonicalPathCache.get(cwd)
+  if (cached) return cached
+  const result = await resolveCanonicalProjectPathUncached(cwd)
+  canonicalPathCache.set(cwd, result)
+  return result
+}
+
+async function resolveCanonicalProjectPathUncached(cwd: string): Promise<{ path: string; isWorktree: boolean }> {
   const trimmed = cwd.trim()
   if (!trimmed) return { path: cwd, isWorktree: false }
 
@@ -3253,6 +3270,7 @@ function cacheKey(dateRange?: DateRange, providerFilter?: string): string {
 
 export function clearSessionCache(): void {
   sessionCache.clear()
+  canonicalPathCache.clear()
 }
 
 function cachePut(key: string, data: ProjectSummary[]) {
