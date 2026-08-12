@@ -102,6 +102,42 @@ describe('mcp-remove plan', () => {
     await undoAction({ id: rec.id }, { actionsDir: fx.actionsDir })
     expect(await readFile(claudeJson, 'utf-8')).toBe(original)
   })
+
+  it('does not plan connector removal and removes only the local server from a mixed finding', async () => {
+    const coverage = (server: string): McpServerCoverage => ({
+      server,
+      toolsAvailable: 20,
+      toolsInvoked: 0,
+      unusedTools: Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+      invocations: 0,
+      loadedSessions: 2,
+      coverageRatio: 0,
+    })
+    const connector = coverage('claude_ai_Netlify')
+
+    const connectorOnly = detectMcpToolCoverage([], [connector])!
+    expect(connectorOnly.apply).toBeUndefined()
+    expect(planFor(connectorOnly)).toBeNull()
+
+    const fx = await makeFixture()
+    const claudeJson = join(fx.home, '.claude.json')
+    await writeFile(claudeJson, JSON.stringify({
+      mcpServers: {
+        filesystem: { command: 'filesystem' },
+        netlify: { command: 'local-netlify' },
+      },
+    }, null, 2) + '\n')
+
+    const mixed = detectMcpToolCoverage([], [connector, coverage('filesystem')])!
+    expect(mixed.apply).toEqual({ kind: 'mcp-remove', servers: ['filesystem'] })
+    const plan = planFor(mixed, { homeDir: fx.home, cwd: fx.project })
+    expect(plan).not.toBeNull()
+
+    await runAction(plan!, fx.actionsDir)
+    expect(JSON.parse(await readFile(claudeJson, 'utf-8')).mcpServers).toEqual({
+      netlify: { command: 'local-netlify' },
+    })
+  })
 })
 
 describe('mcp-project-scope plan', () => {

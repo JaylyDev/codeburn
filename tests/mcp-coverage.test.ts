@@ -333,6 +333,56 @@ describe('detectMcpToolCoverage', () => {
     expect(detectMcpToolCoverage([project([makeSession({})])])).toBeNull()
   })
 
+  it('keeps claude.ai connector evidence but emits manual guidance instead of a local remove command', () => {
+    const server = 'claude_ai_Netlify'
+    const inventory = Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`)
+    const turns = [makeTurn([makeCall({ cacheCreation: 50_000 })])]
+    const sessions = [
+      makeSession({ sessionId: 'a', inventory, turns }),
+      makeSession({ sessionId: 'b', inventory, turns }),
+    ]
+
+    const finding = detectMcpToolCoverage([project(sessions)])
+
+    expect(finding).not.toBeNull()
+    expect(finding!.tokensSaved).toBe(20_000)
+    expect(finding!.explanation).toContain(server)
+    expect(finding!.explanation).toContain('/mcp')
+    expect(finding!.explanation).toContain('claude.ai Settings > Connectors')
+    expect(finding!.fix.type).toBe('paste')
+    if (finding!.fix.type === 'paste') {
+      expect(finding!.fix.destination).toBe('prompt')
+      expect(finding!.fix.text).toContain('/mcp')
+      expect(finding!.fix.text).toContain('claude.ai Settings > Connectors')
+    }
+    expect(JSON.stringify(finding)).not.toContain('claude mcp remove')
+    expect(finding!.apply).toBeUndefined()
+  })
+
+  it('pluralises manual guidance when only claude.ai connectors are flagged', () => {
+    const coverage = ['claude_ai_Slack', 'claude_ai_Google_Calendar'].map(server => ({
+      server,
+      toolsAvailable: 20,
+      toolsInvoked: 0,
+      unusedTools: Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+      invocations: 0,
+      loadedSessions: 2,
+      coverageRatio: 0,
+    }))
+
+    const finding = detectMcpToolCoverage([], coverage)
+
+    expect(finding).not.toBeNull()
+    expect(finding!.fix).toMatchObject({
+      type: 'paste',
+      label: 'Manage the underused claude.ai connectors where they load:',
+    })
+    if (finding!.fix.type === 'paste') {
+      expect(finding!.fix.text).toContain('manage them in claude.ai Settings > Connectors')
+    }
+    expect(finding!.apply).toBeUndefined()
+  })
+
   it('does not flag a server with healthy coverage', () => {
     const inventory = Array.from({ length: 20 }, (_, i) => `mcp__svc__t${i}`)
     const turns = [makeTurn(
@@ -379,7 +429,55 @@ describe('detectMcpToolCoverage', () => {
     expect(finding!.explanation).toContain('1/30')
     expect(finding!.fix.type).toBe('command')
     expect((finding!.fix as { text: string }).text).toContain("claude mcp remove 'hf'")
+    expect(finding!.apply).toEqual({ kind: 'mcp-remove', servers: ['hf'] })
     expect(finding!.tokensSaved).toBeGreaterThan(0)
+  })
+
+  it('keeps mixed connector guidance visible while making only the local server executable', () => {
+    const sessions: SessionSummary[] = []
+    for (const server of ['filesystem', 'claude_ai_Slack']) {
+      const inventory = Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`)
+      sessions.push(
+        makeSession({ sessionId: `${server}-a`, inventory }),
+        makeSession({ sessionId: `${server}-b`, inventory }),
+      )
+    }
+
+    const finding = detectMcpToolCoverage([project(sessions)])
+
+    expect(finding).not.toBeNull()
+    expect(finding!.explanation).toContain('claude_ai_Slack')
+    expect(finding!.explanation).toContain('/mcp')
+    expect(finding!.explanation).toContain('claude.ai Settings > Connectors')
+    expect(finding!.fix).toEqual({
+      type: 'command',
+      label: 'Remove the underused local server, or trim its tools in your MCP config:',
+      text: "claude mcp remove 'filesystem'",
+    })
+    expect(finding!.apply).toEqual({ kind: 'mcp-remove', servers: ['filesystem'] })
+  })
+
+  it('disambiguates a claude.ai connector from a similarly named local server', () => {
+    const sessions: SessionSummary[] = []
+    for (const server of ['claude_ai_Netlify', 'netlify']) {
+      const inventory = Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`)
+      sessions.push(
+        makeSession({ sessionId: `${server}-a`, inventory }),
+        makeSession({ sessionId: `${server}-b`, inventory }),
+      )
+    }
+
+    const finding = detectMcpToolCoverage([project(sessions)])
+
+    expect(finding).not.toBeNull()
+    expect(finding!.explanation).toContain('claude_ai_Netlify')
+    expect(finding!.explanation).toContain('separate from any similarly named local MCP server')
+    expect(finding!.fix.type).toBe('command')
+    if (finding!.fix.type === 'command') {
+      expect(finding!.fix.text).toBe("claude mcp remove 'netlify'")
+      expect(finding!.fix.text).not.toContain('claude_ai_Netlify')
+    }
+    expect(finding!.apply).toEqual({ kind: 'mcp-remove', servers: ['netlify'] })
   })
 
   it('escalates impact to high when token waste crosses the threshold', () => {

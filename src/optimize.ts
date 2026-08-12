@@ -1042,6 +1042,8 @@ export function detectMcpToolCoverage(
   const removeCommands: string[] = []
   const unusedCountsByServer: Record<string, number> = {}
   const flaggedServers: string[] = []
+  const localServers: string[] = []
+  const connectorServers: string[] = []
 
   for (const c of flagged) {
     unusedCountsByServer[c.server] = c.toolsAvailable - c.toolsInvoked
@@ -1050,7 +1052,12 @@ export function detectMcpToolCoverage(
     lines.push(
       `${c.server}: ${c.toolsInvoked}/${c.toolsAvailable} tools used (${pct}% coverage) across ${c.loadedSessions} session${c.loadedSessions === 1 ? '' : 's'}`,
     )
-    removeCommands.push(`claude mcp remove '${c.server}'`)
+    if (c.server.startsWith('claude_ai_')) {
+      connectorServers.push(c.server)
+    } else {
+      localServers.push(c.server)
+      removeCommands.push(`claude mcp remove '${c.server}'`)
+    }
   }
 
   // Single combined cost pass: caps each call's contribution at the
@@ -1064,6 +1071,30 @@ export function detectMcpToolCoverage(
     : flagged.length >= UNUSED_MCP_HIGH_THRESHOLD
       ? 'high'
       : 'medium'
+  // `claude_ai_*` is Claude Code's transcript namespace for server-side
+  // claude.ai connectors. Those connectors are not local mcpServers entries,
+  // so `claude mcp remove` and the file-editing apply plan cannot own them.
+  // Coverage is aggregate here; project-level config attribution is deliberately
+  // out of scope, hence the instruction to inspect /mcp per affected project.
+  const connectorGuidance = connectorServers.length > 0
+    ? ` ${connectorServers.join(', ')} ${connectorServers.length === 1 ? 'is a claude.ai connector namespace' : 'are claude.ai connector namespaces'}, separate from any similarly named local MCP server. Transcript inventory is aggregated across the selected projects; use /mcp in each project where ${connectorServers.length === 1 ? 'it loads' : 'they load'}, or manage ${connectorServers.length === 1 ? 'it' : 'them'} in claude.ai Settings > Connectors.`
+    : ''
+  const fix: WasteAction = localServers.length > 0
+    ? {
+        type: 'command',
+        label: localServers.length === 1
+          ? 'Remove the underused local server, or trim its tools in your MCP config:'
+          : 'Remove underused local servers, or trim their tools in your MCP config:',
+        text: removeCommands.join('\n'),
+      }
+    : {
+        type: 'paste',
+        destination: 'prompt',
+        label: connectorServers.length === 1
+          ? 'Manage the underused claude.ai connector where it loads:'
+          : 'Manage the underused claude.ai connectors where they load:',
+        text: `Open /mcp in each affected project and disable ${connectorServers.join(', ')}, or manage ${connectorServers.length === 1 ? 'it' : 'them'} in claude.ai Settings > Connectors.`,
+      }
 
   return {
     id: 'mcp-low-coverage',
@@ -1071,17 +1102,13 @@ export function detectMcpToolCoverage(
     explanation:
       `Schema for unused tools is loaded into the system prompt every session and ` +
       `carried in the cached prefix on every turn. ` +
-      `${lines.join('; ')}.`,
+      `${lines.join('; ')}.${connectorGuidance}`,
     impact,
     tokensSaved,
-    fix: {
-      type: 'command',
-      label: flagged.length === 1
-        ? 'Remove the underused server, or trim its tools in your MCP config:'
-        : 'Remove underused servers, or trim their tools in your MCP config:',
-      text: removeCommands.join('\n'),
-    },
-    apply: { kind: 'mcp-remove', servers: flaggedServers },
+    fix,
+    ...(localServers.length > 0
+      ? { apply: { kind: 'mcp-remove' as const, servers: localServers } }
+      : {}),
   }
 }
 
