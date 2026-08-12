@@ -143,10 +143,64 @@
       "executableName": "codeburn"
     },
     "snap": {
-      "confinement": "classic",
+      "confinement": "strict",
       "grade": "stable",
       "summary": "See where your AI coding spend actually goes",
-      "artifactName": "codeburn_${version}_${arch}.${ext}"
+      "artifactName": "codeburn_${version}_${arch}.${ext}",
+      "plugs": [
+        "desktop",
+        "desktop-legacy",
+        "home",
+        "x11",
+        "wayland",
+        "unity7",
+        "browser-support",
+        "network",
+        "gsettings",
+        "opengl",
+        {
+          "ai-agent-session-logs": {
+            "interface": "personal-files",
+            "read": [
+              "$HOME/.claude",
+              "$HOME/.cline",
+              "$HOME/.codewhale",
+              "$HOME/.codex",
+              "$HOME/.copilot",
+              "$HOME/.cursor",
+              "$HOME/.deepseek",
+              "$HOME/.factory",
+              "$HOME/.forge",
+              "$HOME/.gemini",
+              "$HOME/.grok",
+              "$HOME/.hermes",
+              "$HOME/.kimi",
+              "$HOME/.kiro",
+              "$HOME/.kiro-server",
+              "$HOME/.lingtai",
+              "$HOME/.lingtai-tui",
+              "$HOME/.mux",
+              "$HOME/.omp",
+              "$HOME/.openclaude",
+              "$HOME/.pi",
+              "$HOME/.quickwork",
+              "$HOME/.qwen",
+              "$HOME/.vibe",
+              "$HOME/.zcode",
+              "$HOME/.config/Claude",
+              "$HOME/.config/Code",
+              "$HOME/.config/Code - Insiders",
+              "$HOME/.config/Cursor",
+              "$HOME/.config/Kiro",
+              "$HOME/.config/Open Design",
+              "$HOME/.config/VSCodium",
+              "$HOME/.config/github-copilot",
+              "$HOME/.config/manicode",
+              "$HOME/.local/share/zed"
+            ]
+          }
+        }
+      ]
     }
   },
   "homepage": "https://github.com/getagentseal/codeburn",
