@@ -1,6 +1,9 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import chalk from 'chalk'
 import stripAnsi from 'strip-ansi'
 
@@ -713,6 +716,66 @@ describe('renderCsv', () => {
 })
 
 describe('models CLI breakdown flags', () => {
+  vi.setConfig({ testTimeout: 30_000 })
+
+  it('filters the models report to unpriced rows', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-models-unpriced-'))
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'models-unpriced')
+      await mkdir(projectDir, { recursive: true })
+      await writeFile(join(projectDir, 'session.jsonl'), [
+        JSON.stringify({
+          type: 'user',
+          sessionId: 'models-unpriced-session',
+          timestamp: '2026-05-09T00:00:00.000Z',
+          cwd: '/tmp/models-unpriced',
+          message: { role: 'user', content: 'Use one priced and one unpriced model.' },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          sessionId: 'models-unpriced-session',
+          timestamp: '2026-05-09T00:01:00.000Z',
+          cwd: '/tmp/models-unpriced',
+          message: {
+            id: 'priced',
+            type: 'message',
+            role: 'assistant',
+            model: 'claude-sonnet-4-6',
+            content: [{ type: 'text', text: 'priced' }],
+            usage: { input_tokens: 1000, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+          },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          sessionId: 'models-unpriced-session',
+          timestamp: '2026-05-09T00:02:00.000Z',
+          cwd: '/tmp/models-unpriced',
+          message: {
+            id: 'unpriced',
+            type: 'message',
+            role: 'assistant',
+            model: 'zz-unpriced-frontier-model',
+            content: [{ type: 'text', text: 'unpriced' }],
+            usage: { input_tokens: 2000, output_tokens: 200, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+          },
+        }),
+      ].join('\n') + '\n')
+
+      const res = spawnSync(
+        process.execPath,
+        ['--import', 'tsx', 'src/cli.ts', 'models', '--unpriced', '--from', '2026-05-09', '--to', '2026-05-09', '--provider', 'claude', '--format', 'json'],
+        { cwd: process.cwd(), env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'), TZ: 'UTC' }, encoding: 'utf-8', timeout: 30_000 },
+      )
+
+      expect(res.status, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0)
+      const rows = JSON.parse(res.stdout) as Array<{ model: string; calls: number }>
+      expect(rows.map(row => row.model)).toEqual(['zz-unpriced-frontier-model'])
+      expect(rows[0]?.calls).toBe(1)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
   it('rejects --by-task and --by-agent together with a clear error and exit 1', () => {
     const res = spawnSync(
       process.execPath,

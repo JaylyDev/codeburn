@@ -2075,6 +2075,7 @@ program
   .option('--by-agent', 'One row per (provider, model, agent) instead of one row per (provider, model). Claude subagent transcripts only; other providers and main sessions bucket under "main"')
   .option('--top <n>', 'Show only the top N rows', (v: string) => parseInt(v, 10))
   .option('--min-cost <usd>', 'Hide rows below this cost threshold', (v: string) => parseFloat(v))
+  .option('--unpriced', 'Show only models with usage that currently price at $0')
   .option('--no-totals', 'Suppress the footer totals row')
   .option('--format <format>', 'Output format: table, markdown, json, csv', 'table')
   .action(async (opts) => {
@@ -2099,13 +2100,21 @@ program
     }
 
     const projects = await parseAllSessions(range, opts.provider)
-    const rows = await aggregateModels(projects, {
+    let rows = await aggregateModels(projects, {
       byTask: !!opts.byTask,
       byAgent: !!opts.byAgent,
       taskFilter: opts.task,
       topN: typeof opts.top === 'number' && Number.isFinite(opts.top) ? opts.top : undefined,
-      minCost: typeof opts.minCost === 'number' && Number.isFinite(opts.minCost) ? opts.minCost : 0.01,
+      minCost: typeof opts.minCost === 'number' && Number.isFinite(opts.minCost) ? opts.minCost : (opts.unpriced ? 0 : 0.01),
     })
+    if (opts.unpriced) {
+      rows = rows.filter(row => findUnpricedModels([{
+        model: row.model,
+        calls: row.calls,
+        cost: row.costUSD,
+        tokens: row.totalTokens,
+      }]).length > 0)
+    }
 
     const fmt = (opts.format ?? 'table').toLowerCase()
     if (rows.length === 0 && (fmt === 'table' || fmt === 'markdown')) {
