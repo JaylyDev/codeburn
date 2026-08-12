@@ -2251,6 +2251,7 @@ async function scanProjectDirs(
     // on a resumed session) and derive the agent id from the `agent-<agentId>`
     // filename. A sidechain whose parent id was never captured stays standalone.
     if (cachedFile.isSidechain) {
+      session.isSidechain = true
       if (cachedFile.parentSessionId) session.parentSessionId = cachedFile.parentSessionId
       session.agentId = sessionId.startsWith('agent-') ? sessionId.slice('agent-'.length) : sessionId
     }
@@ -3327,6 +3328,7 @@ function carryLinkageFields(rebuilt: SessionSummary, original: SessionSummary): 
   if (original.prLinks?.length) rebuilt.prLinks = original.prLinks
   if (original.prAttributionSource) rebuilt.prAttributionSource = original.prAttributionSource
   if (original.workingDirectory) rebuilt.workingDirectory = original.workingDirectory
+  if (original.isSidechain) rebuilt.isSidechain = true
   // prRefsAtRangeStart is NOT copied here: a narrower slice needs it recomputed at
   // the new boundary (see recomputeRangeStartPrRefs), not the wide range's value.
   if (original.parentSessionId) rebuilt.parentSessionId = original.parentSessionId

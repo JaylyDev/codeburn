@@ -1,10 +1,11 @@
 import chalk from 'chalk'
-import { isReadShapedBashCommand } from './bash-utils.js'
+import { createHash } from 'node:crypto'
 import { readdir, stat } from 'fs/promises'
 import { existsSync, statSync } from 'fs'
 import { basename, join } from 'path'
 import { homedir } from 'os'
 
+import { isReadShapedBashCommand } from './bash-utils.js'
 import { readSessionLines, readSessionFileSync } from './fs-utils.js'
 import { discoverAllSessions } from './providers/index.js'
 import { parseJsonlLine, shouldSkipLine } from './parser.js'
@@ -2484,6 +2485,22 @@ function sessionTokenTotal(session: ProjectSummary['sessions'][number]): number 
     + session.totalCacheWriteTokens
 }
 
+// Sidechain transcripts are real usage, so they stay in project totals and in
+// token/cost calibration. They are not user-started sessions, however, and
+// should never enter optimize heuristics whose unit is a human work session.
+// Keep that distinction local to optimize instead of deleting sidechains from
+// ProjectSummary, which would under-report the work delegated to subagents.
+function isOptimizeSession(session: ProjectSummary['sessions'][number]): boolean {
+  return session.isSidechain !== true
+}
+
+function optimizeSessionCount(projects: ProjectSummary[]): number {
+  return projects.reduce(
+    (total, project) => total + project.sessions.filter(isOptimizeSession).length,
+    0,
+  )
+}
+
 function sessionEffectiveContextTokens(session: ProjectSummary['sessions'][number]): number {
   return session.totalInputTokens
     + session.totalCacheReadTokens * CACHE_READ_DISCOUNT
@@ -2592,6 +2609,7 @@ export function findLowWorthCandidates(projects: ProjectSummary[]): LowWorthCand
 
   for (const project of projects) {
     for (const session of project.sessions) {
+      if (!isOptimizeSession(session)) continue
       if (session.totalCostUSD < WORTH_IT_MIN_COST_USD) continue
       if (sessionDeliveryCommand(session)) continue
 
@@ -2692,7 +2710,7 @@ export function findContextBloatCandidates(projects: ProjectSummary[]): ContextB
   const candidates: ContextBloatCandidate[] = []
 
   for (const project of projects) {
-    const sessions = [...project.sessions].sort((a, b) =>
+    const sessions = project.sessions.filter(isOptimizeSession).sort((a, b) =>
       new Date(a.firstTimestamp).getTime() - new Date(b.firstTimestamp).getTime()
     )
     let previousInputTokens: number | null = null
@@ -2805,7 +2823,7 @@ export function detectSessionOutliers(projects: ProjectSummary[], excludedSessio
   const outliers: Outlier[] = []
 
   for (const project of projects) {
-    const sessions = project.sessions.filter(s => s.totalCostUSD > 0)
+    const sessions = project.sessions.filter(s => isOptimizeSession(s) && s.totalCostUSD > 0)
     if (sessions.length < MIN_SESSIONS_FOR_OUTLIER) continue
 
     const totalCost = sessions.reduce((sum, s) => sum + s.totalCostUSD, 0)
@@ -2866,7 +2884,7 @@ function findYoungProjectFirstSessionIds(projects: ProjectSummary[]): Set<string
   const firstSessionIds = new Set<string>()
 
   for (const project of projects) {
-    const costed = project.sessions.filter(s => s.totalCostUSD > 0)
+    const costed = project.sessions.filter(s => isOptimizeSession(s) && s.totalCostUSD > 0)
     if (costed.length >= YOUNG_PROJECT_SESSION_LIMIT) continue
 
     let firstSession: ProjectSummary['sessions'][number] | null = null
@@ -2985,15 +3003,25 @@ export function cacheKey(projects: ProjectSummary[], dateRange: DateRange | unde
   // stale findings when cost/tokens moved (e.g. a re-price) while call count
   // held - reachable in the long-lived menubar process within the 60s TTL.
   // Cost is scaled to whole micro-dollars so float jitter cannot thrash the key.
-  let calls = 0, cost = 0, savings = 0, proxied = 0
+  let calls = 0, cost = 0, savings = 0, proxied = 0, sessions = 0, sidechains = 0
+  const sidechainIdentities: string[] = []
   for (const p of projects) {
     calls += p.totalApiCalls
     cost += p.totalCostUSD
     savings += p.totalSavingsUSD
     proxied += p.totalProxiedCostUSD
+    sessions += p.sessions.length
+    for (const session of p.sessions) {
+      if (session.isSidechain !== true) continue
+      sidechains++
+      sidechainIdentities.push(`${p.projectPath}\0${session.sessionId}`)
+    }
   }
+  const sidechainDigest = createHash('sha256')
+    .update(sidechainIdentities.sort().join('\0'))
+    .digest('base64url')
   // Costs scaled to whole micro-dollars so float jitter cannot thrash the key.
-  const fingerprint = `${projects.length}:${calls}:${Math.round(cost * 1e6)}:${Math.round(savings * 1e6)}:${Math.round(proxied * 1e6)}`
+  const fingerprint = `${projects.length}:${sessions}:${sidechains}:${sidechainDigest}:${calls}:${Math.round(cost * 1e6)}:${Math.round(savings * 1e6)}:${Math.round(proxied * 1e6)}`
   return `${dr}:${fingerprint}`
 }
 
@@ -3205,7 +3233,7 @@ function renderOptimize(
 
   const issueSuffix = findings.length > 0 ? `, ${findings.length} issue${findings.length > 1 ? 's' : ''}` : ''
   lines.push('  ' + [
-    `${sessionCount} sessions`,
+    `${sessionCount} session${sessionCount === 1 ? '' : 's'}`,
     `${callCount.toLocaleString()} calls`,
     chalk.hex(GOLD)(formatCost(periodCost)),
     `Health: ${chalk.bold.hex(GRADE_COLORS[healthGrade])(healthGrade)}${chalk.dim(` (${healthScore}/100${issueSuffix})`)}`,
@@ -3295,7 +3323,7 @@ export async function runOptimize(
 
   const result = await scanAndDetect(projects, dateRange)
   const { findings, costRate, healthScore, healthGrade } = result
-  const sessions = projects.flatMap(p => p.sessions)
+  const sessionCount = optimizeSessionCount(projects)
   const periodCost = projects.reduce((s, p) => s + p.totalCostUSD, 0)
   const callCount = projects.reduce((s, p) => s + p.totalApiCalls, 0)
 
@@ -3305,7 +3333,7 @@ export async function runOptimize(
   }
 
   const { topReworkedFiles, coachingNotes } = buildWorkflowReport(projects)
-  const output = renderOptimize(findings, costRate, periodLabel, periodCost, sessions.length, callCount, healthScore, healthGrade, topReworkedFiles, coachingNotes, opts.appliedHeader, opts.previouslyApplied, result.modelRecommendations)
+  const output = renderOptimize(findings, costRate, periodLabel, periodCost, sessionCount, callCount, healthScore, healthGrade, topReworkedFiles, coachingNotes, opts.appliedHeader, opts.previouslyApplied, result.modelRecommendations)
   console.log(output)
 }
 
@@ -3315,7 +3343,6 @@ export function buildOptimizeJsonReport(
   result: OptimizeResult,
   dateRange?: DateRange,
 ): OptimizeJsonReport {
-  const sessions = projects.flatMap(p => p.sessions)
   const periodCostUSD = projects.reduce((s, p) => s + p.totalCostUSD, 0)
   const calls = projects.reduce((s, p) => s + p.totalApiCalls, 0)
   const potentialSavingsTokens = result.findings.reduce((s, f) => s + f.tokensSaved, 0)
@@ -3335,7 +3362,7 @@ export function buildOptimizeJsonReport(
       healthGrade: result.healthGrade,
       findingCount: result.findings.length,
       periodCostUSD,
-      sessions: sessions.length,
+      sessions: optimizeSessionCount(projects),
       calls,
       potentialSavingsTokens,
       potentialSavingsCostUSD,
