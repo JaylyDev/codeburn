@@ -232,6 +232,7 @@ export type PasteDestination =
   | 'session-opener'   // one-time paste at the start of a NEW session
   | 'prompt'           // one-time ask in the current Claude conversation
   | 'shell-config'     // append to ~/.zshrc / ~/.bashrc
+  | 'manual'           // instructions the user carries out directly
 
 export type WasteAction =
   | { type: 'paste'; label: string; text: string; destination?: PasteDestination }
@@ -1083,8 +1084,14 @@ export function detectMcpToolCoverage(
   // so `claude mcp remove` and the file-editing apply plan cannot own them.
   // Coverage is aggregate here; project-level config attribution is deliberately
   // out of scope, hence the instruction to inspect /mcp per affected project.
+  const connectorLabels = connectorServers.map(server =>
+    `claude.ai ${server.slice('claude_ai_'.length).replaceAll('_', ' ')}`,
+  )
+  const connectorEvidence = connectorServers.map((server, index) =>
+    `${connectorLabels[index]} (${server})`,
+  )
   const connectorGuidance = connectorServers.length > 0
-    ? ` ${connectorServers.join(', ')} ${connectorServers.length === 1 ? 'is a claude.ai connector namespace' : 'are claude.ai connector namespaces'}, separate from any similarly named local MCP server. Transcript inventory is aggregated across the selected projects; use /mcp in each project where ${connectorServers.length === 1 ? 'it loads' : 'they load'}, or manage ${connectorServers.length === 1 ? 'it' : 'them'} in claude.ai Settings > Connectors.`
+    ? ` ${connectorEvidence.join(', ')} ${connectorServers.length === 1 ? 'is a claude.ai connector namespace' : 'are claude.ai connector namespaces'}, separate from any similarly named local MCP server. Transcript inventory is aggregated across the selected projects; use /mcp in each project where ${connectorServers.length === 1 ? 'it loads' : 'they load'}, or manage ${connectorServers.length === 1 ? 'it' : 'them'} in claude.ai Settings > Connectors.`
     : ''
   const fix: WasteAction = localServers.length > 0
     ? {
@@ -1096,11 +1103,11 @@ export function detectMcpToolCoverage(
       }
     : {
         type: 'paste',
-        destination: 'prompt',
+        destination: 'manual',
         label: connectorServers.length === 1
           ? 'Manage the underused claude.ai connector where it loads:'
           : 'Manage the underused claude.ai connectors where they load:',
-        text: `Open /mcp in each affected project and disable ${connectorServers.join(', ')}, or manage ${connectorServers.length === 1 ? 'it' : 'them'} in claude.ai Settings > Connectors.`,
+        text: `Open /mcp in each affected project and disable ${connectorLabels.join(', ')}, or manage ${connectorServers.length === 1 ? 'it' : 'them'} in claude.ai Settings > Connectors.`,
       }
 
   return {
@@ -3152,6 +3159,7 @@ function renderActionHeader(action: WasteAction): string {
         case 'session-opener':  return fillTo('One-time session opener (do NOT add to CLAUDE.md)')
         case 'prompt':          return fillTo('Ask Claude in the current session')
         case 'shell-config':    return fillTo('Add to your shell config')
+        case 'manual':          return fillTo('Manual action')
         default:                return fillTo('Suggested action')
       }
   }

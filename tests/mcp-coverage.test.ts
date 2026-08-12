@@ -1,10 +1,12 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 
 import {
   aggregateMcpCoverage,
+  buildOptimizeJsonReport,
   detectMcpProfileAdvisor,
   detectMcpToolCoverage,
   estimateMcpSchemaCost,
+  runOptimize,
 } from '../src/optimize.js'
 import type {
   ClassifiedTurn,
@@ -346,17 +348,76 @@ describe('detectMcpToolCoverage', () => {
 
     expect(finding).not.toBeNull()
     expect(finding!.tokensSaved).toBe(20_000)
+    // Keep the transcript namespace as evidence, but name the connector the
+    // way users actually see it in /mcp and claude.ai Settings.
     expect(finding!.explanation).toContain(server)
+    expect(finding!.explanation).toContain('claude.ai Netlify')
     expect(finding!.explanation).toContain('/mcp')
     expect(finding!.explanation).toContain('claude.ai Settings > Connectors')
     expect(finding!.fix.type).toBe('paste')
     if (finding!.fix.type === 'paste') {
-      expect(finding!.fix.destination).toBe('prompt')
+      expect(finding!.fix.destination).toBe('manual')
       expect(finding!.fix.text).toContain('/mcp')
+      expect(finding!.fix.text).toContain('claude.ai Netlify')
+      expect(finding!.fix.text).not.toContain(server)
       expect(finding!.fix.text).toContain('claude.ai Settings > Connectors')
     }
     expect(JSON.stringify(finding)).not.toContain('claude mcp remove')
     expect(finding!.apply).toBeUndefined()
+  })
+
+  it('renders connector-only remediation as a manual action, never an Ask Claude prompt', async () => {
+    const server = 'claude_ai_Google_Calendar'
+    const inventory = Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`)
+    const turns = [makeTurn([makeCall({ cacheCreation: 50_000 })])]
+    const projects = [project([
+      makeSession({ sessionId: 'a', inventory, turns }),
+      makeSession({ sessionId: 'b', inventory, turns }),
+    ])]
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+
+    try {
+      await runOptimize(projects, 'Test period')
+      const output = log.mock.calls.map(args => args.join(' ')).join('\n')
+      expect(output).toContain('Manual action')
+      expect(output).toContain('claude.ai Google Calendar')
+      expect(output).not.toContain('Ask Claude in the current session')
+    } finally {
+      log.mockRestore()
+    }
+  })
+
+  it('keeps the public optimize JSON envelope while marking connector guidance manual', () => {
+    const server = 'claude_ai_Slack'
+    const coverage = [{
+      server,
+      toolsAvailable: 20,
+      toolsInvoked: 0,
+      unusedTools: Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+      invocations: 0,
+      loadedSessions: 2,
+      coverageRatio: 0,
+    }]
+    const finding = detectMcpToolCoverage([], coverage)!
+
+    const report = buildOptimizeJsonReport([], 'Test period', {
+      findings: [finding],
+      costRate: 0,
+      healthScore: 90,
+      healthGrade: 'A',
+    })
+
+    expect(report.findings[0]).toMatchObject({
+      id: 'mcp-low-coverage',
+      tokensSaved: 0,
+      fix: {
+        type: 'paste',
+        destination: 'manual',
+        text: expect.stringContaining('claude.ai Slack'),
+      },
+    })
+    expect(report.findings[0]).not.toHaveProperty('apply')
+    expect(report.findings[0]).not.toHaveProperty('applyTokensSaved')
   })
 
   it('pluralises manual guidance when only claude.ai connectors are flagged', () => {
@@ -375,6 +436,7 @@ describe('detectMcpToolCoverage', () => {
     expect(finding).not.toBeNull()
     expect(finding!.fix).toMatchObject({
       type: 'paste',
+      destination: 'manual',
       label: 'Manage the underused claude.ai connectors where they load:',
     })
     if (finding!.fix.type === 'paste') {

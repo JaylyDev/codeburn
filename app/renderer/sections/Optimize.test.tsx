@@ -160,6 +160,29 @@ describe('Optimize', () => {
     expect(screen.getByText('{"batch":true}')).toBeInTheDocument()
   })
 
+  it('renders and copies connector guidance as a manual action', async () => {
+    const report = makeOptimizeReport()
+    report.findings.push({
+      id: 'mcp-low-coverage', title: 'Underused claude.ai connector',
+      explanation: 'The connector loads unused tools.', severity: 'medium',
+      trend: null, tokensSaved: 2_000, estimatedSavingsUSD: 1,
+      fix: {
+        type: 'paste', destination: 'manual', label: 'Manage the connector where it loads:',
+        text: 'Open /mcp and disable claude.ai Google Calendar.',
+      },
+    })
+    getOptimizeReport.mockResolvedValue(report)
+    render(<Optimize period="30days" provider="all" />)
+    const row = await screen.findByRole('button', { name: /Underused claude.ai connector/ })
+    fireEvent.click(row)
+
+    expect(screen.getByText('Manage the connector where it loads:')).toBeInTheDocument()
+    expect(screen.getByText('Open /mcp and disable claude.ai Google Calendar.')).toBeInTheDocument()
+    expect(row.parentElement?.querySelector('.opt-fix')).toHaveClass('opt-fix-paste')
+    fireEvent.click(screen.getByRole('button', { name: 'Copy' }))
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('Open /mcp and disable claude.ai Google Calendar.'))
+  })
+
   it('switches to Reverts and Abandoned and shows only the matching yield details', async () => {
     render(<Optimize period="30days" provider="all" />)
     await screen.findByText('Opus is doing your small talk')
