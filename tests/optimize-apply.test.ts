@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { PassThrough, Writable } from 'node:stream'
+import stripAnsi from 'strip-ansi'
 
 import { planFor, planFindings, type PlanContext } from '../src/act/plans.js'
 import { renderApplyList, runOptimizeApply, type ApplyOptions } from '../src/act/optimize-apply.js'
@@ -137,6 +138,30 @@ describe('mcp-remove plan', () => {
     expect(JSON.parse(await readFile(claudeJson, 'utf-8')).mcpServers).toEqual({
       netlify: { command: 'local-netlify' },
     })
+  })
+
+  it('previews only the savings attributable to a mixed finding local mutation', async () => {
+    const fx = await makeFixture()
+    await writeFile(join(fx.home, '.claude.json'), JSON.stringify({
+      mcpServers: { filesystem: { command: 'filesystem' } },
+    }, null, 2) + '\n')
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage',
+      title: '2 MCP servers with low tool coverage',
+      explanation: '',
+      impact: 'medium',
+      tokensSaved: 80_000,
+      applyTokensSaved: 20_000,
+      fix: { type: 'command', label: '', text: "claude mcp remove 'filesystem'" },
+      apply: { kind: 'mcp-remove', servers: ['filesystem'] },
+    }
+    const plans = planFindings([finding], { homeDir: fx.home, cwd: fx.project })
+
+    const preview = stripAnsi(renderApplyList(plans, [], 0.000002))
+
+    expect(preview).toContain('(~20.0K tokens, ~$0.040)')
+    expect(preview).not.toContain('~80.0K tokens')
+    expect(preview).not.toContain('~$0.160')
   })
 })
 

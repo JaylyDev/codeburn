@@ -688,7 +688,7 @@ export function captureBaseline(finding: WasteFinding, kind: ActionKind, ctx: Ca
   const common = {
     windowDays: ctx.windowDays,
     capturedAt: ctx.now.toISOString(),
-    estimatedTokens: Math.max(0, Math.round(finding.tokensSaved)),
+    estimatedTokens: Math.max(0, Math.round(finding.applyTokensSaved ?? finding.tokensSaved)),
   }
 
   if (MCP_KINDS.has(kind)) {

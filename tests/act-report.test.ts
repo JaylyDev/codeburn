@@ -762,3 +762,43 @@ describe('defer baseline capture', () => {
     expect(b).toBeUndefined()
   })
 })
+
+describe('partial-action baseline capture', () => {
+  it('persists the savings attributable to the local mutation, not the full mixed finding', () => {
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage',
+      title: '2 MCP servers with low tool coverage',
+      explanation: '',
+      impact: 'medium',
+      tokensSaved: 40_000,
+      applyTokensSaved: 20_000,
+      fix: { type: 'command', label: '', text: "claude mcp remove 'filesystem'" },
+      apply: { kind: 'mcp-remove', servers: ['filesystem'] },
+    }
+    const sessions = sessionsAt(2, daysAgo(1), {
+      mcpInventory: Array.from({ length: 20 }, (_, i) => `mcp__filesystem__t${i}`),
+    })
+
+    const baseline = captureBaseline(finding, 'mcp-remove', {
+      projects: [projectOf(sessions)],
+      coverage: [{
+        server: 'filesystem',
+        toolsAvailable: 20,
+        toolsInvoked: 0,
+        unusedTools: [],
+        invocations: 0,
+        loadedSessions: 2,
+        coverageRatio: 0,
+      }],
+      windowDays: 14,
+      now: NOW,
+    })
+
+    expect(baseline).toMatchObject({
+      estimatedTokens: 20_000,
+      sessions: 2,
+      metrics: { filesystem: 8_000 },
+    })
+    expect(finding.tokensSaved).toBe(40_000)
+  })
+})

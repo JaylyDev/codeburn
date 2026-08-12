@@ -434,18 +434,21 @@ describe('detectMcpToolCoverage', () => {
   })
 
   it('keeps mixed connector guidance visible while making only the local server executable', () => {
-    const sessions: SessionSummary[] = []
-    for (const server of ['filesystem', 'claude_ai_Slack']) {
-      const inventory = Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`)
-      sessions.push(
-        makeSession({ sessionId: `${server}-a`, inventory }),
-        makeSession({ sessionId: `${server}-b`, inventory }),
-      )
-    }
+    const inventory = ['filesystem', 'claude_ai_Slack'].flatMap(server =>
+      Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+    )
+    const sessions: SessionSummary[] = [
+      makeSession({ sessionId: 'mixed-a', inventory, turns: [makeTurn([makeCall({ cacheCreation: 50_000 })])] }),
+      makeSession({ sessionId: 'mixed-b', inventory, turns: [makeTurn([makeCall({ cacheCreation: 50_000 })])] }),
+    ]
 
     const finding = detectMcpToolCoverage([project(sessions)])
 
     expect(finding).not.toBeNull()
+    // The finding describes both opportunities: 40 unused tool schemas across
+    // two sessions = 40K effective tokens. The automatic mutation owns only
+    // the 20 local schemas = 20K; the connector portion remains manual.
+    expect(finding).toMatchObject({ tokensSaved: 40_000, applyTokensSaved: 20_000 })
     expect(finding!.explanation).toContain('claude_ai_Slack')
     expect(finding!.explanation).toContain('/mcp')
     expect(finding!.explanation).toContain('claude.ai Settings > Connectors')

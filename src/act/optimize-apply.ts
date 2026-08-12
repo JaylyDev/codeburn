@@ -42,7 +42,8 @@ export function renderApplyList(appliable: FindingPlan[], manual: FindingPlan[],
   lines.push(chalk.bold('  Appliable config-class fixes:'))
   appliable.forEach((fp, i) => {
     const f = fp.finding
-    const savings = `~${formatTokens(f.tokensSaved)} tokens${costRate > 0 ? `, ~${formatCost(f.tokensSaved * costRate)}` : ''}`
+    const actionTokensSaved = f.applyTokensSaved ?? f.tokensSaved
+    const savings = `~${formatTokens(actionTokensSaved)} tokens${costRate > 0 ? `, ~${formatCost(actionTokensSaved * costRate)}` : ''}`
     lines.push('')
     lines.push(`  ${i + 1}. ${f.title}  ${chalk.hex('#FFD700')(`(${savings})`)}`)
     for (const line of changeLines(fp)) lines.push(chalk.dim(`       ${line}`))

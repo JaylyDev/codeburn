@@ -300,6 +300,10 @@ export type WasteFinding = {
   explanation: string
   impact: Impact
   tokensSaved: number
+  /// Savings attributable to the automatic mutation when it covers only a
+  /// subset of the finding. Omitted when `tokensSaved` already describes the
+  /// whole apply action (or when the finding is manual-only).
+  applyTokensSaved?: number
   fix: WasteAction
   trend?: Trend
   apply?: FindingApply
@@ -1066,6 +1070,9 @@ export function detectMcpToolCoverage(
   // bucket and overstate `tokensSaved`.
   const cost = estimateMcpSchemaCost(unusedCountsByServer, projects, flaggedServers)
   const tokensSaved = Math.round(cost.effectiveInputTokens)
+  const applyTokensSaved = localServers.length > 0 && connectorServers.length > 0
+    ? Math.round(estimateMcpSchemaCost(unusedCountsByServer, projects, localServers).effectiveInputTokens)
+    : undefined
   const impact: Impact = tokensSaved >= MCP_COVERAGE_HIGH_IMPACT_TOKENS
     ? 'high'
     : flagged.length >= UNUSED_MCP_HIGH_THRESHOLD
@@ -1105,6 +1112,7 @@ export function detectMcpToolCoverage(
       `${lines.join('; ')}.${connectorGuidance}`,
     impact,
     tokensSaved,
+    ...(applyTokensSaved !== undefined ? { applyTokensSaved } : {}),
     fix,
     ...(localServers.length > 0
       ? { apply: { kind: 'mcp-remove' as const, servers: localServers } }
