@@ -123,13 +123,42 @@ struct DataClient {
         subcommand: [String],
         qualityOfService: QualityOfService = .userInitiated
     ) async throws -> ProcessResult {
+        try await runCLI(
+            subcommand: subcommand,
+            serveRequest: { args in
+                try await ServeConnection.shared.request(args: args)
+            },
+            spawnFallback: {
+                await spawnLimiter.acquire()
+                defer { Task { await spawnLimiter.release() } }
+                let process = CodeburnCLI.makeProcess(
+                    subcommand: subcommand,
+                    qualityOfService: qualityOfService
+                )
+                return try await runProcess(
+                    process,
+                    timeoutSeconds: spawnTimeoutSeconds,
+                    label: subcommand.joined(separator: " ")
+                )
+            }
+        )
+    }
+
+    /// Internal seam for behavior-shaped lifecycle tests. Production supplies
+    /// the shared resident and globally limited one-shot closures above.
+    static func runCLI(
+        subcommand: [String],
+        serveRequest: ([String]) async throws -> Data,
+        spawnFallback: () async throws -> ProcessResult
+    ) async throws -> ProcessResult {
         // Serve path: the first real status payload warms the resident child,
         // then later payloads reuse it (no node boot or session-cache reload).
-        // Any serve failure falls back to the spawn path below, so this remains
-        // strictly an optimization and takes no spawn slot.
+        // Transport/protocol failures fall back to the spawn path below, so
+        // the resident remains an optimization. Resource-policy failures stay
+        // terminal and cannot bypass the resident output ceiling.
         if ServeConnection.isEligible(subcommand) {
             do {
-                let stdout = try await ServeConnection.shared.request(args: subcommand)
+                let stdout = try await serveRequest(subcommand)
                 return ProcessResult(stdout: stdout, stderr: "", exitCode: 0)
             } catch let error as CancellationError {
                 // Cancellation is control flow from the refresh owner. Starting
@@ -137,18 +166,25 @@ struct DataClient {
                 // expensive cold parse and delay task teardown.
                 throw error
             } catch {
+                if let terminalError = terminalServeError(error) {
+                    throw terminalError
+                }
                 // Resident serve is only an optimization. Protocol, child, and
                 // timeout failures retain the established one-shot fallback,
                 // unless a sibling teardown raced this task's cancellation.
                 try Task.checkCancellation()
             }
         }
-        await spawnLimiter.acquire()
-        defer { Task { await spawnLimiter.release() } }
-        let process = CodeburnCLI.makeProcess(subcommand: subcommand, qualityOfService: qualityOfService)
-        return try await runProcess(process,
-                                    timeoutSeconds: spawnTimeoutSeconds,
-                                    label: subcommand.joined(separator: " "))
+        return try await spawnFallback()
+    }
+
+    /// Some resident failures are terminal resource-policy decisions, not
+    /// transport failures. Retrying those through the one-shot path would redo
+    /// the cold scan and could bypass the resident's stricter output ceiling.
+    static func terminalServeError(_ error: Error) -> DataClientError? {
+        guard let failure = error as? ServeConnection.ServeRequestFailed,
+              failure.reason == .outputTooLarge else { return nil }
+        return .outputTooLarge
     }
 
     /// Runs an already-configured process to completion, draining its output and

@@ -60,9 +60,6 @@ const DEFAULT_TIMEOUT_MS = 45_000
 export const DESKTOP_COLD_TIMEOUT_MS = 10 * 60_000
 // A runaway CLI (or a compromised binary) must not exhaust main-process memory.
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024
-// Same-cadence pollers fire near-identical read spawns; share one child and hold
-// its result briefly so six overview hooks don't launch six processes at once.
-const COALESCE_TTL_MS = 5_000
 // A cold-cache CLI spawn costs seconds at ~120% CPU; letting every poll +
 // prefetch launch at once saturates the machine. Cap how many children run
 // concurrently — the rest queue and drain as slots free (interactive first).
@@ -71,7 +68,10 @@ const MAX_CONCURRENT_CLI = 2
 // Every live child so `before-quit` can reap them (Electron does not on macOS).
 const activeChildren = new Set<ChildProcess>()
 const readInflight = new Map<string, Promise<unknown>>()
-const readCache = new Map<string, { at: number; value: unknown }>()
+// Successful mutations advance the epoch before their promise resolves. A read
+// begun against older config may still settle for its original caller, but can
+// never be reused by the post-mutation refetch or delete that newer flight.
+let readGeneration = 0
 
 // Concurrency scheduler. `running` counts spawned (not queued) children; waiters
 // hold the slot-grant resolver for a queued spawn. Two queues so interactive
@@ -395,6 +395,25 @@ function runCli(spec: SpawnSpec, cmdLabel: string, timeoutMs: number, onStderr?:
   })
 }
 
+/** Run a one-shot read under the global child cap. A slot grant resumes on a
+ * microtask, so terminal shutdown must be checked again immediately before the
+ * synchronous spawn call. */
+async function runScheduledCli(
+  spec: SpawnSpec,
+  cmdLabel: string,
+  timeoutMs: number,
+  priority: SpawnPriority,
+  onStderr?: (chunk: string) => void,
+): Promise<unknown> {
+  await acquireSlot(priority)
+  try {
+    if (shuttingDown) throw new CliError('nonzero', 'codeburn is shutting down')
+    return await runCli(spec, cmdLabel, timeoutMs, onStderr)
+  } finally {
+    releaseSlot()
+  }
+}
+
 /**
  * Spawn `codeburn <args>` with plain argv (never a shell), collect stdout, and
  * decode it as JSON. Rejects with a structured {@link CliError}:
@@ -404,8 +423,9 @@ function runCli(spec: SpawnSpec, cmdLabel: string, timeoutMs: number, onStderr?:
  *   timeout    the process was killed after `timeoutMs`
  *   too-large  stdout+stderr exceeded {@link MAX_OUTPUT_BYTES}
  *
- * Read-only, so concurrent identical calls share one child and a 5s result cache
- * absorbs same-cadence pollers. Never use this for config-mutating commands.
+ * Read-only, so concurrent identical calls share one child. Settled results are
+ * never cached here because config can also change outside the desktop app.
+ * Never use this for config-mutating commands.
  */
 // ── Resident serve child ────────────────────────────────────────────────
 // The heavy read queries (one per panel) each pay seconds of CLI startup on
@@ -430,11 +450,13 @@ class ServeClient {
     reject: (e: Error) => void
     timer: NodeJS.Timeout
     warmsServe: boolean
+    decodedBytes: number
     onStderr?: (chunk: string) => void
   }>()
   private nextId = 1
   private deaths = 0
   private buffer = ''
+  private bufferBytes = 0
   private warmed = false
   private destroyed = false
   private requestTail: Promise<void> = Promise.resolve()
@@ -453,19 +475,27 @@ class ServeClient {
     child.stdout!.on('data', (chunk: string) => {
       // A replaced child's stream can drain after its exit callback. Never let
       // those stale bytes repopulate the shared line buffer for the new child.
-      if (this.child === child) this.onData(chunk)
+      if (this.child === child) this.onData(child, chunk)
     })
     const onGone = () => this.onDeath(child)
     child.on('exit', onGone)
     child.on('error', onGone)
   }
 
-  private onData(chunk: string): void {
+  private onData(child: ReturnType<typeof spawn>, chunk: string): void {
     this.buffer += chunk
+    this.bufferBytes += Buffer.byteLength(chunk)
     let idx: number
     while ((idx = this.buffer.indexOf('\n')) >= 0) {
-      const line = this.buffer.slice(0, idx).trim()
+      const rawLine = this.buffer.slice(0, idx)
       this.buffer = this.buffer.slice(idx + 1)
+      const rawLineBytes = Buffer.byteLength(rawLine)
+      this.bufferBytes = Math.max(0, this.bufferBytes - rawLineBytes - 1)
+      if (rawLineBytes > MAX_OUTPUT_BYTES) {
+        this.terminateForOverflow(child)
+        return
+      }
+      const line = rawLine.trim()
       if (!line) continue
       let msg: { id?: number; ready?: boolean; progress?: string; ok?: boolean; refused?: boolean; output?: string; error?: string }
       try { msg = JSON.parse(line) } catch { continue }
@@ -474,11 +504,14 @@ class ServeClient {
       const waiter = this.pending.get(msg.id)
       if (!waiter) continue
       if (typeof msg.progress === 'string') {
+        if (!this.consumeDecodedOutput(child, waiter, msg.progress)) return
         if (waiter.onStderr) {
           try { waiter.onStderr(msg.progress) } catch { /* progress consumers never own the request */ }
         }
         continue
       }
+      const terminalOutput = typeof msg.output === 'string' ? msg.output : typeof msg.error === 'string' ? msg.error : ''
+      if (!this.consumeDecodedOutput(child, waiter, terminalOutput)) return
       this.pending.delete(msg.id)
       clearTimeout(waiter.timer)
       if (msg.ok && typeof msg.output === 'string') {
@@ -489,6 +522,39 @@ class ServeClient {
         waiter.reject(new CliError('nonzero', msg.error ?? 'serve request failed'))
       }
     }
+    // Complete lines are bounded above before parsing. Bound the partial frame
+    // too, otherwise a child that never emits '\n' can grow this buffer forever.
+    if (this.bufferBytes > MAX_OUTPUT_BYTES) this.terminateForOverflow(child)
+  }
+
+  private consumeDecodedOutput(
+    child: ReturnType<typeof spawn>,
+    waiter: { decodedBytes: number },
+    output: string,
+  ): boolean {
+    waiter.decodedBytes += Buffer.byteLength(output)
+    if (waiter.decodedBytes <= MAX_OUTPUT_BYTES) return true
+    this.terminateForOverflow(child)
+    return false
+  }
+
+  private terminateForOverflow(child: ReturnType<typeof spawn>): void {
+    if (this.child !== child) return
+    const error = new CliError('too-large', `codeburn serve produced more than ${MAX_OUTPUT_BYTES} bytes`)
+    // Detach synchronously before SIGKILL. A new request may start the next
+    // generation immediately; the old child's eventual exit must not reject it.
+    this.child = null
+    this.buffer = ''
+    this.bufferBytes = 0
+    this.warmed = false
+    this.deaths += 1
+    activeChildren.delete(child as never)
+    for (const [, waiter] of this.pending) {
+      clearTimeout(waiter.timer)
+      waiter.reject(error)
+    }
+    this.pending.clear()
+    child.kill('SIGKILL')
   }
 
   private onDeath(child: ReturnType<typeof spawn>, countsTowardBudget = true): void {
@@ -498,6 +564,7 @@ class ServeClient {
     if (this.child !== child) return
     this.child = null
     this.buffer = ''
+    this.bufferBytes = 0
     this.warmed = false
     if (countsTowardBudget) this.deaths += 1
     activeChildren.delete(child as never)
@@ -547,6 +614,7 @@ class ServeClient {
         reject,
         timer,
         warmsServe: args[0] === 'status',
+        decodedBytes: 0,
         ...(onStderr ? { onStderr } : {}),
       })
       child.stdin!.write(JSON.stringify({ id, args }) + '\n', (err) => {
@@ -620,14 +688,15 @@ export function spawnCli(
   const spec = spawnSpecFor(target, args)
   if (opts.extraEnv) spec.env = { ...spec.env, ...opts.extraEnv }
 
-  const key = JSON.stringify([spec.bin, ...spec.args])
-  const cached = readCache.get(key)
-  if (cached && Date.now() - cached.at < COALESCE_TTL_MS) return Promise.resolve(cached.value)
+  const generation = readGeneration
+  const key = JSON.stringify([generation, spec.bin, ...spec.args])
   const existing = readInflight.get(key)
   // A same-cadence re-poll during a slow cold warmup coalesces onto the one
   // in-flight child (which already carries onStderr); no second cold parse.
-  // Coalesce/cache hits settle here, BEFORE queueing, so they never hold a slot.
+  // Coalesced calls settle here, BEFORE queueing, so they never hold a slot.
   if (existing) return existing
+
+  const priority = opts.priority ?? 'interactive'
 
   // Serve fast-path: the child is started once at app startup. It accepts the
   // first real query before its ready frame, making that request the single
@@ -644,26 +713,28 @@ export function spawnCli(
         .catch(err => {
           // App shutdown is terminal: never turn rejected resident requests
           // into brand-new one-shot children after killAll() has reaped them.
-          if (serve.isDestroyed()) throw err
-          return runCli(spec, args[0] ?? '', opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, opts.onStderr)
+          if (serve.isDestroyed() || (err instanceof CliError && err.kind === 'too-large')) throw err
+          return runScheduledCli(
+            spec,
+            args[0] ?? '',
+            opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+            priority,
+            opts.onStderr,
+          )
         })
-        .then(value => { readCache.set(key, { at: Date.now(), value }); return value })
         .finally(() => { readInflight.delete(key) })
       readInflight.set(key, flight)
       return flight
     }
   }
 
-  const priority = opts.priority ?? 'interactive'
-  const flight = (async () => {
-    await acquireSlot(priority)
-    try {
-      return await runCli(spec, args[0] ?? '', opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, opts.onStderr)
-    } finally {
-      releaseSlot()
-    }
-  })()
-    .then(value => { readCache.set(key, { at: Date.now(), value }); return value })
+  const flight = runScheduledCli(
+    spec,
+    args[0] ?? '',
+    opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    priority,
+    opts.onStderr,
+  )
     .finally(() => { readInflight.delete(key) })
   readInflight.set(key, flight)
   return flight
@@ -686,6 +757,7 @@ export function spawnCliAction(args: string[], opts: { timeoutMs?: number } = {}
       return { ok: false, stdout: '', stderr: 'codeburn cancelled', code: null }
     }
     try {
+      if (shuttingDown) return { ok: false, stdout: '', stderr: 'codeburn is shutting down', code: null }
       return await runAction(spec, args, timeoutMs)
     } finally {
       releaseSlot()
@@ -706,10 +778,13 @@ function runAction(spec: SpawnSpec, args: string[], timeoutMs: number): Promise<
       settled = true
       clearTimeout(timer)
       activeChildren.delete(child)
-      // The action may have changed config the read cache still reflects; a
-      // Settings refetch fires immediately after, so serve it fresh data.
-      readCache.clear()
-      if (result.ok && actionInvalidatesServe(args)) restartServeAfterMutation()
+      if (result.ok && actionInvalidatesServe(args)) {
+        // Fence coalescing before the action promise resolves. An immediate
+        // same-argv refetch belongs to the new config generation even while an
+        // older read is still running.
+        readGeneration += 1
+        restartServeAfterMutation()
+      }
       resolve(result)
     }
 

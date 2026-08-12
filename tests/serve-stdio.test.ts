@@ -1,7 +1,31 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { spawn, type ChildProcess } from 'child_process'
-import { mkdir, writeFile } from 'fs/promises'
+import { mkdir, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
+import { classifyRootReuse, createOutputMemoEntry } from '../src/serve.js'
+
+it('timestamps a completed output memo before parsing begins', () => {
+  const parseStartedAt = 100
+  const rootEventDuringParseAt = 150
+  const parseCompletedAt = 200
+  const memo = createOutputMemoEntry(parseStartedAt, parseCompletedAt, 'output', 'config')
+  const rootsQuietSince = (sinceTs: number): boolean => rootEventDuringParseAt < sinceTs
+
+  // The old completion timestamp incorrectly made the in-parse event look
+  // older than the memo. The start timestamp keeps it visible to validation.
+  expect(rootsQuietSince(parseCompletedAt)).toBe(true)
+  expect(memo.createdAt).toBe(parseCompletedAt)
+  expect(memo.validatedFrom).toBe(parseStartedAt)
+  expect(rootsQuietSince(memo.validatedFrom)).toBe(false)
+})
+
+it('classifies watcher gaps as unknown without confusing them with dirty roots', () => {
+  expect(classifyRootReuse(100, { startedAt: 50, lastEventAt: 0, healthy: false })).toBe('unknown')
+  expect(classifyRootReuse(100, { startedAt: 150, lastEventAt: 0, healthy: true })).toBe('unknown')
+  expect(classifyRootReuse(100, { startedAt: 50, lastEventAt: 100, healthy: false })).toBe('dirty')
+  expect(classifyRootReuse(100, { startedAt: 50, lastEventAt: 100, healthy: true })).toBe('dirty')
+  expect(classifyRootReuse(100, { startedAt: 50, lastEventAt: 99, healthy: true })).toBe('clean')
+})
 
 // End-to-end protocol test for `codeburn serve --stdio` (the desktop app's
 // resident query server). Runs the real entry through tsx against the
@@ -31,6 +55,9 @@ describe('codeburn serve --stdio', () => {
     const home = process.env['HOME']!
     configPath = join(home, '.config', 'codeburn', 'config.json')
     await mkdir(join(home, '.config', 'codeburn'), { recursive: true })
+    // Give the resident process one real provider root to arm. With no
+    // successfully armed roots, event-driven reuse correctly stays disabled.
+    await mkdir(join(home, '.claude', 'projects'), { recursive: true })
     await writeFile(configPath, JSON.stringify({ currency: { code: 'USD' } }), 'utf8')
 
     // Keep the EUR half of the config-freshness regression fully offline.
@@ -106,6 +133,51 @@ describe('codeburn serve --stdio', () => {
     expect(res['refused']).toBe(true)
   })
 
+  it('refuses every optimize apply-only option without touching shell config or the action journal', async () => {
+    const home = process.env['HOME']!
+    const zshrc = join(home, '.zshrc')
+    const journal = join(home, '.config', 'codeburn', 'actions', 'journal.jsonl')
+    await writeFile(zshrc, '# user-owned\n', 'utf8')
+
+    // `optimize` is the only served command whose Commander definition also
+    // has mutation-capable options. The full request below used to execute a
+    // shell-config action inside the resident process.
+    const applied = await request(300, [
+      'optimize', '--apply', '--yes', '--only', 'bash-output-cap', '--period', 'today',
+    ])
+    expect(applied).toMatchObject({ ok: false, refused: true })
+
+    // Keep the allowlist categorical: apply-only modifiers are not useful to
+    // a read query and must not become resident options on their own either.
+    for (const [id, args] of [
+      [301, ['optimize', '--yes']],
+      [302, ['optimize', '--dry-run']],
+      [303, ['optimize', '--only', 'bash-output-cap']],
+    ] as const) {
+      expect(await request(id, [...args])).toMatchObject({ ok: false, refused: true })
+    }
+
+    expect(await readFile(zshrc, 'utf8')).toBe('# user-owned\n')
+    await expect(readFile(journal, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  }, 60_000)
+
+  it('accepts the reviewed read-only option surface for every served command', async () => {
+    const commands: Array<[number, string[]]> = [
+      [310, ['status', '--format', 'json', '--period', 'today']],
+      [311, ['overview', '--period', 'today', '--no-color']],
+      [312, ['models', '--format', 'json', '--period', 'today', '--no-totals']],
+      [313, ['sessions', '--format', 'json', '--period', 'today', '--no-pager']],
+      [314, ['compare', '--format', 'json', '--period', 'today']],
+      [315, ['yield', '--format', 'json', '--period', 'today']],
+      [316, ['spend', '--format', 'flow-json', '--period', 'today']],
+      [317, ['optimize', '--format', 'json', '--period', 'today']],
+      [318, ['audit', '--format', 'json', '--period', 'today']],
+    ]
+    for (const [id, args] of commands) {
+      expect(await request(id, args)).toMatchObject({ ok: true })
+    }
+  }, 60_000)
+
   it('survives a malformed request line and keeps serving', async () => {
     sendRaw('this is not json')
     const res = await request(6, ['status', '--format', 'menubar-json', '--period', 'today'])
@@ -113,13 +185,68 @@ describe('codeburn serve --stdio', () => {
   }, 60_000)
 
   it('streams captured command stderr as protocol progress frames', async () => {
-    const res = await request(7, ['status', '--definitely-not-a-real-option'])
+    const res = await request(7, ['status', '--provider', 'definitely-not-a-real-provider'])
     expect(res['ok']).toBe(false)
 
     const frames = progressFrames.get(7) ?? []
     expect(frames.length).toBeGreaterThan(0)
     expect(frames.every(frame => Object.keys(frame).sort().join(',') === 'id,progress')).toBe(true)
-    expect(frames.map(frame => frame['progress']).join('')).toContain('unknown option')
+    expect(frames.map(frame => frame['progress']).join('')).toContain('unknown provider')
+  }, 60_000)
+
+  it('discovers a newly configured Claude root on identical resident argv', async () => {
+    const home = process.env['HOME']!
+    const rootA = join(home, 'claude-root-a')
+    const rootB = join(home, 'claude-root-b')
+    const slug = '-Users-test-shared-project'
+    const cwd = '/Users/test/shared-project'
+
+    const writeClaudeSession = async (root: string, sessionId: string, marker: string): Promise<void> => {
+      const projectDir = join(root, 'projects', slug)
+      await mkdir(projectDir, { recursive: true })
+      const lines = [
+        {
+          type: 'summary', summary: marker, leafUuid: `leaf-${marker}`, sessionId, cwd,
+          timestamp: '2026-08-12T10:00:00.000Z',
+        },
+        {
+          type: 'user', uuid: `user-${marker}`, sessionId, cwd,
+          timestamp: '2026-08-12T10:00:01.000Z', message: { role: 'user', content: marker },
+        },
+        {
+          type: 'assistant', uuid: `assistant-${marker}`, parentUuid: `user-${marker}`, sessionId, cwd,
+          timestamp: '2026-08-12T10:00:02.000Z',
+          message: {
+            id: `msg-${marker}`, type: 'message', role: 'assistant', model: 'claude-sonnet-4-6',
+            content: [{ type: 'text', text: 'reply' }], usage: { input_tokens: 100, output_tokens: 50 },
+          },
+        },
+      ]
+      await writeFile(join(projectDir, `${sessionId}.jsonl`), lines.map(line => JSON.stringify(line)).join('\n'))
+    }
+
+    await writeClaudeSession(rootA, 'resident-session-a', 'a')
+    await writeClaudeSession(rootB, 'resident-session-b', 'b')
+    const args = ['sessions', '--period', 'lifetime', '--provider', 'claude', '--format', 'json', '--no-pager']
+
+    await writeFile(configPath, JSON.stringify({ claudeConfigDirs: [rootA] }), 'utf8')
+    const first = await request(200, args)
+    expect(first['ok']).toBe(true)
+    expect((JSON.parse(first['output'] as string) as Array<{ sessionId: string }>).map(row => row.sessionId)).toEqual([
+      'resident-session-a',
+    ])
+
+    // Same command in the same process; only config.json adds root B.
+    await writeFile(configPath, JSON.stringify({ claudeConfigDirs: [rootA, rootB] }), 'utf8')
+    const second = await request(201, args)
+    expect(second['ok']).toBe(true)
+    expect((JSON.parse(second['output'] as string) as Array<{ sessionId: string }>).map(row => row.sessionId).sort()).toEqual([
+      'resident-session-a',
+      'resident-session-b',
+    ])
+
+    // Keep the following currency-freshness regression self-contained.
+    await writeFile(configPath, JSON.stringify({ currency: { code: 'USD' } }), 'utf8')
   }, 60_000)
 
   it('invalidates identical-argv output memo immediately when config.json changes', async () => {
@@ -172,4 +299,47 @@ describe('codeburn serve --stdio', () => {
       currency: { code: string; rate: number }
     }).currency).toMatchObject({ code: 'USD', rate: 1 })
   }, 60_000)
+
+  it('exits on natural stdin EOF after arming a watcher for an existing Claude root', async () => {
+    const claudeRoot = join(process.env['HOME']!, 'claude-eof-root')
+    await mkdir(join(claudeRoot, 'projects'), { recursive: true })
+
+    const eofChild = spawn(process.execPath, ['--import', 'tsx', join(__dirname, '..', 'src', 'cli.ts'), 'serve', '--stdio'], {
+      stdio: ['pipe', 'pipe', 'ignore'],
+      env: { ...process.env, CLAUDE_CONFIG_DIR: claudeRoot },
+    })
+    let stdout = ''
+    const becameReady = new Promise<void>((resolve, reject) => {
+      eofChild.once('error', reject)
+      eofChild.stdout!.setEncoding('utf8')
+      eofChild.stdout!.on('data', (chunk: string) => {
+        stdout += chunk
+        if (stdout.split('\n').some(line => {
+          try { return (JSON.parse(line) as { ready?: boolean }).ready === true } catch { return false }
+        })) resolve()
+      })
+      eofChild.once('exit', (code, signal) => reject(new Error(`serve exited before ready: ${code ?? signal}`)))
+    })
+    const exited = new Promise<boolean>(resolve => eofChild.once('exit', () => resolve(true)))
+
+    let naturalExit = false
+    try {
+      await becameReady
+      // READY is intentionally emitted before provider probing; give the real
+      // watcher setup time to finish so the regression exercises its handle.
+      await new Promise(resolve => setTimeout(resolve, 500))
+      eofChild.stdin!.end()
+      naturalExit = await Promise.race([
+        exited,
+        new Promise<false>(resolve => setTimeout(() => resolve(false), 2_000)),
+      ])
+    } finally {
+      if (!naturalExit) {
+        eofChild.kill('SIGKILL')
+        await exited
+      }
+    }
+
+    expect(naturalExit).toBe(true)
+  }, 10_000)
 })

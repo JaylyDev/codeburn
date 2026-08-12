@@ -1,7 +1,7 @@
 import { readdir, readFile, mkdir, stat, open, rename, unlink } from 'fs/promises'
 import { execFile } from 'child_process'
 import { randomBytes } from 'crypto'
-import { basename, join } from 'path'
+import { basename, join, resolve } from 'path'
 import { homedir } from 'os'
 import { fileURLToPath } from 'url'
 import https from 'https'
@@ -162,8 +162,8 @@ type AntigravityGenMetadataRow = {
 
 const cachedServers = new Map<string, ServerInfo | null>()
 const cachedModelMaps = new Map<string, ModelMap>()
-let memCache: AntigravityCache | null = null
-let cacheDirty = false
+type AntigravityCacheState = { cache: AntigravityCache; dirty: boolean }
+const cacheStates = new Map<string, AntigravityCacheState>()
 let httpsAgent: https.Agent | undefined
 const protoTextDecoder = new TextDecoder('utf-8', { fatal: false })
 
@@ -176,8 +176,12 @@ function getAgent(): https.Agent {
   return httpsAgent
 }
 
-function getCachePath(): string {
-  return join(getCodeburnCacheDir(), 'antigravity-results.json')
+function currentCacheDir(): string {
+  return resolve(getCodeburnCacheDir())
+}
+
+function getCachePath(cacheDir: string): string {
+  return join(cacheDir, 'antigravity-results.json')
 }
 
 export function getAntigravityStatusLineEventsPath(): string {
@@ -320,22 +324,30 @@ export function extractAntigravityGeneratorMetadata(resp: unknown): GeneratorMet
   return Array.isArray(metadata) ? metadata : []
 }
 
-async function loadCache(): Promise<AntigravityCache> {
-  if (memCache) return memCache
+async function loadCache(cacheDir: string): Promise<AntigravityCacheState> {
+  const inMemory = cacheStates.get(cacheDir)
+  if (inMemory) return inMemory
   try {
-    const raw = await readFile(getCachePath(), 'utf-8')
+    const raw = await readFile(getCachePath(cacheDir), 'utf-8')
     const cache = JSON.parse(raw) as AntigravityCache
     if (cache.version === CACHE_VERSION && cache.cascades && typeof cache.cascades === 'object') {
-      memCache = cache
-      return cache
+      const state = { cache, dirty: false }
+      cacheStates.set(cacheDir, state)
+      return state
     }
   } catch { /* no cache or invalid */ }
-  memCache = { version: CACHE_VERSION, cascades: {} }
-  return memCache
+  const state: AntigravityCacheState = {
+    cache: { version: CACHE_VERSION, cascades: {} },
+    dirty: false,
+  }
+  cacheStates.set(cacheDir, state)
+  return state
 }
 
-async function flushCache(liveCascadeIds?: Set<string>): Promise<void> {
-  if (!memCache) return
+async function flushCache(liveCascadeIds?: Set<string>, cacheDir = currentCacheDir()): Promise<void> {
+  const state = cacheStates.get(cacheDir)
+  if (!state) return
+  const memCache = state.cache
   // If the caller supplied liveCascadeIds, we must run the eviction step
   // even when no cascade was added or updated this run; otherwise deleted
   // .pb files would persist in the cache forever once it stops getting
@@ -345,16 +357,14 @@ async function flushCache(liveCascadeIds?: Set<string>): Promise<void> {
     for (const id of Object.keys(memCache.cascades)) {
       if (!liveCascadeIds.has(id)) {
         delete memCache.cascades[id]
-        cacheDirty = true
+        state.dirty = true
       }
     }
   }
-  if (!cacheDirty) return
+  if (!state.dirty) return
   try {
-
-    const dir = getCodeburnCacheDir()
-    await mkdir(dir, { recursive: true })
-    const finalPath = getCachePath()
+    await mkdir(cacheDir, { recursive: true })
+    const finalPath = getCachePath(cacheDir)
     const tempPath = `${finalPath}.${randomBytes(8).toString('hex')}.tmp`
     const handle = await open(tempPath, 'w', 0o600)
     try {
@@ -368,7 +378,7 @@ async function flushCache(liveCascadeIds?: Set<string>): Promise<void> {
     } catch {
       try { await unlink(tempPath) } catch { /* cleanup */ }
     }
-    cacheDirty = false
+    state.dirty = false
   } catch { /* best-effort */ }
 }
 
@@ -1170,7 +1180,9 @@ export async function snapshotAntigravityStatusLinePayload(input: unknown): Prom
   const s = await stat(source.path).catch(() => null)
   if (!s) return false
 
-  const cache = await loadCache()
+  const cacheDir = currentCacheDir()
+  const state = await loadCache(cacheDir)
+  const cache = state.cache
   const cached = cache.cascades[cascadeId]
   if (cached && cached.mtimeMs === s.mtimeMs && cached.sizeBytes === s.size && cached.calls.length > 0) {
     return true
@@ -1192,8 +1204,8 @@ export async function snapshotAntigravityStatusLinePayload(input: unknown): Prom
       sizeBytes: s.size,
       calls: snapshotCalls,
     }
-    cacheDirty = true
-    await flushCache()
+    state.dirty = true
+    await flushCache(undefined, cacheDir)
     return cache.cascades[cascadeId]!.calls.length > 0
   } catch {
     return false
@@ -1297,7 +1309,8 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       }
 
       const cascadeId = antigravityCascadeIdFromPath(source.path)
-      const cache = await loadCache()
+      const state = await loadCache(currentCacheDir())
+      const cache = state.cache
 
       const s = await stat(source.path).catch(() => null)
       if (!s) return
@@ -1328,7 +1341,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           sizeBytes: s.size,
           calls: sqliteResults,
         }
-        cacheDirty = true
+        state.dirty = true
 
         for (const call of sqliteResults) {
           if (seenKeys.has(call.deduplicationKey)) continue
@@ -1381,7 +1394,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         sizeBytes: s.size,
         calls: results,
       }
-      cacheDirty = true
+      state.dirty = true
 
       for (const call of results) {
         if (seenKeys.has(call.deduplicationKey)) continue
@@ -1442,8 +1455,8 @@ export function createAntigravityProvider(): Provider {
   }
 }
 
-export async function flushAntigravityCache(liveCascadeIds?: Set<string>): Promise<void> {
-  await flushCache(liveCascadeIds)
+export async function flushAntigravityCache(liveCascadeIds?: Set<string>, cacheDir?: string): Promise<void> {
+  await flushCache(liveCascadeIds, cacheDir ? resolve(cacheDir) : currentCacheDir())
 }
 
 export const antigravity = createAntigravityProvider()

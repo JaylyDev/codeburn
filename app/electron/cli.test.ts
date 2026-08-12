@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, isAbsolute, relative, win32, posix } from 'node:path'
@@ -25,6 +25,14 @@ function fakeBin(name: string, body: string): string {
 
 function readMaybe(path: string): string {
   try { return readFileSync(path, 'utf8') } catch { return '' }
+}
+
+async function waitFor(condition: () => boolean, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error('waitFor timed out')
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
 }
 
 /** A protocol-faithful fake CLI whose serve child accepts requests before its
@@ -405,19 +413,19 @@ describe('spawnCli coalescing (read-only)', () => {
     expect(readFileSync(countFile, 'utf8')).toBe('x') // exactly one spawn
   })
 
-  it('spawns again once the 5s result cache has expired', async () => {
-    vi.useFakeTimers({ toFake: ['Date'] })
-    try {
-      const countFile = join(dir, 'spawns')
-      fakeBin('counter-ttl.js', `require('fs').appendFileSync(${JSON.stringify(countFile)},'x'); process.stdout.write(JSON.stringify({ok:1}))`)
-      vi.setSystemTime(0)
-      await spawnCli(['status'])
-      vi.setSystemTime(6_000)
-      await spawnCli(['status'])
-      expect(readFileSync(countFile, 'utf8')).toBe('xx') // cache expired → new spawn
-    } finally {
-      vi.useRealTimers()
-    }
+  it('reflects an external config change on the next same-argv read', async () => {
+    const configFile = join(dir, 'external-config')
+    const countFile = join(dir, 'spawns')
+    writeFileSync(configFile, 'before')
+    fakeBin(
+      'external-config.js',
+      `const fs = require('node:fs'); fs.appendFileSync(${JSON.stringify(countFile)}, 'x'); process.stdout.write(JSON.stringify({ value: fs.readFileSync(${JSON.stringify(configFile)}, 'utf8') }))`,
+    )
+
+    await expect(spawnCli(['model-alias', '--list'])).resolves.toEqual({ value: 'before' })
+    writeFileSync(configFile, 'after')
+    await expect(spawnCli(['model-alias', '--list'])).resolves.toEqual({ value: 'after' })
+    expect(readFileSync(countFile, 'utf8')).toBe('xx')
   })
 
   it('never coalesces config-mutating action calls', async () => {
@@ -427,13 +435,61 @@ describe('spawnCli coalescing (read-only)', () => {
     expect(readFileSync(countFile, 'utf8')).toBe('xx') // two independent spawns
   })
 
-  it('flushes the read cache when an action completes, so post-action refetches are fresh', async () => {
+  it('runs a fresh read after a config-mutating action', async () => {
     const countFile = join(dir, 'spawns')
     fakeBin('mixed.js', `require('fs').appendFileSync(${JSON.stringify(countFile)},'x'); process.stdout.write(JSON.stringify({ok:1}))`)
-    await spawnCli(['model-alias', '--list']) // primes the 5s cache
-    await spawnCliAction(['model-alias', 'a', 'b']) // config change → cache flush
-    await spawnCli(['model-alias', '--list']) // must NOT serve the pre-action cache
+    await spawnCli(['model-alias', '--list'])
+    await spawnCliAction(['model-alias', 'a', 'b'])
+    await spawnCli(['model-alias', '--list'])
     expect(readFileSync(countFile, 'utf8')).toBe('xxx')
+  })
+
+  it('fences old in-flight reads across a mutation without deleting the new flight', async () => {
+    const configFile = join(dir, 'generation-config')
+    const startsFile = join(dir, 'generation-read-starts')
+    const releaseDir = join(dir, 'generation-release')
+    mkdirSync(releaseDir)
+    writeFileSync(configFile, 'old')
+    fakeBin(
+      'generation-fence.js',
+      `const fs = require('node:fs'); const path = require('node:path');
+       if (process.argv[3] === '--list') {
+         const value = fs.readFileSync(${JSON.stringify(configFile)}, 'utf8');
+         fs.appendFileSync(${JSON.stringify(startsFile)}, 'r');
+         const generation = fs.readFileSync(${JSON.stringify(startsFile)}, 'utf8').length;
+         const release = path.join(${JSON.stringify(releaseDir)}, String(generation));
+         const timer = setInterval(() => {
+           if (!fs.existsSync(release)) return;
+           clearInterval(timer);
+           process.stdout.write(JSON.stringify({ value, generation }));
+         }, 5);
+       } else {
+         fs.writeFileSync(${JSON.stringify(configFile)}, 'new');
+         process.stdout.write('updated');
+       }`,
+    )
+
+    const oldRead = spawnCli(['model-alias', '--list'])
+    await waitFor(() => readMaybe(startsFile) === 'r')
+    await expect(spawnCliAction(['model-alias', 'alias', 'model']))
+      .resolves.toMatchObject({ ok: true })
+
+    const newRead = spawnCli(['model-alias', '--list'])
+    await waitFor(() => readMaybe(startsFile) === 'rr')
+    writeFileSync(join(releaseDir, '1'), '')
+    await expect(oldRead).resolves.toEqual({ value: 'old', generation: 1 })
+
+    // Settling the superseded flight must not remove the current generation's
+    // entry: this identical call still shares read #2 instead of spawning #3.
+    const coalescedNewRead = spawnCli(['model-alias', '--list'])
+    await new Promise(resolve => setTimeout(resolve, 100))
+    expect(readMaybe(startsFile)).toBe('rr')
+
+    writeFileSync(join(releaseDir, '2'), '')
+    await expect(Promise.all([newRead, coalescedNewRead])).resolves.toEqual([
+      { value: 'new', generation: 2 },
+      { value: 'new', generation: 2 },
+    ])
   })
 })
 
@@ -559,6 +615,63 @@ describe('resident serve single-flight', () => {
     })
 
     expect(chunks.join('')).toBe('CODEBURN_PROGRESS {"kind":"provider","provider":"claude","state":"start","generation":1}\n')
+  })
+
+  it('rejects and terminates a resident that emits an oversized valid JSON frame', async () => {
+    const startsFile = join(dir, 'oversized-frame-starts')
+    const oneShotsFile = join(dir, 'oversized-frame-one-shots')
+    fakeBin(
+      'oversized-frame-resident.js',
+      `const fs = require('node:fs'); const readline = require('node:readline');
+       if (process.argv[2] === 'serve') {
+         fs.appendFileSync(${JSON.stringify(startsFile)}, 's');
+         const generation = fs.readFileSync(${JSON.stringify(startsFile)}, 'utf8').length;
+         const rl = readline.createInterface({ input: process.stdin });
+         rl.once('line', line => {
+           const request = JSON.parse(line);
+           const output = generation === 1
+             ? JSON.stringify({ value: 'x'.repeat(16 * 1024 * 1024 + 1024) })
+             : JSON.stringify({ generation });
+           process.stdout.write(JSON.stringify({ id: request.id, ok: true, output }) + '\\n');
+         });
+         setInterval(() => {}, 1000);
+       } else {
+         fs.appendFileSync(${JSON.stringify(oneShotsFile)}, 'o');
+         process.stdout.write('{}');
+       }`,
+    )
+    startServe()
+
+    await expect(spawnCli(['status', '--oversized-frame'], { timeoutMs: 5_000 }))
+      .rejects.toMatchObject({ kind: 'too-large' } satisfies Partial<CliError>)
+    await expect(spawnCli(['status', '--after-oversized-frame'], { timeoutMs: 5_000 }))
+      .resolves.toEqual({ generation: 2 })
+    expect(readMaybe(startsFile)).toBe('ss')
+    expect(readMaybe(oneShotsFile)).toBe('')
+  })
+
+  it('rejects and terminates a resident whose protocol line never terminates', async () => {
+    const startsFile = join(dir, 'unterminated-line-starts')
+    const oneShotsFile = join(dir, 'unterminated-line-one-shots')
+    fakeBin(
+      'unterminated-line-resident.js',
+      `const fs = require('node:fs'); const readline = require('node:readline');
+       if (process.argv[2] === 'serve') {
+         fs.appendFileSync(${JSON.stringify(startsFile)}, 's');
+         const rl = readline.createInterface({ input: process.stdin });
+         rl.once('line', () => process.stdout.write('x'.repeat(16 * 1024 * 1024 + 1024)));
+         setInterval(() => {}, 1000);
+       } else {
+         fs.appendFileSync(${JSON.stringify(oneShotsFile)}, 'o');
+         process.stdout.write('{}');
+       }`,
+    )
+    startServe()
+
+    await expect(spawnCli(['status', '--unterminated-line'], { timeoutMs: 5_000 }))
+      .rejects.toMatchObject({ kind: 'too-large' } satisfies Partial<CliError>)
+    expect(readMaybe(startsFile)).toBe('s')
+    expect(readMaybe(oneShotsFile)).toBe('')
   })
 
   it('keeps requests with any non-progress env override on the one-shot path', async () => {
@@ -706,8 +819,8 @@ describe('resident serve single-flight', () => {
 
     const before = await spawnCli(['status'], { timeoutMs: 5_000 }) as { generation: number }
     const action = await spawnCliAction(['export', '-f', 'json', '-o', join(dir, 'usage.json')], { timeoutMs: 5_000 })
-    // Different argv bypasses the 5s result cache and proves which resident
-    // generation actually handled the next served read.
+    // A different panel query proves which resident generation handled the
+    // next served read without relying on same-request coalescing.
     const after = await spawnCli(['models', '--format', 'json'], { timeoutMs: 5_000 }) as { generation: number }
 
     expect(action.ok).toBe(true)
@@ -742,6 +855,26 @@ describe('killAll', () => {
       .rejects.toMatchObject({ kind: 'nonzero' })
     await expect(spawnCliAction(['currency', 'EUR']))
       .resolves.toMatchObject({ ok: false, code: null })
+    expect(readMaybe(startsFile)).toBe('')
+  })
+
+  it('terminal shutdown cancels read and action slots admitted before their spawn microtask', async () => {
+    const startsFile = join(dir, 'starts-after-admission')
+    fakeBin(
+      'shutdown-after-admission.js',
+      `require('node:fs').appendFileSync(${JSON.stringify(startsFile)}, process.argv[2] + '\\n'); if (process.argv[2] === 'status') process.stdout.write('{}'); else process.stdout.write('updated')`,
+    )
+
+    // Both calls synchronously acquire the two free scheduler slots. Their
+    // actual spawn resumes in a microtask, which is exactly the before-quit race.
+    const read = spawnCli(['status', '--admitted'])
+    const action = spawnCliAction(['currency', 'EUR'])
+    shutdownAll()
+
+    await Promise.all([
+      expect(read).rejects.toMatchObject({ kind: 'nonzero' }),
+      expect(action).resolves.toMatchObject({ ok: false, code: null }),
+    ])
     expect(readMaybe(startsFile)).toBe('')
   })
 })
@@ -870,6 +1003,52 @@ describe('spawnCli concurrency scheduler', () => {
 
     await delay(50)
     expect(startedList(startedFile)).not.toContain('sessions') // never spawned
+  })
+
+  it('limits six simultaneous resident-failure fallbacks to two one-shot children', async () => {
+    const startedFile = join(dir, 'fallback-started')
+    const activeDir = join(dir, 'fallback-active'); mkdirSync(activeDir)
+    const activeCountsFile = join(dir, 'fallback-active-counts')
+    const releaseDir = join(dir, 'fallback-release'); mkdirSync(releaseDir)
+    fakeBin(
+      'failing-resident-with-blocked-fallbacks.js',
+      `const fs = require('node:fs'); const path = require('node:path'); const readline = require('node:readline');
+       if (process.argv[2] === 'serve') {
+         const rl = readline.createInterface({ input: process.stdin });
+         rl.on('line', line => {
+           const request = JSON.parse(line);
+           process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: 'resident failed' }) + '\\n');
+         });
+       } else {
+         const id = process.argv[3];
+         fs.appendFileSync(${JSON.stringify(startedFile)}, id + '\\n');
+         const activeFile = path.join(${JSON.stringify(activeDir)}, String(process.pid));
+         fs.writeFileSync(activeFile, '');
+         fs.appendFileSync(${JSON.stringify(activeCountsFile)}, fs.readdirSync(${JSON.stringify(activeDir)}).length + '\\n');
+         const releaseFile = path.join(${JSON.stringify(releaseDir)}, id);
+         const timer = setInterval(() => {
+           if (!fs.existsSync(releaseFile)) return;
+           clearInterval(timer);
+           fs.unlinkSync(activeFile);
+           process.stdout.write(JSON.stringify({ via: 'spawn', id }));
+         }, 5);
+       }`,
+    )
+    startServe()
+
+    const requests = Array.from({ length: 6 }, (_, index) =>
+      spawnCli(['status', `fallback-${index}`], { timeoutMs: 5_000 }),
+    )
+    await waitUntil(() => startedList(startedFile).length >= 2)
+    await delay(150)
+    const admittedBeforeRelease = startedList(startedFile)
+
+    for (let index = 0; index < 6; index += 1) release(releaseDir, `fallback-${index}`)
+    await Promise.all(requests)
+
+    const activeCounts = startedList(activeCountsFile).map(Number)
+    expect(admittedBeforeRelease).toHaveLength(2)
+    expect(Math.max(...activeCounts)).toBeLessThanOrEqual(2)
   })
 })
 

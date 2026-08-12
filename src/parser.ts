@@ -6,10 +6,11 @@ import { calculateCost, calculateLocalModelSavings, getShortModelName, isProxied
 import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
 import { normalizeContentBlocks } from './content-utils.js'
 import { discoverAllSessions, getProvider } from './providers/index.js'
-import { flushCodexCache } from './codex-cache.js'
+import { flushCodexCache, withCodexCacheDirectory } from './codex-cache.js'
 import { antigravityCascadeIdFromPath, flushAntigravityCache, shouldReparseAntigravitySource } from './providers/antigravity.js'
-import { getDesktopSessionsDirs } from './providers/claude.js'
+import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { isSqliteBusyError } from './sqlite.js'
+import { getCodeburnCacheDir } from './cache-dir.js'
 import {
   type CachedCall,
   type CachedFile,
@@ -2869,6 +2870,10 @@ async function parseProviderSources(
 ): Promise<ProjectSummary[]> {
   const provider = await getProvider(providerName)
   if (!provider) return []
+  // The environment is a call-time input. Capture Antigravity's cache target
+  // for this whole parse transaction so a host changing CODEBURN_CACHE_DIR
+  // before the final flush cannot redirect A's dirty state into (or past) B.
+  const antigravityCacheDir = providerName === 'antigravity' ? getCodeburnCacheDir() : undefined
 
   const section = getOrCreateProviderSection(diskCache, providerName)
   const allDiscoveredFiles = new Set<string>()
@@ -3019,7 +3024,7 @@ async function parseProviderSources(
     if (didParse && providerName === 'codex') await flushCodexCache()
     if (didParse && providerName === 'antigravity') {
       const liveIds = new Set(sources.map(s => antigravityCascadeIdFromPath(s.path)))
-      await flushAntigravityCache(liveIds)
+      await flushAntigravityCache(liveIds, antigravityCacheDir)
     }
   }
 
@@ -3190,7 +3195,15 @@ async function parseProviderSources(
 
 const CACHE_TTL_MS = 180_000
 const MAX_CACHE_ENTRIES = 10
-const sessionCache = new Map<string, { data: ProjectSummary[]; ts: number; startMs?: number; endMs?: number; sig?: string }>()
+type SessionCacheEntry = {
+  data: ProjectSummary[]
+  createdAt: number
+  validatedFrom: number
+  startMs?: number
+  endMs?: number
+  sig?: string
+}
+const sessionCache = new Map<string, SessionCacheEntry>()
 
 // Burst reuse for a resident process (codeburn serve). Every payload command
 // anchors its range end at its own `new Date()`, so two panel fetches issued
@@ -3207,15 +3220,16 @@ function parseBurstWindowMs(): number {
 
 // A resident process (codeburn serve) can install a validator that answers
 // "has any watched session root changed since this timestamp?" — typically
-// backed by fs.watch over every provider's probeRoots(). While the validator
-// reports clean, a previous parse stays reusable well past the burst window,
-// bounded by a hard cap so a missed filesystem event self-heals instead of
-// pinning stale data forever. Null (the default everywhere but serve) keeps
-// reuse strictly inside the burst window.
-let parseReuseValidator: ((sinceTs: number) => boolean) | null = null
+// backed by fs.watch over every provider's probeRoots(). Clean extends reuse
+// to the hard cap, dirty rejects every memo, and unknown (watcher coverage is
+// unavailable or began too late) falls back to the ordinary exact TTL / short
+// burst rather than disabling caching. Null keeps those ordinary semantics.
+export type ParseReuseValidation = 'clean' | 'dirty' | 'unknown'
+type ParseReuseValidator = (sinceTs: number) => ParseReuseValidation
+let parseReuseValidator: ParseReuseValidator | null = null
 const VALIDATED_REUSE_CAP_MS = 5 * 60 * 1000
 
-export function setParseReuseValidator(validator: ((sinceTs: number) => boolean) | null): void {
+export function setParseReuseValidator(validator: ParseReuseValidator | null): void {
   parseReuseValidator = validator
 }
 
@@ -3227,9 +3241,13 @@ function burstReuse(dateRange: DateRange, sig: string): ProjectSummary[] | null 
   const endMs = dateRange.end.getTime()
   for (const entry of sessionCache.values()) {
     if (entry.sig !== sig || entry.startMs !== startMs || entry.endMs === undefined) continue
-    const age = now - entry.ts
+    const validation = parseReuseValidator?.(entry.validatedFrom) ?? 'unknown'
+    // A dirty event during the producing parse must not be hidden even by the
+    // short burst. Unknown coverage, however, retains that bounded fallback.
+    if (validation === 'dirty') continue
+    const age = now - entry.createdAt
     const insideBurst = age <= windowMs
-    const validatedClean = parseReuseValidator !== null && age <= VALIDATED_REUSE_CAP_MS && parseReuseValidator(entry.ts)
+    const validatedClean = validation === 'clean' && age <= VALIDATED_REUSE_CAP_MS
     if (!insideBurst && !validatedClean) continue
     if (endMs < entry.endMs || endMs - entry.endMs > Math.max(windowMs, validatedClean ? VALIDATED_REUSE_CAP_MS : 0)) continue
     return filterProjectsByDateRange(entry.data, dateRange)
@@ -3237,34 +3255,35 @@ function burstReuse(dateRange: DateRange, sig: string): ProjectSummary[] | null 
   return null
 }
 
-function cacheKey(dateRange?: DateRange, providerFilter?: string): string {
+function cacheKey(dateRange: DateRange | undefined, providerFilter: string | undefined, claudeDiscoveryRoots: readonly string[]): string {
   const s = dateRange ? `${dateRange.start.getTime()}:${dateRange.end.getTime()}` : 'none'
-  // Include the Claude config-dir env so a config change in a long-lived
-  // process (menubar / GNOME extension / test workers) does not return
-  // stale data keyed under a previous configuration.
-  const claudeEnv = (process.env['CLAUDE_CONFIG_DIRS'] ?? '') + '|' + (process.env['CLAUDE_CONFIG_DIR'] ?? '')
+  // Key on the effective roots, not only their env inputs: GUI consumers can
+  // change config.json claudeConfigDirs while a resident serve process stays
+  // alive. Normalized roots also collapse syntactically different inputs that
+  // discover the same directories.
+  const claudeRoots = JSON.stringify(claudeDiscoveryRoots)
   // Proxy attribution (totalProxiedCostUSD) is computed live from proxyPaths and
   // then cached, so the key must change when that config changes.
   // Pricing-affecting config participates so a memoized parse (exact-key or
   // burst-reused in a resident serve process) can never present costs priced
   // under aliases/overrides/savings the user has since changed.
-  return `${s}:${providerFilter ?? 'all'}:${claudeEnv}:${getProxyPathsConfigHash()}:${getModelAliasesConfigHash()}:${getPriceOverridesConfigHash()}:${getLocalModelSavingsConfigHash()}`
+  return `${s}:${providerFilter ?? 'all'}:${claudeRoots}:${getProxyPathsConfigHash()}:${getModelAliasesConfigHash()}:${getPriceOverridesConfigHash()}:${getLocalModelSavingsConfigHash()}`
 }
 
 export function clearSessionCache(): void {
   sessionCache.clear()
 }
 
-function cachePut(key: string, data: ProjectSummary[]) {
+function cachePut(key: string, data: ProjectSummary[], parseStartedAt: number) {
   const now = Date.now()
   for (const [k, v] of sessionCache) {
-    if (now - v.ts > CACHE_TTL_MS) sessionCache.delete(k)
+    if (now - v.createdAt > CACHE_TTL_MS) sessionCache.delete(k)
   }
   if (sessionCache.size >= MAX_CACHE_ENTRIES) {
-    const oldest = [...sessionCache.entries()].sort((a, b) => a[1].ts - b[1].ts)[0]
+    const oldest = [...sessionCache.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0]
     if (oldest) sessionCache.delete(oldest[0])
   }
-  sessionCache.set(key, { data, ts: now, ...(putMeta ?? {}) })
+  sessionCache.set(key, { data, createdAt: now, validatedFrom: parseStartedAt, ...(putMeta ?? {}) })
   putMeta = null
 }
 
@@ -3707,13 +3726,33 @@ export function isSessionHydrationComplete(): boolean {
 // chart (gapStart = lastComputedDate + 1 never looks back at them).
 let readOnlyServedStale = false
 
-export async function parseAllSessions(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
-  const key = cacheKey(dateRange, providerFilter)
+export function parseAllSessions(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
+  // Capture synchronously, before the first await. AsyncLocalStorage keeps all
+  // Codex cache reads, dirty writes, and the final flush on this call-time
+  // directory even if an embedding host changes the process env mid-parse.
+  const codexCacheDir = getCodeburnCacheDir()
+  return withCodexCacheDirectory(codexCacheDir, () => parseAllSessionsInCacheScope(dateRange, providerFilter))
+}
+
+async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
+  // Anchor freshness before any config, cache, or session input is read. A
+  // watched-root event that lands while this parse is in flight must remain
+  // newer than the resulting memo instead of being blessed retroactively.
+  const parseStartedAt = Date.now()
+  const claudeDiscoveryRoots = await getClaudeConfigDirs()
+  const key = cacheKey(dateRange, providerFilter, claudeDiscoveryRoots)
   const cached = sessionCache.get(key)
-  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.data
+  if (cached) {
+    const age = Date.now() - cached.createdAt
+    const validation = parseReuseValidator?.(cached.validatedFrom) ?? 'unknown'
+    if (
+      validation !== 'dirty'
+      && (age < CACHE_TTL_MS || (validation === 'clean' && age <= VALIDATED_REUSE_CAP_MS))
+    ) return cached.data
+  }
   // The signature is the key minus the range: what must match for a burst
   // reuse (provider, config env, proxy hash) regardless of the now-anchor.
-  const burstSig = cacheKey(undefined, providerFilter)
+  const burstSig = cacheKey(undefined, providerFilter, claudeDiscoveryRoots)
   if (dateRange) {
     const reused = burstReuse(dateRange, burstSig)
     if (reused) return reused
@@ -3735,7 +3774,7 @@ export async function parseAllSessions(dateRange?: DateRange, providerFilter?: s
     if (hydration.waited) diskCache = await loadCache()
     const isCold = !isCacheComplete(diskCache)
     try {
-      return await runParse(key, diskCache, dateRange, providerFilter, { isCold })
+      return await runParse(key, diskCache, dateRange, providerFilter, { isCold, burstSig, parseStartedAt })
     } finally {
       await hydration.release()
     }
@@ -3747,20 +3786,20 @@ export async function parseAllSessions(dateRange?: DateRange, providerFilter?: s
   const priorSnapshot = diskCache
   const refresh = await acquireCacheRefreshLock()
   if (refresh.outcome === 'timed-out' || refresh.outcome === 'unavailable') {
-    return runParse(key, priorSnapshot, dateRange, providerFilter, { readOnly: true })
+    return runParse(key, priorSnapshot, dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   }
   if (refresh.outcome === 'completed-by-other') {
-    return runParse(key, await loadCache(), dateRange, providerFilter, { readOnly: true })
+    return runParse(key, await loadCache(), dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   }
 
   try {
     // Reload only after ownership is canonical; this closes the lost-update
     // window between the pre-gate read and the holder's completed publication.
     diskCache = await loadCache()
-    return await runParse(key, diskCache, dateRange, providerFilter, { refreshLock: refresh.handle })
+    return await runParse(key, diskCache, dateRange, providerFilter, { refreshLock: refresh.handle, burstSig, parseStartedAt })
   } catch (err) {
     if (!(err instanceof RefreshFenceLostError) && !(err instanceof RefreshPublicationUnavailableError)) throw err
-    return runParse(key, await loadCache(), dateRange, providerFilter, { readOnly: true })
+    return runParse(key, await loadCache(), dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   } finally {
     await refresh.handle.release()
   }
@@ -3773,14 +3812,16 @@ type RunParseOptions = {
   isCold?: boolean
   readOnly?: boolean
   refreshLock?: RefreshLockHandle
+  burstSig: string
+  parseStartedAt: number
 }
 
 async function runParse(
   key: string,
   diskCache: SessionCache,
-  dateRange?: DateRange,
-  providerFilter?: string,
-  options: RunParseOptions = {},
+  dateRange: DateRange | undefined,
+  providerFilter: string | undefined,
+  options: RunParseOptions,
 ): Promise<ProjectSummary[]> {
   const { isCold = false, readOnly = false, refreshLock } = options
   readOnlyServedStale = false
@@ -3942,7 +3983,7 @@ async function runParse(
 
   const result = Array.from(mergedMap.values()).sort((a, b) => b.totalCostUSD - a.totalCostUSD)
   correlateCrossProviderPrSessions(result)
-  if (dateRange) setCachePutMeta({ startMs: dateRange.start.getTime(), endMs: dateRange.end.getTime(), sig: cacheKey(undefined, providerFilter) })
-  cachePut(key, result)
+  if (dateRange) setCachePutMeta({ startMs: dateRange.start.getTime(), endMs: dateRange.end.getTime(), sig: options.burstSig })
+  cachePut(key, result, options.parseStartedAt)
   return result
 }
