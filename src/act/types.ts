@@ -66,4 +66,10 @@ export type ActionPlan = {
   findingId?: string | null
   changes: PlannedChange[]
   baseline?: ActionBaseline
+  // MCP plans only: exact server identities the generated file mutations own.
+  // Preview and baseline capture must not claim skipped/managed targets.
+  affectedMcpServers?: string[]
+  // Relevant config scopes could not all be read, so removal may proceed
+  // with warnings but savings/baseline claims must be suppressed.
+  mcpSavingsUncertain?: boolean
 }

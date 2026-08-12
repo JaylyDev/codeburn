@@ -37,17 +37,43 @@ function changeLines(fp: FindingPlan): string[] {
   })
 }
 
+function planTokensSaved(fp: FindingPlan): number {
+  if (fp.plan?.mcpSavingsUncertain) return Number.NaN
+  const byServer = fp.finding.applyTokensSavedByServer
+  const affected = fp.plan?.affectedMcpServers
+  if (byServer && affected) return affected.reduce((sum, server) => sum + (byServer[server] ?? 0), 0)
+  return fp.finding.applyTokensSaved ?? fp.finding.tokensSaved
+}
+
+function manualActionLines(fp: FindingPlan): string[] {
+  if (fp.finding.manualFollowUp) {
+    return [fp.finding.manualFollowUp.label, fp.finding.manualFollowUp.text]
+  }
+  const action = fp.finding.fix
+  if (action.type === 'paste' && action.destination === 'manual') {
+    return [action.label, action.text]
+  }
+  return []
+}
+
 export function renderApplyList(appliable: FindingPlan[], manual: FindingPlan[], costRate: number): string {
   const lines: string[] = ['']
   lines.push(chalk.bold('  Appliable config-class fixes:'))
   appliable.forEach((fp, i) => {
     const f = fp.finding
-    const actionTokensSaved = f.applyTokensSaved ?? f.tokensSaved
-    const savings = `~${formatTokens(actionTokensSaved)} tokens${costRate > 0 ? `, ~${formatCost(actionTokensSaved * costRate)}` : ''}`
+    const actionTokensSaved = planTokensSaved(fp)
+    const savings = Number.isFinite(actionTokensSaved)
+      ? `~${formatTokens(actionTokensSaved)} tokens${costRate > 0 ? `, ~${formatCost(actionTokensSaved * costRate)}` : ''}`
+      : 'Savings not estimated'
     lines.push('')
     lines.push(`  ${i + 1}. ${f.title}  ${chalk.hex('#FFD700')(`(${savings})`)}`)
+    if (fp.plan?.affectedMcpServers?.length) {
+      const servers = fp.plan.affectedMcpServers.join(', ')
+      lines.push(chalk.yellow(`       Removes local MCP server${fp.plan.affectedMcpServers.length === 1 ? '' : 's'}: ${servers}`))
+    }
     for (const line of changeLines(fp)) lines.push(chalk.dim(`       ${line}`))
     for (const note of fp.notes) lines.push(chalk.yellow(`       ! ${note}`))
+    for (const line of manualActionLines(fp)) lines.push(chalk.cyan(`       ${line}`))
   })
   if (manual.length > 0) {
     lines.push('')
@@ -55,6 +81,7 @@ export function renderApplyList(appliable: FindingPlan[], manual: FindingPlan[],
     for (const fp of manual) {
       lines.push(chalk.dim(`    - ${fp.finding.title}  [${fp.finding.id}]  manual`))
       for (const note of fp.notes) lines.push(chalk.yellow(`        ! ${note}`))
+      for (const line of manualActionLines(fp)) lines.push(chalk.cyan(`        ${line}`))
     }
   }
   lines.push('')
@@ -130,6 +157,7 @@ export async function runOptimizeApply(
     print(chalk.dim('\n  No appliable config-class fixes for this period.'))
     for (const fp of manual) {
       for (const note of fp.notes) print(chalk.yellow(`  ! ${fp.finding.id}: ${note}`))
+      for (const line of manualActionLines(fp)) print(chalk.cyan(`  ${line}`))
     }
     print()
     return

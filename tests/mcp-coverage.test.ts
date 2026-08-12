@@ -315,6 +315,23 @@ describe('estimateMcpSchemaCost', () => {
     expect(cost.cacheWriteTokens).toBe(24_000)
   })
 
+  it('does not count a duplicated server identifier twice', () => {
+    const inventory = Array.from({ length: 20 }, (_, i) => `mcp__svc__t${i}`)
+    const sessions = [makeSession({
+      inventory,
+      turns: [makeTurn([makeCall({ cacheCreation: 50_000 })])],
+    })]
+
+    const cost = estimateMcpSchemaCost(
+      { svc: 20 },
+      [project(sessions)],
+      ['svc', 'svc'],
+    )
+
+    expect(cost.cacheWriteTokens).toBe(8_000)
+    expect(cost.effectiveInputTokens).toBe(10_000)
+  })
+
   it('still works with the single-server signature (backward compat)', () => {
     const turns = [makeTurn([makeCall({ cacheCreation: 50_000 })])]
     const sessions = [makeSession({
@@ -418,6 +435,64 @@ describe('detectMcpToolCoverage', () => {
     })
     expect(report.findings[0]).not.toHaveProperty('apply')
     expect(report.findings[0]).not.toHaveProperty('applyTokensSaved')
+    expect(report.findings[0]).not.toHaveProperty('applyTokensSavedByServer')
+    expect(report.findings[0]).not.toHaveProperty('manualFollowUp')
+  })
+
+  it('intersects globally unused tool identities with each session inventory', () => {
+    const server = 'filesystem'
+    const coverage = [{
+      server,
+      toolsAvailable: 20,
+      toolsInvoked: 0,
+      unusedTools: Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+      invocations: 0,
+      loadedSessions: 2,
+      coverageRatio: 0,
+    }]
+    const sessions = [5, 20].map((count, index) => makeSession({
+      sessionId: `s${index}`,
+      inventory: Array.from({ length: count }, (_, i) => `mcp__${server}__t${i}`),
+      turns: [makeTurn([makeCall({ cacheCreation: 50_000 })])],
+    }))
+
+    const finding = detectMcpToolCoverage([project(sessions)], coverage)
+
+    // 5*400 and 20*400, each at 1.25x cache-write pricing.
+    expect(finding).toMatchObject({ tokensSaved: 12_500 })
+    expect(finding!.applyTokensSavedByServer?.filesystem).toBe(12_500)
+  })
+
+  it('conserves simultaneous cache-write and cache-read buckets with fractional shares', () => {
+    const inventory = [
+      ...Array.from({ length: 15 }, (_, i) => `mcp__filesystem__t${i}`),
+      ...Array.from({ length: 11 }, (_, i) => `mcp__claude_ai_Slack__t${i}`),
+    ]
+    const coverage: McpServerCoverage[] = [
+      {
+        server: 'filesystem', toolsAvailable: 15, toolsInvoked: 0,
+        unusedTools: inventory.slice(0, 15), invocations: 0, loadedSessions: 2, coverageRatio: 0,
+      },
+      {
+        server: 'claude_ai_Slack', toolsAvailable: 11, toolsInvoked: 0,
+        unusedTools: inventory.slice(15), invocations: 0, loadedSessions: 2, coverageRatio: 0,
+      },
+    ]
+    // Duplicate inventory entries must not increase the schema share.
+    const sessionInventory = [...inventory, inventory[0]!, inventory[15]!]
+    const sessions = ['a', 'b'].map(sessionId => makeSession({
+      sessionId,
+      inventory: sessionInventory,
+      turns: [makeTurn([makeCall({ cacheCreation: 5_001, cacheRead: 3_333 })])],
+    }))
+
+    const finding = detectMcpToolCoverage([project(sessions)], coverage)!
+    const total = 2 * (5_001 * 1.25 + 3_333 * 0.10)
+    const local = total * (15 / 26)
+
+    expect(finding.tokensSaved).toBe(Math.round(total))
+    expect(finding.applyTokensSaved).toBe(Math.round(local))
+    expect(finding.applyTokensSavedByServer?.filesystem).toBeCloseTo(local, 8)
   })
 
   it('pluralises manual guidance when only claude.ai connectors are flagged', () => {
@@ -520,6 +595,39 @@ describe('detectMcpToolCoverage', () => {
       text: "claude mcp remove 'filesystem'",
     })
     expect(finding!.apply).toEqual({ kind: 'mcp-remove', servers: ['filesystem'] })
+  })
+
+  it('attributes a capped mixed cache bucket proportionally to the local action', () => {
+    const inventory = ['filesystem', 'claude_ai_Slack'].flatMap(server =>
+      Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+    )
+    const sessions = ['a', 'b'].map(sessionId => makeSession({
+      sessionId,
+      inventory,
+      turns: [makeTurn([makeCall({ cacheCreation: 10_000 })])],
+    }))
+
+    const finding = detectMcpToolCoverage([project(sessions)])
+
+    // Each call's 10K cache bucket is shared evenly by two 8K schemas.
+    // Total: 2 * 10K * 1.25 = 25K. The local mutation owns half.
+    expect(finding).toMatchObject({ tokensSaved: 25_000, applyTokensSaved: 12_500 })
+  })
+
+  it('charges only the flagged servers actually loaded in each session', () => {
+    const sessions = ['filesystem', 'claude_ai_Slack'].flatMap(server =>
+      ['a', 'b'].map(suffix => makeSession({
+        sessionId: `${server}-${suffix}`,
+        inventory: Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+        turns: [makeTurn([makeCall({ cacheCreation: 50_000 })])],
+      })),
+    )
+
+    const finding = detectMcpToolCoverage([project(sessions)])
+
+    // Four sessions each load one 8K schema. The combined finding must not
+    // charge both schemas to every session merely because both are flagged.
+    expect(finding).toMatchObject({ tokensSaved: 40_000, applyTokensSaved: 20_000 })
   })
 
   it('disambiguates a claude.ai connector from a similarly named local server', () => {

@@ -163,6 +163,109 @@ describe('mcp-remove plan', () => {
     expect(preview).not.toContain('~80.0K tokens')
     expect(preview).not.toContain('~$0.160')
   })
+
+  it('scopes targets and savings to local servers actually present in editable config', async () => {
+    const fx = await makeFixture()
+    await writeFile(join(fx.home, '.claude.json'), JSON.stringify({
+      mcpServers: { filesystem: { command: 'filesystem' } },
+    }, null, 2) + '\n')
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage',
+      title: '3 MCP servers with low tool coverage',
+      explanation: '',
+      impact: 'medium',
+      tokensSaved: 60_000,
+      applyTokensSaved: 30_000,
+      applyTokensSavedByServer: { filesystem: 10_000, managed: 20_000 },
+      fix: { type: 'command', label: '', text: "claude mcp remove 'filesystem'\nclaude mcp remove 'managed'" },
+      apply: { kind: 'mcp-remove', servers: ['filesystem', 'managed'] },
+    }
+
+    const plans = planFindings([finding], { homeDir: fx.home, cwd: fx.project })
+    const preview = stripAnsi(renderApplyList(plans.filter(p => p.plan), plans.filter(p => !p.plan), 0))
+
+    expect(plans[0]!.plan?.affectedMcpServers).toEqual(['filesystem'])
+    expect(preview).toContain('Removes local MCP server: filesystem')
+    expect(preview).toContain('~10.0K tokens')
+    expect(preview).not.toContain('~30.0K tokens')
+    expect(preview).toContain('skipped managed: not found in editable config')
+  })
+
+  it('suppresses savings for a legacy partial plan without per-server attribution', async () => {
+    const fx = await makeFixture()
+    await writeFile(join(fx.home, '.claude.json'), JSON.stringify({
+      mcpServers: { filesystem: { command: 'filesystem' } },
+    }, null, 2) + '\n')
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage',
+      title: '2 MCP servers with low tool coverage',
+      explanation: '',
+      impact: 'medium',
+      tokensSaved: 30_000,
+      applyTokensSaved: 30_000,
+      fix: { type: 'command', label: '', text: '' },
+      apply: { kind: 'mcp-remove', servers: ['filesystem', 'managed'] },
+    }
+
+    const plans = planFindings([finding], { homeDir: fx.home, cwd: fx.project })
+    const preview = stripAnsi(renderApplyList(plans.filter(p => p.plan), plans.filter(p => !p.plan), 0))
+
+    expect(plans[0]!.plan?.affectedMcpServers).toEqual(['filesystem'])
+    expect(plans[0]!.plan?.mcpSavingsUncertain).toBe(true)
+    expect(preview).toContain('Savings not estimated')
+    expect(preview).not.toContain('~30.0K tokens')
+  })
+
+  it('deduplicates repeated removal targets before planning and pricing them', async () => {
+    const fx = await makeFixture()
+    await writeFile(join(fx.home, '.claude.json'), JSON.stringify({
+      mcpServers: { filesystem: { command: 'filesystem' } },
+    }, null, 2) + '\n')
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage',
+      title: '1 MCP server with low tool coverage',
+      explanation: '',
+      impact: 'medium',
+      tokensSaved: 10_000,
+      applyTokensSavedByServer: { filesystem: 10_000 },
+      fix: { type: 'command', label: '', text: '' },
+      apply: { kind: 'mcp-remove', servers: ['filesystem', 'filesystem'] },
+    }
+
+    const plans = planFindings([finding], { homeDir: fx.home, cwd: fx.project })
+    const preview = stripAnsi(renderApplyList(plans.filter(p => p.plan), [], 0))
+
+    expect(plans[0]!.plan?.affectedMcpServers).toEqual(['filesystem'])
+    expect(preview).toContain('~10.0K tokens')
+    expect(preview).not.toContain('~20.0K tokens')
+  })
+
+  it('does not claim savings when another relevant config scope is unreadable', async () => {
+    const fx = await makeFixture()
+    await writeFile(join(fx.home, '.claude.json'), JSON.stringify({
+      mcpServers: { filesystem: { command: 'filesystem' } },
+    }, null, 2) + '\n')
+    await writeFile(join(fx.project, '.mcp.json'), 'not json{{{')
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage',
+      title: '1 MCP server with low tool coverage',
+      explanation: '',
+      impact: 'medium',
+      tokensSaved: 10_000,
+      applyTokensSavedByServer: { filesystem: 10_000 },
+      fix: { type: 'command', label: '', text: "claude mcp remove 'filesystem'" },
+      apply: { kind: 'mcp-remove', servers: ['filesystem'] },
+    }
+
+    const plans = planFindings([finding], { homeDir: fx.home, cwd: fx.project })
+    const preview = stripAnsi(renderApplyList(plans.filter(p => p.plan), plans.filter(p => !p.plan), 0))
+
+    expect(plans[0]!.plan?.affectedMcpServers).toEqual(['filesystem'])
+    expect(plans[0]!.plan?.mcpSavingsUncertain).toBe(true)
+    expect(preview).toContain('Savings not estimated')
+    expect(preview).toContain('could not parse')
+    expect(preview).not.toContain('~10.0K tokens')
+  })
 })
 
 describe('mcp-project-scope plan', () => {
@@ -479,6 +582,53 @@ async function threeFindingFixture(): Promise<{ fx: Fixture; findings: WasteFind
 }
 
 describe('runOptimizeApply end-to-end', () => {
+  it('prints connector-only manual guidance when there is nothing to apply', async () => {
+    const fx = await makeFixture()
+    const connector: McpServerCoverage = {
+      server: 'claude_ai_Netlify',
+      toolsAvailable: 20,
+      toolsInvoked: 0,
+      unusedTools: Array.from({ length: 20 }, (_, i) => `mcp__claude_ai_Netlify__t${i}`),
+      invocations: 0,
+      loadedSessions: 2,
+      coverageRatio: 0,
+    }
+    const finding = detectMcpToolCoverage([], [connector])!
+    const io = makeIo()
+
+    await runOptimizeApply([], undefined, applyOpts(fx, io, { findings: [finding], yes: true }))
+
+    expect(io.stdout()).toContain('No appliable config-class fixes')
+    expect(io.stdout()).toContain('/mcp')
+    expect(io.stdout()).toContain('claude.ai Netlify')
+    expect(io.stdout()).not.toContain('claude mcp remove')
+  })
+
+  it('names the exact local removal target and preserves connector follow-up in a mixed preview', async () => {
+    const fx = await makeFixture()
+    await writeFile(join(fx.home, '.claude.json'), JSON.stringify({
+      mcpServers: { filesystem: { command: 'filesystem' }, netlify: { command: 'local-netlify' } },
+    }, null, 2) + '\n')
+    const coverage = (server: string): McpServerCoverage => ({
+      server,
+      toolsAvailable: 20,
+      toolsInvoked: 0,
+      unusedTools: Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+      invocations: 0,
+      loadedSessions: 2,
+      coverageRatio: 0,
+    })
+    const finding = detectMcpToolCoverage([], [coverage('filesystem'), coverage('claude_ai_Netlify')])!
+    const io = makeIo()
+
+    await runOptimizeApply([], undefined, applyOpts(fx, io, { findings: [finding], dryRun: true }))
+
+    expect(io.stdout()).toContain('Removes local MCP server: filesystem')
+    expect(io.stdout()).toContain('/mcp')
+    expect(io.stdout()).toContain('claude.ai Netlify')
+    expect(io.stdout()).not.toContain("claude mcp remove 'claude_ai_Netlify'")
+  })
+
   it('--yes applies every plan and prints journal short ids with the undo hint', async () => {
     const { fx, findings } = await threeFindingFixture()
     const io = makeIo()
