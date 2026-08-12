@@ -1,6 +1,13 @@
-<p align="center">
-  <a href="https://claude.com/open-source-max"><img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/open-source-recipient.png" alt="Codex and Claude for Open Source Recipient" width="720" /></a>
-</p>
+<table align="center">
+  <tr>
+    <td align="center" valign="middle">
+      <a href="https://claude.com/open-source-max"><img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/open-source-recipient.png" alt="Codex and Claude for Open Source Recipient" width="520" /></a>
+    </td>
+    <td align="center" valign="middle">
+      <a href="https://www.producthunt.com/products/codeburn?embed=true&utm_source=badge-featured&utm_medium=badge&utm_campaign=badge-codeburn-2" target="_blank" rel="noopener noreferrer"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1220451&theme=dark&t=1786459783669" alt="CodeBurn - See where your AI coding spend actually goes | Product Hunt" width="250" height="54" /></a>
+    </td>
+  </tr>
+</table>
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/providers.png" alt="CodeBurn" width="420" />
