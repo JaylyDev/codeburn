@@ -4,7 +4,7 @@ import { basename, dirname, join, resolve, sep } from 'path'
 import { readSessionLines } from './fs-utils.js'
 import { calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
 import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
-import { normalizeContentBlocks } from './content-utils.js'
+import { normalizeContentBlocks, flatSlice, flatString } from './content-utils.js'
 import { discoverAllSessions, getProvider } from './providers/index.js'
 import { flushCodexCache } from './codex-cache.js'
 import { antigravityCascadeIdFromPath, flushAntigravityCache, shouldReparseAntigravitySource } from './providers/antigravity.js'
@@ -1261,7 +1261,7 @@ export function collectToolResultMeta(entry: JournalEntry, map: Map<string, Tool
 export function collectSessionMeta(entry: JournalEntry, meta: SessionMeta): void {
   if (entry.type === 'ai-title') {
     const t = (entry as Record<string, unknown>)['aiTitle']
-    if (typeof t === 'string' && t.trim()) meta.title = t.trim().slice(0, 200)
+    if (typeof t === 'string' && t.trim()) meta.title = flatString(t.trim().slice(0, 200))
   } else if (entry.type === 'pr-link') {
     const url = (entry as Record<string, unknown>)['prUrl']
     if (typeof url === 'string' && url && !meta.prLinks.includes(url)) meta.prLinks.push(url)
@@ -1900,7 +1900,7 @@ export async function readAgentType(filePath: string): Promise<string | undefine
   const metaPath = filePath.replace(/\.jsonl$/, '.meta.json')
   try {
     const t = (JSON.parse(await readFile(metaPath, 'utf8')) as { agentType?: unknown }).agentType
-    if (typeof t === 'string' && t.trim()) return t.trim().slice(0, 100)
+    if (typeof t === 'string' && t.trim()) return flatString(t.trim().slice(0, 100))
   } catch { /* missing or unreadable meta */ }
   // Workflow agents always live under `subagents/workflows/`, so fall back to that
   // even when the meta sidecar is absent.
@@ -2453,7 +2453,7 @@ function parsedTurnToCachedTurn(turn: ParsedTurn): CachedTurn {
   return {
     timestamp: turn.timestamp,
     sessionId: turn.sessionId,
-    userMessage: turn.userMessage.slice(0, 2000),
+    userMessage: flatSlice(turn.userMessage, 2000),
     calls: turn.assistantCalls.map(apiCallToCachedCall),
     // Stored per-turn directly (already sorted/deduped in groupIntoTurns), unlike
     // gitBranch's change-detection dedup, so each turn's refs are self-contained.
@@ -2484,7 +2484,7 @@ function providerCallToCachedTurn(call: ParsedProviderCall): CachedTurn {
   return {
     timestamp: call.timestamp,
     sessionId: call.sessionId,
-    userMessage: call.userMessage.slice(0, 2000),
+    userMessage: flatSlice(call.userMessage, 2000),
     calls: [providerCallToCachedCall(call)],
     ...(prRefs.length ? { prRefs } : {}),
   }
@@ -2507,7 +2507,7 @@ function providerCallsToCachedTurns(calls: ParsedProviderCall[]): CachedTurn[] {
       turn = {
         timestamp: call.timestamp,
         sessionId: call.sessionId,
-        userMessage: call.userMessage.slice(0, 2000),
+        userMessage: flatSlice(call.userMessage, 2000),
         calls: [],
         ...(prRefs.length ? { prRefs } : {}),
       }
