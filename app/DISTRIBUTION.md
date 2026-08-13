@@ -93,8 +93,9 @@ self-contained bundle into `app/build/cli`; see "The bundled CLI" above), then
 `vite`), then `electron-builder --mac` (whose `afterPack` hook copies the
 staged CLI into the app). `package:win` and `package:linux` mirror it exactly,
 swapping the final flag for `electron-builder --win` and `electron-builder
---linux`. All three can run on the same macOS host — electron-builder downloads
-the NSIS and AppImage tooling on first use.
+--linux`. Developers can run all three locally on the same macOS host —
+electron-builder downloads the NSIS and AppImage tooling on first use. Release
+Windows installers are built by the `windows-latest` workflow described below.
 
 ### Artifacts
 
@@ -154,10 +155,12 @@ separate `electron-builder.yml`):
 
 ## Windows and Linux builds
 
-Both are cross-built from the same macOS host used for the mac build — no
-Windows or Linux machine, and no `wine`, is required. electron-builder 26
-embeds the Windows executable's icon/version resources natively and downloads
-the NSIS and AppImage tooling on first run.
+Developers can cross-build both locally from the same macOS host used for the
+mac build — no Windows or Linux machine, and no `wine`, is required.
+Release-authoritative Windows NSIS installers are instead built by the `Build
+Windows installer` workflow on `windows-latest`. electron-builder 26 embeds the
+Windows executable's icon/version resources natively and downloads the NSIS and
+AppImage tooling on first run.
 
 ### Windows (`package:win`)
 
