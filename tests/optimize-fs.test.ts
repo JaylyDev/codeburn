@@ -20,6 +20,9 @@ import {
   detectUnusedMcp,
   detectBashBloat,
   detectGhostCommands,
+  detectDuplicateReads,
+  detectJunkReads,
+  detectLowReadEditRatio,
   loadMcpConfigs,
   scanJsonlFile,
   scanAndDetect,
@@ -292,6 +295,75 @@ describe('scanJsonlFile', () => {
     const result = await scanJsonlFile(filePath, 'p1', undefined)
     expect(result.calls).toHaveLength(1)
     expect(result.calls[0].name).toBe('Read')
+  })
+
+  it('marks tool calls from sidechain transcript entries', async () => {
+    const root = makeFixtureRoot()
+    const filePath = join(root, 'agent-reviewer.jsonl')
+    const now = new Date().toISOString()
+    writeFile(filePath, JSON.stringify({
+      type: 'assistant', isSidechain: true, timestamp: now,
+      message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: '/x/foo.ts' } }] },
+    }))
+
+    const result = await scanJsonlFile(filePath, 'p1', undefined)
+
+    expect(result.calls).toHaveLength(1)
+    expect(result.calls[0]!.isSidechain).toBe(true)
+  })
+
+  it('classifies every tool call in a transcript when a later large entry marks it as sidechain', async () => {
+    const root = makeFixtureRoot()
+    const filePath = join(root, 'agent-reviewer.jsonl')
+    const now = new Date().toISOString()
+    const assistant = (name: string, isSidechain?: boolean, padding = '') => JSON.stringify({
+      type: 'assistant',
+      ...(isSidechain === true ? { isSidechain: true } : {}),
+      timestamp: now,
+      cwd: '/x',
+      padding,
+      message: {
+        model: 'claude-sonnet-4-5',
+        usage: { cache_creation_input_tokens: 1 },
+        content: [{ type: 'tool_use', name, input: { file_path: `/x/${name}.ts` } }],
+      },
+    })
+    writeFile(filePath, [
+      JSON.stringify({ type: 'user', timestamp: now, cwd: '/x', message: { content: 'delegate this' } }),
+      assistant('Read'),
+      assistant('Edit', true, 'x'.repeat(40_000)),
+      assistant('Bash'),
+    ].join('\n'))
+
+    const result = await scanJsonlFile(filePath, 'p1', undefined)
+
+    expect(result.calls.map(call => [call.name, call.isSidechain])).toEqual([
+      ['Read', true],
+      ['Edit', true],
+      ['Bash', true],
+    ])
+    expect(result.apiCalls).toHaveLength(3)
+    expect(result.cwds).toHaveLength(4)
+    expect(result.userMessages).toEqual(['delegate this'])
+  })
+
+  it('excludes marked sidechain calls from raw human-behavior detectors', () => {
+    const editCalls = Array.from({ length: 10 }, (_, index) => ({
+      name: 'Edit', input: { file_path: `/src/${index}.ts` },
+      sessionId: 'agent-reviewer', project: 'p1', isSidechain: true,
+    }))
+    const junkReads = Array.from({ length: 6 }, () => ({
+      name: 'Read', input: { file_path: '/app/node_modules/pkg/index.js' },
+      sessionId: 'agent-reviewer', project: 'p1', isSidechain: true,
+    }))
+    const repeatReads = Array.from({ length: 6 }, () => ({
+      name: 'Read', input: { file_path: '/app/src/a.ts' },
+      sessionId: 'agent-reviewer', project: 'p1', isSidechain: true,
+    }))
+
+    expect(detectLowReadEditRatio(editCalls)).toBeNull()
+    expect(detectJunkReads(junkReads)).toBeNull()
+    expect(detectDuplicateReads(repeatReads)).toBeNull()
   })
 
   it('skips malformed JSONL lines without crashing', async () => {

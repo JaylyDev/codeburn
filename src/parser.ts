@@ -531,7 +531,7 @@ function extractObjectFields(
   return captured
 }
 
-const LARGE_ROOT_FIELDS = ['type', 'timestamp', 'sessionId', 'cwd', 'gitBranch', 'attachment', 'message'] as const
+const LARGE_ROOT_FIELDS = ['type', 'timestamp', 'sessionId', 'cwd', 'gitBranch', 'attachment', 'message', 'isSidechain'] as const
 const LARGE_ASSISTANT_MESSAGE_FIELDS = ['model', 'usage', 'id', 'content'] as const
 
 function parseLargeJsonl(line: string | Buffer): JournalEntry | null {
@@ -545,6 +545,9 @@ function parseLargeJsonl(line: string | Buffer): JournalEntry | null {
   if (!type) return null
 
   const entry: JournalEntry = { type }
+  if (root['isSidechain']?.kind === 'scalar' && source.slice(root['isSidechain'].start, root['isSidechain'].end) === 'true') {
+    entry.isSidechain = true
+  }
   const timestamp = readJsonString(source, root['timestamp'])
   const sessionId = readJsonString(source, root['sessionId'])
   const cwd = readJsonString(source, root['cwd'])

@@ -13,6 +13,7 @@ import type { DateRange, ProjectSummary, SessionSummary } from './types.js'
 import { formatCost } from './currency.js'
 import { formatTokens } from './format.js'
 import { recommendModelDefault, type ModelDefaultRecommendation } from './act/model-defaults.js'
+import { isUserStartedSession, userStartedProjects } from './session-population.js'
 import { aggregateFileChurn, buildCoachingNotes, scanUserCorrections, medianTimeToFirstEditMs, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 
 // ============================================================================
@@ -355,6 +356,7 @@ export type ToolCall = {
   sessionId: string
   project: string
   recent?: boolean
+  isSidechain?: boolean
 }
 
 export type ApiCallMeta = {
@@ -480,6 +482,7 @@ export async function scanJsonlFile(
   const userMessages: string[] = []
   const sessionId = basename(filePath, '.jsonl')
   let lastVersion = ''
+  let fileIsSidechain = false
 
   const skipThreshold = dateRange
     ? new Date(dateRange.start.getTime() - 86_400_000).toISOString()
@@ -494,6 +497,11 @@ export async function scanJsonlFile(
     const parsed = parseJsonlLine(line)
     if (!parsed) continue
     const entry = parsed as Record<string, unknown>
+
+    if (entry.isSidechain === true && !fileIsSidechain) {
+      fileIsSidechain = true
+      for (const call of calls) call.isSidechain = true
+    }
 
     if (entry.version && typeof entry.version === 'string') lastVersion = entry.version
 
@@ -545,6 +553,7 @@ export async function scanJsonlFile(
         sessionId,
         project,
         recent,
+        isSidechain: fileIsSidechain,
       })
     }
   }
@@ -656,6 +665,7 @@ export function loadMcpConfigs(projectCwds: Iterable<string>, homeDir = homedir(
 // ============================================================================
 
 export function detectJunkReads(calls: ToolCall[], dateRange?: DateRange): WasteFinding | null {
+  calls = calls.filter(call => call.isSidechain !== true)
   const dirCounts = new Map<string, number>()
   let totalJunkReads = 0
   let recentJunkReads = 0
@@ -706,6 +716,7 @@ export function detectJunkReads(calls: ToolCall[], dateRange?: DateRange): Waste
 }
 
 export function detectDuplicateReads(calls: ToolCall[], dateRange?: DateRange): WasteFinding | null {
+  calls = calls.filter(call => call.isSidechain !== true)
   const sessionFiles = new Map<string, Map<string, { count: number; recent: number }>>()
 
   for (const call of calls) {
@@ -1515,6 +1526,7 @@ function findCapabilityReliabilityCandidates(projects: ProjectSummary[]): Capabi
 }
 
 export function detectCapabilityReliability(projects: ProjectSummary[]): WasteFinding | null {
+  projects = userStartedProjects(projects)
   const candidates = findCapabilityReliabilityCandidates(projects)
   if (candidates.length === 0) return null
 
@@ -2198,6 +2210,7 @@ export const EDIT_TOOL_NAMES = new Set(['Edit', 'Write', 'FileEditTool', 'FileWr
 export const BASH_TOOL_NAMES = new Set(['Bash', 'BashTool', 'PowerShellTool'])
 
 export function detectLowReadEditRatio(calls: ToolCall[]): WasteFinding | null {
+  calls = calls.filter(call => call.isSidechain !== true)
   let reads = 0
   let edits = 0
   let recentEdits = 0
@@ -2491,7 +2504,7 @@ function sessionTokenTotal(session: ProjectSummary['sessions'][number]): number 
 // Keep that distinction local to optimize instead of deleting sidechains from
 // ProjectSummary, which would under-report the work delegated to subagents.
 function isOptimizeSession(session: ProjectSummary['sessions'][number]): boolean {
-  return session.isSidechain !== true
+  return isUserStartedSession(session)
 }
 
 function optimizeSessionCount(projects: ProjectSummary[]): number {
@@ -3038,6 +3051,7 @@ export async function scanAndDetect(
   if (cached && Date.now() - cached.ts < RESULT_CACHE_TTL_MS) return cached.data
 
   const costRate = computeInputCostRate(projects)
+  const behavioralProjects = userStartedProjects(projects)
   const { toolCalls, projectCwds, apiCalls, userMessages } = await scanSessions(dateRange)
   const mcpCoverage = aggregateMcpCoverage(projects)
 
@@ -3045,13 +3059,13 @@ export async function scanAndDetect(
   // Priority order for the per-session findings: low-worth → context-bloat →
   // outliers. Each later detector excludes sessions already named by an
   // earlier one so a single session is not listed in three findings.
-  const lowWorthSessionIds = new Set(findLowWorthCandidates(projects).map(c => c.sessionId))
+  const lowWorthSessionIds = new Set(findLowWorthCandidates(behavioralProjects).map(c => c.sessionId))
   const contextBloatVisibleIds = new Set(
-    findContextBloatCandidates(projects)
+    findContextBloatCandidates(behavioralProjects)
       .filter(c => !lowWorthSessionIds.has(c.sessionId))
       .map(c => c.sessionId),
   )
-  const firstSessionIds = findYoungProjectFirstSessionIds(projects)
+  const firstSessionIds = findYoungProjectFirstSessionIds(behavioralProjects)
   const outlierExclusions = new Set([...lowWorthSessionIds, ...contextBloatVisibleIds, ...firstSessionIds])
   const syncDetectors: Array<() => WasteFinding | null> = [
     () => detectCacheBloat(apiCalls, projects, dateRange),
@@ -3065,10 +3079,10 @@ export async function scanAndDetect(
     () => detectMcpDeferralOff(toolCalls, projects, projectCwds, apiCalls),
     () => detectMcpAlwaysLoadHygiene(projects, projectCwds, apiCalls, mcpCoverage),
     () => detectMcpDeferThreshold(projects, projectCwds),
-    () => detectCapabilityReliability(projects),
-    () => detectLowWorthSessions(projects),
-    () => detectContextBloat(projects, lowWorthSessionIds),
-    () => detectSessionOutliers(projects, outlierExclusions),
+    () => detectCapabilityReliability(behavioralProjects),
+    () => detectLowWorthSessions(behavioralProjects),
+    () => detectContextBloat(behavioralProjects, lowWorthSessionIds),
+    () => detectSessionOutliers(behavioralProjects, outlierExclusions),
     () => detectBloatedClaudeMd(projectCwds),
     () => detectBashBloat(),
   ]
@@ -3088,7 +3102,7 @@ export async function scanAndDetect(
   const { score, grade } = computeHealth(findings)
   
   const modelRecommendations: ModelDefaultRecommendation[] = []
-  for (const project of projects) {
+  for (const project of behavioralProjects) {
     const rec = recommendModelDefault(project, { now: dateRange?.end })
     if (rec) modelRecommendations.push(rec)
   }

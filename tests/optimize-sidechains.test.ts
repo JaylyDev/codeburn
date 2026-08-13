@@ -15,6 +15,7 @@ import {
   buildOptimizeJsonReport,
   cacheKey,
   computeInputCostRate,
+  detectCapabilityReliability,
   detectSessionOutliers,
   findContextBloatCandidates,
   findLowWorthCandidates,
@@ -22,7 +23,47 @@ import {
   scanAndDetect,
   type OptimizeResult,
 } from '../src/optimize.js'
-import type { ProjectSummary, SessionSummary } from '../src/types.js'
+import type { ClassifiedTurn, ProjectSummary, SessionSummary } from '../src/types.js'
+
+function behavioralTurn(
+  model: string,
+  index: number,
+  options: { retries?: number; costUSD?: number; userMessage?: string } = {},
+): ClassifiedTurn {
+  const timestamp = new Date(Date.parse('2026-08-01T10:00:00.000Z') + index * 1_000).toISOString()
+  return {
+    userMessage: options.userMessage ?? 'edit the code',
+    timestamp,
+    sessionId: 'agent-behavior',
+    category: 'feature',
+    retries: options.retries ?? 0,
+    hasEdits: true,
+    assistantCalls: [{
+      provider: 'claude',
+      model,
+      usage: {
+        inputTokens: 100,
+        outputTokens: 50,
+        cacheCreationInputTokens: 0,
+        cacheReadInputTokens: 0,
+        cachedInputTokens: 0,
+        reasoningTokens: 0,
+        webSearchRequests: 0,
+      },
+      costUSD: options.costUSD ?? 1,
+      tools: ['Edit'],
+      mcpTools: [],
+      skills: [],
+      subagentTypes: [],
+      hasAgentSpawn: false,
+      hasPlanMode: false,
+      speed: 'standard',
+      timestamp,
+      bashCommands: [],
+      deduplicationKey: `${model}-${index}`,
+    }],
+  }
+}
 
 function session(
   sessionId: string,
@@ -78,6 +119,69 @@ function project(sessions: SessionSummary[]): ProjectSummary {
 }
 
 describe('optimize sidechain population (issue #974)', () => {
+  it('does not recommend a model default from sidechain-only edit behavior', async () => {
+    const sonnetTurns = Array.from({ length: 35 }, (_, index) =>
+      behavioralTurn('claude-sonnet-4-20250514', index, {
+        retries: index >= 32 ? 1 : 0,
+        costUSD: 2,
+      }))
+    const haikuTurns = Array.from({ length: 32 }, (_, index) =>
+      behavioralTurn('claude-haiku-3-5-20241022', index + 35, {
+        retries: index >= 29 ? 1 : 0,
+        costUSD: 0.9,
+      }))
+    const child = sidechain('agent-behavior', { turns: [...sonnetTurns, ...haikuTurns] })
+    const projects = [project([child])]
+
+    const result = await scanAndDetect(projects, {
+      start: new Date('2026-08-01T00:00:00.000Z'),
+      end: new Date('2026-08-02T00:00:00.000Z'),
+    })
+
+    expect(result.modelRecommendations).toEqual([])
+  })
+
+  it('does not emit coaching from sidechain-only correction behavior', () => {
+    const turns = Array.from({ length: 66 }, (_, index) =>
+      behavioralTurn('claude-sonnet-4-20250514', index, {
+        userMessage: index === 0 ? 'review the code' : 'you missed the edge case',
+      }))
+    const child = sidechain('agent-corrections', {
+      totalCostUSD: 9,
+      totalInputTokens: 6_600,
+      totalOutputTokens: 3_300,
+      apiCalls: 66,
+      turns,
+    })
+    const projects = [project([child])]
+    const result: OptimizeResult = {
+      findings: [],
+      costRate: computeInputCostRate(projects),
+      healthScore: 100,
+      healthGrade: 'A',
+      modelRecommendations: [],
+    }
+
+    const report = buildOptimizeJsonReport(projects, 'fixture', result)
+
+    expect(report.coachingNotes).toEqual([])
+    expect(report.summary.periodCostUSD).toBe(9)
+    expect(report.summary.calls).toBe(66)
+  })
+
+  it('does not report retry-heavy capabilities from sidechain-only edits', () => {
+    const turns = Array.from({ length: 5 }, (_, index) => {
+      const item = behavioralTurn('claude-sonnet-4-20250514', index, {
+        retries: index < 3 ? 1 : 0,
+      })
+      item.assistantCalls[0]!.skills = ['reviewer']
+      return item
+    })
+    const child = sidechain('agent-capability', { turns })
+
+    expect(detectCapabilityReliability([project([child])])).toBeNull()
+  })
+
   it('keeps sidechain spend out of the low-worth candidate population', () => {
     const parent = session('parent', {
       totalCostUSD: 4,
