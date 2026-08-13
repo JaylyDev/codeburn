@@ -2,7 +2,7 @@ import { isAbsolute } from 'path'
 import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
-import { findUnpricedModels, loadPricing, setModelAliases, setPriceOverrides, setLocalModelSavings, setProxyPaths, normalizeProxyPath } from './models.js'
+import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setProxyPaths, normalizeProxyPath } from './models.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
 import { getProvider } from './providers/index.js'
@@ -2100,35 +2100,50 @@ program
     }
 
     const projects = await parseAllSessions(range, opts.provider)
+    const topN = typeof opts.top === 'number' && Number.isFinite(opts.top) ? opts.top : undefined
+    const minCost = typeof opts.minCost === 'number' && Number.isFinite(opts.minCost)
+      ? opts.minCost
+      : opts.unpriced ? undefined : 0.01
     let rows = await aggregateModels(projects, {
       byTask: !!opts.byTask,
       byAgent: !!opts.byAgent,
       taskFilter: opts.task,
-      topN: typeof opts.top === 'number' && Number.isFinite(opts.top) ? opts.top : undefined,
-      minCost: typeof opts.minCost === 'number' && Number.isFinite(opts.minCost) ? opts.minCost : (opts.unpriced ? 0 : 0.01),
+      topN: opts.unpriced ? undefined : topN,
+      minCost,
     })
     if (opts.unpriced) {
-      rows = rows.filter(row => findUnpricedModels([{
-        model: row.model,
-        calls: row.calls,
-        cost: row.costUSD,
-        tokens: row.totalTokens,
-      }]).length > 0)
+      rows = rows
+        .filter(row => findUnpricedModels([{
+          model: row.model,
+          calls: row.calls,
+          cost: row.costUSD,
+          tokens: row.totalTokens,
+        }]).length > 0)
+        .sort((a, b) => (b.totalTokens - a.totalTokens) || (b.calls - a.calls)
+          || (a.provider < b.provider ? -1 : a.provider > b.provider ? 1 : 0)
+          || (a.model < b.model ? -1 : a.model > b.model ? 1 : 0))
+      if (topN !== undefined) rows = rows.slice(0, topN)
     }
 
     const fmt = (opts.format ?? 'table').toLowerCase()
     if (rows.length === 0 && (fmt === 'table' || fmt === 'markdown')) {
-      process.stdout.write('No model usage found for the selected period.\n')
+      process.stdout.write(opts.unpriced
+        ? 'No unpriced models found for the selected period.\n'
+        : 'No model usage found for the selected period.\n')
       return
     }
+    const renderRows = opts.unpriced && fmt !== 'json'
+      ? rows.map(row => ({ ...row, modelDisplayName: sanitizeModelForDisplay(row.model) }))
+      : rows
     if (fmt === 'json') {
       process.stdout.write(renderJson(rows) + '\n')
     } else if (fmt === 'csv') {
-      process.stdout.write(renderCsv(rows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent }) + '\n')
+      process.stdout.write(renderCsv(renderRows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent }) + '\n')
     } else if (fmt === 'markdown' || fmt === 'md') {
-      process.stdout.write(renderMarkdown(rows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent, showTotals: opts.totals !== false }) + '\n')
+      process.stdout.write(renderMarkdown(renderRows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent, showTotals: opts.totals !== false }) + '\n')
     } else if (fmt === 'table') {
-      process.stdout.write(renderTable(rows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent, showTotals: opts.totals !== false }) + '\n')
+      process.stdout.write(renderTable(renderRows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent, showTotals: opts.totals !== false }) + '\n')
+      if (opts.unpriced) process.stdout.write('Fix: codeburn model-alias "<model>" <known-model>\n')
     } else {
       process.stderr.write(`codeburn: unknown --format "${opts.format}". Choose table, markdown, json, or csv.\n`)
       process.exit(1)

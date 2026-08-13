@@ -652,8 +652,10 @@ function ModelBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: 
         )
       })}
       {unpriced.length > 0 && (
-        <Text color="yellow" wrap="truncate-end">
-          {`! ${unpriced.length} model${unpriced.length === 1 ? '' : 's'} unpriced at $0, fix: codeburn model-alias (${unpriced.slice(0, 2).map(u => u.model).join(', ')}${unpriced.length > 2 ? ', ...' : ''})`}
+        <Text color="yellow" wrap={pw <= 44 ? 'wrap' : 'truncate-end'}>
+          {pw <= 44
+            ? 'codeburn models --unpriced'
+            : `! ${unpriced.length} unpriced: codeburn models --unpriced`}
         </Text>
       )}
       {anyEstimated && (

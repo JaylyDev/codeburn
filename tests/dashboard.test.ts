@@ -395,6 +395,57 @@ describe('interactive terminal rendering', () => {
     expect(INTERACTIVE_RENDER_OPTIONS).toMatchObject({ alternateScreen: true })
   })
 
+  it.each([
+    { columns: 42, expected: 'codeburn models --unpriced' },
+    { columns: 43, expected: 'codeburn models --unpriced' },
+    { columns: 44, expected: 'codeburn models --unpriced' },
+    { columns: 80, expected: '! 10 unpriced: codeburn models --unpriced' },
+  ])('shows an actionable unpriced-model command in a real $columns-column Ink frame', async ({ columns, expected }) => {
+    const stdin = new PassThrough() as PassThrough & NodeJS.ReadStream
+    const stdout = new PassThrough() as PassThrough & NodeJS.WriteStream
+    stdin.isTTY = true
+    stdin.setRawMode = () => stdin
+    stdin.ref = () => stdin
+    stdin.unref = () => stdin
+    stdout.isTTY = true
+    stdout.columns = columns
+    stdout.rows = 100
+    const frames: string[] = []
+    stdout.on('data', chunk => frames.push(stripAnsi(String(chunk))))
+
+    const session = makeSession('unpriced-session', 0)
+    for (let index = 0; index < 10; index++) {
+      const model = `vendor-${index}/unknown-model-${index}-969`
+      session.modelBreakdown[model] = {
+        calls: 1,
+        costUSD: 0,
+        savingsUSD: 0,
+        tokens: {
+          inputTokens: 1_000,
+          outputTokens: 100,
+          cacheCreationInputTokens: 0,
+          cacheReadInputTokens: 0,
+          cachedInputTokens: 0,
+          reasoningTokens: 0,
+          webSearchRequests: 0,
+        },
+      }
+    }
+
+    const app = render(React.createElement(InteractiveDashboard, {
+      initialProjects: [makeProject('unpriced-project', [session])],
+      initialPeriod: 'today',
+      initialProvider: 'all',
+      refreshSeconds: 0,
+      windowColumns: columns,
+    }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
+    onTestFinished(() => app.unmount())
+    await app.waitUntilRenderFlush()
+
+    const frame = frames.filter(value => value.trim()).at(-1) ?? ''
+    expect(frame).toContain(expected)
+  })
+
   it('leaves resize frame synchronization entirely to Ink', () => {
     const source = readFileSync(new URL('../src/dashboard.tsx', import.meta.url), 'utf8')
     expect(source).not.toContain('process.stdout.write(BSU)')
