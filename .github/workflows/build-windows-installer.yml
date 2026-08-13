@@ -1,0 +1,60 @@
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/build-windows-installer.yml
+      - app/**
+      - src/**
+      - scripts/**
+      - package.json
+      - package-lock.json
+  push:
+    tags:
+      - 'desktop-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  nsis:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.13.0
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            app/package-lock.json
+
+      - name: Install CLI dependencies
+        run: npm ci
+
+      - name: Install desktop dependencies
+        run: npm ci --prefix app
+
+      - name: Build NSIS installer
+        run: npm --prefix app run package:win
+
+      - name: Verify installer manifest
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            node app/scripts/verify-windows-installer.mjs --tag $env:GITHUB_REF_NAME
+          } else {
+            node app/scripts/verify-windows-installer.mjs
+          }
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: CodeBurn-Windows-Installer
+          path: |
+            app/release/CodeBurn-Setup-*.exe
+            app/release/CodeBurn-Setup-*.exe.blockmap
+          if-no-files-found: error
+          retention-days: 14
