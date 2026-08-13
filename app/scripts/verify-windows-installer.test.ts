@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { describe, expect, it } from 'vitest'
+import { rootFromModuleUrl } from './windows-installer-paths.mjs'
 
 const verifier = new URL('./verify-windows-installer.mjs', import.meta.url)
 
@@ -34,7 +35,27 @@ function fixture(options: {
   return spawnSync(process.execPath, args, { encoding: 'utf8' })
 }
 
+function releaseFixture(files: string[]) {
+  const root = mkdtempSync(join(tmpdir(), 'codeburn-windows-release-'))
+  const assets = join(root, 'assets.json')
+  writeFileSync(assets, JSON.stringify(files))
+  return spawnSync(process.execPath, [
+    verifier.pathname,
+    '--tag',
+    'desktop-v1.2.3',
+    '--release-assets',
+    assets,
+  ], { encoding: 'utf8' })
+}
+
 describe('Windows installer release manifest verifier', () => {
+  it('converts a Windows module URL into a valid drive-letter repository root', () => {
+    expect(rootFromModuleUrl(
+      'file:///D:/a/codeburn/codeburn/app/scripts/verify-windows-installer.mjs',
+      true,
+    )).toBe('D:\\a\\codeburn\\codeburn')
+  })
+
   it('accepts one exact installer and blockmap for matching package versions and tag', () => {
     const result = fixture({ tag: 'desktop-v1.2.3' })
 
@@ -63,17 +84,16 @@ describe('Windows installer release manifest verifier', () => {
     expect(result.stderr).toContain('expected exactly one CodeBurn-Setup-1.2.3.exe.blockmap, found 0')
   })
 
-  it('rejects duplicate expected artifacts in nested output directories', () => {
+  it('requires installer artifacts at the documented top-level output', () => {
     const result = fixture({
       files: [
-        'CodeBurn-Setup-1.2.3.exe',
         'CodeBurn-Setup-1.2.3.exe.blockmap',
         'duplicate/CodeBurn-Setup-1.2.3.exe',
       ],
     })
 
     expect(result.status).toBe(1)
-    expect(result.stderr).toContain('expected exactly one CodeBurn-Setup-1.2.3.exe, found 2')
+    expect(result.stderr).toContain('expected exactly one CodeBurn-Setup-1.2.3.exe, found 0')
   })
 
   it('rejects stale installer artifacts from another version', () => {
@@ -88,5 +108,34 @@ describe('Windows installer release manifest verifier', () => {
 
     expect(result.status).toBe(1)
     expect(result.stderr).toContain('unexpected Windows installer artifacts')
+  })
+
+  it('accepts a complete live desktop release asset manifest', () => {
+    const result = releaseFixture([
+      'CodeBurn-1.2.3-arm64.dmg',
+      'CodeBurn-1.2.3.dmg',
+      'CodeBurn-1.2.3-arm64-mac.zip',
+      'CodeBurn-1.2.3-mac.zip',
+      'CodeBurn-1.2.3.AppImage',
+      'CodeBurn-Setup-1.2.3.exe',
+      'CodeBurn-Setup-1.2.3.exe.blockmap',
+    ])
+
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('Live desktop release assets verified for 1.2.3')
+  })
+
+  it('rejects a live desktop release missing the Windows installer', () => {
+    const result = releaseFixture([
+      'CodeBurn-1.2.3-arm64.dmg',
+      'CodeBurn-1.2.3.dmg',
+      'CodeBurn-1.2.3-arm64-mac.zip',
+      'CodeBurn-1.2.3-mac.zip',
+      'CodeBurn-1.2.3.AppImage',
+      'CodeBurn-Setup-1.2.3.exe.blockmap',
+    ])
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('live release is missing CodeBurn-Setup-1.2.3.exe')
   })
 })

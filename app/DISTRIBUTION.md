@@ -249,9 +249,10 @@ Pushing a `desktop-v<version>` tag runs the `Build Windows installer` workflow
 on `windows-latest`. The workflow requires the tag version, root package
 version, and app package version to agree, and it fails unless the build emits
 exactly one `CodeBurn-Setup-<version>.exe` and one matching
-`.exe.blockmap`. It uploads both files as the `CodeBurn-Windows-Installer`
+`.exe.blockmap` at the top level of `app/release/`. It uploads those exact
+top-level filenames as the `CodeBurn-Windows-Installer`
 Actions artifact. The workflow has read-only repository permissions and does
-**not** publish release assets automatically.
+**not** publish release assets automatically. Artifacts are retained for 30 days.
 
 Before publishing the GitHub Release, the release owner must download that
 workflow artifact and manually upload both Windows files along with the four
@@ -261,6 +262,10 @@ website's download links **pin that tag** in their URLs, so a release with a
 missing installer is broken even when another Windows distribution channel is
 available. The Windows installer uses an explicit `nsis.artifactName` of
 `CodeBurn-Setup-${version}.${ext}`.
+
+Publishing the Release triggers a read-only live-asset check. If the files are
+uploaded afterward, rerun the workflow manually with `release_tag` set to the
+existing `desktop-v<version>` tag and require the verification job to pass.
 
 ## Verifying a build
 

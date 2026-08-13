@@ -2,6 +2,7 @@
 
 import { readFileSync, readdirSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
+import { rootFromModuleUrl } from './windows-installer-paths.mjs'
 
 function fail(message) {
   console.error(`Windows installer manifest invalid: ${message}`)
@@ -20,44 +21,78 @@ function packageVersion(path) {
 }
 
 function filesBelow(directory) {
-  return readdirSync(directory, { recursive: true, withFileTypes: true })
+  return readdirSync(directory, { withFileTypes: true })
     .filter(entry => entry.isFile())
     .map(entry => basename(entry.name))
 }
 
-try {
-  const root = resolve(option('--root', new URL('../..', import.meta.url).pathname))
-  const artifacts = resolve(option('--artifacts', join(root, 'app', 'release')))
-  const tag = option('--tag', '')
-  const rootVersion = packageVersion(join(root, 'package.json'))
-  const appVersion = packageVersion(join(root, 'app', 'package.json'))
+function releaseVersion(tag) {
+  const match = /^desktop-v(.+)$/.exec(tag)
+  if (!match) throw new Error(`${tag || '(missing tag)'} is not a desktop release tag`)
+  return match[1]
+}
 
-  if (rootVersion !== appVersion) {
-    fail(`root version ${rootVersion} does not match app version ${appVersion}`)
+function verifyLiveRelease(tag, assetPath) {
+  const version = releaseVersion(tag)
+  const assets = JSON.parse(readFileSync(assetPath, 'utf8'))
+  if (!Array.isArray(assets) || assets.some(asset => typeof asset !== 'string')) {
+    throw new Error('release asset manifest must be a JSON array of names')
   }
-
-  if (tag && tag !== `desktop-v${appVersion}`) {
-    fail(`${tag} does not match app version ${appVersion}`)
-  }
-
-  const files = filesBelow(artifacts)
-  const expectedArtifacts = [
-    `CodeBurn-Setup-${appVersion}.exe`,
-    `CodeBurn-Setup-${appVersion}.exe.blockmap`,
+  const required = [
+    `CodeBurn-${version}-arm64.dmg`,
+    `CodeBurn-${version}.dmg`,
+    `CodeBurn-${version}-arm64-mac.zip`,
+    `CodeBurn-${version}-mac.zip`,
+    `CodeBurn-${version}.AppImage`,
+    `CodeBurn-Setup-${version}.exe`,
+    `CodeBurn-Setup-${version}.exe.blockmap`,
   ]
-  for (const expected of expectedArtifacts) {
-    const count = files.filter(file => file === expected).length
-    if (count !== 1) fail(`expected exactly one ${expected}, found ${count}`)
+  for (const expected of required) {
+    const count = assets.filter(asset => asset === expected).length
+    if (count === 0) fail(`live release is missing ${expected}`)
+    if (count > 1) fail(`live release contains ${count} copies of ${expected}`)
   }
+  if (!process.exitCode) console.log(`Live desktop release assets verified for ${version}`)
+}
 
-  const installerArtifacts = files.filter(file => /^CodeBurn-Setup-.*\.exe(?:\.blockmap)?$/.test(file))
-  const unexpected = installerArtifacts.filter(file => !expectedArtifacts.includes(file))
-  if (unexpected.length > 0) {
-    fail(`unexpected Windows installer artifacts: ${unexpected.join(', ')}`)
-  }
+try {
+  const tag = option('--tag', '')
+  const releaseAssets = option('--release-assets', '')
+  if (releaseAssets) {
+    verifyLiveRelease(tag, resolve(releaseAssets))
+  } else {
+    const root = resolve(option('--root', rootFromModuleUrl(import.meta.url)))
+    const artifacts = resolve(option('--artifacts', join(root, 'app', 'release')))
+    const rootVersion = packageVersion(join(root, 'package.json'))
+    const appVersion = packageVersion(join(root, 'app', 'package.json'))
 
-  if (!process.exitCode) {
-    console.log(`Windows installer manifest verified for ${appVersion}`)
+    if (rootVersion !== appVersion) {
+      fail(`root version ${rootVersion} does not match app version ${appVersion}`)
+    }
+
+    if (tag && tag !== `desktop-v${appVersion}`) {
+      fail(`${tag} does not match app version ${appVersion}`)
+    }
+
+    const files = filesBelow(artifacts)
+    const expectedArtifacts = [
+      `CodeBurn-Setup-${appVersion}.exe`,
+      `CodeBurn-Setup-${appVersion}.exe.blockmap`,
+    ]
+    for (const expected of expectedArtifacts) {
+      const count = files.filter(file => file === expected).length
+      if (count !== 1) fail(`expected exactly one ${expected}, found ${count}`)
+    }
+
+    const installerArtifacts = files.filter(file => /^CodeBurn-Setup-.*\.exe(?:\.blockmap)?$/.test(file))
+    const unexpected = installerArtifacts.filter(file => !expectedArtifacts.includes(file))
+    if (unexpected.length > 0) {
+      fail(`unexpected Windows installer artifacts: ${unexpected.join(', ')}`)
+    }
+
+    if (!process.exitCode) {
+      console.log(`Windows installer manifest verified for ${appVersion}`)
+    }
   }
 } catch (error) {
   fail(error instanceof Error ? error.message : String(error))

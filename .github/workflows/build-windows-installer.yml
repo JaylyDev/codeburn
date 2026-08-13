@@ -2,6 +2,11 @@ name: Build Windows installer
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing desktop-v* release to verify after manual asset upload
+        required: false
+        type: string
   pull_request:
     paths:
       - .github/workflows/build-windows-installer.yml
@@ -13,12 +18,15 @@ on:
   push:
     tags:
       - 'desktop-v*'
+  release:
+    types: [published]
 
 permissions:
   contents: read
 
 jobs:
   nsis:
+    if: ${{ github.event_name != 'release' && !(github.event_name == 'workflow_dispatch' && inputs.release_tag != '') }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -36,6 +44,9 @@ jobs:
 
       - name: Install desktop dependencies
         run: npm ci --prefix app
+
+      - name: Test installer verifier
+        run: npm --prefix app test -- scripts/verify-windows-installer.test.ts
 
       - name: Build NSIS installer
         run: npm --prefix app run package:win
@@ -57,4 +68,21 @@ jobs:
             app/release/CodeBurn-Setup-*.exe
             app/release/CodeBurn-Setup-*.exe.blockmap
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
+
+  verify-release-assets:
+    if: ${{ (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'desktop-v')) || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify live desktop release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          gh api "repos/${{ github.repository }}/releases/tags/$RELEASE_TAG" \
+            --jq '[.assets[].name]' > "$RUNNER_TEMP/release-assets.json"
+          node app/scripts/verify-windows-installer.mjs \
+            --tag "$RELEASE_TAG" \
+            --release-assets "$RUNNER_TEMP/release-assets.json"
