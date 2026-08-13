@@ -256,8 +256,10 @@ Actions artifact. The workflow has read-only repository permissions and does
 
 Before publishing the GitHub Release, the release owner must download that
 workflow artifact and manually upload both Windows files along with the four
-macOS `.dmg`/`.zip` files and `CodeBurn-<version>.AppImage`. Confirm the live
-release contains every required platform asset before announcing it. The
+macOS `.dmg`/`.zip` files, `CodeBurn-<version>.AppImage`,
+`codeburn-desktop_<version>_amd64.deb`, and
+`codeburn-desktop-<version>.x86_64.rpm`. Confirm the live release contains
+every required platform asset before announcing it. The
 website's download links **pin that tag** in their URLs, so a release with a
 missing installer is broken even when another Windows distribution channel is
 available. The Windows installer uses an explicit `nsis.artifactName` of

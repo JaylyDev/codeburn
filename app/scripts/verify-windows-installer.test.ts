@@ -2,10 +2,12 @@ import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { rootFromModuleUrl } from './windows-installer-paths.mjs'
 
 const verifier = new URL('./verify-windows-installer.mjs', import.meta.url)
+const verifierPath = fileURLToPath(verifier)
 
 function fixture(options: {
   appVersion?: string
@@ -30,7 +32,7 @@ function fixture(options: {
     writeFileSync(path, 'fixture')
   }
 
-  const args = [verifier.pathname, '--root', root, '--artifacts', releaseDir]
+  const args = [verifierPath, '--root', root, '--artifacts', releaseDir]
   if (options.tag) args.push('--tag', options.tag)
   return spawnSync(process.execPath, args, { encoding: 'utf8' })
 }
@@ -40,7 +42,7 @@ function releaseFixture(files: string[]) {
   const assets = join(root, 'assets.json')
   writeFileSync(assets, JSON.stringify(files))
   return spawnSync(process.execPath, [
-    verifier.pathname,
+    verifierPath,
     '--tag',
     'desktop-v1.2.3',
     '--release-assets',
@@ -117,6 +119,8 @@ describe('Windows installer release manifest verifier', () => {
       'CodeBurn-1.2.3-arm64-mac.zip',
       'CodeBurn-1.2.3-mac.zip',
       'CodeBurn-1.2.3.AppImage',
+      'codeburn-desktop_1.2.3_amd64.deb',
+      'codeburn-desktop-1.2.3.x86_64.rpm',
       'CodeBurn-Setup-1.2.3.exe',
       'CodeBurn-Setup-1.2.3.exe.blockmap',
     ])
@@ -132,10 +136,33 @@ describe('Windows installer release manifest verifier', () => {
       'CodeBurn-1.2.3-arm64-mac.zip',
       'CodeBurn-1.2.3-mac.zip',
       'CodeBurn-1.2.3.AppImage',
+      'codeburn-desktop_1.2.3_amd64.deb',
+      'codeburn-desktop-1.2.3.x86_64.rpm',
       'CodeBurn-Setup-1.2.3.exe.blockmap',
     ])
 
     expect(result.status).toBe(1)
     expect(result.stderr).toContain('live release is missing CodeBurn-Setup-1.2.3.exe')
+  })
+
+  it.each([
+    'codeburn-desktop_1.2.3_amd64.deb',
+    'codeburn-desktop-1.2.3.x86_64.rpm',
+  ])('rejects a live desktop release missing %s', missing => {
+    const required = [
+      'CodeBurn-1.2.3-arm64.dmg',
+      'CodeBurn-1.2.3.dmg',
+      'CodeBurn-1.2.3-arm64-mac.zip',
+      'CodeBurn-1.2.3-mac.zip',
+      'CodeBurn-1.2.3.AppImage',
+      'codeburn-desktop_1.2.3_amd64.deb',
+      'codeburn-desktop-1.2.3.x86_64.rpm',
+      'CodeBurn-Setup-1.2.3.exe',
+      'CodeBurn-Setup-1.2.3.exe.blockmap',
+    ]
+    const result = releaseFixture(required.filter(asset => asset !== missing))
+
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain(`live release is missing ${missing}`)
   })
 })

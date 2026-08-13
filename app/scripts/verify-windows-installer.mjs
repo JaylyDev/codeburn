@@ -44,6 +44,8 @@ function verifyLiveRelease(tag, assetPath) {
     `CodeBurn-${version}-arm64-mac.zip`,
     `CodeBurn-${version}-mac.zip`,
     `CodeBurn-${version}.AppImage`,
+    `codeburn-desktop_${version}_amd64.deb`,
+    `codeburn-desktop-${version}.x86_64.rpm`,
     `CodeBurn-Setup-${version}.exe`,
     `CodeBurn-Setup-${version}.exe.blockmap`,
   ]

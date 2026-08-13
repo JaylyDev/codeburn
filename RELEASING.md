@@ -4,7 +4,7 @@ This document describes the actual steps a maintainer takes to cut a CLI or macO
 
 The Electron desktop app (`app/`) is released manually under `desktop-v<version>` tags. Build macOS and Linux artifacts as described in `app/DISTRIBUTION.md`; the tag also runs the read-only `Build Windows installer` workflow on `windows-latest`. Download its `CodeBurn-Windows-Installer` artifact and upload both the `.exe` and `.exe.blockmap` with the other platform assets. The workflow never publishes release assets.
 
-Before announcing a desktop release, the release owner must confirm the live GitHub Release contains all four macOS `.dmg`/`.zip` files, the Linux `.AppImage`, and both Windows installer files. Publishing the Release runs the workflow's read-only live-asset verification job. If assets are uploaded after publication, rerun `Build Windows installer` with the `release_tag` input and require that verification job to pass. A failed or missing verification is a release blocker.
+Before announcing a desktop release, the release owner must confirm the live GitHub Release contains all four macOS `.dmg`/`.zip` files, the Linux `.AppImage`, `.deb`, and `.rpm`, and both Windows installer files. Publishing the Release runs the workflow's read-only live-asset verification job. If assets are uploaded after publication, rerun `Build Windows installer` with the `release_tag` input and require that verification job to pass. A failed or missing verification is a release blocker.
 
 ## Versioning
 
