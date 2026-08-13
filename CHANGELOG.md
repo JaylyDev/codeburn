@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Old durable sources remain visible while they still exist.** The 90-day session-cache age-out now applies only after a durable source disappears from discovery, so an unchanged older Copilot source keeps reporting usage and reuses its persisted fingerprint instead of being reparsed and immediately discarded. (#987)
+
 ## 0.9.20 - 2026-08-10
 
 ### Added
