@@ -629,6 +629,33 @@ describe('runOptimizeApply end-to-end', () => {
     expect(io.stdout()).not.toContain("claude mcp remove 'claude_ai_Netlify'")
   })
 
+  it('keeps mixed connector follow-up explicitly pending after applying the local fix', async () => {
+    const fx = await makeFixture()
+    await writeFile(join(fx.home, '.claude.json'), JSON.stringify({
+      mcpServers: { filesystem: { command: 'filesystem' } },
+    }, null, 2) + '\n')
+    const coverage = (server: string): McpServerCoverage => ({
+      server,
+      toolsAvailable: 20,
+      toolsInvoked: 0,
+      unusedTools: Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+      invocations: 0,
+      loadedSessions: 2,
+      coverageRatio: 0,
+    })
+    const finding = detectMcpToolCoverage([], [coverage('filesystem'), coverage('claude_ai_Netlify')])!
+    const io = makeIo()
+
+    await runOptimizeApply([], undefined, applyOpts(fx, io, { findings: [finding], yes: true }))
+
+    const out = io.stdout()
+    expect(out).toContain('Manual follow-up (not applied):')
+    expect(out).toContain('Still requires manual action:')
+    expect(out).toContain('claude.ai Netlify')
+    expect(await readRecords(fx.actionsDir)).toHaveLength(1)
+    expect(JSON.parse(await readFile(join(fx.home, '.claude.json'), 'utf-8')).mcpServers).toEqual({})
+  })
+
   it('--yes applies every plan and prints journal short ids with the undo hint', async () => {
     const { fx, findings } = await threeFindingFixture()
     const io = makeIo()

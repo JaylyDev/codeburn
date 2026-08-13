@@ -73,7 +73,11 @@ export function renderApplyList(appliable: FindingPlan[], manual: FindingPlan[],
     }
     for (const line of changeLines(fp)) lines.push(chalk.dim(`       ${line}`))
     for (const note of fp.notes) lines.push(chalk.yellow(`       ! ${note}`))
-    for (const line of manualActionLines(fp)) lines.push(chalk.cyan(`       ${line}`))
+    const manualLines = manualActionLines(fp)
+    if (manualLines.length > 0) {
+      lines.push(chalk.cyan('       Manual follow-up (not applied):'))
+      for (const line of manualLines) lines.push(chalk.cyan(`         ${line}`))
+    }
   })
   if (manual.length > 0) {
     lines.push('')
@@ -206,6 +210,11 @@ export async function runOptimizeApply(
       const record = await runAction(fp.plan!, opts.actionsDir)
       print(`  Applied ${chalk.bold(shortId(record.id))}  ${record.description}`)
       print(chalk.dim(`    Undo anytime: codeburn act undo ${shortId(record.id)}`))
+      const manualLines = manualActionLines(fp)
+      if (manualLines.length > 0) {
+        print(chalk.cyan('    Still requires manual action:'))
+        for (const line of manualLines) print(chalk.cyan(`      ${line}`))
+      }
     } catch (e) {
       errout.write(chalk.red(`  Failed to apply ${fp.finding.id}: ${e instanceof Error ? e.message : String(e)}`) + '\n')
       process.exitCode = 1
