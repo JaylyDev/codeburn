@@ -1,5 +1,6 @@
 import { existsSync } from 'fs'
 import { lstat, readFile, readdir, stat } from 'fs/promises'
+import { createHash } from 'crypto'
 import { basename, dirname, join, resolve, sep } from 'path'
 import { readSessionLines } from './fs-utils.js'
 import { calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
@@ -3706,6 +3707,56 @@ export function isSessionHydrationComplete(): boolean {
 // finalizing daily history off it freezes the days it never saw out of the
 // chart (gapStart = lastComputedDate + 1 never looks back at them).
 let readOnlyServedStale = false
+
+export type CorpusFingerprint = {
+  /** Content-free signature of every discovered source's dev/ino/mtime/size. */
+  hash: string
+  /** Newest mtime observed across all discovered sources, 0 when there are
+   *  none. Lets a caller tell "definitely changed" apart from "may still be
+   *  mid-write" without re-stat'ing anything itself. */
+  newestMtimeMs: number
+}
+
+// Cheap, content-free signature of "has anything in the discoverable session
+// corpus changed since the last check" — a stat-only pass (readdir + stat per
+// discovered source; no session-cache.json read/parse, no transcript content
+// read) hashed into one string, plus the newest mtime seen along the way.
+// Order-independent (sorted before hashing) so discovery order never causes a
+// spurious miss. Lets a fresh, short-lived CLI invocation (e.g. a menubar
+// poll) cheaply decide whether it can skip the full parse+aggregation
+// pipeline and serve a persisted result instead, without ever needing to
+// `JSON.parse` the (potentially hundreds-of-MB) session cache file just to
+// answer that question.
+//
+// Claude `SessionSource.path` is a project DIRECTORY, not a leaf transcript
+// (see `scanProjectDirs`/`collectJsonlFiles` above) — every other provider's
+// path IS the leaf file/DB it parses. Fingerprinting the directory itself
+// would miss an in-place rewrite of an existing file inside it: a
+// directory's own mtime only moves when entries are added or removed, not
+// when one of its files' content changes. So Claude sources are expanded to
+// their actual `.jsonl` files first, exactly the way scanProjectDirs discovers
+// them, and each of those is fingerprinted individually.
+export async function computeCorpusFingerprint(providerFilter?: string): Promise<CorpusFingerprint> {
+  const sources = await discoverAllSessions(providerFilter)
+  const entries: string[] = []
+  let newestMtimeMs = 0
+  const record = async (path: string): Promise<void> => {
+    const fp = await fingerprintFile(path)
+    if (!fp) return
+    entries.push(`${path}|${fp.dev}|${fp.ino}|${fp.mtimeMs}|${fp.sizeBytes}`)
+    if (fp.mtimeMs > newestMtimeMs) newestMtimeMs = fp.mtimeMs
+  }
+  for (const source of sources) {
+    if (source.provider === 'claude') {
+      for (const filePath of await collectJsonlFiles(source.path)) await record(filePath)
+      continue
+    }
+    await record(source.path)
+  }
+  entries.sort()
+  const hash = createHash('sha256').update(entries.join('\n')).digest('hex')
+  return { hash, newestMtimeMs }
+}
 
 export async function parseAllSessions(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
   const key = cacheKey(dateRange, providerFilter)

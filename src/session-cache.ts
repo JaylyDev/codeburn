@@ -809,9 +809,15 @@ export async function cleanupOrphanedTempFiles(): Promise<void> {
 
     // Only our own (versioned) temp files. Legacy `session-cache.json.*.tmp`
     // temps belong to old binaries mid-write and must not be touched.
-    const prefix = `${CACHE_FILE}.`
+    // `status-snapshot.json.*.tmp` (see saveStatusSnapshot below) is swept
+    // the same way — same atomic temp+rename pattern, same narrow crash
+    // window between the write and the rename, and this is exactly the cache
+    // dir PERF-DEFECT-FINDINGS.md flagged for unbounded stale-file
+    // accumulation, so any temp file this module can leave behind here needs
+    // a sweep path, not just the main cache's own.
+    const prefixes = [`${CACHE_FILE}.`, `${STATUS_SNAPSHOT_FILE}.`]
     for (const entry of entries) {
-      if (!entry.startsWith(prefix) || !entry.endsWith('.tmp')) continue
+      if (!prefixes.some(prefix => entry.startsWith(prefix)) || !entry.endsWith('.tmp')) continue
       try {
         const fullPath = join(dir, entry)
         const s = await stat(fullPath)
@@ -961,4 +967,122 @@ export async function beginColdHydration(isCold: boolean): Promise<HydrationHand
   } catch {
     return NOOP_HANDLE
   }
+}
+
+// ── Status Snapshot ────────────────────────────────────────────────────
+//
+// `codeburn status --format menubar-json` is spawned as a fresh CLI process
+// on every menubar poll tick, so every in-process reuse layer above
+// (`cacheMemo`, and `parser.ts`'s TTL/burst maps) starts cold on every poll —
+// none of them survive between invocations. Live profiling of a repeat poll
+// against an already-warm, unchanged ~386MB session cache showed the cost is
+// dominated by re-running `JSON.parse` on that whole file plus re-running the
+// full aggregation pipeline over it, every single time, even when nothing in
+// the underlying session corpus changed.
+//
+// This snapshot persists the last computed menubar payload keyed by a
+// caller-supplied corpus fingerprint (see `computeCorpusFingerprint` in
+// parser.ts — a cheap stat-only pass over every discovered source, with no
+// session-cache.json read/parse and no transcript content read) plus the
+// resolved query that produced it. A poll whose corpus fingerprint and query
+// both still match is served straight from this tiny file with no corpus
+// parse or aggregation at all; the instant either changes, the lookup misses
+// and the caller recomputes for real. Best-effort throughout: any read/write
+// failure just falls back to a full recompute, never to stale or corrupt
+// data.
+
+// Debounce: once the corpus fingerprint moves, keep serving the last SETTLED
+// snapshot until the freshest touched file (`newestMtimeMs`, from
+// `computeCorpusFingerprint`) has aged past this window, instead of
+// recomputing on every single poll of a burst. A streaming assistant turn
+// can touch its transcript many times a second; without this, a menubar
+// polling on a tight interval would pay the full parse+aggregation cost on
+// every one of those ticks. The deferred call deliberately does NOT persist
+// a new snapshot — the pre-churn baseline it's still serving stays on disk —
+// so the very next poll after writes actually stop (mtime ages past the
+// window) sees a real fingerprint mismatch with no fresh grace period left,
+// recomputes for real, and persists the settled result. No update is ever
+// masked permanently: the window only ever delays picking one up. Mirrors
+// the existing `parseBurstWindowMs`/`CODEBURN_PARSE_BURST_MS` convention:
+// small, capped, env-overridable for tuning/tests.
+function statusSnapshotSettleMs(): number {
+  const raw = Number(process.env['CODEBURN_STATUS_SNAPSHOT_SETTLE_MS'] ?? '2000')
+  return Number.isFinite(raw) && raw >= 0 ? Math.min(raw, 60_000) : 2000
+}
+
+const STATUS_SNAPSHOT_FILE = 'status-snapshot.json'
+
+// Bump on any incompatible change to the *shape* of the payload this snapshot
+// persists (i.e. whenever `buildMenubarPayloadForRange`'s return shape
+// changes) or to this record's own envelope fields. Without this, an on-disk
+// snapshot written by an older binary would be blindly cast and served
+// verbatim by a newer one on a corpus-fingerprint+query match — the payload
+// shape has no other correctness gate, unlike the main session cache, which
+// already guards exactly this class of drift via `CACHE_VERSION`/
+// `validateCache`. A version mismatch is treated as a miss (same as a
+// missing/corrupt file): the caller recomputes for real and persists a fresh,
+// current-shaped snapshot.
+const STATUS_SNAPSHOT_VERSION = 1
+
+type StatusSnapshotRecord = {
+  version: number
+  corpusFingerprint: string
+  newestMtimeMs: number
+  queryKey: string
+  payload: unknown
+}
+
+function statusSnapshotPath(): string {
+  return join(getCacheDir(), STATUS_SNAPSHOT_FILE)
+}
+
+async function readStatusSnapshotRecord(): Promise<StatusSnapshotRecord | null> {
+  try {
+    const raw = await readFile(statusSnapshotPath(), 'utf-8')
+    const parsed = JSON.parse(raw) as Partial<StatusSnapshotRecord>
+    if (
+      parsed.version !== STATUS_SNAPSHOT_VERSION ||
+      typeof parsed.corpusFingerprint !== 'string' ||
+      typeof parsed.newestMtimeMs !== 'number' || !Number.isFinite(parsed.newestMtimeMs) ||
+      typeof parsed.queryKey !== 'string'
+    ) return null
+    return parsed as StatusSnapshotRecord
+  } catch {
+    return null
+  }
+}
+
+/** Returns the previously-saved payload when the query still matches AND
+ *  either the corpus fingerprint is an exact match (nothing changed) or the
+ *  corpus's most recently touched file is still within the settle window
+ *  (likely still being written — see `statusSnapshotSettleMs`). Null
+ *  otherwise, so the caller recomputes for real and should persist a fresh
+ *  snapshot with the new fingerprint. */
+export async function loadStatusSnapshot(corpusFingerprint: string, newestMtimeMs: number, queryKey: string): Promise<unknown | null> {
+  const stored = await readStatusSnapshotRecord()
+  if (!stored || stored.queryKey !== queryKey) return null
+  if (stored.corpusFingerprint === corpusFingerprint) return stored.payload ?? null
+  if (Date.now() - newestMtimeMs < statusSnapshotSettleMs()) return stored.payload ?? null
+  return null
+}
+
+/** Best-effort: a failed write just means the next poll recomputes instead
+ *  of reusing. Only ever called by the caller when `loadStatusSnapshot`
+ *  missed, so a settled recompute's result always supersedes whatever was
+ *  there before. */
+export async function saveStatusSnapshot(corpusFingerprint: string, newestMtimeMs: number, queryKey: string, payload: unknown): Promise<void> {
+  try {
+    const dir = getCacheDir()
+    if (!existsSync(dir)) await mkdir(dir, { recursive: true })
+    const finalPath = statusSnapshotPath()
+    const tempPath = `${finalPath}.${randomBytes(8).toString('hex')}.tmp`
+    const record: StatusSnapshotRecord = { version: STATUS_SNAPSHOT_VERSION, corpusFingerprint, newestMtimeMs, queryKey, payload }
+    const handle = await open(tempPath, 'w', 0o600)
+    try {
+      await handle.writeFile(JSON.stringify(record), { encoding: 'utf-8' })
+    } finally {
+      await handle.close()
+    }
+    await rename(tempPath, finalPath)
+  } catch { /* best-effort; next poll just recomputes */ }
 }

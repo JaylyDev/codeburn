@@ -3,7 +3,7 @@ import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
 import { findUnpricedModels, loadPricing, setModelAliases, setPriceOverrides, setLocalModelSavings, setProxyPaths, normalizeProxyPath } from './models.js'
-import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI } from './parser.js'
+import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
 import { getProvider } from './providers/index.js'
 import { convertCost, formatCost } from './currency.js'
@@ -13,6 +13,7 @@ import { dateKey } from './day-aggregator.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
 import { buildPeriodData, buildMenubarPayloadForRange, buildDurablePeriod, type DurablePeriod } from './usage-aggregator.js'
+import { loadStatusSnapshot, saveStatusSnapshot } from './session-cache.js'
 import { renderDashboard } from './dashboard.js'
 import { renderOverview } from './overview.js'
 import { runWebDashboard } from './web-dashboard.js'
@@ -1125,7 +1126,30 @@ program
         : customRange
         ? { range: customRange, label: formatDateRangeLabel(opts.from, opts.to) }
         : daySelection ?? getDateRange(opts.period)
-      const payload = await buildMenubarPayloadForRange(periodInfo, {
+      // Fast path: the menubar app spawns this exact command fresh on every
+      // poll tick, so nothing in-process (parser.ts's TTL/burst caches,
+      // session-cache.ts's cacheMemo) ever survives between polls. A cheap
+      // stat-only pass (no session-cache.json parse, no transcript content
+      // read) over the discoverable corpus tells us whether anything changed
+      // since the last identical query; when it hasn't — or the only thing
+      // that changed is still within loadStatusSnapshot's settle window and
+      // may still be mid-write — skip the full parse + aggregation pipeline
+      // entirely and serve the persisted snapshot instead.
+      const queryKey = JSON.stringify({
+        start: periodInfo.range.start.toISOString(),
+        end: periodInfo.range.end.toISOString(),
+        label: periodInfo.label,
+        provider: pf,
+        project: opts.project,
+        exclude: opts.exclude,
+        days: daysSelection ? [...daysSelection.days].sort() : undefined,
+        optimize: opts.optimize !== false,
+        timeline: opts.timeline !== false,
+        claudeConfigSourceId: opts.claudeConfigSource ?? null,
+      })
+      const corpus = await computeCorpusFingerprint(pf)
+      const snapshot = await loadStatusSnapshot(corpus.hash, corpus.newestMtimeMs, queryKey)
+      const payload = (snapshot ?? await buildMenubarPayloadForRange(periodInfo, {
         provider: pf,
         project: opts.project,
         exclude: opts.exclude,
@@ -1133,7 +1157,8 @@ program
         optimize: opts.optimize !== false,
         timeline: opts.timeline !== false,
         claudeConfigSourceId: opts.claudeConfigSource,
-      })
+      })) as Awaited<ReturnType<typeof buildMenubarPayloadForRange>>
+      if (!snapshot) await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, queryKey, payload)
       if (opts.scope === 'combined') {
         // Combined multi-device usage is best-effort enrichment on the menubar's
         // hot path. Never let pulling peers (or a corrupt remotes store) take
