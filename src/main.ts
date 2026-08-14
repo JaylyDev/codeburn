@@ -1135,28 +1135,30 @@ program
       // that changed is still within loadStatusSnapshot's settle window and
       // may still be mid-write — skip the full parse + aggregation pipeline
       // entirely and serve the persisted snapshot instead.
+      // Single source of truth for the fields that define the query scope,
+      // shared between the cache key below and the payload builder options
+      // — a field added to only one of the two would otherwise silently
+      // desync the cache from what it's supposed to be keying on.
+      const queryScope = {
+        provider: pf,
+        project: opts.project,
+        exclude: opts.exclude,
+        optimize: opts.optimize !== false,
+        timeline: opts.timeline !== false,
+        claudeConfigSourceId: opts.claudeConfigSource ?? null,
+      }
       const queryKey = JSON.stringify({
         start: periodInfo.range.start.toISOString(),
         end: periodInfo.range.end.toISOString(),
         label: periodInfo.label,
-        provider: pf,
-        project: opts.project,
-        exclude: opts.exclude,
+        ...queryScope,
         days: daysSelection ? [...daysSelection.days].sort() : undefined,
-        optimize: opts.optimize !== false,
-        timeline: opts.timeline !== false,
-        claudeConfigSourceId: opts.claudeConfigSource ?? null,
       })
       const corpus = await computeCorpusFingerprint(pf)
       const snapshot = await loadStatusSnapshot(corpus.hash, corpus.newestMtimeMs, queryKey)
       const payload = (snapshot ?? await buildMenubarPayloadForRange(periodInfo, {
-        provider: pf,
-        project: opts.project,
-        exclude: opts.exclude,
+        ...queryScope,
         daysSelection,
-        optimize: opts.optimize !== false,
-        timeline: opts.timeline !== false,
-        claudeConfigSourceId: opts.claudeConfigSource,
       })) as Awaited<ReturnType<typeof buildMenubarPayloadForRange>>
       if (!snapshot) await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, queryKey, payload)
       if (opts.scope === 'combined') {
