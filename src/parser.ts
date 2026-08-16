@@ -98,12 +98,15 @@ function isCoworkSession(cwd: string, filePath: string): boolean {
 // (measured ~+5% cold-parse time for a large kiro store). Filesystem facts
 // can go stale in a long-lived process (a dir converted to a worktree
 // mid-run), so the cache is cleared with the session cache.
-const canonicalPathCache = new Map<string, { path: string; isWorktree: boolean }>()
+// Stores the Promise, not the resolved value: callers within the same
+// Promise.all batch would otherwise all miss the cache and each re-walk the
+// filesystem before the first walk's result lands.
+const canonicalPathCache = new Map<string, Promise<{ path: string; isWorktree: boolean }>>()
 
 async function resolveCanonicalProjectPath(cwd: string): Promise<{ path: string; isWorktree: boolean }> {
   const cached = canonicalPathCache.get(cwd)
   if (cached) return cached
-  const result = await resolveCanonicalProjectPathUncached(cwd)
+  const result = resolveCanonicalProjectPathUncached(cwd)
   canonicalPathCache.set(cwd, result)
   return result
 }

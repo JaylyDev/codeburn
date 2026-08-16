@@ -38,11 +38,12 @@ export function normalizeContentBlocks<T extends { type?: string; text?: string 
 /// only ~300MB for the same data.
 ///
 /// Round-tripping through a Buffer forces a fresh flat string with no parent
-/// reference. Strings already within the bound are returned as-is: they ARE
-/// the parent, so nothing extra is retained.
+/// reference. This always runs, even when `s` is already within `max`:
+/// callers may pass an already-sliced view (provider adapters pre-truncate
+/// with `.slice(0, 500)` before the cache-site call), and that view is
+/// itself a SlicedString pinning its own large parent.
 export function flatSlice(s: string, max: number): string {
-  if (s.length <= max) return s
-  return Buffer.from(s.slice(0, max), 'utf-8').toString('utf-8')
+  return Buffer.from(s.slice(0, max), 'utf16le').toString('utf16le')
 }
 
 /// Force a FLAT copy of a string regardless of length.
@@ -53,5 +54,5 @@ export function flatSlice(s: string, max: number): string {
 /// both come back as V8 SlicedStrings. Use this when storing such values
 /// in long-lived structures; use `flatSlice` when also bounding length.
 export function flatString(s: string): string {
-  return Buffer.from(s, 'utf-8').toString('utf-8')
+  return Buffer.from(s, 'utf16le').toString('utf16le')
 }

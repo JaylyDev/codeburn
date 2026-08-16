@@ -34,17 +34,35 @@ describe('flatSlice', () => {
     expect(out).toBe(s.slice(0, 500))
   })
 
-  it('documents the mid-surrogate-pair cut behavior (U+FFFD)', () => {
+  it('preserves a lone surrogate at a mid-pair cut', () => {
     // A cut landing between the high and low surrogate of a pair leaves a
-    // lone surrogate. Plain .slice() preserves it; the Buffer round-trip
-    // replaces it with U+FFFD. Either way the string is length-bounded and
-    // the preceding content is intact — this test pins the chosen behavior
-    // so a future implementation change is a conscious decision.
+    // lone surrogate. utf16le round-trips code units byte-for-byte, so the
+    // lone surrogate survives intact (unlike utf-8, which would replace it
+    // with U+FFFD).
     const s = 'ab' + '🐾'.repeat(300) // odd offset puts every emoji across even boundaries
     const out = flatSlice(s, 501)     // cuts mid-pair
     expect(out.length).toBe(501)
     expect(out.slice(0, 500)).toBe(s.slice(0, 500)) // content before the cut intact
-    expect(out.charCodeAt(500)).toBe(0xfffd)        // lone surrogate became U+FFFD
+    expect(out.charCodeAt(500)).toBe(s.charCodeAt(500)) // lone surrogate preserved
+  })
+
+  it('does not retain the parent of an already-sliced view', () => {
+    // The bug this early-return removal fixes: provider adapters pre-truncate
+    // with .slice(0, 500) before the cache-site flatSlice call, so a naive
+    // "already within bound" early return would skip flattening and leave
+    // the SlicedString pinning its 100KB parent.
+    const before = process.memoryUsage().heapUsed
+    const kept: string[] = []
+    for (let i = 0; i < 1000; i++) {
+      const parent = (i % 10).toString().repeat(100_000) + i
+      const preSliced = parent.slice(0, 500)
+      kept.push(flatSlice(preSliced, 2000))
+    }
+    if (typeof global.gc === 'function') global.gc()
+    const after = process.memoryUsage().heapUsed
+    const growthMB = (after - before) / 1048576
+    expect(kept.length).toBe(1000)
+    expect(growthMB).toBeLessThan(50)
   })
 
   it('does not retain the parent string (heap growth stays bounded)', () => {

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+- **Cold parse no longer retains full message bodies through cached previews.** `flatSlice` skipped its Buffer round-trip for strings already within the bound, but provider adapters pre-truncate user-message previews with `.slice(0, 500)` before the cache-site call — those pre-sliced views are still V8 SlicedStrings pinning their large parent, so the retention that OOM'd cold parses of large histories survived. The round-trip now always runs.
+- **Kiro sessions carry the real `projectPath`** (CLI meta.cwd, v2 `workspacePaths[0]`, workspace sessions' `workspaceDirectory`), so git-repo attribution can resolve them; previously they were attribution-blind. Bumps the kiro parse version, so the first run after upgrade re-parses kiro history once, and kiro sessions in linked git worktrees now group under the main repo.
+
 ## 0.9.20 - 2026-08-10
 
 ### Added
