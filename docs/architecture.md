@@ -191,7 +191,7 @@ type Provider = {
 
 `src/providers/index.ts` registers providers across two tiers:
 
-- **Eager**: `claude`, `cline`, `codewhale`, `codebuff`, `codex`, `copilot`, `devin`, `droid`, `gemini`, `hermes`, `ibm-bob`, `kilo-code`, `kiro`, `kimi`, `lingtai-tui`, `mistral-vibe`, `mux`, `openclaw`, `open-design`, `pi`, `omp`, `qwen`, `roo-code`, `zerostack`, `grok`. Imported at module load.
+- **Eager**: `claude`, `cline`, `codewhale`, `codebuff`, `codex`, `copilot`, `devin`, `droid`, `dsh`, `gemini`, `hermes`, `ibm-bob`, `kilo-code`, `kiro`, `kimi`, `lingtai-tui`, `mistral-vibe`, `mux`, `openclaw`, `open-design`, `pi`, `omp`, `qwen`, `roo-code`, `zerostack`, `grok`. Imported at module load.
 - **Lazy**: `antigravity`, `forge`, `goose`, `cursor`, `opencode`, `cursor-agent`, `crush`, `warp`, `vercel-gateway`, `zcode`, `zed`. Imported via dynamic `import()` so the heavy dependencies (SQLite, protobuf, network clients) do not touch users who do not have those tools installed.
 
 Both lists hit the same `getAllProviders()` aggregator. A failed lazy import is silent and excludes that provider from the run.
