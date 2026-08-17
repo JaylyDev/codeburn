@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+- **One rule for every cache file.** `CODEBURN_CACHE_DIR` when set, otherwise `~/.cache/codeburn`. `XDG_CACHE_HOME` is no longer consulted; the sync ledger, the only file that ever honored it, is merged into the canonical location on first read and the legacy copy is retired, so nothing is re-uploaded after the move. (#972)
+
+### Fixed (Desktop & Menubar)
+- **The resident `codeburn serve` child.** The first real panel request is also the cache warm-up, so startup never runs an artificial warm-up query beside a duplicate one-shot child; each served command carries its own read-only option allowlist, and anything outside it falls back to a normal spawn; the child exits when its stdin closes, so it can never outlive the app. Requests whose response exceeds the 16 MiB frame limit still replace the child, but that deliberate kill no longer spends the resident's unexpected-death budget. (#972)
+
 ### Fixed
 - **Cold parse no longer retains full message bodies through cached previews.** `flatSlice` skipped its Buffer round-trip for strings already within the bound, but provider adapters pre-truncate user-message previews with `.slice(0, 500)` before the cache-site call — those pre-sliced views are still V8 SlicedStrings pinning their large parent, so the retention that OOM'd cold parses of large histories survived. The round-trip now always runs.
 - **Kiro sessions carry the real `projectPath`** (CLI meta.cwd, v2 `workspacePaths[0]`, workspace sessions' `workspaceDirectory`), so git-repo attribution can resolve them; previously they were attribution-blind. Bumps the kiro parse version, so the first run after upgrade re-parses kiro history once, and kiro sessions in linked git worktrees now group under the main repo.

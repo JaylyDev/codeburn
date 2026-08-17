@@ -1,9 +1,10 @@
 import { readFile, mkdir, stat, open, rename, unlink } from 'fs/promises'
 import { existsSync } from 'fs'
 import { randomBytes } from 'crypto'
-import { join } from 'path'
-import { homedir } from 'os'
+import { join, resolve } from 'path'
+import { AsyncLocalStorage } from 'node:async_hooks'
 
+import { getCodeburnCacheDir } from './cache-dir.js'
 import type { ParsedProviderCall } from './providers/types.js'
 
 // v4: attribute MCP calls emitted as event_msg/mcp_tool_call_end (issue #478).
@@ -31,28 +32,49 @@ type ResultCache = {
   files: Record<string, FileEntry>
 }
 
-function getCacheDir(): string {
-  return process.env['CODEBURN_CACHE_DIR'] ?? join(homedir(), '.cache', 'codeburn')
+const cacheDirContext = new AsyncLocalStorage<string>()
+
+function currentCacheDir(): string {
+  return cacheDirContext.getStore() ?? resolve(getCodeburnCacheDir())
 }
 
-function getCachePath(): string {
-  return join(getCacheDir(), CACHE_FILE)
+// A parse can cross many async boundaries before the Codex provider publishes
+// its incremental cache. Embedded hosts are allowed to change the process env
+// between calls, so pin the call-time directory for the whole transaction
+// instead of re-reading CODEBURN_CACHE_DIR at each cache operation.
+export function withCodexCacheDirectory<T>(cacheDir: string, operation: () => T): T {
+  return cacheDirContext.run(resolve(cacheDir), operation)
 }
 
-let memCache: ResultCache | null = null
+function getCachePath(cacheDir: string): string {
+  return join(cacheDir, CACHE_FILE)
+}
 
-async function loadCache(): Promise<ResultCache> {
-  if (memCache) return memCache
+// Embedded consumers can change CODEBURN_CACHE_DIR without reloading this
+// module. Keep each directory's in-memory state separate so a warm cache (or an
+// unflushed update) from A can never be read from or written into B.
+const memCaches = new Map<string, ResultCache>()
+
+// Dropped by the resident RSS guard. Every write is published by
+// flushCodexCache() in the parse's finally, so the next load re-reads disk.
+export function clearCodexMemCaches(): void {
+  memCaches.clear()
+}
+
+async function loadCache(cacheDir: string): Promise<ResultCache> {
+  const inMemory = memCaches.get(cacheDir)
+  if (inMemory) return inMemory
   try {
-    const raw = await readFile(getCachePath(), 'utf-8')
+    const raw = await readFile(getCachePath(cacheDir), 'utf-8')
     const cache = JSON.parse(raw) as ResultCache
     if (cache.version === CODEX_CACHE_VERSION && cache.files && typeof cache.files === 'object') {
-      memCache = cache
+      memCaches.set(cacheDir, cache)
       return cache
     }
   } catch {}
-  memCache = { version: CODEX_CACHE_VERSION, files: {} }
-  return memCache
+  const empty = { version: CODEX_CACHE_VERSION, files: {} }
+  memCaches.set(cacheDir, empty)
+  return empty
 }
 
 function getEntry(cache: ResultCache, filePath: string, fp: FileFingerprint): FileEntry | null {
@@ -69,7 +91,7 @@ export async function readCachedCodexResults(
 ): Promise<ParsedProviderCall[] | null> {
   try {
     const s = await stat(filePath)
-    const cache = await loadCache()
+    const cache = await loadCache(currentCacheDir())
     const entry = getEntry(cache, filePath, { mtimeMs: s.mtimeMs, sizeBytes: s.size })
     return entry?.calls ?? null
   } catch {}
@@ -81,7 +103,7 @@ export async function getCachedCodexProject(
 ): Promise<string | null> {
   try {
     const s = await stat(filePath)
-    const cache = await loadCache()
+    const cache = await loadCache(currentCacheDir())
     const entry = getEntry(cache, filePath, { mtimeMs: s.mtimeMs, sizeBytes: s.size })
     return entry?.project ?? null
   } catch {}
@@ -106,7 +128,7 @@ export async function writeCachedCodexResults(
   fingerprint: FileFingerprint,
 ): Promise<void> {
   try {
-    const cache = await loadCache()
+    const cache = await loadCache(currentCacheDir())
     cache.files[filePath] = {
       mtimeMs: fingerprint.mtimeMs,
       sizeBytes: fingerprint.sizeBytes,
@@ -117,6 +139,8 @@ export async function writeCachedCodexResults(
 }
 
 export async function flushCodexCache(): Promise<void> {
+  const cacheDir = currentCacheDir()
+  const memCache = memCaches.get(cacheDir)
   if (!memCache) return
   try {
     // Evict entries for files that no longer exist on disk
@@ -129,9 +153,8 @@ export async function flushCodexCache(): Promise<void> {
       }
     }
 
-    const dir = getCacheDir()
-    if (!existsSync(dir)) await mkdir(dir, { recursive: true })
-    const finalPath = getCachePath()
+    if (!existsSync(cacheDir)) await mkdir(cacheDir, { recursive: true })
+    const finalPath = getCachePath(cacheDir)
     const tempPath = `${finalPath}.${randomBytes(8).toString('hex')}.tmp`
     const payload = JSON.stringify(memCache)
     const handle = await open(tempPath, 'w', 0o600)
