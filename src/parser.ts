@@ -26,6 +26,7 @@ import {
   isCacheDirty,
   loadCache,
   markCacheDirty,
+  monthScopeForRange,
   reconcileFile,
   saveCache,
 } from './session-cache.js'
@@ -2015,7 +2016,7 @@ async function scanProjectDirs(
     // Marked here, not after the re-parse: an unreadable file `continue`s out
     // below, and the deletion would otherwise live only in memory.
     delete section.files[filePath]
-    markCacheDirty(diskCache, 'claude')
+    markCacheDirty(diskCache, 'claude', filePath)
 
     try {
       if (append) {
@@ -2120,7 +2121,7 @@ async function scanProjectDirs(
             ...(Object.keys(mergedSpawnLinks).length > 0 ? { agentSpawnLinks: mergedSpawnLinks } : {}),
             ...(mergedAmbiguousIds.length > 0 ? { ambiguousSpawnAgentIds: mergedAmbiguousIds } : {}),
           }
-          markCacheDirty(diskCache, 'claude')
+          markCacheDirty(diskCache, 'claude', filePath)
           filesDone++
           await parseProgress.tick(filesDone)
           if (filesDone % 50 === 0 || filesDone === progressTotal) {
@@ -2157,7 +2158,7 @@ async function scanProjectDirs(
         ...(Object.keys(sessionMeta.agentSpawnLinks).length > 0 ? { agentSpawnLinks: sessionMeta.agentSpawnLinks } : {}),
         ...(sessionMeta.ambiguousSpawnAgentIds.length > 0 ? { ambiguousSpawnAgentIds: sessionMeta.ambiguousSpawnAgentIds } : {}),
       }
-      markCacheDirty(diskCache, 'claude')
+      markCacheDirty(diskCache, 'claude', filePath)
     } catch (err) {
       // A single malformed Claude session file must not abort the whole run — that
       // would empty the daily-cache backfill and wipe the trend/history (issue #441,
@@ -2165,7 +2166,7 @@ async function scanProjectDirs(
       // by the current fingerprint so it isn't re-read and re-thrown every run; it
       // re-parses only if the file changes.
       section.files[filePath] = { fingerprint: info.fp, mcpInventory: [], turns: [], failed: true }
-      markCacheDirty(diskCache, 'claude')
+      markCacheDirty(diskCache, 'claude', filePath)
       warnProviderParseFailure('claude', filePath, err)
     }
     filesDone++
@@ -2186,7 +2187,7 @@ async function scanProjectDirs(
       // but they carry attributable PR spend (surfaced above as a legacy split).
       if (section.files[cachedPath]?.prLinks?.length) continue
       delete section.files[cachedPath]
-      markCacheDirty(diskCache, 'claude')
+      markCacheDirty(diskCache, 'claude', cachedPath)
     }
   }
 
@@ -2990,7 +2991,7 @@ async function parseProviderSources(
       // that pruned-away data is preserved for monotonic monthly totals.
       if (!provider.durableSources && !clearedPaths.has(source.path)) {
         delete section.files[source.path]
-        markCacheDirty(diskCache, providerName)
+        markCacheDirty(diskCache, providerName, source.path)
         clearedPaths.add(source.path)
       }
 
@@ -3036,7 +3037,7 @@ async function parseProviderSources(
           }
         }
         didParse = true
-        markCacheDirty(diskCache, providerName)
+        markCacheDirty(diskCache, providerName, source.path)
       } catch (err) {
         if (isSqliteBusyError(err)) {
           warnProviderReadFailureOnce(providerName, err)
@@ -3049,7 +3050,7 @@ async function parseProviderSources(
         // on every refresh; it re-parses only if it changes. Empty turns => no
         // usage contributed.
         section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns: [], failed: true }
-        markCacheDirty(diskCache, providerName)
+        markCacheDirty(diskCache, providerName, source.path)
         warnProviderParseFailure(providerName, source.path, err)
         continue
       }
@@ -3073,7 +3074,7 @@ async function parseProviderSources(
     for (const cachedPath of Object.keys(section.files)) {
       if (!allDiscoveredFiles.has(cachedPath)) {
         delete section.files[cachedPath]
-        markCacheDirty(diskCache, providerName)
+        markCacheDirty(diskCache, providerName, cachedPath)
       }
     }
   }
@@ -3090,7 +3091,7 @@ async function parseProviderSources(
         .reduce((max, ts) => Math.max(max, ts), 0)
       if (newestTs > 0 && newestTs < cutoffMs) {
         delete section.files[cachedPath]
-        markCacheDirty(diskCache, providerName)
+        markCacheDirty(diskCache, providerName, cachedPath)
       }
     }
   }
@@ -3793,7 +3794,18 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
     if (reused) return reused
   }
 
-  let diskCache = await loadCache()
+  // Load only the month shards a query over `dateRange` can possibly report
+  // on. Sessions whose every turn falls outside the range are dropped from the
+  // report anyway, so skipping their shards changes nothing except the bytes
+  // read — and a save writes only dirty months, leaving the skipped ones on
+  // disk untouched (see saveCache). Cross-file dedup is weakened, not broken:
+  // the pre-seed of `seenMsgIds` / `seenKeys` only covers loaded files, so a key
+  // that a skipped file also holds is no longer suppressed. Totals are
+  // unaffected (a suppressed duplicate contributes nothing either way), but for
+  // a proxied key emitted under two providers the attribution can land on a
+  // different provider than a full load would pick.
+  const loadScope = dateRange ? monthScopeForRange(dateRange.start, dateRange.end) : undefined
+  let diskCache = await loadCache(loadScope)
   await cleanupOrphanedTempFiles()
 
   // Cold-hydration coordination (advisory, cross-process). Engages whenever the
@@ -3806,7 +3818,7 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
   // doubt it proceeds unlocked.
   if (!isCacheComplete(diskCache)) {
     const hydration = await beginColdHydration(true)
-    if (hydration.waited) diskCache = await loadCache()
+    if (hydration.waited) diskCache = await loadCache(loadScope)
     const isCold = !isCacheComplete(diskCache)
     try {
       return await runParse(key, diskCache, dateRange, providerFilter, { isCold, burstSig, parseStartedAt })
@@ -3824,17 +3836,17 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
     return runParse(key, priorSnapshot, dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   }
   if (refresh.outcome === 'completed-by-other') {
-    return runParse(key, await loadCache(), dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
+    return runParse(key, await loadCache(loadScope), dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   }
 
   try {
     // Reload only after ownership is canonical; this closes the lost-update
     // window between the pre-gate read and the holder's completed publication.
-    diskCache = await loadCache()
+    diskCache = await loadCache(loadScope)
     return await runParse(key, diskCache, dateRange, providerFilter, { refreshLock: refresh.handle, burstSig, parseStartedAt })
   } catch (err) {
     if (!(err instanceof RefreshFenceLostError) && !(err instanceof RefreshPublicationUnavailableError)) throw err
-    return runParse(key, await loadCache(), dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
+    return runParse(key, await loadCache(loadScope), dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   } finally {
     await refresh.handle.release()
   }
