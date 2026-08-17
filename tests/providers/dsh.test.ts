@@ -14,6 +14,10 @@ import type { ParsedProviderCall } from '../../src/providers/types.js'
 // format than what DSH writes.
 
 const zstdCompress = (zlib as { zstdCompressSync?: (buf: Buffer) => Buffer }).zstdCompressSync
+// node:zlib gained zstd in 22.15; the package floor (and CI's pinned Node) is
+// 22.13. Container-specific tests skip there; the rest fall back to plain jsonl
+// so the parsing semantics are still exercised.
+const itZstd = zstdCompress ? it : it.skip
 
 let tmpDir: string
 
@@ -95,8 +99,13 @@ function toolCall(turn: number, step: number, name: string, args: Record<string,
 async function writeZstdSession(projectDirName: string, sessionDirName: string, batches: string[][]) {
   const dir = join(tmpDir, 'sessions', projectDirName, sessionDirName)
   await mkdir(dir, { recursive: true })
+  if (!zstdCompress) {
+    const filePath = join(dir, 'session.jsonl')
+    await writeFile(filePath, batches.map(lines => lines.join('\n') + '\n').join(''))
+    return filePath
+  }
   const filePath = join(dir, 'session.jsonl.zstd')
-  const frames = batches.map(lines => zstdCompress!(Buffer.from(lines.join('\n') + '\n', 'utf-8')))
+  const frames = batches.map(lines => zstdCompress(Buffer.from(lines.join('\n') + '\n', 'utf-8')))
   await writeFile(filePath, Buffer.concat(frames))
   return filePath
 }
@@ -119,7 +128,7 @@ async function parseAll(provider: ReturnType<typeof createDshProvider>, filePath
 }
 
 describe('dsh provider - session discovery', () => {
-  it('discovers a multi-frame zstd session, project from the header cwd', async () => {
+  itZstd('discovers a multi-frame zstd session, project from the header cwd', async () => {
     await writeZstdSession('--C-Users-test-myproject--', 'session-abc', [
       [sessionHeader({ cwd: 'C:\\Users\\test\\myproject' })],
       [assistantMessage(1, 1, { inputTokens: 100, outputTokens: 10 }, 1786707340000)],
@@ -196,7 +205,7 @@ describe('dsh provider - session discovery', () => {
 })
 
 describe('dsh provider - parsing', () => {
-  it('decodes events spread across multiple independent zstd frames', async () => {
+  itZstd('decodes events spread across multiple independent zstd frames', async () => {
     const filePath = await writeZstdSession('--C-Users-test-myproject--', 'session-multi', [
       [sessionHeader({ id: 'session-multi', cwd: 'C:\\Users\\test\\myproject' })],
       [turnStart(1, 1786707339000), userMessage('build the thing', 1786707339100)],
@@ -340,7 +349,7 @@ describe('dsh provider - parsing', () => {
     expect(calls).toHaveLength(0)
   })
 
-  it('ignores a torn final frame appended by a crashed writer', async () => {
+  itZstd('ignores a torn final frame appended by a crashed writer', async () => {
     const dir = join(tmpDir, 'sessions', '--C-Users-test-myproject--', 'session-torn')
     await mkdir(dir, { recursive: true })
     const filePath = join(dir, 'session.jsonl.zstd')
@@ -513,7 +522,7 @@ describe('dsh provider - defensive reads', () => {
 })
 
 describe('dsh provider - real log, real container', () => {
-  it('reads the upstream snapshot out of multi-frame zstd with a torn tail identically to plain jsonl', async () => {
+  itZstd('reads the upstream snapshot out of multi-frame zstd with a torn tail identically to plain jsonl', async () => {
     const lines = (await readFile(join(import.meta.dirname, '../fixtures/dsh/bash-tool-turn.jsonl'), 'utf-8'))
       .split('\n').filter(l => l.trim())
     const plain = await parseAll(
