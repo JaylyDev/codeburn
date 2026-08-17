@@ -71,31 +71,53 @@ output formatter (Ink TUI, JSON, or menubar-json)
 
 ### Parallel Cold Parse
 
-A cold Claude parse spends most of its time on work that is per-file and pure:
-reading a session JSONL, decoding it, and turning each line into a journal entry.
-`src/parse-workers.ts` moves that onto `worker_threads` when the pending workload
-is big enough to pay for them. Each worker runs `parseClaudeFileFull` against an
-empty dedup set and ships the result back as a JSON string; the parent installs
-results in the same order the serial loop would, and everything with cross-file
-state (the `seenMsgIds` dedup, canonical project paths, spawn links, PR
-correlation) stays on the main thread. A file whose message ids were already
-claimed by an earlier file, or whose worker failed, is re-parsed in-process — so
-the output is identical to the serial path either way. Only whole-file re-parses
-go off-thread; the append/incremental path is untouched. Workers are created at
-the start of a qualifying parse and terminated when it ends, so the resident
-`serve` child never accumulates threads.
+A cold parse spends most of its time on work that is per-file and pure: reading a
+session JSONL or a Codex rollout, decoding it, and turning each line into a
+journal entry. `src/parse-workers.ts` moves that onto `worker_threads` when the
+pending workload is big enough to pay for them. Each worker runs the same
+per-file function the serial path runs — `parseClaudeFileFull` for a Claude
+session, `parseCodexFileFull` for a Codex rollout — against an empty dedup set,
+and ships the result back as a JSON string together with every dedup key it
+claimed. The parent installs results in the same order the serial loop would, and
+everything with cross-file state (the dedup sets, canonical project paths, spawn
+links, PR correlation, the Codex result cache) stays on the main thread. A file
+whose keys were already claimed by an earlier file, or whose worker failed, is
+re-parsed in-process — so the output is identical to the serial path either way.
+That overlap check is what makes a forked Codex rollout safe: it replays its
+parent's token_count history under the parent's key namespace, collides, and is
+re-parsed against the real dedup set.
+
+A Codex worker never touches `src/codex-cache.ts`: it returns the cache entry it
+would have written and the parent writes it, in install order, so
+`flushCodexCache` publishes exactly what a serial parse would. Only whole-file
+parses go off-thread; the append/incremental paths (a Claude append, a Codex
+byte-offset resume) are untouched and stay in-process. The decision is made per
+provider — the Claude scan and the provider loop run one after the other, so at
+most one pool is alive — and the pool is terminated when its scan ends, so the
+resident `serve` child never accumulates threads.
 
 The pool is off by default for anything that is not a large cold parse:
 
 | Gate | Serial when |
 |---|---|
-| Pending files | fewer than 200 whole-file re-parses |
-| Pending bytes | under 200 MB behind those files |
+| Pending bytes | under 200 MB behind the pending whole-file parses |
 | Cores | `availableParallelism() <= 2` |
 | Memory | under 4 GB available |
 
 Otherwise the worker count is
-`min(cores - 1, min(0.25 * available, 2 GB) / 256 MB, pendingFiles / 50)`.
+`min(cores - 1, min(0.25 * available, 2 GB) / perWorker, max(pendingFiles / 50, pendingBytes / 200 MB))`.
+Files and bytes each earn threads on their own, so a few hundred multi-hundred-MB
+Codex rollouts parallelize as well as a few thousand small Claude transcripts. The
+gate is bytes only, deliberately: 250 pending files holding under a megabyte
+between them spawn threads that make the run ~5% slower, and a file count only
+starts paying for itself around 400.
+
+`perWorker` is the per-thread memory budget, derived per parse as
+`clamp(256 MB, 2 x (pendingBytes / pendingFiles) + 128 MB, 1 GB)`. A flat figure
+was wrong in both directions: small Claude transcripts peak well under 256 MB,
+while a 260 MB Codex rollout peaks near 430 MB in its worker and scales linearly
+with the pool. The budget also covers the parent, which buffers up to `pool.size`
+finished results while it installs one.
 
 "Available" is `process.availableMemory()`, falling back to `os.totalmem()`. It is
 deliberately not `os.freemem()`: on macOS that counts free pages rather than
