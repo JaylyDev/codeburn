@@ -547,7 +547,8 @@ class ServeClient {
     this.buffer = ''
     this.bufferBytes = 0
     this.warmed = false
-    this.deaths += 1
+    // Deliberate termination, not a crash: it must not spend the unexpected-death
+    // budget, or three oversized payloads would disable serve for the app run.
     activeChildren.delete(child as never)
     for (const [, waiter] of this.pending) {
       clearTimeout(waiter.timer)

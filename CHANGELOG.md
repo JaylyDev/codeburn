@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+- **One rule for every cache file.** `CODEBURN_CACHE_DIR` when set, otherwise `~/.cache/codeburn`. `XDG_CACHE_HOME` is no longer consulted; the sync ledger, the only file that ever honored it, is merged into the canonical location on first read and the legacy copy is retired, so nothing is re-uploaded after the move. (#972)
+
+### Fixed (Desktop & Menubar)
+- **The resident `codeburn serve` child.** The first real panel request is also the cache warm-up, so startup never runs an artificial warm-up query beside a duplicate one-shot child; each served command carries its own read-only option allowlist, and anything outside it falls back to a normal spawn; the child exits when its stdin closes, so it can never outlive the app. Requests whose response exceeds the 16 MiB frame limit still replace the child, but that deliberate kill no longer spends the resident's unexpected-death budget. (#972)
+
 ## 0.9.20 - 2026-08-10
 
 ### Added

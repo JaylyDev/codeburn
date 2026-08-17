@@ -164,6 +164,15 @@ const cachedServers = new Map<string, ServerInfo | null>()
 const cachedModelMaps = new Map<string, ModelMap>()
 type AntigravityCacheState = { cache: AntigravityCache; dirty: boolean }
 const cacheStates = new Map<string, AntigravityCacheState>()
+
+// Dropped by the resident RSS guard. A dirty state holds cascades not yet on
+// disk, so it stays resident until its own flush publishes it.
+export function clearAntigravityCacheStates(): void {
+  for (const [dir, state] of cacheStates) {
+    if (!state.dirty) cacheStates.delete(dir)
+  }
+}
+
 let httpsAgent: https.Agent | undefined
 const protoTextDecoder = new TextDecoder('utf-8', { fatal: false })
 

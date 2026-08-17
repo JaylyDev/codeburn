@@ -55,6 +55,12 @@ function getCachePath(cacheDir: string): string {
 // unflushed update) from A can never be read from or written into B.
 const memCaches = new Map<string, ResultCache>()
 
+// Dropped by the resident RSS guard. Every write is published by
+// flushCodexCache() in the parse's finally, so the next load re-reads disk.
+export function clearCodexMemCaches(): void {
+  memCaches.clear()
+}
+
 async function loadCache(cacheDir: string): Promise<ResultCache> {
   const inMemory = memCaches.get(cacheDir)
   if (inMemory) return inMemory

@@ -6,12 +6,14 @@ import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import {
+  clearCodexMemCaches,
   fingerprintFile,
   flushCodexCache,
   readCachedCodexResults,
   writeCachedCodexResults,
 } from '../src/codex-cache.js'
 import {
+  clearAntigravityCacheStates,
   createAntigravityProvider,
   flushAntigravityCache,
 } from '../src/providers/antigravity.js'
@@ -241,5 +243,35 @@ describe('call-time CODEBURN_CACHE_DIR isolation', () => {
     expect(diskB.cascades.shared.calls[0].model).toBe('from-b')
     const diskA = JSON.parse(await readFile(join(cacheA, 'antigravity-results.json'), 'utf8'))
     expect(diskA.cascades).toEqual({})
+  })
+
+  it('drops clean per-directory memos when the resident RSS guard clears them', async () => {
+    const codexSource = join(root, 'guard.jsonl')
+    const antigravitySource = join(root, 'shared.pb')
+    const cacheDir = join(root, 'guard-cache')
+    await writeFile(codexSource, '{}\n')
+    await writeFile(antigravitySource, 'fixture')
+    await seedAntigravityCache(cacheDir, antigravitySource, 'before')
+
+    process.env['CODEBURN_CACHE_DIR'] = cacheDir
+    await writeCachedCodexResults(codexSource, 'project', [call('codex', 'before')], (await fingerprintFile(codexSource))!)
+    await flushCodexCache()
+    expect(await readAntigravityModel(antigravitySource)).toBe('before')
+
+    // Another process republishes both cache files. Without the clear, the
+    // resident keeps serving its warm copies.
+    await seedAntigravityCache(cacheDir, antigravitySource, 'after')
+    const codexDisk = JSON.parse(await readFile(join(cacheDir, 'codex-results.json'), 'utf8'))
+    codexDisk.files[codexSource].calls[0].model = 'after'
+    await writeFile(join(cacheDir, 'codex-results.json'), JSON.stringify(codexDisk))
+
+    expect((await readCachedCodexResults(codexSource))?.map(entry => entry.model)).toEqual(['before'])
+    expect(await readAntigravityModel(antigravitySource)).toBe('before')
+
+    clearCodexMemCaches()
+    clearAntigravityCacheStates()
+
+    expect((await readCachedCodexResults(codexSource))?.map(entry => entry.model)).toEqual(['after'])
+    expect(await readAntigravityModel(antigravitySource)).toBe('after')
   })
 })

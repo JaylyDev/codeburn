@@ -650,6 +650,39 @@ describe('resident serve single-flight', () => {
     expect(readMaybe(oneShotsFile)).toBe('')
   })
 
+  it('keeps serve enabled after more overflows than the resident death budget', async () => {
+    const startsFile = join(dir, 'overflow-budget-starts')
+    const oneShotsFile = join(dir, 'overflow-budget-one-shots')
+    fakeBin(
+      'always-oversized-resident.js',
+      `const fs = require('node:fs'); const readline = require('node:readline');
+       if (process.argv[2] === 'serve') {
+         fs.appendFileSync(${JSON.stringify(startsFile)}, 's');
+         const rl = readline.createInterface({ input: process.stdin });
+         rl.once('line', line => {
+           const request = JSON.parse(line);
+           const output = JSON.stringify({ value: 'x'.repeat(16 * 1024 * 1024 + 1024) });
+           process.stdout.write(JSON.stringify({ id: request.id, ok: true, output }) + '\\n');
+         });
+         setInterval(() => {}, 1000);
+       } else {
+         fs.appendFileSync(${JSON.stringify(oneShotsFile)}, 'o');
+         process.stdout.write('{}');
+       }`,
+    )
+    startServe()
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await expect(spawnCli(['status', '--overflow', String(attempt)], { timeoutMs: 5_000 }))
+        .rejects.toMatchObject({ kind: 'too-large' } satisfies Partial<CliError>)
+    }
+
+    // An overflow kill is deliberate, so it never spends the unexpected-death
+    // budget: the fourth request still reaches a resident, not a one-shot.
+    expect(readMaybe(startsFile)).toBe('ssss')
+    expect(readMaybe(oneShotsFile)).toBe('')
+  })
+
   it('rejects and terminates a resident whose protocol line never terminates', async () => {
     const startsFile = join(dir, 'unterminated-line-starts')
     const oneShotsFile = join(dir, 'unterminated-line-one-shots')

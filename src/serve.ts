@@ -433,8 +433,12 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
       if (process.memoryUsage().rss > SERVE_MAX_RSS_BYTES) {
         const { clearSessionCache } = await import('./parser.js')
         const { clearLoadCacheMemo } = await import('./session-cache.js')
+        const { clearCodexMemCaches } = await import('./codex-cache.js')
+        const { clearAntigravityCacheStates } = await import('./providers/antigravity.js')
         clearSessionCache()
         clearLoadCacheMemo()
+        clearCodexMemCaches()
+        clearAntigravityCacheStates()
         if (typeof globalThis.gc === 'function') globalThis.gc()
       }
     })
