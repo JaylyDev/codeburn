@@ -2213,7 +2213,13 @@ async function scanProjectDirs(
     let carriedPrRefs: string[] | undefined
     let prRefsAtRangeStart: string[] | undefined
     let frozePrRefs = !dateRange
-    let classifiedTurns = cachedFile.turns.map(turn => {
+    // The keep/drop decision is taken on the RAW turn, before classifying it:
+    // `cachedTurnToClassified` maps `calls` 1:1 onto `assistantCalls`, so a turn
+    // with no call in range is dropped whole by the slicer below and classifying
+    // it is pure waste (on a week view that is nearly all of history). The
+    // carries above still run over the FULL ordered turn list.
+    const classifiedTurns: ClassifiedTurn[] = []
+    for (const turn of cachedFile.turns) {
       if (turn.gitBranch) carriedBranch = turn.gitBranch
       if (dateRange && !frozePrRefs) {
         const firstTs = turn.calls[0]?.timestamp
@@ -2223,10 +2229,16 @@ async function scanProjectDirs(
         }
       }
       if (turn.prRefs?.length) carriedPrRefs = turn.prRefs
-      return cachedTurnToClassified(turn, carriedBranch)
-    })
-    // Captured from the FULL turn list, before the date slice below can drop the
-    // turn a branch was first seen on. Lets the by-branch report keep this
+      if (dateRange && !callsInRange(turn.calls, dateRange)) continue
+      const classified = cachedTurnToClassified(turn, carriedBranch)
+      // Slice rather than drop: a turn spanning local midnight would otherwise
+      // lose every call that lands in the requested day (issue #852). Only
+      // `assistantCalls`/`timestamp` are touched — see classifiedTurnSlicedToRange.
+      const sliced = dateRange ? classifiedTurnSlicedToRange(classified, dateRange) : classified
+      if (sliced) classifiedTurns.push(sliced)
+    }
+    // Captured from the FULL turn list, which the date slice above can strip of
+    // the turn a branch was first seen on. Lets the by-branch report keep this
     // session's in-range unbranched spend as `null` instead of discarding it.
     const everHadBranch = carriedBranch !== undefined
 
@@ -2235,16 +2247,6 @@ async function scanProjectDirs(
     // right PR even when its launching turn is later sliced out of range. Only for
     // sessions that both spawned subagents and referenced a PR.
     const spawnPrSets = cachedFile.prLinks?.length ? buildSpawnPrSets(cachedFile.turns) : {}
-
-    if (dateRange) {
-      // Slice rather than drop: a turn spanning local midnight would otherwise
-      // lose every call that lands in the requested day (issue #852). Only
-      // `assistantCalls`/`timestamp` are touched — see classifiedTurnSlicedToRange.
-      classifiedTurns = classifiedTurns.flatMap(turn => {
-        const sliced = classifiedTurnSlicedToRange(turn, dateRange)
-        return sliced ? [sliced] : []
-      })
-    }
 
     // A PR-linked parent that spawned subagents is kept even when its OWN turns all
     // fall out of range, as a 0-cost fold ANCHOR: an in-range child (an async agent
@@ -2864,8 +2866,8 @@ function turnSlicedToRange(turn: CachedTurn, dateRange: DateRange): CachedTurn |
   return { ...turn, calls: inRangeCalls, timestamp: inRangeCalls[0]!.timestamp }
 }
 
-// Same slice, applied post-classification (scanProjectDirs classifies every
-// turn from its FULL call list up front, before date filtering — see the
+// Same slice, applied post-classification (scanProjectDirs classifies each
+// surviving turn from its FULL call list, before date filtering — see the
 // carriedBranch/carriedPrRefs comments in scanProjectDirs — so this only
 // trims `assistantCalls` and re-anchors `timestamp`; `category`/`subCategory`/
 // `retries`/`hasEdits` stay exactly as classified from the complete turn.
