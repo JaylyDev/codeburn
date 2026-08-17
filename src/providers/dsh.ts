@@ -167,9 +167,11 @@ function mapToolName(raw: string): string {
 // A log stamped with a version this parser was not written against is skipped
 // whole: a bump means an event's meaning changed, so reading it with today's
 // assumptions would report confident wrong numbers.
-function isReadableVersion(header: DshEvent, filePath: string): boolean {
+function isReadableVersion(header: DshEvent): boolean {
   if (header.version === SESSION_FORMAT_VERSION) return true
-  notice(`codeburn: skipping DSH session ${filePath}: unsupported session format version ${String(header.version)}; upgrade codeburn.\n`)
+  // Keyed on the version, not the path: a DSH upgrade makes EVERY session
+  // unreadable at once, and one line per session log is noise, not a report.
+  notice(`codeburn: skipping DSH sessions written in session format version ${String(header.version)}; upgrade codeburn.\n`)
   return false
 }
 
@@ -261,8 +263,11 @@ async function readSessionHeader(filePath: string): Promise<DshEvent | null> {
       }
       let { frames } = scanZstdFrames(head, 1)
       if (frames.length === 0) {
-        // Head read did not cover one full frame; take the whole file.
+        // Head read did not cover one full frame; take the whole file. A fork's
+        // first batch carries the whole inherited seed, so this is reachable on
+        // a real log and needs the same oversize guard as the parse read.
         try {
+          if ((await stat(filePath)).size > MAX_SESSION_FILE_BYTES) return null
           const full = await readFile(filePath)
           frames = scanZstdFrames(full, 1).frames
           if (frames.length === 0) return null
@@ -283,7 +288,7 @@ async function readSessionHeader(filePath: string): Promise<DshEvent | null> {
     if (!line) return null
     const event = JSON.parse(line) as DshEvent
     if (event.type !== 'session') return null
-    return isReadableVersion(event, filePath) ? event : null
+    return isReadableVersion(event) ? event : null
   } catch {
     return null
   }
@@ -377,7 +382,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         }
 
         if (event.type === 'session') {
-          if (!isReadableVersion(event, source.path)) return
+          if (!isReadableVersion(event)) return
           sessionId = event.id ?? sessionId
           cwd = event.cwd ?? cwd
           sessionStart = isoTimestamp(event.createdAt, sessionStart)
