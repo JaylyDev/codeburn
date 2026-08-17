@@ -6,7 +6,7 @@ import { homedir } from 'os'
 
 import { readSessionLines } from '../fs-utils.js'
 import { calculateCost } from '../models.js'
-import { readCachedCodexResults, writeCachedCodexResults, getCachedCodexProject, fingerprintFile } from '../codex-cache.js'
+import { readCachedCodexResults, writeCachedCodexResults, getCachedCodexProject, fingerprintFile, type CodexFileFingerprint } from '../codex-cache.js'
 import { normalizeContentBlocks } from '../content-utils.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ToolCall } from '../types.js'
@@ -624,10 +624,22 @@ function isResumeState(value: unknown): value is CodexResumeState {
     && typeof v['currentTurnId'] === 'string'
 }
 
-function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+/** What the serial path would have written to the codex cache for one file. */
+export type CodexCacheWrite = {
+  project: string
+  fingerprint: CodexFileFingerprint
+  resume?: { offset: number; state: unknown; callCount: number }
+}
+
+// When `capture` is passed the parse is a whole-file decode that never touches
+// the codex cache: no hit lookup (so no resume), and the entry it would have
+// written comes back through `capture` for the caller to install. That is what
+// lets a worker thread run this exact decode without owning the cache module's
+// per-directory state.
+function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { write?: CodexCacheWrite }): SessionParser {
   return {
     async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const hit = await readCachedCodexResults(source.path)
+      const hit = capture ? null : await readCachedCodexResults(source.path)
       if (hit?.kind === 'exact') {
         for (const call of hit.calls) {
           if (seenKeys.has(call.deduplicationKey)) continue
@@ -1112,19 +1124,32 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       // Flush the final task, which has no following task_started to trigger it.
       results.push(...pendingTaskCalls)
 
-      await writeCachedCodexResults(
-        source.path,
-        source.project,
-        results,
-        fp,
-        resumeState ? { offset: resumeOffset, state: resumeState, callCount: resumeCallCount } : undefined,
-      )
+      const resumeWrite = resumeState ? { offset: resumeOffset, state: resumeState, callCount: resumeCallCount } : undefined
+      if (capture) {
+        capture.write = { project: source.project, fingerprint: fp, ...(resumeWrite ? { resume: resumeWrite } : {}) }
+      } else {
+        await writeCachedCodexResults(source.path, source.project, results, fp, resumeWrite)
+      }
 
       for (const call of results) {
         yield call
       }
     },
   }
+}
+
+export type CodexFullParse = { calls: ParsedProviderCall[]; write?: CodexCacheWrite }
+
+/// Decode one rollout end to end, exactly as the serial path does for a file
+/// with no cache entry, without reading or writing the codex cache. `seenKeys`
+/// is the dedup set the decode runs against — pass an empty one off-thread and
+/// let the caller prove no earlier file claimed any of the keys before
+/// installing the result.
+export async function parseCodexFileFull(source: SessionSource, seenKeys: Set<string>): Promise<CodexFullParse> {
+  const capture: { write?: CodexCacheWrite } = {}
+  const calls: ParsedProviderCall[] = []
+  for await (const call of createParser(source, seenKeys, capture).parse()) calls.push(call)
+  return { calls, ...(capture.write ? { write: capture.write } : {}) }
 }
 
 export function createCodexProvider(codexDir?: string): Provider {

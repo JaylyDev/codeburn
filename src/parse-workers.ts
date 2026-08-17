@@ -2,6 +2,7 @@ import { availableParallelism, totalmem } from 'os'
 import { Worker } from 'worker_threads'
 import { snapshotPricingState } from './models.js'
 import type { ClaudeFileParse } from './parser.js'
+import type { SessionSource } from './providers/types.js'
 
 // Each worker holds one file's entry list plus its serialized result. 256 MB is
 // the observed high-water mark for the largest real session files; going over the
@@ -10,8 +11,12 @@ const PER_WORKER_RSS_BYTES = 256 * 1024 * 1024
 const MEMORY_BUDGET_CAP_BYTES = 2 * 1024 * 1024 * 1024
 const MIN_AVAILABLE_BYTES = 4 * 1024 * 1024 * 1024
 const MIN_FILES_PER_WORKER = 50
-// Below these, a parse is warm/incremental and the thread startup + result
-// transfer costs more than the parallelism buys.
+const MIN_BYTES_PER_WORKER = 200 * 1024 * 1024
+// Below BOTH of these, a parse is warm/incremental and the thread startup +
+// result transfer costs more than the parallelism buys. Either one on its own
+// qualifies: a Codex corpus is a few hundred rollouts of which a handful carry
+// most of the gigabytes, so a file-count-only gate leaves the biggest workload
+// there is (150 huge rollouts) parsing serially.
 const MIN_PENDING_FILES = 200
 const MIN_PENDING_BYTES = 200 * 1024 * 1024
 
@@ -53,16 +58,23 @@ export function decideParseWorkers(
 
   // Workload gates first, so a warm run's log line says "warm", not whatever the
   // machine happened to look like at that moment.
-  if (pending.files < MIN_PENDING_FILES) return { workers: 0, reason: `below ${MIN_PENDING_FILES} pending files; ${inputs}` }
-  if (pending.bytes < MIN_PENDING_BYTES) return { workers: 0, reason: `below ${Math.round(MIN_PENDING_BYTES / 1e6)} MB pending; ${inputs}` }
+  if (pending.files < MIN_PENDING_FILES && pending.bytes < MIN_PENDING_BYTES) {
+    return { workers: 0, reason: `below ${MIN_PENDING_FILES} pending files and ${Math.round(MIN_PENDING_BYTES / 1e6)} MB pending; ${inputs}` }
+  }
   if (sys.cores <= 2) return { workers: 0, reason: `too few cores; ${inputs}` }
   if (sys.availableBytes < MIN_AVAILABLE_BYTES) return { workers: 0, reason: `below ${Math.round(MIN_AVAILABLE_BYTES / 1e9)} GB available memory; ${inputs}` }
 
   const memoryBudget = Math.min(0.25 * sys.availableBytes, MEMORY_BUDGET_CAP_BYTES)
+  // Files and bytes each earn threads on their own: a few hundred huge rollouts
+  // are as parallelisable as a few thousand small transcripts, and gating the
+  // count on files alone would hand a 6 GB / 60-file workload a single thread.
   const workers = Math.min(
     sys.cores - 1,
     Math.floor(memoryBudget / PER_WORKER_RSS_BYTES),
-    Math.floor(pending.files / MIN_FILES_PER_WORKER),
+    Math.max(
+      Math.floor(pending.files / MIN_FILES_PER_WORKER),
+      Math.floor(pending.bytes / MIN_BYTES_PER_WORKER),
+    ),
   )
   return { workers, reason: inputs }
 }
@@ -90,11 +102,19 @@ function workerEntryUrl(): string {
   return new URL(`./parse-worker${ext}`, import.meta.url).href
 }
 
-export type ClaudeWorkerResult =
-  | { ok: true; parsed: (ClaudeFileParse & { msgIds: string[] }) | null }
+/// One whole-file parse for a worker to run. Both kinds carry exactly what the
+/// serial per-file parse takes, so the worker can run that same function.
+export type ParseJob =
+  | { kind: 'claude'; filePath: string }
+  | { kind: 'codex'; source: SessionSource }
+
+export type ParseWorkerResult<T> =
+  | { ok: true; parsed: T | null }
   | { ok: false; error: string }
 
-type Task = { filePath: string; resolve: (r: ClaudeWorkerResult) => void }
+export type ClaudeWorkerParse = ClaudeFileParse & { msgIds: string[] }
+
+type Task = { job: ParseJob; resolve: (r: ParseWorkerResult<unknown>) => void }
 
 type WorkerMessage = { json?: string | null; error?: string }
 
@@ -132,13 +152,13 @@ export class ParseWorkerPool {
   /// Parse one file off-thread. Never rejects: a worker-side failure (or a dead
   /// pool) comes back as `ok: false` so the caller can fall back to an in-process
   /// parse and never lose a file to a crashed thread.
-  submit(filePath: string): Promise<ClaudeWorkerResult> {
-    return new Promise<ClaudeWorkerResult>((resolve) => {
+  submit<T>(job: ParseJob): Promise<ParseWorkerResult<T>> {
+    return new Promise<ParseWorkerResult<T>>((resolve) => {
       if (this.closed || this.workers.length === 0) {
         resolve({ ok: false, error: 'parse worker pool unavailable' })
         return
       }
-      this.queue.push({ filePath, resolve })
+      this.queue.push({ job, resolve: resolve as (r: ParseWorkerResult<unknown>) => void })
       this.pump()
     })
   }
@@ -159,7 +179,7 @@ export class ParseWorkerPool {
       const worker = this.idle.pop()!
       const task = this.queue.shift()!
       this.inflight.set(worker, task)
-      worker.postMessage({ filePath: task.filePath })
+      worker.postMessage(task.job)
     }
   }
 
@@ -197,22 +217,22 @@ export class ParseWorkerPool {
   }
 }
 
-/// Yield results for `filePaths` in the SAME order they were given, no matter
-/// which worker finishes first. Keeps exactly `pool.size` files in flight, so at
-/// most that many parsed results are buffered while the caller installs one.
-export async function* parseFilesInOrder(
+/// Yield results for `jobs` in the SAME order they were given, no matter which
+/// worker finishes first. Keeps exactly `pool.size` files in flight, so at most
+/// that many parsed results are buffered while the caller installs one.
+export async function* parseFilesInOrder<T>(
   pool: ParseWorkerPool,
-  filePaths: readonly string[],
-): AsyncGenerator<ClaudeWorkerResult, void, void> {
-  const inflight: Array<Promise<ClaudeWorkerResult>> = []
+  jobs: readonly ParseJob[],
+): AsyncGenerator<ParseWorkerResult<T>, void, void> {
+  const inflight: Array<Promise<ParseWorkerResult<T>>> = []
   let next = 0
   const fill = (): void => {
-    while (inflight.length < Math.max(1, pool.size) && next < filePaths.length) {
-      inflight.push(pool.submit(filePaths[next++]!))
+    while (inflight.length < Math.max(1, pool.size) && next < jobs.length) {
+      inflight.push(pool.submit<T>(jobs[next++]!))
     }
   }
   fill()
-  for (let i = 0; i < filePaths.length; i++) {
+  for (let i = 0; i < jobs.length; i++) {
     const result = await inflight.shift()!
     fill()
     yield result

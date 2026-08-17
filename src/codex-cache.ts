@@ -22,7 +22,8 @@ import type { ParsedProviderCall } from './providers/types.js'
 const CODEX_CACHE_VERSION = 8
 const CACHE_FILE = 'codex-results.json'
 
-type FileFingerprint = { dev: number; ino: number; mtimeMs: number; sizeBytes: number }
+export type CodexFileFingerprint = { dev: number; ino: number; mtimeMs: number; sizeBytes: number }
+type FileFingerprint = CodexFileFingerprint
 
 type FileEntry = {
   // Absent on entries written before the resume support landed.

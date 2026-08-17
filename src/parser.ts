@@ -6,7 +6,7 @@ import { calculateCost, calculateLocalModelSavings, getShortModelName, isProxied
 import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
 import { normalizeContentBlocks, flatSlice, flatString } from './content-utils.js'
 import { discoverAllSessions, getProvider } from './providers/index.js'
-import { flushCodexCache, withCodexCacheDirectory } from './codex-cache.js'
+import { flushCodexCache, readCachedCodexResults, withCodexCacheDirectory, writeCachedCodexResults } from './codex-cache.js'
 import { antigravityCascadeIdFromPath, flushAntigravityCache, shouldReparseAntigravitySource } from './providers/antigravity.js'
 import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { isSqliteBusyError } from './sqlite.js'
@@ -31,7 +31,8 @@ import {
   saveCache,
 } from './session-cache.js'
 import { acquireCacheRefreshLock, type RefreshLockHandle } from './cache-refresh-lock.js'
-import { decideParseWorkers, parseFilesInOrder, ParseWorkerPool } from './parse-workers.js'
+import { decideParseWorkers, parseFilesInOrder, ParseWorkerPool, type ClaudeWorkerParse, type ParseJob } from './parse-workers.js'
+import type { CodexFullParse } from './providers/codex.js'
 import { dateKey } from './day-aggregator.js'
 import type { ParsedProviderCall, SessionSource } from './providers/types.js'
 import type {
@@ -2032,7 +2033,9 @@ async function scanProjectDirs(
       process.stderr.write(`codeburn: parse workers unavailable, parsing serially (${err instanceof Error ? err.message : String(err)})\n`)
     }
   }
-  const offThread = pool ? parseFilesInOrder(pool, fullReparsePaths) : null
+  const offThread = pool
+    ? parseFilesInOrder<ClaudeWorkerParse>(pool, fullReparsePaths.map(filePath => ({ kind: 'claude', filePath })))
+    : null
   // Files whose worker result had to be thrown away because an earlier file had
   // already claimed one of its message ids. Expected to stay near zero; a large
   // count means the corpus is full of resumed sessions and the pool is doing
@@ -3078,6 +3081,45 @@ async function parseProviderSources(
     }
   }
 
+  // Codex rollouts are the bulk of a cold parse (multi-GB against Claude's
+  // hundreds of MB), so whole-file decodes go to worker threads. A file the
+  // codex cache can serve exactly, or resume into from a byte offset, stays
+  // in-process: it reads a few KB, and it is the codex cache's own per-directory
+  // state that a thread must never own. The eligible list is built with the same
+  // filters (and in the same order) the parse loop applies, so the Nth result
+  // parseFilesInOrder yields is the Nth file that reaches the worker branch.
+  // The decision is per provider rather than pooled across Claude+Codex because
+  // the two scans run one after the other — at most one pool is ever alive — and
+  // a per-provider count is what the verbose line can honestly report.
+  const workerJobs: ParseJob[] = []
+  const workerPaths = new Set<string>()
+  let workerDiscards = 0
+  let pendingBytes = 0
+  if (providerName === 'codex' && !readOnly) {
+    for (const { source, fp } of changedSources) {
+      if (dateRange && fp.mtimeMs < dateRange.start.getTime()) continue
+      if (await readCachedCodexResults(source.path)) continue
+      workerJobs.push({ kind: 'codex', source })
+      workerPaths.add(source.path)
+      pendingBytes += fp.sizeBytes
+    }
+  }
+  const decision = workerJobs.length > 0
+    ? decideParseWorkers({ files: workerJobs.length, bytes: pendingBytes })
+    : { workers: 0, reason: 'no full parses pending' }
+  if (providerName === 'codex' && !readOnly && process.env['CODEBURN_VERBOSE'] === '1') {
+    process.stderr.write(`codeburn: codex parse workers=${decision.workers} (${decision.reason})\n`)
+  }
+  let pool: ParseWorkerPool | null = null
+  if (decision.workers > 0) {
+    try {
+      pool = new ParseWorkerPool(decision.workers)
+    } catch (err) {
+      process.stderr.write(`codeburn: parse workers unavailable, parsing serially (${err instanceof Error ? err.message : String(err)})\n`)
+    }
+  }
+  const offThread = pool ? parseFilesInOrder<CodexFullParse & { keys: string[] }>(pool, workerJobs) : null
+
   // Parse changed files, update cache
   let didParse = false
   // Track which paths have already been cleared this pass so that subsequent
@@ -3101,12 +3143,36 @@ async function parseProviderSources(
         clearedPaths.add(source.path)
       }
 
-      const parser = provider.createSessionParser(source, parserDedup, dateRange)
-
       try {
-        const providerCalls: ParsedProviderCall[] = []
-        for await (const call of parser.parse()) {
-          providerCalls.push(call)
+        // Off-thread results arrive in this order, so the Nth eligible file here
+        // is the Nth yielded result. A worker decodes against an EMPTY dedup set,
+        // so an EMPTY key intersection is the proof that a serial parse would
+        // have dropped nothing either — that, and only that, makes the result
+        // installable. On any overlap (a forked rollout replaying its parent's
+        // token_count history is exactly this) the WHOLE file is discarded and
+        // re-parsed in-process against the real dedup set.
+        let providerCalls: ParsedProviderCall[] | undefined
+        if (offThread && workerPaths.has(source.path)) {
+          const result = (await offThread.next()).value
+          if (result?.ok && result.parsed) {
+            if (result.parsed.keys.some(k => parserDedup.has(k))) {
+              workerDiscards++
+            } else {
+              for (const k of result.parsed.keys) parserDedup.add(k)
+              providerCalls = result.parsed.calls
+              // The worker never touches the codex cache; publish its entry here,
+              // in install order, so flushCodexCache writes what serial would.
+              const write = result.parsed.write
+              if (write) await writeCachedCodexResults(source.path, write.project, providerCalls, write.fingerprint, write.resume)
+            }
+          }
+        }
+        if (!providerCalls) {
+          const parser = provider.createSessionParser(source, parserDedup, dateRange)
+          providerCalls = []
+          for await (const call of parser.parse()) {
+            providerCalls.push(call)
+          }
         }
         const canonicalCalls = await Promise.all(providerCalls.map(canonicalizeProviderCallProject))
         const turns = providerCallsToCachedTurns(canonicalCalls)
@@ -3162,6 +3228,10 @@ async function parseProviderSources(
       }
     }
   } finally {
+    await pool?.close()
+    if (pool && process.env['CODEBURN_VERBOSE'] === '1') {
+      process.stderr.write(`codeburn: codex parse workers done, ${workerDiscards}/${workerJobs.length} results re-parsed in-process on id overlap\n`)
+    }
     if (didParse && providerName === 'codex') await flushCodexCache()
     if (didParse && providerName === 'antigravity') {
       const liveIds = new Set(sources.map(s => antigravityCascadeIdFromPath(s.path)))
