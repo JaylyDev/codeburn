@@ -3,7 +3,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 import zlib from 'zlib'
 
-import { readSessionFile } from '../fs-utils.js'
+import { MAX_SESSION_FILE_BYTES, readSessionFile } from '../fs-utils.js'
 import { calculateCost, getShortModelName } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
@@ -22,6 +22,23 @@ import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderC
 const zstdDecompress = (zlib as { zstdDecompressSync?: (buf: Buffer) => Buffer }).zstdDecompressSync
 
 const ZSTD_MAGIC = 0xfd2fb528
+
+// SESSION_FORMAT_VERSION in @deepseek-ai/dsh-session. DSH refuses to load a log
+// stamped with any other version, and a bump means an event's meaning changed,
+// so a foreign version is skipped rather than read with today's assumptions.
+const SESSION_FORMAT_VERSION = 0
+
+const MIN_REASONABLE_TIMESTAMP_MS = 1_000_000_000_000
+
+// Discovery walks every session, so a per-file notice would repeat once per
+// log; each distinct message is worth saying exactly once.
+const noticed = new Set<string>()
+
+function notice(message: string): void {
+  if (noticed.has(message)) return
+  noticed.add(message)
+  process.stderr.write(message)
+}
 
 type ZstdFrame = { start: number; end: number }
 
@@ -87,13 +104,21 @@ type DshEvent = {
   seq?: number
   time?: number
   // Session header fields live at the top level of the first event.
+  version?: number
   id?: string
   cwd?: string
+  createdAt?: number
+  parentSession?: string
+  seedLength?: number
   data?: {
     turn?: number
     step?: number
     content?: Array<{ type?: string; text?: string }>
+    // `user/message` carries the message author: a real prompt is
+    // `{ kind: 'user' }`, agent-injected context is `{ kind: 'plugin' }`.
+    source?: { kind?: string }
     header?: { config?: { model?: string; provider?: string } }
+    message?: { source?: { kind?: string; model?: string; provider?: string } }
     chunk?: { type?: string; usage?: DshUsage }
     usage?: DshUsage
     name?: string
@@ -109,8 +134,9 @@ type StepBucket = {
   // projection). Time follows the winning report.
   final: boolean
   time?: number
-  // Model in force when this step's usage was reported (the most recent
-  // request/header config at that point in the log).
+  // Model that produced this step: the reporting assistant/message's own
+  // `message.source` when it names one, else the most recent request/header
+  // config (a header can change the model mid-turn between steps).
   model: string
   tools: string[]
   skills: string[]
@@ -136,6 +162,25 @@ const toolNameMap: Record<string, string> = {
 
 function mapToolName(raw: string): string {
   return toolNameMap[raw] ?? raw
+}
+
+// A log stamped with a version this parser was not written against is skipped
+// whole: a bump means an event's meaning changed, so reading it with today's
+// assumptions would report confident wrong numbers.
+function isReadableVersion(header: DshEvent, filePath: string): boolean {
+  if (header.version === SESSION_FORMAT_VERSION) return true
+  notice(`codeburn: skipping DSH session ${filePath}: unsupported session format version ${String(header.version)}; upgrade codeburn.\n`)
+  return false
+}
+
+// DSH writes epoch milliseconds; promote a seconds-resolution value and reject
+// what stays implausible, matching the guard cline-cli.ts uses on the hazard.
+function isoTimestamp(value: number | undefined, fallback: string): string {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallback
+  const ms = value < MIN_REASONABLE_TIMESTAMP_MS ? value * 1000 : value
+  const date = new Date(ms)
+  if (Number.isNaN(date.getTime()) || date.getTime() < MIN_REASONABLE_TIMESTAMP_MS) return fallback
+  return date.toISOString()
 }
 
 function getDshHome(override?: string): string {
@@ -165,11 +210,18 @@ function* readZstdLines(buffer: Buffer, maxFrames = Number.POSITIVE_INFINITY): G
 async function readEventLines(filePath: string): Promise<string[] | null> {
   if (filePath.endsWith('.zstd')) {
     if (!zstdDecompress) {
-      process.stderr.write('codeburn: DSH sessions need Node >= 22.15 (zstd support); skipping DSH usage.\n')
+      notice('codeburn: DSH sessions need Node >= 22.15 (zstd support); skipping DSH usage.\n')
       return null
     }
     let buffer: Buffer
     try {
+      // The whole log is buffered to scan its frames, so it needs the same
+      // oversize guard readSessionFile applies to the uncompressed variant.
+      const size = (await stat(filePath)).size
+      if (size > MAX_SESSION_FILE_BYTES) {
+        notice(`codeburn: skipped oversize DSH session log ${filePath} (${size} bytes)\n`)
+        return null
+      }
       buffer = await readFile(filePath)
     } catch {
       return null
@@ -177,7 +229,7 @@ async function readEventLines(filePath: string): Promise<string[] | null> {
     try {
       return [...readZstdLines(buffer)]
     } catch (err) {
-      process.stderr.write(`codeburn: skipped corrupt DSH session log ${filePath}: ${err instanceof Error ? err.message : err}\n`)
+      notice(`codeburn: skipped corrupt DSH session log ${filePath}: ${err instanceof Error ? err.message : err}\n`)
       return null
     }
   }
@@ -230,7 +282,8 @@ async function readSessionHeader(filePath: string): Promise<DshEvent | null> {
     const line = await firstLine()
     if (!line) return null
     const event = JSON.parse(line) as DshEvent
-    return event.type === 'session' ? event : null
+    if (event.type !== 'session') return null
+    return isReadableVersion(event, filePath) ? event : null
   } catch {
     return null
   }
@@ -307,6 +360,11 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       let cwd = ''
       let model = 'unknown'
       let currentTurn = 0
+      let sessionStart = ''
+      // Events a forked session inherited from its parent. They are a verbatim
+      // copy of the parent's log, which codeburn parses as its own session, so
+      // counting them here would bill the same calls twice.
+      let seedLength = 0
       const userMessageByTurn = new Map<number, string>()
       const buckets = new Map<string, StepBucket>()
 
@@ -319,10 +377,17 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         }
 
         if (event.type === 'session') {
+          if (!isReadableVersion(event, source.path)) return
           sessionId = event.id ?? sessionId
           cwd = event.cwd ?? cwd
+          sessionStart = isoTimestamp(event.createdAt, sessionStart)
+          if (typeof event.parentSession === 'string' && event.parentSession && typeof event.seedLength === 'number') {
+            seedLength = event.seedLength
+          }
           continue
         }
+
+        if (typeof event.seq === 'number' && event.seq < seedLength) continue
 
         if (event.type === 'turn/start') {
           currentTurn = event.data?.turn ?? currentTurn
@@ -338,10 +403,15 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         }
 
         if (event.type === 'user/message') {
+          // Plugin-injected context (runtime snapshots, skill bodies, file-change
+          // notices) rides the same event type as a typed prompt; only the latter
+          // is a useful preview.
+          if (event.data?.source?.kind !== 'user') continue
+          if (userMessageByTurn.has(currentTurn)) continue
           const texts = (event.data?.content ?? [])
             .filter(c => c.type === 'text' && typeof c.text === 'string' && c.text)
             .map(c => c.text!)
-          if (texts.length > 0) userMessageByTurn.set(currentTurn, texts.join(' '))
+          if (texts.length > 0) userMessageByTurn.set(currentTurn, texts.join(' ').slice(0, 500))
           continue
         }
 
@@ -369,11 +439,16 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
         let usage: DshUsage | undefined
         let isFinal = false
+        // The model that actually served the call, when the message records it.
+        // request/header only describes the request codeburn is about to see.
+        let reportedModel = model
         if (event.type === 'assistant/chunk' && event.data?.chunk?.type === 'usage') {
           usage = event.data.chunk.usage
         } else if (event.type === 'assistant/message' && event.data?.usage) {
           usage = event.data.usage
           isFinal = true
+          const messageModel = event.data.message?.source?.model
+          if (typeof messageModel === 'string' && messageModel) reportedModel = messageModel
         } else {
           continue
         }
@@ -394,7 +469,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           bucket.usage = usage
           bucket.final = isFinal
           bucket.time = event.time
-          bucket.model = model
+          bucket.model = reportedModel
         }
       }
 
@@ -435,13 +510,14 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           tools: [...new Set(bucket.tools)],
           bashCommands: bucket.bashCommands,
           skills: bucket.skills.length > 0 ? [...new Set(bucket.skills)] : undefined,
-          timestamp: typeof bucket.time === 'number' ? new Date(bucket.time).toISOString() : '',
+          timestamp: isoTimestamp(bucket.time, sessionStart),
           speed: 'standard',
           deduplicationKey: dedupKey,
           userMessage: userMessageByTurn.get(turn!) ?? '',
           sessionId: sessionId || source.path,
           project: cwd ? projectFromCwd(cwd, source.project) : source.project,
           projectPath: cwd || undefined,
+          workingDirectory: cwd || undefined,
         }
       }
     },

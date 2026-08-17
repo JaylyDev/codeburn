@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, rm } from 'fs/promises'
 import { join } from 'path'
 import { homedir, tmpdir } from 'os'
 import zlib from 'zlib'
@@ -402,5 +402,138 @@ describe('dsh provider - display names', () => {
     expect(provider.toolDisplayName('pwsh')).toBe('Bash')
     expect(provider.toolDisplayName('todo_write')).toBe('TodoWrite')
     expect(provider.toolDisplayName('cordis_run')).toBe('cordis_run')
+  })
+})
+
+describe('dsh provider - real log fidelity', () => {
+  // The upstream snapshot from deepseek-ai/deepseek-harness
+  // (examples/acp-agent/tests/snapshots/bash-tool-turn/session.jsonl), with its
+  // template placeholders filled in. It is the reference for every shape the
+  // parser reads: packed `reasoning-chunks`/`tool-call-chunks` storage rows, a
+  // plugin-injected user/message beside the typed one, and both the streamed
+  // usage chunk and the final assistant/message usage for the same step.
+  async function writeRealSession(): Promise<string> {
+    const lines = (await readFile(join(import.meta.dirname, '../fixtures/dsh/bash-tool-turn.jsonl'), 'utf-8'))
+      .split('\n').filter(l => l.trim())
+    return writePlainSession('--home-u-proj--', 'e128dda9-ed11-4868-8266-0ef90d03c3d6', lines)
+  }
+
+  it('parses the upstream snapshot: two steps, exact usage, model from the message source', async () => {
+    const calls = await parseAll(createDshProvider(tmpDir), await writeRealSession())
+
+    expect(calls).toHaveLength(2)
+    expect(calls.map(c => c.model)).toEqual(['deepseek-v4-flash', 'deepseek-v4-flash'])
+    expect(calls[0]).toMatchObject({
+      inputTokens: 2877,
+      outputTokens: 90,
+      cacheReadInputTokens: 0,
+      reasoningTokens: 18,
+      sessionId: 'e128dda9-ed11-4868-8266-0ef90d03c3d6',
+      project: 'proj',
+      projectPath: '/home/u/proj',
+      workingDirectory: '/home/u/proj',
+    })
+    expect(calls[1]).toMatchObject({ inputTokens: 168, outputTokens: 25, cacheReadInputTokens: 2816, reasoningTokens: 22 })
+    // Reasoning bills at the output rate, so it must not appear as input.
+    expect(calls[0]!.costUSD).toBe(calculateCost('deepseek-v4-flash', 2877, 90 + 18, 0, 0, 0))
+    expect(calls[0]!.costUSD).toBeGreaterThan(0)
+  })
+
+  it('takes the typed prompt as the preview, not the plugin-injected context', async () => {
+    const calls = await parseAll(createDshProvider(tmpDir), await writeRealSession())
+
+    expect(calls[0]!.userMessage).toBe('Use the bash tool to run exactly: echo TERMINAL_OK. Then reply with the single word DONE and stop.')
+    expect(calls[0]!.userMessage).not.toContain('Current runtime context')
+  })
+
+  it('reads the tool call through the packed chunk rows around it', async () => {
+    const calls = await parseAll(createDshProvider(tmpDir), await writeRealSession())
+
+    expect(calls[0]!.tools).toEqual(['Bash'])
+    expect(calls[0]!.bashCommands).toEqual(['echo'])
+  })
+})
+
+describe('dsh provider - defensive reads', () => {
+  it('skips a log stamped with an unsupported session format version', async () => {
+    const filePath = await writePlainSession('--home-u-proj--', 'session-future', [
+      JSON.stringify({ type: 'session', version: 1, id: 'session-future', createdAt: 1786707336131, cwd: '/home/u/proj', delegationDepth: 0 }),
+      chunkUsage(1, 1, { inputTokens: 100, outputTokens: 10 }, 1786707340000),
+    ])
+
+    expect(await createDshProvider(tmpDir).discoverSessions()).toEqual([])
+    expect(await parseAll(createDshProvider(tmpDir), filePath)).toEqual([])
+  })
+
+  it('does not bill a forked session for the events it inherited from its parent', async () => {
+    const filePath = await writePlainSession('--home-u-proj--', 'session-fork', [
+      JSON.stringify({
+        type: 'session', version: 0, id: 'session-fork', createdAt: 1786707336131,
+        cwd: '/home/u/proj', parentSession: 'session-parent', seedLength: 3, delegationDepth: 0,
+      }),
+      // seq 0..2 are a verbatim copy of the parent's log, which codeburn parses
+      // as its own session; only seq >= 3 is this session's own work.
+      JSON.stringify({ type: 'turn/start', seq: 0, time: 1786707337000, data: { turn: 1 } }),
+      JSON.stringify({ type: 'assistant/message', seq: 1, time: 1786707337100, data: { turn: 1, step: 1, message: { role: 'assistant', content: [] }, usage: { inputTokens: 9999, outputTokens: 999 } } }),
+      JSON.stringify({ type: 'session/end-seed', seq: 2, time: 1786707337200, data: {} }),
+      JSON.stringify({ type: 'turn/start', seq: 3, time: 1786707338000, data: { turn: 2 } }),
+      JSON.stringify({ type: 'assistant/message', seq: 4, time: 1786707338100, data: { turn: 2, step: 1, message: { role: 'assistant', content: [] }, usage: { inputTokens: 100, outputTokens: 10 } } }),
+    ])
+
+    const calls = await parseAll(createDshProvider(tmpDir), filePath)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.inputTokens).toBe(100)
+  })
+
+  it('ignores unknown event types, packed chunk rows, and unparsable lines', async () => {
+    const filePath = await writePlainSession('--home-u-proj--', 'session-noise', [
+      sessionHeader({ id: 'session-noise', cwd: '/home/u/proj' }),
+      JSON.stringify({ type: 'agent/inbox/spliced', seq: 0, time: 1786707337000, data: { target: 'next-turn' } }),
+      JSON.stringify({ type: 'reasoning-chunks', seq0: 1, time0: 1786707337100, data: { turn: 1, step: 1, index: 0, dt: [0], texts: ['a', 'b'] } }),
+      '{ not json at all',
+      '   ',
+      chunkUsage(1, 1, { inputTokens: 100, outputTokens: 10 }, 1786707340000),
+    ])
+
+    const calls = await parseAll(createDshProvider(tmpDir), filePath)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.inputTokens).toBe(100)
+  })
+
+  it('falls back to the header createdAt when a usage event carries no usable time', async () => {
+    const filePath = await writePlainSession('--home-u-proj--', 'session-notime', [
+      JSON.stringify({ type: 'session', version: 0, id: 'session-notime', createdAt: 1786707336131, cwd: '/home/u/proj', delegationDepth: 0 }),
+      JSON.stringify({ type: 'assistant/message', seq: 1, data: { turn: 1, step: 1, message: { role: 'assistant', content: [] }, usage: { inputTokens: 100, outputTokens: 10 } } }),
+    ])
+
+    const calls = await parseAll(createDshProvider(tmpDir), filePath)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.timestamp).toBe(new Date(1786707336131).toISOString())
+  })
+})
+
+describe('dsh provider - real log, real container', () => {
+  it('reads the upstream snapshot out of multi-frame zstd with a torn tail identically to plain jsonl', async () => {
+    const lines = (await readFile(join(import.meta.dirname, '../fixtures/dsh/bash-tool-turn.jsonl'), 'utf-8'))
+      .split('\n').filter(l => l.trim())
+    const plain = await parseAll(
+      createDshProvider(tmpDir),
+      await writePlainSession('--home-u-proj--', 'plain', lines),
+    )
+
+    // Header batch, then three append batches — the layout DSH writes.
+    const dir = join(tmpDir, 'sessions', '--home-u-proj--', 'framed')
+    await mkdir(dir, { recursive: true })
+    const filePath = join(dir, 'session.jsonl.zstd')
+    const frames = [[lines[0]!], lines.slice(1, 10), lines.slice(10, 25), lines.slice(25)]
+      .map(batch => zstdCompress!(Buffer.from(batch.join('\n') + '\n', 'utf-8')))
+    // A crashed writer's half-written final batch, carrying usage that must not count.
+    const torn = zstdCompress!(Buffer.from(assistantMessage(9, 9, { inputTokens: 123456, outputTokens: 1 }, 1785730424999) + '\n', 'utf-8'))
+    await writeFile(filePath, Buffer.concat([...frames, torn.subarray(0, Math.floor(torn.length / 2))]))
+
+    const framed = await parseAll(createDshProvider(tmpDir), filePath)
+    expect(framed.map(c => [c.inputTokens, c.outputTokens, c.reasoningTokens, c.model]))
+      .toEqual(plain.map(c => [c.inputTokens, c.outputTokens, c.reasoningTokens, c.model]))
+    expect(framed).toHaveLength(2)
   })
 })
