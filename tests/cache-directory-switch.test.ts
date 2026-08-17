@@ -111,7 +111,7 @@ describe('call-time CODEBURN_CACHE_DIR isolation', () => {
     expect(diskB.files[sourcePath].calls.map((entry: ParsedProviderCall) => entry.model)).toEqual(['from-b'])
 
     process.env['CODEBURN_CACHE_DIR'] = cacheA
-    expect((await readCachedCodexResults(sourcePath))?.map(entry => entry.model)).toEqual(['from-a'])
+    expect((await readCachedCodexResults(sourcePath))?.calls.map(entry => entry.model)).toEqual(['from-a'])
   })
 
   it('does not flush dirty Codex state from A into B', async () => {
@@ -265,13 +265,13 @@ describe('call-time CODEBURN_CACHE_DIR isolation', () => {
     codexDisk.files[codexSource].calls[0].model = 'after'
     await writeFile(join(cacheDir, 'codex-results.json'), JSON.stringify(codexDisk))
 
-    expect((await readCachedCodexResults(codexSource))?.map(entry => entry.model)).toEqual(['before'])
+    expect((await readCachedCodexResults(codexSource))?.calls.map(entry => entry.model)).toEqual(['before'])
     expect(await readAntigravityModel(antigravitySource)).toBe('before')
 
     clearCodexMemCaches()
     clearAntigravityCacheStates()
 
-    expect((await readCachedCodexResults(codexSource))?.map(entry => entry.model)).toEqual(['after'])
+    expect((await readCachedCodexResults(codexSource))?.calls.map(entry => entry.model)).toEqual(['after'])
     expect(await readAntigravityModel(antigravitySource)).toBe('after')
   })
 })

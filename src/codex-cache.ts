@@ -15,17 +15,35 @@ import type { ParsedProviderCall } from './providers/types.js'
 // v6/v7: rich-session-capture — per-call locAdded/locRemoved/editFailed from
 // patch_apply_end. Sessions cached under v5 lack these fields; re-parse to add.
 // v8: persist native MCP timing and compact invocation attribution.
+// Deliberately NOT bumped for the resume fields (dev/ino + resumeOffset/
+// resumeState): they are additive and absence-safe in both directions, so a
+// bump would only throw away a warm multi-hundred-MB cache to gain nothing. An
+// entry without them simply re-parses in full once and gains them.
 const CODEX_CACHE_VERSION = 8
 const CACHE_FILE = 'codex-results.json'
 
-type FileFingerprint = { mtimeMs: number; sizeBytes: number }
+type FileFingerprint = { dev: number; ino: number; mtimeMs: number; sizeBytes: number }
 
 type FileEntry = {
+  // Absent on entries written before the resume support landed.
+  dev?: number
+  ino?: number
   mtimeMs: number
   sizeBytes: number
   project: string
   calls: ParsedProviderCall[]
+  /** Byte offset of a complete-line boundary the parser can restart from. */
+  resumeOffset?: number
+  /** Opaque parser state captured at `resumeOffset` (shape owned by the Codex parser). */
+  resumeState?: unknown
+  /** How many of `calls` were decoded before `resumeOffset`. */
+  resumeCallCount?: number
 }
+
+/** An exact fingerprint match, or an append the parser can resume into. */
+export type CodexCacheHit =
+  | { kind: 'exact'; calls: ParsedProviderCall[] }
+  | { kind: 'resume'; calls: ParsedProviderCall[]; offset: number; state: unknown; callCount: number }
 
 type ResultCache = {
   version: number
@@ -88,12 +106,28 @@ function getEntry(cache: ResultCache, filePath: string, fp: FileFingerprint): Fi
 
 export async function readCachedCodexResults(
   filePath: string,
-): Promise<ParsedProviderCall[] | null> {
+): Promise<CodexCacheHit | null> {
   try {
     const s = await stat(filePath)
     const cache = await loadCache(currentCacheDir())
-    const entry = getEntry(cache, filePath, { mtimeMs: s.mtimeMs, sizeBytes: s.size })
-    return entry?.calls ?? null
+    const fp = { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, sizeBytes: s.size }
+    const entry = getEntry(cache, filePath, fp)
+    if (entry) return { kind: 'exact', calls: entry.calls }
+    // Rollouts are append-only: the same inode, grown past a boundary we
+    // recorded, can be picked up from that boundary instead of re-read whole.
+    const stale = cache.files[filePath]
+    if (
+      stale
+      && stale.dev === fp.dev
+      && stale.ino === fp.ino
+      && stale.resumeOffset !== undefined
+      && stale.resumeState !== undefined
+      && stale.resumeCallCount !== undefined
+      && fp.sizeBytes > stale.sizeBytes
+      && stale.resumeOffset <= fp.sizeBytes
+    ) {
+      return { kind: 'resume', calls: stale.calls, offset: stale.resumeOffset, state: stale.resumeState, callCount: stale.resumeCallCount }
+    }
   } catch {}
   return null
 }
@@ -104,7 +138,7 @@ export async function getCachedCodexProject(
   try {
     const s = await stat(filePath)
     const cache = await loadCache(currentCacheDir())
-    const entry = getEntry(cache, filePath, { mtimeMs: s.mtimeMs, sizeBytes: s.size })
+    const entry = getEntry(cache, filePath, { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, sizeBytes: s.size })
     return entry?.project ?? null
   } catch {}
   return null
@@ -115,7 +149,7 @@ export async function fingerprintFile(
 ): Promise<FileFingerprint | null> {
   try {
     const s = await stat(filePath)
-    return { mtimeMs: s.mtimeMs, sizeBytes: s.size }
+    return { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, sizeBytes: s.size }
   } catch {
     return null
   }
@@ -126,14 +160,18 @@ export async function writeCachedCodexResults(
   project: string,
   calls: ParsedProviderCall[],
   fingerprint: FileFingerprint,
+  resume?: { offset: number; state: unknown; callCount: number },
 ): Promise<void> {
   try {
     const cache = await loadCache(currentCacheDir())
     cache.files[filePath] = {
+      dev: fingerprint.dev,
+      ino: fingerprint.ino,
       mtimeMs: fingerprint.mtimeMs,
       sizeBytes: fingerprint.sizeBytes,
       project,
       calls,
+      ...(resume ? { resumeOffset: resume.offset, resumeState: resume.state, resumeCallCount: resume.callCount } : {}),
     }
   } catch {}
 }
