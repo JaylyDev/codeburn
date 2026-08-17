@@ -14,7 +14,8 @@ import { createRequire } from 'node:module'
 
 import { isSqliteAvailable } from '../src/sqlite.js'
 import { clearSessionCache, parseAllSessions, setParseReuseValidator } from '../src/parser.js'
-import { loadCache, saveCache, sessionCachePath } from '../src/session-cache.js'
+import { loadCache, saveCache } from '../src/session-cache.js'
+import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 import type { SessionSource, SessionParser, ParsedProviderCall } from '../src/providers/types.js'
 
 // ── Synthetic provider state ───────────────────────────────────────────────
@@ -449,12 +450,10 @@ describe('(f) durable orphans survive a parse-version bump', () => {
 
     // Simulate the fingerprint a PREVIOUS release computed (any mismatching
     // value takes the same code path as a real parse-version bump).
-    const { readFile, writeFile: writeFileFs } = await import('fs/promises')
-    const cachePath = sessionCachePath()
-    const disk = JSON.parse(await readFile(cachePath, 'utf-8')) as { providers: Record<string, { envFingerprint: string }> }
+    const disk = await readCacheOnDisk()
     expect(disk.providers['copilot']).toBeDefined()
     disk.providers['copilot']!.envFingerprint = '0000000000000000'
-    await writeFileFs(cachePath, JSON.stringify(disk), 'utf-8')
+    await writeCacheOnDisk(disk)
 
     // First parse after the "upgrade": the orphan must still be counted and
     // must survive in the rewritten cache, not be erased with the section.

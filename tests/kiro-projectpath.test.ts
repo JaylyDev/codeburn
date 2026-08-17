@@ -24,9 +24,9 @@ import {
   CACHE_VERSION,
   computeEnvFingerprint,
   fingerprintFile,
-  sessionCachePath,
   type SessionCache,
 } from '../src/session-cache.js'
+import { writeCacheOnDisk } from './fixtures/session-cache-io.js'
 
 // The kiro provider reads homedir()/env at call time in discovery; HOME must
 // point at the test root before ../src/parser.js is evaluated (see the
@@ -194,7 +194,7 @@ describe('kiro projectPath cache invalidation (project-path-v1 bump)', () => {
       },
     }
     await mkdir(CACHE_DIR, { recursive: true })
-    await writeFile(sessionCachePath(), JSON.stringify(cache))
+    await writeCacheOnDisk(cache)
     clearSessionCache()
 
     const rows = await kiroCalls()
