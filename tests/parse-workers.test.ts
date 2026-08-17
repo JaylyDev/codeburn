@@ -67,21 +67,24 @@ describe('decideParseWorkers', () => {
   })
 })
 
-function sessionLines(project: number, session: string, turns: number): string {
+type Turn = { id: string; t: number }
+
+function sessionLines(project: string, session: string, turns: Turn[]): string {
   const lines: string[] = []
-  for (let t = 0; t < turns; t++) {
+  for (const { id, t } of turns) {
     const ts = new Date(Date.UTC(2026, 4, 4 + (t % 5), 9, t % 60, 0)).toISOString()
+    const gitBranch = t % 3 === 0 ? 'main' : 'feature'
     lines.push(JSON.stringify({
-      type: 'user', sessionId: session, timestamp: ts, cwd: `/tmp/proj${project}`, gitBranch: 'main',
+      type: 'user', sessionId: session, timestamp: ts, cwd: `/tmp/proj${project}`, gitBranch,
       message: { role: 'user', content: `task ${t} in ${project}` },
     }))
     lines.push(JSON.stringify({
-      type: 'assistant', sessionId: session, timestamp: ts, cwd: `/tmp/proj${project}`, gitBranch: 'main',
+      type: 'assistant', sessionId: session, timestamp: ts, cwd: `/tmp/proj${project}`, gitBranch,
       message: {
-        id: `msg-${project}-${session}-${t}`, type: 'message', role: 'assistant', model: 'claude-sonnet-4-5',
+        id, type: 'message', role: 'assistant', model: 'claude-sonnet-4-5',
         content: [
           { type: 'text', text: 'x'.repeat(200) },
-          { type: 'tool_use', id: `tu-${project}-${session}-${t}`, name: 'Edit', input: { file_path: '/tmp/x', old_string: 'a', new_string: 'b' } },
+          { type: 'tool_use', id: `tu-${id}`, name: 'Edit', input: { file_path: '/tmp/x', old_string: 'a', new_string: 'b' } },
         ],
         usage: { input_tokens: 400 + t, output_tokens: 40 + t, cache_read_input_tokens: 9 },
       },
@@ -89,6 +92,8 @@ function sessionLines(project: number, session: string, turns: number): string {
   }
   return lines.join('\n') + '\n'
 }
+
+const range = (n: number, from = 0): number[] => Array.from({ length: n }, (_, i) => i + from)
 
 async function writeCorpus(claudeDir: string, projects: number, filesPerProject: number): Promise<string[]> {
   const written: string[] = []
@@ -98,11 +103,28 @@ async function writeCorpus(claudeDir: string, projects: number, filesPerProject:
     for (let f = 0; f < filesPerProject; f++) {
       const session = `${p}${f}`.padStart(8, '0') + '-aaaa-bbbb-cccc-000000000000'
       const path = join(dir, `${session}.jsonl`)
-      await writeFile(path, sessionLines(p, session, 12))
+      await writeFile(path, sessionLines(String(p), session, range(12).map(t => ({ id: `msg-${p}-${session}-${t}`, t }))))
       written.push(path)
     }
   }
   return written
+}
+
+/// A resumed Claude session: the new transcript restates the original's assistant
+/// messages verbatim (same message ids) before adding its own. Cross-file dedup
+/// means whichever file is installed FIRST keeps those turns and the other loses
+/// them, so this fixture is only stable if worker results are installed in the
+/// serial order — and it is the only fixture that drives the discard/re-parse path,
+/// since a worker parses against an empty dedup set and cannot see the overlap.
+async function writeResumedPair(claudeDir: string, tag: string, originalName: string, resumedName: string): Promise<void> {
+  const dir = join(claudeDir, 'projects', `-tmp-${tag}`)
+  await mkdir(dir, { recursive: true })
+  const shared = range(6).map(t => ({ id: `${tag}-m${t}`, t }))
+  await writeFile(join(dir, `${originalName}.jsonl`), sessionLines(tag, originalName, shared))
+  await writeFile(
+    join(dir, `${resumedName}.jsonl`),
+    sessionLines(tag, resumedName, [...shared, ...range(4, 6).map(t => ({ id: `${tag}-n${t}`, t }))]),
+  )
 }
 
 /// Cache shard file names carry a random nonce, so compare bodies keyed by
@@ -148,39 +170,57 @@ function stripVolatile(payload: unknown): unknown {
 }
 
 describe('parallel cold parse', () => {
-  let serialHome: string
-  let parallelHome: string
+  let home: string
 
   beforeEach(async () => {
-    serialHome = await mkdtemp(join(tmpdir(), 'cb-serial-'))
-    parallelHome = await mkdtemp(join(tmpdir(), 'cb-parallel-'))
+    home = await mkdtemp(join(tmpdir(), 'cb-cold-'))
   })
 
   afterEach(async () => {
-    await rm(serialHome, { recursive: true, force: true })
-    await rm(parallelHome, { recursive: true, force: true })
+    await rm(home, { recursive: true, force: true })
   })
 
-  // The whole point of the feature: threads may only ever be a speed change.
-  it('produces an identical payload and identical cache shards with and without workers', async () => {
-    await writeCorpus(join(serialHome, '.claude'), 4, 12)
-    await writeCorpus(join(parallelHome, '.claude'), 4, 12)
-
-    const serial = runCli(['status', '--format', 'menubar-json'], serialHome, { CODEBURN_PARSE_WORKERS: '0' })
-    const parallel = runCli(['status', '--format', 'menubar-json'], parallelHome, { CODEBURN_PARSE_WORKERS: '3' })
+  /// Both runs read the SAME corpus, so the absolute paths embedded in the cache
+  /// shards match and the bodies can be compared byte for byte.
+  async function bothWays(extraParallelEnv: Record<string, string> = {}) {
+    const serialCache = join(home, 'cache-serial')
+    const parallelCache = join(home, 'cache-parallel')
+    const args = ['status', '--format', 'menubar-json']
+    const serial = runCli(args, home, { CODEBURN_PARSE_WORKERS: '0', CODEBURN_CACHE_DIR: serialCache })
+    const parallel = runCli(args, home, { CODEBURN_PARSE_WORKERS: '3', CODEBURN_CACHE_DIR: parallelCache, ...extraParallelEnv })
 
     expect(serial.status, serial.stderr).toBe(0)
     expect(parallel.status, parallel.stderr).toBe(0)
-
-    // Homes differ only in their path prefix, which the payload does not carry.
     expect(stripVolatile(JSON.parse(parallel.stdout))).toEqual(stripVolatile(JSON.parse(serial.stdout)))
 
-    const serialShards = await shardBodies(join(serialHome, '.cache', 'codeburn'))
-    const parallelShards = await shardBodies(join(parallelHome, '.cache', 'codeburn'))
+    const serialShards = await shardBodies(serialCache)
     expect(Object.keys(serialShards).length).toBeGreaterThan(0)
-    // Shard bodies embed the absolute source path, so compare shape not bytes
-    // here; the byte-identity claim is the payload equality above.
-    expect(Object.keys(parallelShards)).toEqual(Object.keys(serialShards))
+    expect(await shardBodies(parallelCache)).toEqual(serialShards)
+    return parallel
+  }
+
+  // The whole point of the feature: threads may only ever be a speed change.
+  it('produces an identical payload and byte-identical cache shards with and without workers', async () => {
+    await writeCorpus(join(home, '.claude'), 4, 12)
+    await bothWays()
+  })
+
+  // Resumed sessions in both filename orders: the restating file sorts after the
+  // original in one project and before it in the other, so install order decides
+  // which file keeps the shared turns either way. Out-of-order installation, or
+  // any attempt to patch overlapping turns out of a worker result instead of
+  // discarding the whole file, changes the answer.
+  it("matches the serial parse when files restate each other's message ids", async () => {
+    const claude = join(home, '.claude')
+    await writeResumedPair(claude, 'fwd', '00000000-aaaa-bbbb-cccc-000000000000', '99999999-aaaa-bbbb-cccc-000000000000')
+    await writeResumedPair(claude, 'rev', '99999999-dddd-bbbb-cccc-000000000000', '00000000-dddd-bbbb-cccc-000000000000')
+
+    const parallel = await bothWays({ CODEBURN_VERBOSE: '1' })
+
+    // Pin that the discard path actually ran rather than passing by luck.
+    const overlaps = [...parallel.stderr.matchAll(/(\d+)\/\d+ results re-parsed in-process on id overlap/g)]
+      .reduce((n, m) => n + Number(m[1]), 0)
+    expect(overlaps).toBeGreaterThan(0)
   })
 })
 

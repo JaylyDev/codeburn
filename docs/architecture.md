@@ -100,7 +100,9 @@ Otherwise the worker count is
 "Available" is `process.availableMemory()`, falling back to `os.totalmem()`. It is
 deliberately not `os.freemem()`: on macOS that counts free pages rather than
 available memory and reads as a few hundred MB on an idle 128 GB machine, so a
-gate built on it switches the feature on and off between runs.
+gate built on it switches the feature on and off between runs. On Linux outside a
+memory-limited cgroup, `availableMemory()` reports free memory and can still
+under-report on a busy host — which fails safe, to fewer threads or none.
 
 `CODEBURN_PARSE_WORKERS` overrides the decision and skips every gate above:
 `0` forces the serial parse, `N` forces N workers (capped at the core count).

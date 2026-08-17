@@ -2033,6 +2033,11 @@ async function scanProjectDirs(
     }
   }
   const offThread = pool ? parseFilesInOrder(pool, fullReparsePaths) : null
+  // Files whose worker result had to be thrown away because an earlier file had
+  // already claimed one of its message ids. Expected to stay near zero; a large
+  // count means the corpus is full of resumed sessions and the pool is doing
+  // double work.
+  let workerDiscards = 0
 
   const installClaudeFile = async (filePath: string, info: FileInfo, parsed: ClaudeFileParse): Promise<void> => {
     const cwd = parsed.workingDirectory
@@ -2178,18 +2183,21 @@ async function scanProjectDirs(
           // Straddled: fall through to the full re-parse below.
         }
 
-        // Off-thread results arrive in this same order (parseFilesInOrder), so the
-        // Nth full re-parse in this loop is always the Nth yielded result. A worker
-        // parses against an EMPTY dedup set, which only matches what a serial parse
-        // would produce if none of the ids it claimed were already taken by an
-        // earlier file; when one was (a resumed session restating another file's
-        // history), the result is discarded and the file re-parses in-process, the
-        // same abandon-the-shortcut move the append path makes on a straddle.
+        // Off-thread results arrive in this order (parseFilesInOrder), so the Nth
+        // full re-parse here is the Nth yielded result. A worker parses against an
+        // EMPTY dedup set, so an EMPTY id intersection is the proof that a serial
+        // parse would have dropped nothing either — that, and only that, makes the
+        // result installable. On any overlap the WHOLE file is discarded and
+        // re-parsed in-process. Never patch the overlapping turns out of a worker
+        // result instead: a drop is not local to its own turn, because
+        // parsedTurnsToCachedTurns delta-encodes gitBranch across turns, so removing
+        // one turn changes whether a LATER turn carries a gitBranch key.
         let parsed: ClaudeFileParse | null | undefined
         if (offThread && !append) {
           const result = (await offThread.next()).value
           if (result?.ok && result.parsed) {
             if (result.parsed.msgIds.some(id => seenMsgIds.has(id))) {
+              workerDiscards++
               parsed = undefined
             } else {
               for (const id of result.parsed.msgIds) seenMsgIds.add(id)
@@ -2224,6 +2232,9 @@ async function scanProjectDirs(
     }
   } finally {
     await pool?.close()
+  }
+  if (pool && process.env['CODEBURN_VERBOSE'] === '1') {
+    process.stderr.write(`codeburn: claude parse workers done, ${workerDiscards}/${fullReparsePaths.length} results re-parsed in-process on id overlap\n`)
   }
   parseProgress.finish()
 
