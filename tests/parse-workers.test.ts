@@ -31,6 +31,9 @@ describe('decideParseWorkers', () => {
     expect(decideParseWorkers(BIG_PENDING, { cores: 16, availableBytes: 6 * 1024 ** 3 }, NO_ENV).workers).toBe(6)
     // The smallest machine that clears every gate still only earns 2 threads
     expect(decideParseWorkers({ files: 200, bytes: 300 * 1024 ** 2 }, { cores: 3, availableBytes: 4 * 1024 ** 3 }, NO_ENV).workers).toBe(2)
+    // Big average file: the per-worker budget scales with it (2 x 260 MB + 128 MB),
+    // so the same 2 GB buys 3 threads instead of the 8 a flat 256 MB would.
+    expect(decideParseWorkers({ files: 250, bytes: 65 * 1024 ** 3 }, BIG_SYSTEM, NO_ENV).workers).toBe(3)
     // 300 files earn 6, but the 6 GB behind them earn 30 — bytes win, then the
     // memory budget caps it. A Codex corpus is exactly this shape.
     expect(decideParseWorkers({ files: 300, bytes: 6 * 1024 ** 3 }, BIG_SYSTEM, NO_ENV).workers).toBe(8)
@@ -42,19 +45,19 @@ describe('decideParseWorkers', () => {
     expect(decideParseWorkers(BIG_PENDING, { cores: 2, availableBytes: 32 * 1024 ** 3 }, NO_ENV).workers).toBe(0)
     // A 4 GB box: availableMemory() always reads a little under the nominal size
     expect(decideParseWorkers(BIG_PENDING, { cores: 16, availableBytes: 3.9 * 1024 ** 3 }, NO_ENV).workers).toBe(0)
-    // Warm/incremental: neither gate reached
+    // Warm/incremental: the byte gate is not reached
     expect(decideParseWorkers({ files: 12, bytes: 10 * 1024 ** 2 }, BIG_SYSTEM, NO_ENV).workers).toBe(0)
   })
 
-  it('takes files OR bytes, so a few huge rollouts still parallelise', () => {
-    // 150 rollouts of 4 GB: under the file gate, far over the byte gate
+  it('gates on bytes alone, so a thin corpus never spawns threads it cannot pay for', () => {
+    // 250 files holding under a megabyte between them: threads made this ~5% slower
+    expect(decideParseWorkers({ files: 250, bytes: 917 * 1024 }, BIG_SYSTEM, NO_ENV).workers).toBe(0)
+    expect(decideParseWorkers({ files: 5000, bytes: 10 * 1024 ** 2 }, BIG_SYSTEM, NO_ENV).workers).toBe(0)
+    expect(decideParseWorkers({ files: 250, bytes: 917 * 1024 }, BIG_SYSTEM, NO_ENV).reason)
+      .toContain('below 210 MB pending')
+    // 150 rollouts over the byte gate: far under any file-count threshold, and the
+    // biggest workload there is
     expect(decideParseWorkers({ files: 150, bytes: 4 * 1024 ** 3 }, BIG_SYSTEM, NO_ENV).workers).toBe(8)
-    // Many small files: under the byte gate, over the file gate
-    expect(decideParseWorkers({ files: 5000, bytes: 10 * 1024 ** 2 }, BIG_SYSTEM, NO_ENV).workers).toBe(8)
-    // Neither: still serial
-    expect(decideParseWorkers({ files: 150, bytes: 10 * 1024 ** 2 }, BIG_SYSTEM, NO_ENV).workers).toBe(0)
-    expect(decideParseWorkers({ files: 150, bytes: 10 * 1024 ** 2 }, BIG_SYSTEM, NO_ENV).reason)
-      .toContain('below 200 pending files and 210 MB pending')
   })
 
   it('honours CODEBURN_PARSE_WORKERS, which also bypasses the auto gates', () => {
@@ -431,8 +434,10 @@ describe('ParseWorkerPool', () => {
     const serial = await parseClaudeFileFull(files[0]!, new Set<string>())
     expect(fromWorker.ok).toBe(true)
     if (!fromWorker.ok || !fromWorker.parsed) throw new Error('expected a parsed result')
-    const { msgIds, ...worker } = fromWorker.parsed
+    const { msgIds, path, ...worker } = fromWorker.parsed
     expect(msgIds.length).toBeGreaterThan(0)
+    // Echoed back so the parent can assert the positional worker/file pairing.
+    expect(path).toBe(files[0])
     expect(worker).toEqual(JSON.parse(JSON.stringify(serial)))
   })
 
@@ -453,9 +458,11 @@ describe('ParseWorkerPool', () => {
     const seen = new Set<string>()
     const serial = await parseCodexFileFull(codexSource, seen)
     if (!fromWorker.ok || !fromWorker.parsed) throw new Error('expected a parsed result')
-    const { keys, ...worker } = fromWorker.parsed
+    const { keys, path, ...worker } = fromWorker.parsed
     expect(keys.length).toBeGreaterThan(0)
     expect(new Set(keys)).toEqual(seen)
+    // Echoed back so the parent can assert the positional worker/file pairing.
+    expect(path).toBe(codexPath)
     expect(worker).toEqual(JSON.parse(JSON.stringify(serial)))
     // The decode itself must never have touched the codex cache file.
     expect(await codexResults(join(home, '.cache', 'codeburn'))).toBeNull()

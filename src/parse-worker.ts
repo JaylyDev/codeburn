@@ -22,11 +22,11 @@ port.on('message', (msg: ParseJob) => {
       const seen = new Set<string>()
       if (msg.kind === 'codex') {
         const parsed = await parseCodexFileFull(msg.source, seen)
-        port.postMessage({ json: JSON.stringify({ ...parsed, keys: [...seen] }) })
+        port.postMessage({ json: JSON.stringify({ ...parsed, keys: [...seen], path: msg.source.path }) })
         return
       }
       const parsed = await parseClaudeFileFull(msg.filePath, seen)
-      port.postMessage({ json: parsed === null ? null : JSON.stringify({ ...parsed, msgIds: [...seen] }) })
+      port.postMessage({ json: parsed === null ? null : JSON.stringify({ ...parsed, msgIds: [...seen], path: msg.filePath }) })
     } catch (err) {
       port.postMessage({ error: err instanceof Error ? err.message : String(err) })
     }

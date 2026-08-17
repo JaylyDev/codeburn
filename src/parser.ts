@@ -2071,6 +2071,39 @@ async function scanProjectDirs(
       delete section.files[filePath]
       markCacheDirty(diskCache, 'claude', filePath)
 
+      // Off-thread results arrive in this order (parseFilesInOrder), so the Nth
+      // full re-parse here is the Nth yielded result — appends never consume one,
+      // in either the shortcut or the straddled-fallthrough case. A worker parses
+      // against an EMPTY dedup set, so an EMPTY id intersection is the proof that a
+      // serial parse would have dropped nothing either — that, and only that, makes
+      // the result installable. On any overlap the WHOLE file is discarded and
+      // re-parsed in-process. Never patch the overlapping turns out of a worker
+      // result instead: a drop is not local to its own turn, because
+      // parsedTurnsToCachedTurns delta-encodes gitBranch across turns, so removing
+      // one turn changes whether a LATER turn carries a gitBranch key.
+      // Deliberately OUTSIDE the per-file try below: the pairing is positional, and
+      // a misalignment would install one session's turns under another's path — a
+      // wrong number nobody would ever notice, so it fails the run instead of being
+      // caught as a parse failure.
+      let parsed: ClaudeFileParse | null | undefined
+      if (offThread && !append) {
+        const result = (await offThread.next()).value
+        if (result?.ok && result.parsed) {
+          if (result.parsed.path !== filePath) {
+            throw new Error(`claude parse worker result out of order: got ${result.parsed.path}, expected ${filePath}`)
+          }
+          if (result.parsed.msgIds.some(id => seenMsgIds.has(id))) {
+            workerDiscards++
+            parsed = undefined
+          } else {
+            for (const id of result.parsed.msgIds) seenMsgIds.add(id)
+            parsed = result.parsed
+          }
+        } else if (result?.ok) {
+          parsed = null
+        }
+      }
+
       try {
         if (append) {
           // Append-only growth: parse ONLY the bytes past the cached resume offset
@@ -2186,30 +2219,6 @@ async function scanProjectDirs(
           // Straddled: fall through to the full re-parse below.
         }
 
-        // Off-thread results arrive in this order (parseFilesInOrder), so the Nth
-        // full re-parse here is the Nth yielded result. A worker parses against an
-        // EMPTY dedup set, so an EMPTY id intersection is the proof that a serial
-        // parse would have dropped nothing either — that, and only that, makes the
-        // result installable. On any overlap the WHOLE file is discarded and
-        // re-parsed in-process. Never patch the overlapping turns out of a worker
-        // result instead: a drop is not local to its own turn, because
-        // parsedTurnsToCachedTurns delta-encodes gitBranch across turns, so removing
-        // one turn changes whether a LATER turn carries a gitBranch key.
-        let parsed: ClaudeFileParse | null | undefined
-        if (offThread && !append) {
-          const result = (await offThread.next()).value
-          if (result?.ok && result.parsed) {
-            if (result.parsed.msgIds.some(id => seenMsgIds.has(id))) {
-              workerDiscards++
-              parsed = undefined
-            } else {
-              for (const id of result.parsed.msgIds) seenMsgIds.add(id)
-              parsed = result.parsed
-            }
-          } else if (result?.ok) {
-            parsed = null
-          }
-        }
         if (parsed === undefined) parsed = await parseClaudeFileFull(filePath, seenMsgIds)
         if (!parsed) { filesDone++; await parseProgress.tick(filesDone); continue }
 
@@ -3118,7 +3127,7 @@ async function parseProviderSources(
       process.stderr.write(`codeburn: parse workers unavailable, parsing serially (${err instanceof Error ? err.message : String(err)})\n`)
     }
   }
-  const offThread = pool ? parseFilesInOrder<CodexFullParse & { keys: string[] }>(pool, workerJobs) : null
+  const offThread = pool ? parseFilesInOrder<CodexFullParse & { keys: string[]; path: string }>(pool, workerJobs) : null
 
   // Parse changed files, update cache
   let didParse = false
@@ -3143,30 +3152,37 @@ async function parseProviderSources(
         clearedPaths.add(source.path)
       }
 
-      try {
-        // Off-thread results arrive in this order, so the Nth eligible file here
-        // is the Nth yielded result. A worker decodes against an EMPTY dedup set,
-        // so an EMPTY key intersection is the proof that a serial parse would
-        // have dropped nothing either — that, and only that, makes the result
-        // installable. On any overlap (a forked rollout replaying its parent's
-        // token_count history is exactly this) the WHOLE file is discarded and
-        // re-parsed in-process against the real dedup set.
-        let providerCalls: ParsedProviderCall[] | undefined
-        if (offThread && workerPaths.has(source.path)) {
-          const result = (await offThread.next()).value
-          if (result?.ok && result.parsed) {
-            if (result.parsed.keys.some(k => parserDedup.has(k))) {
-              workerDiscards++
-            } else {
-              for (const k of result.parsed.keys) parserDedup.add(k)
-              providerCalls = result.parsed.calls
-              // The worker never touches the codex cache; publish its entry here,
-              // in install order, so flushCodexCache writes what serial would.
-              const write = result.parsed.write
-              if (write) await writeCachedCodexResults(source.path, write.project, providerCalls, write.fingerprint, write.resume)
-            }
+      // Off-thread results arrive in this order, so the Nth eligible file here is
+      // the Nth yielded result. A worker decodes against an EMPTY dedup set, so an
+      // EMPTY key intersection is the proof that a serial parse would have dropped
+      // nothing either — that, and only that, makes the result installable. On any
+      // overlap (a forked rollout replaying its parent's token_count history is
+      // exactly this) the WHOLE file is discarded and re-parsed in-process against
+      // the real dedup set. Deliberately OUTSIDE the per-file try below: the
+      // pairing is positional, and a misalignment would install one rollout's
+      // calls under another's path — a wrong number nobody would ever notice, so
+      // it fails the run instead of being caught as a parse failure.
+      let providerCalls: ParsedProviderCall[] | undefined
+      if (offThread && workerPaths.has(source.path)) {
+        const result = (await offThread.next()).value
+        if (result?.ok && result.parsed) {
+          if (result.parsed.path !== source.path) {
+            throw new Error(`codex parse worker result out of order: got ${result.parsed.path}, expected ${source.path}`)
+          }
+          if (result.parsed.keys.some(k => parserDedup.has(k))) {
+            workerDiscards++
+          } else {
+            for (const k of result.parsed.keys) parserDedup.add(k)
+            providerCalls = result.parsed.calls
+            // The worker never touches the codex cache; publish its entry here,
+            // in install order, so flushCodexCache writes what serial would.
+            const write = result.parsed.write
+            if (write) await writeCachedCodexResults(source.path, write.project, providerCalls, write.fingerprint, write.resume)
           }
         }
+      }
+
+      try {
         if (!providerCalls) {
           const parser = provider.createSessionParser(source, parserDedup, dateRange)
           providerCalls = []

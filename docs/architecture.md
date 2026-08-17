@@ -100,14 +100,24 @@ The pool is off by default for anything that is not a large cold parse:
 
 | Gate | Serial when |
 |---|---|
-| Pending workload | fewer than 200 whole-file parses AND under 200 MB behind them (either one on its own qualifies) |
+| Pending bytes | under 200 MB behind the pending whole-file parses |
 | Cores | `availableParallelism() <= 2` |
 | Memory | under 4 GB available |
 
 Otherwise the worker count is
-`min(cores - 1, min(0.25 * available, 2 GB) / 256 MB, max(pendingFiles / 50, pendingBytes / 200 MB))`.
+`min(cores - 1, min(0.25 * available, 2 GB) / perWorker, max(pendingFiles / 50, pendingBytes / 200 MB))`.
 Files and bytes each earn threads on their own, so a few hundred multi-hundred-MB
-Codex rollouts parallelize as well as a few thousand small Claude transcripts.
+Codex rollouts parallelize as well as a few thousand small Claude transcripts. The
+gate is bytes only, deliberately: 250 pending files holding under a megabyte
+between them spawn threads that make the run ~5% slower, and a file count only
+starts paying for itself around 400.
+
+`perWorker` is the per-thread memory budget, derived per parse as
+`clamp(256 MB, 2 x (pendingBytes / pendingFiles) + 128 MB, 1 GB)`. A flat figure
+was wrong in both directions: small Claude transcripts peak well under 256 MB,
+while a 260 MB Codex rollout peaks near 430 MB in its worker and scales linearly
+with the pool. The budget also covers the parent, which buffers up to `pool.size`
+finished results while it installs one.
 
 "Available" is `process.availableMemory()`, falling back to `os.totalmem()`. It is
 deliberately not `os.freemem()`: on macOS that counts free pages rather than

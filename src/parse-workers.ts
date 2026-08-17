@@ -4,20 +4,23 @@ import { snapshotPricingState } from './models.js'
 import type { ClaudeFileParse } from './parser.js'
 import type { SessionSource } from './providers/types.js'
 
-// Each worker holds one file's entry list plus its serialized result. 256 MB is
-// the observed high-water mark for the largest real session files; going over the
-// budget is what turns a parallel parse into a swapping one.
-const PER_WORKER_RSS_BYTES = 256 * 1024 * 1024
+// A worker holds one file's entries plus its serialized result, and the parent
+// buffers up to `pool.size` finished results while it installs one — both are in
+// this budget. A flat 256 MB was measured wrong on Codex: a 260 MB rollout peaks
+// near 430 MB per worker and scales linearly with the pool. So derive it from the
+// average pending file instead, floored at the small-transcript figure and capped
+// at 1 GB. Going over the budget is what turns a parallel parse into a swapping one.
+const MIN_PER_WORKER_RSS_BYTES = 256 * 1024 * 1024
+const MAX_PER_WORKER_RSS_BYTES = 1024 * 1024 * 1024
+const PER_WORKER_RSS_OVERHEAD_BYTES = 128 * 1024 * 1024
 const MEMORY_BUDGET_CAP_BYTES = 2 * 1024 * 1024 * 1024
 const MIN_AVAILABLE_BYTES = 4 * 1024 * 1024 * 1024
 const MIN_FILES_PER_WORKER = 50
 const MIN_BYTES_PER_WORKER = 200 * 1024 * 1024
-// Below BOTH of these, a parse is warm/incremental and the thread startup +
-// result transfer costs more than the parallelism buys. Either one on its own
-// qualifies: a Codex corpus is a few hundred rollouts of which a handful carry
-// most of the gigabytes, so a file-count-only gate leaves the biggest workload
-// there is (150 huge rollouts) parsing serially.
-const MIN_PENDING_FILES = 200
+// Below this a parse is warm/incremental and the thread startup + result transfer
+// costs more than the parallelism buys. Bytes, not file count: 250 pending files
+// holding under a megabyte between them spawn threads that make the run ~5%
+// SLOWER, and the file count only starts paying for itself around 400.
 const MIN_PENDING_BYTES = 200 * 1024 * 1024
 
 export type ParseWorkerDecision = { workers: number; reason: string }
@@ -58,19 +61,21 @@ export function decideParseWorkers(
 
   // Workload gates first, so a warm run's log line says "warm", not whatever the
   // machine happened to look like at that moment.
-  if (pending.files < MIN_PENDING_FILES && pending.bytes < MIN_PENDING_BYTES) {
-    return { workers: 0, reason: `below ${MIN_PENDING_FILES} pending files and ${Math.round(MIN_PENDING_BYTES / 1e6)} MB pending; ${inputs}` }
-  }
+  if (pending.bytes < MIN_PENDING_BYTES) return { workers: 0, reason: `below ${Math.round(MIN_PENDING_BYTES / 1e6)} MB pending; ${inputs}` }
   if (sys.cores <= 2) return { workers: 0, reason: `too few cores; ${inputs}` }
   if (sys.availableBytes < MIN_AVAILABLE_BYTES) return { workers: 0, reason: `below ${Math.round(MIN_AVAILABLE_BYTES / 1e9)} GB available memory; ${inputs}` }
 
   const memoryBudget = Math.min(0.25 * sys.availableBytes, MEMORY_BUDGET_CAP_BYTES)
+  const perWorker = Math.min(
+    MAX_PER_WORKER_RSS_BYTES,
+    Math.max(MIN_PER_WORKER_RSS_BYTES, 2 * (pending.bytes / Math.max(1, pending.files)) + PER_WORKER_RSS_OVERHEAD_BYTES),
+  )
   // Files and bytes each earn threads on their own: a few hundred huge rollouts
   // are as parallelisable as a few thousand small transcripts, and gating the
   // count on files alone would hand a 6 GB / 60-file workload a single thread.
   const workers = Math.min(
     sys.cores - 1,
-    Math.floor(memoryBudget / PER_WORKER_RSS_BYTES),
+    Math.floor(memoryBudget / perWorker),
     Math.max(
       Math.floor(pending.files / MIN_FILES_PER_WORKER),
       Math.floor(pending.bytes / MIN_BYTES_PER_WORKER),
@@ -112,7 +117,7 @@ export type ParseWorkerResult<T> =
   | { ok: true; parsed: T | null }
   | { ok: false; error: string }
 
-export type ClaudeWorkerParse = ClaudeFileParse & { msgIds: string[] }
+export type ClaudeWorkerParse = ClaudeFileParse & { msgIds: string[]; path: string }
 
 type Task = { job: ParseJob; resolve: (r: ParseWorkerResult<unknown>) => void }
 
