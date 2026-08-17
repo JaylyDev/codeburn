@@ -1,13 +1,8 @@
-import { useState } from 'react'
 import type { Model } from '../lib/payload'
 import type { CurrencyState } from '../lib/currency'
-import { formatCompactCurrency } from '../lib/currency'
-
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
-  return String(n)
-}
+import { formatCompactCurrency, formatTokens } from '../lib/currency'
+import { CollapsibleSection } from './CollapsibleSection'
+import { FixedBar, COL_COST, COL_COUNT } from './ActivitySection'
 
 type Props = {
   models: Model[]
@@ -18,54 +13,35 @@ type Props = {
 }
 
 export function ModelsSection({ models, inputTokens, outputTokens, cacheHitPercent, currency }: Props) {
-  const [expanded, setExpanded] = useState(true)
-
   if (models.length === 0) return null
-
-  const maxCost = Math.max(...models.map(m => m.cost))
+  const maxCost = Math.max(...models.map(m => m.cost), 0.01)
 
   return (
-    <section className="models-section">
-      <button className="section-header" onClick={() => setExpanded(!expanded)}>
-        <span className="section-dot" />
-        <span className="section-caption">Models</span>
-        {expanded && (
-          <span className="section-columns">
-            <span>Cost</span>
-            <span>Calls</span>
-          </span>
-        )}
-        <span className={`chevron ${expanded ? 'chevron-open' : ''}`}>&#9656;</span>
-      </button>
-
-      {expanded && (
-        <>
-          {models.map(m => {
-            const fillPct = maxCost > 0 ? (m.cost / maxCost) * 100 : 0
-            return (
-              <div key={m.name} className="model-row">
-                <div className="row-bar-container">
-                  <div className="row-bar-fill" style={{ width: `${fillPct}%` }} />
-                </div>
-                <div className="row-label">{m.name}</div>
-                <div className="row-cost">{formatCompactCurrency(m.cost, currency)}</div>
-                <div className="row-calls">{m.calls}</div>
-              </div>
-            )
-          })}
-
-          {(inputTokens > 0 || outputTokens > 0) && (
-            <div className="tokens-line">
-              <span className="tokens-label">Tokens</span>
-              <span className="tokens-value">{formatTokens(inputTokens)} in</span>
-              <span className="tokens-sep">&middot;</span>
-              <span className="tokens-value">{formatTokens(outputTokens)} out</span>
-              <span className="tokens-sep">&middot;</span>
-              <span className="tokens-value">{Math.round(cacheHitPercent)}% cache hit</span>
-            </div>
-          )}
-        </>
+    <CollapsibleSection
+      caption="Models"
+      columns={[
+        { label: 'Cost', width: COL_COST },
+        { label: 'Calls', width: COL_COUNT },
+      ]}
+    >
+      {models.map(m => (
+        <div key={m.name} className="data-row">
+          <FixedBar fraction={m.cost / maxCost} />
+          <span className="row-name">{m.name}</span>
+          <span className="row-cost" style={{ minWidth: COL_COST }}>{formatCompactCurrency(m.cost, currency)}</span>
+          <span className="row-count" style={{ minWidth: COL_COUNT }}>{m.calls}</span>
+        </div>
+      ))}
+      {(inputTokens > 0 || outputTokens > 0) && (
+        <div className="tokens-line">
+          <span className="tokens-label">Tokens</span>
+          <span className="tokens-value">{formatTokens(inputTokens)} in</span>
+          <span className="tokens-sep">·</span>
+          <span className="tokens-value">{formatTokens(outputTokens)} out</span>
+          <span className="tokens-sep">·</span>
+          <span className="tokens-value">{Math.round(cacheHitPercent)}% cache hit</span>
+        </div>
       )}
-    </section>
+    </CollapsibleSection>
   )
 }

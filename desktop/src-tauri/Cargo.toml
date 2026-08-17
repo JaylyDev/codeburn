@@ -25,6 +25,9 @@ anyhow = "1"
 dirs = "5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = "0.3"
 png = "0.17"

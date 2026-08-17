@@ -35,8 +35,14 @@ export type Model = {
   name: string
   cost: number
   calls: number
-  inputTokens?: number
-  outputTokens?: number
+}
+
+export type DailyModel = {
+  name: string
+  cost: number
+  calls: number
+  inputTokens: number
+  outputTokens: number
 }
 
 export type DailyEntry = {
@@ -47,24 +53,5 @@ export type DailyEntry = {
   outputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
-  topModels?: Array<{ name: string; totalTokens?: number; inputTokens?: number; outputTokens?: number }>
-}
-
-export const placeholderPayload: MenubarPayload = {
-  generated: new Date().toISOString(),
-  current: {
-    label: 'Loading...',
-    cost: 0,
-    calls: 0,
-    sessions: 0,
-    oneShotRate: null,
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheHitPercent: 0,
-    topActivities: [],
-    topModels: [],
-    providers: {},
-  },
-  optimize: { findingCount: 0, savingsUSD: 0, topFindings: [] },
-  history: { daily: [] },
+  topModels?: DailyModel[]
 }

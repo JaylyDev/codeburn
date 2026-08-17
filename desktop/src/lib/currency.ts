@@ -10,6 +10,13 @@ export type CurrencyState = {
 
 export const USD: CurrencyState = { code: 'USD', symbol: '$', rate: 1 }
 
+export const CURRENCY_CODES = [
+  'USD', 'GBP', 'EUR', 'AUD', 'CAD', 'NZD', 'JPY', 'CHF', 'INR',
+  'BRL', 'SEK', 'SGD', 'HKD', 'KRW', 'MXN', 'ZAR', 'DKK',
+] as const
+
+const SUB_CENT = 0.005
+
 /// Wider format with thousands separators. Used for the hero value.
 export function formatCurrency(usdAmount: number, currency: CurrencyState): string {
   const converted = usdAmount * currency.rate
@@ -23,4 +30,22 @@ export function formatCurrency(usdAmount: number, currency: CurrencyState): stri
 export function formatCompactCurrency(usdAmount: number, currency: CurrencyState): string {
   const converted = usdAmount * currency.rate
   return `${currency.symbol}${converted.toFixed(2)}`
+}
+
+/// For savings and other tiny amounts: never print a misleading "$0.00".
+export function formatSmallCurrency(usdAmount: number, currency: CurrencyState): string {
+  const converted = usdAmount * currency.rate
+  if (converted > 0 && converted < SUB_CENT) return `<${currency.symbol}0.01`
+  return formatCompactCurrency(usdAmount, currency)
+}
+
+/// Token compaction shared by every surface (the mac app rounds K to whole numbers).
+export function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`
+  return `${Math.round(n)}`
+}
+
+export function plural(n: number, singular: string, pluralForm = `${singular}s`): string {
+  return `${n} ${n === 1 ? singular : pluralForm}`
 }

@@ -22,7 +22,12 @@
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "visible": false,
-        "focus": false
+        "focus": false,
+        "shadow": true,
+        "windowEffects": {
+          "effects": ["acrylic"],
+          "state": "active"
+        }
       }
     ],
     "security": {
@@ -31,7 +36,8 @@
     "trayIcon": {
       "id": "codeburn-tray",
       "iconPath": "icons/tray.png",
-      "iconAsTemplate": false
+      "iconAsTemplate": false,
+      "tooltip": "CodeBurn"
     }
   },
   "bundle": {

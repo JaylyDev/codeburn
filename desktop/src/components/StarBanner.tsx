@@ -1,35 +1,28 @@
 import { useState } from 'react'
+import { readSetting, writeSetting } from '../lib/settings'
+import { StarIcon, XIcon } from './Icons'
 
-const STORAGE_KEY = 'codeburn.starBannerDismissed'
 const GITHUB_URL = 'https://github.com/getagentseal/codeburn'
 
 export function StarBanner() {
-  const [dismissed, setDismissed] = useState(() => {
-    return localStorage.getItem(STORAGE_KEY) === 'true'
-  })
-
+  const [dismissed, setDismissed] = useState(() => readSetting('starBannerDismissed') === 'true')
   if (dismissed) return null
 
   const dismiss = () => {
-    localStorage.setItem(STORAGE_KEY, 'true')
+    writeSetting('starBannerDismissed', 'true')
     setDismissed(true)
   }
 
   return (
     <div className="star-banner">
-      <span className="star-banner-icon">*</span>
-      <a
-        className="star-banner-link"
-        href={GITHUB_URL}
-        target="_blank"
-        rel="noopener noreferrer"
-      >
+      <StarIcon size={10} className="star-banner-icon" />
+      <a className="star-banner-link" href={GITHUB_URL} target="_blank" rel="noopener noreferrer">
         <span>Enjoying CodeBurn?</span>{' '}
         <span className="star-banner-cta">Star us on GitHub</span>
       </a>
-      <span style={{ flex: 1 }} />
-      <button className="star-banner-close" onClick={dismiss} title="Hide this banner">
-        ×
+      <span className="star-banner-spacer" />
+      <button type="button" className="star-banner-close" onClick={dismiss} title="Hide this banner" aria-label="Hide this banner">
+        <XIcon size={9} />
       </button>
     </div>
   )

@@ -1,56 +1,64 @@
 import { useState } from 'react'
 import type { MenubarPayload } from '../lib/payload'
+import type { CurrencyState } from '../lib/currency'
 import { computeTipGroups, type TipGroup } from '../lib/tips'
-import { invoke } from '@tauri-apps/api/core'
+import { plural } from '../lib/currency'
+import { ArrowForward, ArrowUpRightCircleIcon, BulbIcon, CheckCircleIcon, ChevronRight, WarningIcon } from './Icons'
 
 type Props = {
   payload: MenubarPayload
+  currency: CurrencyState
+  onOpenTerminal: (args: string[]) => void
 }
 
-export function FindingsSection({ payload }: Props) {
+export function FindingsSection({ payload, currency, onOpenTerminal }: Props) {
   const [expanded, setExpanded] = useState(true)
-  const groups = computeTipGroups(payload)
+  const groups = computeTipGroups(payload, currency)
   const totalSignals = groups.reduce((s, g) => s + g.items.length, 0)
   if (totalSignals === 0) return null
 
   return (
-    <section className="findings-section">
-      <button className="findings-header" onClick={() => setExpanded(!expanded)}>
-        <div className="findings-header-left">
-          <span className="findings-icon section-dot" />
-          <span className="findings-title">Tips for you</span>
-        </div>
-        <div className="findings-header-right">
-          <span className="findings-count">{totalSignals} signals</span>
-          <span className={`chevron ${expanded ? 'chevron-open' : ''}`}>›</span>
-        </div>
-      </button>
+    <section className="findings-wrap">
+      <div className="findings-card">
+        <button type="button" className="findings-header" aria-expanded={expanded} onClick={() => setExpanded(e => !e)}>
+          <span className="findings-header-left">
+            <BulbIcon size={11} className="findings-icon" />
+            <span className="findings-title">Tips for you</span>
+          </span>
+          <span className="findings-header-right">
+            <span className="findings-count">{plural(totalSignals, 'signal')}</span>
+            <ChevronRight size={9} className={`chevron ${expanded ? 'chevron-open' : ''}`} />
+          </span>
+        </button>
 
-      {expanded && (
-        <div className="findings-body">
-          {groups.map(g => g.items.length > 0 && (
-            <TipsGroupView key={g.label} group={g} />
-          ))}
-          {payload.optimize.findingCount > 0 && (
-            <button
-              className="findings-open-optimize"
-              onClick={() => invoke('open_terminal_command', { args: ['optimize'] }).catch(() => {})}
-            >
-              Open Full Optimize →
-            </button>
-          )}
-        </div>
-      )}
+        {expanded && (
+          <div className="findings-body">
+            {groups.map(g => g.items.length > 0 && <TipsGroupView key={g.label} group={g} />)}
+            {payload.optimize.findingCount > 0 && (
+              <button type="button" className="findings-open-optimize" onClick={() => onOpenTerminal(['optimize'])}>
+                <span>Open Full Optimize</span>
+                <ArrowForward size={9} />
+              </button>
+            )}
+          </div>
+        )}
+      </div>
     </section>
   )
+}
+
+function GroupIcon({ icon }: { icon: string }) {
+  if (icon === 'check') return <CheckCircleIcon size={10} />
+  if (icon === 'up') return <ArrowUpRightCircleIcon size={10} />
+  return <WarningIcon size={10} />
 }
 
 function TipsGroupView({ group }: { group: TipGroup }) {
   return (
     <div className="tips-group">
       <div className="tips-group-header">
-        <span className="tips-group-icon">{group.icon}</span>
-        <span className="tips-group-label">{group.label}</span>
+        <GroupIcon icon={group.icon} />
+        <span>{group.label}</span>
       </div>
       {group.items.map((item, i) => (
         <div key={i} className="tips-item">

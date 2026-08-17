@@ -1,122 +1,219 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
 import type { MenubarPayload } from './lib/payload'
-import { placeholderPayload } from './lib/payload'
 import type { CurrencyState } from './lib/currency'
-import { USD } from './lib/currency'
+import { USD, formatCurrency } from './lib/currency'
 import { PayloadCache } from './lib/cache'
-import { AgentTabStrip } from './components/AgentTabStrip'
+import { relativePast } from './lib/dates'
+import { applyTheme, currentTheme, readSetting, writeSetting } from './lib/settings'
+import { AgentTabStrip, detectedProviders } from './components/AgentTabStrip'
 import type { Provider } from './components/AgentTabStrip'
 import { ModelsSection } from './components/ModelsSection'
-import { InsightPills, type InsightMode } from './components/InsightPills'
+import { InsightPills, INSIGHT_ORDER, isInsightMode, type InsightMode } from './components/InsightPills'
 import { TrendInsight } from './components/TrendInsight'
 import { ForecastInsight } from './components/ForecastInsight'
 import { PulseInsight } from './components/PulseInsight'
 import { StatsInsight } from './components/StatsInsight'
+import { PlanInsight } from './components/PlanInsight'
 import { FindingsSection } from './components/FindingsSection'
 import { ActivitySection } from './components/ActivitySection'
 import { LoadingOverlay } from './components/LoadingOverlay'
 import { EmptyProviderState } from './components/EmptyProviderState'
+import { NoDataState } from './components/NoDataState'
+import { SetupState, type CliStatus } from './components/SetupState'
 import { StarBanner } from './components/StarBanner'
 import { HeroSection } from './components/HeroSection'
 import { PeriodTabs, PERIOD_LABELS } from './components/PeriodTabs'
 import type { Period } from './components/PeriodTabs'
+import { FooterBar } from './components/FooterBar'
+import { ErrorToast } from './components/ErrorToast'
 
 const payloadCache = new PayloadCache<MenubarPayload>()
 
+/// Background cadence. Every tick refreshes today/all (tray tooltip, provider badges) and
+/// the visible period/provider; entries younger than STALE_MS are left alone when the
+/// popover is re-opened.
 const REFRESH_INTERVAL_MS = 60_000
+const STALE_MS = 60_000
+
+type FetchOptions = {
+  includeOptimize: boolean
+  showOverlay: boolean
+}
 
 export function App() {
-  const [payload, setPayload] = useState<MenubarPayload>(placeholderPayload)
-  const [todayPayload, setTodayPayload] = useState<MenubarPayload>(placeholderPayload)
   const [period, setPeriod] = useState<Period>('today')
   const [provider, setProvider] = useState<Provider>('all')
+  const [payload, setPayload] = useState<MenubarPayload | null>(null)
+  const [todayPayload, setTodayPayload] = useState<MenubarPayload | null>(null)
   const [currency, setCurrency] = useState<CurrencyState>(USD)
-  const [loading, setLoading] = useState(false)
+  const [overlay, setOverlay] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [insight, setInsight] = useState<InsightMode>('trend')
+  const [insight, setInsight] = useState<InsightMode>(() => {
+    const saved = readSetting('insight')
+    return isInsightMode(saved) ? saved : 'trend'
+  })
+  const [cliStatus, setCliStatus] = useState<CliStatus | null>(null)
+  const [cliChecking, setCliChecking] = useState(false)
+  const [version, setVersion] = useState('')
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
+  const [theme, setTheme] = useState(() => currentTheme())
 
-  const refresh = useCallback(async (includeOptimize: boolean) => {
-    if (!includeOptimize) {
-      const cached = payloadCache.get(period, provider)
-      if (cached) {
-        setPayload(cached)
-        return
-      }
-    }
+  const selection = useRef({ period, provider })
+  selection.current = { period, provider }
 
-    if (payloadCache.isInFlight(period, provider)) return
-
-    const stale = payloadCache.getStale(period, provider)
-    if (stale) setPayload(stale)
-
-    payloadCache.markInFlight(period, provider)
-    setLoading(true)
-    setError(null)
+  const fetchKey = useCallback(async (p: Period, prov: Provider, opts: FetchOptions) => {
+    if (payloadCache.isInFlight(p, prov)) return
+    payloadCache.markInFlight(p, prov)
+    const isSelected = () => selection.current.period === p && selection.current.provider === prov
+    if (opts.showOverlay && isSelected()) setOverlay(true)
     try {
       const json = await invoke<MenubarPayload>('fetch_payload', {
-        period,
-        provider,
-        includeOptimize,
+        period: p,
+        provider: prov,
+        includeOptimize: opts.includeOptimize,
       })
-      payloadCache.set(period, provider, json)
-      setPayload(json)
-      if (period === 'today' && provider === 'all') {
-        setTodayPayload(json)
+      payloadCache.set(p, prov, json)
+      if (isSelected()) setPayload(json)
+      if (p === 'today' && prov === 'all') setTodayPayload(json)
+      setLastUpdated(new Date())
+      setCliStatus(prev => (prev && !(prev.found && prev.compatible) ? { ...prev, found: true, compatible: true, error: null } : prev))
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      if (message.includes('CLI not found')) {
+        const status = await invoke<CliStatus>('cli_status').catch(() => null)
+        if (status) setCliStatus(status)
+      } else if (isSelected()) {
+        setError(message)
+      }
+    } finally {
+      payloadCache.clearInFlight(p, prov)
+      if (isSelected()) setOverlay(false)
+    }
+  }, [])
+
+  const refreshAll = useCallback(async (opts: FetchOptions) => {
+    const { period: p, provider: prov } = selection.current
+    if (!(p === 'today' && prov === 'all')) {
+      fetchKey('today', 'all', { includeOptimize: false, showOverlay: false })
+    }
+    await fetchKey(p, prov, opts)
+  }, [fetchKey])
+
+  const checkCli = useCallback(async () => {
+    setCliChecking(true)
+    try {
+      const status = await invoke<CliStatus>('cli_status')
+      setCliStatus(status)
+      if (status.found && status.compatible) {
+        refreshAll({ includeOptimize: true, showOverlay: true })
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
-      payloadCache.clearInFlight(period, provider)
-      setLoading(false)
+      setCliChecking(false)
     }
-  }, [period, provider])
+  }, [refreshAll])
 
   useEffect(() => {
-    refresh(true)
-    const id = setInterval(() => refresh(false), REFRESH_INTERVAL_MS)
+    invoke<string>('app_version').then(setVersion).catch(() => {})
+    refreshAll({ includeOptimize: true, showOverlay: true })
+    const id = setInterval(() => refreshAll({ includeOptimize: true, showOverlay: false }), REFRESH_INTERVAL_MS)
     return () => clearInterval(id)
-  }, [refresh])
+  }, [refreshAll])
 
   useEffect(() => {
-    const unlisten = listen('codeburn://refresh', () => refresh(true))
-    return () => { unlisten.then(fn => fn()) }
-  }, [refresh])
+    const cached = payloadCache.get(period, provider)
+    setPayload(cached)
+    if (!cached) {
+      fetchKey(period, provider, { includeOptimize: true, showOverlay: true })
+    } else if (payloadCache.age(period, provider) > STALE_MS) {
+      fetchKey(period, provider, { includeOptimize: true, showOverlay: false })
+    }
+  }, [period, provider, fetchKey])
 
   useEffect(() => {
-    const saved = localStorage.getItem('codeburn-theme')
-    if (saved) document.documentElement.setAttribute('data-theme', saved)
-
-    const unlisten = listen('codeburn://toggle-theme', () => {
-      const current = document.documentElement.getAttribute('data-theme')
-      const isDark = current === 'dark' || (!current && window.matchMedia('(prefers-color-scheme: dark)').matches)
-      const next = isDark ? 'light' : 'dark'
-      document.documentElement.setAttribute('data-theme', next)
-      localStorage.setItem('codeburn-theme', next)
+    const unlistenRefresh = listen('codeburn://refresh', () => refreshAll({ includeOptimize: true, showOverlay: true }))
+    const unlistenShown = listen('codeburn://shown', () => {
+      const { period: p, provider: prov } = selection.current
+      if (payloadCache.age(p, prov) > STALE_MS) refreshAll({ includeOptimize: true, showOverlay: false })
     })
-    return () => { unlisten.then(fn => fn()) }
+    const unlistenTheme = listen('codeburn://toggle-theme', () => toggleTheme())
+    return () => {
+      unlistenRefresh.then(fn => fn())
+      unlistenShown.then(fn => fn())
+      unlistenTheme.then(fn => fn())
+    }
+  }, [refreshAll])
+
+  useEffect(() => {
+    const saved = readSetting('theme')
+    if (saved === 'dark' || saved === 'light') applyTheme(saved)
+    setTheme(currentTheme())
+    const media = window.matchMedia('(prefers-color-scheme: dark)')
+    const onChange = () => setTheme(currentTheme())
+    media.addEventListener('change', onChange)
+    return () => media.removeEventListener('change', onChange)
   }, [])
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') invoke('hide_popover').catch(() => {})
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  useEffect(() => {
+    if (!todayPayload) return
+    const text = `CodeBurn · ${formatCurrency(todayPayload.current.cost, currency)} today`
+    invoke('set_tray_tooltip', { text }).catch(() => {})
+  }, [todayPayload, currency])
+
+  const toggleTheme = () => {
+    const next = currentTheme() === 'dark' ? 'light' : 'dark'
+    applyTheme(next)
+    setTheme(next)
+  }
 
   const applyCurrency = async (code: string) => {
     try {
-      const applied = await invoke<CurrencyState>('set_currency', { code })
-      setCurrency(applied)
+      setCurrency(await invoke<CurrencyState>('set_currency', { code }))
     } catch (err) {
-      console.error('set_currency failed', err)
+      setError(err instanceof Error ? err.message : String(err))
     }
   }
 
-  const openFullReport = () => {
-    invoke('open_terminal_command', { args: ['report'] }).catch(console.error)
+  const openTerminal = (args: string[]) => {
+    invoke('open_terminal_command', { args }).catch(err => setError(String(err)))
+  }
+  const connectClaude = () => {
+    invoke('open_claude_login').catch(err => setError(String(err)))
   }
 
-  const exportData = (format: 'csv' | 'json') => {
-    invoke('open_terminal_command', { args: ['export', '-f', format] }).catch(console.error)
+  const selectInsight = (mode: InsightMode) => {
+    setInsight(mode)
+    writeSetting('insight', mode)
   }
 
-  const isFilteredEmpty = provider !== 'all' && payload.current.cost <= 0 && payload.current.calls === 0
+  const providers = detectedProviders(todayPayload)
+  const planVisible = provider === 'claude' || (provider === 'all' && providers.length === 1 && providers[0] === 'claude')
+  const visibleModes = useMemo(
+    () => INSIGHT_ORDER.filter(m => m !== 'plan' || planVisible),
+    [planVisible],
+  )
+  const activeInsight = visibleModes.includes(insight) ? insight : 'trend'
+
+  const cliBlocked = cliStatus !== null && (!cliStatus.found || !cliStatus.compatible)
+  const isFilteredEmpty = payload !== null && provider !== 'all' && payload.current.cost <= 0 && payload.current.calls === 0
+  const neverAnyData = payload !== null && provider === 'all'
+    && payload.current.calls === 0 && payload.current.sessions === 0 && payload.history.daily.length === 0
+
+  const footnote = [version ? `CodeBurn v${version}` : 'CodeBurn', lastUpdated ? `updated ${relativePast(lastUpdated)}` : null]
+    .filter(Boolean)
+    .join(' · ')
 
   return (
     <div className="popover">
@@ -128,105 +225,70 @@ export function App() {
         <div className="subhead">AI Coding Cost Tracker</div>
       </header>
 
-      <AgentTabStrip
-        selected={provider}
-        onSelect={setProvider}
-        payload={todayPayload}
-        currency={currency}
-      />
+      {!cliBlocked && (
+        <AgentTabStrip selected={provider} onSelect={setProvider} payload={todayPayload} currency={currency} />
+      )}
 
       <div className="main-content">
-        <HeroSection payload={payload} currency={currency} />
-
-        <PeriodTabs selected={period} onSelect={setPeriod} />
-
-        {isFilteredEmpty ? (
-          <EmptyProviderState provider={provider} period={period} />
+        {cliBlocked && cliStatus ? (
+          <SetupState status={cliStatus} checking={cliChecking} onCheckAgain={checkCli} />
         ) : (
           <>
-            <div className="insight-area">
-              <InsightPills
-                selected={insight}
-                onSelect={setInsight}
-                modes={['trend', 'forecast', 'pulse', 'stats']}
-              />
-              {insight === 'trend' && (
-                <TrendInsight days={payload.history.daily} currency={currency} />
-              )}
-              {insight === 'forecast' && (
-                <ForecastInsight days={payload.history.daily} currency={currency} />
-              )}
-              {insight === 'pulse' && (
-                <PulseInsight payload={payload} currency={currency} />
-              )}
-              {insight === 'stats' && (
-                <StatsInsight payload={payload} currency={currency} />
-              )}
-            </div>
+            <HeroSection payload={payload} currency={currency} periodLabel={PERIOD_LABELS[period]} isToday={period === 'today'} />
+            <PeriodTabs selected={period} onSelect={setPeriod} />
 
-            {!loading && payload.current.calls === 0 && payload.current.sessions === 0 ? (
-              <section className="empty-state">
-                <h2 className="section-title">No session data yet</h2>
-                <p>
-                  CodeBurn reads local session logs from your AI coding tools. It looks like
-                  none of the supported tools have written any sessions on this machine yet.
-                </p>
-                <p>Supported sources:</p>
-                <ul>
-                  <li><code>~/.claude/projects/</code> (Claude Code)</li>
-                  <li><code>~/.codex/sessions/</code> (Codex CLI)</li>
-                  <li>Cursor IDE local database</li>
-                  <li>GitHub Copilot session events</li>
-                </ul>
-                <p>Run one of those tools for a session, then hit Refresh.</p>
-              </section>
+            {isFilteredEmpty ? (
+              <EmptyProviderState provider={provider} period={period} />
+            ) : neverAnyData ? (
+              <NoDataState onRefresh={() => refreshAll({ includeOptimize: true, showOverlay: true })} />
             ) : (
-              <ActivitySection payload={payload} currency={currency} />
+              <>
+                <div className="insight-area">
+                  <InsightPills selected={activeInsight} onSelect={selectInsight} modes={visibleModes} />
+                  {activeInsight === 'plan' && (
+                    <PlanInsight payload={payload} currency={currency} onOpenTerminal={openTerminal} onConnectClaude={connectClaude} />
+                  )}
+                  {activeInsight === 'trend' && <TrendInsight days={payload?.history.daily ?? []} currency={currency} />}
+                  {activeInsight === 'forecast' && <ForecastInsight days={payload?.history.daily ?? []} currency={currency} />}
+                  {activeInsight === 'pulse' && payload && <PulseInsight payload={payload} currency={currency} />}
+                  {activeInsight === 'stats' && payload && <StatsInsight payload={payload} currency={currency} period={period} />}
+                </div>
+                {payload && (
+                  <>
+                    <ActivitySection payload={payload} currency={currency} />
+                    <ModelsSection
+                      models={payload.current.topModels}
+                      inputTokens={payload.current.inputTokens}
+                      outputTokens={payload.current.outputTokens}
+                      cacheHitPercent={payload.current.cacheHitPercent}
+                      currency={currency}
+                    />
+                    <FindingsSection payload={payload} currency={currency} onOpenTerminal={openTerminal} />
+                  </>
+                )}
+              </>
             )}
-
-            <ModelsSection
-              models={payload.current.topModels}
-              inputTokens={payload.current.inputTokens}
-              outputTokens={payload.current.outputTokens}
-              cacheHitPercent={payload.current.cacheHitPercent}
-              currency={currency}
-            />
-
-            <FindingsSection payload={payload} />
+            {overlay && <LoadingOverlay periodLabel={PERIOD_LABELS[period]} />}
           </>
         )}
-
-        {loading && <LoadingOverlay periodLabel={PERIOD_LABELS[period] ?? period} />}
       </div>
 
-      <footer className="footer">
-        <select
-          className="currency-picker"
-          value={currency.code}
-          onChange={e => applyCurrency(e.target.value)}
-        >
-          {['USD', 'GBP', 'EUR', 'AUD', 'CAD', 'NZD', 'JPY', 'CHF', 'INR', 'BRL', 'SEK', 'SGD', 'HKD', 'KRW', 'MXN', 'ZAR', 'DKK']
-            .map(c => <option key={c} value={c}>{c}</option>)}
-        </select>
-        <button className="refresh" onClick={() => refresh(true)} disabled={loading}>
-          {loading ? '...' : '↻'}
-        </button>
-        <select
-          className="export-picker"
-          value=""
-          onChange={e => { if (e.target.value) exportData(e.target.value as 'csv' | 'json'); e.target.value = '' }}
-        >
-          <option value="" disabled>Export</option>
-          <option value="csv">CSV (folder)</option>
-          <option value="json">JSON</option>
-        </select>
-        <button className="report" onClick={openFullReport}>Open Full Report</button>
-        <button className="quit" onClick={() => invoke('quit_app').catch(console.error)} title="Quit CodeBurn">×</button>
-      </footer>
+      <FooterBar
+        currency={currency}
+        onCurrency={applyCurrency}
+        loading={overlay}
+        onRefresh={() => refreshAll({ includeOptimize: true, showOverlay: true })}
+        onExport={format => openTerminal(['export', '-f', format])}
+        onOpenReport={() => openTerminal(['report'])}
+        onToggleTheme={toggleTheme}
+        onQuit={() => invoke('quit_app').catch(() => {})}
+        themeLabel={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+        footnote={footnote}
+      />
 
       <StarBanner />
 
-      {error && <div className="error-toast">{error}</div>}
+      {error && <ErrorToast message={error} onDismiss={() => setError(null)} />}
     </div>
   )
 }
