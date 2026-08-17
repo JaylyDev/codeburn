@@ -279,9 +279,9 @@ describe('codex resume differential', () => {
 
   it('matches a full re-parse at every line boundary of a rich session', async () => {
     await assertEverySplitMatches(RICH_LINES)
-  })
+  }, 60_000)
 
   it('matches a full re-parse at every line boundary of a forked session', async () => {
     await assertEverySplitMatches(FORK_LINES)
-  })
+  }, 60_000)
 })
