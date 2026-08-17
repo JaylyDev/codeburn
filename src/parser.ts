@@ -31,6 +31,7 @@ import {
   saveCache,
 } from './session-cache.js'
 import { acquireCacheRefreshLock, type RefreshLockHandle } from './cache-refresh-lock.js'
+import { decideParseWorkers, parseFilesInOrder, ParseWorkerPool } from './parse-workers.js'
 import { dateKey } from './day-aggregator.js'
 import type { ParsedProviderCall, SessionSource } from './providers/types.js'
 import type {
@@ -2012,171 +2013,217 @@ async function scanProjectDirs(
   const progressTotal = changedFiles.length
   let filesDone = 0
   emitScanProgress({ kind: 'tick', provider: 'claude', done: 0, total: progressTotal })
-  for (const { filePath, info, append } of changedFiles) {
-    // Marked here, not after the re-parse: an unreadable file `continue`s out
-    // below, and the deletion would otherwise live only in memory.
-    delete section.files[filePath]
-    markCacheDirty(diskCache, 'claude', filePath)
 
+  // Only whole-file re-parses go off-thread. Appends are the warm path: they read
+  // a few KB past the cached offset, so a thread hop would cost more than it saves.
+  const fullReparsePaths = changedFiles.filter(f => !f.append).map(f => f.filePath)
+  const pendingBytes = changedFiles.reduce((n, f) => f.append ? n : n + f.info.fp.sizeBytes, 0)
+  const decision = decideParseWorkers({ files: fullReparsePaths.length, bytes: pendingBytes })
+  if (process.env['CODEBURN_VERBOSE'] === '1') {
+    process.stderr.write(`codeburn: claude parse workers=${decision.workers} (${decision.reason})\n`)
+  }
+  // A pool that cannot even start (worker entry missing from an odd packaging,
+  // thread limit reached) must degrade to the serial parse, not fail the run.
+  let pool: ParseWorkerPool | null = null
+  if (decision.workers > 0) {
     try {
-      if (append) {
-        // Append-only growth: parse ONLY the bytes past the cached resume offset
-        // and merge with the cached turns, rather than re-reading the file from 0.
-        // On a studio machine where live agents constantly append to session
-        // JSONL, this is the dominant warm-run cost. The merged result is
-        // byte-for-byte identical to a full re-parse (see mergeBoundaryCalls).
-        const tracker = { lastCompleteLineOffset: append.readFromOffset }
-        const toolResultMeta = new Map<string, ToolResultMeta>()
-        const sessionMeta = emptySessionMeta()
-        const newEntries = await parseClaudeEntries(filePath, tracker, append.readFromOffset, { toolResultMeta, sessionMeta })
-        const cached = append.cached
-
-        // Straddle guard: a streamed assistant message id that first appeared in
-        // the committed prefix can be restated inside the appended region
-        // (image-heavy turns stream one id across several records over seconds).
-        // The appended region is grouped before this file's cached keys join
-        // seenMsgIds, so the restated id would count twice; suppressing it
-        // instead would freeze the stale first emission. Neither matches a full
-        // re-parse, so on any id overlap the shortcut is abandoned and the file
-        // re-parses from byte 0 (rare: ~0.3% of real files).
-        const cachedIds = new Set(cached.turns.flatMap(t => t.calls.map(c => c.deduplicationKey)))
-        const straddles = newEntries !== null && newEntries.some(e => {
-          const id = getMessageId(e)
-          return id !== null && cachedIds.has(id)
-        })
-        if (!straddles) {
-          const newTurns = newEntries
-            ? parsedTurnsToCachedTurns(groupIntoTurns(dedupeStreamingMessageIds(newEntries), seenMsgIds, toolResultMeta))
-            : []
-
-          const mergedTurns: CachedTurn[] = cached.turns.map(t => ({ ...t, calls: [...t.calls] }))
-          if (newTurns.length > 0) {
-            let startIdx = 0
-            // A first new turn with no leading user message is a continuation of
-            // the last cached turn — merge its calls in (a full re-parse would put
-            // them in that same turn), then append the remaining new turns.
-            if (!newTurns[0]!.userMessage.trim() && mergedTurns.length > 0) {
-              const last = mergedTurns[mergedTurns.length - 1]!
-              last.calls = mergeBoundaryCalls(last.calls, newTurns[0]!.calls)
-              // A PR referenced in the appended continuation belongs to this same
-              // turn: union its refs in so the shortcut matches a full re-parse.
-              const refs = Array.from(new Set([...(last.prRefs ?? []), ...(newTurns[0]!.prRefs ?? [])])).sort()
-              if (refs.length > 0) last.prRefs = refs
-              // A subagent spawned in the appended continuation belongs to this
-              // same turn: union its spawn ids in for the same reason.
-              const spawnIds = Array.from(new Set([...(last.spawnToolUseIds ?? []), ...(newTurns[0]!.spawnToolUseIds ?? [])]))
-              if (spawnIds.length > 0) last.spawnToolUseIds = spawnIds
-              startIdx = 1
-            }
-            for (let i = startIdx; i < newTurns.length; i++) mergedTurns.push(newTurns[i]!)
-          }
-
-          // The cached region's dedup keys were not added to seenMsgIds (only
-          // unchanged files pre-seed it), so add them now — a full re-parse would
-          // have, and later files dedup cross-file against them.
-          for (const t of cached.turns) for (const c of t.calls) seenMsgIds.add(c.deduplicationKey)
-
-          // First-cwd wins, and the first cwd lives in the cached region whenever
-          // one was resolved there; only re-derive if the cached region had none.
-          let canonicalCwd = cached.canonicalCwd
-          let canonicalProjectName = cached.canonicalProjectName
-          let workingDirectory = cached.workingDirectory
-          if (canonicalCwd === undefined && newEntries) {
-            const cwd = extractCanonicalCwd(newEntries)
-            workingDirectory = workingDirectory ?? cwd
-            const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
-            canonicalCwd = canonical?.path
-            canonicalProjectName = canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined
-          }
-
-          // Inventory is a sorted set union; cached (older entries) ∪ new = full.
-          const mcpInventory = newEntries
-            ? Array.from(new Set([...cached.mcpInventory, ...extractMcpInventory(newEntries)])).sort()
-            : cached.mcpInventory
-
-          // Session meta merges across the append boundary: title is last-wins
-          // (prefer the newly-parsed tail), PR links union, isSidechain is sticky.
-          // parentSessionId is sticky (cached-first, it is the earliest region);
-          // agentSpawnLinks union (cached-first, first-seen spawn id per agent wins).
-          const mergedTitle = sessionMeta.title ?? cached.title
-          const mergedPrLinks = Array.from(new Set([...(cached.prLinks ?? []), ...sessionMeta.prLinks]))
-          const mergedSidechain = cached.isSidechain === true || sessionMeta.isSidechain
-          const mergedParentSessionId = cached.parentSessionId ?? sessionMeta.parentSessionId
-          const mergedSpawnLinks = { ...sessionMeta.agentSpawnLinks, ...cached.agentSpawnLinks }
-          const mergedAmbiguousIds = Array.from(new Set([...(cached.ambiguousSpawnAgentIds ?? []), ...sessionMeta.ambiguousSpawnAgentIds]))
-
-          section.files[filePath] = {
-            fingerprint: info.fp,
-            lastCompleteLineOffset: tracker.lastCompleteLineOffset,
-            canonicalCwd,
-            ...(workingDirectory ? { workingDirectory } : {}),
-            canonicalProjectName,
-            mcpInventory,
-            turns: mergedTurns,
-            agentType: cached.agentType,
-            ...(mergedTitle ? { title: mergedTitle } : {}),
-            ...(mergedPrLinks.length > 0 ? { prLinks: mergedPrLinks } : {}),
-            ...(mergedSidechain ? { isSidechain: true } : {}),
-            ...(mergedParentSessionId ? { parentSessionId: mergedParentSessionId } : {}),
-            ...(Object.keys(mergedSpawnLinks).length > 0 ? { agentSpawnLinks: mergedSpawnLinks } : {}),
-            ...(mergedAmbiguousIds.length > 0 ? { ambiguousSpawnAgentIds: mergedAmbiguousIds } : {}),
-          }
-          markCacheDirty(diskCache, 'claude', filePath)
-          filesDone++
-          await parseProgress.tick(filesDone)
-          if (filesDone % 50 === 0 || filesDone === progressTotal) {
-            emitScanProgress({ kind: 'tick', provider: 'claude', done: filesDone, total: progressTotal })
-          }
-          if (onFileParsed) await onFileParsed()
-          continue
-        }
-        // Straddled: fall through to the full re-parse below.
-      }
-
-      const tracker = { lastCompleteLineOffset: 0 }
-      const toolResultMeta = new Map<string, ToolResultMeta>()
-      const sessionMeta = emptySessionMeta()
-      const entries = await parseClaudeEntries(filePath, tracker, undefined, { toolResultMeta, sessionMeta })
-      if (!entries) { filesDone++; await parseProgress.tick(filesDone); continue }
-
-      const turns = groupIntoTurns(dedupeStreamingMessageIds(entries), seenMsgIds, toolResultMeta)
-      const cwd = extractCanonicalCwd(entries)
-      const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
-      section.files[filePath] = {
-        fingerprint: info.fp,
-        lastCompleteLineOffset: tracker.lastCompleteLineOffset,
-        canonicalCwd: canonical?.path,
-        ...(cwd ? { workingDirectory: cwd } : {}),
-        canonicalProjectName: canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined,
-        mcpInventory: extractMcpInventory(entries),
-        turns: parsedTurnsToCachedTurns(turns),
-        agentType: await readAgentType(filePath),
-        ...(sessionMeta.title ? { title: sessionMeta.title } : {}),
-        ...(sessionMeta.prLinks.length > 0 ? { prLinks: sessionMeta.prLinks } : {}),
-        ...(sessionMeta.isSidechain ? { isSidechain: true } : {}),
-        ...(sessionMeta.parentSessionId ? { parentSessionId: sessionMeta.parentSessionId } : {}),
-        ...(Object.keys(sessionMeta.agentSpawnLinks).length > 0 ? { agentSpawnLinks: sessionMeta.agentSpawnLinks } : {}),
-        ...(sessionMeta.ambiguousSpawnAgentIds.length > 0 ? { ambiguousSpawnAgentIds: sessionMeta.ambiguousSpawnAgentIds } : {}),
-      }
-      markCacheDirty(diskCache, 'claude', filePath)
+      pool = new ParseWorkerPool(decision.workers)
     } catch (err) {
-      // A single malformed Claude session file must not abort the whole run — that
-      // would empty the daily-cache backfill and wipe the trend/history (issue #441,
-      // same isolation the provider path already has). Record a failure marker keyed
-      // by the current fingerprint so it isn't re-read and re-thrown every run; it
-      // re-parses only if the file changes.
-      section.files[filePath] = { fingerprint: info.fp, mcpInventory: [], turns: [], failed: true }
+      process.stderr.write(`codeburn: parse workers unavailable, parsing serially (${err instanceof Error ? err.message : String(err)})\n`)
+    }
+  }
+  const offThread = pool ? parseFilesInOrder(pool, fullReparsePaths) : null
+
+  const installClaudeFile = async (filePath: string, info: FileInfo, parsed: ClaudeFileParse): Promise<void> => {
+    const cwd = parsed.workingDirectory
+    const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
+    section.files[filePath] = {
+      fingerprint: info.fp,
+      lastCompleteLineOffset: parsed.lastCompleteLineOffset,
+      canonicalCwd: canonical?.path,
+      ...(cwd ? { workingDirectory: cwd } : {}),
+      canonicalProjectName: canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined,
+      mcpInventory: parsed.mcpInventory,
+      turns: parsed.turns,
+      agentType: parsed.agentType,
+      ...(parsed.title ? { title: parsed.title } : {}),
+      ...(parsed.prLinks?.length ? { prLinks: parsed.prLinks } : {}),
+      ...(parsed.isSidechain ? { isSidechain: true } : {}),
+      ...(parsed.parentSessionId ? { parentSessionId: parsed.parentSessionId } : {}),
+      ...(Object.keys(parsed.agentSpawnLinks ?? {}).length > 0 ? { agentSpawnLinks: parsed.agentSpawnLinks } : {}),
+      ...(parsed.ambiguousSpawnAgentIds?.length ? { ambiguousSpawnAgentIds: parsed.ambiguousSpawnAgentIds } : {}),
+    }
+    markCacheDirty(diskCache, 'claude', filePath)
+  }
+
+  try {
+    for (const { filePath, info, append } of changedFiles) {
+      // Marked here, not after the re-parse: an unreadable file `continue`s out
+      // below, and the deletion would otherwise live only in memory.
+      delete section.files[filePath]
       markCacheDirty(diskCache, 'claude', filePath)
-      warnProviderParseFailure('claude', filePath, err)
+
+      try {
+        if (append) {
+          // Append-only growth: parse ONLY the bytes past the cached resume offset
+          // and merge with the cached turns, rather than re-reading the file from 0.
+          // On a studio machine where live agents constantly append to session
+          // JSONL, this is the dominant warm-run cost. The merged result is
+          // byte-for-byte identical to a full re-parse (see mergeBoundaryCalls).
+          const tracker = { lastCompleteLineOffset: append.readFromOffset }
+          const toolResultMeta = new Map<string, ToolResultMeta>()
+          const sessionMeta = emptySessionMeta()
+          const newEntries = await parseClaudeEntries(filePath, tracker, append.readFromOffset, { toolResultMeta, sessionMeta })
+          const cached = append.cached
+
+          // Straddle guard: a streamed assistant message id that first appeared in
+          // the committed prefix can be restated inside the appended region
+          // (image-heavy turns stream one id across several records over seconds).
+          // The appended region is grouped before this file's cached keys join
+          // seenMsgIds, so the restated id would count twice; suppressing it
+          // instead would freeze the stale first emission. Neither matches a full
+          // re-parse, so on any id overlap the shortcut is abandoned and the file
+          // re-parses from byte 0 (rare: ~0.3% of real files).
+          const cachedIds = new Set(cached.turns.flatMap(t => t.calls.map(c => c.deduplicationKey)))
+          const straddles = newEntries !== null && newEntries.some(e => {
+            const id = getMessageId(e)
+            return id !== null && cachedIds.has(id)
+          })
+          if (!straddles) {
+            const newTurns = newEntries
+              ? parsedTurnsToCachedTurns(groupIntoTurns(dedupeStreamingMessageIds(newEntries), seenMsgIds, toolResultMeta))
+              : []
+
+            const mergedTurns: CachedTurn[] = cached.turns.map(t => ({ ...t, calls: [...t.calls] }))
+            if (newTurns.length > 0) {
+              let startIdx = 0
+              // A first new turn with no leading user message is a continuation of
+              // the last cached turn — merge its calls in (a full re-parse would put
+              // them in that same turn), then append the remaining new turns.
+              if (!newTurns[0]!.userMessage.trim() && mergedTurns.length > 0) {
+                const last = mergedTurns[mergedTurns.length - 1]!
+                last.calls = mergeBoundaryCalls(last.calls, newTurns[0]!.calls)
+                // A PR referenced in the appended continuation belongs to this same
+                // turn: union its refs in so the shortcut matches a full re-parse.
+                const refs = Array.from(new Set([...(last.prRefs ?? []), ...(newTurns[0]!.prRefs ?? [])])).sort()
+                if (refs.length > 0) last.prRefs = refs
+                // A subagent spawned in the appended continuation belongs to this
+                // same turn: union its spawn ids in for the same reason.
+                const spawnIds = Array.from(new Set([...(last.spawnToolUseIds ?? []), ...(newTurns[0]!.spawnToolUseIds ?? [])]))
+                if (spawnIds.length > 0) last.spawnToolUseIds = spawnIds
+                startIdx = 1
+              }
+              for (let i = startIdx; i < newTurns.length; i++) mergedTurns.push(newTurns[i]!)
+            }
+
+            // The cached region's dedup keys were not added to seenMsgIds (only
+            // unchanged files pre-seed it), so add them now — a full re-parse would
+            // have, and later files dedup cross-file against them.
+            for (const t of cached.turns) for (const c of t.calls) seenMsgIds.add(c.deduplicationKey)
+
+            // First-cwd wins, and the first cwd lives in the cached region whenever
+            // one was resolved there; only re-derive if the cached region had none.
+            let canonicalCwd = cached.canonicalCwd
+            let canonicalProjectName = cached.canonicalProjectName
+            let workingDirectory = cached.workingDirectory
+            if (canonicalCwd === undefined && newEntries) {
+              const cwd = extractCanonicalCwd(newEntries)
+              workingDirectory = workingDirectory ?? cwd
+              const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
+              canonicalCwd = canonical?.path
+              canonicalProjectName = canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined
+            }
+
+            // Inventory is a sorted set union; cached (older entries) ∪ new = full.
+            const mcpInventory = newEntries
+              ? Array.from(new Set([...cached.mcpInventory, ...extractMcpInventory(newEntries)])).sort()
+              : cached.mcpInventory
+
+            // Session meta merges across the append boundary: title is last-wins
+            // (prefer the newly-parsed tail), PR links union, isSidechain is sticky.
+            // parentSessionId is sticky (cached-first, it is the earliest region);
+            // agentSpawnLinks union (cached-first, first-seen spawn id per agent wins).
+            const mergedTitle = sessionMeta.title ?? cached.title
+            const mergedPrLinks = Array.from(new Set([...(cached.prLinks ?? []), ...sessionMeta.prLinks]))
+            const mergedSidechain = cached.isSidechain === true || sessionMeta.isSidechain
+            const mergedParentSessionId = cached.parentSessionId ?? sessionMeta.parentSessionId
+            const mergedSpawnLinks = { ...sessionMeta.agentSpawnLinks, ...cached.agentSpawnLinks }
+            const mergedAmbiguousIds = Array.from(new Set([...(cached.ambiguousSpawnAgentIds ?? []), ...sessionMeta.ambiguousSpawnAgentIds]))
+
+            section.files[filePath] = {
+              fingerprint: info.fp,
+              lastCompleteLineOffset: tracker.lastCompleteLineOffset,
+              canonicalCwd,
+              ...(workingDirectory ? { workingDirectory } : {}),
+              canonicalProjectName,
+              mcpInventory,
+              turns: mergedTurns,
+              agentType: cached.agentType,
+              ...(mergedTitle ? { title: mergedTitle } : {}),
+              ...(mergedPrLinks.length > 0 ? { prLinks: mergedPrLinks } : {}),
+              ...(mergedSidechain ? { isSidechain: true } : {}),
+              ...(mergedParentSessionId ? { parentSessionId: mergedParentSessionId } : {}),
+              ...(Object.keys(mergedSpawnLinks).length > 0 ? { agentSpawnLinks: mergedSpawnLinks } : {}),
+              ...(mergedAmbiguousIds.length > 0 ? { ambiguousSpawnAgentIds: mergedAmbiguousIds } : {}),
+            }
+            markCacheDirty(diskCache, 'claude', filePath)
+            filesDone++
+            await parseProgress.tick(filesDone)
+            if (filesDone % 50 === 0 || filesDone === progressTotal) {
+              emitScanProgress({ kind: 'tick', provider: 'claude', done: filesDone, total: progressTotal })
+            }
+            if (onFileParsed) await onFileParsed()
+            continue
+          }
+          // Straddled: fall through to the full re-parse below.
+        }
+
+        // Off-thread results arrive in this same order (parseFilesInOrder), so the
+        // Nth full re-parse in this loop is always the Nth yielded result. A worker
+        // parses against an EMPTY dedup set, which only matches what a serial parse
+        // would produce if none of the ids it claimed were already taken by an
+        // earlier file; when one was (a resumed session restating another file's
+        // history), the result is discarded and the file re-parses in-process, the
+        // same abandon-the-shortcut move the append path makes on a straddle.
+        let parsed: ClaudeFileParse | null | undefined
+        if (offThread && !append) {
+          const result = (await offThread.next()).value
+          if (result?.ok && result.parsed) {
+            if (result.parsed.msgIds.some(id => seenMsgIds.has(id))) {
+              parsed = undefined
+            } else {
+              for (const id of result.parsed.msgIds) seenMsgIds.add(id)
+              parsed = result.parsed
+            }
+          } else if (result?.ok) {
+            parsed = null
+          }
+        }
+        if (parsed === undefined) parsed = await parseClaudeFileFull(filePath, seenMsgIds)
+        if (!parsed) { filesDone++; await parseProgress.tick(filesDone); continue }
+
+        await installClaudeFile(filePath, info, parsed)
+      } catch (err) {
+        // A single malformed Claude session file must not abort the whole run — that
+        // would empty the daily-cache backfill and wipe the trend/history (issue #441,
+        // same isolation the provider path already has). Record a failure marker keyed
+        // by the current fingerprint so it isn't re-read and re-thrown every run; it
+        // re-parses only if the file changes.
+        section.files[filePath] = { fingerprint: info.fp, mcpInventory: [], turns: [], failed: true }
+        markCacheDirty(diskCache, 'claude', filePath)
+        warnProviderParseFailure('claude', filePath, err)
+      }
+      filesDone++
+      await parseProgress.tick(filesDone)
+      // Machine-readable tick for the app splash (throttled to ~every 50 files so
+      // a large cold run doesn't flood stderr), plus a partial-progress save.
+      if (filesDone % 50 === 0 || filesDone === progressTotal) {
+        emitScanProgress({ kind: 'tick', provider: 'claude', done: filesDone, total: progressTotal })
+      }
+      if (onFileParsed) await onFileParsed()
     }
-    filesDone++
-    await parseProgress.tick(filesDone)
-    // Machine-readable tick for the app splash (throttled to ~every 50 files so
-    // a large cold run doesn't flood stderr), plus a partial-progress save.
-    if (filesDone % 50 === 0 || filesDone === progressTotal) {
-      emitScanProgress({ kind: 'tick', provider: 'claude', done: filesDone, total: progressTotal })
-    }
-    if (onFileParsed) await onFileParsed()
+  } finally {
+    await pool?.close()
   }
   parseProgress.finish()
 
@@ -2674,6 +2721,54 @@ async function parseClaudeEntries(
   }
   if (!hasLines || entries.length === 0) return null
   return entries
+}
+
+// Everything a cold Claude re-parse does for ONE file: read + decode + line-parse
+// the JSONL, group it into turns, shape it for the cache. Depends on nothing
+// process-wide except `seenMsgIds`, so a worker thread can run it against a fresh
+// empty set and the parent can install the result verbatim once it has confirmed
+// none of those ids were already claimed by an earlier file. Canonical-path
+// resolution deliberately stays with the caller: it walks the filesystem behind a
+// process-global memo.
+export type ClaudeFileParse = {
+  lastCompleteLineOffset: number
+  workingDirectory?: string
+  mcpInventory: string[]
+  turns: CachedTurn[]
+  agentType?: string
+  title?: string
+  prLinks?: string[]
+  isSidechain?: boolean
+  parentSessionId?: string
+  agentSpawnLinks?: Record<string, string>
+  ambiguousSpawnAgentIds?: string[]
+}
+
+export async function parseClaudeFileFull(
+  filePath: string,
+  seenMsgIds: Set<string>,
+): Promise<ClaudeFileParse | null> {
+  const tracker = { lastCompleteLineOffset: 0 }
+  const toolResultMeta = new Map<string, ToolResultMeta>()
+  const sessionMeta = emptySessionMeta()
+  const entries = await parseClaudeEntries(filePath, tracker, undefined, { toolResultMeta, sessionMeta })
+  if (!entries) return null
+
+  const turns = groupIntoTurns(dedupeStreamingMessageIds(entries), seenMsgIds, toolResultMeta)
+  const cwd = extractCanonicalCwd(entries)
+  return {
+    lastCompleteLineOffset: tracker.lastCompleteLineOffset,
+    ...(cwd ? { workingDirectory: cwd } : {}),
+    mcpInventory: extractMcpInventory(entries),
+    turns: parsedTurnsToCachedTurns(turns),
+    agentType: await readAgentType(filePath),
+    ...(sessionMeta.title ? { title: sessionMeta.title } : {}),
+    ...(sessionMeta.prLinks.length > 0 ? { prLinks: sessionMeta.prLinks } : {}),
+    ...(sessionMeta.isSidechain ? { isSidechain: true } : {}),
+    ...(sessionMeta.parentSessionId ? { parentSessionId: sessionMeta.parentSessionId } : {}),
+    ...(Object.keys(sessionMeta.agentSpawnLinks).length > 0 ? { agentSpawnLinks: sessionMeta.agentSpawnLinks } : {}),
+    ...(sessionMeta.ambiguousSpawnAgentIds.length > 0 ? { ambiguousSpawnAgentIds: sessionMeta.ambiguousSpawnAgentIds } : {}),
+  }
 }
 
 function getOrCreateProviderSection(cache: SessionCache, provider: string): ProviderSection {
