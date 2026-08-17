@@ -23,7 +23,9 @@ import {
   DURABLE_PROVIDER_NAMES,
   fingerprintFile,
   isCacheComplete,
+  isCacheDirty,
   loadCache,
+  markCacheDirty,
   reconcileFile,
   saveCache,
 } from './session-cache.js'
@@ -2010,7 +2012,10 @@ async function scanProjectDirs(
   let filesDone = 0
   emitScanProgress({ kind: 'tick', provider: 'claude', done: 0, total: progressTotal })
   for (const { filePath, info, append } of changedFiles) {
+    // Marked here, not after the re-parse: an unreadable file `continue`s out
+    // below, and the deletion would otherwise live only in memory.
     delete section.files[filePath]
+    markCacheDirty(diskCache, 'claude')
 
     try {
       if (append) {
@@ -2115,7 +2120,7 @@ async function scanProjectDirs(
             ...(Object.keys(mergedSpawnLinks).length > 0 ? { agentSpawnLinks: mergedSpawnLinks } : {}),
             ...(mergedAmbiguousIds.length > 0 ? { ambiguousSpawnAgentIds: mergedAmbiguousIds } : {}),
           }
-          ;(diskCache as { _dirty?: boolean })._dirty = true
+          markCacheDirty(diskCache, 'claude')
           filesDone++
           await parseProgress.tick(filesDone)
           if (filesDone % 50 === 0 || filesDone === progressTotal) {
@@ -2152,7 +2157,7 @@ async function scanProjectDirs(
         ...(Object.keys(sessionMeta.agentSpawnLinks).length > 0 ? { agentSpawnLinks: sessionMeta.agentSpawnLinks } : {}),
         ...(sessionMeta.ambiguousSpawnAgentIds.length > 0 ? { ambiguousSpawnAgentIds: sessionMeta.ambiguousSpawnAgentIds } : {}),
       }
-      ;(diskCache as { _dirty?: boolean })._dirty = true
+      markCacheDirty(diskCache, 'claude')
     } catch (err) {
       // A single malformed Claude session file must not abort the whole run — that
       // would empty the daily-cache backfill and wipe the trend/history (issue #441,
@@ -2160,7 +2165,7 @@ async function scanProjectDirs(
       // by the current fingerprint so it isn't re-read and re-thrown every run; it
       // re-parses only if the file changes.
       section.files[filePath] = { fingerprint: info.fp, mcpInventory: [], turns: [], failed: true }
-      ;(diskCache as { _dirty?: boolean })._dirty = true
+      markCacheDirty(diskCache, 'claude')
       warnProviderParseFailure('claude', filePath, err)
     }
     filesDone++
@@ -2181,7 +2186,7 @@ async function scanProjectDirs(
       // but they carry attributable PR spend (surfaced above as a legacy split).
       if (section.files[cachedPath]?.prLinks?.length) continue
       delete section.files[cachedPath]
-      ;(diskCache as { _dirty?: boolean })._dirty = true
+      markCacheDirty(diskCache, 'claude')
     }
   }
 
@@ -2686,6 +2691,7 @@ function getOrCreateProviderSection(cache: SessionCache, provider: string): Prov
     }
   }
   cache.providers[provider] = section
+  markCacheDirty(cache, provider)
   return section
 }
 
@@ -2803,10 +2809,15 @@ export function emitScanProgress(event: ScanProgressEvent): void {
   try { process.stderr.write(`${PROGRESS_LINE_PREFIX}${JSON.stringify(event)}\n`) } catch { /* stderr closed */ }
 }
 
-// Minimum spacing between partial-progress saves during a cold parse. Low enough
+// Files parsed between partial-progress saves during a cold parse. Low enough
 // that an interrupted long run loses little work, high enough that repeated
-// full-cache writes never dominate a fast warm run.
-const PROGRESS_SAVE_THROTTLE_MS = 5000
+// cache writes never dominate the parse.
+const PROGRESS_SAVE_FILE_INTERVAL = 2000
+// Only the claude scan reports per file; every other provider calls saveProgress
+// once, at its own boundary. Without a time floor the counter would never reach
+// the interval during a long non-claude phase and progress saves would simply
+// stop happening there.
+const PROGRESS_SAVE_MAX_INTERVAL_MS = 30_000
 
 export function createScanProgress(label: string, total: number) {
   const show = !interactiveScanUI && total > 20 && process.stderr.isTTY === true
@@ -2977,6 +2988,7 @@ async function parseProviderSources(
       // that pruned-away data is preserved for monotonic monthly totals.
       if (!provider.durableSources && !clearedPaths.has(source.path)) {
         delete section.files[source.path]
+        markCacheDirty(diskCache, providerName)
         clearedPaths.add(source.path)
       }
 
@@ -3022,7 +3034,7 @@ async function parseProviderSources(
           }
         }
         didParse = true
-        ;(diskCache as { _dirty?: boolean })._dirty = true
+        markCacheDirty(diskCache, providerName)
       } catch (err) {
         if (isSqliteBusyError(err)) {
           warnProviderReadFailureOnce(providerName, err)
@@ -3035,7 +3047,7 @@ async function parseProviderSources(
         // on every refresh; it re-parses only if it changes. Empty turns => no
         // usage contributed.
         section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns: [], failed: true }
-        ;(diskCache as { _dirty?: boolean })._dirty = true
+        markCacheDirty(diskCache, providerName)
         warnProviderParseFailure(providerName, source.path, err)
         continue
       }
@@ -3052,14 +3064,14 @@ async function parseProviderSources(
   // parseAllSessions can fast-check without a getProvider() round-trip.
   if (!readOnly && provider.durableSources && !section.durable) {
     section.durable = true
-    ;(diskCache as { _dirty?: boolean })._dirty = true
+    markCacheDirty(diskCache, providerName)
   }
 
   if (!readOnly && sources.length > 0 && !provider.durableSources) {
     for (const cachedPath of Object.keys(section.files)) {
       if (!allDiscoveredFiles.has(cachedPath)) {
         delete section.files[cachedPath]
-        ;(diskCache as { _dirty?: boolean })._dirty = true
+        markCacheDirty(diskCache, providerName)
       }
     }
   }
@@ -3076,7 +3088,7 @@ async function parseProviderSources(
         .reduce((max, ts) => Math.max(max, ts), 0)
       if (newestTs > 0 && newestTs < cutoffMs) {
         delete section.files[cachedPath]
-        ;(diskCache as { _dirty?: boolean })._dirty = true
+        markCacheDirty(diskCache, providerName)
       }
     }
   }
@@ -3860,15 +3872,22 @@ async function runParse(
     providerGroups.set(source.provider, existing)
   }
 
-  // Cold-run robustness: persist partial progress during a long parse (throttled)
-  // so a run interrupted before the single end-of-parse save still leaves a warm
-  // cache behind. saveCache is atomic (temp + rename) and clears `_dirty`, so this
+  // Cold-run robustness: persist partial progress during a long parse so a run
+  // interrupted before the single end-of-parse save still leaves a warm cache
+  // behind. Triggered by files parsed rather than elapsed time: the cost of a
+  // save scales with the corpus, not the clock, so a wall-clock throttle made a
+  // slow cold parse rewrite the whole (growing) cache every few seconds. At this
+  // interval a ~18k-file cold parse saves under a dozen times. saveCache is
+  // atomic (temp + rename) and writes only the dirty provider shards, so this
   // never races the final save below.
+  let filesSinceSave = 0
   let lastSaveAt = Date.now()
   const saveProgress = async (): Promise<void> => {
     if (!isCold || readOnly) return
-    if (!(diskCache as { _dirty?: boolean })._dirty) return
-    if (Date.now() - lastSaveAt < PROGRESS_SAVE_THROTTLE_MS) return
+    if (!isCacheDirty(diskCache)) return
+    filesSinceSave++
+    if (filesSinceSave < PROGRESS_SAVE_FILE_INTERVAL && Date.now() - lastSaveAt < PROGRESS_SAVE_MAX_INTERVAL_MS) return
+    filesSinceSave = 0
     lastSaveAt = Date.now()
     try { await saveCache(diskCache) } catch { /* best-effort partial save */ }
   }
@@ -3952,7 +3971,7 @@ async function runParse(
   // partial saves keep `complete: false` and the next launch resumes cold.
   const wasComplete = isCacheComplete(diskCache)
   if (!readOnly && !wasComplete) diskCache.complete = true
-  if (!readOnly && ((diskCache as { _dirty?: boolean })._dirty || !wasComplete)) {
+  if (!readOnly && (isCacheDirty(diskCache) || !wasComplete)) {
     try {
       const published = await saveCache(diskCache, refreshLock?.verifyStillOwner)
       if (!published) throw new RefreshFenceLostError()

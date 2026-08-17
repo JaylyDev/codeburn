@@ -157,19 +157,30 @@ export type SessionCache = {
 // INVARIANT: a version bump must extend `PRIOR_CACHE_VERSIONS` (the adoption path
 // below) to EVERY prior version that can still exist on disk, or expired-PR
 // history from the immediately preceding build silently vanishes.
-export const CACHE_VERSION = 7
+// v8: on-disk layout only - the single blob became a directory of per-provider
+// shards plus a small envelope, so a launch that only touched one provider
+// rewrites just that provider's file. The turn shape is unchanged, so a v7 file
+// migrates losslessly (migrateSingleFileCache) rather than re-parsing.
+export const CACHE_VERSION = 8
 
-// The cache filename is version-suffixed so different binaries (e.g. an old
-// launchd menubar on a prior release and a newer desktop app) each own a
-// distinct file and can never clobber each other's incompatible schema. Bumping
-// CACHE_VERSION automatically mints a fresh filename, superseding the migration
-// dance the legacy unversioned file used to need.
-const CACHE_FILE = `session-cache.v${CACHE_VERSION}.json`
+// The cache directory is version-suffixed for the same reason the file used to
+// be: different binaries (an old launchd menubar, a newer desktop app) each own
+// a distinct layout and can never clobber each other's incompatible schema.
+const CACHE_DIR_NAME = `session-cache.v${CACHE_VERSION}`
+// Written LAST on every save: it names the shard file of every provider, so the
+// rename that publishes it is the single point at which a save becomes visible.
+const ENVELOPE_FILE = 'envelope.json'
 // The pre-versioning filename. Never written or deleted anymore — old binaries
 // still own it. On first load we adopt-copy it once (see loadCache) when the
 // versioned file is absent and the legacy file's version matches ours.
 const LEGACY_CACHE_FILE = 'session-cache.json'
 const TEMP_FILE_MAX_AGE_MS = 5 * 60 * 1000
+// A shard the published envelope does not name is either superseded garbage or
+// a CONCURRENT writer's shard that its envelope has not published yet. The
+// second case is why this guard is an order of magnitude above the temp-file
+// one: sweeping a live save's shard out from under it would publish an envelope
+// naming a file that no longer exists. No save takes an hour.
+const UNREFERENCED_SHARD_MAX_AGE_MS = 60 * 60 * 1000
 
 // Env vars that change what a provider discovers or how its sessions parse.
 // computeEnvFingerprint hashes exactly these to decide when a provider's cache
@@ -284,17 +295,48 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   antigravity: 'worktree-project-grouping-v5',
 }
 
-function getCachePath(): string {
-  return join(getCodeburnCacheDir(), CACHE_FILE)
-}
-
 function getLegacyCachePath(): string {
   return join(getCodeburnCacheDir(), LEGACY_CACHE_FILE)
 }
 
-/** Absolute path of the active (version-suffixed) session cache file. */
-export function sessionCachePath(): string {
-  return getCachePath()
+/** Absolute path of the active (version-suffixed) session cache directory. */
+export function sessionCacheDir(): string {
+  return join(getCodeburnCacheDir(), CACHE_DIR_NAME)
+}
+
+type CacheEnvelope = {
+  version: number
+  complete?: boolean
+  nonce: string
+  shards: Record<string, string>
+}
+
+// Save bookkeeping, held beside the cache rather than on it so it never lands in
+// a shard's JSON or in a caller's deep-equality. `shards` is the
+// provider -> shard filename map the last load/save published; a provider that
+// is neither dirty nor already sharded is written on the next save.
+type CacheState = { dirty: boolean; dirtyProviders: Set<string>; shards: Record<string, string> }
+const cacheStates = new WeakMap<SessionCache, CacheState>()
+
+function stateOf(cache: SessionCache): CacheState {
+  let state = cacheStates.get(cache)
+  if (!state) {
+    state = { dirty: false, dirtyProviders: new Set(), shards: {} }
+    cacheStates.set(cache, state)
+  }
+  return state
+}
+
+/** Record that `provider`'s section changed, so the next save rewrites its shard. */
+export function markCacheDirty(cache: SessionCache, provider: string): void {
+  const state = stateOf(cache)
+  state.dirty = true
+  state.dirtyProviders.add(provider)
+}
+
+/** True when any provider section changed since the last save. */
+export function isCacheDirty(cache: SessionCache): boolean {
+  return stateOf(cache).dirty
 }
 
 // ── Env Fingerprint ────────────────────────────────────────────────────
@@ -447,10 +489,11 @@ function validateProviderSection(s: unknown): s is ProviderSection {
   return Object.values(o['files'] as Record<string, unknown>).every(validateCachedFile)
 }
 
-function validateCache(raw: unknown): raw is SessionCache {
+// Full validation of a single-file (pre-v8) cache blob at `version`.
+function validateCache(raw: unknown, version: number): raw is SessionCache {
   if (!raw || typeof raw !== 'object') return false
   const o = raw as Record<string, unknown>
-  if (o['version'] !== CACHE_VERSION) return false
+  if (o['version'] !== version) return false
   if (!o['providers'] || typeof o['providers'] !== 'object' || Array.isArray(o['providers'])) return false
   return Object.values(o['providers'] as Record<string, unknown>).every(validateProviderSection)
 }
@@ -463,7 +506,7 @@ function validateCache(raw: unknown): raw is SessionCache {
 // CACHE_VERSION bump MUST extend this list to every prior version that can still
 // exist on disk, or that history silently vanishes. (v5 was missed on the 5->6
 // bump; v6 on the 6->7 bump; both are listed here.)
-const PRIOR_CACHE_VERSIONS = [6, 5] as const
+const PRIOR_CACHE_VERSIONS = [7, 6, 5] as const
 
 function priorCacheFile(version: number): string {
   return `session-cache.v${version}.json`
@@ -539,54 +582,110 @@ async function adoptNewestPriorCache(): Promise<SessionCache | null> {
   return merged
 }
 
-// In-process memo of the parsed cache, keyed by the file identity that last
-// produced it. On a 100MB+ corpus the JSON.parse of the session cache is
-// seconds of work per load; a resident process (codeburn serve) pays it once
-// and revalidates with a stat() per request. A rewrite by ANOTHER process
-// moves mtime/size and forces a reload, so cross-process freshness is
-// preserved; saveCache updates the memo write-through so the object handed
-// out stays the canonical one after a refresh.
-let cacheMemo: { path: string; mtimeMs: number; size: number; cache: SessionCache } | null = null
+// In-process memo of the parsed cache, keyed by the envelope nonce that last
+// produced it. On a 100MB+ corpus the JSON.parse of the shards is seconds of
+// work per load; a resident process (codeburn serve) pays it once and
+// revalidates by re-reading the (tiny) envelope per request. A save by ANOTHER
+// process mints a new nonce and forces a reload, so cross-process freshness is
+// preserved; saveCache updates the memo write-through so the object handed out
+// stays the canonical one after a refresh.
+let cacheMemo: { dir: string; nonce: string; cache: SessionCache } | null = null
 
 export function clearLoadCacheMemo(): void {
   cacheMemo = null
 }
 
-export async function loadCache(): Promise<SessionCache> {
-  const path = getCachePath()
+function isEnvelope(raw: unknown): raw is CacheEnvelope {
+  if (!raw || typeof raw !== 'object') return false
+  const o = raw as Record<string, unknown>
+  return o['version'] === CACHE_VERSION
+    && typeof o['nonce'] === 'string'
+    && !!o['shards'] && typeof o['shards'] === 'object' && !Array.isArray(o['shards'])
+    && Object.values(o['shards'] as Record<string, unknown>).every(v => typeof v === 'string')
+}
+
+// A shard that is missing or malformed is treated as an ABSENT provider, not as
+// a corrupt cache: only that provider re-parses, instead of the old all-or-
+// nothing where one bad turn discarded every provider's history.
+async function loadShard(path: string): Promise<ProviderSection | null> {
   try {
-    const info = await stat(path)
-    if (cacheMemo && cacheMemo.path === path && cacheMemo.mtimeMs === info.mtimeMs && cacheMemo.size === info.size) {
-      return cacheMemo.cache
-    }
-    const raw = await readFile(path, 'utf-8')
-    const parsed = JSON.parse(raw)
-    if (!validateCache(parsed)) return afterMissingVersionedCache()
-    cacheMemo = { path, mtimeMs: info.mtimeMs, size: info.size, cache: parsed }
-    return parsed
+    const parsed = JSON.parse(await readFile(path, 'utf-8'))
+    return validateProviderSection(parsed) ? parsed : null
   } catch {
-    return afterMissingVersionedCache()
+    return null
   }
 }
 
-// The current versioned file is absent/unreadable. Prefer adopting the newest
-// prior versioned file's expired-source PR orphans (v6 before v5); failing that,
-// fall back to the legacy unversioned file. Either way the versioned file is
-// minted on the next save.
-async function afterMissingVersionedCache(): Promise<SessionCache> {
+export async function loadCache(): Promise<SessionCache> {
+  const dir = sessionCacheDir()
+  let envelope: CacheEnvelope
+  try {
+    const parsed = JSON.parse(await readFile(join(dir, ENVELOPE_FILE), 'utf-8'))
+    if (!isEnvelope(parsed)) return afterMissingShardCache()
+    envelope = parsed
+  } catch {
+    return afterMissingShardCache()
+  }
+  if (cacheMemo && cacheMemo.dir === dir && cacheMemo.nonce === envelope.nonce) return cacheMemo.cache
+
+  const cache: SessionCache = { version: CACHE_VERSION, providers: {}, complete: envelope.complete === true }
+  const shards: Record<string, string> = {}
+  for (const [provider, file] of Object.entries(envelope.shards)) {
+    const section = await loadShard(join(dir, file))
+    if (!section) continue
+    cache.providers[provider] = section
+    shards[provider] = file
+  }
+  stateOf(cache).shards = shards
+  cacheMemo = { dir, nonce: envelope.nonce, cache }
+  return cache
+}
+
+// The shard directory is absent/unreadable. Prefer the LOSSLESS re-layout of the
+// v7 single-file cache (same turn shape, so nothing re-parses); failing that,
+// adopt the prior versions' expired-source PR orphans, then the legacy
+// unversioned file. Either way the shard directory is minted on the next save.
+async function afterMissingShardCache(): Promise<SessionCache> {
+  const migrated = await migrateSingleFileCache()
+  if (migrated) return migrated
   const prior = await adoptNewestPriorCache()
   if (prior) return prior
-  // validateCache requires version === CACHE_VERSION, so a different-version
-  // legacy file is ignored (left intact). We copy it into the versioned file once
-  // via saveCache; the legacy file is never modified.
+  // validateCache requires the version to match, so a different-version legacy
+  // file is ignored (left intact). We copy it into the shard layout once via
+  // saveCache; the legacy file is never modified.
   return adoptLegacyCache()
+}
+
+// One-time, lossless migration of the v7 single-file cache: v8 changed the
+// on-disk LAYOUT only, so every section moves across verbatim and nothing
+// re-parses. Every section is marked dirty so the save below writes each shard;
+// the v7 file is removed only once that save has published.
+async function migrateSingleFileCache(): Promise<SessionCache | null> {
+  const v7Path = join(getCodeburnCacheDir(), priorCacheFile(7))
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(await readFile(v7Path, 'utf-8'))
+  } catch {
+    return null
+  }
+  if (!validateCache(parsed, 7)) return null
+  const cache: SessionCache = {
+    version: CACHE_VERSION,
+    providers: parsed.providers,
+    complete: parsed.complete === true,
+  }
+  for (const provider of Object.keys(cache.providers)) markCacheDirty(cache, provider)
+  const published = await saveCache(cache).catch(() => false)
+  if (published) await retryCacheFileMutation(() => unlink(v7Path))
+  return cache
 }
 
 async function adoptLegacyCache(): Promise<SessionCache> {
   try {
     const raw = await readFile(getLegacyCachePath(), 'utf-8')
     const parsed = JSON.parse(raw)
-    if (!validateCache(parsed)) return emptyCache()
+    if (!validateCache(parsed, CACHE_VERSION)) return emptyCache()
+    for (const provider of Object.keys(parsed.providers)) markCacheDirty(parsed, provider)
     await saveCache(parsed).catch(() => {})
     return parsed
   } catch {
@@ -594,15 +693,19 @@ async function adoptLegacyCache(): Promise<SessionCache> {
   }
 }
 
-export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Promise<boolean>): Promise<boolean> {
-  const dir = getCodeburnCacheDir()
-  if (!existsSync(dir)) await mkdir(dir, { recursive: true })
+// Shard filenames carry a fresh nonce on every write, so a save never overwrites
+// the file the currently-published envelope points at: readers keep seeing a
+// consistent set until the envelope rename publishes the new one, and a writer
+// that loses the ownership fence leaves the canonical shards untouched.
+function shardFileName(provider: string): string {
+  return `${provider.replace(/[^A-Za-z0-9_-]/g, '_')}.${randomBytes(8).toString('hex')}.json`
+}
 
-  const finalPath = getCachePath()
+// The temp name carries a nonce: two processes writing the SAME final path
+// (the envelope, every save) would otherwise share one temp file and interleave
+// their writes into a torn or foreign payload.
+async function writeFileAtomic(finalPath: string, payload: string): Promise<void> {
   const tempPath = `${finalPath}.${randomBytes(8).toString('hex')}.tmp`
-  delete (cache as { _dirty?: boolean })._dirty
-  const payload = JSON.stringify(cache)
-
   const handle = await open(tempPath, 'w', 0o600)
   try {
     await handle.writeFile(payload, { encoding: 'utf-8' })
@@ -610,40 +713,96 @@ export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Pr
   } finally {
     await handle.close()
   }
-
   try {
-    // The warm refresh transaction passes an ownership fence. It must be the
-    // final operation before publication so a displaced writer cannot replace
-    // the canonical cache with its stale snapshot.
-    if (verifyStillOwner && !await verifyStillOwner()) {
-      await retryCacheFileMutation(() => unlink(tempPath))
-      return false
-    }
-    let renamed = false
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         await rename(tempPath, finalPath)
-        renamed = true
-        break
+        return
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code
         if ((code !== 'EPERM' && code !== 'EBUSY') || attempt === 2) throw err
         await new Promise(resolve => { setTimeout(resolve, 10 * (attempt + 1)) })
       }
     }
-    if (!renamed) throw new Error('session cache rename failed')
-    // Write-through: the object just published IS the freshest state; capture
-    // the post-rename file identity so the next loadCache in this process
-    // reuses it instead of re-parsing what it just wrote.
-    try {
-      const info = await stat(finalPath)
-      cacheMemo = { path: finalPath, mtimeMs: info.mtimeMs, size: info.size, cache }
-    } catch {
-      cacheMemo = null
+  } catch (err) {
+    await retryCacheFileMutation(() => unlink(tempPath))
+    throw err
+  }
+}
+
+export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Promise<boolean>): Promise<boolean> {
+  const dir = sessionCacheDir()
+  if (!existsSync(dir)) await mkdir(dir, { recursive: true, mode: 0o700 })
+
+  const state = stateOf(cache)
+  const priorShards = state.shards
+  const shards: Record<string, string> = {}
+  const written: string[] = []
+
+  const writeShard = async (provider: string): Promise<void> => {
+    const name = shardFileName(provider)
+    await writeFileAtomic(join(dir, name), JSON.stringify(cache.providers[provider]))
+    written.push(name)
+    shards[provider] = name
+  }
+
+  try {
+    for (const provider of Object.keys(cache.providers)) {
+      const prior = priorShards[provider]
+      // `priorShards` is this process's snapshot from its last load or save.
+      // ANOTHER process may have republished that provider since, unlinking the
+      // file we are about to name — so reuse is conditional on the file still
+      // being there, and a vanished one is rewritten from memory.
+      if (prior && !state.dirtyProviders.has(provider) && existsSync(join(dir, prior))) {
+        shards[provider] = prior
+        continue
+      }
+      await writeShard(provider)
+    }
+
+    // The warm refresh transaction passes an ownership fence. It must be the
+    // final operation before publication so a displaced writer cannot replace
+    // the canonical cache with its stale snapshot. Shards written above are
+    // unreferenced until the envelope names them, so a lost fence publishes
+    // nothing.
+    if (verifyStillOwner && !await verifyStillOwner()) {
+      for (const name of written) await retryCacheFileMutation(() => unlink(join(dir, name)))
+      return false
+    }
+
+    // Last look before publishing: a concurrent save may have unlinked a reused
+    // shard while this one was writing its own. An envelope must never name a
+    // file that is already gone — that reads back as a corrupt provider and
+    // drops its history, including orphans no re-parse can recover.
+    for (const [provider, name] of Object.entries(shards)) {
+      if (written.includes(name) || existsSync(join(dir, name))) continue
+      await writeShard(provider)
+    }
+
+    const envelope: CacheEnvelope = {
+      version: CACHE_VERSION,
+      complete: cache.complete === true,
+      nonce: randomBytes(8).toString('hex'),
+      shards,
+    }
+    await writeFileAtomic(join(dir, ENVELOPE_FILE), JSON.stringify(envelope))
+
+    state.dirty = false
+    state.dirtyProviders.clear()
+    state.shards = shards
+    // Write-through: the object just published IS the freshest state, so the
+    // next loadCache in this process reuses it instead of re-parsing.
+    cacheMemo = { dir, nonce: envelope.nonce, cache }
+    // Shards the new envelope no longer references are garbage; a reader that
+    // already opened one keeps reading it, and any failure here is swept later
+    // by cleanupOrphanedTempFiles.
+    for (const [provider, name] of Object.entries(priorShards)) {
+      if (shards[provider] === name) continue
+      await retryCacheFileMutation(() => unlink(join(dir, name)))
     }
     return true
   } catch (err) {
-    await retryCacheFileMutation(() => unlink(tempPath))
+    for (const name of written) await retryCacheFileMutation(() => unlink(join(dir, name)))
     throw err
   }
 }
@@ -798,26 +957,50 @@ export function mergeCallByDedupKey(
 
 // ── Temp Cleanup ───────────────────────────────────────────────────────
 
+async function unlinkIfOlderThan(path: string, maxAgeMs: number, now: number): Promise<void> {
+  try {
+    const s = await stat(path)
+    if (now - s.mtimeMs > maxAgeMs) await unlink(path)
+  } catch {}
+}
+
+// Sweeps our own shard directory: interrupted temp writes, plus shards the
+// published envelope no longer references. Also retires the single-file layout's
+// leftover temps in the parent directory, which nothing writes anymore.
 export async function cleanupOrphanedTempFiles(): Promise<void> {
-  const dir = getCodeburnCacheDir()
+  const now = Date.now()
+  const parent = getCodeburnCacheDir()
+
+  // `session-cache.v<n>.json.<nonce>.tmp` from a pre-v8 binary interrupted
+  // mid-write. Age-guarded, so an old binary's in-flight write is left alone.
+  try {
+    for (const entry of await readdir(parent)) {
+      if (!/^session-cache\.v\d+\.json\..*\.tmp$/.test(entry)) continue
+      await unlinkIfOlderThan(join(parent, entry), TEMP_FILE_MAX_AGE_MS, now)
+    }
+  } catch {}
+
+  const dir = sessionCacheDir()
   if (!existsSync(dir)) return
 
+  const referenced = new Set<string>([ENVELOPE_FILE])
+  let envelopeRead = false
   try {
-    const entries = await readdir(dir)
-    const now = Date.now()
+    const parsed = JSON.parse(await readFile(join(dir, ENVELOPE_FILE), 'utf-8'))
+    if (isEnvelope(parsed)) {
+      for (const name of Object.values(parsed.shards)) referenced.add(name)
+      envelopeRead = true
+    }
+  } catch {}
 
-    // Only our own (versioned) temp files. Legacy `session-cache.json.*.tmp`
-    // temps belong to old binaries mid-write and must not be touched.
-    const prefix = `${CACHE_FILE}.`
-    for (const entry of entries) {
-      if (!entry.startsWith(prefix) || !entry.endsWith('.tmp')) continue
-      try {
-        const fullPath = join(dir, entry)
-        const s = await stat(fullPath)
-        if (now - s.mtimeMs > TEMP_FILE_MAX_AGE_MS) {
-          await unlink(fullPath)
-        }
-      } catch {}
+  try {
+    for (const entry of await readdir(dir)) {
+      if (entry.endsWith('.tmp')) {
+        await unlinkIfOlderThan(join(dir, entry), TEMP_FILE_MAX_AGE_MS, now)
+        continue
+      }
+      if (!envelopeRead || referenced.has(entry)) continue
+      await unlinkIfOlderThan(join(dir, entry), UNREFERENCED_SHARD_MAX_AGE_MS, now)
     }
   } catch {}
 }

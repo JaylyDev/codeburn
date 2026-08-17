@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Changed
+- **A warm launch rewrites only the provider that changed.** The session cache was a single blob, so any provider appending a few KB republished the whole thing — 147 MB of stringify + fsync on a 6 GB corpus, ~18% of a warm run. It is now a version-suffixed directory holding one shard per provider plus a small envelope, written per provider and published by a single envelope rename. An existing v7 cache is re-laid-out losslessly on first load and the old file removed once the new layout is on disk: nothing re-parses. One unreadable shard now costs that provider a re-parse instead of discarding every provider's history, and partial saves during a cold parse are triggered every 2000 files rather than every 5 seconds, so a slow cold parse no longer rewrites the growing cache on a wall clock.
+- **An appended Codex rollout parses only its tail.** Rollout files are append-only and the active ones run to hundreds of MB, but the Codex result cache keyed on mtime + size alone, so any growth re-read the file from byte 0. Each entry now records a restart point at the last task boundary — byte offset plus the state the single-pass decode carries across it — and a grown file with the same inode resumes there, producing output identical to a full re-parse. An entry without a usable restart point simply re-parses in full once and gains one.
 - **One rule for every cache file.** `CODEBURN_CACHE_DIR` when set, otherwise `~/.cache/codeburn`. `XDG_CACHE_HOME` is no longer consulted; the sync ledger, the only file that ever honored it, is merged into the canonical location on first read and the legacy copy is retired, so nothing is re-uploaded after the move. (#972)
 
 ### Fixed (Desktop & Menubar)
