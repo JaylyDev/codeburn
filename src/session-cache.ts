@@ -1,4 +1,4 @@
-import { readFile, stat, open, rename, unlink, readdir, mkdir } from 'fs/promises'
+import { readFile, stat, open, rename, unlink, readdir, mkdir, rm } from 'fs/promises'
 import { existsSync, readFileSync, unlinkSync } from 'fs'
 import { createHash, randomBytes } from 'crypto'
 import { join } from 'path'
@@ -161,14 +161,21 @@ export type SessionCache = {
 // shards plus a small envelope, so a launch that only touched one provider
 // rewrites just that provider's file. The turn shape is unchanged, so a v7 file
 // migrates losslessly (migrateSingleFileCache) rather than re-parsing.
-export const CACHE_VERSION = 8
+// v9: on-disk layout only - a provider's shard split further by the UTC month of
+// each cached file, so one appended session rewrites one month instead of the
+// provider's whole (100MB-scale) history, and a ranged query loads only the
+// months it can possibly report on. Turn shape unchanged, so v8 and v7 both
+// migrate losslessly.
+export const CACHE_VERSION = 9
 
 // The cache directory is version-suffixed for the same reason the file used to
 // be: different binaries (an old launchd menubar, a newer desktop app) each own
 // a distinct layout and can never clobber each other's incompatible schema.
 const CACHE_DIR_NAME = `session-cache.v${CACHE_VERSION}`
-// Written LAST on every save: it names the shard file of every provider, so the
-// rename that publishes it is the single point at which a save becomes visible.
+// The v8 shard directory, read once by the lossless v8 -> v9 re-layout.
+const PRIOR_SHARD_DIR_NAME = 'session-cache.v8'
+// Written LAST on every save: it names the shard file of every provider-month, so
+// the rename that publishes it is the single point at which a save becomes visible.
 const ENVELOPE_FILE = 'envelope.json'
 // The pre-versioning filename. Never written or deleted anymore — old binaries
 // still own it. On first load we adopt-copy it once (see loadCache) when the
@@ -304,34 +311,117 @@ export function sessionCacheDir(): string {
   return join(getCodeburnCacheDir(), CACHE_DIR_NAME)
 }
 
+// `until` is the UTC month of the newest turn any file in the shard holds. The
+// shard's own key is the month of the OLDEST (a file is bucketed by its first
+// turn), so the pair bounds every turn the shard can contribute and a ranged
+// load can skip the shard outright when the two do not overlap the query.
+type ShardRef = { name: string; until: string }
+type EnvelopeProvider = {
+  envFingerprint: string
+  durable?: boolean
+  /** month (`YYYY-MM`, or `0000-00` for turn-less files) -> shard */
+  shards: Record<string, ShardRef>
+}
 type CacheEnvelope = {
   version: number
   complete?: boolean
   nonce: string
-  shards: Record<string, string>
+  providers: Record<string, EnvelopeProvider>
+}
+
+// Files with no turns (failure markers, empty sessions) have no month to bucket
+// by. They live in one always-loaded bucket, which is also what makes the only
+// possible re-bucketing safe: a file leaves this bucket the first time it gains
+// a turn, and the bucket it leaves is guaranteed to be in memory.
+const UNDATED_BUCKET = '0000-00'
+// Sentinel inside `dirtyBuckets`: every bucket of the provider is dirty.
+const ALL_BUCKETS = '*'
+
+function monthKey(timestamp: string | undefined): string | null {
+  if (!timestamp) return null
+  const ms = Date.parse(timestamp)
+  if (Number.isNaN(ms)) return null
+  const d = new Date(ms)
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
+}
+
+/** The shard bucket a cached file belongs to: the UTC month of its FIRST turn.
+ *  First-turn (not last, not mtime) is the only choice that is stable across
+ *  appends — an appended session must never migrate shards, or the entry would
+ *  be written to a new shard while the old one still holds a stale copy. */
+export function cacheBucketMonth(file: CachedFile): string {
+  return monthKey(file.turns[0]?.timestamp) ?? UNDATED_BUCKET
+}
+
+// Turns are appended in order, so the last one carries the newest timestamp.
+function newestMonth(file: CachedFile): string {
+  return monthKey(file.turns[file.turns.length - 1]?.timestamp) ?? cacheBucketMonth(file)
 }
 
 // Save bookkeeping, held beside the cache rather than on it so it never lands in
-// a shard's JSON or in a caller's deep-equality. `shards` is the
-// provider -> shard filename map the last load/save published; a provider that
-// is neither dirty nor already sharded is written on the next save.
-type CacheState = { dirty: boolean; dirtyProviders: Set<string>; shards: Record<string, string> }
+// a shard's JSON or in a caller's deep-equality.
+type CacheState = {
+  dirty: boolean
+  /** provider -> dirty months (or `ALL_BUCKETS`). */
+  dirtyBuckets: Map<string, Set<string>>
+  /** provider -> the shard refs the last load/save published. */
+  shards: Map<string, Record<string, ShardRef>>
+  /** provider -> months held in memory; `null` when the whole provider loaded. */
+  loaded: Map<string, Set<string> | null>
+  /** provider -> the envFingerprint the published envelope recorded. */
+  fingerprints: Map<string, string>
+  /** `provider\0path` -> the bucket the entry was loaded/saved under, so a
+   *  delete or a re-bucketing can dirty the bucket it is leaving. */
+  bucketOf: Map<string, string>
+  /** The load scope this cache was read under, for the cross-request memo. */
+  scope: string
+}
 const cacheStates = new WeakMap<SessionCache, CacheState>()
 
 function stateOf(cache: SessionCache): CacheState {
   let state = cacheStates.get(cache)
   if (!state) {
-    state = { dirty: false, dirtyProviders: new Set(), shards: {} }
+    state = {
+      dirty: false,
+      dirtyBuckets: new Map(),
+      shards: new Map(),
+      loaded: new Map(),
+      fingerprints: new Map(),
+      bucketOf: new Map(),
+      scope: 'all',
+    }
     cacheStates.set(cache, state)
   }
   return state
 }
 
-/** Record that `provider`'s section changed, so the next save rewrites its shard. */
-export function markCacheDirty(cache: SessionCache, provider: string): void {
-  const state = stateOf(cache)
+function markBucketDirty(state: CacheState, provider: string, bucket: string): void {
   state.dirty = true
-  state.dirtyProviders.add(provider)
+  let buckets = state.dirtyBuckets.get(provider)
+  if (!buckets) { buckets = new Set(); state.dirtyBuckets.set(provider, buckets) }
+  buckets.add(bucket)
+}
+
+function isBucketDirty(state: CacheState, provider: string, bucket: string): boolean {
+  const buckets = state.dirtyBuckets.get(provider)
+  return buckets !== undefined && (buckets.has(ALL_BUCKETS) || buckets.has(bucket))
+}
+
+/** Record that `provider`'s section changed, so the next save rewrites the
+ *  affected shards. Pass `filePath` whenever the change is scoped to one cached
+ *  file — both the bucket it was last saved in and the bucket it is in now are
+ *  marked, so a delete, a rewrite and a re-bucketing are all covered whichever
+ *  order the caller mutates and marks in. Omitting it dirties every bucket. */
+export function markCacheDirty(cache: SessionCache, provider: string, filePath?: string): void {
+  const state = stateOf(cache)
+  if (filePath === undefined) { markBucketDirty(state, provider, ALL_BUCKETS); return }
+  const prior = state.bucketOf.get(`${provider}\0${filePath}`)
+  if (prior !== undefined) markBucketDirty(state, provider, prior)
+  const file = cache.providers[provider]?.files[filePath]
+  if (file) markBucketDirty(state, provider, cacheBucketMonth(file))
+  // A path with neither a prior bucket nor a live entry (deleted before this
+  // process ever saw it) still has to move `dirty`, or the save is skipped.
+  state.dirty = true
 }
 
 /** True when any provider section changed since the last save. */
@@ -481,6 +571,12 @@ function validateCachedFile(f: unknown): f is CachedFile {
     && (o['turns'] as unknown[]).every(validateTurn)
 }
 
+// A shard's payload: the provider's `files` map, restricted to one month.
+function validateFiles(v: unknown): v is Record<string, CachedFile> {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false
+  return Object.values(v as Record<string, unknown>).every(validateCachedFile)
+}
+
 function validateProviderSection(s: unknown): s is ProviderSection {
   if (!s || typeof s !== 'object') return false
   const o = s as Record<string, unknown>
@@ -589,34 +685,79 @@ async function adoptNewestPriorCache(): Promise<SessionCache | null> {
 // process mints a new nonce and forces a reload, so cross-process freshness is
 // preserved; saveCache updates the memo write-through so the object handed out
 // stays the canonical one after a refresh.
-let cacheMemo: { dir: string; nonce: string; cache: SessionCache } | null = null
+let cacheMemo: { dir: string; nonce: string; scope: string; cache: SessionCache } | null = null
 
 export function clearLoadCacheMemo(): void {
   cacheMemo = null
 }
 
+/** Months (UTC `YYYY-MM`, inclusive) a query can possibly report on. */
+export type CacheLoadScope = { fromMonth: string; toMonth: string }
+
+export function monthScopeForRange(start: Date, end: Date): CacheLoadScope {
+  return { fromMonth: monthKey(start.toISOString())!, toMonth: monthKey(end.toISOString())! }
+}
+
+function previousMonth(month: string): string {
+  const [y, m] = month.split('-').map(Number) as [number, number]
+  return m === 1 ? `${y - 1}-12` : `${y}-${String(m - 1).padStart(2, '0')}`
+}
+
+// A shard is in scope when its [bucket .. until] span overlaps the query. One
+// extra month of slack below the range covers the cross-range carries that read
+// turns from BEFORE the window: the pre-range PR set / git branch a session
+// carries into its first in-range turn (both resolved from the same file, so
+// they only need the file loaded at all), and the out-of-range subagent-spawn
+// ANCHOR whose in-range child folds into it. The undated bucket has no span and
+// is always loaded.
+function shardInScope(bucket: string, until: string, scope: CacheLoadScope): boolean {
+  if (bucket === UNDATED_BUCKET) return true
+  return bucket <= scope.toMonth && until >= previousMonth(scope.fromMonth)
+}
+
+function isShardRef(v: unknown): v is ShardRef {
+  if (!v || typeof v !== 'object') return false
+  const o = v as Record<string, unknown>
+  return typeof o['name'] === 'string' && typeof o['until'] === 'string'
+}
+
 function isEnvelope(raw: unknown): raw is CacheEnvelope {
   if (!raw || typeof raw !== 'object') return false
   const o = raw as Record<string, unknown>
-  return o['version'] === CACHE_VERSION
-    && typeof o['nonce'] === 'string'
-    && !!o['shards'] && typeof o['shards'] === 'object' && !Array.isArray(o['shards'])
-    && Object.values(o['shards'] as Record<string, unknown>).every(v => typeof v === 'string')
+  if (o['version'] !== CACHE_VERSION || typeof o['nonce'] !== 'string') return false
+  const providers = o['providers']
+  if (!providers || typeof providers !== 'object' || Array.isArray(providers)) return false
+  return Object.values(providers as Record<string, unknown>).every(p => {
+    if (!p || typeof p !== 'object') return false
+    const e = p as Record<string, unknown>
+    if (typeof e['envFingerprint'] !== 'string') return false
+    if (!e['shards'] || typeof e['shards'] !== 'object' || Array.isArray(e['shards'])) return false
+    return Object.values(e['shards'] as Record<string, unknown>).every(isShardRef)
+  })
 }
 
-// A shard that is missing or malformed is treated as an ABSENT provider, not as
-// a corrupt cache: only that provider re-parses, instead of the old all-or-
-// nothing where one bad turn discarded every provider's history.
-async function loadShard(path: string): Promise<ProviderSection | null> {
+// A shard that is missing or malformed costs exactly the provider-months it
+// held, not the provider and never the whole cache: those files re-parse while
+// every other month keeps serving.
+async function loadShard(path: string): Promise<Record<string, CachedFile> | null> {
   try {
     const parsed = JSON.parse(await readFile(path, 'utf-8'))
-    return validateProviderSection(parsed) ? parsed : null
+    return validateFiles(parsed) ? parsed : null
   } catch {
     return null
   }
 }
 
-export async function loadCache(): Promise<SessionCache> {
+/**
+ * Read the cache. With a `scope`, only the shards whose months can contribute a
+ * turn to that range are read — everything else stays on disk and is carried
+ * across the next save untouched (see saveCache). Durable providers and any
+ * provider whose recorded fingerprint no longer matches are always read in
+ * full: the first because its cache is the only surviving record of pruned
+ * usage, the second because a fingerprint change discards the whole section and
+ * must see every entry it is discarding.
+ */
+export async function loadCache(scope?: CacheLoadScope): Promise<SessionCache> {
   const dir = sessionCacheDir()
   let envelope: CacheEnvelope
   try {
@@ -626,28 +767,56 @@ export async function loadCache(): Promise<SessionCache> {
   } catch {
     return afterMissingShardCache()
   }
-  if (cacheMemo && cacheMemo.dir === dir && cacheMemo.nonce === envelope.nonce) return cacheMemo.cache
+  const scopeKey = scope ? `${scope.fromMonth}..${scope.toMonth}` : 'all'
+  if (cacheMemo && cacheMemo.dir === dir && cacheMemo.nonce === envelope.nonce
+    && (cacheMemo.scope === 'all' || cacheMemo.scope === scopeKey)) return cacheMemo.cache
 
   const cache: SessionCache = { version: CACHE_VERSION, providers: {}, complete: envelope.complete === true }
-  const shards: Record<string, string> = {}
-  for (const [provider, file] of Object.entries(envelope.shards)) {
-    const section = await loadShard(join(dir, file))
-    if (!section) continue
+  const state = stateOf(cache)
+  const reads: Promise<void>[] = []
+  for (const [provider, meta] of Object.entries(envelope.providers)) {
+    const section: ProviderSection = {
+      envFingerprint: meta.envFingerprint,
+      files: {},
+      ...(meta.durable ? { durable: true } : {}),
+    }
+    // Recorded even when every shard is skipped or unreadable: the section is
+    // what tells the next save which provider these carried-forward shard refs
+    // belong to, and what stops the reconcile from re-parsing under a
+    // fingerprint the envelope already agrees with.
     cache.providers[provider] = section
-    shards[provider] = file
+    const full = !scope || meta.durable === true || meta.envFingerprint !== computeEnvFingerprint(provider)
+    const loaded: Set<string> | null = full ? null : new Set()
+    for (const [bucket, ref] of Object.entries(meta.shards)) {
+      if (loaded && !shardInScope(bucket, ref.until, scope!)) continue
+      loaded?.add(bucket)
+      reads.push(loadShard(join(dir, ref.name)).then(files => {
+        // Unreadable: the bucket counts as loaded-and-empty and is marked
+        // dirty, so the re-parsed files replace it instead of the stale shard
+        // being carried forward forever.
+        if (!files) { markBucketDirty(state, provider, bucket); return }
+        for (const path of Object.keys(files)) state.bucketOf.set(`${provider}\0${path}`, bucket)
+        Object.assign(section.files, files)
+      }))
+    }
+    state.loaded.set(provider, loaded)
+    state.shards.set(provider, meta.shards)
+    state.fingerprints.set(provider, meta.envFingerprint)
   }
-  stateOf(cache).shards = shards
-  cacheMemo = { dir, nonce: envelope.nonce, cache }
+  await Promise.all(reads)
+  state.scope = scopeKey
+  cacheMemo = { dir, nonce: envelope.nonce, scope: scopeKey, cache }
   return cache
 }
 
-// The shard directory is absent/unreadable. Prefer the LOSSLESS re-layout of the
-// v7 single-file cache (same turn shape, so nothing re-parses); failing that,
+// The shard directory is absent/unreadable. Prefer a LOSSLESS re-layout of the
+// newest prior layout that is present (v8 provider shards, then the v7 single
+// file — both hold the current turn shape, so nothing re-parses); failing that,
 // adopt the prior versions' expired-source PR orphans, then the legacy
 // unversioned file. Either way the shard directory is minted on the next save.
 async function afterMissingShardCache(): Promise<SessionCache> {
-  const migrated = await migrateSingleFileCache()
-  if (migrated) return migrated
+  const relaid = await migrateProviderShardCache() ?? await migrateSingleFileCache()
+  if (relaid) return relaid
   const prior = await adoptNewestPriorCache()
   if (prior) return prior
   // validateCache requires the version to match, so a different-version legacy
@@ -656,10 +825,33 @@ async function afterMissingShardCache(): Promise<SessionCache> {
   return adoptLegacyCache()
 }
 
-// One-time, lossless migration of the v7 single-file cache: v8 changed the
-// on-disk LAYOUT only, so every section moves across verbatim and nothing
-// re-parses. Every section is marked dirty so the save below writes each shard;
-// the v7 file is removed only once that save has published.
+// One-time, lossless re-layout of the v8 per-provider shard directory: v9
+// changed the on-disk LAYOUT only, so every entry moves across verbatim (just
+// re-bucketed by month in memory) and nothing re-parses. The v8 directory is
+// removed only once the v9 save has published.
+async function migrateProviderShardCache(): Promise<SessionCache | null> {
+  const dir = join(getCodeburnCacheDir(), PRIOR_SHARD_DIR_NAME)
+  let envelope: { complete?: boolean; shards: Record<string, string> }
+  try {
+    const parsed = JSON.parse(await readFile(join(dir, ENVELOPE_FILE), 'utf-8')) as Record<string, unknown>
+    if (parsed['version'] !== 8 || !parsed['shards'] || typeof parsed['shards'] !== 'object') return null
+    envelope = parsed as { complete?: boolean; shards: Record<string, string> }
+  } catch {
+    return null
+  }
+  const cache: SessionCache = { version: CACHE_VERSION, providers: {}, complete: envelope.complete === true }
+  await Promise.all(Object.entries(envelope.shards).map(async ([provider, name]) => {
+    try {
+      const parsed = JSON.parse(await readFile(join(dir, name), 'utf-8'))
+      if (validateProviderSection(parsed)) cache.providers[provider] = parsed
+    } catch { /* one unreadable v8 shard costs that provider, as it already did */ }
+  }))
+  return publishRelaidCache(cache, () => rm(dir, { recursive: true, force: true }))
+}
+
+// One-time, lossless re-layout of the v7 single-file cache. v7 never wrote a
+// shard directory, so it is migrated straight to v9 without minting a v8 in
+// between.
 async function migrateSingleFileCache(): Promise<SessionCache | null> {
   const v7Path = join(getCodeburnCacheDir(), priorCacheFile(7))
   let parsed: unknown
@@ -669,14 +861,18 @@ async function migrateSingleFileCache(): Promise<SessionCache | null> {
     return null
   }
   if (!validateCache(parsed, 7)) return null
-  const cache: SessionCache = {
-    version: CACHE_VERSION,
-    providers: parsed.providers,
-    complete: parsed.complete === true,
-  }
+  return publishRelaidCache(
+    { version: CACHE_VERSION, providers: parsed.providers, complete: parsed.complete === true },
+    () => unlink(v7Path),
+  )
+}
+
+// Every section is marked dirty so the save writes each month's shard; the old
+// layout is retired only once that save has published.
+async function publishRelaidCache(cache: SessionCache, retire: () => Promise<unknown>): Promise<SessionCache> {
   for (const provider of Object.keys(cache.providers)) markCacheDirty(cache, provider)
   const published = await saveCache(cache).catch(() => false)
-  if (published) await retryCacheFileMutation(() => unlink(v7Path))
+  if (published) await retryCacheFileMutation(async () => { await retire() })
   return cache
 }
 
@@ -697,8 +893,8 @@ async function adoptLegacyCache(): Promise<SessionCache> {
 // the file the currently-published envelope points at: readers keep seeing a
 // consistent set until the envelope rename publishes the new one, and a writer
 // that loses the ownership fence leaves the canonical shards untouched.
-function shardFileName(provider: string): string {
-  return `${provider.replace(/[^A-Za-z0-9_-]/g, '_')}.${randomBytes(8).toString('hex')}.json`
+function shardFileName(provider: string, bucket: string): string {
+  return `${provider.replace(/[^A-Za-z0-9_-]/g, '_')}.${bucket}.${randomBytes(8).toString('hex')}.json`
 }
 
 // The temp name carries a nonce: two processes writing the SAME final path
@@ -730,34 +926,94 @@ async function writeFileAtomic(finalPath: string, payload: string): Promise<void
   }
 }
 
+function bucketFiles(section: ProviderSection): Map<string, Record<string, CachedFile>> {
+  const buckets = new Map<string, Record<string, CachedFile>>()
+  for (const [path, file] of Object.entries(section.files)) {
+    const bucket = cacheBucketMonth(file)
+    let group = buckets.get(bucket)
+    if (!group) { group = {}; buckets.set(bucket, group) }
+    group[path] = file
+  }
+  return buckets
+}
+
+function untilMonth(files: Record<string, CachedFile>): string {
+  let until = UNDATED_BUCKET
+  for (const file of Object.values(files)) {
+    const month = newestMonth(file)
+    if (month > until) until = month
+  }
+  return until
+}
+
 export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Promise<boolean>): Promise<boolean> {
   const dir = sessionCacheDir()
   if (!existsSync(dir)) await mkdir(dir, { recursive: true, mode: 0o700 })
 
   const state = stateOf(cache)
-  const priorShards = state.shards
-  const shards: Record<string, string> = {}
+  const providers: Record<string, EnvelopeProvider> = {}
   const written: string[] = []
+  // Deferred so the fence check below stays the last thing before publication.
+  const payloads = new Map<string, Record<string, CachedFile>>()
 
-  const writeShard = async (provider: string): Promise<void> => {
-    const name = shardFileName(provider)
-    await writeFileAtomic(join(dir, name), JSON.stringify(cache.providers[provider]))
+  const writeShard = async (provider: string, bucket: string): Promise<ShardRef> => {
+    const files = payloads.get(`${provider}\0${bucket}`)!
+    const name = shardFileName(provider, bucket)
+    await writeFileAtomic(join(dir, name), JSON.stringify(files))
     written.push(name)
-    shards[provider] = name
+    return { name, until: untilMonth(files) }
   }
 
   try {
-    for (const provider of Object.keys(cache.providers)) {
-      const prior = priorShards[provider]
-      // `priorShards` is this process's snapshot from its last load or save.
-      // ANOTHER process may have republished that provider since, unlinking the
-      // file we are about to name — so reuse is conditional on the file still
-      // being there, and a vanished one is rewritten from memory.
-      if (prior && !state.dirtyProviders.has(provider) && existsSync(join(dir, prior))) {
-        shards[provider] = prior
-        continue
+    for (const [provider, section] of Object.entries(cache.providers)) {
+      const priorRefs = state.shards.get(provider) ?? {}
+      const loaded = state.loaded.get(provider) ?? null
+      // A fingerprint change discards the section outright (see
+      // getOrCreateProviderSection), so the months it did not load must be
+      // dropped rather than carried — they hold entries under the old
+      // fingerprint. loadCache never scopes such a provider, so `loaded` is
+      // null here in practice; the guard is what makes that safe to rely on.
+      const priorFingerprint = state.fingerprints.get(provider)
+      const reset = priorFingerprint !== undefined && priorFingerprint !== section.envFingerprint
+      const refs: Record<string, ShardRef> = {}
+
+      for (const [bucket, files] of bucketFiles(section)) {
+        const prior = priorRefs[bucket]
+        // `priorRefs` is this process's snapshot from its last load or save.
+        // ANOTHER process may have republished that shard since, unlinking the
+        // file we are about to name — so reuse is conditional on the file still
+        // being there, and a vanished one is rewritten from memory.
+        if (prior && !isBucketDirty(state, provider, bucket) && existsSync(join(dir, prior.name))) {
+          refs[bucket] = prior
+          continue
+        }
+        let payload = files
+        // Dirty but never loaded: memory holds only the entries this run wrote
+        // into the bucket, so the shard's other entries have to be merged back
+        // in or the save would silently drop them. Nothing in an unloaded
+        // bucket can have been deleted — every delete goes through
+        // `section.files`, which only holds what was loaded.
+        if (loaded && !loaded.has(bucket) && prior) {
+          const onDisk = await loadShard(join(dir, prior.name))
+          if (onDisk) payload = { ...onDisk, ...files }
+        }
+        payloads.set(`${provider}\0${bucket}`, payload)
+        refs[bucket] = await writeShard(provider, bucket)
       }
-      await writeShard(provider)
+
+      // Months this run never loaded keep their published shard verbatim. This
+      // is the invariant that makes a scoped load safe to save from.
+      if (loaded && !reset) {
+        for (const [bucket, ref] of Object.entries(priorRefs)) {
+          if (refs[bucket] || loaded.has(bucket)) continue
+          if (existsSync(join(dir, ref.name))) refs[bucket] = ref
+        }
+      }
+      providers[provider] = {
+        envFingerprint: section.envFingerprint,
+        ...(section.durable ? { durable: true } : {}),
+        shards: refs,
+      }
     }
 
     // The warm refresh transaction passes an ownership fence. It must be the
@@ -771,35 +1027,61 @@ export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Pr
     }
 
     // Last look before publishing: a concurrent save may have unlinked a reused
-    // shard while this one was writing its own. An envelope must never name a
-    // file that is already gone — that reads back as a corrupt provider and
-    // drops its history, including orphans no re-parse can recover.
-    for (const [provider, name] of Object.entries(shards)) {
-      if (written.includes(name) || existsSync(join(dir, name))) continue
-      await writeShard(provider)
+    // or carried shard while this one was writing its own. An envelope must
+    // never name a file that is already gone — that reads back as a corrupt
+    // month and drops its history, including orphans no re-parse can recover.
+    for (const [provider, meta] of Object.entries(providers)) {
+      for (const [bucket, ref] of Object.entries(meta.shards)) {
+        if (written.includes(ref.name) || existsSync(join(dir, ref.name))) continue
+        if (!payloads.has(`${provider}\0${bucket}`)) {
+          // A carried month whose file vanished: its content was never in
+          // memory, so there is nothing to rewrite. Dropping the reference is
+          // the only honest option, and the sweep retires the name.
+          delete meta.shards[bucket]
+          continue
+        }
+        meta.shards[bucket] = await writeShard(provider, bucket)
+      }
     }
 
     const envelope: CacheEnvelope = {
       version: CACHE_VERSION,
       complete: cache.complete === true,
       nonce: randomBytes(8).toString('hex'),
-      shards,
+      providers,
     }
     await writeFileAtomic(join(dir, ENVELOPE_FILE), JSON.stringify(envelope))
 
-    state.dirty = false
-    state.dirtyProviders.clear()
-    state.shards = shards
-    // Write-through: the object just published IS the freshest state, so the
-    // next loadCache in this process reuses it instead of re-parsing.
-    cacheMemo = { dir, nonce: envelope.nonce, cache }
     // Shards the new envelope no longer references are garbage; a reader that
     // already opened one keeps reading it, and any failure here is swept later
     // by cleanupOrphanedTempFiles.
-    for (const [provider, name] of Object.entries(priorShards)) {
-      if (shards[provider] === name) continue
-      await retryCacheFileMutation(() => unlink(join(dir, name)))
+    const retired: string[] = []
+    for (const [provider, priorRefs] of state.shards) {
+      const kept = providers[provider]?.shards ?? {}
+      for (const [bucket, ref] of Object.entries(priorRefs)) {
+        if (kept[bucket]?.name !== ref.name) retired.push(ref.name)
+      }
     }
+
+    state.dirty = false
+    state.dirtyBuckets.clear()
+    state.shards.clear()
+    state.fingerprints.clear()
+    state.bucketOf.clear()
+    // `loaded` deliberately survives: a merged-and-rewritten shard is complete
+    // on disk but still partial in memory, so the next save has to merge again.
+    for (const [provider, meta] of Object.entries(providers)) {
+      state.shards.set(provider, meta.shards)
+      state.fingerprints.set(provider, meta.envFingerprint)
+      for (const [path, file] of Object.entries(cache.providers[provider]!.files)) {
+        state.bucketOf.set(`${provider}\0${path}`, cacheBucketMonth(file))
+      }
+    }
+    // Write-through: the object just published IS the freshest state, so the
+    // next loadCache in this process reuses it instead of re-parsing. Its scope
+    // is whatever was loaded, not `all` — a save never widens what is in memory.
+    cacheMemo = { dir, nonce: envelope.nonce, scope: state.scope, cache }
+    for (const name of retired) await retryCacheFileMutation(() => unlink(join(dir, name)))
     return true
   } catch (err) {
     for (const name of written) await retryCacheFileMutation(() => unlink(join(dir, name)))
@@ -988,7 +1270,9 @@ export async function cleanupOrphanedTempFiles(): Promise<void> {
   try {
     const parsed = JSON.parse(await readFile(join(dir, ENVELOPE_FILE), 'utf-8'))
     if (isEnvelope(parsed)) {
-      for (const name of Object.values(parsed.shards)) referenced.add(name)
+      for (const meta of Object.values(parsed.providers)) {
+        for (const ref of Object.values(meta.shards)) referenced.add(ref.name)
+      }
       envelopeRead = true
     }
   } catch {}
