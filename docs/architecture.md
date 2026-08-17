@@ -89,13 +89,18 @@ The pool is off by default for anything that is not a large cold parse:
 
 | Gate | Serial when |
 |---|---|
-| Cores | `availableParallelism() <= 2` |
-| Free memory | `os.freemem() < 2 GB` |
 | Pending files | fewer than 200 whole-file re-parses |
 | Pending bytes | under 200 MB behind those files |
+| Cores | `availableParallelism() <= 2` |
+| Memory | under 4 GB available |
 
 Otherwise the worker count is
-`min(cores - 1, min(0.4 * freemem, 2 GB) / 256 MB, pendingFiles / 50)`.
+`min(cores - 1, min(0.25 * available, 2 GB) / 256 MB, pendingFiles / 50)`.
+
+"Available" is `process.availableMemory()`, falling back to `os.totalmem()`. It is
+deliberately not `os.freemem()`: on macOS that counts free pages rather than
+available memory and reads as a few hundred MB on an idle 128 GB machine, so a
+gate built on it switches the feature on and off between runs.
 
 `CODEBURN_PARSE_WORKERS` overrides the decision and skips every gate above:
 `0` forces the serial parse, `N` forces N workers (capped at the core count).

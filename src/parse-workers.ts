@@ -1,4 +1,4 @@
-import { availableParallelism, freemem } from 'os'
+import { availableParallelism, totalmem } from 'os'
 import { Worker } from 'worker_threads'
 import { snapshotPricingState } from './models.js'
 import type { ClaudeFileParse } from './parser.js'
@@ -8,6 +8,7 @@ import type { ClaudeFileParse } from './parser.js'
 // budget is what turns a parallel parse into a swapping one.
 const PER_WORKER_RSS_BYTES = 256 * 1024 * 1024
 const MEMORY_BUDGET_CAP_BYTES = 2 * 1024 * 1024 * 1024
+const MIN_AVAILABLE_BYTES = 4 * 1024 * 1024 * 1024
 const MIN_FILES_PER_WORKER = 50
 // Below these, a parse is warm/incremental and the thread startup + result
 // transfer costs more than the parallelism buys.
@@ -16,10 +17,18 @@ const MIN_PENDING_BYTES = 200 * 1024 * 1024
 
 export type ParseWorkerDecision = { workers: number; reason: string }
 
-export type SystemCapacity = { cores: number; freeBytes: number }
+export type SystemCapacity = { cores: number; availableBytes: number }
 
+// `process.availableMemory()` respects a container's cgroup / rlimit, which is the
+// case this gate exists for; where it is absent it falls back to total RAM. Free
+// memory is deliberately NOT used: on macOS `os.freemem()` counts free pages, not
+// available memory, and reads as a few hundred MB on an idle 128 GB machine — a
+// gate built on it turns the feature on and off at random.
 function currentSystemCapacity(): SystemCapacity {
-  return { cores: availableParallelism(), freeBytes: freemem() }
+  return {
+    cores: availableParallelism(),
+    availableBytes: typeof process.availableMemory === 'function' ? process.availableMemory() : totalmem(),
+  }
 }
 
 /// Decide how many parse worker threads a pending workload earns. Returning 0
@@ -30,28 +39,32 @@ export function decideParseWorkers(
   sys: SystemCapacity = currentSystemCapacity(),
   env: NodeJS.ProcessEnv = process.env,
 ): ParseWorkerDecision {
+  // Every reason carries the full decision input, so a support log line explains
+  // itself without a second run.
+  const inputs = `${sys.cores} cores, ${Math.round(sys.availableBytes / 1e9 * 10) / 10} GB available, ${pending.files} pending files / ${Math.round(pending.bytes / 1e6)} MB`
+
   const override = env['CODEBURN_PARSE_WORKERS']
   if (override !== undefined && override !== '') {
     const n = Number(override)
     if (!Number.isFinite(n) || n < 0) return { workers: 0, reason: `invalid CODEBURN_PARSE_WORKERS=${override}` }
     const capped = Math.min(Math.floor(n), sys.cores)
-    return { workers: capped, reason: capped === 0 ? 'forced serial (CODEBURN_PARSE_WORKERS=0)' : `forced by CODEBURN_PARSE_WORKERS=${override}` }
+    return { workers: capped, reason: `${capped === 0 ? 'forced serial' : 'forced'} by CODEBURN_PARSE_WORKERS=${override}; ${inputs}` }
   }
 
   // Workload gates first, so a warm run's log line says "warm", not whatever the
   // machine happened to look like at that moment.
-  if (pending.files < MIN_PENDING_FILES) return { workers: 0, reason: `${pending.files} pending files below ${MIN_PENDING_FILES}` }
-  if (pending.bytes < MIN_PENDING_BYTES) return { workers: 0, reason: `${Math.round(pending.bytes / 1e6)} MB pending below ${Math.round(MIN_PENDING_BYTES / 1e6)} MB` }
-  if (sys.cores <= 2) return { workers: 0, reason: `only ${sys.cores} cores available` }
-  if (sys.freeBytes < 2 * 1024 * 1024 * 1024) return { workers: 0, reason: `only ${Math.round(sys.freeBytes / 1e6)} MB free memory` }
+  if (pending.files < MIN_PENDING_FILES) return { workers: 0, reason: `below ${MIN_PENDING_FILES} pending files; ${inputs}` }
+  if (pending.bytes < MIN_PENDING_BYTES) return { workers: 0, reason: `below ${Math.round(MIN_PENDING_BYTES / 1e6)} MB pending; ${inputs}` }
+  if (sys.cores <= 2) return { workers: 0, reason: `too few cores; ${inputs}` }
+  if (sys.availableBytes < MIN_AVAILABLE_BYTES) return { workers: 0, reason: `below ${Math.round(MIN_AVAILABLE_BYTES / 1e9)} GB available memory; ${inputs}` }
 
-  const memoryBudget = Math.min(0.4 * sys.freeBytes, MEMORY_BUDGET_CAP_BYTES)
+  const memoryBudget = Math.min(0.25 * sys.availableBytes, MEMORY_BUDGET_CAP_BYTES)
   const workers = Math.min(
     sys.cores - 1,
     Math.floor(memoryBudget / PER_WORKER_RSS_BYTES),
     Math.floor(pending.files / MIN_FILES_PER_WORKER),
   )
-  return { workers, reason: `${sys.cores} cores, ${Math.round(sys.freeBytes / 1e9 * 10) / 10} GB free, ${pending.files} pending files` }
+  return { workers, reason: inputs }
 }
 
 // In dist the entry is the bundled sibling of this module and a worker can load

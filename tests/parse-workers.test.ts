@@ -13,25 +13,30 @@ import { clearSessionCache, parseAllSessions, parseClaudeFileFull } from '../src
 // that spawn real threads.
 vi.setConfig({ testTimeout: 60_000 })
 
-const BIG_SYSTEM = { cores: 16, freeBytes: 32 * 1024 ** 3 }
+const BIG_SYSTEM = { cores: 16, availableBytes: 32 * 1024 ** 3 }
 const BIG_PENDING = { files: 5000, bytes: 6 * 1024 ** 3 }
 const NO_ENV = {} as NodeJS.ProcessEnv
 
 describe('decideParseWorkers', () => {
   it('scales with cores, memory budget and pending file count', () => {
-    // 15 (cores-1) vs 8 (2 GB budget / 256 MB) vs 100 (5000/50) -> memory wins
+    // 15 (cores-1) vs 8 (2 GB budget / 256 MB) vs 100 (5000/50) -> memory cap wins
     expect(decideParseWorkers(BIG_PENDING, BIG_SYSTEM, NO_ENV).workers).toBe(8)
     // Fewer cores than the memory budget allows -> cores-1 wins
-    expect(decideParseWorkers(BIG_PENDING, { cores: 6, freeBytes: 32 * 1024 ** 3 }, NO_ENV).workers).toBe(5)
+    expect(decideParseWorkers(BIG_PENDING, { cores: 6, availableBytes: 32 * 1024 ** 3 }, NO_ENV).workers).toBe(5)
+    // 8 GB reaches the same cap as 32 GB: a quarter of it is the 2 GB budget
+    expect(decideParseWorkers(BIG_PENDING, { cores: 16, availableBytes: 8 * 1024 ** 3 }, NO_ENV).workers).toBe(8)
+    // Under that, the quarter-of-available budget is the binding constraint
+    expect(decideParseWorkers(BIG_PENDING, { cores: 16, availableBytes: 6 * 1024 ** 3 }, NO_ENV).workers).toBe(6)
     // The smallest machine that clears every gate still only earns 2 threads
-    expect(decideParseWorkers({ files: 200, bytes: 300 * 1024 ** 2 }, { cores: 3, freeBytes: 2 * 1024 ** 3 }, NO_ENV).workers).toBe(2)
+    expect(decideParseWorkers({ files: 200, bytes: 300 * 1024 ** 2 }, { cores: 3, availableBytes: 4 * 1024 ** 3 }, NO_ENV).workers).toBe(2)
     // Few enough files that MIN_FILES_PER_WORKER is the binding constraint
     expect(decideParseWorkers({ files: 300, bytes: 6 * 1024 ** 3 }, BIG_SYSTEM, NO_ENV).workers).toBe(6)
   })
 
   it('stays serial on low-spec machines and on warm/small parses', () => {
-    expect(decideParseWorkers(BIG_PENDING, { cores: 2, freeBytes: 32 * 1024 ** 3 }, NO_ENV).workers).toBe(0)
-    expect(decideParseWorkers(BIG_PENDING, { cores: 16, freeBytes: 1024 ** 3 }, NO_ENV).workers).toBe(0)
+    expect(decideParseWorkers(BIG_PENDING, { cores: 2, availableBytes: 32 * 1024 ** 3 }, NO_ENV).workers).toBe(0)
+    // A 4 GB box: availableMemory() always reads a little under the nominal size
+    expect(decideParseWorkers(BIG_PENDING, { cores: 16, availableBytes: 3.9 * 1024 ** 3 }, NO_ENV).workers).toBe(0)
     // Warm/incremental: a handful of appended files
     expect(decideParseWorkers({ files: 12, bytes: 6 * 1024 ** 3 }, BIG_SYSTEM, NO_ENV).workers).toBe(0)
     // Many files but almost no bytes behind them
@@ -42,11 +47,23 @@ describe('decideParseWorkers', () => {
     expect(decideParseWorkers(BIG_PENDING, BIG_SYSTEM, { CODEBURN_PARSE_WORKERS: '0' }).workers).toBe(0)
     expect(decideParseWorkers(BIG_PENDING, BIG_SYSTEM, { CODEBURN_PARSE_WORKERS: '4' }).workers).toBe(4)
     // Capped by the core count
-    expect(decideParseWorkers(BIG_PENDING, { cores: 4, freeBytes: 32 * 1024 ** 3 }, { CODEBURN_PARSE_WORKERS: '32' }).workers).toBe(4)
+    expect(decideParseWorkers(BIG_PENDING, { cores: 4, availableBytes: 32 * 1024 ** 3 }, { CODEBURN_PARSE_WORKERS: '32' }).workers).toBe(4)
     // A tiny fixture corpus still gets threads when forced — that is what makes
     // the determinism test below able to exercise them at all.
     expect(decideParseWorkers({ files: 3, bytes: 1000 }, BIG_SYSTEM, { CODEBURN_PARSE_WORKERS: '3' }).workers).toBe(3)
     expect(decideParseWorkers(BIG_PENDING, BIG_SYSTEM, { CODEBURN_PARSE_WORKERS: 'nonsense' }).workers).toBe(0)
+  })
+
+  it('reports the decision inputs in every reason, gate or not', () => {
+    for (const d of [
+      decideParseWorkers(BIG_PENDING, BIG_SYSTEM, NO_ENV),
+      decideParseWorkers({ files: 12, bytes: 1000 }, BIG_SYSTEM, NO_ENV),
+      decideParseWorkers(BIG_PENDING, BIG_SYSTEM, { CODEBURN_PARSE_WORKERS: '2' }),
+    ]) {
+      expect(d.reason).toContain('16 cores')
+      expect(d.reason).toContain('GB available')
+      expect(d.reason).toContain('pending files')
+    }
   })
 })
 
