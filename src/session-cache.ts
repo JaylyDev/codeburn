@@ -175,6 +175,12 @@ const ENVELOPE_FILE = 'envelope.json'
 // versioned file is absent and the legacy file's version matches ours.
 const LEGACY_CACHE_FILE = 'session-cache.json'
 const TEMP_FILE_MAX_AGE_MS = 5 * 60 * 1000
+// A shard the published envelope does not name is either superseded garbage or
+// a CONCURRENT writer's shard that its envelope has not published yet. The
+// second case is why this guard is an order of magnitude above the temp-file
+// one: sweeping a live save's shard out from under it would publish an envelope
+// naming a file that no longer exists. No save takes an hour.
+const UNREFERENCED_SHARD_MAX_AGE_MS = 60 * 60 * 1000
 
 // Env vars that change what a provider discovers or how its sessions parse.
 // computeEnvFingerprint hashes exactly these to decide when a provider's cache
@@ -695,8 +701,11 @@ function shardFileName(provider: string): string {
   return `${provider.replace(/[^A-Za-z0-9_-]/g, '_')}.${randomBytes(8).toString('hex')}.json`
 }
 
+// The temp name carries a nonce: two processes writing the SAME final path
+// (the envelope, every save) would otherwise share one temp file and interleave
+// their writes into a torn or foreign payload.
 async function writeFileAtomic(finalPath: string, payload: string): Promise<void> {
-  const tempPath = `${finalPath}.tmp`
+  const tempPath = `${finalPath}.${randomBytes(8).toString('hex')}.tmp`
   const handle = await open(tempPath, 'w', 0o600)
   try {
     await handle.writeFile(payload, { encoding: 'utf-8' })
@@ -723,21 +732,32 @@ async function writeFileAtomic(finalPath: string, payload: string): Promise<void
 
 export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Promise<boolean>): Promise<boolean> {
   const dir = sessionCacheDir()
-  if (!existsSync(dir)) await mkdir(dir, { recursive: true })
+  if (!existsSync(dir)) await mkdir(dir, { recursive: true, mode: 0o700 })
 
   const state = stateOf(cache)
   const priorShards = state.shards
   const shards: Record<string, string> = {}
   const written: string[] = []
 
+  const writeShard = async (provider: string): Promise<void> => {
+    const name = shardFileName(provider)
+    await writeFileAtomic(join(dir, name), JSON.stringify(cache.providers[provider]))
+    written.push(name)
+    shards[provider] = name
+  }
+
   try {
-    for (const [provider, section] of Object.entries(cache.providers)) {
+    for (const provider of Object.keys(cache.providers)) {
       const prior = priorShards[provider]
-      if (prior && !state.dirtyProviders.has(provider)) { shards[provider] = prior; continue }
-      const name = shardFileName(provider)
-      await writeFileAtomic(join(dir, name), JSON.stringify(section))
-      written.push(name)
-      shards[provider] = name
+      // `priorShards` is this process's snapshot from its last load or save.
+      // ANOTHER process may have republished that provider since, unlinking the
+      // file we are about to name — so reuse is conditional on the file still
+      // being there, and a vanished one is rewritten from memory.
+      if (prior && !state.dirtyProviders.has(provider) && existsSync(join(dir, prior))) {
+        shards[provider] = prior
+        continue
+      }
+      await writeShard(provider)
     }
 
     // The warm refresh transaction passes an ownership fence. It must be the
@@ -748,6 +768,15 @@ export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Pr
     if (verifyStillOwner && !await verifyStillOwner()) {
       for (const name of written) await retryCacheFileMutation(() => unlink(join(dir, name)))
       return false
+    }
+
+    // Last look before publishing: a concurrent save may have unlinked a reused
+    // shard while this one was writing its own. An envelope must never name a
+    // file that is already gone — that reads back as a corrupt provider and
+    // drops its history, including orphans no re-parse can recover.
+    for (const [provider, name] of Object.entries(shards)) {
+      if (written.includes(name) || existsSync(join(dir, name))) continue
+      await writeShard(provider)
     }
 
     const envelope: CacheEnvelope = {
@@ -928,11 +957,29 @@ export function mergeCallByDedupKey(
 
 // ── Temp Cleanup ───────────────────────────────────────────────────────
 
+async function unlinkIfOlderThan(path: string, maxAgeMs: number, now: number): Promise<void> {
+  try {
+    const s = await stat(path)
+    if (now - s.mtimeMs > maxAgeMs) await unlink(path)
+  } catch {}
+}
+
 // Sweeps our own shard directory: interrupted temp writes, plus shards the
-// published envelope no longer references (a save supersedes a provider's shard
-// rather than overwriting it). Temps from OTHER cache versions belong to old
-// binaries mid-write and are never touched.
+// published envelope no longer references. Also retires the single-file layout's
+// leftover temps in the parent directory, which nothing writes anymore.
 export async function cleanupOrphanedTempFiles(): Promise<void> {
+  const now = Date.now()
+  const parent = getCodeburnCacheDir()
+
+  // `session-cache.v<n>.json.<nonce>.tmp` from a pre-v8 binary interrupted
+  // mid-write. Age-guarded, so an old binary's in-flight write is left alone.
+  try {
+    for (const entry of await readdir(parent)) {
+      if (!/^session-cache\.v\d+\.json\..*\.tmp$/.test(entry)) continue
+      await unlinkIfOlderThan(join(parent, entry), TEMP_FILE_MAX_AGE_MS, now)
+    }
+  } catch {}
+
   const dir = sessionCacheDir()
   if (!existsSync(dir)) return
 
@@ -947,17 +994,13 @@ export async function cleanupOrphanedTempFiles(): Promise<void> {
   } catch {}
 
   try {
-    const entries = await readdir(dir)
-    const now = Date.now()
-    for (const entry of entries) {
-      if (!entry.endsWith('.tmp') && (!envelopeRead || referenced.has(entry))) continue
-      try {
-        const fullPath = join(dir, entry)
-        const s = await stat(fullPath)
-        if (now - s.mtimeMs > TEMP_FILE_MAX_AGE_MS) {
-          await unlink(fullPath)
-        }
-      } catch {}
+    for (const entry of await readdir(dir)) {
+      if (entry.endsWith('.tmp')) {
+        await unlinkIfOlderThan(join(dir, entry), TEMP_FILE_MAX_AGE_MS, now)
+        continue
+      }
+      if (!envelopeRead || referenced.has(entry)) continue
+      await unlinkIfOlderThan(join(dir, entry), UNREFERENCED_SHARD_MAX_AGE_MS, now)
     }
   } catch {}
 }

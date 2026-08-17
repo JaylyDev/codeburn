@@ -21,7 +21,7 @@ vi.mock('../../src/fs-utils.js', async (importOriginal) => {
   }
 })
 
-import { flushCodexCache, withCodexCacheDirectory } from '../../src/codex-cache.js'
+import { clearCodexMemCaches, flushCodexCache, withCodexCacheDirectory } from '../../src/codex-cache.js'
 import { createCodexProvider } from '../../src/providers/codex.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
@@ -111,9 +111,10 @@ async function writeRollout(lines: string[]): Promise<string> {
   return path
 }
 
-async function parse(cacheDir: string): Promise<ParsedProviderCall[]> {
+async function parse(cacheDir: string, codexDir = tmpDir): Promise<ParsedProviderCall[]> {
+  clearCodexMemCaches()
   return withCodexCacheDirectory(cacheDir, async () => {
-    const provider = createCodexProvider(tmpDir)
+    const provider = createCodexProvider(codexDir)
     const sources = await provider.discoverSessions()
     const seenKeys = new Set<string>()
     const calls: ParsedProviderCall[] = []
@@ -121,6 +122,7 @@ async function parse(cacheDir: string): Promise<ParsedProviderCall[]> {
       for await (const call of provider.createSessionParser!(source, seenKeys).parse()) calls.push(call)
     }
     await flushCodexCache()
+    clearCodexMemCaches()
     return calls
   })
 }
@@ -196,5 +198,90 @@ describe('codex incremental resume', () => {
 
     const full = await parse(join(tmpDir, 'cache-cold'))
     expect(JSON.stringify(resumed)).toBe(JSON.stringify(full))
+  })
+})
+
+// The resume snapshot has to carry EVERY field the decode reads from an earlier
+// line. Missing one shows up only when the split lands between the line that
+// sets it and the line that reads it — so split at every line boundary and
+// require the resumed decode to equal a full one each time.
+const J = (o: unknown) => JSON.stringify(o)
+const ts = (n: number, s: number) => `2026-04-14T${String(10 + Math.floor(n / 60)).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}:${String(s).padStart(2, '0')}Z`
+
+function richTask(n: number, opts: { tokens?: false | 'empty'; reasoning?: number; model?: string; noComplete?: boolean } = {}): string[] {
+  const lines: string[] = [J({ type: 'event_msg', timestamp: ts(n, 0), payload: { type: 'task_started' } })]
+  if (opts.model) lines.push(J({ type: 'turn_context', timestamp: ts(n, 0), payload: { model: opts.model } }))
+  lines.push(
+    J({ type: 'response_item', timestamp: ts(n, 1), payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: `please do task ${n} with some length` }] } }),
+    J({ type: 'response_item', timestamp: ts(n, 2), payload: { type: 'function_call', name: 'shell', call_id: `c${n}`, arguments: J({ command: `ls ${n}` }) } }),
+    J({ type: 'response_item', timestamp: ts(n, 3), payload: { type: 'function_call_output', call_id: `c${n}` } }),
+    J({ type: 'event_msg', timestamp: ts(n, 4), payload: { type: 'patch_apply_end', success: n % 3 !== 0, changes: { [`/Users/test/proj/f${n}.ts`]: { unified_diff: '@@ -1 +1,2 @@\n-old\n+new\n+extra\n' } } } }),
+    J({ type: 'event_msg', timestamp: ts(n, 5), payload: { type: 'mcp_tool_call_end', call_id: `m${n}`, invocation: { server: 'github', tool: 'list' }, duration_ms: 120, result: { Ok: {} } } }),
+    J({ type: 'response_item', timestamp: ts(n, 6), payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'y'.repeat(120) }] } }),
+  )
+  if (opts.tokens === 'empty') {
+    // No `info`: the estimated-usage path, which advances estCounter.
+    lines.push(J({ type: 'event_msg', timestamp: ts(n, 7), payload: { type: 'token_count' } }))
+  } else if (opts.tokens !== false) {
+    const c = { input: 100 * n, cached: 20 * n, output: 50 * n, reasoning: (opts.reasoning ?? 10) * n }
+    lines.push(J({ type: 'event_msg', timestamp: ts(n, 7), payload: { type: 'token_count', info: {
+      last_token_usage: { input_tokens: 100, cached_input_tokens: 20, output_tokens: 50, reasoning_output_tokens: opts.reasoning ?? 10, total_tokens: 180 },
+      total_token_usage: { input_tokens: c.input, cached_input_tokens: c.cached, output_tokens: c.output, reasoning_output_tokens: c.reasoning, total_tokens: c.input + c.output + c.reasoning },
+    } } }))
+  }
+  if (!opts.noComplete) lines.push(J({ type: 'event_msg', timestamp: ts(n, 8), payload: { type: 'task_complete', duration_ms: 5000 } }))
+  return lines
+}
+
+const RICH_LINES = [
+  J({ type: 'session_meta', timestamp: ts(0, 0), payload: { cwd: '/Users/test/proj', originator: 'codex-cli', session_id: 'sess-1', model: 'gpt-5.3-codex' } }),
+  ...richTask(1),
+  ...richTask(2, { tokens: 'empty' }),
+  ...richTask(7, { tokens: 'empty' }),
+  ...richTask(3, { model: 'gpt-5.3-codex-mini' }),
+  ...richTask(4, { reasoning: 33 }),
+  ...richTask(5, { noComplete: true }),
+  ...richTask(6),
+]
+
+const FORK_LINES = [
+  J({ type: 'session_meta', timestamp: ts(0, 0), payload: { cwd: '/Users/test/proj', originator: 'codex-cli', session_id: 'sess-2', forked_from_id: 'sess-1', model: 'gpt-5.3-codex' } }),
+  // Parent history replayed inside the 5s fork cutoff: must stay skipped across a split.
+  ...richTask(0).map(l => l.replace(/2026-04-14T10:00:0\d/g, '2026-04-14T10:00:01')),
+  ...richTask(11),
+  ...richTask(12, { tokens: 'empty' }),
+]
+
+describe('codex resume differential', () => {
+  async function rollout(lines: string[]): Promise<{ codexDir: string; path: string }> {
+    const codexDir = await mkdtemp(join(tmpdir(), 'codex-split-'))
+    const dir = join(codexDir, 'sessions', '2026', '04', '14')
+    await mkdir(dir, { recursive: true })
+    const path = join(dir, 'rollout-sess-1.jsonl')
+    await writeFile(path, lines.join('\n') + '\n')
+    return { codexDir, path }
+  }
+
+  async function assertEverySplitMatches(lines: string[]): Promise<void> {
+    const base = await rollout(lines)
+    const full = await parse(await mkdtemp(join(tmpdir(), 'codex-c-')), base.codexDir)
+    expect(full.length).toBeGreaterThan(0)
+
+    for (let k = 1; k < lines.length; k++) {
+      const split = await rollout(lines.slice(0, k))
+      const cacheDir = await mkdtemp(join(tmpdir(), 'codex-c-'))
+      await parse(cacheDir, split.codexDir)
+      await appendFile(split.path, lines.slice(k).join('\n') + '\n')
+      const resumed = await parse(cacheDir, split.codexDir)
+      expect(JSON.stringify(resumed), `split after line ${k}: ${lines[k - 1]!.slice(0, 80)}`).toBe(JSON.stringify(full))
+    }
+  }
+
+  it('matches a full re-parse at every line boundary of a rich session', async () => {
+    await assertEverySplitMatches(RICH_LINES)
+  })
+
+  it('matches a full re-parse at every line boundary of a forked session', async () => {
+    await assertEverySplitMatches(FORK_LINES)
   })
 })

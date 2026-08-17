@@ -183,26 +183,134 @@ describe('cleanupOrphanedTempFiles', () => {
     const dir = sessionCacheDir()
     const live = (await shardNames()).find(n => n.startsWith('claude.'))!
 
-    const stale = new Date(Date.now() - 10 * 60 * 1000)
+    const backdate = async (path: string, minutes: number) => {
+      const at = new Date(Date.now() - minutes * 60 * 1000)
+      await utimes(path, at, at)
+    }
+
     const oldTemp = join(dir, 'claude.deadbeef.json.tmp')
     await writeFile(oldTemp, 'partial')
-    await utimes(oldTemp, stale, stale)
+    await backdate(oldTemp, 10)
     const orphanShard = join(dir, 'codex.deadbeef.json')
     await writeFile(orphanShard, '{}')
-    await utimes(orphanShard, stale, stale)
+    await backdate(orphanShard, 90)
+    // Unreferenced but fresh: this is what a CONCURRENT save's shard looks like
+    // before its envelope lands, so the sweep must leave it alone.
+    const inFlightShard = join(dir, 'codex.c0ffee00.json')
+    await writeFile(inFlightShard, '{}')
     const recentTemp = join(dir, 'claude.feedface.json.tmp')
     await writeFile(recentTemp, 'in flight')
+    // The live shard is far older than the temp cutoff; being referenced is what
+    // protects it, not its age.
+    await backdate(join(dir, live), 120)
 
     await cleanupOrphanedTempFiles()
 
     expect(existsSync(oldTemp)).toBe(false)
     expect(existsSync(orphanShard)).toBe(false)
+    expect(existsSync(inFlightShard)).toBe(true)
     expect(existsSync(recentTemp)).toBe(true)
     expect(existsSync(join(dir, live))).toBe(true)
     expect(existsSync(join(dir, 'envelope.json'))).toBe(true)
-    // The live shard is untouched by the sweep even though it is older than the
-    // temp-file age cutoff.
-    const info = await stat(join(dir, live))
-    expect(info.size).toBeGreaterThan(0)
+  })
+
+  it('retires the pre-v8 single-file layout temps left in the parent directory', async () => {
+    await saveCache({ version: CACHE_VERSION, complete: true, providers: {} })
+    const legacyTemp = join(TMP_DIR, 'session-cache.v7.json.abc123.tmp')
+    await writeFile(legacyTemp, 'orphan from an older build')
+    const at = new Date(Date.now() - 10 * 60 * 1000)
+    await utimes(legacyTemp, at, at)
+    const freshLegacyTemp = join(TMP_DIR, 'session-cache.v7.json.def456.tmp')
+    await writeFile(freshLegacyTemp, 'an old binary mid-write')
+
+    await cleanupOrphanedTempFiles()
+
+    expect(existsSync(legacyTemp)).toBe(false)
+    expect(existsSync(freshLegacyTemp)).toBe(true)
+  })
+})
+
+// Two live processes share one cache directory routinely: a one-shot CLI beside
+// the resident serve child, or two menubar polls. Neither may publish an
+// envelope naming a file that is not there — that reads back as a corrupt
+// provider and silently drops its history.
+describe('concurrent writers', () => {
+  function seed(provider: string, tag: string, files: number): SessionCache {
+    const cache: SessionCache = {
+      version: CACHE_VERSION,
+      complete: true,
+      providers: {
+        [provider]: {
+          envFingerprint: tag,
+          files: Object.fromEntries(
+            Array.from({ length: files }, (_, i) => [`/f/${provider}/${i}.jsonl`, cachedFile()]),
+          ),
+        },
+      },
+    }
+    markCacheDirty(cache, provider)
+    return cache
+  }
+
+  async function assertReferentialIntegrity(expected: string[]): Promise<void> {
+    const dir = sessionCacheDir()
+    const envelope = JSON.parse(await readFile(join(dir, 'envelope.json'), 'utf-8'))
+    for (const name of Object.values(envelope.shards) as string[]) {
+      expect(existsSync(join(dir, name)), `envelope names a missing shard: ${name}`).toBe(true)
+    }
+    clearLoadCacheMemo()
+    const loaded = await loadCache()
+    expect(Object.keys(loaded.providers).length).toBeGreaterThan(0)
+    for (const provider of expected) expect(loaded.providers[provider]).toBeDefined()
+  }
+
+  it('never publishes a dangling envelope when two saves race', async () => {
+    for (let round = 0; round < 15; round++) {
+      await Promise.allSettled([
+        saveCache(seed('claude', `a${round}`, 40)),
+        saveCache(seed('codex', `b${round}`, 40)),
+      ])
+      // Whichever won, the published set has to be internally consistent and
+      // hold at least the provider that got there last.
+      await assertReferentialIntegrity([])
+    }
+  })
+
+  it('a stale writer rewrites a shard another process retired instead of orphaning it', async () => {
+    // Seed: claude holds an expired-source PR orphan no re-parse can recover.
+    const initial: SessionCache = {
+      version: CACHE_VERSION,
+      complete: true,
+      providers: {
+        claude: { envFingerprint: 'fp', files: { '/gone/pruned.jsonl': cachedFile({ prLinks: ['https://github.com/o/r/pull/1'] }) } },
+        codex: { envFingerprint: 'fp', durable: true, files: { '/live/r.jsonl': cachedFile() } },
+      },
+    }
+    markCacheDirty(initial, 'claude')
+    markCacheDirty(initial, 'codex')
+    await saveCache(initial)
+
+    // Process B loads now, recording claude's current shard name.
+    clearLoadCacheMemo()
+    const b = await loadCache()
+
+    // Process A independently touches ONLY claude and republishes, retiring the
+    // shard file B is still holding a name for.
+    clearLoadCacheMemo()
+    const a = await loadCache()
+    a.providers['claude']!.files['/live/new.jsonl'] = cachedFile()
+    markCacheDirty(a, 'claude')
+    await saveCache(a)
+
+    // B now saves an unrelated codex change.
+    b.providers['codex']!.files['/live/r2.jsonl'] = cachedFile()
+    markCacheDirty(b, 'codex')
+    await saveCache(b)
+
+    await assertReferentialIntegrity(['claude', 'codex'])
+    clearLoadCacheMemo()
+    const final = await loadCache()
+    expect(final.providers['claude']!.files['/gone/pruned.jsonl']).toBeDefined()
+    expect(final.providers['codex']!.files['/live/r2.jsonl']).toBeDefined()
   })
 })

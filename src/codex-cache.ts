@@ -104,6 +104,26 @@ function getEntry(cache: ResultCache, filePath: string, fp: FileFingerprint): Fi
   return null
 }
 
+// A grown file is only assumed to be an APPEND if the recorded boundary still
+// falls right after a newline. A same-inode rewrite (truncate + refill, or an
+// in-place edit) that happens to end up larger would otherwise resume into the
+// middle of an unrelated line. Reading one byte is cheaper than being wrong.
+async function endsLineAt(filePath: string, offset: number): Promise<boolean> {
+  if (offset === 0) return true
+  try {
+    const handle = await open(filePath, 'r')
+    try {
+      const buf = Buffer.alloc(1)
+      const { bytesRead } = await handle.read(buf, 0, 1, offset - 1)
+      return bytesRead === 1 && buf[0] === 0x0a
+    } finally {
+      await handle.close()
+    }
+  } catch {
+    return false
+  }
+}
+
 export async function readCachedCodexResults(
   filePath: string,
 ): Promise<CodexCacheHit | null> {
@@ -125,6 +145,7 @@ export async function readCachedCodexResults(
       && stale.resumeCallCount !== undefined
       && fp.sizeBytes > stale.sizeBytes
       && stale.resumeOffset <= fp.sizeBytes
+      && await endsLineAt(filePath, stale.resumeOffset)
     ) {
       return { kind: 'resume', calls: stale.calls, offset: stale.resumeOffset, state: stale.resumeState, callCount: stale.resumeCallCount }
     }

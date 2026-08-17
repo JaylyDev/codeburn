@@ -119,8 +119,9 @@ describe('parseAllSessions hydration lock', () => {
     expect(totalOutput(result)).toBe(50)
     // Lock released in the finally.
     expect(existsSync(lockPath())).toBe(false)
-    // The parse warmed the versioned cache.
-    expect(existsSync(sessionCacheDir())).toBe(true)
+    // The parse warmed the versioned cache: the envelope is what publishes it,
+    // so the directory merely existing proves nothing.
+    expect(existsSync(join(sessionCacheDir(), 'envelope.json'))).toBe(true)
   })
 
   it('ignores a fresh lock whose pid is dead', async () => {

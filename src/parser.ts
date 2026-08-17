@@ -2012,7 +2012,10 @@ async function scanProjectDirs(
   let filesDone = 0
   emitScanProgress({ kind: 'tick', provider: 'claude', done: 0, total: progressTotal })
   for (const { filePath, info, append } of changedFiles) {
+    // Marked here, not after the re-parse: an unreadable file `continue`s out
+    // below, and the deletion would otherwise live only in memory.
     delete section.files[filePath]
+    markCacheDirty(diskCache, 'claude')
 
     try {
       if (append) {
@@ -2810,6 +2813,11 @@ export function emitScanProgress(event: ScanProgressEvent): void {
 // that an interrupted long run loses little work, high enough that repeated
 // cache writes never dominate the parse.
 const PROGRESS_SAVE_FILE_INTERVAL = 2000
+// Only the claude scan reports per file; every other provider calls saveProgress
+// once, at its own boundary. Without a time floor the counter would never reach
+// the interval during a long non-claude phase and progress saves would simply
+// stop happening there.
+const PROGRESS_SAVE_MAX_INTERVAL_MS = 30_000
 
 export function createScanProgress(label: string, total: number) {
   const show = !interactiveScanUI && total > 20 && process.stderr.isTTY === true
@@ -2980,6 +2988,7 @@ async function parseProviderSources(
       // that pruned-away data is preserved for monotonic monthly totals.
       if (!provider.durableSources && !clearedPaths.has(source.path)) {
         delete section.files[source.path]
+        markCacheDirty(diskCache, providerName)
         clearedPaths.add(source.path)
       }
 
@@ -3872,11 +3881,14 @@ async function runParse(
   // atomic (temp + rename) and writes only the dirty provider shards, so this
   // never races the final save below.
   let filesSinceSave = 0
+  let lastSaveAt = Date.now()
   const saveProgress = async (): Promise<void> => {
     if (!isCold || readOnly) return
     if (!isCacheDirty(diskCache)) return
-    if (++filesSinceSave < PROGRESS_SAVE_FILE_INTERVAL) return
+    filesSinceSave++
+    if (filesSinceSave < PROGRESS_SAVE_FILE_INTERVAL && Date.now() - lastSaveAt < PROGRESS_SAVE_MAX_INTERVAL_MS) return
     filesSinceSave = 0
+    lastSaveAt = Date.now()
     try { await saveCache(diskCache) } catch { /* best-effort partial save */ }
   }
 
