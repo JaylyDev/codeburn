@@ -281,6 +281,11 @@ describe('codeburn serve --stdio', () => {
     const sameBytes = await request(110, args)
     expect(sameBytes['ok']).toBe(true)
     expect(sameBytes['output']).toBe(memoized!['output'])
+    // `generated` is minted per render, so an unchanged stamp is the proof
+    // that a memo hit returns the stored string instead of re-rendering.
+    const stamp = (res: Record<string, unknown>): string =>
+      (JSON.parse(res['output'] as string) as { generated: string }).generated
+    expect(stamp(sameBytes)).toBe(stamp(memoized!))
 
     // Same byte length as USD: a size-only fingerprint would miss this.
     await writeFile(configPath, JSON.stringify({ currency: { code: 'EUR' } }), 'utf8')
