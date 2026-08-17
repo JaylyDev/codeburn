@@ -13,6 +13,7 @@ import { join } from 'path'
 import {
   CACHE_VERSION,
   cacheBucketMonth,
+  cacheFileSpan,
   computeEnvFingerprint,
   cleanupOrphanedTempFiles,
   clearLoadCacheMemo,
@@ -562,5 +563,240 @@ describe('v8 -> v9 migration', () => {
 
     clearLoadCacheMemo()
     expect(await loadCache()).toEqual(loaded)
+  })
+})
+
+// Several providers emit turns in a non-chronological order (cursor composers by
+// ROWID, goose / crush / copilot by a DESC ordering). Reading the span off
+// turns[0]/turns[-1] then gives `until < bucket` — an empty span, unreachable at
+// every scope.
+describe('out-of-order turns', () => {
+  const outOfOrder = () => cachedFile({ turns: [turnAt('2026-08-10T10:00:00Z', 'a'), turnAt('2026-03-04T10:00:00Z', 'b')] })
+
+  it('spans oldest to newest whatever order the turns arrive in', () => {
+    const span = cacheFileSpan(outOfOrder())
+    expect(span).toEqual({ bucket: '2026-03', until: '2026-08' })
+    expect(cacheBucketMonth(outOfOrder())).toBe('2026-03')
+  })
+
+  it('stays reachable at the scope of either end', async () => {
+    const cache: SessionCache = {
+      version: CACHE_VERSION,
+      complete: true,
+      providers: { claude: { envFingerprint: computeEnvFingerprint('claude'), files: { '/live/desc.jsonl': outOfOrder() } } },
+    }
+    markCacheDirty(cache, 'claude')
+    await saveCache(cache)
+    expect((await envelope()).providers['claude']!.shards['2026-03']!.until).toBe('2026-08')
+
+    for (const [from, to] of [['2026-03-01', '2026-03-31'], ['2026-08-01', '2026-08-31']] as const) {
+      clearLoadCacheMemo()
+      const scoped = await loadCache(monthScopeForRange(new Date(`${from}T00:00:00Z`), new Date(`${to}T23:59:59Z`)))
+      expect(scoped.providers['claude']!.files['/live/desc.jsonl'], `unreachable at ${from}`).toBeDefined()
+    }
+  })
+})
+
+// A path must never end up in two shards at once: on a later load the two copies
+// race and the stale one can win, and nothing sweeps it because the envelope
+// names both.
+describe('re-bucketing out of an unloaded month', () => {
+  const juneScope = monthScopeForRange(new Date('2026-06-01T00:00:00Z'), new Date('2026-06-30T23:59:59Z'))
+
+  async function seed(): Promise<void> {
+    const cache: SessionCache = {
+      version: CACHE_VERSION,
+      complete: true,
+      providers: {
+        claude: {
+          envFingerprint: computeEnvFingerprint('claude'),
+          files: {
+            '/live/moving.jsonl': fileSpanning('2026-01-10T10:00:00Z'),
+            '/live/stay.jsonl': fileSpanning('2026-01-11T10:00:00Z'),
+            '/live/jun.jsonl': fileSpanning('2026-06-10T10:00:00Z'),
+          },
+        },
+      },
+    }
+    markCacheDirty(cache, 'claude')
+    await saveCache(cache)
+  }
+
+  /** Every shard's view of `path`, so a duplicate is visible directly. */
+  async function copiesOf(path: string): Promise<string[]> {
+    const dir = sessionCacheDir()
+    const found: string[] = []
+    for (const [bucket, ref] of Object.entries((await envelope()).providers['claude']!.shards)) {
+      const files = JSON.parse(await readFile(join(dir, ref.name), 'utf-8'))
+      if (files[path]) found.push(bucket)
+    }
+    return found.sort()
+  }
+
+  it('(a) drops the old copy when a re-parse moves the file to another month', async () => {
+    await seed()
+    clearLoadCacheMemo()
+    const scoped = await loadCache(juneScope)
+    expect(scoped.providers['claude']!.files['/live/moving.jsonl']).toBeUndefined()
+    // Re-parsed from byte 0 after a rewrite: its oldest turn is now in May.
+    scoped.providers['claude']!.files['/live/moving.jsonl'] = cachedFile({ turns: [turnAt('2026-05-02T10:00:00Z', 'new')], mcpInventory: ['reparsed'] })
+    markCacheDirty(scoped, 'claude', '/live/moving.jsonl')
+    await saveCache(scoped)
+
+    expect(await copiesOf('/live/moving.jsonl')).toEqual(['2026-05'])
+    clearLoadCacheMemo()
+    const full = await loadCache()
+    expect(full.providers['claude']!.files['/live/moving.jsonl']!.mcpInventory).toEqual(['reparsed'])
+    expect(full.providers['claude']!.files['/live/stay.jsonl']).toBeDefined()
+  })
+
+  it('(b) drops the old copy when a parse failure leaves a turn-less marker', async () => {
+    await seed()
+    clearLoadCacheMemo()
+    const scoped = await loadCache(juneScope)
+    // The #441 path: the file threw, so only a failure marker is cached.
+    scoped.providers['claude']!.files['/live/moving.jsonl'] = { fingerprint: { dev: 1, ino: 2, mtimeMs: 9, sizeBytes: 4 }, mcpInventory: [], turns: [], failed: true }
+    markCacheDirty(scoped, 'claude', '/live/moving.jsonl')
+    await saveCache(scoped)
+
+    expect(await copiesOf('/live/moving.jsonl')).toEqual(['0000-00'])
+    clearLoadCacheMemo()
+    const full = await loadCache()
+    expect(full.providers['claude']!.files['/live/moving.jsonl']!.failed).toBe(true)
+    expect(full.providers['claude']!.files['/live/stay.jsonl']).toBeDefined()
+  })
+
+  it('resolves a duplicate to the freshest copy and prunes it on the next save', async () => {
+    await seed()
+    // Forge the split state directly: the same path in two shards.
+    const dir = sessionCacheDir()
+    const env = await envelope()
+    const janName = env.providers['claude']!.shards['2026-01']!.name
+    const junName = env.providers['claude']!.shards['2026-06']!.name
+    const jun = JSON.parse(await readFile(join(dir, junName), 'utf-8'))
+    jun['/live/moving.jsonl'] = cachedFile({ turns: [turnAt('2026-06-02T10:00:00Z', 'fresh')], fingerprint: { dev: 1, ino: 2, mtimeMs: 999, sizeBytes: 4 }, mcpInventory: ['fresh'] })
+    await writeFile(join(dir, junName), JSON.stringify(jun))
+
+    clearLoadCacheMemo()
+    const full = await loadCache()
+    // Newest fingerprint wins, whichever shard finished reading first.
+    expect(full.providers['claude']!.files['/live/moving.jsonl']!.mcpInventory).toEqual(['fresh'])
+    await saveCache(full)
+    expect(await copiesOf('/live/moving.jsonl')).toEqual(['2026-06'])
+    expect(existsSync(join(dir, janName))).toBe(false)
+  })
+})
+
+describe('carried months under a concurrent writer', () => {
+  it('adopts the current shard rather than dropping an orphan-bearing month', async () => {
+    const orphan = cachedFile({ turns: [turnAt('2026-03-10T10:00:00Z', 'm')], prLinks: ['https://github.com/o/r/pull/1'] })
+    const initial: SessionCache = {
+      version: CACHE_VERSION,
+      complete: true,
+      providers: {
+        claude: {
+          envFingerprint: computeEnvFingerprint('claude'),
+          files: { '/gone/mar.jsonl': orphan, '/live/jun.jsonl': fileSpanning('2026-06-10T10:00:00Z') },
+        },
+      },
+    }
+    markCacheDirty(initial, 'claude')
+    await saveCache(initial)
+
+    // Process B loads June-scoped: March is carried, by the name it saw.
+    clearLoadCacheMemo()
+    const b = await loadCache(monthScopeForRange(new Date('2026-06-01T00:00:00Z'), new Date('2026-06-30T23:59:59Z')))
+
+    // Process A independently republishes March, retiring the file B remembers.
+    clearLoadCacheMemo()
+    const a = await loadCache(monthScopeForRange(new Date('2026-03-01T00:00:00Z'), new Date('2026-03-31T23:59:59Z')))
+    a.providers['claude']!.files['/gone/mar2.jsonl'] = cachedFile({ turns: [turnAt('2026-03-12T10:00:00Z', 'n')], prLinks: ['https://github.com/o/r/pull/2'] })
+    markCacheDirty(a, 'claude', '/gone/mar2.jsonl')
+    await saveCache(a)
+
+    // B saves its own unrelated June change.
+    b.providers['claude']!.files['/live/jun2.jsonl'] = fileSpanning('2026-06-20T10:00:00Z')
+    markCacheDirty(b, 'claude', '/live/jun2.jsonl')
+    await saveCache(b)
+
+    clearLoadCacheMemo()
+    const final = await loadCache()
+    // March survived under A's name, with both orphans; June has both files.
+    expect(Object.keys(final.providers['claude']!.files).sort())
+      .toEqual(['/gone/mar.jsonl', '/gone/mar2.jsonl', '/live/jun.jsonl', '/live/jun2.jsonl'])
+    for (const ref of Object.values((await envelope()).providers['claude']!.shards)) {
+      expect(existsSync(join(sessionCacheDir(), ref.name))).toBe(true)
+    }
+  })
+
+  // Two saves merging into the SAME unloaded month are a read-modify-write with
+  // no lock between them. In the product they are serialised by the warm refresh
+  // lock; this covers what survives when they are not. The optimistic retry in
+  // saveCache narrows the window to the envelope publish, and a loser's entries
+  // are re-derived by the next parse (the reconcile finds no cache entry and
+  // re-reads the file) rather than being lost for good.
+  it('two scoped saves merging into the same unloaded month keep the envelope sound', async () => {
+    const base: SessionCache = {
+      version: CACHE_VERSION,
+      complete: true,
+      providers: {
+        claude: {
+          envFingerprint: computeEnvFingerprint('claude'),
+          files: { '/live/mar.jsonl': fileSpanning('2026-03-10T10:00:00Z'), '/live/jun.jsonl': fileSpanning('2026-06-10T10:00:00Z') },
+        },
+      },
+    }
+    markCacheDirty(base, 'claude')
+    await saveCache(base)
+    const juneScope = monthScopeForRange(new Date('2026-06-01T00:00:00Z'), new Date('2026-06-30T23:59:59Z'))
+
+    clearLoadCacheMemo()
+    const p1 = await loadCache(juneScope)
+    clearLoadCacheMemo()
+    const p2 = await loadCache(juneScope)
+    // Both re-parse a different March session neither of them loaded.
+    p1.providers['claude']!.files['/live/mar-a.jsonl'] = fileSpanning('2026-03-20T10:00:00Z')
+    markCacheDirty(p1, 'claude', '/live/mar-a.jsonl')
+    p2.providers['claude']!.files['/live/mar-b.jsonl'] = fileSpanning('2026-03-21T10:00:00Z')
+    markCacheDirty(p2, 'claude', '/live/mar-b.jsonl')
+    await Promise.allSettled([saveCache(p1), saveCache(p2)])
+
+    clearLoadCacheMemo()
+    const final = await loadCache()
+    // The envelope is internally consistent and the pre-existing March session
+    // survived; a read-modify-write loser is re-derived by the next parse.
+    for (const ref of Object.values((await envelope()).providers['claude']!.shards)) {
+      expect(existsSync(join(sessionCacheDir(), ref.name))).toBe(true)
+    }
+    expect(final.providers['claude']!.files['/live/mar.jsonl']).toBeDefined()
+    expect(final.providers['claude']!.files['/live/jun.jsonl']).toBeDefined()
+    const landed = ['/live/mar-a.jsonl', '/live/mar-b.jsonl'].filter(p => final.providers['claude']!.files[p])
+    expect(landed.length).toBeGreaterThanOrEqual(1)
+  })
+})
+
+describe('retiring an orphaned prior layout', () => {
+  it('sweeps a v8 directory and a v7 file left behind by an interrupted re-layout', async () => {
+    await saveCache({ version: CACHE_VERSION, complete: true, providers: {
+      claude: { envFingerprint: 'fp', files: { '/a.jsonl': fileSpanning('2026-05-10T10:00:00Z') } },
+    } })
+    const v8Dir = join(TMP_DIR, 'session-cache.v8')
+    await mkdir(v8Dir, { recursive: true })
+    await writeFile(join(v8Dir, 'envelope.json'), JSON.stringify({ version: 8, nonce: 'n', shards: {} }))
+    await writeFile(join(v8Dir, 'claude.abc.json'), '{}')
+    const v7 = join(TMP_DIR, 'session-cache.v7.json')
+    await writeFile(v7, '{}')
+
+    // Fresh: an in-flight write by an older binary must be left alone.
+    await cleanupOrphanedTempFiles()
+    expect(existsSync(v8Dir)).toBe(true)
+    expect(existsSync(v7)).toBe(true)
+
+    const old = new Date(Date.now() - 90 * 60 * 1000)
+    await utimes(join(v8Dir, 'envelope.json'), old, old)
+    await utimes(v7, old, old)
+    await cleanupOrphanedTempFiles()
+    expect(existsSync(v8Dir)).toBe(false)
+    expect(existsSync(v7)).toBe(false)
   })
 })

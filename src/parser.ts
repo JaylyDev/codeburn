@@ -3798,9 +3798,12 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
   // on. Sessions whose every turn falls outside the range are dropped from the
   // report anyway, so skipping their shards changes nothing except the bytes
   // read — and a save writes only dirty months, leaving the skipped ones on
-  // disk untouched (see saveCache). Dedup is unaffected: a duplicate
-  // deduplicationKey is the same message at the same timestamp, so it can never
-  // straddle the loaded/skipped boundary.
+  // disk untouched (see saveCache). Cross-file dedup is weakened, not broken:
+  // the pre-seed of `seenMsgIds` / `seenKeys` only covers loaded files, so a key
+  // that a skipped file also holds is no longer suppressed. Totals are
+  // unaffected (a suppressed duplicate contributes nothing either way), but for
+  // a proxied key emitted under two providers the attribution can land on a
+  // different provider than a full load would pick.
   const loadScope = dateRange ? monthScopeForRange(dateRange.start, dateRange.end) : undefined
   let diskCache = await loadCache(loadScope)
   await cleanupOrphanedTempFiles()
