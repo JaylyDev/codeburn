@@ -2,8 +2,8 @@ import { readFile, writeFile, mkdir } from 'fs/promises'
 import { join } from 'path'
 
 import { getCodeburnCacheDir } from './cache-dir.js'
-import snapshotData from './data/litellm-snapshot.json'
-import fallbackData from './data/pricing-fallback.json'
+import snapshotData from './data/litellm-snapshot.json' with { type: 'json' }
+import fallbackData from './data/pricing-fallback.json' with { type: 'json' }
 import { fetchWithTimeout } from './fetch-utils.js'
 
 export type ModelCosts = {
@@ -994,4 +994,34 @@ export function getShortModelName(model: string): string {
     return segment ? getShortModelName(segment) : canonical
   }
   return canonical
+}
+
+// Pricing is process-global state assembled at CLI startup from the cached
+// LiteLLM snapshot plus user config. A parse worker thread starts with none of
+// it, and re-running loadPricing() there would mean N more disk reads (or, on a
+// cold pricing cache, N network fetches). Ship the resolved state across
+// instead, so every thread prices a call exactly as the main thread would.
+export type PricingSnapshot = {
+  pricing: Map<string, ModelCosts>
+  aliases: Record<string, string>
+  priceOverrides: Record<string, PriceOverrideRates>
+  localModelSavings: Record<string, string>
+}
+
+export function snapshotPricingState(): PricingSnapshot {
+  return {
+    pricing: pricingCache,
+    aliases: userAliases,
+    priceOverrides: userPriceOverridesConfig,
+    localModelSavings: userLocalModelSavings,
+  }
+}
+
+export function restorePricingState(snapshot: PricingSnapshot): void {
+  pricingCache = snapshot.pricing
+  sortedPricingKeys = null
+  lowercasePricingIndex = null
+  setModelAliases(snapshot.aliases)
+  setPriceOverrides(snapshot.priceOverrides)
+  setLocalModelSavings(snapshot.localModelSavings)
 }

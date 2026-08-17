@@ -69,6 +69,45 @@ output formatter (Ink TUI, JSON, or menubar-json)
 
 `src/parser.ts` is the central aggregator. Public exports: `parseAllSessions`, `filterProjectsByName`, `extractMcpInventory`. It owns the dedup `Set` (`seenKeys`) that is passed into every provider parser so a turn that surfaces in two providers (Claude logs vs. Cursor mirror, for instance) is counted once.
 
+### Parallel Cold Parse
+
+A cold Claude parse spends most of its time on work that is per-file and pure:
+reading a session JSONL, decoding it, and turning each line into a journal entry.
+`src/parse-workers.ts` moves that onto `worker_threads` when the pending workload
+is big enough to pay for them. Each worker runs `parseClaudeFileFull` against an
+empty dedup set and ships the result back as a JSON string; the parent installs
+results in the same order the serial loop would, and everything with cross-file
+state (the `seenMsgIds` dedup, canonical project paths, spawn links, PR
+correlation) stays on the main thread. A file whose message ids were already
+claimed by an earlier file, or whose worker failed, is re-parsed in-process — so
+the output is identical to the serial path either way. Only whole-file re-parses
+go off-thread; the append/incremental path is untouched. Workers are created at
+the start of a qualifying parse and terminated when it ends, so the resident
+`serve` child never accumulates threads.
+
+The pool is off by default for anything that is not a large cold parse:
+
+| Gate | Serial when |
+|---|---|
+| Pending files | fewer than 200 whole-file re-parses |
+| Pending bytes | under 200 MB behind those files |
+| Cores | `availableParallelism() <= 2` |
+| Memory | under 4 GB available |
+
+Otherwise the worker count is
+`min(cores - 1, min(0.25 * available, 2 GB) / 256 MB, pendingFiles / 50)`.
+
+"Available" is `process.availableMemory()`, falling back to `os.totalmem()`. It is
+deliberately not `os.freemem()`: on macOS that counts free pages rather than
+available memory and reads as a few hundred MB on an idle 128 GB machine, so a
+gate built on it switches the feature on and off between runs. On Linux outside a
+memory-limited cgroup, `availableMemory()` reports free memory and can still
+under-report on a busy host — which fails safe, to fewer threads or none.
+
+`CODEBURN_PARSE_WORKERS` overrides the decision and skips every gate above:
+`0` forces the serial parse, `N` forces N workers (capped at the core count).
+`CODEBURN_VERBOSE=1` prints the resolved worker count and the reason for it.
+
 ### Cache Layers
 
 Three caches under `~/.cache/codeburn/` (override with `CODEBURN_CACHE_DIR`):
