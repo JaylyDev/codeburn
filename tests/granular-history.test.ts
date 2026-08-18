@@ -45,7 +45,7 @@ function apiCall(options: {
   }
 }
 
-function project(sessions: Array<{ id: string; project?: string; calls: ParsedApiCall[] }>): ProjectSummary {
+function project(sessions: Array<{ id: string; project?: string; title?: string; calls: ParsedApiCall[] }>): ProjectSummary {
   return {
     project: 'demo',
     projectPath: '/repos/demo',
@@ -56,6 +56,7 @@ function project(sessions: Array<{ id: string; project?: string; calls: ParsedAp
     sessions: sessions.map(session => ({
       sessionId: session.id,
       project: session.project ?? 'demo',
+      title: session.title,
       firstTimestamp: session.calls[0]?.timestamp ?? '',
       lastTimestamp: session.calls.at(-1)?.timestamp ?? '',
       totalCostUSD: session.calls.reduce((sum, call) => sum + call.costUSD, 0),
@@ -105,6 +106,70 @@ describe('granular history', () => {
     expect(granularBucketMinutes(range(24 * 8))).toBe(60)
     expect(granularBucketMinutes(range(24 * 8 + 1))).toBe(1440)
     expect(granularBucketMinutes(range(24 * 30))).toBe(1440)
+  })
+
+  it('prefers a sanitised session title and preserves the exact project fallback when it is missing or blank', () => {
+    const timestamp = '2026-07-15T12:05:00.000Z'
+    const start = new Date('2026-07-15T00:00:00.000Z')
+    const end = new Date('2026-07-15T23:59:59.999Z')
+    const history = buildGranularHistory([project([
+      { id: 'session-titled-123456', title: 'Refactor billing module', calls: [apiCall({ timestamp, cost: 1 })] },
+      { id: 'session-absent-123457', calls: [apiCall({ timestamp, cost: 1 })] },
+      { id: 'session-empty-123458', title: '', calls: [apiCall({ timestamp, cost: 1 })] },
+      { id: 'session-blank-123459', title: ' \t\n ', calls: [apiCall({ timestamp, cost: 1 })] },
+    ])], { start, end }, end)
+
+    expect(history.sessionSeries.map(series => series.label)).toEqual([
+      'Refactor billing module · sessio…3456 (claude)',
+      'repos/demo · sessio…3457 (claude)',
+      'repos/demo · sessio…3458 (claude)',
+      'repos/demo · sessio…3459 (claude)',
+    ])
+  })
+
+  it('keeps identical session titles distinguishable with the short session id', () => {
+    const timestamp = '2026-07-15T12:05:00.000Z'
+    const start = new Date('2026-07-15T00:00:00.000Z')
+    const end = new Date('2026-07-15T23:59:59.999Z')
+    const history = buildGranularHistory([project([
+      { id: 'session-111111', title: 'Refactor billing module', calls: [apiCall({ timestamp, cost: 1 })] },
+      { id: 'session-222222', title: 'Refactor billing module', calls: [apiCall({ timestamp, cost: 1 })] },
+    ])], { start, end }, end)
+
+    expect(history.sessionSeries.map(series => series.id)).toEqual(['session_0', 'session_1'])
+    expect(history.sessionSeries.map(series => series.label)).toEqual([
+      'Refactor billing module · sessio…1111 (claude)',
+      'Refactor billing module · sessio…2222 (claude)',
+    ])
+    expect(new Set(history.sessionSeries.map(series => series.label)).size).toBe(2)
+  })
+
+  it('sanitises control characters and ANSI escapes in session titles', () => {
+    const timestamp = '2026-07-15T12:05:00.000Z'
+    const start = new Date('2026-07-15T00:00:00.000Z')
+    const end = new Date('2026-07-15T23:59:59.999Z')
+    const history = buildGranularHistory([project([{
+      id: 'session-sanitised-123456',
+      title: '\x1b[31mRefactor\x1b[0m\t billing\nmodule\x00',
+      calls: [apiCall({ timestamp, cost: 1 })],
+    }])], { start, end }, end)
+
+    expect(history.sessionSeries[0]?.label).toBe('Refactor billing module · sessio…3456 (claude)')
+    expect(history.sessionSeries[0]?.label).not.toContain('\x1b')
+    expect(history.sessionSeries[0]?.label).not.toContain('\x00')
+  })
+
+  it('caps over-long session titles before putting them in the legend label', () => {
+    const timestamp = '2026-07-15T12:05:00.000Z'
+    const start = new Date('2026-07-15T00:00:00.000Z')
+    const end = new Date('2026-07-15T23:59:59.999Z')
+    const history = buildGranularHistory([project([{
+      id: 'session-long-title-123456',
+      title: 'x'.repeat(200),
+      calls: [apiCall({ timestamp, cost: 1 })],
+    }])], { start, end }, end)
+
+    expect(history.sessionSeries[0]?.label).toBe('x'.repeat(80) + ' · sessio…3456 (claude)')
   })
 
   it('fills idle buckets and keeps separate model and session lines from real call timestamps', () => {

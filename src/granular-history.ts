@@ -1,3 +1,5 @@
+import stripAnsi from 'strip-ansi'
+
 import type { DateRange, ProjectSummary } from './types.js'
 
 const FIFTEEN_MINUTES = 15
@@ -5,6 +7,10 @@ const ONE_HOUR = 60
 const ONE_DAY = 24 * 60
 const MINUTE_MS = 60 * 1000
 const MAX_SERIES_PER_METRIC = 6
+// Keep metadata bounded for both the max-w-40 legend and the tooltip: 80
+// characters preserves a useful title without letting the parser's 200-char
+// transcript cap dominate either UI surface.
+const MAX_SESSION_TITLE_LENGTH = 80
 
 export type GranularSeries = {
   id: string
@@ -97,6 +103,21 @@ function topSeriesKeys(totals: Map<string, Totals>): Set<string> {
 function shortSessionId(sessionId: string): string {
   const trimmed = sessionId.trim()
   return trimmed.length > 12 ? `${trimmed.slice(0, 6)}…${trimmed.slice(-4)}` : trimmed || 'unknown'
+}
+
+function cleanSessionTitle(title: string | undefined): string | undefined {
+  if (title === undefined) return undefined
+
+  // Match the control-character range used by the model-name sanitizer. ANSI
+  // sequences are removed first; remaining controls become spaces so transcript
+  // line breaks cannot join words before internal whitespace is collapsed.
+  const cleaned = stripAnsi(title)
+    .replace(/[\x00-\x1F\x7F-\x9F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!cleaned) return undefined
+
+  return cleaned.slice(0, MAX_SESSION_TITLE_LENGTH).trimEnd() || undefined
 }
 
 // Legend labels: the sanitized project dir ("-Users-name-Projects-app") is
@@ -214,7 +235,13 @@ export function buildGranularHistory(
           add(modelTotals, modelKey, cost, tokens)
           add(sessionTotals, sessionKey, cost, tokens)
           modelLabels.set(modelKey, modelKey === '<synthetic>' ? 'Other model' : modelKey)
-          sessionLabels.set(sessionKey, `${shortProjectLabel(project.projectPath, projectName)} · ${shortSessionId(session.sessionId)} (${call.provider})`)
+          // Every input is constant for a given sessionKey (the provider is part
+          // of the key), so build the label once instead of re-sanitizing the
+          // title on every call in the session.
+          if (!sessionLabels.has(sessionKey)) {
+            const sessionLabel = cleanSessionTitle(session.title) ?? shortProjectLabel(project.projectPath, projectName)
+            sessionLabels.set(sessionKey, `${sessionLabel} · ${shortSessionId(session.sessionId)} (${call.provider})`)
+          }
           callCount++
         }
       }
