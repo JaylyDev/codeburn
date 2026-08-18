@@ -9,6 +9,7 @@ import {
   ALWAYSLOAD_STARTUP_CAP_SECONDS,
   ENABLE_TOOL_SEARCH_VAR,
   parseVersion,
+  SHELL_PROFILE_SCOPE,
   versionPredates,
 } from '../optimize.js'
 import type { WasteFinding } from '../optimize.js'
@@ -275,12 +276,15 @@ function pathNoteAdder(pathNotes: Record<string, string>): (path: string, note: 
 }
 
 function buildMcpRemove(finding: WasteFinding, r: ResolvedPaths): BuiltPlan {
-  const servers = finding.apply?.kind === 'mcp-remove' ? finding.apply.servers : []
+  const servers = finding.apply?.kind === 'mcp-remove'
+    ? [...new Set(finding.apply.servers)]
+    : []
   const searchPaths = [r.projectMcpJson, r.projectSettings, r.projectSettingsLocal, r.userClaudeJson]
   const docs = new ConfigDocs(r.homeDir)
   const skips: string[] = []
   const pathNotes: Record<string, string> = {}
   const addPathNote = pathNoteAdder(pathNotes)
+  const affectedServers: string[] = []
 
   for (const server of servers) {
     let removed = false
@@ -291,14 +295,24 @@ function buildMcpRemove(finding: WasteFinding, r: ResolvedPaths): BuiltPlan {
       if (res.removed) removed = true
       if (res.projectEntries.length > 0) addPathNote(path, projectRemovalNote(server, res.projectEntries, r.homeDir))
     }
-    if (!removed) skips.push(`skipped ${server}: not found in editable config (plugin or managed config?)`)
+    if (removed) affectedServers.push(server)
+    else skips.push(`skipped ${server}: not found in editable config (plugin or managed config?)`)
   }
 
   const changes = docs.changes()
   const notes = [...docs.errorNotes(), ...skips]
+  const attribution = finding.applyTokensSavedByServer
+  const partialWithoutAttribution = affectedServers.length < servers.length && !attribution
+  const affectedMissingAttribution = attribution !== undefined
+    && affectedServers.some(server => !Object.hasOwn(attribution, server))
+  const savingsUncertain = docs.errorNotes().length > 0
+    || partialWithoutAttribution
+    || affectedMissingAttribution
   if (changes.length === 0) return { plan: null, notes }
+  const plan = mcpPlan('mcp-remove', finding.id, `Remove ${affectedServers.length === 1 ? 'an MCP server' : 'MCP servers'} from config`, changes, affectedServers)
+  if (savingsUncertain) plan.mcpSavingsUncertain = true
   return {
-    plan: mcpPlan('mcp-remove', finding.id, `Remove ${changes.length === 1 ? 'an MCP server' : 'MCP servers'} from config`, changes),
+    plan,
     notes,
     ...(Object.keys(pathNotes).length > 0 ? { pathNotes } : {}),
   }
@@ -371,8 +385,8 @@ function buildMcpProjectScope(finding: WasteFinding, r: ResolvedPaths): BuiltPla
   }
 }
 
-function mcpPlan(kind: ActionKind, findingId: string, description: string, changes: PlannedChange[]): ActionPlan {
-  return { kind, findingId, description, changes }
+function mcpPlan(kind: ActionKind, findingId: string, description: string, changes: PlannedChange[], affectedMcpServers?: string[]): ActionPlan {
+  return { kind, findingId, description, changes, ...(affectedMcpServers ? { affectedMcpServers } : {}) }
 }
 
 // ---------------------------------------------------------------------------
@@ -386,7 +400,6 @@ const NEXT_SESSION_NOTE = 'takes effect on the next session (this config is read
 
 // findDeferralEnvSetting (src/optimize.ts) reports shell-profile hits with
 // exactly this scope string; the plan layer keys its refusal on it.
-const SHELL_PROFILE_SCOPE = 'shell profile'
 
 const SHELL_TOOL_SEARCH_LINE = new RegExp(`^\\s*(?:export\\s+)?${ENABLE_TOOL_SEARCH_VAR}\\s*=.*$`, 'm')
 

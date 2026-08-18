@@ -11,6 +11,7 @@ import { renderStatusBar } from './format.js'
 import { toDateString } from './daily-cache.js'
 import { dateKey } from './day-aggregator.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
+import type { AppliedFix } from './act/types.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
 import { buildPeriodData, buildMenubarPayloadForRange, buildDurablePeriod, type DurablePeriod } from './usage-aggregator.js'
 import { renderDashboard } from './dashboard.js'
@@ -1310,12 +1311,13 @@ program
 
 program
   .command('menubar')
-  .description('Install and launch the macOS menubar app (one command, no clone)')
-  .option('--force', 'Reinstall even if an older copy is already in ~/Applications')
+  .description('Install and launch the menubar app on macOS and Windows (one command, no clone)')
+  .option('--force', 'Reinstall even if a copy is already installed')
   .action(async (opts: { force?: boolean }) => {
     try {
       const result = await installMenubarApp({ force: opts.force, cliVersion: version })
-      console.log(`\n  Ready. ${result.installedPath}\n`)
+      // A cancelled Windows installer leaves nothing to point at.
+      if (result.installedPath) console.log(`\n  Ready. ${result.installedPath}\n`)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       console.error(`\n  Menubar install failed: ${message}\n`)
@@ -1806,6 +1808,7 @@ program
   .option('--yes', 'With --apply: apply every appliable fix without prompting')
   .option('--dry-run', 'With --apply: print the plan and exit without changing anything')
   .option('--only <ids>', 'With --apply: restrict to a comma-separated list of finding ids')
+  .option('--auto-revert', 'Undo applied fixes that measured no reduction (never CLAUDE.md rules)')
   .action(async (opts) => {
     assertProvider(opts.provider, 'optimize')
     const format = opts.json ? 'json' : opts.format
@@ -1831,28 +1834,35 @@ program
     const projects = await parseAllSessions(range, opts.provider)
     if (opts.apply) {
       const { runOptimizeApply } = await import('./act/optimize-apply.js')
-      await runOptimizeApply(projects, range, { yes: opts.yes, dryRun: opts.dryRun, only: opts.only })
+      await runOptimizeApply(projects, range, { yes: opts.yes, dryRun: opts.dryRun, only: opts.only, provider: opts.provider })
       return
     }
     assertFormat(format, ['text', 'json'], 'optimize')
-    if (format === 'text') {
-      // Surface realized savings from applied actions. Best effort: optimize
-      // must never fail because of journal contents, so any error just drops
-      // the header. computeActReport returns fast without scanning when the
-      // journal has no eligible applied actions, so users who never opted in
-      // see identical output.
-      let appliedHeader: string | undefined
-      let previouslyApplied: Record<string, string> | undefined
-      try {
-        const { computeActReport, buildOptimizeAppliedHeader } = await import('./act/report.js')
-        const applied = await computeActReport()
-        appliedHeader = buildOptimizeAppliedHeader(applied) ?? undefined
-        previouslyApplied = applied.appliedByFinding
-      } catch { /* the header is optional; never block the findings */ }
-      await runOptimize(projects, label, range, { format, appliedHeader, previouslyApplied })
-    } else {
-      await runOptimize(projects, label, range, { format })
-    }
+    // Surface realized savings from applied actions, and re-measure every one
+    // of them. Best effort: optimize must never fail because of journal
+    // contents, so any error just drops the extras. computeActReport returns
+    // fast without scanning when the journal has no applied actions, so users
+    // who never opted in see identical output.
+    let appliedHeader: string | undefined
+    let previouslyApplied: Record<string, string> | undefined
+    let appliedFixes: AppliedFix[] | undefined
+    try {
+      const { computeActReport, buildOptimizeAppliedHeader, autoRevertNoEffect } = await import('./act/report.js')
+      const applied = await computeActReport()
+      appliedHeader = buildOptimizeAppliedHeader(applied) ?? undefined
+      previouslyApplied = applied.appliedByFinding
+      appliedFixes = applied.appliedFixes
+      if (opts.autoRevert) {
+        const { lines, revertedIds } = await autoRevertNoEffect(appliedFixes)
+        appliedFixes = appliedFixes.filter(f => !revertedIds.has(f.id))
+        // JSON output must stay parseable, so the revert log goes to stderr there.
+        for (const line of lines) {
+          if (format === 'json') process.stderr.write(`  ${line}\n`)
+          else console.log(`  ${line}`)
+        }
+      }
+    } catch { /* the applied section is optional; never block the findings */ }
+    await runOptimize(projects, label, range, { format, appliedHeader, previouslyApplied, appliedFixes, provider: opts.provider })
   })
 
 program
@@ -2075,6 +2085,7 @@ program
   .option('--by-agent', 'One row per (provider, model, agent) instead of one row per (provider, model). Claude subagent transcripts only; other providers and main sessions bucket under "main"')
   .option('--top <n>', 'Show only the top N rows', (v: string) => parseInt(v, 10))
   .option('--min-cost <usd>', 'Hide rows below this cost threshold', (v: string) => parseFloat(v))
+  .option('--unpriced', 'Show only models with usage that currently price at $0')
   .option('--no-totals', 'Suppress the footer totals row')
   .option('--format <format>', 'Output format: table, markdown, json, csv', 'table')
   .action(async (opts) => {
@@ -2099,13 +2110,21 @@ program
     }
 
     const projects = await parseAllSessions(range, opts.provider)
-    const rows = await aggregateModels(projects, {
+    let rows = await aggregateModels(projects, {
       byTask: !!opts.byTask,
       byAgent: !!opts.byAgent,
       taskFilter: opts.task,
       topN: typeof opts.top === 'number' && Number.isFinite(opts.top) ? opts.top : undefined,
-      minCost: typeof opts.minCost === 'number' && Number.isFinite(opts.minCost) ? opts.minCost : 0.01,
+      minCost: typeof opts.minCost === 'number' && Number.isFinite(opts.minCost) ? opts.minCost : (opts.unpriced ? 0 : 0.01),
     })
+    if (opts.unpriced) {
+      rows = rows.filter(row => findUnpricedModels([{
+        model: row.model,
+        calls: row.calls,
+        cost: row.costUSD,
+        tokens: row.totalTokens,
+      }]).length > 0)
+    }
 
     const fmt = (opts.format ?? 'table').toLowerCase()
     if (rows.length === 0 && (fmt === 'table' || fmt === 'markdown')) {

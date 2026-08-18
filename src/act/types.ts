@@ -1,3 +1,5 @@
+import { formatTokens } from '../format.js'
+
 export type ActionKind =
   | 'mcp-remove' | 'mcp-project-scope'
   | 'defer-enable' | 'defer-alwaysload' | 'defer-threshold'
@@ -66,4 +68,68 @@ export type ActionPlan = {
   findingId?: string | null
   changes: PlannedChange[]
   baseline?: ActionBaseline
+  // MCP plans only: exact server identities the generated file mutations own.
+  // Preview and baseline capture must not claim skipped/managed targets.
+  affectedMcpServers?: string[]
+  // Relevant config scopes could not all be read, so removal may proceed
+  // with warnings but savings/baseline claims must be suppressed.
+  mcpSavingsUncertain?: boolean
+}
+
+// Applied actions are re-measured on every `codeburn optimize` run: only fixes
+// at least this old have a post-apply window to measure against.
+export const REPORT_MIN_AGE_DAYS = 3
+// A fix counts as having worked once it realizes this share of its
+// window-scaled estimate; anything above zero but below it is partial.
+export const VERDICT_WORKED_RATIO = 0.7
+
+// Per-applied-entry judgement shown by `codeburn optimize` after an --apply.
+// Computed in act/report.ts from the same rows `act report` prints - there is
+// one reconciliation, not two. Lives here so the optimize renderer can format
+// it without importing report.ts back into optimize.ts.
+export type AppliedVerdict = 'worked' | 'partial' | 'no-effect' | 'pending'
+
+export type AppliedFix = {
+  id: string
+  kind: ActionKind
+  findingId: string | null
+  appliedAt: string
+  ageDays: number
+  verdict: AppliedVerdict
+  // Window-scaled estimate, the same column `act report` compares against.
+  estimatedTokens: number
+  realizedTokens: number
+  note: string
+  undoCommand: string
+}
+
+const VERDICT_GLYPH: Record<AppliedVerdict, string> = {
+  worked: '\u2713',
+  partial: '~',
+  'no-effect': '\u2717',
+  pending: '\u2026',
+}
+
+export function appliedFixGlyph(fix: AppliedFix): string {
+  return VERDICT_GLYPH[fix.verdict]
+}
+
+// One plain line per applied fix: what it estimated, what it measured, and for
+// a fix that did nothing, how to put it back.
+export function formatAppliedFix(fix: AppliedFix): string {
+  const age = Math.max(0, Math.floor(fix.ageDays))
+  const head = `${fix.findingId ?? fix.kind} (${age}d ago)`
+  if (fix.verdict === 'pending') {
+    const why = fix.note || (age <= REPORT_MIN_AGE_DAYS
+      ? `measuring, check back after ${REPORT_MIN_AGE_DAYS} days`
+      : 'measuring')
+    return `${head}: ${why}`
+  }
+  const pair = `est. ${formatTokens(fix.estimatedTokens)} -> measured ${formatTokens(fix.realizedTokens)}`
+  if (fix.verdict === 'worked') return `${head}: ${pair}`
+  if (fix.verdict === 'partial') {
+    const under = Math.round((1 - fix.realizedTokens / fix.estimatedTokens) * 100)
+    return `${head}: ${pair} (-${under}% vs estimate)`
+  }
+  return `${head}: ${pair} - did not help. Revert: ${fix.undoCommand}`
 }
