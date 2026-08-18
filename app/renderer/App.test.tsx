@@ -138,7 +138,12 @@ function installDefaultMocks() {
     summary: {
       healthScore: 100, healthGrade: 'A', findingCount: 0, periodCostUSD: 0,
       sessions: 0, calls: 0, potentialSavingsTokens: 0, potentialSavingsCostUSD: 0,
-      potentialSavingsPercent: 0, costRateUSD: 0,
+      potentialSavingsPercent: 0, costRateUSD: 0, measuredSavingsUSD: 0,
+      byClass: {
+        fix: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+        nudge: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+        keep: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+      },
     },
     findings: [],
   })

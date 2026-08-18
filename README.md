@@ -25,7 +25,7 @@
     <a href="https://github.com/sponsors/iamtoruk"><img src="https://img.shields.io/badge/sponsor-♥-F97316?logo=github" alt="Sponsor" /></a>
 </p>
 
-<p align="center">If CodeBurn shows you something your bill never did, <a href="https://github.com/getagentseal/codeburn/stargazers">star the repo</a> so other developers find it, and consider <a href="https://github.com/sponsors/iamtoruk">sponsoring</a> to keep 40 integrations honest.</p>
+<p align="center">If CodeBurn shows you something your bill never did, <a href="https://github.com/getagentseal/codeburn/stargazers">star the repo</a> so other developers find it, and consider <a href="https://github.com/sponsors/iamtoruk">sponsoring</a> to keep 41 integrations honest.</p>
 
 <table align="center">
   <tr>
@@ -52,20 +52,21 @@
       <code>npx codeburn</code>
     </td>
     <td align="center" width="50%">
-      <strong>macOS Menubar</strong><br/>
+      <strong>Menubar</strong><br/>
       <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/menubar-app.jpg" alt="CodeBurn macOS menubar" /><br/>
-      <code>codeburn menubar</code>
+      <code>codeburn menubar</code><br/>
+      <a href="https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.20"><img src="https://img.shields.io/badge/Windows-Tray_app_(.msi)-F97316?logo=windows&logoColor=white" alt="Download the CodeBurn Windows menubar" /></a>
     </td>
   </tr>
 </table>
 
 <p align="center"><em>Four surfaces, one source of truth: everything reads the session files already on your disk.</em></p>
 
-**CodeBurn is a free, open-source, local-first tool that tracks AI coding token usage and cost across 40 tools and agents (Claude Code, Cursor, Codex, Gemini, Grok and more), broken down by model, project, and task.**
+**CodeBurn is a free, open-source, local-first tool that tracks AI coding token usage and cost across 41 tools and agents (Claude Code, Cursor, Codex, Gemini, Grok and more), broken down by model, project, and task.**
 
 You pay for Claude, Codex, Cursor, and a stack of other AI tools. The bill tells you the total. It never tells you that half of it went to conversation instead of code, or that an expensive model burned your budget on work a cheaper one would have one-shot.
 
-CodeBurn does. It reads the session files your tools already write to disk and breaks down every token and dollar by **task, model, tool, and project**, across **40 AI tools**.
+CodeBurn does. It reads the session files your tools already write to disk and breaks down every token and dollar by **task, model, tool, and project**, across **41 AI tools**.
 
 Everything runs locally. No wrapper, no proxy, no API keys, nothing leaves your machine. Pricing comes from [LiteLLM](https://github.com/BerriAI/litellm), refreshed daily.
 
@@ -107,7 +108,7 @@ Also runs via `bunx codeburn` or `pnpm dlx codeburn`, or `brew install codeburn`
 codeburn menubar
 ```
 
-On Linux, a GNOME Shell extension gives the same panel view; see [Linux (GNOME)](#linux-gnome).
+The same command installs the tray app on Windows; see [Windows](#windows). On Linux, a GNOME Shell extension gives it in the top panel; see [Linux (GNOME)](#linux-gnome).
 
 Requires **Node.js 22.13+** and at least one supported tool with session data on disk. For Cursor and OpenCode, `better-sqlite3` installs automatically.
 
@@ -167,6 +168,12 @@ codeburn optimize --format json         # setup health + findings as JSON
 - Possibly low-worth expensive sessions with no edit turns or repeated retries
   when no `git`/`gh` delivery command is observed
 
+Findings are grouped into three classes: **Fix now** (CodeBurn can apply it for you), **Habits**
+(you change how you drive the next session), and **FYI** (informational, the cost may be justified).
+Each one says whether its savings number is `measured` from provider-counted usage or `estimated`
+from a model. See [docs/optimize.md](docs/optimize.md) for what is scanned, what `--apply` may write,
+and how to read the health grade.
+
 Each finding shows the estimated token and dollar savings plus a ready-to-paste fix: a `CLAUDE.md` line, an environment variable, or a `mv` command to archive unused items. Findings are ranked by urgency (impact weighted against observed waste) and rolled up into an A to F setup health grade. Repeat runs classify each finding as new, improving, or resolved against a 48-hour recent window.
 
 You can also open it inline from the dashboard: press `o` when a finding count appears in the status bar, `b` to return.
@@ -180,11 +187,12 @@ codeburn optimize --apply --yes       # apply every appliable fix without prompt
 codeburn act list                     # every change CodeBurn has made
 codeburn act undo --last              # roll the most recent change back
 codeburn act report                   # realized vs estimated savings
+codeburn optimize --auto-revert       # undo the applied fixes that measured no reduction
 ```
 
 `codeburn optimize` finds the waste; `--apply` fixes the config-class findings for you: settings values, environment variables, archiving unused agents and skills. Every change is backed up and journaled before it lands. `codeburn act list` shows the history and `codeburn act undo <id>` restores the original files (it refuses if the files changed since being applied, unless you pass `--force`).
 
-The loop closes on honesty: once an applied fix is at least 3 days old, `codeburn act report` compares its estimated savings against what your sessions actually did, and later `codeburn optimize` runs show that realized figure in the header. Estimates get checked against reality, not just claimed.
+The loop closes on honesty: once an applied fix is at least 3 days old, `codeburn act report` compares its estimated savings against what your sessions actually did, and every later `codeburn optimize` run lists it under `Applied fixes` with a plain verdict — worked, under its estimate, or did not help, with the undo command for that last case. `--auto-revert` undoes the ones that did nothing (never `CLAUDE.md` rules). Estimates get checked against reality, not just claimed.
 
 ## Guard your budget
 
@@ -281,6 +289,8 @@ Pairing is PIN-authorized and stays on your local network. You can also discover
 
 ## Menu bar
 
+### macOS
+
 ```bash
 codeburn menubar
 ```
@@ -321,6 +331,20 @@ defaults write org.agentseal.codeburn-menubar CodeBurnPreferredTerminal -string 
 
 Allowed values are `terminal` (macOS Terminal.app, the default) and `iterm2`. Anything else falls back to `terminal`. Only terminals that can script a command into a live window are offered; if the chosen app is missing or fails to accept the command, CodeBurn tries Terminal.app and then runs the command in the background, logging each step to Console.app. Takes effect on the next launch of a command, no relaunch needed.
 
+### Windows
+
+Windows gets the same ambient view from the system tray, from the same one command:
+
+```powershell
+codeburn menubar
+```
+
+It downloads the `.msi` for your CLI version, verifies its sha256, runs it through `msiexec /passive`, and launches the tray app. Re-run with `--force` to reinstall; an already-installed matching version is just launched. You can also download the `.msi` yourself from the [latest Windows Menubar release](https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.20).
+
+Today's spend sits in the tray as a number beside the flame icon (turn it off in Settings, and the tooltip always carries it). Click for the same popover the macOS app shows: agent tabs, period switcher, Trend, Forecast, Pulse, Stats and Plan insights, activity and model breakdowns, optimize findings, and CSV/JSON export. Settings covers launch at login, the tray number, theme, and currency. It refreshes every 60 seconds while the popover is open and every 2 minutes while it is closed.
+
+The tray app reads everything through the CLI, so install that first (`npm install -g codeburn`) — it needs **codeburn 0.9.9 or newer**, and shows a setup screen with the install command until it finds one. Source and build instructions are in [`windows/`](windows/) ([windows/DEVELOPMENT.md](windows/DEVELOPMENT.md)). The `.msi` is unsigned for now, so SmartScreen prompts on first run.
+
 ### Linux (GNOME)
 
 Linux gets the same ambient view through a GNOME Shell extension (GNOME 45+): spend in the top panel, period switcher, compact mode, and daily budget alerts. It lives in [`gnome/`](gnome/):
@@ -331,7 +355,7 @@ git clone https://github.com/getagentseal/codeburn && cd codeburn/gnome
 gnome-extensions enable codeburn@codeburn.dev
 ```
 
-See [gnome/README.md](gnome/README.md) for settings and development notes. On Windows, `codeburn web` is the always-on view for now.
+See [gnome/README.md](gnome/README.md) for settings and development notes. The Tauri tray app in `windows/` also builds and runs on Linux, but it is experimental and unreleased there — the GNOME extension is the supported Linux surface.
 
 ## CodeBurn in your agent (MCP)
 
@@ -683,6 +707,7 @@ These are starting points, not verdicts. A 60% cache hit on a single experimenta
 | **Cline / Roo Code / KiloCode** | VS Code `globalStorage` across VS Code, VS Code Insiders, and VSCodium (Cline at `saoudrizwan.claude-dev`, plus `~/.cline/data`) | Cline-family agents. CodeBurn reads `ui_messages.json` from each task directory, extracting token counts from `type: "say"` entries with `say: "api_req_started"`. |
 | **Cline CLI** | `~/.cline/data/sessions/<session-id>/` (honors `CLINE_SESSION_DATA_DIR`, `CLINE_DATA_DIR`, `CLINE_DIR`) | The Cline command-line agent, whose layout is unrelated to the VS Code extension's. Reads `<session-id>.json` for session metadata and the rolled-up `usage`, and `<session-id>.messages.json` for the per-message `metrics` block (input, output, cacheRead, cacheWrite, cost) that becomes one call each. |
 | **CodeWhale** | `~/.codewhale/sessions/*.json` plus unmigrated legacy `~/.deepseek/sessions/*.json`; `$CODEWHALE_HOME/sessions` is an exact override | Emits one cumulative record per saved session. CodeWhale exposes only `total_tokens`, so CodeBurn preserves that aggregate in the input column rather than inventing an input/output split. Cost is the exact stored parent-session plus subagent USD total; model pricing is used only when the cost snapshot is absent. Tool blocks, shell commands, skills, and subagent types are retained. |
+| **DeepSeek Harness** (`dsh`) | `~/.dsh/sessions/--<slug>--/<session-id>/session.jsonl.zstd` (or `session.jsonl` when compression is off); `DSH_HOME` relocates the root | DeepSeek's open-source agent harness, unrelated to the CodeWhale desktop app. The `.zstd` log is a concatenation of independent zstd frames (one per write batch), decoded frame by frame; needs Node 22.15+. One call per `(turn, step)`, with usage from the step's `assistant/message` (the streamed `assistant/chunk` sample is a draft of the same call, never a second one). DSH records tokens but no cost, so calls are priced from the shared tables with reasoning billed at the output rate. |
 | **IBM Bob** | `User/globalStorage/ibm.bob-code/tasks/<task-id>/` (GA `IBM Bob` and preview `Bob-IDE` app folders) | Reads `ui_messages.json` for API request token/cost records and `api_conversation_history.json` for the selected model. |
 | **Kimi Code CLI** | `$KIMI_SHARE_DIR/sessions/<workdir-hash>/<session-id>/` or `~/.kimi/sessions/<workdir-hash>/<session-id>/` | Reads `wire.jsonl` `StatusUpdate.token_usage` records, mapping `input_other`, `input_cache_read`, `input_cache_creation`, and `output` into the standard token columns; includes subagents under each session's `subagents/` folder. |
 | **LingTai TUI** | `~/.lingtai/<agent>/logs/token_ledger.jsonl` plus project homes from `~/.lingtai-tui/registry.jsonl` (`<project>/.lingtai/<agent>/logs/token_ledger.jsonl`); honors `LINGTAI_HOME` / `LINGTAI_TUI_HOME` | Reads LingTai's append-only token ledger, mapping `input - cached` to fresh input, `cached` to cache reads, `output` to output, and `thinking` to reasoning. Nested daemon ledgers are skipped because parent ledgers already mirror daemon usage with `source`/`run_id` tags. |
@@ -722,12 +747,12 @@ CodeBurn deduplicates messages (by API message ID for Claude, by cumulative toke
 
 CodeBurn is free, runs entirely on your machine, and exists to cut your AI bill. If it has already saved you more than a sponsorship costs, consider sending a little of that back.
 
-Keeping 40 integrations accurate is constant work. The tools underneath change every week: Cursor reshapes its database, Claude moves a config path, new models ship at new prices. Sponsorship keeps CodeBurn current with all of it, so the numbers you see are always the real ones.
+Keeping 41 integrations accurate is constant work. The tools underneath change every week: Cursor reshapes its database, Claude moves a config path, new models ship at new prices. Sponsorship keeps CodeBurn current with all of it, so the numbers you see are always the real ones.
 
 Where your sponsorship goes:
 
 - **Honest numbers.** New models and price changes are mapped quickly, so your cost is the real cost, not a guess.
-- **More tools.** Every one of the 40 providers started as a single file. Sponsorship funds the next one.
+- **More tools.** Every one of the 41 providers started as a single file. Sponsorship funds the next one.
 - **Fast fixes.** When a vendor breaks something, paid time is what gets it patched now instead of someday.
 
 Sponsoring as a team or company? Your logo lands right here, in front of every developer who opens the repo. The first sponsor gets it to themselves until the next one shows up.

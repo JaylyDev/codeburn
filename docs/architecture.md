@@ -4,27 +4,27 @@ A map of the codebase. Read this once before opening a non-trivial PR.
 
 ## Three Surfaces
 
-CodeBurn is one Node.js CLI plus two GUI clients that shell out to it.
+CodeBurn is one Node.js CLI plus three ambient GUI clients that shell out to it.
 
 ```
-+----------------------+      +-----------------+
-| mac/  (Swift)        | ---> |                 |
-+----------------------+      |  src/cli.ts     |
-| gnome/ (JavaScript)  | ---> |  (the CLI)      |
-+----------------------+      |                 |
-                              |  status         |
-                              |  --format       |
-                              |  menubar-json   |
-                              +-----------------+
-                                       |
-                                       v
-                          +----------------------------+
-                          | session files on disk      |
-                          | (JSONL, SQLite, protobuf)  |
-                          +----------------------------+
++---------------------------+      +-----------------+
+| mac/     (Swift)          | ---> |                 |
++---------------------------+      |  src/cli.ts     |
+| windows/ (Rust + React)   | ---> |  (the CLI)      |
++---------------------------+      |                 |
+| gnome/   (JavaScript)     | ---> |  status         |
++---------------------------+      |  --format       |
+                                   |  menubar-json   |
+                                   +-----------------+
+                                            |
+                                            v
+                               +----------------------------+
+                               | session files on disk      |
+                               | (JSONL, SQLite, protobuf)  |
+                               +----------------------------+
 ```
 
-The macOS menubar (`mac/`) and the GNOME extension (`gnome/`) both invoke `codeburn status --format menubar-json --period <p>` and parse the JSON. They do not share code with the CLI; they only depend on its output contract.
+The macOS menubar (`mac/`), the Windows tray app (`windows/`), and the GNOME extension (`gnome/`) all invoke `codeburn status --format menubar-json --period <p>` and parse the JSON. They do not share code with the CLI; they only depend on its output contract.
 
 ## CLI (`src/`)
 
@@ -69,6 +69,67 @@ output formatter (Ink TUI, JSON, or menubar-json)
 
 `src/parser.ts` is the central aggregator. Public exports: `parseAllSessions`, `filterProjectsByName`, `extractMcpInventory`. It owns the dedup `Set` (`seenKeys`) that is passed into every provider parser so a turn that surfaces in two providers (Claude logs vs. Cursor mirror, for instance) is counted once.
 
+### Parallel Cold Parse
+
+A cold parse spends most of its time on work that is per-file and pure: reading a
+session JSONL or a Codex rollout, decoding it, and turning each line into a
+journal entry. `src/parse-workers.ts` moves that onto `worker_threads` when the
+pending workload is big enough to pay for them. Each worker runs the same
+per-file function the serial path runs — `parseClaudeFileFull` for a Claude
+session, `parseCodexFileFull` for a Codex rollout — against an empty dedup set,
+and ships the result back as a JSON string together with every dedup key it
+claimed. The parent installs results in the same order the serial loop would, and
+everything with cross-file state (the dedup sets, canonical project paths, spawn
+links, PR correlation, the Codex result cache) stays on the main thread. A file
+whose keys were already claimed by an earlier file, or whose worker failed, is
+re-parsed in-process — so the output is identical to the serial path either way.
+That overlap check is what makes a forked Codex rollout safe: it replays its
+parent's token_count history under the parent's key namespace, collides, and is
+re-parsed against the real dedup set.
+
+A Codex worker never touches `src/codex-cache.ts`: it returns the cache entry it
+would have written and the parent writes it, in install order, so
+`flushCodexCache` publishes exactly what a serial parse would. Only whole-file
+parses go off-thread; the append/incremental paths (a Claude append, a Codex
+byte-offset resume) are untouched and stay in-process. The decision is made per
+provider — the Claude scan and the provider loop run one after the other, so at
+most one pool is alive — and the pool is terminated when its scan ends, so the
+resident `serve` child never accumulates threads.
+
+The pool is off by default for anything that is not a large cold parse:
+
+| Gate | Serial when |
+|---|---|
+| Pending bytes | under 200 MB behind the pending whole-file parses |
+| Cores | `availableParallelism() <= 2` |
+| Memory | under 4 GB available |
+
+Otherwise the worker count is
+`min(cores - 1, min(0.25 * available, 2 GB) / perWorker, max(pendingFiles / 50, pendingBytes / 200 MB))`.
+Files and bytes each earn threads on their own, so a few hundred multi-hundred-MB
+Codex rollouts parallelize as well as a few thousand small Claude transcripts. The
+gate is bytes only, deliberately: 250 pending files holding under a megabyte
+between them spawn threads that make the run ~5% slower, and a file count only
+starts paying for itself around 400.
+
+`perWorker` is the per-thread memory budget, derived per parse as
+`clamp(256 MB, 2 x (pendingBytes / pendingFiles) + 128 MB, 1 GB)`. A flat figure
+was wrong in both directions: small Claude transcripts peak well under 256 MB,
+while a 260 MB Codex rollout peaks near 430 MB in its worker and scales linearly
+with the pool. The budget also covers the parent, which buffers up to `pool.size`
+finished results while it installs one.
+
+"Available" is `process.availableMemory()`, falling back to `os.totalmem()`. It is
+deliberately not `os.freemem()`: on macOS that counts free pages rather than
+available memory and reads as a few hundred MB on an idle 128 GB machine, so a
+gate built on it switches the feature on and off between runs. On Linux outside a
+memory-limited cgroup, `availableMemory()` reports free memory and can still
+under-report on a busy host — which fails safe, to fewer threads or none.
+
+`CODEBURN_PARSE_WORKERS` overrides the decision and skips every gate above:
+`0` forces the serial parse, `N` forces N workers (capped at the core count).
+`CODEBURN_VERBOSE=1` prints the resolved worker count and the reason for it.
+
 ### Cache Layers
 
 Three caches under `~/.cache/codeburn/` (override with `CODEBURN_CACHE_DIR`):
@@ -83,7 +144,7 @@ All three use atomic write (temp file + `rename`) and write with mode `0o600`. A
 
 ### Optimize Detectors
 
-`src/optimize.ts` exports 14 detectors. Each returns a `WasteFinding | null`. They are composed by `runOptimize()` which collects findings, ranks them by impact, and returns them with `WasteAction` objects (paste-to-CLAUDE.md, paste-to-session-opener, prompt-now, edit shell config).
+`src/optimize.ts` exports 20 detectors. Each returns a `WasteFinding | null`. They are composed by `runOptimize()` which collects findings, ranks them by impact, and returns them with `WasteAction` objects (paste-to-CLAUDE.md, paste-to-session-opener, prompt-now, edit shell config).
 
 | Detector | Line | What it catches |
 |---|---|---|
@@ -130,7 +191,7 @@ type Provider = {
 
 `src/providers/index.ts` registers providers across two tiers:
 
-- **Eager**: `claude`, `cline`, `codewhale`, `codebuff`, `codex`, `copilot`, `devin`, `droid`, `gemini`, `hermes`, `ibm-bob`, `kilo-code`, `kiro`, `kimi`, `lingtai-tui`, `mistral-vibe`, `mux`, `openclaw`, `open-design`, `pi`, `omp`, `qwen`, `roo-code`, `zerostack`, `grok`. Imported at module load.
+- **Eager**: `claude`, `cline`, `codewhale`, `codebuff`, `codex`, `copilot`, `devin`, `droid`, `dsh`, `gemini`, `hermes`, `ibm-bob`, `kilo-code`, `kiro`, `kimi`, `lingtai-tui`, `mistral-vibe`, `mux`, `openclaw`, `open-design`, `pi`, `omp`, `qwen`, `roo-code`, `zerostack`, `grok`. Imported at module load.
 - **Lazy**: `antigravity`, `forge`, `goose`, `cursor`, `opencode`, `cursor-agent`, `crush`, `warp`, `vercel-gateway`, `zcode`, `zed`. Imported via dynamic `import()` so the heavy dependencies (SQLite, protobuf, network clients) do not touch users who do not have those tools installed.
 
 Both lists hit the same `getAllProviders()` aggregator. A failed lazy import is silent and excludes that provider from the run.
@@ -155,6 +216,20 @@ Swift package (`mac/Package.swift`), targets macOS 14, strict concurrency on. La
 Tests live in `mac/Tests/CodeBurnMenubarTests/` (currently `CapacityEstimatorTests.swift`).
 
 The build artifact is a zipped `.app` bundle produced by `mac/Scripts/package-app.sh`. See `RELEASING.md` for how the GitHub Actions workflow uses it.
+
+## Windows Menubar (`windows/`)
+
+Tauri 2 app: a Rust binary (`windows/src-tauri/`) owning the tray and the process spawning, plus a React + TypeScript popover (`windows/src/`) rendered in a WebView2 window. Design tokens come from `windows/tokens.json`, the same file `mac/` reads at build time, so both products render as one.
+
+- `src-tauri/src/lib.rs` builds the tray, positions the popover against the taskbar edge, and registers the `#[tauri::command]` surface the frontend calls.
+- `src-tauri/src/cli.rs` resolves and spawns the CLI. Only absolute `PATH` directories are searched (an empty entry from `;;` would otherwise resolve against the current directory), `CODEBURN_BIN` is allowlisted, and Windows system tools are spawned by absolute `%SystemRoot%\System32` path because `CreateProcess` searches the current directory first. `MIN_CLI_VERSION` gates the whole app; below it the popover shows a setup screen.
+- `src-tauri/src/plan.rs` ports the Claude quota view. Like the macOS `ClaudeCredentialStore`, it never spends Claude's single-use refresh token; on a 401 it re-reads Claude's own credential file for a token Claude Code has already rotated.
+- `src-tauri/src/tray_badge.rs` renders today's spend into a second tray icon, since Windows has no menubar title.
+- `src/App.tsx` owns the payload cache, the CLI gate, and the refresh cadence, which follows popover visibility the way `mac/`'s `RefreshCadence.swift` does.
+
+`cargo test` covers the PATH filter and the version gate. `windows/DEVELOPMENT.md` has the build, security, and release details; CI is `.github/workflows/windows-menubar-ci.yml` and releases go out on `windows-v*` tags.
+
+The Linux (ksni) paths in the same crate are kept compiling but are experimental and unreleased; `gnome/` is the shipping Linux surface.
 
 ## GNOME Extension (`gnome/`)
 
