@@ -4,27 +4,27 @@ A map of the codebase. Read this once before opening a non-trivial PR.
 
 ## Three Surfaces
 
-CodeBurn is one Node.js CLI plus two GUI clients that shell out to it.
+CodeBurn is one Node.js CLI plus three ambient GUI clients that shell out to it.
 
 ```
-+----------------------+      +-----------------+
-| mac/  (Swift)        | ---> |                 |
-+----------------------+      |  src/cli.ts     |
-| gnome/ (JavaScript)  | ---> |  (the CLI)      |
-+----------------------+      |                 |
-                              |  status         |
-                              |  --format       |
-                              |  menubar-json   |
-                              +-----------------+
-                                       |
-                                       v
-                          +----------------------------+
-                          | session files on disk      |
-                          | (JSONL, SQLite, protobuf)  |
-                          +----------------------------+
++---------------------------+      +-----------------+
+| mac/     (Swift)          | ---> |                 |
++---------------------------+      |  src/cli.ts     |
+| windows/ (Rust + React)   | ---> |  (the CLI)      |
++---------------------------+      |                 |
+| gnome/   (JavaScript)     | ---> |  status         |
++---------------------------+      |  --format       |
+                                   |  menubar-json   |
+                                   +-----------------+
+                                            |
+                                            v
+                               +----------------------------+
+                               | session files on disk      |
+                               | (JSONL, SQLite, protobuf)  |
+                               +----------------------------+
 ```
 
-The macOS menubar (`mac/`) and the GNOME extension (`gnome/`) both invoke `codeburn status --format menubar-json --period <p>` and parse the JSON. They do not share code with the CLI; they only depend on its output contract.
+The macOS menubar (`mac/`), the Windows tray app (`windows/`), and the GNOME extension (`gnome/`) all invoke `codeburn status --format menubar-json --period <p>` and parse the JSON. They do not share code with the CLI; they only depend on its output contract.
 
 ## CLI (`src/`)
 
@@ -144,7 +144,7 @@ All three use atomic write (temp file + `rename`) and write with mode `0o600`. A
 
 ### Optimize Detectors
 
-`src/optimize.ts` exports 14 detectors. Each returns a `WasteFinding | null`. They are composed by `runOptimize()` which collects findings, ranks them by impact, and returns them with `WasteAction` objects (paste-to-CLAUDE.md, paste-to-session-opener, prompt-now, edit shell config).
+`src/optimize.ts` exports 20 detectors. Each returns a `WasteFinding | null`. They are composed by `runOptimize()` which collects findings, ranks them by impact, and returns them with `WasteAction` objects (paste-to-CLAUDE.md, paste-to-session-opener, prompt-now, edit shell config).
 
 | Detector | Line | What it catches |
 |---|---|---|
@@ -191,7 +191,7 @@ type Provider = {
 
 `src/providers/index.ts` registers providers across two tiers:
 
-- **Eager**: `claude`, `cline`, `codewhale`, `codebuff`, `codex`, `copilot`, `devin`, `droid`, `gemini`, `hermes`, `ibm-bob`, `kilo-code`, `kiro`, `kimi`, `lingtai-tui`, `mistral-vibe`, `mux`, `openclaw`, `open-design`, `pi`, `omp`, `qwen`, `roo-code`, `zerostack`, `grok`. Imported at module load.
+- **Eager**: `claude`, `cline`, `codewhale`, `codebuff`, `codex`, `copilot`, `devin`, `droid`, `dsh`, `gemini`, `hermes`, `ibm-bob`, `kilo-code`, `kiro`, `kimi`, `lingtai-tui`, `mistral-vibe`, `mux`, `openclaw`, `open-design`, `pi`, `omp`, `qwen`, `roo-code`, `zerostack`, `grok`. Imported at module load.
 - **Lazy**: `antigravity`, `forge`, `goose`, `cursor`, `opencode`, `cursor-agent`, `crush`, `warp`, `vercel-gateway`, `zcode`, `zed`. Imported via dynamic `import()` so the heavy dependencies (SQLite, protobuf, network clients) do not touch users who do not have those tools installed.
 
 Both lists hit the same `getAllProviders()` aggregator. A failed lazy import is silent and excludes that provider from the run.
@@ -216,6 +216,20 @@ Swift package (`mac/Package.swift`), targets macOS 14, strict concurrency on. La
 Tests live in `mac/Tests/CodeBurnMenubarTests/` (currently `CapacityEstimatorTests.swift`).
 
 The build artifact is a zipped `.app` bundle produced by `mac/Scripts/package-app.sh`. See `RELEASING.md` for how the GitHub Actions workflow uses it.
+
+## Windows Menubar (`windows/`)
+
+Tauri 2 app: a Rust binary (`windows/src-tauri/`) owning the tray and the process spawning, plus a React + TypeScript popover (`windows/src/`) rendered in a WebView2 window. Design tokens come from `windows/tokens.json`, the same file `mac/` reads at build time, so both products render as one.
+
+- `src-tauri/src/lib.rs` builds the tray, positions the popover against the taskbar edge, and registers the `#[tauri::command]` surface the frontend calls.
+- `src-tauri/src/cli.rs` resolves and spawns the CLI. Only absolute `PATH` directories are searched (an empty entry from `;;` would otherwise resolve against the current directory), `CODEBURN_BIN` is allowlisted, and Windows system tools are spawned by absolute `%SystemRoot%\System32` path because `CreateProcess` searches the current directory first. `MIN_CLI_VERSION` gates the whole app; below it the popover shows a setup screen.
+- `src-tauri/src/plan.rs` ports the Claude quota view. Like the macOS `ClaudeCredentialStore`, it never spends Claude's single-use refresh token; on a 401 it re-reads Claude's own credential file for a token Claude Code has already rotated.
+- `src-tauri/src/tray_badge.rs` renders today's spend into a second tray icon, since Windows has no menubar title.
+- `src/App.tsx` owns the payload cache, the CLI gate, and the refresh cadence, which follows popover visibility the way `mac/`'s `RefreshCadence.swift` does.
+
+`cargo test` covers the PATH filter and the version gate. `windows/DEVELOPMENT.md` has the build, security, and release details; CI is `.github/workflows/windows-menubar-ci.yml` and releases go out on `windows-v*` tags.
+
+The Linux (ksni) paths in the same crate are kept compiling but are experimental and unreleased; `gnome/` is the shipping Linux surface.
 
 ## GNOME Extension (`gnome/`)
 

@@ -26,12 +26,16 @@ import {
   computeHealth,
   computeTrend,
   buildOptimizeJsonReport,
+  renderOptimize,
+  findingBasis,
+  type FindingId,
   type ToolCall,
   type ApiCallMeta,
   type WasteFinding,
   type OptimizeResult,
 } from '../src/optimize.js'
 import type { ProjectSummary } from '../src/types.js'
+import type { AppliedFix } from '../src/act/types.js'
 
 function call(name: string, input: Record<string, unknown>, sessionId = 's1', project = 'p1'): ToolCall {
   return { name, input, sessionId, project }
@@ -1004,6 +1008,29 @@ describe('detectSessionOutliers', () => {
     expect(finding!.tokensSaved).toBeGreaterThan(0)
   })
 
+  it('keeps estimated-cost sessions out of the peer math', () => {
+    const project = projectWithSessions([1, 1, 1, 10])
+    // The expensive session is priced from modelled tokens, so it is not
+    // comparable against the provider-reported peers and never gets flagged.
+    project.sessions[3]!.totalEstimatedCostUSD = project.sessions[3]!.totalCostUSD
+    expect(detectSessionOutliers([project])).toBeNull()
+  })
+
+  it('falls back to estimated costs when nothing else is priced, and says so', () => {
+    const project = projectWithSessions([1, 1, 1, 10])
+    for (const s of project.sessions) s.totalEstimatedCostUSD = s.totalCostUSD
+    const finding = detectSessionOutliers([project])
+    expect(finding).not.toBeNull()
+    expect(finding!.basis).toBe('estimated')
+    expect(findingBasis(finding!)).toBe('estimated')
+  })
+
+  it('reports measured basis when every peer cost is provider-reported', () => {
+    const finding = detectSessionOutliers([projectWithSessions([1, 1, 1, 10])])
+    expect(finding!.basis).toBeUndefined()
+    expect(findingBasis(finding!)).toBe('measured')
+  })
+
   it('ignores tiny absolute-cost outliers', () => {
     expect(detectSessionOutliers([projectWithSessions([0.01, 0.01, 0.01, 0.2])])).toBeNull()
   })
@@ -1197,9 +1224,9 @@ describe('paste-fix destination tagging (issue #277)', () => {
       if (f.fix.type === 'paste') {
         expect(
           f.fix.destination,
-          `finding "${f.title}" has paste fix without destination — pick one of: claude-md / session-opener / prompt / shell-config`
+          `finding "${f.title}" has paste fix without destination — pick one of: claude-md / session-opener / prompt / shell-config / manual`
         ).toBeDefined()
-        expect(['claude-md', 'session-opener', 'prompt', 'shell-config'])
+        expect(['claude-md', 'session-opener', 'prompt', 'shell-config', 'manual'])
           .toContain(f.fix.destination)
       }
     }
@@ -1240,6 +1267,7 @@ describe('buildOptimizeJsonReport', () => {
       healthGrade: 'C',
       findings: [
         {
+          id: 'claude-md-too-long',
           title: 'Trim stale context',
           explanation: 'Old instructions are loaded every turn.',
           impact: 'medium',
@@ -1283,16 +1311,121 @@ describe('buildOptimizeJsonReport', () => {
       potentialSavingsPercent: 20,
       costRateUSD: 0.00002,
     })
+    expect(report.summary.measuredSavingsUSD).toBe(0)
+    expect(report.summary.byClass).toEqual({
+      fix: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+      nudge: { tokensSaved: 50_000, savingsUSD: 1, count: 1 },
+      keep: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+    })
+    const classes = Object.values(report.summary.byClass)
+    expect(classes.reduce((s, c) => s + c.tokensSaved, 0)).toBe(report.summary.potentialSavingsTokens)
+    expect(classes.reduce((s, c) => s + c.savingsUSD, 0)).toBeCloseTo(report.summary.potentialSavingsCostUSD, 10)
+    expect(classes.reduce((s, c) => s + c.count, 0)).toBe(report.summary.findingCount)
+    expect(report.appliedFixes).toEqual([])
     expect(report.findings[0]).toMatchObject({
       title: 'Trim stale context',
       severity: 'medium',
       trend: 'active',
       tokensSaved: 50_000,
       estimatedSavingsUSD: 1,
+      class: 'nudge',
+      basis: 'estimated',
       fix: {
         type: 'paste',
         destination: 'claude-md',
       },
     })
+  })
+})
+
+describe('renderOptimize grouping', () => {
+  const plain = (s: string): string => s.replace(/\[[0-9;]*m/g, '')
+
+  function finding(id: FindingId, title: string): WasteFinding {
+    return {
+      id,
+      title,
+      explanation: 'why',
+      impact: 'medium',
+      tokensSaved: 1000,
+      fix: { type: 'paste', destination: 'prompt', label: 'ask', text: 'ask' },
+    }
+  }
+
+  it('groups findings under fix / habits / FYI with continuous numbering and a basis split', () => {
+    const findings = [
+      finding('bash-output-cap', 'Cap bash output'),
+      finding('claude-md-too-long', 'Trim CLAUDE.md'),
+      finding('context-heavy-sessions', 'Context-heavy sessions'),
+    ]
+    const out = plain(renderOptimize(findings, 0.00001, '7 Days', 10, 5, 100, 80, 'B', [], []))
+
+    const headers = [
+      'Fix now (apply-able) · ~1.0K tokens (~$0.010) · 1 finding — codeburn optimize --apply',
+      'Habits · ~1.0K tokens (~$0.010) · 1 finding',
+      'FYI · ~1.0K tokens (~$0.010) · 1 finding',
+    ].map(h => out.indexOf(h))
+    expect(headers.every(i => i >= 0)).toBe(true)
+    expect(headers).toEqual([...headers].sort((a, b) => a - b))
+    // Headline is the whole board; the apply-able slice is named separately.
+    expect(out).toContain('Potential savings: ~3.0K tokens (~$0.030, ~0.3% of spend) — apply-able: ~$0.010')
+    expect(out).toContain('1. Cap bash output')
+    expect(out).toContain('2. Trim CLAUDE.md')
+    expect(out).toContain('3. Context-heavy sessions')
+    expect(out).toContain('1 measured · 2 estimated')
+    expect(out).not.toContain('Estimates only.')
+  })
+})
+
+describe('renderOptimize applied-fixes section', () => {
+  const plain = (s: string): string => s.replace(/\[[0-9;]*m/g, '')
+
+  function fixture(over: Partial<AppliedFix>): AppliedFix {
+    return {
+      id: 'abcdef12',
+      kind: 'mcp-remove',
+      findingId: 'unused-mcp',
+      appliedAt: '2026-05-01T00:00:00.000Z',
+      ageDays: 4,
+      verdict: 'worked',
+      estimatedTokens: 300_000,
+      realizedTokens: 280_000,
+      note: '',
+      undoCommand: 'codeburn act undo abcdef12',
+      ...over,
+    }
+  }
+
+  const findings: WasteFinding[] = [{
+    id: 'bash-output-cap',
+    title: 'Cap bash output',
+    explanation: 'why',
+    impact: 'medium',
+    tokensSaved: 1000,
+    fix: { type: 'paste', destination: 'prompt', label: 'ask', text: 'ask' },
+  }]
+
+  const render = (appliedFixes: AppliedFix[], f = findings): string =>
+    plain(renderOptimize(f, 0.00001, '7 Days', 10, 5, 100, 80, 'B', [], [], undefined, undefined, undefined, appliedFixes))
+
+  it('renders one line per verdict with its own glyph', () => {
+    const out = render([
+      fixture({}),
+      fixture({ id: 'b', findingId: 'mcp-defer-threshold', verdict: 'partial', ageDays: 3, estimatedTokens: 600_000, realizedTokens: 420_000 }),
+      fixture({ id: 'c', findingId: 'bash-output-cap', verdict: 'no-effect', ageDays: 5, estimatedTokens: 41_000, realizedTokens: 0, undoCommand: 'codeburn act undo cccccccc' }),
+      fixture({ id: 'd', findingId: 'mcp-remove-linear', verdict: 'pending', ageDays: 1 }),
+    ])
+
+    expect(out).toContain('Applied fixes')
+    expect(out).toContain('\u2713 unused-mcp (4d ago): est. 300.0K -> measured 280.0K')
+    expect(out).toContain('~ mcp-defer-threshold (3d ago): est. 600.0K -> measured 420.0K (-30% vs estimate)')
+    expect(out).toContain('\u2717 bash-output-cap (5d ago): est. 41.0K -> measured 0 - did not help. Revert: codeburn act undo cccccccc')
+    expect(out).toContain('\u2026 mcp-remove-linear (1d ago): measuring, check back after 3 days')
+  })
+
+  it('shows the section on a clean setup too, and omits it when nothing is applied', () => {
+    expect(render([fixture({})], [])).toContain('Applied fixes')
+    expect(render([])).not.toContain('Applied fixes')
+    expect(render([], [])).not.toContain('Applied fixes')
   })
 })

@@ -22,8 +22,12 @@ import {
   detectBashBloat,
   detectGhostCommands,
   loadMcpConfigs,
+  localMcpServerNames,
   scanJsonlFile,
   scanAndDetect,
+  detectRecurringContext,
+  renderOptimize,
+  type SessionOpener,
   type ToolCall,
 } from '../src/optimize.js'
 import {
@@ -170,6 +174,32 @@ describe('loadMcpConfigs', () => {
     writeFile(join(projectDir, '.mcp.json'), '{ not valid json')
     expect(() => loadMcpConfigs([projectDir])).not.toThrow()
     expect(loadMcpConfigs([projectDir]).size).toBe(0)
+  })
+})
+
+describe('localMcpServerNames', () => {
+  it('adds the ~/.claude.json top-level and per-project servers to the config names', () => {
+    const root = makeFixtureRoot()
+    const projectDir = join(root, 'myapp')
+    mkdirSync(projectDir, { recursive: true })
+    writeFile(join(projectDir, '.mcp.json'), JSON.stringify({ mcpServers: { fromMcpJson: {} } }))
+    writeFile(join(FAKE_HOME_FOR_MOCK, '.claude.json'), JSON.stringify({
+      mcpServers: { 'claude_ai_homegrown': {}, 'plugin:ctx:ctx': {} },
+      projects: { [projectDir]: { mcpServers: { scoped: {} } } },
+    }))
+
+    const names = localMcpServerNames([projectDir])
+
+    expect([...names].sort()).toEqual(['claude_ai_homegrown', 'fromMcpJson', 'plugin_ctx_ctx', 'scoped'])
+  })
+
+  it('contributes no names when ~/.claude.json cannot be parsed', () => {
+    const root = makeFixtureRoot()
+    const projectDir = join(root, 'myapp')
+    mkdirSync(projectDir, { recursive: true })
+    writeFile(join(FAKE_HOME_FOR_MOCK, '.claude.json'), '{ not valid json')
+
+    expect(localMcpServerNames([projectDir]).size).toBe(0)
   })
 })
 
@@ -359,6 +389,136 @@ describe('scanJsonlFile', () => {
     const result = await scanJsonlFile(filePath, 'p1', { start, end: today })
     expect(result.calls).toHaveLength(1)
     expect((result.calls[0].input as Record<string, unknown>).file_path).toBe('/new')
+  })
+})
+
+// ============================================================================
+// detectRecurringContext
+// ============================================================================
+
+describe('detectRecurringContext', () => {
+  // ~2.2 KB, comfortably over the 1.5 KB floor.
+  const BRIEF = 'PROJECT BRIEF\n' + 'Ship the invoice importer behind a flag. '.repeat(53)
+  const TOKENS_PER_CHAR = 0.25
+
+  type Opener = { text: string; project?: string }
+
+  async function openersFor(sessions: Opener[]): Promise<SessionOpener[]> {
+    const root = makeFixtureRoot()
+    const now = new Date().toISOString()
+    const openers: SessionOpener[] = []
+    for (const [i, { text, project }] of sessions.entries()) {
+      const filePath = join(root, `s${i}.jsonl`)
+      writeFile(filePath, JSON.stringify({ type: 'user', timestamp: now, message: { content: text } }))
+      const result = await scanJsonlFile(filePath, project ?? 'my-app', undefined)
+      openers.push(...result.openers)
+    }
+    return openers
+  }
+
+  const repeat = (n: number, text = BRIEF, project?: string): Opener[] =>
+    Array.from({ length: n }, () => ({ text, project }))
+
+  it('flags a block that opens the session threshold worth of sessions', async () => {
+    const finding = detectRecurringContext(await openersFor(repeat(5)))
+    expect(finding).not.toBeNull()
+    expect(finding!.id).toBe('recurring-context')
+    expect(finding!.title).toBe(`Same ${(BRIEF.length / 1024).toFixed(1)} KB block pasted at the start of 5 sessions`)
+    // Only the four repeats are recoverable; the first paste is the honest cost.
+    expect(finding!.tokensSaved).toBe(Math.round(4 * BRIEF.length * TOKENS_PER_CHAR))
+    expect(finding!.fix.type).toBe('paste')
+    expect(finding!.fix.type === 'paste' && finding!.fix.destination).toBe('prompt')
+  })
+
+  it('renders the finding with its preview and destination header', async () => {
+    const finding = detectRecurringContext(await openersFor(repeat(5)))!
+    const out = renderOptimize([finding], 0.00001, '30 Days', 10, 5, 100, 80, 'B', [], [])
+      .replace(/\u001b\[[0-9;]*m/g, '')
+    expect(out).toContain(finding.title)
+    expect(out).toContain('PROJECT BRIEF Ship the invoice importer')
+    expect(out).toContain('Ask Claude in the current session')
+    expect(out).toContain('Move it into CLAUDE.md if it is a standing rule')
+  })
+
+  it('stays quiet below the session threshold', async () => {
+    expect(detectRecurringContext(await openersFor(repeat(4)))).toBeNull()
+  })
+
+  it('ignores short openers however often they repeat', async () => {
+    expect(detectRecurringContext(await openersFor(repeat(20, 'continue')))).toBeNull()
+    expect(detectRecurringContext(await openersFor(repeat(20, 'yes')))).toBeNull()
+  })
+
+  it('groups sessions whose block differs only in whitespace', async () => {
+    const reflowed = BRIEF.replace(/ /g, '  ').replace(/\n/g, '\n\n')
+    const finding = detectRecurringContext(await openersFor([...repeat(3), ...repeat(2, reflowed)]))
+    expect(finding).not.toBeNull()
+    expect(finding!.title).toContain('start of 5 sessions')
+  })
+
+  it('ignores injected system reminders and slash-command wrappers', async () => {
+    expect(detectRecurringContext(await openersFor(repeat(6, `<system-reminder>${BRIEF}</system-reminder>`)))).toBeNull()
+    expect(detectRecurringContext(await openersFor(repeat(6, `<command-name>/brief</command-name>${BRIEF}`)))).toBeNull()
+  })
+
+  it('skips prompts a program wrote: SDK sessions and subagent transcripts', async () => {
+    const root = makeFixtureRoot()
+    const now = new Date().toISOString()
+    const openers: SessionOpener[] = []
+    for (const [i, entry] of [{ promptSource: 'sdk' }, { isSidechain: true }].entries()) {
+      for (let j = 0; j < 6; j++) {
+        const filePath = join(root, `machine-${i}-${j}.jsonl`)
+        writeFile(filePath, JSON.stringify({ type: 'user', timestamp: now, ...entry, message: { content: BRIEF } }))
+        openers.push(...(await scanJsonlFile(filePath, 'my-app', undefined)).openers)
+      }
+    }
+    expect(openers).toEqual([])
+    expect(detectRecurringContext(openers)).toBeNull()
+  })
+
+  // Over 32 KB the JSONL parser returns a reduced entry without the root
+  // flags, so the markers have to be read off the raw line.
+  it('skips machine-written prompts too large for the parser to keep flags on', async () => {
+    const root = makeFixtureRoot()
+    const now = new Date().toISOString()
+    const huge = BRIEF + 'x'.repeat(40_000)
+    const openers: SessionOpener[] = []
+    for (let i = 0; i < 6; i++) {
+      const filePath = join(root, `huge-${i}.jsonl`)
+      // Field order matters: the flags land past the head, behind the very
+      // message that made the line large.
+      writeFile(filePath, JSON.stringify({
+        isSidechain: false, type: 'user', message: { content: huge }, timestamp: now, promptSource: 'sdk',
+      }))
+      openers.push(...(await scanJsonlFile(filePath, 'my-app', undefined)).openers)
+    }
+    expect(openers).toEqual([])
+  })
+
+  it('only counts the first message of a session as its opener', async () => {
+    const root = makeFixtureRoot()
+    const now = new Date().toISOString()
+    const openers: SessionOpener[] = []
+    for (let i = 0; i < 6; i++) {
+      const filePath = join(root, `late-${i}.jsonl`)
+      writeFile(filePath, [
+        JSON.stringify({ type: 'user', timestamp: now, message: { content: 'go on' } }),
+        JSON.stringify({ type: 'user', timestamp: now, message: { content: BRIEF } }),
+      ].join('\n'))
+      openers.push(...(await scanJsonlFile(filePath, 'my-app', undefined)).openers)
+    }
+    expect(detectRecurringContext(openers)).toBeNull()
+  })
+
+  it('names the project when the block is confined to one, and counts them otherwise', async () => {
+    const single = detectRecurringContext(await openersFor(repeat(5, BRIEF, '-Users-me-Projects-codeburn')))
+    expect(single!.explanation).toContain('5 sessions in codeburn')
+
+    const spread = detectRecurringContext(await openersFor([
+      ...repeat(3, BRIEF, '-Users-me-Projects-codeburn'),
+      ...repeat(2, BRIEF, '-Users-me-Projects-dash'),
+    ]))
+    expect(spread!.explanation).toContain('5 sessions in 2 projects')
   })
 })
 

@@ -3,10 +3,10 @@
 This document describes how to produce distributable macOS, Windows, and Linux
 builds of the Electron desktop app. The macOS build is ad-hoc-signed and
 **not notarized** (no paid Apple Developer account); the Windows and Linux
-builds are **unsigned**. There is no CI automation for any of this yet (unlike
-the CLI and menubar release processes in `../RELEASING.md`) — packaging is run
-by hand on a maintainer's machine. All three targets are produced by
-`electron-builder` and can be cross-built from a single macOS host.
+builds are **unsigned**. Windows NSIS packages are built and checked by the
+`Build Windows installer` GitHub Actions workflow; the other desktop packages
+are still produced by hand. All three targets are produced by
+`electron-builder`.
 
 ## The bundled CLI (no install prerequisite)
 
@@ -93,8 +93,9 @@ self-contained bundle into `app/build/cli`; see "The bundled CLI" above), then
 `vite`), then `electron-builder --mac` (whose `afterPack` hook copies the
 staged CLI into the app). `package:win` and `package:linux` mirror it exactly,
 swapping the final flag for `electron-builder --win` and `electron-builder
---linux`. All three can run on the same macOS host — electron-builder downloads
-the NSIS and AppImage tooling on first use.
+--linux`. Developers can run all three locally on the same macOS host —
+electron-builder downloads the NSIS and AppImage tooling on first use. Release
+Windows installers are built by the `windows-latest` workflow described below.
 
 ### Artifacts
 
@@ -154,19 +155,20 @@ separate `electron-builder.yml`):
 
 ## Windows and Linux builds
 
-Both are cross-built from the same macOS host used for the mac build — no
-Windows or Linux machine, and no `wine`, is required. electron-builder 26
-embeds the Windows executable's icon/version resources natively and downloads
-the NSIS and AppImage tooling on first run.
+Developers can cross-build both locally from the same macOS host used for the
+mac build — no Windows or Linux machine, and no `wine`, is required.
+Release-authoritative Windows NSIS installers are instead built by the `Build
+Windows installer` workflow on `windows-latest`. electron-builder 26 embeds the
+Windows executable's icon/version resources natively and downloads the NSIS and
+AppImage tooling on first run.
 
 ### Windows (`package:win`)
 
-`electron-builder --win` produces a single artifact in `app/release/`:
+`electron-builder --win` produces a single installer in `app/release/`:
 
-- **`CodeBurn Setup 0.9.15.exe`** — the NSIS installer (the version number
-  tracks `package.json`; note the spaces in the filename). A `.exe.blockmap`
-  is written alongside it (differential-update metadata, unused — no
-  auto-updater yet).
+- **`CodeBurn-Setup-0.9.15.exe`** — the NSIS installer (the version number
+  tracks `package.json`). A `.exe.blockmap` is written alongside it
+  (differential-update metadata, unused — no auto-updater yet).
 
 Config (`build.win` + `build.nsis`):
 
@@ -236,8 +238,7 @@ taskbar/dock; it does not affect packaging or launch.
 
 ## Releases
 
-There is no release CI for the desktop app yet (see the note at the top). When
-a maintainer cuts a desktop release by hand, the GitHub tag convention is:
+When a maintainer cuts a desktop release, the GitHub tag convention is:
 
 ```
 desktop-v<version>      # e.g. desktop-v0.9.15
@@ -245,14 +246,31 @@ desktop-v<version>      # e.g. desktop-v0.9.15
 
 This mirrors the menubar's `mac-v<version>` convention (see `../RELEASING.md`)
 and keeps the desktop app's tags in their own namespace, separate from the CLI
-(`v<version>`) and the menubar (`mac-v<version>`). Upload all of the artifacts
-above — the four macOS `.dmg`/`.zip` files, `CodeBurn-Setup-<version>.exe`,
-and `CodeBurn-<version>.AppImage` — to the GitHub Release created at that
-tag. The website's download links **pin that tag** in their URLs, so the
-release name and the artifact filenames must match exactly. (The Windows
-installer uses an explicit `nsis.artifactName` of
-`CodeBurn-Setup-${version}.${ext}` — electron-builder's default contains
-spaces, which make ugly percent-encoded URLs.)
+(`v<version>`) and the menubar (`mac-v<version>`).
+
+Pushing a `desktop-v<version>` tag runs the `Build Windows installer` workflow
+on `windows-latest`. The workflow requires the tag version, root package
+version, and app package version to agree, and it fails unless the build emits
+exactly one `CodeBurn-Setup-<version>.exe` and one matching
+`.exe.blockmap` at the top level of `app/release/`. It uploads those exact
+top-level filenames as the `CodeBurn-Windows-Installer`
+Actions artifact. The workflow has read-only repository permissions and does
+**not** publish release assets automatically. Artifacts are retained for 30 days.
+
+Before publishing the GitHub Release, the release owner must download that
+workflow artifact and manually upload both Windows files along with the four
+macOS `.dmg`/`.zip` files, `CodeBurn-<version>.AppImage`,
+`codeburn-desktop_<version>_amd64.deb`, and
+`codeburn-desktop-<version>.x86_64.rpm`. Confirm the live release contains
+every required platform asset before announcing it. The
+website's download links **pin that tag** in their URLs, so a release with a
+missing installer is broken even when another Windows distribution channel is
+available. The Windows installer uses an explicit `nsis.artifactName` of
+`CodeBurn-Setup-${version}.${ext}`.
+
+Publishing the Release triggers a read-only live-asset check. If the files are
+uploaded afterward, rerun the workflow manually with `release_tag` set to the
+existing `desktop-v<version>` tag and require the verification job to pass.
 
 ## Verifying a build
 

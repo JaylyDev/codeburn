@@ -6,5 +6,8 @@ export default defineConfig({
     // session-discovery env vars (CLAUDE_CONFIG_DIRS, HOME, XDG_*, every
     // provider-specific *_HOME) don't bleed real local data into fixtures.
     setupFiles: ['./tests/setup/env-isolation.ts'],
+    // Real-I/O tests (session parses, sqlite fixtures, worker pools) exceed the
+    // 5s default under CI runner load; a hung test still fails at 30s.
+    testTimeout: 30_000,
   },
 })
