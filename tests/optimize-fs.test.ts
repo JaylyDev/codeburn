@@ -434,6 +434,40 @@ describe('detectRecurringContext', () => {
     expect(detectRecurringContext(await openersFor(repeat(6, `<command-name>/brief</command-name>${BRIEF}`)))).toBeNull()
   })
 
+  it('skips prompts a program wrote: SDK sessions and subagent transcripts', async () => {
+    const root = makeFixtureRoot()
+    const now = new Date().toISOString()
+    const openers: SessionOpener[] = []
+    for (const [i, entry] of [{ promptSource: 'sdk' }, { isSidechain: true }].entries()) {
+      for (let j = 0; j < 6; j++) {
+        const filePath = join(root, `machine-${i}-${j}.jsonl`)
+        writeFile(filePath, JSON.stringify({ type: 'user', timestamp: now, ...entry, message: { content: BRIEF } }))
+        openers.push(...(await scanJsonlFile(filePath, 'my-app', undefined)).openers)
+      }
+    }
+    expect(openers).toEqual([])
+    expect(detectRecurringContext(openers)).toBeNull()
+  })
+
+  // Over 32 KB the JSONL parser returns a reduced entry without the root
+  // flags, so the markers have to be read off the raw line.
+  it('skips machine-written prompts too large for the parser to keep flags on', async () => {
+    const root = makeFixtureRoot()
+    const now = new Date().toISOString()
+    const huge = BRIEF + 'x'.repeat(40_000)
+    const openers: SessionOpener[] = []
+    for (let i = 0; i < 6; i++) {
+      const filePath = join(root, `huge-${i}.jsonl`)
+      // Field order matters: the flags land past the head, behind the very
+      // message that made the line large.
+      writeFile(filePath, JSON.stringify({
+        isSidechain: false, type: 'user', message: { content: huge }, timestamp: now, promptSource: 'sdk',
+      }))
+      openers.push(...(await scanJsonlFile(filePath, 'my-app', undefined)).openers)
+    }
+    expect(openers).toEqual([])
+  })
+
   it('only counts the first message of a session as its opener', async () => {
     const root = makeFixtureRoot()
     const now = new Date().toISOString()

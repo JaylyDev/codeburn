@@ -527,8 +527,8 @@ export type ApiCallMeta = {
 }
 
 /// One session's opening paste. `hash` groups sessions that open with the
-/// same block; `chars` is the block's full length (the transcript text is
-/// only capped for the hash, not for the size).
+/// same block; `chars` is the block's length, a floor for a block long
+/// enough that the parser capped its text.
 export type SessionOpener = {
   hash: string
   chars: number
@@ -637,9 +637,29 @@ function normalizeOpener(text: string): string {
   return stripAnsi(text).replace(/\s+/g, ' ').trim()
 }
 
+const MACHINE_PROMPT_HEAD_BYTES = 2048
+const MACHINE_PROMPT_PATTERN = /"promptSource"\s*:\s*"sdk"|"isSidechain"\s*:\s*true/
+
+/// True when a program wrote this prompt rather than a person pasting it: an
+/// SDK caller, or a parent agent writing a subagent's task. Either repeats by
+/// design and has no home in CLAUDE.md. A user entry over the parser's
+/// large-line threshold — routine for generated prompts — comes back without
+/// its root flags, so those are read off the raw line instead: the ends of it,
+/// since the fields sit either side of the message that made the line large.
+function isMachineWrittenPrompt(entry: Record<string, unknown>, line: string | Buffer): boolean {
+  if (entry['promptSource'] === 'sdk' || entry['isSidechain'] === true) return true
+  const edge = (start: number, end: number): string =>
+    typeof line === 'string' ? line.slice(start, end) : line.subarray(start, end).toString('utf-8')
+  const head = edge(0, MACHINE_PROMPT_HEAD_BYTES)
+  const tail = edge(Math.max(MACHINE_PROMPT_HEAD_BYTES, line.length - MACHINE_PROMPT_HEAD_BYTES), line.length)
+  return MACHINE_PROMPT_PATTERN.test(head) || MACHINE_PROMPT_PATTERN.test(tail)
+}
+
 /// A session's opening block, or null when it is too small to matter or is
 /// not a paste at all: system reminders carry CLAUDE.md and hook output,
-/// slash command wrappers refer to a file that already exists.
+/// slash command wrappers refer to a file that already exists. `chars` is a
+/// floor: the parser caps the text of a very large user entry, so a huge
+/// block is sized at that cap rather than its true length.
 function toSessionOpener(text: string, project: string): SessionOpener | null {
   if (text.length < RECURRING_CONTEXT_MIN_CHARS) return null
   const head = text.trimStart()
@@ -716,7 +736,7 @@ export async function scanJsonlFile(
         userMessages.push(msgContent.slice(0, OPTIMIZE_TEXT_CAP))
         if (!sawUserText) {
           sawUserText = true
-          const opener = toSessionOpener(msgContent, project)
+          const opener = isMachineWrittenPrompt(entry, line) ? null : toSessionOpener(msgContent, project)
           if (opener) openers.push(opener)
         }
       } else if (Array.isArray(msgContent)) {
@@ -729,7 +749,7 @@ export async function scanJsonlFile(
             remaining -= text.length
             if (!sawUserText) {
               sawUserText = true
-              const opener = toSessionOpener(block.text, project)
+              const opener = isMachineWrittenPrompt(entry, line) ? null : toSessionOpener(block.text, project)
               if (opener) openers.push(opener)
             }
           }
