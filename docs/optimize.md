@@ -6,8 +6,9 @@ costing tokens without earning them, and grades the setup A to F.
 ## What it scans
 
 - **Session transcripts** for the selected period: tool calls, per-call token usage, turn retries,
-  per-session cost. This is where re-reads, junk directory reads, low read:edit ratios, warmup
-  overhead, retries, and expensive or context-heavy sessions come from.
+  per-session cost, and the block each session opens with. This is where re-reads, junk directory
+  reads, low read:edit ratios, warmup overhead, retries, context pasted into session after session,
+  and expensive or context-heavy sessions come from.
 - **Your configuration**: `~/.claude.json`, user and project `settings.json` / `settings.local.json`,
   `.mcp.json`, `CLAUDE.md` (including `@`-imports), and the `skills/`, `agents/`, `commands/`
   directories. This is where unused MCP servers, MCP deferral gaps, ghost skills/agents/commands,
