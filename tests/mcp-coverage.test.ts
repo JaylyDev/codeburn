@@ -970,6 +970,25 @@ describe('connector findings and finding class', () => {
     expect(classTotals([finding!], 0.00002).fix.tokensSaved).toBe(finding!.tokensSaved)
   })
 
+  it('charges each session only for the local schemas it actually loaded', () => {
+    // Same per-session scoping the connector split relies on, with no
+    // connector in play: two flagged local servers in disjoint sessions are
+    // charged one schema each, not both schemas everywhere.
+    const sessions = ['filesystem', 'playwright'].flatMap(server =>
+      ['a', 'b'].map(suffix => makeSession({
+        sessionId: `${server}-${suffix}`,
+        inventory: inventoryFor([server]),
+        turns: [makeTurn([makeCall({ cacheCreation: 50_000 })])],
+      })),
+    )
+
+    const finding = detectMcpToolCoverage([project(sessions)])
+
+    expect(finding).toMatchObject({ tokensSaved: 40_000 })
+    expect(finding!.applyTokensSaved).toBeUndefined()
+    expect(classTotals([finding!], 0.00002).fix.tokensSaved).toBe(40_000)
+  })
+
   it('treats a local server named like a connector namespace as manual only', () => {
     // Known limitation: the namespace prefix is the only connector signal in
     // the transcript, so a local server literally named claude_ai_* gets the
