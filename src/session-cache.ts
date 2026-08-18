@@ -792,8 +792,15 @@ async function loadShard(path: string): Promise<Record<string, CachedFile> | nul
  * full: the first because its cache is the only surviving record of pruned
  * usage, the second because a fingerprint change discards the whole section and
  * must see every entry it is discarding.
+ *
+ * `CODEBURN_CACHE_SCOPE=all` is the escape hatch: it drops the scope here, at
+ * the one place every caller routes through, so a suspect scoped read can be
+ * compared against a full one without a rebuild. It is a READ policy and
+ * deliberately not part of any env fingerprint (PROVIDER_ENV_VARS) — setting or
+ * unsetting it must never invalidate a cache, only change how much of it is read.
  */
 export async function loadCache(scope?: CacheLoadScope): Promise<SessionCache> {
+  if (process.env['CODEBURN_CACHE_SCOPE'] === 'all') scope = undefined
   const dir = sessionCacheDir()
   const envelope = await readEnvelope(dir)
   if (!envelope) return afterMissingShardCache()

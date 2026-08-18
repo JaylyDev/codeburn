@@ -557,7 +557,7 @@ function extractObjectFields(
   return captured
 }
 
-const LARGE_ROOT_FIELDS = ['type', 'timestamp', 'sessionId', 'cwd', 'gitBranch', 'attachment', 'message', 'isSidechain'] as const
+const LARGE_ROOT_FIELDS = ['type', 'timestamp', 'sessionId', 'cwd', 'gitBranch', 'attachment', 'message', 'isSidechain', 'promptSource'] as const
 const LARGE_ASSISTANT_MESSAGE_FIELDS = ['model', 'usage', 'id', 'content'] as const
 
 function parseLargeJsonl(line: string | Buffer): JournalEntry | null {
@@ -578,10 +578,12 @@ function parseLargeJsonl(line: string | Buffer): JournalEntry | null {
   const sessionId = readJsonString(source, root['sessionId'])
   const cwd = readJsonString(source, root['cwd'])
   const gitBranch = readJsonString(source, root['gitBranch'])
+  const promptSource = readJsonString(source, root['promptSource'])
   if (timestamp !== undefined) entry.timestamp = timestamp
   if (sessionId !== undefined) entry.sessionId = sessionId
   if (cwd !== undefined) entry.cwd = cwd
   if (gitBranch !== undefined) entry.gitBranch = gitBranch
+  if (promptSource !== undefined) entry.promptSource = promptSource
   const addedNames = extractLargeAddedNames(source, root['attachment'])
   if (addedNames.length > 0) {
     ;(entry as Record<string, unknown>)['attachment'] = { type: 'deferred_tools_delta', addedNames }

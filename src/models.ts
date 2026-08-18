@@ -947,6 +947,10 @@ const SHORT_NAMES: Record<string, string> = {
   // The Grok Build harness reports the model it runs (`grok-4.5`), so this is
   // the model's own name; `grok-build*` ids still resolve to "Grok Build".
   'grok-4.5': 'Grok 4.5',
+  // The harness also reports a `-build` variant of that model. It is a distinct
+  // id and reports bucket by id, so without its own entry the prefix match gave
+  // it the same name as `grok-4.5` and the report showed two identical rows.
+  'grok-4.5-build': 'Grok 4.5 (build)',
   // ClinePass routes models as `cline-pass/<slug>`; getShortModelName's path
   // fallback strips the prefix and re-resolves the bare slug through this
   // table, the same way it handles `accounts/fireworks/models/<slug>`.

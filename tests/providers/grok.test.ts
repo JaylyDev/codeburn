@@ -490,6 +490,13 @@ describe('grok provider - display names', () => {
     expect(provider.modelDisplayName('grok-build')).toBe('Grok Build')
   })
 
+  // Two distinct ids, so two rows; identical names made them look like one row
+  // printed twice (#1029).
+  it('distinguishes the build variant of a model from the model itself', () => {
+    expect(provider.modelDisplayName('grok-4.5')).toBe('Grok 4.5')
+    expect(provider.modelDisplayName('grok-4.5-build')).toBe('Grok 4.5 (build)')
+  })
+
   it('normalizes tool names', () => {
     expect(provider.toolDisplayName('run_terminal_command')).toBe('Bash')
     expect(provider.toolDisplayName('mystery_tool')).toBe('mystery_tool')

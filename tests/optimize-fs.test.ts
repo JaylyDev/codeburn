@@ -551,17 +551,15 @@ describe('detectRecurringContext', () => {
     expect(detectRecurringContext(openers)).toBeNull()
   })
 
-  // Over 32 KB the JSONL parser returns a reduced entry without the root
-  // flags, so the markers have to be read off the raw line.
-  it('skips machine-written prompts too large for the parser to keep flags on', async () => {
+  // Over 32 KB the JSONL parser returns a reduced entry; the root flags are
+  // part of that reduction, so the markers survive.
+  it('skips machine-written prompts on lines too large for a full parse', async () => {
     const root = makeFixtureRoot()
     const now = new Date().toISOString()
     const huge = BRIEF + 'x'.repeat(40_000)
     const openers: SessionOpener[] = []
     for (let i = 0; i < 6; i++) {
       const filePath = join(root, `huge-${i}.jsonl`)
-      // Field order matters: the flags land past the head, behind the very
-      // message that made the line large.
       writeFile(filePath, JSON.stringify({
         isSidechain: false, type: 'user', message: { content: huge }, timestamp: now, promptSource: 'sdk',
       }))
