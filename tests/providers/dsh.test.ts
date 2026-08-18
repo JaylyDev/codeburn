@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, mkdir, writeFile, readFile, rm } from 'fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, rm, stat } from 'fs/promises'
 import { join } from 'path'
 import { homedir, tmpdir } from 'os'
 import zlib from 'zlib'
 
-import { createDshProvider } from '../../src/providers/dsh.js'
+import { createDshProvider, readZstdLines } from '../../src/providers/dsh.js'
 import { calculateCost } from '../../src/models.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
@@ -544,5 +544,77 @@ describe('dsh provider - real log, real container', () => {
     expect(framed.map(c => [c.inputTokens, c.outputTokens, c.reasoningTokens, c.model]))
       .toEqual(plain.map(c => [c.inputTokens, c.outputTokens, c.reasoningTokens, c.model]))
     expect(framed).toHaveLength(2)
+  })
+})
+
+describe('dsh provider - hostile input', () => {
+  itZstd('skips a session whose frames decompress to far more than the file cap', async () => {
+    const dir = join(tmpDir, 'sessions', '--home-u-proj--', 'session-bomb')
+    await mkdir(dir, { recursive: true })
+    const filePath = join(dir, 'session.jsonl.zstd')
+    // 200 MB of zeros compresses to a few KB. Uncapped this decoded to ~916 MB
+    // of RSS for a 16 KB file; the per-frame cap now rejects it without
+    // allocating past the cap.
+    const bomb = zstdCompress!(Buffer.alloc(200 * 1024 * 1024))
+    const good = zstdCompress!(Buffer.from(
+      sessionHeader({ id: 'session-bomb', cwd: '/home/u/proj' }) + '\n'
+      + chunkUsage(1, 1, { inputTokens: 100, outputTokens: 10 }, 1786707340000) + '\n',
+      'utf-8',
+    ))
+    await writeFile(filePath, Buffer.concat([good, bomb]))
+    expect((await stat(filePath)).size).toBeLessThan(64 * 1024)
+
+    // The whole file is skipped: the frames read before the bomb are not
+    // counted, so a crafted tail cannot poison a partial total.
+    expect(await parseAll(createDshProvider(tmpDir), filePath)).toEqual([])
+  })
+
+  itZstd('stops decoding once the frames exceed the running budget', async () => {
+    const frame = zstdCompress!(Buffer.from('{"type":"turn/start","seq":0,"time":1,"data":{"turn":1}}\n', 'utf-8'))
+    const buffer = Buffer.concat([frame, frame, frame])
+
+    expect([...readZstdLines(buffer, Number.POSITIVE_INFINITY, 4096)]).toHaveLength(3)
+    // A budget under two frames' plaintext stops at the frame that overruns it.
+    expect(() => [...readZstdLines(buffer, Number.POSITIVE_INFINITY, 60)]).toThrow()
+  })
+
+  it('coerces non-numeric usage fields instead of poisoning the totals', async () => {
+    const filePath = await writePlainSession('--home-u-proj--', 'session-poison', [
+      sessionHeader({ id: 'session-poison', cwd: '/home/u/proj' }),
+      JSON.stringify({
+        type: 'assistant/message', seq: 1, time: 1786707340000,
+        data: {
+          turn: 1, step: 1, message: { role: 'assistant', content: [] },
+          usage: { inputTokens: '999', outputTokens: [1, 2], reasoningTokens: 1e308 * 10, cacheReadTokens: -5, cacheWriteTokens: 7 },
+        },
+      }),
+    ])
+
+    const calls = await parseAll(createDshProvider(tmpDir), filePath)
+    expect(calls).toHaveLength(1)
+    // Only the one genuinely numeric field survives; every other shape is 0.
+    expect(calls[0]).toMatchObject({
+      inputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 7,
+    })
+    for (const value of [calls[0]!.inputTokens, calls[0]!.outputTokens, calls[0]!.costUSD]) {
+      expect(typeof value).toBe('number')
+      expect(Number.isFinite(value)).toBe(true)
+    }
+  })
+
+  it('still skips a call whose usage is all non-numeric', async () => {
+    const filePath = await writePlainSession('--home-u-proj--', 'session-poison-zero', [
+      sessionHeader({ id: 'session-poison-zero', cwd: '/home/u/proj' }),
+      JSON.stringify({
+        type: 'assistant/message', seq: 1, time: 1786707340000,
+        data: { turn: 1, step: 1, message: { role: 'assistant', content: [] }, usage: { inputTokens: '999', outputTokens: [1, 2] } },
+      }),
+    ])
+
+    expect(await parseAll(createDshProvider(tmpDir), filePath)).toEqual([])
   })
 })

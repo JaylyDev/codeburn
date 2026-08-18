@@ -15,17 +15,25 @@ import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderC
 // so node:zlib's one-shot zstdDecompressSync (which decodes a single frame)
 // must be driven frame-by-frame behind a structural frame-boundary scan. The
 // scan below is a port of scanZstdFrames from the official
-// @deepseek-ai/dsh-session-persistence-jsonl package.
+// @deepseek-ai/dsh-session-persistence-jsonl package, which is third-party code
+// under its own license - see THIRD_PARTY_NOTICES.md.
 
 // zstd landed in node:zlib in 22.15 / 23.8; the package floor is lower, so the
 // provider degrades with a notice instead of assuming the export exists.
-const zstdDecompress = (zlib as { zstdDecompressSync?: (buf: Buffer) => Buffer }).zstdDecompressSync
+const zstdDecompress = (zlib as { zstdDecompressSync?: (buf: Buffer, opts?: { maxOutputLength?: number }) => Buffer }).zstdDecompressSync
 
 const ZSTD_MAGIC = 0xfd2fb528
 
 // SESSION_FORMAT_VERSION in @deepseek-ai/dsh-session. DSH refuses to load a log
 // stamped with any other version, and a bump means an event's meaning changed,
 // so a foreign version is skipped rather than read with today's assumptions.
+// A zstd frame's declared content size is attacker-controlled, so a few KB of
+// crafted input can expand to gigabytes. Every decode is capped: no single
+// frame may exceed this, and no file may decode to more than it would have been
+// allowed to occupy uncompressed (MAX_SESSION_FILE_BYTES). Overflow throws, and
+// the caller skips the WHOLE file rather than counting the frames it got to.
+const MAX_FRAME_DECODED_BYTES = 64 * 1024 * 1024
+
 const SESSION_FORMAT_VERSION = 0
 
 const MIN_REASONABLE_TIMESTAMP_MS = 1_000_000_000_000
@@ -164,6 +172,13 @@ function mapToolName(raw: string): string {
   return toolNameMap[raw] ?? raw
 }
 
+// Usage fields are whatever the JSON held. A string or array would flow
+// straight into the global token totals and the persisted cache, where
+// `0 + [1, 2]` silently becomes "01,2". Same semantics as copilot.ts.
+function numberOrZero(raw: unknown): number {
+  return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : 0
+}
+
 // A log stamped with a version this parser was not written against is skipped
 // whole: a bump means an event's meaning changed, so reading it with today's
 // assumptions would report confident wrong numbers.
@@ -198,12 +213,24 @@ function projectFromCwd(cwd: string, fallback: string): string {
 }
 
 // Decode every complete frame and yield its JSONL lines. A torn final frame is
-// ignored; a structurally corrupt file throws for the caller to report.
-function* readZstdLines(buffer: Buffer, maxFrames = Number.POSITIVE_INFINITY): Generator<string> {
+// ignored; a structurally corrupt file, or one that decodes past `budget`,
+// throws for the caller to report. Exported for the decode-budget test.
+export function* readZstdLines(
+  buffer: Buffer,
+  maxFrames = Number.POSITIVE_INFINITY,
+  budget = MAX_SESSION_FILE_BYTES,
+): Generator<string> {
   const { frames } = scanZstdFrames(buffer, maxFrames)
+  let remaining = budget
   for (const frame of frames) {
-    const text = zstdDecompress!(buffer.subarray(frame.start, frame.end)).toString('utf-8')
-    for (const line of text.split('\n')) {
+    if (remaining <= 0) throw new Error(`decodes past the ${budget}-byte cap`)
+    // node throws ERR_BUFFER_TOO_LARGE without allocating past the cap, so the
+    // per-frame limit doubles as the running budget for the frames after it.
+    const decoded = zstdDecompress!(buffer.subarray(frame.start, frame.end), {
+      maxOutputLength: Math.min(remaining, MAX_FRAME_DECODED_BYTES),
+    })
+    remaining -= decoded.length
+    for (const line of decoded.toString('utf-8').split('\n')) {
       if (line.trim()) yield line
     }
   }
@@ -276,7 +303,9 @@ async function readSessionHeader(filePath: string): Promise<DshEvent | null> {
           return null
         }
       }
-      const text = zstdDecompress(head.subarray(frames[0]!.start, frames[0]!.end)).toString('utf-8')
+      const text = zstdDecompress(head.subarray(frames[0]!.start, frames[0]!.end), {
+        maxOutputLength: MAX_FRAME_DECODED_BYTES,
+      }).toString('utf-8')
       return text.split('\n').find(l => l.trim()) ?? null
     }
     const content = await readSessionFile(filePath)
@@ -486,11 +515,11 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
       for (const key of sortedKeys) {
         const bucket = buckets.get(key)!
-        const input = bucket.usage.inputTokens ?? 0
-        const output = bucket.usage.outputTokens ?? 0
-        const cacheRead = bucket.usage.cacheReadTokens ?? 0
-        const cacheWrite = bucket.usage.cacheWriteTokens ?? 0
-        const reasoning = bucket.usage.reasoningTokens ?? 0
+        const input = numberOrZero(bucket.usage.inputTokens)
+        const output = numberOrZero(bucket.usage.outputTokens)
+        const cacheRead = numberOrZero(bucket.usage.cacheReadTokens)
+        const cacheWrite = numberOrZero(bucket.usage.cacheWriteTokens)
+        const reasoning = numberOrZero(bucket.usage.reasoningTokens)
         if (input + output + cacheRead + cacheWrite + reasoning === 0) continue
 
         const dedupKey = `dsh:${sessionId || source.path}:${key}`
