@@ -416,6 +416,45 @@ describe('(e) 90-day age-out for durable providers', () => {
     expect.soft(cache3.providers['test-synthetic']?.files[synthFile]).toBeUndefined()
   })
 
+  it('keeps a discovered 91-day source through a month-scoped refresh', async () => {
+    const synthFile = join(tmpHome, 'synth-scoped.txt')
+    await writeFile(synthFile, 'placeholder')
+
+    const ts91dAgo = new Date(Date.now() - 91 * 24 * 60 * 60 * 1000).toISOString()
+
+    _synthDurable = true
+    _synthSources = [{ path: synthFile, project: 'test', provider: 'test-synthetic' }]
+    _synthYields  = [{
+      provider: 'test-synthetic', model: 'gpt-4o',
+      inputTokens: 10, outputTokens: 8,
+      cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0,
+      costUSD: 0.002, tools: [], bashCommands: [],
+      timestamp: ts91dAgo,
+      speed: 'standard',
+      deduplicationKey: 'synth-age-out-91d-scoped',
+      userMessage: 'old', sessionId: 'synth-old-scoped',
+    }]
+
+    expect.soft(totalOutput(await parseAllSessions(undefined, 'test-synthetic'))).toBe(8)
+
+    // A today-ranged refresh loads under a month scope that excludes the entry's
+    // shard. Durable providers are never scoped, so the age-out still sees the
+    // entry as discovered and the save must carry its month across intact.
+    clearSessionCache()
+    const today = new Date()
+    const start = new Date(today); start.setHours(0, 0, 0, 0)
+    const end   = new Date(today); end.setHours(23, 59, 59, 999)
+    expect.soft(totalOutput(await parseAllSessions({ start, end }, 'test-synthetic'))).toBe(0)
+
+    clearSessionCache()
+    expect.soft(totalOutput(await parseAllSessions(undefined, 'test-synthetic'))).toBe(8)
+    expect.soft(_synthParseCalls).toBe(1)
+
+    const cache = await loadCache()
+    expect.soft(cache.providers['test-synthetic']?.files[synthFile]).toBeDefined()
+  })
+
   it('retains an orphaned cache entry whose newest call is 89 days old', async () => {
     const synthFile = join(tmpHome, 'synth-retain.txt')
     await writeFile(synthFile, 'placeholder')
