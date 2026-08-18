@@ -6,7 +6,20 @@ import type { Server } from 'http'
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
-import { runWebDashboard } from '../src/web-dashboard.js'
+import { injectDashboardBootstrap, runWebDashboard } from '../src/web-dashboard.js'
+
+describe('web dashboard bootstrap injection', () => {
+  it('keeps replacement syntax in a payload value literal', () => {
+    const payloadValue = "$`|$'|$&|$1"
+    const json = JSON.stringify({ devices: [{ name: payloadValue }] })
+    const html = '<!doctype html><script type="module" src="/app.js"></script>'
+
+    const injected = injectDashboardBootstrap(html, json)
+
+    expect(injected).toContain(`window.__CODEBURN_BOOTSTRAP__=${json}</script>`)
+    expect(injected).toContain(`"name":"${payloadValue}"`)
+  })
+})
 
 // Regression guard for the original bug: a bad `period` query used to hit
 // process.exit(1) and kill the long-running dashboard server. The handlers must

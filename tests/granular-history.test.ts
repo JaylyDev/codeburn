@@ -172,6 +172,36 @@ describe('granular history', () => {
     expect(history.sessionSeries[0]?.label).toBe('x'.repeat(80) + ' · sessio…3456 (claude)')
   })
 
+  it('caps session titles by code point without splitting an emoji', () => {
+    const timestamp = '2026-07-15T12:05:00.000Z'
+    const start = new Date('2026-07-15T00:00:00.000Z')
+    const end = new Date('2026-07-15T23:59:59.999Z')
+    const title = 'x'.repeat(79) + '😀' + ' after the boundary'
+    const history = buildGranularHistory([project([{
+      id: 'session-emoji-title-123456',
+      title,
+      calls: [apiCall({ timestamp, cost: 1 })],
+    }])], { start, end }, end)
+
+    const label = history.sessionSeries[0]?.label ?? ''
+    const titlePrefix = label.slice(0, label.indexOf(' · '))
+    expect(titlePrefix).toBe('x'.repeat(79) + '😀')
+    expect([...titlePrefix]).toEqual([...('x'.repeat(79) + '😀')])
+  })
+
+  it('prefers a title from any duplicate session summary sharing a key', () => {
+    const timestamp = '2026-07-15T12:05:00.000Z'
+    const start = new Date('2026-07-15T00:00:00.000Z')
+    const end = new Date('2026-07-15T23:59:59.999Z')
+    const history = buildGranularHistory([project([
+      { id: 'session-cache-collision-123456', calls: [apiCall({ timestamp, cost: 1 })] },
+      { id: 'session-cache-collision-123456', title: 'Recovered session title', calls: [apiCall({ timestamp, cost: 2 })] },
+    ])], { start, end }, end)
+
+    expect(history.sessionSeries).toHaveLength(1)
+    expect(history.sessionSeries[0]?.label).toBe('Recovered session title · sessio…3456 (claude)')
+  })
+
   it('fills idle buckets and keeps separate model and session lines from real call timestamps', () => {
     const start = new Date('2026-07-15T00:00:00.000Z')
     const end = new Date('2026-07-15T23:59:59.999Z')
@@ -284,6 +314,42 @@ describe('granular history', () => {
       expect.stringContaining('alpha ·'),
       expect.stringContaining('beta ·'),
     ]))
+  })
+
+  it('adds the project only when identical title and session id labels collide', () => {
+    const timestamp = '2026-07-15T12:05:00.000Z'
+    const alpha = project([{ id: 'shared-session-123456', title: 'Same task', calls: [apiCall({ timestamp, cost: 1 })] }])
+    const beta = project([{ id: 'shared-session-123456', title: 'Same task', calls: [apiCall({ timestamp, cost: 1 })] }])
+    alpha.projectPath = '/repos/alpha'
+    beta.projectPath = '/repos/beta'
+    const start = new Date('2026-07-15T00:00:00.000Z')
+    const end = new Date('2026-07-15T23:59:59.999Z')
+
+    const history = buildGranularHistory([alpha, beta], { start, end }, end)
+    const labels = history.sessionSeries.map(series => series.label)
+
+    expect(labels).toEqual([
+      'Same task · shared…3456 (claude) · repos/alpha',
+      'Same task · shared…3456 (claude) · repos/beta',
+    ])
+    expect(new Set(labels).size).toBe(2)
+  })
+
+  it('keeps all labels unique even when a title matches another label shape', () => {
+    const timestamp = '2026-07-15T12:05:00.000Z'
+    const alpha = project([{ id: 'sameid', title: 'Task', calls: [apiCall({ timestamp, cost: 1 })] }])
+    const beta = project([{ id: 'sameid', title: 'Task', calls: [apiCall({ timestamp, cost: 1 })] }])
+    const shaped = project([{ id: 'repos/alpha', title: 'Task · sameid (claude)', calls: [apiCall({ timestamp, cost: 1 })] }])
+    alpha.projectPath = '/repos/alpha (claude)'
+    beta.projectPath = '/repos/beta (claude)'
+    shaped.projectPath = '/other/shaped'
+    const start = new Date('2026-07-15T00:00:00.000Z')
+    const end = new Date('2026-07-15T23:59:59.999Z')
+
+    const history = buildGranularHistory([alpha, beta, shaped], { start, end }, end)
+    const labels = history.sessionSeries.map(series => series.label)
+
+    expect(new Set(labels).size).toBe(labels.length)
   })
 
   it('aligns quarter-hour buckets to local wall time in a fractional-offset timezone', () => {

@@ -90,6 +90,10 @@ function openBrowser(url: string): void {
   }
 }
 
+export function injectDashboardBootstrap(html: string, json: string): string {
+  return html.replace('<script type="module"', () => `<script>window.__CODEBURN_BOOTSTRAP__=${json}</script>\n    <script type="module"`)
+}
+
 export async function runWebDashboard(opts: {
   period: string
   provider: string
@@ -182,7 +186,7 @@ export async function runWebDashboard(opts: {
     const devices = [{ id: 'local', name: hostname(), local: true, payload }]
     // Escape every '<' so a device/model/project name can't close the <script>.
     const json = JSON.stringify({ devices }).replace(/</g, String.fromCharCode(92) + 'u003c')
-    const injected = html.replace('<script type="module"', `<script>window.__CODEBURN_BOOTSTRAP__=${json}</script>\n    <script type="module"`)
+    const injected = injectDashboardBootstrap(html, json)
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
     res.end(injected)
   }

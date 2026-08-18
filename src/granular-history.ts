@@ -47,6 +47,20 @@ type RawBucket = {
   sessions: Map<string, Totals>
 }
 
+type SessionLabelInfo = {
+  provider: string
+  projectPath: string
+  projectNames: Set<string>
+  sessionId: string
+  titleCandidates: Set<string>
+}
+
+type SessionLabelEntry = {
+  key: string
+  info: SessionLabelInfo
+  baseLabel: string
+}
+
 function nonNegative(value: number): number {
   return Number.isFinite(value) && value > 0 ? value : 0
 }
@@ -117,7 +131,73 @@ function cleanSessionTitle(title: string | undefined): string | undefined {
     .trim()
   if (!cleaned) return undefined
 
-  return cleaned.slice(0, MAX_SESSION_TITLE_LENGTH).trimEnd() || undefined
+  return Array.from(cleaned).slice(0, MAX_SESSION_TITLE_LENGTH).join('').trimEnd() || undefined
+}
+
+function preferredProjectName(projectNames: Set<string>): string {
+  return [...projectNames].sort()[0] ?? 'Unknown project'
+}
+
+function preferredSessionTitle(titleCandidates: Set<string>): string | undefined {
+  return [...titleCandidates]
+    .map(cleanSessionTitle)
+    .filter((title): title is string => title !== undefined)
+    .sort()[0]
+}
+
+function buildSessionLabels(inputs: Map<string, SessionLabelInfo>): Map<string, string> {
+  const entries: SessionLabelEntry[] = [...inputs.entries()].map(([key, info]) => {
+    const sessionLabel = preferredSessionTitle(info.titleCandidates)
+      ?? shortProjectLabel(info.projectPath, preferredProjectName(info.projectNames))
+    return {
+      key,
+      info,
+      baseLabel: `${sessionLabel} · ${shortSessionId(info.sessionId)} (${info.provider})`,
+    }
+  })
+  const byBaseLabel = new Map<string, SessionLabelEntry[]>()
+  for (const entry of entries) {
+    const group = byBaseLabel.get(entry.baseLabel) ?? []
+    group.push(entry)
+    byBaseLabel.set(entry.baseLabel, group)
+  }
+
+  const labels = new Map<string, string>()
+  const usedLabels = new Set<string>()
+  const setUniqueLabel = (entry: SessionLabelEntry, candidate: string): void => {
+    let label = candidate
+    if (usedLabels.has(label)) {
+      const identity = `${candidate} · ${entry.info.projectPath} · ${entry.info.sessionId}`
+      label = identity
+      let suffix = 2
+      while (usedLabels.has(label)) label = `${identity} · ${suffix++}`
+    }
+    labels.set(entry.key, label)
+    usedLabels.add(label)
+  }
+  for (const group of byBaseLabel.values()) {
+    if (group.length === 1) {
+      setUniqueLabel(group[0]!, group[0]!.baseLabel)
+      continue
+    }
+
+    const projectLabels = group.map(entry => shortProjectLabel(entry.info.projectPath, preferredProjectName(entry.info.projectNames)))
+    if (new Set(projectLabels).size === group.length) {
+      for (let i = 0; i < group.length; i++) {
+        const entry = group[i]!
+        setUniqueLabel(entry, `${entry.baseLabel} · ${projectLabels[i]}`)
+      }
+      continue
+    }
+
+    // A short project label can still collide (for example two worktrees with
+    // the same final path segments). The full path + id is only used for this
+    // residual collision, and is unique because provider/path/id form the key.
+    for (const entry of group) {
+      setUniqueLabel(entry, `${entry.baseLabel} · ${entry.info.projectPath} · ${entry.info.sessionId}`)
+    }
+  }
+  return labels
 }
 
 // Legend labels: the sanitized project dir ("-Users-name-Projects-app") is
@@ -205,7 +285,7 @@ export function buildGranularHistory(
   const modelTotals = new Map<string, Totals>()
   const sessionTotals = new Map<string, Totals>()
   const modelLabels = new Map<string, string>()
-  const sessionLabels = new Map<string, string>()
+  const sessionLabelInputs = new Map<string, SessionLabelInfo>()
   let callCount = 0
 
   for (const project of projects) {
@@ -235,13 +315,19 @@ export function buildGranularHistory(
           add(modelTotals, modelKey, cost, tokens)
           add(sessionTotals, sessionKey, cost, tokens)
           modelLabels.set(modelKey, modelKey === '<synthetic>' ? 'Other model' : modelKey)
-          // Every input is constant for a given sessionKey (the provider is part
-          // of the key), so build the label once instead of re-sanitizing the
-          // title on every call in the session.
-          if (!sessionLabels.has(sessionKey)) {
-            const sessionLabel = cleanSessionTitle(session.title) ?? shortProjectLabel(project.projectPath, projectName)
-            sessionLabels.set(sessionKey, `${sessionLabel} · ${shortSessionId(session.sessionId)} (${call.provider})`)
+          // Collect raw metadata first. Titles are cleaned once per distinct
+          // session-key candidate after all calls are aggregated, so a late
+          // cache title can win without putting sanitisation on the call path.
+          const labelInfo = sessionLabelInputs.get(sessionKey) ?? {
+            provider: call.provider,
+            projectPath: project.projectPath,
+            projectNames: new Set<string>(),
+            sessionId: session.sessionId,
+            titleCandidates: new Set<string>(),
           }
+          labelInfo.projectNames.add(projectName)
+          if (session.title !== undefined) labelInfo.titleCandidates.add(session.title)
+          sessionLabelInputs.set(sessionKey, labelInfo)
           callCount++
         }
       }
@@ -252,6 +338,7 @@ export function buildGranularHistory(
     return { bucketMinutes, modelSeries: [], sessionSeries: [], points: [] }
   }
 
+  const sessionLabels = buildSessionLabels(sessionLabelInputs)
   const modelProjection = projectSeries(rawBuckets, 'models', modelTotals, modelLabels)
   const sessionProjection = projectSeries(rawBuckets, 'sessions', sessionTotals, sessionLabels)
   return {
