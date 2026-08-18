@@ -403,7 +403,7 @@ export type SpendFlow = {
 // ————— src/optimize.ts —————
 
 export type WasteAction =
-  | { type: 'paste'; label: string; text: string; destination?: 'claude-md' | 'session-opener' | 'prompt' | 'shell-config' }
+  | { type: 'paste'; label: string; text: string; destination?: 'claude-md' | 'session-opener' | 'prompt' | 'shell-config' | 'manual' }
   | { type: 'command'; label: string; text: string }
   | { type: 'file-content'; label: string; path: string; content: string }
 

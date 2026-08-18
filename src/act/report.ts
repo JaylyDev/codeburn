@@ -731,7 +731,8 @@ type CaptureCtx = {
   now: Date
 }
 
-function mcpServersFromApply(finding: WasteFinding): string[] {
+function mcpServersFromApply(finding: WasteFinding, affectedMcpServers?: string[]): string[] {
+  if (affectedMcpServers) return affectedMcpServers
   if (finding.apply?.kind === 'mcp-remove') return finding.apply.servers
   if (finding.apply?.kind === 'mcp-project-scope') return finding.apply.servers.map(s => s.server)
   return []
@@ -749,24 +750,37 @@ function deferServers(finding: WasteFinding, ctx: CaptureCtx): string[] {
   return observedMcpServers(ctx.projects)
 }
 
-export function captureBaseline(finding: WasteFinding, kind: ActionKind, ctx: CaptureCtx): ActionBaseline | undefined {
+export function captureBaseline(
+  finding: WasteFinding,
+  kind: ActionKind,
+  ctx: CaptureCtx,
+  affectedMcpServers?: string[],
+): ActionBaseline | undefined {
   const common = {
     windowDays: ctx.windowDays,
     capturedAt: ctx.now.toISOString(),
-    estimatedTokens: Math.max(0, Math.round(finding.tokensSaved)),
+    estimatedTokens: Math.max(0, Math.round(finding.applyTokensSaved ?? finding.tokensSaved)),
   }
 
   if (MCP_KINDS.has(kind)) {
-    const servers = mcpServersFromApply(finding)
+    const servers = mcpServersFromApply(finding, affectedMcpServers)
     if (servers.length === 0) return undefined
     const covByServer = new Map(ctx.coverage.map(c => [c.server, c]))
     const metrics: Record<string, number> = {}
     for (const server of servers) {
       const cov = covByServer.get(server)
-      const tools = cov && cov.toolsAvailable > 0 ? cov.toolsAvailable : TOOLS_PER_MCP_SERVER
+      // Removal realizes only the unused schema that the low-coverage
+      // detector estimated. If coverage is unavailable, omit the numeric
+      // claim instead of inventing a five-tool baseline.
+      const tools = finding.id === 'mcp-low-coverage'
+        ? cov?.unusedTools.length ?? 0
+        : cov && cov.toolsAvailable > 0 ? cov.toolsAvailable : TOOLS_PER_MCP_SERVER
       metrics[server] = tools * TOKENS_PER_MCP_TOOL
     }
-    return { ...common, sessions: countSessionsLoading(ctx.projects, servers), metrics }
+    const estimatedTokens = finding.applyTokensSavedByServer
+      ? Math.round(servers.reduce((sum, server) => sum + (finding.applyTokensSavedByServer?.[server] ?? 0), 0))
+      : common.estimatedTokens
+    return { ...common, estimatedTokens, sessions: countSessionsLoading(ctx.projects, servers), metrics }
   }
 
   if (DEFER_KINDS.has(kind)) {
@@ -815,7 +829,8 @@ export async function captureBaselinesForPlans(
   const projects = await loadProjects({ start, end: now })
   const ctx: CaptureCtx = { projects, coverage: aggregateMcpCoverage(projects), windowDays: BASELINE_WINDOW_DAYS, now }
   for (const fp of applicable) {
-    const baseline = captureBaseline(fp.finding, fp.plan!.kind, ctx)
+    if (fp.plan!.mcpSavingsUncertain) continue
+    const baseline = captureBaseline(fp.finding, fp.plan!.kind, ctx, fp.plan!.affectedMcpServers)
     if (baseline) fp.plan!.baseline = baseline
   }
 }

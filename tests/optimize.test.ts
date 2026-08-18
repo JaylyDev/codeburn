@@ -1224,9 +1224,9 @@ describe('paste-fix destination tagging (issue #277)', () => {
       if (f.fix.type === 'paste') {
         expect(
           f.fix.destination,
-          `finding "${f.title}" has paste fix without destination — pick one of: claude-md / session-opener / prompt / shell-config`
+          `finding "${f.title}" has paste fix without destination — pick one of: claude-md / session-opener / prompt / shell-config / manual`
         ).toBeDefined()
-        expect(['claude-md', 'session-opener', 'prompt', 'shell-config'])
+        expect(['claude-md', 'session-opener', 'prompt', 'shell-config', 'manual'])
           .toContain(f.fix.destination)
       }
     }

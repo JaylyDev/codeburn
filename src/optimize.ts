@@ -246,6 +246,7 @@ export type PasteDestination =
   | 'session-opener'   // one-time paste at the start of a NEW session
   | 'prompt'           // one-time ask in the current Claude conversation
   | 'shell-config'     // append to ~/.zshrc / ~/.bashrc
+  | 'manual'           // instructions the user carries out directly
 
 export type WasteAction =
   | { type: 'paste'; label: string; text: string; destination?: PasteDestination }
@@ -402,9 +403,17 @@ export function classTotals(findings: WasteFinding[], costRate: number): Record<
     keep: { tokensSaved: 0, savingsUSD: 0, count: 0 },
   }
   for (const f of findings) {
-    const t = totals[findingClass(f)]
-    t.tokensSaved += f.tokensSaved
-    t.savingsUSD += f.tokensSaved * costRate
+    const cls = findingClass(f)
+    // A `fix` whose plan owns only part of its estimate (a mixed local +
+    // claude.ai connector MCP finding) contributes only the apply-able
+    // subset, so this subtotal and the "apply-able" headline never promise
+    // what `--apply` cannot recover. The finding keeps the whole
+    // opportunity in its own `tokensSaved`, so the fix subtotal can be
+    // smaller than the findings listed under it.
+    const tokens = cls === 'fix' ? f.applyTokensSaved ?? f.tokensSaved : f.tokensSaved
+    const t = totals[cls]
+    t.tokensSaved += tokens
+    t.savingsUSD += tokens * costRate
     t.count++
   }
   return totals
@@ -454,6 +463,18 @@ export type WasteFinding = {
   explanation: string
   impact: Impact
   tokensSaved: number
+  /// Savings attributable to the automatic mutation when it covers only a
+  /// subset of the finding. Omitted when `tokensSaved` already describes the
+  /// whole apply action (or when the finding is manual-only).
+  applyTokensSaved?: number
+  /// Per-server shares from the same capped cost pass as `tokensSaved`.
+  /// Internal apply/report consumers use this to price only targets that a
+  /// concrete mutation plan can actually edit; JSON output remains stable.
+  applyTokensSavedByServer?: Record<string, number>
+  /// Additional by-hand action retained when `fix` is an executable local
+  /// command (for example, connector guidance beside a local MCP removal).
+  /// Internal apply UI metadata; the stable optimize JSON mapper omits it.
+  manualFollowUp?: { label: string; text: string }
   fix: WasteAction
   trend?: Trend
   apply?: FindingApply
@@ -902,6 +923,27 @@ export function loadMcpConfigs(projectCwds: Iterable<string>, homeDir = homedir(
   return servers
 }
 
+/// Server names owned by readable local MCP config, normalized the way
+/// transcript namespaces are (":" -> "_"). `loadMcpConfigs` covers
+/// settings.json and .mcp.json; `~/.claude.json` adds the top-level and
+/// per-project `mcpServers` containers the remove plan also edits.
+///
+/// A `claude_ai_*` namespace listed here is a local server that happens to
+/// carry the connector prefix, not a claude.ai connector. Config we cannot
+/// read simply contributes no names, which leaves those namespaces on the
+/// conservative connector path.
+export function localMcpServerNames(projectCwds: Iterable<string>, homeDir = homedir()): Set<string> {
+  const names = new Set(loadMcpConfigs(projectCwds, homeDir).keys())
+  const userJson = readJsonFile(join(homeDir, '.claude.json'))
+  const projects = (userJson?.['projects'] ?? {}) as Record<string, { mcpServers?: unknown } | null>
+  const containers = [userJson?.['mcpServers'], ...Object.values(projects).map(entry => entry?.mcpServers)]
+  for (const container of containers) {
+    if (!container || typeof container !== 'object') continue
+    for (const name of Object.keys(container)) names.add(name.replace(/:/g, '_'))
+  }
+  return names
+}
+
 // ============================================================================
 // Detectors
 // ============================================================================
@@ -1040,6 +1082,12 @@ type McpSchemaCostEstimate = {
   cacheReadTokens: number
   effectiveInputTokens: number
 }
+
+type McpSchemaCostAttribution = McpSchemaCostEstimate & {
+  byServer: Record<string, McpSchemaCostEstimate>
+}
+
+type McpUnusedToolsByServer = Record<string, number | readonly string[]>
 
 /**
  * Aggregate MCP inventory and invocations across the projects in scope.
@@ -1216,49 +1264,86 @@ export function estimateMcpSchemaCost(
     counts = unusedToolCounts
   }
 
-  const totalUnusedSchemaTokens = servers.reduce(
-    (s, srv) => s + (counts[srv] ?? 0) * TOKENS_PER_MCP_TOOL,
-    0,
-  )
-  if (totalUnusedSchemaTokens === 0) {
-    return { cacheWriteTokens: 0, cacheReadTokens: 0, effectiveInputTokens: 0 }
+  const attributed = estimateMcpSchemaCostAttributed(counts, projects, servers)
+  return {
+    cacheWriteTokens: attributed.cacheWriteTokens,
+    cacheReadTokens: attributed.cacheReadTokens,
+    effectiveInputTokens: attributed.effectiveInputTokens,
+  }
+}
+
+function estimateMcpSchemaCostAttributed(
+  unusedToolsByServer: McpUnusedToolsByServer,
+  projects: ProjectSummary[],
+  servers: string[],
+): McpSchemaCostAttribution {
+  servers = [...new Set(servers)]
+  const byServer: Record<string, McpSchemaCostEstimate> = {}
+  for (const server of servers) {
+    byServer[server] = { cacheWriteTokens: 0, cacheReadTokens: 0, effectiveInputTokens: 0 }
   }
 
-  const serverSet = new Set(servers)
-  let cacheWriteTokens = 0
-  let cacheReadTokens = 0
+  const addBucket = (
+    loaded: Array<{ server: string; schemaTokens: number }>,
+    bucket: number,
+    key: 'cacheWriteTokens' | 'cacheReadTokens',
+  ): void => {
+    if (bucket <= 0) return
+    const totalSchemaTokens = loaded.reduce((sum, entry) => sum + entry.schemaTokens, 0)
+    if (totalSchemaTokens <= 0) return
+    const charged = Math.min(totalSchemaTokens, bucket)
+    for (const entry of loaded) {
+      byServer[entry.server]![key] += charged * (entry.schemaTokens / totalSchemaTokens)
+    }
+  }
 
   for (const project of projects) {
     for (const session of project.sessions) {
-      // A session counts only if its observed inventory included at least
-      // one of the flagged servers — same invariant `aggregateMcpCoverage`
-      // uses for `loadedSessions`.
-      let loaded = false
-      for (const fqn of session.mcpInventory ?? []) {
-        const seg = fqn.split('__')[1]
-        if (seg && serverSet.has(seg)) { loaded = true; break }
+      const inventory = new Set(session.mcpInventory ?? [])
+      const inventoryCounts = new Map<string, number>()
+      for (const fqn of inventory) {
+        const parts = fqn.split('__')
+        if (parts[0] !== 'mcp' || !parts[1] || parts.length < 3) continue
+        inventoryCounts.set(parts[1], (inventoryCounts.get(parts[1]) ?? 0) + 1)
       }
-      if (!loaded) continue
+
+      const loaded: Array<{ server: string; schemaTokens: number }> = []
+      for (const server of servers) {
+        const unused = unusedToolsByServer[server]
+        const toolCount = typeof unused === 'number'
+          ? Math.min(unused, inventoryCounts.get(server) ?? 0)
+          : [...new Set(unused ?? [])].reduce((count, fqn) => count + (inventory.has(fqn) ? 1 : 0), 0)
+        if (toolCount > 0) loaded.push({ server, schemaTokens: toolCount * TOKENS_PER_MCP_TOOL })
+      }
+      if (loaded.length === 0) continue
 
       for (const turn of session.turns) {
         for (const call of turn.assistantCalls) {
-          // Both buckets can be non-zero on the same call (cache rebuild
-          // alongside a partial read), so account for them independently.
-          // The cap is applied to the combined unused-schema budget so
-          // multiple flagged servers cannot all claim the same call.
-          if (call.usage.cacheCreationInputTokens > 0) {
-            cacheWriteTokens += Math.min(totalUnusedSchemaTokens, call.usage.cacheCreationInputTokens)
-          }
-          if (call.usage.cacheReadInputTokens > 0) {
-            cacheReadTokens += Math.min(totalUnusedSchemaTokens, call.usage.cacheReadInputTokens)
-          }
+          // A cache bucket is shared by every flagged schema loaded on this
+          // call. Charge it once, then attribute the capped amount in
+          // proportion to each server's unused schema. This conserves the
+          // combined total and makes any local-only subset additive.
+          addBucket(loaded, call.usage.cacheCreationInputTokens, 'cacheWriteTokens')
+          addBucket(loaded, call.usage.cacheReadInputTokens, 'cacheReadTokens')
         }
       }
     }
   }
 
-  const effectiveInputTokens = cacheWriteTokens * CACHE_WRITE_MULTIPLIER + cacheReadTokens * CACHE_READ_DISCOUNT
-  return { cacheWriteTokens, cacheReadTokens, effectiveInputTokens }
+  let cacheWriteTokens = 0
+  let cacheReadTokens = 0
+  for (const estimate of Object.values(byServer)) {
+    estimate.effectiveInputTokens = estimate.cacheWriteTokens * CACHE_WRITE_MULTIPLIER
+      + estimate.cacheReadTokens * CACHE_READ_DISCOUNT
+    cacheWriteTokens += estimate.cacheWriteTokens
+    cacheReadTokens += estimate.cacheReadTokens
+  }
+  return {
+    cacheWriteTokens,
+    cacheReadTokens,
+    effectiveInputTokens: cacheWriteTokens * CACHE_WRITE_MULTIPLIER + cacheReadTokens * CACHE_READ_DISCOUNT,
+    byServer,
+  }
 }
 
 /**
@@ -1278,6 +1363,7 @@ export function estimateMcpSchemaCost(
 export function detectMcpToolCoverage(
   projects: ProjectSummary[],
   coverage = aggregateMcpCoverage(projects),
+  localServerNames: ReadonlySet<string> = new Set(),
 ): WasteFinding | null {
   if (coverage.length === 0) return null
 
@@ -1292,30 +1378,102 @@ export function detectMcpToolCoverage(
 
   const lines: string[] = []
   const removeCommands: string[] = []
-  const unusedCountsByServer: Record<string, number> = {}
+  const unusedToolsByServer: Record<string, readonly string[]> = {}
   const flaggedServers: string[] = []
+  const localServers: string[] = []
+  const connectorServers: string[] = []
+  // Local, but named like a connector: the transcript cannot tell the two
+  // apart, so the removal targets the config entry and the guidance warns
+  // about a possible same-name connector instead of asserting one.
+  const ambiguousServers: string[] = []
 
   for (const c of flagged) {
-    unusedCountsByServer[c.server] = c.toolsAvailable - c.toolsInvoked
+    unusedToolsByServer[c.server] = c.unusedTools
     flaggedServers.push(c.server)
     const pct = Math.round(c.coverageRatio * 100)
     lines.push(
       `${c.server}: ${c.toolsInvoked}/${c.toolsAvailable} tools used (${pct}% coverage) across ${c.loadedSessions} session${c.loadedSessions === 1 ? '' : 's'}`,
     )
-    removeCommands.push(`claude mcp remove '${c.server}'`)
+    if (c.server.startsWith('claude_ai_') && !localServerNames.has(c.server)) {
+      connectorServers.push(c.server)
+    } else {
+      if (c.server.startsWith('claude_ai_')) ambiguousServers.push(c.server)
+      localServers.push(c.server)
+      removeCommands.push(`claude mcp remove '${c.server}'`)
+    }
   }
 
   // Single combined cost pass: caps each call's contribution at the
   // total unused-schema budget across all flagged servers, so two
   // flagged servers cannot independently claim the same call's cache
   // bucket and overstate `tokensSaved`.
-  const cost = estimateMcpSchemaCost(unusedCountsByServer, projects, flaggedServers)
+  const cost = estimateMcpSchemaCostAttributed(unusedToolsByServer, projects, flaggedServers)
   const tokensSaved = Math.round(cost.effectiveInputTokens)
+  const applyTokensSavedByServer = Object.fromEntries(localServers.map(server => [
+    server,
+    cost.byServer[server]?.effectiveInputTokens ?? 0,
+  ]))
+  const localTokensSaved = Object.values(applyTokensSavedByServer).reduce((sum, value) => sum + value, 0)
+  const applyTokensSaved = localServers.length > 0 && connectorServers.length > 0
+    ? Math.round(localTokensSaved)
+    : undefined
   const impact: Impact = tokensSaved >= MCP_COVERAGE_HIGH_IMPACT_TOKENS
     ? 'high'
     : flagged.length >= UNUSED_MCP_HIGH_THRESHOLD
       ? 'high'
       : 'medium'
+  // `claude_ai_*` is Claude Code's transcript namespace for server-side
+  // claude.ai connectors, which are not local mcpServers entries, so
+  // `claude mcp remove` and the file-editing apply plan cannot own them --
+  // unless readable local config claims the exact name (`ambiguousServers`).
+  // Coverage is aggregate here; project-level config attribution is deliberately
+  // out of scope, hence the instruction to inspect /mcp per affected project.
+  const one = connectorServers.length === 1
+  const connectorLabels = connectorServers.map(server =>
+    `claude.ai ${server.slice('claude_ai_'.length).replaceAll('_', ' ')}`,
+  )
+  const connectorEvidence = connectorServers.map((server, index) =>
+    `${connectorLabels[index]} (${server})`,
+  )
+  const connectorGuidance = connectorServers.length > 0
+    ? ` ${connectorEvidence.join(', ')} ${one ? 'is a claude.ai connector namespace' : 'are claude.ai connector namespaces'}, separate from any similarly named local MCP server. Transcript inventory is aggregated across the selected projects; use /mcp in each project where ${one ? 'it loads' : 'they load'}, or manage ${one ? 'it' : 'them'} in claude.ai Settings > Connectors.`
+    : ''
+  const oneAmbiguous = ambiguousServers.length === 1
+  const ambiguousNote = ambiguousServers.length > 0
+    ? `If you also use ${oneAmbiguous ? 'a claude.ai connector' : 'claude.ai connectors'} named ${ambiguousServers.join(', ')}, manage ${oneAmbiguous ? 'it' : 'them'} with /mcp or in claude.ai Settings > Connectors.`
+    : ''
+  const ambiguousGuidance = ambiguousServers.length > 0
+    ? ` ${ambiguousServers.join(', ')} ${oneAmbiguous ? 'is a local MCP config entry whose name matches' : 'are local MCP config entries whose names match'} the claude.ai connector namespace, so the removal below edits local config only. ${ambiguousNote}`
+    : ''
+  const connectorText = [
+    connectorServers.length > 0
+      ? `Open /mcp in each affected project and disable ${connectorLabels.join(', ')}, or manage ${one ? 'it' : 'them'} in claude.ai Settings > Connectors.`
+      : '',
+    ambiguousNote,
+  ].filter(Boolean).join(' ')
+  const connectorAction = connectorText
+    ? {
+        label: connectorServers.length === 0
+          ? 'Check for a same-name claude.ai connector:'
+          : one ? 'Manage the underused claude.ai connector where it loads:'
+            : 'Manage the underused claude.ai connectors where they load:',
+        text: connectorText,
+      }
+    : undefined
+  const fix: WasteAction = localServers.length > 0
+    ? {
+        type: 'command',
+        label: localServers.length === 1
+          ? 'Remove the underused local server, or trim its tools in your MCP config:'
+          : 'Remove underused local servers, or trim their tools in your MCP config:',
+        text: removeCommands.join('\n'),
+      }
+    : {
+        type: 'paste',
+        destination: 'manual',
+        label: connectorAction!.label,
+        text: connectorAction!.text,
+      }
 
   return {
     id: 'mcp-low-coverage',
@@ -1323,17 +1481,16 @@ export function detectMcpToolCoverage(
     explanation:
       `Schema for unused tools is loaded into the system prompt every session and ` +
       `carried in the cached prefix on every turn. ` +
-      `${lines.join('; ')}.`,
+      `${lines.join('; ')}.${connectorGuidance}${ambiguousGuidance}`,
     impact,
     tokensSaved,
-    fix: {
-      type: 'command',
-      label: flagged.length === 1
-        ? 'Remove the underused server, or trim its tools in your MCP config:'
-        : 'Remove underused servers, or trim their tools in your MCP config:',
-      text: removeCommands.join('\n'),
-    },
-    apply: { kind: 'mcp-remove', servers: flaggedServers },
+    ...(applyTokensSaved !== undefined ? { applyTokensSaved } : {}),
+    ...(localServers.length > 0 ? { applyTokensSavedByServer } : {}),
+    ...(localServers.length > 0 && connectorAction ? { manualFollowUp: connectorAction } : {}),
+    fix,
+    ...(localServers.length > 0
+      ? { apply: { kind: 'mcp-remove' as const, servers: localServers } }
+      : {}),
   }
 }
 
@@ -3358,7 +3515,7 @@ export async function scanAndDetect(
     claudeOnly(() => detectJunkReads(toolCalls, dateRange)),
     claudeOnly(() => detectDuplicateReads(toolCalls, dateRange)),
     claudeOnly(() => detectUnusedMcp(toolCalls, projects, projectCwds, mcpCoverage)),
-    () => detectMcpToolCoverage(projects, mcpCoverage),
+    () => detectMcpToolCoverage(projects, mcpCoverage, localMcpServerNames(projectCwds)),
     () => detectMcpProfileAdvisor(projects, mcpCoverage),
     // mcp-deferral-gaps family (#614): detection only, no apply plans yet.
     claudeOnly(() => detectMcpDeferralOff(toolCalls, projects, projectCwds, apiCalls)),
@@ -3450,6 +3607,7 @@ function renderActionHeader(action: WasteAction): string {
         case 'session-opener':  return fillTo('One-time session opener (do NOT add to CLAUDE.md)')
         case 'prompt':          return fillTo('Ask Claude in the current session')
         case 'shell-config':    return fillTo('Add to your shell config')
+        case 'manual':          return fillTo('Manual action')
         default:                return fillTo('Suggested action')
       }
   }

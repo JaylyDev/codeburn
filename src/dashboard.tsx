@@ -1047,6 +1047,8 @@ function actionDestinationHeader(action: WasteAction): string {
           return '── Ask Claude in the current session '.padEnd(64, '─')
         case 'shell-config':
           return '── Add to your shell config '.padEnd(64, '─')
+        case 'manual':
+          return '── Manual action '.padEnd(64, '─')
         default:
           return '── Suggested action '.padEnd(64, '─')
       }

@@ -9,11 +9,13 @@ import {
   buildActReportJson,
   buildOptimizeAppliedHeader,
   captureBaseline,
+  captureBaselinesForPlans,
   computeActReport,
   renderActReport,
 } from '../src/act/report.js'
 import { formatAppliedFix, REPORT_MIN_AGE_DAYS } from '../src/act/types.js'
 import type { ActionRecord } from '../src/act/types.js'
+import type { FindingPlan } from '../src/act/plans.js'
 import type { WasteFinding } from '../src/optimize.js'
 import type { ClassifiedTurn, ProjectSummary } from '../src/types.js'
 
@@ -762,6 +764,173 @@ describe('defer baseline capture', () => {
     const projects = [projectOf(sessionsAt(3, daysAgo(5)))] // no mcpBreakdown, no inventory
     const b = captureBaseline(finding({ kind: 'defer-enable', cause: 'env-false', settingPath: '/x', settingScope: 'project settings', value: 'false' }), 'defer-enable', ctx(projects))
     expect(b).toBeUndefined()
+  })
+})
+
+describe('partial-action baseline capture', () => {
+  it('persists the savings attributable to the local mutation, not the full mixed finding', () => {
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage',
+      title: '2 MCP servers with low tool coverage',
+      explanation: '',
+      impact: 'medium',
+      tokensSaved: 40_000,
+      applyTokensSaved: 20_000,
+      fix: { type: 'command', label: '', text: "claude mcp remove 'filesystem'" },
+      apply: { kind: 'mcp-remove', servers: ['filesystem'] },
+    }
+    const sessions = sessionsAt(2, daysAgo(1), {
+      mcpInventory: Array.from({ length: 20 }, (_, i) => `mcp__filesystem__t${i}`),
+    })
+
+    const baseline = captureBaseline(finding, 'mcp-remove', {
+      projects: [projectOf(sessions)],
+      coverage: [{
+        server: 'filesystem',
+        toolsAvailable: 20,
+        toolsInvoked: 3,
+        unusedTools: Array.from({ length: 17 }, (_, i) => `mcp__filesystem__unused${i}`),
+        invocations: 0,
+        loadedSessions: 2,
+        coverageRatio: 3 / 20,
+      }],
+      windowDays: 14,
+      now: NOW,
+    })
+
+    expect(baseline).toMatchObject({
+      estimatedTokens: 20_000,
+      sessions: 2,
+      metrics: { filesystem: 6_800 },
+    })
+    expect(finding.tokensSaved).toBe(40_000)
+  })
+
+  it('prices and measures only servers owned by the concrete mutation plan', () => {
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage',
+      title: '2 MCP servers with low tool coverage',
+      explanation: '',
+      impact: 'medium',
+      tokensSaved: 30_000,
+      applyTokensSaved: 30_000,
+      applyTokensSavedByServer: { filesystem: 10_000, managed: 20_000 },
+      fix: { type: 'command', label: '', text: '' },
+      apply: { kind: 'mcp-remove', servers: ['filesystem', 'managed'] },
+    }
+    const sessions = sessionsAt(2, daysAgo(1), {
+      mcpInventory: [
+        ...Array.from({ length: 17 }, (_, i) => `mcp__filesystem__t${i}`),
+        ...Array.from({ length: 12 }, (_, i) => `mcp__managed__t${i}`),
+      ],
+    })
+    const coverage = [
+      {
+        server: 'filesystem', toolsAvailable: 20, toolsInvoked: 3,
+        unusedTools: Array.from({ length: 17 }, (_, i) => `mcp__filesystem__t${i}`),
+        invocations: 3, loadedSessions: 2, coverageRatio: 3 / 20,
+      },
+      {
+        server: 'managed', toolsAvailable: 20, toolsInvoked: 8,
+        unusedTools: Array.from({ length: 12 }, (_, i) => `mcp__managed__t${i}`),
+        invocations: 8, loadedSessions: 2, coverageRatio: 8 / 20,
+      },
+    ]
+
+    const baseline = captureBaseline(finding, 'mcp-remove', {
+      projects: [projectOf(sessions)], coverage, windowDays: 14, now: NOW,
+    }, ['filesystem'])
+
+    expect(baseline).toMatchObject({
+      estimatedTokens: 10_000,
+      sessions: 2,
+      metrics: { filesystem: 6_800 },
+    })
+    expect(baseline!.metrics).not.toHaveProperty('managed')
+  })
+
+  it('does not invent a low-coverage schema baseline when coverage is unavailable', () => {
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage',
+      title: '1 MCP server with low tool coverage',
+      explanation: '',
+      impact: 'medium',
+      tokensSaved: 10_000,
+      applyTokensSavedByServer: { filesystem: 10_000 },
+      fix: { type: 'command', label: '', text: '' },
+      apply: { kind: 'mcp-remove', servers: ['filesystem'] },
+    }
+
+    const baseline = captureBaseline(finding, 'mcp-remove', {
+      projects: [projectOf(sessionsAt(2, daysAgo(1)))],
+      coverage: [],
+      windowDays: 14,
+      now: NOW,
+    }, ['filesystem'])
+
+    expect(baseline).toMatchObject({
+      estimatedTokens: 10_000,
+      metrics: { filesystem: 0 },
+    })
+  })
+
+  it('stamps a narrowed plan with only its concrete server baseline', async () => {
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage', title: '2 MCP servers', explanation: '', impact: 'medium',
+      tokensSaved: 30_000, applyTokensSaved: 30_000,
+      applyTokensSavedByServer: { filesystem: 10_000, managed: 20_000 },
+      fix: { type: 'command', label: '', text: '' },
+      apply: { kind: 'mcp-remove', servers: ['filesystem', 'managed'] },
+    }
+    const plan: FindingPlan = {
+      finding,
+      notes: [],
+      plan: {
+        kind: 'mcp-remove', description: 'Remove filesystem', changes: [],
+        affectedMcpServers: ['filesystem'],
+      },
+    }
+    const sessions = sessionsAt(2, daysAgo(1), {
+      mcpInventory: [
+        ...Array.from({ length: 17 }, (_, i) => `mcp__filesystem__t${i}`),
+        ...Array.from({ length: 12 }, (_, i) => `mcp__managed__t${i}`),
+      ],
+    })
+
+    await captureBaselinesForPlans([plan], {
+      now: NOW,
+      loadProjects: async () => [projectOf(sessions)],
+    })
+
+    expect(plan.plan?.baseline).toMatchObject({
+      estimatedTokens: 10_000,
+      metrics: { filesystem: 6_800 },
+    })
+    expect(plan.plan?.baseline?.metrics).not.toHaveProperty('managed')
+  })
+
+  it('does not stamp a numeric baseline onto an uncertain partial mutation', async () => {
+    const finding: WasteFinding = {
+      id: 'mcp-low-coverage', title: '1 MCP server', explanation: '', impact: 'medium',
+      tokensSaved: 10_000, applyTokensSavedByServer: { filesystem: 10_000 },
+      fix: { type: 'command', label: '', text: '' },
+      apply: { kind: 'mcp-remove', servers: ['filesystem'] },
+    }
+    const plan: FindingPlan = {
+      finding,
+      notes: ['could not parse .mcp.json'],
+      plan: {
+        kind: 'mcp-remove', description: 'Remove filesystem', changes: [],
+        affectedMcpServers: ['filesystem'], mcpSavingsUncertain: true,
+      },
+    }
+
+    await captureBaselinesForPlans([plan], {
+      now: NOW,
+      loadProjects: async () => [projectOf(sessionsAt(2, daysAgo(1)))],
+    })
+
+    expect(plan.plan?.baseline).toBeUndefined()
   })
 })
 

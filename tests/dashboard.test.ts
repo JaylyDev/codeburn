@@ -395,6 +395,47 @@ describe('interactive terminal rendering', () => {
     expect(INTERACTIVE_RENDER_OPTIONS).toMatchObject({ alternateScreen: true })
   })
 
+  it('labels claude.ai connector remediation as a manual action', async () => {
+    const stdin = new PassThrough() as PassThrough & NodeJS.ReadStream
+    const stdout = new PassThrough() as PassThrough & NodeJS.WriteStream
+    stdin.isTTY = true
+    stdin.setRawMode = () => stdin
+    stdin.ref = () => stdin
+    stdin.unref = () => stdin
+    stdout.isTTY = true
+    stdout.columns = 120
+    stdout.rows = 50
+    const frames: string[] = []
+    stdout.on('data', chunk => frames.push(stripAnsi(String(chunk))))
+
+    const inventory = Array.from({ length: 20 }, (_, i) => `mcp__claude_ai_Google_Calendar__t${i}`)
+    const sessions = ['connector-a', 'connector-b'].map((id, index) => {
+      const session = makeSession(id, 91.337 + index)
+      session.mcpInventory = inventory
+      return session
+    })
+    const app = render(React.createElement(InteractiveDashboard, {
+      initialProjects: [makeProject('connector-manual-action', sessions)],
+      initialPeriod: 'today',
+      initialProvider: 'all',
+      refreshSeconds: 0,
+      windowColumns: 120,
+    }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
+    onTestFinished(() => app.unmount())
+
+    await app.waitUntilRenderFlush()
+    stdin.write('o')
+    let frame = ''
+    for (let i = 0; i < 100 && !frame.includes('Manual action'); i++) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      frame = frames.filter(value => value.trim()).at(-1) ?? ''
+    }
+
+    expect(frame).toContain('Manual action')
+    expect(frame).toContain('claude.ai Google Calendar')
+    expect(frame).not.toContain('Ask Claude in the current session')
+  })
+
   it('leaves resize frame synchronization entirely to Ink', () => {
     const source = readFileSync(new URL('../src/dashboard.tsx', import.meta.url), 'utf8')
     expect(source).not.toContain('process.stdout.write(BSU)')
