@@ -216,6 +216,7 @@ export const PROVIDER_ENV_VARS: Record<string, string[]> = {
   hermes: ['HERMES_HOME'],
   'lingtai-tui': ['LINGTAI_HOME', 'LINGTAI_TUI_HOME', 'LINGTAI_TUI_GLOBAL_DIR'],
   droid: ['FACTORY_DIR'],
+  dsh: ['DSH_HOME'],
   cursor: ['CODEBURN_CURSOR_MAX_BUBBLES'],
   // XDG_DATA_HOME is stale here (cursor-agent never reads it) but deliberately
   // kept: removing it would force a re-parse to fix nothing.
@@ -284,6 +285,10 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // input/cache rollup; this bump re-parses them so the missing tokens land.
   copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1',
   grok: 'estimated-cost-v1',
+  // seed-aware-v1: the parser now skips the parent events a forked session
+  // replays (double-counted before), takes the model from the reporting
+  // assistant/message, and keeps agent-injected context out of the preview.
+  dsh: 'seed-aware-v1',
   hermes: 'reasoning-output-accounting-v1-est-cost',
   'lingtai-tui': 'token-ledger-registry-activity-v3',
   'ibm-bob': 'worktree-project-grouping-v1',

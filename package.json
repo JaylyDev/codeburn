@@ -9,6 +9,7 @@
   },
   "files": [
     "dist",
+    "THIRD_PARTY_NOTICES.md",
     "!dist/parse-worker.js.map"
   ],
   "scripts": {
@@ -33,6 +34,7 @@
     "pi",
     "codebuff",
     "codewhale",
+    "dsh",
     "ai-coding",
     "token-usage",
     "cost-tracking",
