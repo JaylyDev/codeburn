@@ -437,6 +437,17 @@ export type OptimizeJsonReport = {
     basis: 'measured' | 'estimated'
     fix: WasteAction
   }>
+  /** Still-applied fixes, re-measured on every run. Absent on older CLIs. */
+  appliedFixes?: Array<{
+    id: string
+    kind: string
+    findingId: string | null
+    appliedAt: string
+    verdict: 'worked' | 'partial' | 'no-effect' | 'pending'
+    estimatedTokens: number
+    realizedTokens: number
+    undoCommand: string
+  }>
 }
 
 // ————— T1b: src/sharing/* (defined by the shared contract) —————

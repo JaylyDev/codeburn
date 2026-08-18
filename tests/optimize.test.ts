@@ -35,6 +35,7 @@ import {
   type OptimizeResult,
 } from '../src/optimize.js'
 import type { ProjectSummary } from '../src/types.js'
+import type { AppliedFix } from '../src/act/types.js'
 
 function call(name: string, input: Record<string, unknown>, sessionId = 's1', project = 'p1'): ToolCall {
   return { name, input, sessionId, project }
@@ -1320,6 +1321,7 @@ describe('buildOptimizeJsonReport', () => {
     expect(classes.reduce((s, c) => s + c.tokensSaved, 0)).toBe(report.summary.potentialSavingsTokens)
     expect(classes.reduce((s, c) => s + c.savingsUSD, 0)).toBeCloseTo(report.summary.potentialSavingsCostUSD, 10)
     expect(classes.reduce((s, c) => s + c.count, 0)).toBe(report.summary.findingCount)
+    expect(report.appliedFixes).toEqual([])
     expect(report.findings[0]).toMatchObject({
       title: 'Trim stale context',
       severity: 'medium',
@@ -1372,5 +1374,58 @@ describe('renderOptimize grouping', () => {
     expect(out).toContain('3. Context-heavy sessions')
     expect(out).toContain('1 measured · 2 estimated')
     expect(out).not.toContain('Estimates only.')
+  })
+})
+
+describe('renderOptimize applied-fixes section', () => {
+  const plain = (s: string): string => s.replace(/\[[0-9;]*m/g, '')
+
+  function fixture(over: Partial<AppliedFix>): AppliedFix {
+    return {
+      id: 'abcdef12',
+      kind: 'mcp-remove',
+      findingId: 'unused-mcp',
+      appliedAt: '2026-05-01T00:00:00.000Z',
+      ageDays: 4,
+      verdict: 'worked',
+      estimatedTokens: 300_000,
+      realizedTokens: 280_000,
+      note: '',
+      undoCommand: 'codeburn act undo abcdef12',
+      ...over,
+    }
+  }
+
+  const findings: WasteFinding[] = [{
+    id: 'bash-output-cap',
+    title: 'Cap bash output',
+    explanation: 'why',
+    impact: 'medium',
+    tokensSaved: 1000,
+    fix: { type: 'paste', destination: 'prompt', label: 'ask', text: 'ask' },
+  }]
+
+  const render = (appliedFixes: AppliedFix[], f = findings): string =>
+    plain(renderOptimize(f, 0.00001, '7 Days', 10, 5, 100, 80, 'B', [], [], undefined, undefined, undefined, appliedFixes))
+
+  it('renders one line per verdict with its own glyph', () => {
+    const out = render([
+      fixture({}),
+      fixture({ id: 'b', findingId: 'mcp-defer-threshold', verdict: 'partial', ageDays: 3, estimatedTokens: 600_000, realizedTokens: 420_000 }),
+      fixture({ id: 'c', findingId: 'bash-output-cap', verdict: 'no-effect', ageDays: 5, estimatedTokens: 41_000, realizedTokens: 0, undoCommand: 'codeburn act undo cccccccc' }),
+      fixture({ id: 'd', findingId: 'mcp-remove-linear', verdict: 'pending', ageDays: 1 }),
+    ])
+
+    expect(out).toContain('Applied fixes')
+    expect(out).toContain('\u2713 unused-mcp (4d ago): est. 300.0K -> measured 280.0K')
+    expect(out).toContain('~ mcp-defer-threshold (3d ago): est. 600.0K -> measured 420.0K (-30% vs estimate)')
+    expect(out).toContain('\u2717 bash-output-cap (5d ago): est. 41.0K -> measured 0 - did not help. Revert: codeburn act undo cccccccc')
+    expect(out).toContain('\u2026 mcp-remove-linear (1d ago): measuring, check back after 3 days')
+  })
+
+  it('shows the section on a clean setup too, and omits it when nothing is applied', () => {
+    expect(render([fixture({})], [])).toContain('Applied fixes')
+    expect(render([])).not.toContain('Applied fixes')
+    expect(render([], [])).not.toContain('Applied fixes')
   })
 })

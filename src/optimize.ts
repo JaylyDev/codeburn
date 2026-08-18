@@ -12,6 +12,7 @@ import type { DateRange, ProjectSummary, SessionSummary } from './types.js'
 import { formatCost } from './currency.js'
 import { formatTokens } from './format.js'
 import { recommendModelDefault, type ModelDefaultRecommendation } from './act/model-defaults.js'
+import { appliedFixGlyph, formatAppliedFix, type AppliedFix } from './act/types.js'
 import { aggregateFileChurn, buildCoachingNotes, scanUserCorrections, medianTimeToFirstEditMs, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 
 // ============================================================================
@@ -491,6 +492,8 @@ export type OptimizeJsonReport = {
   /// 1-3 templated one-liners keyed on the strongest workflow signals.
   coachingNotes: string[]
   modelRecommendations?: Array<ModelDefaultRecommendation>
+  /// One entry per still-applied fix, re-measured on every run (see act/report.ts).
+  appliedFixes: Array<Omit<AppliedFix, 'ageDays' | 'note'>>
 }
 
 export type ToolCall = {
@@ -3365,6 +3368,25 @@ function renderWorkflowSection(reworkedFiles: ReworkedFile[], coachingNotes: str
   return lines
 }
 
+const APPLIED_FIX_COLORS: Record<AppliedFix['verdict'], string> = {
+  worked: GREEN,
+  partial: GOLD,
+  'no-effect': RED,
+  pending: DIM,
+}
+
+// Closes the loop after --apply: every still-applied fix gets its measured
+// verdict back here, on every run.
+function renderAppliedFixes(appliedFixes: AppliedFix[]): string[] {
+  if (appliedFixes.length === 0) return []
+  const lines = [chalk.bold.hex(ORANGE)('  Applied fixes'), '']
+  for (const fix of appliedFixes) {
+    lines.push(chalk.hex(APPLIED_FIX_COLORS[fix.verdict])(`  ${appliedFixGlyph(fix)} ${formatAppliedFix(fix)}`))
+  }
+  lines.push('')
+  return lines
+}
+
 export function renderOptimize(
   findings: WasteFinding[],
   costRate: number,
@@ -3379,6 +3401,7 @@ export function renderOptimize(
   appliedHeader?: string,
   previouslyApplied?: Record<string, string>,
   modelRecommendations?: ModelDefaultRecommendation[],
+  appliedFixes: AppliedFix[] = [],
 ): string {
   const lines: string[] = []
   lines.push('')
@@ -3406,6 +3429,7 @@ export function renderOptimize(
     lines.push(chalk.dim('  token waste: junk directory reads, duplicate file reads, unused'))
     lines.push(chalk.dim('  agents/skills/MCP servers, bloated CLAUDE.md, and more.'))
     lines.push('')
+    lines.push(...renderAppliedFixes(appliedFixes))
     lines.push(...renderWorkflowSection(reworkedFiles, coachingNotes))
     return lines.join('\n')
   }
@@ -3441,6 +3465,7 @@ export function renderOptimize(
   lines.push(chalk.hex(DIM)('  ' + SEP.repeat(PANEL_WIDTH)))
   lines.push('')
 
+  lines.push(...renderAppliedFixes(appliedFixes))
   lines.push(...renderWorkflowSection(reworkedFiles, coachingNotes))
 
   if (modelRecommendations && modelRecommendations.length > 0) {
@@ -3478,7 +3503,7 @@ export async function runOptimize(
   projects: ProjectSummary[],
   periodLabel: string,
   dateRange?: DateRange,
-  opts: { format?: 'text' | 'json'; appliedHeader?: string; previouslyApplied?: Record<string, string>; provider?: string } = {},
+  opts: { format?: 'text' | 'json'; appliedHeader?: string; previouslyApplied?: Record<string, string>; appliedFixes?: AppliedFix[]; provider?: string } = {},
 ): Promise<void> {
   const format = opts.format ?? 'text'
   if (projects.length === 0 && format === 'text') {
@@ -3497,12 +3522,12 @@ export async function runOptimize(
   const callCount = projects.reduce((s, p) => s + p.totalApiCalls, 0)
 
   if (format === 'json') {
-    console.log(JSON.stringify(buildOptimizeJsonReport(projects, periodLabel, result, dateRange), null, 2))
+    console.log(JSON.stringify(buildOptimizeJsonReport(projects, periodLabel, result, dateRange, opts.appliedFixes), null, 2))
     return
   }
 
   const { topReworkedFiles, coachingNotes } = buildWorkflowReport(projects)
-  const output = renderOptimize(findings, costRate, periodLabel, periodCost, sessions.length, callCount, healthScore, healthGrade, topReworkedFiles, coachingNotes, opts.appliedHeader, opts.previouslyApplied, result.modelRecommendations)
+  const output = renderOptimize(findings, costRate, periodLabel, periodCost, sessions.length, callCount, healthScore, healthGrade, topReworkedFiles, coachingNotes, opts.appliedHeader, opts.previouslyApplied, result.modelRecommendations, opts.appliedFixes)
   console.log(output)
 }
 
@@ -3511,6 +3536,7 @@ export function buildOptimizeJsonReport(
   periodLabel: string,
   result: OptimizeResult,
   dateRange?: DateRange,
+  appliedFixes: AppliedFix[] = [],
 ): OptimizeJsonReport {
   const sessions = projects.flatMap(p => p.sessions)
   const periodCostUSD = projects.reduce((s, p) => s + p.totalCostUSD, 0)
@@ -3557,5 +3583,15 @@ export function buildOptimizeJsonReport(
     })),
     ...buildWorkflowReport(projects),
     modelRecommendations: result.modelRecommendations,
+    appliedFixes: appliedFixes.map(f => ({
+      id: f.id,
+      kind: f.kind,
+      findingId: f.findingId,
+      appliedAt: f.appliedAt,
+      verdict: f.verdict,
+      estimatedTokens: f.estimatedTokens,
+      realizedTokens: f.realizedTokens,
+      undoCommand: f.undoCommand,
+    })),
   }
 }

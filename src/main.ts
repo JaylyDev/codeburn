@@ -11,6 +11,7 @@ import { renderStatusBar } from './format.js'
 import { toDateString } from './daily-cache.js'
 import { dateKey } from './day-aggregator.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
+import type { AppliedFix } from './act/types.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
 import { buildPeriodData, buildMenubarPayloadForRange, buildDurablePeriod, type DurablePeriod } from './usage-aggregator.js'
 import { renderDashboard } from './dashboard.js'
@@ -1806,6 +1807,7 @@ program
   .option('--yes', 'With --apply: apply every appliable fix without prompting')
   .option('--dry-run', 'With --apply: print the plan and exit without changing anything')
   .option('--only <ids>', 'With --apply: restrict to a comma-separated list of finding ids')
+  .option('--auto-revert', 'Undo applied fixes that measured no reduction (never CLAUDE.md rules)')
   .action(async (opts) => {
     assertProvider(opts.provider, 'optimize')
     const format = opts.json ? 'json' : opts.format
@@ -1835,24 +1837,31 @@ program
       return
     }
     assertFormat(format, ['text', 'json'], 'optimize')
-    if (format === 'text') {
-      // Surface realized savings from applied actions. Best effort: optimize
-      // must never fail because of journal contents, so any error just drops
-      // the header. computeActReport returns fast without scanning when the
-      // journal has no eligible applied actions, so users who never opted in
-      // see identical output.
-      let appliedHeader: string | undefined
-      let previouslyApplied: Record<string, string> | undefined
-      try {
-        const { computeActReport, buildOptimizeAppliedHeader } = await import('./act/report.js')
-        const applied = await computeActReport()
-        appliedHeader = buildOptimizeAppliedHeader(applied) ?? undefined
-        previouslyApplied = applied.appliedByFinding
-      } catch { /* the header is optional; never block the findings */ }
-      await runOptimize(projects, label, range, { format, appliedHeader, previouslyApplied, provider: opts.provider })
-    } else {
-      await runOptimize(projects, label, range, { format, provider: opts.provider })
-    }
+    // Surface realized savings from applied actions, and re-measure every one
+    // of them. Best effort: optimize must never fail because of journal
+    // contents, so any error just drops the extras. computeActReport returns
+    // fast without scanning when the journal has no applied actions, so users
+    // who never opted in see identical output.
+    let appliedHeader: string | undefined
+    let previouslyApplied: Record<string, string> | undefined
+    let appliedFixes: AppliedFix[] | undefined
+    try {
+      const { computeActReport, buildOptimizeAppliedHeader, autoRevertNoEffect } = await import('./act/report.js')
+      const applied = await computeActReport()
+      appliedHeader = buildOptimizeAppliedHeader(applied) ?? undefined
+      previouslyApplied = applied.appliedByFinding
+      appliedFixes = applied.appliedFixes
+      if (opts.autoRevert) {
+        const { lines, revertedIds } = await autoRevertNoEffect(appliedFixes)
+        appliedFixes = appliedFixes.filter(f => !revertedIds.has(f.id))
+        // JSON output must stay parseable, so the revert log goes to stderr there.
+        for (const line of lines) {
+          if (format === 'json') process.stderr.write(`  ${line}\n`)
+          else console.log(`  ${line}`)
+        }
+      }
+    } catch { /* the applied section is optional; never block the findings */ }
+    await runOptimize(projects, label, range, { format, appliedHeader, previouslyApplied, appliedFixes, provider: opts.provider })
   })
 
 program
