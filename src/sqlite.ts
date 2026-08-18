@@ -1,4 +1,9 @@
 import { createRequire } from 'node:module'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
+import { join } from 'node:path'
+
+import { getCodeburnCacheDir } from './cache-dir.js'
 
 /// Thin SQLite read-only wrapper over Node's built-in `node:sqlite` module (stable in
 /// Node 24, experimental in Node 22 / 23). Replaces the earlier `better-sqlite3` binding
@@ -14,11 +19,13 @@ export type SqliteDatabase = {
   close(): void
 }
 
-type DatabaseSyncCtor = new (path: string, options?: { readOnly?: boolean }) => {
+type DatabaseSyncInstance = {
   prepare(sql: string): { all(...params: unknown[]): Row[] }
   exec?(sql: string): void
   close(): void
 }
+
+type DatabaseSyncCtor = new (path: string, options?: { readOnly?: boolean }) => DatabaseSyncInstance
 
 let DatabaseSync: DatabaseSyncCtor | null = null
 let loadAttempted = false
@@ -116,12 +123,219 @@ export function isSqliteBusyError(err: unknown): boolean {
   )
 }
 
+/// SQLite reports SQLITE_READONLY_DIRECTORY as ERR_SQLITE_ERROR with an extended
+/// result code on the Node 22 builds CodeBurn supports. Keep the base-code check
+/// so this also covers SQLITE_READONLY and its other extended variants, while
+/// leaving ENOENT/SQLITE_CANTOPEN distinguishable to callers.
+export function isSqliteReadonlyError(err: unknown): boolean {
+  const e = err as { code?: unknown; errcode?: unknown; errstr?: unknown; message?: unknown } | null
+  const code = typeof e?.code === 'string' ? e.code : ''
+  const errcode = typeof e?.errcode === 'number' ? e.errcode : null
+  const message = [
+    typeof e?.message === 'string' ? e.message : '',
+    typeof e?.errstr === 'string' ? e.errstr : '',
+  ].join(' ')
+
+  return (
+    (errcode !== null && (errcode & 0xff) === 8) ||
+    /SQLITE_READONLY|attempt to write a readonly database|readonly database|read-only database/i.test(`${code} ${message}`)
+  )
+}
+
+type DatabaseFingerprint = {
+  dev: number
+  ino: number
+  mtimeMs: number
+  sizeBytes: number
+}
+
+type CachedDatabaseMetadata = {
+  version: number
+  sourcePath: string
+  fingerprint: DatabaseFingerprint
+}
+
+const SQLITE_CACHE_VERSION = 1
+const warnedReadonlyDatabases = new Set<string>()
+
+/// A read-only SQLite connection can still need sidecar files. This notice is
+/// intentionally once per source path: a provider may discover many sessions
+/// from the same database, and the fallback is already doing the useful work.
+export function warnSqliteReadonlyOnce(path: string): void {
+  if (warnedReadonlyDatabases.has(path)) return
+  warnedReadonlyDatabases.add(path)
+  process.stderr.write(
+    `codeburn: SQLite database ${path} is in a read-only directory and needs sidecar files; using a cache copy when necessary. ` +
+    'The original database is not modified.\n',
+  )
+}
+
+function errorCode(err: unknown): string | undefined {
+  if (typeof err !== 'object' || err === null || !('code' in err)) return undefined
+  const code = err.code
+  return typeof code === 'string' ? code : undefined
+}
+
+/// This deliberately mirrors fingerprintSqliteFile/fingerprintFile in
+/// session-cache.ts. openDatabase is synchronous, so the fallback uses the
+/// synchronous fs APIs only after the direct open has already failed; the
+/// ordinary successful open remains probe-free.
+function fingerprintDatabase(path: string): DatabaseFingerprint {
+  const main = statSync(path)
+  let wal: ReturnType<typeof statSync> | null = null
+  try {
+    wal = statSync(path + '-wal')
+  } catch (err) {
+    if (errorCode(err) !== 'ENOENT') throw err
+  }
+  return {
+    dev: main.dev,
+    ino: main.ino,
+    mtimeMs: wal ? Math.max(main.mtimeMs, wal.mtimeMs) : main.mtimeMs,
+    sizeBytes: main.size + (wal?.size ?? 0),
+  }
+}
+
+function sameFingerprint(a: DatabaseFingerprint, b: DatabaseFingerprint): boolean {
+  return (
+    a.dev === b.dev &&
+    a.ino === b.ino &&
+    a.mtimeMs === b.mtimeMs &&
+    a.sizeBytes === b.sizeBytes
+  )
+}
+
+function isDatabaseFingerprint(value: unknown): value is DatabaseFingerprint {
+  if (typeof value !== 'object' || value === null) return false
+  const candidate = value as Partial<DatabaseFingerprint>
+  return (
+    typeof candidate.dev === 'number' &&
+    typeof candidate.ino === 'number' &&
+    typeof candidate.mtimeMs === 'number' &&
+    typeof candidate.sizeBytes === 'number'
+  )
+}
+
+function readCachedMetadata(path: string): CachedDatabaseMetadata | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'))
+    if (typeof parsed !== 'object' || parsed === null) return null
+    const candidate = parsed as { version?: unknown; sourcePath?: unknown; fingerprint?: unknown }
+    if (
+      candidate.version !== SQLITE_CACHE_VERSION ||
+      typeof candidate.sourcePath !== 'string' ||
+      !isDatabaseFingerprint(candidate.fingerprint)
+    ) return null
+    return { version: SQLITE_CACHE_VERSION, sourcePath: candidate.sourcePath, fingerprint: candidate.fingerprint }
+  } catch {
+    return null
+  }
+}
+
+function unlinkIfPresent(path: string): void {
+  try {
+    unlinkSync(path)
+  } catch (err) {
+    if (errorCode(err) !== 'ENOENT') throw err
+  }
+}
+
+function copyOptionalFile(sourcePath: string, destinationPath: string): boolean {
+  try {
+    copyFileSync(sourcePath, destinationPath)
+    return true
+  } catch (err) {
+    if (errorCode(err) === 'ENOENT') return false
+    throw err
+  }
+}
+
+function readOnlyCachePath(sourcePath: string, fingerprint: DatabaseFingerprint): string {
+  const cacheDir = join(getCodeburnCacheDir(), 'sqlite-ro')
+  mkdirSync(cacheDir, { recursive: true, mode: 0o700 })
+
+  const sourceKey = createHash('sha256').update(sourcePath, 'utf8').digest('hex')
+  const cachePath = join(cacheDir, `${sourceKey}.db`)
+  const metadataPath = `${cachePath}.json`
+  const cached = readCachedMetadata(metadataPath)
+  if (
+    existsSync(cachePath) &&
+    cached?.sourcePath === sourcePath &&
+    sameFingerprint(cached.fingerprint, fingerprint)
+  ) {
+    return cachePath
+  }
+
+  const tempBase = `${cachePath}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`
+  const tempWal = tempBase + '-wal'
+  const tempShm = tempBase + '-shm'
+  const tempMetadata = `${metadataPath}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`
+
+  try {
+    copyFileSync(sourcePath, tempBase)
+    const copiedWal = copyOptionalFile(sourcePath + '-wal', tempWal)
+    const copiedShm = copyOptionalFile(sourcePath + '-shm', tempShm)
+
+    // Do not publish a cache made from a moving database. A live WAL writer will
+    // normally make the direct open succeed once its sidecars exist; this check
+    // covers the narrow race where the source changes during the copy fallback.
+    if (!sameFingerprint(fingerprintDatabase(sourcePath), fingerprint)) {
+      throw new Error('SQLite database changed while preparing its read-only cache copy')
+    }
+
+    unlinkIfPresent(cachePath)
+    unlinkIfPresent(cachePath + '-wal')
+    unlinkIfPresent(cachePath + '-shm')
+    renameSync(tempBase, cachePath)
+    if (copiedWal) renameSync(tempWal, cachePath + '-wal')
+    if (copiedShm) renameSync(tempShm, cachePath + '-shm')
+
+    const metadata: { version: number; sourcePath: string; fingerprint: DatabaseFingerprint } = {
+      version: SQLITE_CACHE_VERSION,
+      sourcePath,
+      fingerprint,
+    }
+    writeFileSync(tempMetadata, JSON.stringify(metadata), { encoding: 'utf8', mode: 0o600 })
+    renameSync(tempMetadata, metadataPath)
+    return cachePath
+  } finally {
+    unlinkIfPresent(tempBase)
+    unlinkIfPresent(tempWal)
+    unlinkIfPresent(tempShm)
+    unlinkIfPresent(tempMetadata)
+  }
+}
+
+function openReadonlyCache(path: string, originalError: unknown): DatabaseSyncInstance {
+  let fingerprint: DatabaseFingerprint
+  try {
+    fingerprint = fingerprintDatabase(path)
+  } catch {
+    // Preserve the original SQLite error when the source disappeared or became
+    // inaccessible between the failed query and the fallback probe.
+    throw originalError
+  }
+  const cachedPath = readOnlyCachePath(path, fingerprint)
+  const Driver = DatabaseSync
+  if (Driver === null) throw new Error(getSqliteLoadError())
+  return new Driver(cachedPath, { readOnly: true })
+}
+
 export function openDatabase(path: string): SqliteDatabase {
   if (!loadDriver() || DatabaseSync === null) {
     throw new Error(getSqliteLoadError())
   }
 
-  const db = new DatabaseSync(path, { readOnly: true })
+  let db: DatabaseSyncInstance
+  let fallbackUsed = false
+  try {
+    db = new DatabaseSync(path, { readOnly: true })
+  } catch (err) {
+    if (!isSqliteReadonlyError(err)) throw err
+    fallbackUsed = true
+    warnSqliteReadonlyOnce(path)
+    db = openReadonlyCache(path, err)
+  }
   try {
     db.exec?.('PRAGMA busy_timeout = 1000')
   } catch {
@@ -130,7 +344,26 @@ export function openDatabase(path: string): SqliteDatabase {
 
   return {
     query<T extends Row = Row>(sql: string, params: unknown[] = []): T[] {
-      return db.prepare(sql).all(...params) as T[]
+      try {
+        return db.prepare(sql).all(...params) as T[]
+      } catch (err) {
+        if (!isSqliteReadonlyError(err)) throw err
+        if (fallbackUsed) throw err
+        fallbackUsed = true
+        warnSqliteReadonlyOnce(path)
+        try {
+          db.close()
+        } catch {
+          // The failed connection may already have been closed by node:sqlite.
+        }
+        db = openReadonlyCache(path, err)
+        try {
+          db.exec?.('PRAGMA busy_timeout = 1000')
+        } catch {
+          // Best effort, matching the direct-open path above.
+        }
+        return db.prepare(sql).all(...params) as T[]
+      }
     },
     close() {
       db.close()

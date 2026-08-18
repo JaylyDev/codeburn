@@ -5,7 +5,16 @@ import { homedir } from 'os'
 import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import { readCachedResults, writeCachedResults } from '../cursor-cache.js'
-import { isSqliteAvailable, isSqliteBusyError, getSqliteLoadError, openDatabase, blobToText, type SqliteDatabase } from '../sqlite.js'
+import {
+  isSqliteAvailable,
+  isSqliteBusyError,
+  getSqliteLoadError,
+  openDatabase,
+  blobToText,
+  isSqliteReadonlyError,
+  warnSqliteReadonlyOnce,
+  type SqliteDatabase,
+} from '../sqlite.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { DateRange } from '../types.js'
 import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
@@ -188,7 +197,8 @@ function loadWorkspaceMap(workspaceStorageDir: string): WorkspaceMapping {
     let db: SqliteDatabase
     try {
       db = openDatabase(wsDbPath)
-    } catch {
+    } catch (err) {
+      if (isSqliteReadonlyError(err)) warnSqliteReadonlyOnce(wsDbPath)
       continue
     }
     try {
