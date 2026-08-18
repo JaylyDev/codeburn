@@ -3271,8 +3271,9 @@ async function parseProviderSources(
     }
   }
 
-  // 90-day age-out for durable providers: remove entries whose newest call is
-  // older than 90 days so the cache doesn't grow unboundedly over time.
+  // 90-day age-out for durable providers: prune only orphaned entries whose
+  // newest call is older than 90 days. Still-discovered sources remain live
+  // regardless of age and keep their persisted fingerprint for reuse.
   if (!readOnly && provider.durableSources) {
     const cutoffMs = Date.now() - 90 * 24 * 60 * 60 * 1000
     for (const [cachedPath, cachedFile] of Object.entries(section.files)) {
@@ -3281,7 +3282,7 @@ async function parseProviderSources(
         .map(c => new Date(c.timestamp).getTime())
         .filter(ts => !isNaN(ts))
         .reduce((max, ts) => Math.max(max, ts), 0)
-      if (newestTs > 0 && newestTs < cutoffMs) {
+      if (!allDiscoveredFiles.has(cachedPath) && newestTs > 0 && newestTs < cutoffMs) {
         delete section.files[cachedPath]
         markCacheDirty(diskCache, providerName, cachedPath)
       }
