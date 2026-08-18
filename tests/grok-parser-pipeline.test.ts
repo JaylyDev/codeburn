@@ -5,6 +5,19 @@ import { join } from 'path'
 import { calculateCost } from '../src/models.js'
 import { clearSessionCache, parseAllSessions } from '../src/parser.js'
 
+// `chooseAuthoritativeModel` branches on whether a modelUsage id resolves to a
+// price, so pin the reporter's real id from #998 as unpriced here rather than
+// letting the bundled LiteLLM snapshot decide it: xAI pricing landing upstream
+// would otherwise silently flip these assertions. Only this lookup is stubbed,
+// so `calculateCost` still prices off the real tables.
+vi.mock('../src/models.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/models.js')>()
+  return {
+    ...actual,
+    getModelCosts: (model: string) => (model === 'grok-4.6-build' ? null : actual.getModelCosts(model)),
+  }
+})
+
 // The exported Grok provider resolves GROK_HOME when its singleton is created,
 // before the test body runs. Set the root during module hoisting, then re-assert
 // the call-time cache/env values in beforeEach after env-isolation runs.
