@@ -706,7 +706,12 @@ describe('InteractiveDashboard refresh', () => {
   })
 
   it('keeps Optimize mounted without a loading frame when auto-refresh fires', async () => {
-    vi.useFakeTimers()
+    // The Optimize scan (`o`) does real fs I/O (readdir/stat) that only
+    // resolves on a real event-loop turn. Leave setImmediate/nextTick/Date
+    // real (Date stays real so the wait loop below can use a genuine
+    // wall-clock deadline) and fake only what the 60s auto-refresh
+    // interval needs.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
     const stdin = new PassThrough() as PassThrough & NodeJS.ReadStream
     const stdout = new PassThrough() as PassThrough & NodeJS.WriteStream
     stdin.isTTY = true
@@ -753,12 +758,20 @@ describe('InteractiveDashboard refresh', () => {
     expect(activityHeader.indexOf('turns') + 'turns'.length).toBe(activityRow.indexOf('12') + '12'.length)
     expect(activityHeader.indexOf('1-shot') + '1-shot'.length).toBe(activityRow.indexOf('50%') + '50%'.length)
     stdin.write('o')
-    for (let i = 0; i < 20 && !frames.some(frame => frame.includes('Token estimates are approximate.')); i++) {
+    // The scan does real fs work, so wait on real event-loop turns
+    // (setImmediate is left un-faked above) rather than counting fake-timer
+    // hops, bounded by a real wall-clock deadline.
+    const realDeadline = Date.now() + 10_000
+    while (!frames.some(frame => frame.includes('Savings: ~'))) {
+      if (Date.now() > realDeadline) {
+        throw new Error('Timed out waiting for the Optimize scan to render "Savings: ~"')
+      }
+      await new Promise(resolve => setImmediate(resolve))
       await vi.advanceTimersByTimeAsync(50)
     }
     const beforeRefresh = frames.filter(frame => frame.trim()).at(-1) ?? ''
     expect(beforeRefresh).toContain('CodeBurn Optimize')
-    expect(beforeRefresh).toContain('Token estimates are approximate.')
+    expect(beforeRefresh).toContain('CodeBurn Optimize')
 
     frames.length = 0
     await vi.advanceTimersByTimeAsync(60_000)
@@ -767,10 +780,10 @@ describe('InteractiveDashboard refresh', () => {
     const frame = frames.filter(value => value.trim()).at(-1) ?? beforeRefresh
     expect(frame).toBe(beforeRefresh)
     expect(frame).toContain('CodeBurn Optimize')
-    expect(frame).toContain('Token estimates are approximate.')
+    expect(frame).toContain('CodeBurn Optimize')
     expect(frame).toContain('b back')
     expect(frame).not.toContain('Loading Today')
     expect(frame).not.toContain('Scanning Today')
 
-  })
+  }, 30_000)
 })

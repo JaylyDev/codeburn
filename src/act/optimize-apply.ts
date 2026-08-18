@@ -7,12 +7,17 @@ import { formatCost } from '../currency.js'
 import { formatTokens } from '../format.js'
 import { runAction } from './apply.js'
 import { shortId } from './journal.js'
+import { REPORT_MIN_AGE_DAYS } from './types.js'
 import { planFindings, type FindingPlan, type PlanContext } from './plans.js'
 
 export type ApplyOptions = {
   yes?: boolean
   dryRun?: boolean
   only?: string
+  // Mirrors `optimize --provider`. The scan below only reads Claude
+  // transcripts, and this path does not just report findings, it plans and
+  // applies them - a Codex-scoped run must never offer to edit ~/.claude.
+  provider?: string
   actionsDir?: string
   ctx?: PlanContext
   // Test seams: crafted findings skip the session scan; streams default to
@@ -135,7 +140,7 @@ export async function runOptimizeApply(
   let costRate = opts.costRate ?? 0
   if (!findings) {
     errout.write(chalk.dim('  Analyzing your sessions...\n'))
-    const scanned = await scanAndDetect(projects, dateRange)
+    const scanned = await scanAndDetect(projects, dateRange, opts.provider)
     findings = scanned.findings
     costRate = scanned.costRate
   }
@@ -205,9 +210,11 @@ export async function runOptimizeApply(
   } catch { /* baseline is optional; apply proceeds without it */ }
 
   print()
+  let applied = 0
   for (const fp of selected) {
     try {
       const record = await runAction(fp.plan!, opts.actionsDir)
+      applied++
       print(`  Applied ${chalk.bold(shortId(record.id))}  ${record.description}`)
       print(chalk.dim(`    Undo anytime: codeburn act undo ${shortId(record.id)}`))
       const manualLines = manualActionLines(fp)
@@ -219,6 +226,9 @@ export async function runOptimizeApply(
       errout.write(chalk.red(`  Failed to apply ${fp.finding.id}: ${e instanceof Error ? e.message : String(e)}`) + '\n')
       process.exitCode = 1
     }
+  }
+  if (applied > 0) {
+    print(chalk.dim(`  CodeBurn will re-measure these on your next optimize run after ${REPORT_MIN_AGE_DAYS} days.`))
   }
   print()
 }

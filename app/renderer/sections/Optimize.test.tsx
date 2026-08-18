@@ -48,23 +48,31 @@ function makeOptimizeReport(): OptimizeJsonReport {
       healthScore: 72, healthGrade: 'C', findingCount: 3, periodCostUSD: 612.48,
       sessions: 88, calls: 1220, potentialSavingsTokens: 184_000,
       potentialSavingsCostUSD: 94.4, potentialSavingsPercent: 15.4, costRateUSD: 0.0005,
+      measuredSavingsUSD: 27.8,
+      byClass: {
+        fix: { tokensSaved: 18_200, savingsUSD: 9.1, count: 1 },
+        nudge: { tokensSaved: 17_400, savingsUSD: 8.7, count: 1 },
+        keep: { tokensSaved: 4_800, savingsUSD: 2.4, count: 1 },
+      },
     },
     findings: [
       {
-        id: 'cost-outliers', title: 'Opus is doing your small talk',
+        id: 'unused-mcp', title: 'Opus is doing your small talk',
         explanation: 'Small conversational requests are running on an expensive model.',
         severity: 'high', trend: 'active', tokensSaved: 18_200, estimatedSavingsUSD: 9.1,
+        class: 'fix', basis: 'estimated',
         fix: { type: 'paste', label: 'Paste into CLAUDE.md', text: 'Use Sonnet for routine questions.', destination: 'claude-md' },
       },
       {
-        id: 'context-heavy-sessions', title: 'Cache hit is low in agentseal-dash',
+        id: 'cost-outliers', title: 'Cache hit is low in agentseal-dash',
         explanation: 'Repeated context is not being served from cache.', severity: 'medium',
-        trend: null, tokensSaved: 17_400, estimatedSavingsUSD: 8.7,
+        trend: null, tokensSaved: 17_400, estimatedSavingsUSD: 8.7, class: 'nudge', basis: 'measured',
         fix: { type: 'command', label: 'Run this command', text: 'codeburn cache inspect' },
       },
       {
-        id: 'warmup-heavy', title: 'Batch tiny requests', explanation: 'Many short sessions repeat setup work.',
+        id: 'context-heavy-sessions', title: 'Batch tiny requests', explanation: 'Many short sessions repeat setup work.',
         severity: 'low', trend: 'improving', tokensSaved: 4_800, estimatedSavingsUSD: 2.4,
+        class: 'keep', basis: 'measured',
         fix: { type: 'file-content', label: 'Create configuration', path: '~/.codeburn/config.json', content: '{"batch":true}' },
       },
     ],
@@ -121,6 +129,46 @@ describe('Optimize', () => {
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
   })
 
+  it('lists applied fixes with a glyph per verdict and the undo hint', async () => {
+    const report = makeOptimizeReport()
+    report.appliedFixes = [
+      { id: 'a1', kind: 'archive-skill', findingId: 'unused-skills', appliedAt: '2026-07-06T00:00:00.000Z', verdict: 'worked', estimatedTokens: 300_000, realizedTokens: 280_000, undoCommand: 'codeburn act undo a1' },
+      { id: 'b2', kind: 'defer-threshold', findingId: 'mcp-defer-threshold', appliedAt: '2026-07-07T00:00:00.000Z', verdict: 'partial', estimatedTokens: 600_000, realizedTokens: 420_000, undoCommand: 'codeburn act undo b2' },
+      { id: 'c3', kind: 'shell-config', findingId: 'bash-output-cap', appliedAt: '2026-07-05T00:00:00.000Z', verdict: 'no-effect', estimatedTokens: 41_000, realizedTokens: 0, undoCommand: 'codeburn act undo c3' },
+      { id: 'd4', kind: 'mcp-remove', findingId: null, appliedAt: '2026-07-09T00:00:00.000Z', verdict: 'pending', estimatedTokens: 0, realizedTokens: 0, undoCommand: 'codeburn act undo d4' },
+    ]
+    getOptimizeReport.mockResolvedValue(report)
+    render(<Optimize period="30days" provider="all" />)
+
+    await screen.findByText('Applied fixes')
+    const rows = [...document.querySelectorAll('.opt-applied-row')]
+    expect(rows.map(r => r.className.split(' ')[1])).toEqual([
+      'opt-applied-worked', 'opt-applied-partial', 'opt-applied-no-effect', 'opt-applied-pending',
+    ])
+    expect(rows[0]!.textContent).toContain('unused-skills')
+    expect(rows[0]!.textContent).toContain('est. 300K \u2192 280K')
+    expect(rows[3]!.textContent).toContain('mcp-remove')
+    expect(screen.getByText('codeburn act undo c3')).toBeTruthy()
+  })
+
+  it('omits the applied-fixes list when nothing is applied', async () => {
+    render(<Optimize period="30days" provider="all" />)
+    await screen.findByText('Opus is doing your small talk')
+    expect(document.querySelector('.opt-applied')).toBeNull()
+  })
+
+  it('groups Waste findings under the fix / habits / FYI headers in order', async () => {
+    render(<Optimize period="30days" provider="all" />)
+
+    await screen.findByText('Opus is doing your small talk')
+    const groups = document.querySelectorAll('.opt-group')
+    expect([...groups].map(g => g.textContent)).toEqual([
+      'Fix now (apply-able) · 18.2K tokens · $9.10 · 1 finding',
+      'Habits · 17.4K tokens · $8.70 · 1 finding',
+      'FYI · 4.8K tokens · $2.40 · 1 finding',
+    ])
+  })
+
   it('renders tabs and actionable Waste findings with impact, savings, explanation, and copy-paste fix', async () => {
     render(<Optimize period="30days" provider="all" />)
 
@@ -130,7 +178,7 @@ describe('Optimize', () => {
     expect(screen.getByText('Medium')).toHaveClass('opt-impact-medium')
     expect(screen.getByText('Low')).toHaveClass('opt-impact-low')
     expect(screen.getByText('$9.10')).toHaveClass('opt-finding-savings')
-    expect(screen.getByText('18.2K tokens')).toBeInTheDocument()
+    expect(screen.getByText('18.2K tokens · estimated')).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: 'Waste $94.40' })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: 'Reverts $107.00' })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: 'Abandoned $65.40' })).toBeInTheDocument()

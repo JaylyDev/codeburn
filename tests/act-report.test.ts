@@ -5,6 +5,7 @@ import { join } from 'node:path'
 
 import { journalPath } from '../src/act/journal.js'
 import {
+  autoRevertNoEffect,
   buildActReportJson,
   buildOptimizeAppliedHeader,
   captureBaseline,
@@ -12,6 +13,7 @@ import {
   computeActReport,
   renderActReport,
 } from '../src/act/report.js'
+import { formatAppliedFix, REPORT_MIN_AGE_DAYS } from '../src/act/types.js'
 import type { ActionRecord } from '../src/act/types.js'
 import type { FindingPlan } from '../src/act/plans.js'
 import type { WasteFinding } from '../src/optimize.js'
@@ -929,5 +931,131 @@ describe('partial-action baseline capture', () => {
     })
 
     expect(plan.plan?.baseline).toBeUndefined()
+  })
+})
+
+describe('applied-fix verdicts', () => {
+  const fixOf = async (records: ActionRecord[], projects: ProjectSummary[]) => {
+    const actionsDir = await writeJournal(records)
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load(projects) })
+    return { report, fixes: report.appliedFixes, actionsDir }
+  }
+
+  it('calls a fix that realized its whole window estimate "worked"', async () => {
+    const { fixes } = await fixOf([mcpRecord()], [projectOf(sessionsAt(20, daysAgo(5)))])
+    expect(fixes).toHaveLength(1)
+    expect(fixes[0]!.verdict).toBe('worked')
+    expect(fixes[0]!.estimatedTokens).toBe(40_000)
+    expect(fixes[0]!.realizedTokens).toBe(40_000)
+    expect(fixes[0]!.undoCommand).toBe('codeburn act undo a1')
+  })
+
+  it('holds the worked/partial boundary at the 70% ratio', async () => {
+    const rec = mcpRecord({ kind: 'mcp-project-scope' })
+    // 14 of 20 sessions saved = exactly 70% of the window estimate.
+    const at70 = await fixOf(
+      [rec],
+      [projectOf([...sessionsAt(14, daysAgo(5)), ...sessionsAt(6, daysAgo(4), { mcpInventory: ['mcp__brave-search__search'] })])],
+    )
+    expect(at70.fixes[0]!.verdict).toBe('worked')
+
+    const below = await fixOf(
+      [rec],
+      [projectOf([...sessionsAt(13, daysAgo(5)), ...sessionsAt(7, daysAgo(4), { mcpInventory: ['mcp__brave-search__search'] })])],
+    )
+    expect(below.fixes[0]!.verdict).toBe('partial')
+    expect(formatAppliedFix(below.fixes[0]!)).toContain('-35% vs estimate')
+  })
+
+  it('calls a fix that realized nothing "no-effect" and offers the undo', async () => {
+    const rec = mcpRecord({ kind: 'mcp-project-scope' })
+    const stillLoading = sessionsAt(20, daysAgo(5), { mcpInventory: ['mcp__brave-search__search'] })
+    const { fixes } = await fixOf([rec], [projectOf(stillLoading)])
+    expect(fixes[0]!.verdict).toBe('no-effect')
+    expect(fixes[0]!.realizedTokens).toBe(0)
+    expect(formatAppliedFix(fixes[0]!)).toContain('did not help. Revert: codeburn act undo a1')
+  })
+
+  it('treats an estimate of zero as worked only when something was realized', async () => {
+    const zeroEstimate = { windowDays: 14, capturedAt: daysAgo(10), estimatedTokens: 0, sessions: 0, metrics: {} }
+    const { fixes } = await fixOf(
+      [mcpRecord({ baseline: { ...zeroEstimate, metrics: { 'brave-search': 2000 } } })],
+      [projectOf(sessionsAt(20, daysAgo(5)))],
+    )
+    expect(fixes[0]!.estimatedTokens).toBe(40_000)
+    expect(fixes[0]!.verdict).toBe('worked')
+  })
+
+  it('leaves entries younger than the measurement window pending', async () => {
+    const { fixes } = await fixOf([mcpRecord({ at: daysAgo(1) })], [projectOf(sessionsAt(20, daysAgo(1)))])
+    expect(fixes[0]!.verdict).toBe('pending')
+    expect(formatAppliedFix(fixes[0]!)).toBe(`unused-mcp (1d ago): measuring, check back after ${REPORT_MIN_AGE_DAYS} days`)
+  })
+
+  it('keeps a user-reverted entry out of the verdicts and carries its note', async () => {
+    const back = sessionsAt(20, daysAgo(5), { mcpInventory: ['mcp__brave-search__search'] })
+    const { fixes } = await fixOf([mcpRecord()], [projectOf(back)])
+    expect(fixes[0]!.verdict).toBe('pending')
+    expect(fixes[0]!.note).toMatch(/reverted by user/)
+  })
+
+  it('drops undone journal entries entirely', async () => {
+    const rec = mcpRecord()
+    const { fixes } = await fixOf(
+      [rec, { ...rec, status: 'undone', undoneAt: daysAgo(2) }],
+      [projectOf(sessionsAt(20, daysAgo(5)))],
+    )
+    expect(fixes).toHaveLength(0)
+  })
+
+  it('never judges a correlation-only kind, so --auto-revert can never touch it', async () => {
+    const { fixes } = await fixOf([modelDefaultRecord()], [modelProject('app', '/tmp/app', 'candidate-model', 20, 19)])
+    expect(fixes[0]!.verdict).toBe('pending')
+  })
+})
+
+describe('autoRevertNoEffect', () => {
+  const noEffect = (over: Partial<ActionRecord> = {}) => ({
+    ...mcpRecord({ kind: 'mcp-project-scope', ...over }),
+  })
+
+  it('undoes the no-effect entries and leaves the rest alone', async () => {
+    const worked = noEffect({ id: 'keep1', findingId: 'kept' })
+    const actionsDir = await writeJournal([noEffect(), worked])
+    const stillLoading = sessionsAt(20, daysAgo(5), { mcpInventory: ['mcp__brave-search__search'] })
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(stillLoading)]) })
+    // Both are no-effect here; pin that only the ones we hand over get undone.
+    const target = report.appliedFixes.filter(f => f.id === 'a1')
+    const { lines, revertedIds } = await autoRevertNoEffect(target, { actionsDir })
+
+    expect([...revertedIds]).toEqual(['a1'])
+    expect(lines).toEqual(['Reverted a1: Remove an MCP server from config'])
+    const after = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(stillLoading)]) })
+    expect(after.appliedFixes.map(f => f.id)).toEqual(['keep1'])
+  })
+
+  it('never auto-reverts a CLAUDE.md rule, it prints the undo command instead', async () => {
+    const rec = mcpRecord({
+      id: 'cm1',
+      kind: 'claude-md-rule',
+      findingId: 'read-edit-ratio',
+      baseline: { windowDays: 14, capturedAt: daysAgo(10), estimatedTokens: 10_000, sessions: 20, metrics: { reads: 10, edits: 10 } },
+    })
+    const actionsDir = await writeJournal([rec])
+    const sessions = sessionsAt(20, daysAgo(5), { toolBreakdown: { Edit: { calls: 10, tokens: 0 }, Read: { calls: 10, tokens: 0 } } as never })
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(sessions)]) })
+
+    expect(report.appliedFixes[0]!.verdict).toBe('no-effect')
+    const { lines, revertedIds } = await autoRevertNoEffect(report.appliedFixes, { actionsDir })
+    expect(revertedIds.size).toBe(0)
+    expect(lines).toEqual(['Not auto-reverted: read-edit-ratio edits a CLAUDE.md. Revert: codeburn act undo cm1'])
+  })
+
+  it('ignores partial and pending entries', async () => {
+    const actionsDir = await writeJournal([mcpRecord({ at: daysAgo(1) })])
+    const report = await computeActReport({ actionsDir, now: NOW, loadProjects: load([projectOf(sessionsAt(20, daysAgo(1)))]) })
+    const { lines, revertedIds } = await autoRevertNoEffect(report.appliedFixes, { actionsDir })
+    expect(lines).toEqual([])
+    expect(revertedIds.size).toBe(0)
   })
 })

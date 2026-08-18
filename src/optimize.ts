@@ -1,5 +1,7 @@
 import chalk from 'chalk'
+import stripAnsi from 'strip-ansi'
 import { isReadShapedBashCommand } from './bash-utils.js'
+import { createHash } from 'crypto'
 import { readdir, stat } from 'fs/promises'
 import { existsSync, statSync } from 'fs'
 import { basename, join } from 'path'
@@ -12,6 +14,7 @@ import type { DateRange, ProjectSummary, SessionSummary } from './types.js'
 import { formatCost } from './currency.js'
 import { formatTokens } from './format.js'
 import { recommendModelDefault, type ModelDefaultRecommendation } from './act/model-defaults.js'
+import { appliedFixGlyph, formatAppliedFix, type AppliedFix } from './act/types.js'
 import { aggregateFileChurn, buildCoachingNotes, scanUserCorrections, medianTimeToFirstEditMs, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 
 // ============================================================================
@@ -168,6 +171,17 @@ const DEFER_THRESHOLD_DEFAULT_PERCENT = 10
 const DEFER_THRESHOLD_MAX_PERCENT = 100
 const DEFER_THRESHOLD_MIN_TOKENS_PER_SESSION = 5_000
 const DEFER_THRESHOLD_MEDIUM_IMPACT_TOKENS = 200_000
+// "recurring-context": the same block opening session after session. 1.5 KB
+// is roughly 400 tokens at BASH_TOKENS_PER_CHAR — below that a repeated
+// opener costs too little to be worth a habit change, and five sessions is
+// where "I keep pasting this" stops looking like coincidence.
+const RECURRING_CONTEXT_MIN_CHARS = 1_500
+const RECURRING_CONTEXT_MIN_SESSIONS = 5
+const RECURRING_CONTEXT_NORMALIZE_SLACK = 4
+const RECURRING_CONTEXT_PREVIEW = 3
+const RECURRING_CONTEXT_PREVIEW_CHARS = 80
+const RECURRING_CONTEXT_MEDIUM_IMPACT_TOKENS = 50_000
+const RECURRING_CONTEXT_HIGH_IMPACT_TOKENS = 200_000
 
 // ============================================================================
 // Scoring constants
@@ -264,6 +278,146 @@ export type FindingId =
   | 'unused-agents'
   | 'unused-skills'
   | 'unused-commands'
+  | 'recurring-context'
+
+/// How a finding is meant to be acted on:
+/// - `fix`   CodeBurn can write the change itself (`codeburn optimize --apply`)
+/// - `nudge` behavioural, the user changes a habit
+/// - `keep`  informational; the cost may well be justified
+export type FindingClass = 'fix' | 'nudge' | 'keep'
+
+/// Where a finding's `tokensSaved` number comes from:
+/// - `measured`  summed from provider-counted usage on the parsed calls
+/// - `estimated` a schema/heuristic model (per-tool sizes, recovery fractions)
+/// A detector that mixes the two counts as `estimated`.
+export type FindingBasis = 'measured' | 'estimated'
+
+/// Static class per finding id. `fix` entries are exactly the ids `buildPlan`
+/// (src/act/plans.ts) routes to a plan builder; tests assert the two lists
+/// stay equal. Instances that lack the payload their builder needs fall back
+/// to `nudge` via `findingClass`.
+export const FINDING_CLASS: Record<FindingId, FindingClass> = {
+  'read-edit-ratio': 'fix',          // CLAUDE.md rule block
+  'build-folder-reads': 'fix',       // CLAUDE.md rule block
+  'redundant-rereads': 'nudge',
+  'warmup-heavy': 'nudge',
+  'unused-mcp': 'fix',
+  'mcp-low-coverage': 'fix',
+  'mcp-project-scope': 'fix',
+  'mcp-deferral-off': 'fix',
+  'mcp-alwaysload-hygiene': 'fix',
+  'mcp-defer-threshold': 'fix',
+  'retry-heavy-capabilities': 'nudge',
+  'low-worth-sessions': 'nudge',
+  'context-heavy-sessions': 'keep',  // context-heavy work is often load-bearing
+  'cost-outliers': 'nudge',
+  'claude-md-too-long': 'nudge',     // trimming is a judgement call, not a rule block
+  'bash-output-cap': 'fix',
+  'unused-agents': 'fix',
+  'unused-skills': 'fix',
+  'unused-commands': 'fix',
+  'recurring-context': 'nudge',
+}
+
+/// Ids whose plan is built from the `apply` payload: without it the plan
+/// builder returns null, so the finding is only a nudge.
+const CLASS_NEEDS_APPLY: ReadonlySet<FindingId> = new Set<FindingId>([
+  'unused-mcp',
+  'mcp-low-coverage',
+  'mcp-project-scope',
+  'mcp-deferral-off',
+  'mcp-alwaysload-hygiene',
+  'mcp-defer-threshold',
+  'unused-agents',
+  'unused-skills',
+  'unused-commands',
+])
+
+/// Static basis per finding id. Only the two session-level detectors sum
+/// provider-counted tokens end to end; everything else multiplies a modelled
+/// per-unit size or a recovery fraction.
+export const FINDING_BASIS: Record<FindingId, FindingBasis> = {
+  'read-edit-ratio': 'estimated',          // reads x AVG_TOKENS_PER_READ
+  'build-folder-reads': 'estimated',       // reads x AVG_TOKENS_PER_READ
+  'redundant-rereads': 'estimated',        // reads x AVG_TOKENS_PER_READ
+  'warmup-heavy': 'estimated',             // observed median minus a modelled baseline
+  'unused-mcp': 'estimated',               // tools x TOKENS_PER_MCP_TOOL x sessions
+  'mcp-low-coverage': 'estimated',         // schema-size model, only capped by observed cache tokens
+  'mcp-project-scope': 'estimated',        // same schema-size model
+  'mcp-deferral-off': 'estimated',         // schema-size model x affected sessions
+  'mcp-alwaysload-hygiene': 'estimated',   // tools x TOKENS_PER_MCP_TOOL x loaded sessions
+  'mcp-defer-threshold': 'estimated',      // definition-size model x sessions
+  'retry-heavy-capabilities': 'estimated', // real turn tokens x recovery fraction
+  'low-worth-sessions': 'estimated',       // real session tokens x recovery fraction
+  'context-heavy-sessions': 'measured',    // counted input/cache tokens above the target ratio
+  'cost-outliers': 'measured',             // counted session tokens above the peer average
+  'claude-md-too-long': 'estimated',       // lines x CLAUDEMD_TOKENS_PER_LINE
+  'bash-output-cap': 'estimated',          // chars x BASH_TOKENS_PER_CHAR
+  'unused-agents': 'estimated',            // count x TOKENS_PER_AGENT_DEF
+  'unused-skills': 'estimated',            // count x TOKENS_PER_SKILL_DEF
+  'unused-commands': 'estimated',          // count x TOKENS_PER_COMMAND_DEF
+  // Provider usage is per API call: the first turn's input tokens mix the
+  // system prompt, tool schemas and CLAUDE.md in with the pasted block, so
+  // nothing counted isolates the block. Its size is modelled from its bytes.
+  'recurring-context': 'estimated',        // block chars x BASH_TOKENS_PER_CHAR x repeats
+}
+
+/// Scope label for a setting that lives in ~/.zshrc / ~/.bashrc. The MCP
+/// deferral plans (defer-enable, defer-threshold) refuse to rewrite an
+/// override found there and report it instead; bash-output-cap does append
+/// its own marker block to the shell rc.
+export const SHELL_PROFILE_SCOPE = 'shell profile'
+
+export function findingClass(f: WasteFinding): FindingClass {
+  const base = FINDING_CLASS[f.id]
+  if (base !== 'fix') return base
+  if (CLASS_NEEDS_APPLY.has(f.id) && !f.apply) return 'nudge'
+  const apply = f.apply
+  if ((apply?.kind === 'defer-enable' || apply?.kind === 'defer-threshold') && apply.settingScope === SHELL_PROFILE_SCOPE) {
+    return 'nudge'
+  }
+  // Of the deferral causes only these two have a plan; the rest are manual
+  // advice (Vertex policy, an outdated Claude Code, an unverified proxy).
+  if (apply?.kind === 'defer-enable' && apply.cause !== 'env-false' && apply.cause !== 'proxy-verified') return 'nudge'
+  return 'fix'
+}
+
+export function findingBasis(f: WasteFinding): FindingBasis {
+  return f.basis ?? FINDING_BASIS[f.id]
+}
+
+const CLASS_ORDER: Record<FindingClass, number> = { fix: 0, nudge: 1, keep: 2 }
+
+export const CLASS_HEADERS: Record<FindingClass, string> = {
+  fix: 'Fix now (apply-able)',
+  nudge: 'Habits',
+  keep: 'FYI',
+}
+
+export type ClassTotals = { tokensSaved: number; savingsUSD: number; count: number }
+
+export function classTotals(findings: WasteFinding[], costRate: number): Record<FindingClass, ClassTotals> {
+  const totals: Record<FindingClass, ClassTotals> = {
+    fix: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+    nudge: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+    keep: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+  }
+  for (const f of findings) {
+    const t = totals[findingClass(f)]
+    t.tokensSaved += f.tokensSaved
+    t.savingsUSD += f.tokensSaved * costRate
+    t.count++
+  }
+  return totals
+}
+
+/// Group header with its own subtotal, shared by the CLI and the TUI so the
+/// two never drift apart.
+export function classHeaderLine(cls: FindingClass, totals: ClassTotals, costRate: number): string {
+  const cost = costRate > 0 ? ` (~${formatCost(totals.savingsUSD)})` : ''
+  const suffix = cls === 'fix' ? ' — codeburn optimize --apply' : ''
+  return `${CLASS_HEADERS[cls]} · ~${formatTokens(totals.tokensSaved)} tokens${cost} · ${totals.count} finding${totals.count === 1 ? '' : 's'}${suffix}`
+}
 
 // Cause taxonomy for defer-enable plans (mcp-deferral-off findings).
 // 'proxy-verified' is never produced by the detector today: it is reserved
@@ -316,6 +470,9 @@ export type WasteFinding = {
   fix: WasteAction
   trend?: Trend
   apply?: FindingApply
+  /// Set only when a detector's basis varies per run (see detectSessionOutliers);
+  /// otherwise `FINDING_BASIS[id]` applies. Read through `findingBasis`.
+  basis?: FindingBasis
 }
 
 export type OptimizeResult = {
@@ -343,6 +500,12 @@ export type OptimizeJsonReport = {
     potentialSavingsCostUSD: number
     potentialSavingsPercent: number | null
     costRateUSD: number
+    /// Portion of `potentialSavingsCostUSD` coming from `measured`-basis
+    /// findings. The total keeps its old meaning: measured plus estimated.
+    measuredSavingsUSD: number
+    /// Per-class subtotals; the three counts and token sums add up to
+    /// `findingCount` and `potentialSavingsTokens`.
+    byClass: Record<FindingClass, ClassTotals>
   }
   findings: Array<{
     id: FindingId
@@ -352,6 +515,8 @@ export type OptimizeJsonReport = {
     trend: Trend | null
     tokensSaved: number
     estimatedSavingsUSD: number
+    class: FindingClass
+    basis: FindingBasis
     fix: WasteAction
   }>
   /// Files most reworked by edit-family calls, relative to project root (top 15).
@@ -359,6 +524,8 @@ export type OptimizeJsonReport = {
   /// 1-3 templated one-liners keyed on the strongest workflow signals.
   coachingNotes: string[]
   modelRecommendations?: Array<ModelDefaultRecommendation>
+  /// One entry per still-applied fix, re-measured on every run (see act/report.ts).
+  appliedFixes: Array<Omit<AppliedFix, 'ageDays' | 'note'>>
 }
 
 export type ToolCall = {
@@ -375,11 +542,22 @@ export type ApiCallMeta = {
   recent?: boolean
 }
 
+/// One session's opening paste. `hash` groups sessions that open with the
+/// same block; `chars` is the block's length, a floor for a block long
+/// enough that the parser capped its text.
+export type SessionOpener = {
+  hash: string
+  chars: number
+  project: string
+  preview: string
+}
+
 type ScanData = {
   toolCalls: ToolCall[]
   projectCwds: Set<string>
   apiCalls: ApiCallMeta[]
   userMessages: string[]
+  openers: SessionOpener[]
 }
 
 // ============================================================================
@@ -466,6 +644,53 @@ type ScanFileResult = {
   cwds: string[]
   apiCalls: ApiCallMeta[]
   userMessages: string[]
+  openers: SessionOpener[]
+}
+
+/// Whitespace-insensitive so the same block reflowed by a different paste
+/// still groups, and ANSI-free so terminal output pasted twice matches.
+function normalizeOpener(text: string): string {
+  return stripAnsi(text).replace(/\s+/g, ' ').trim()
+}
+
+const MACHINE_PROMPT_HEAD_BYTES = 2048
+const MACHINE_PROMPT_PATTERN = /"promptSource"\s*:\s*"sdk"|"isSidechain"\s*:\s*true/
+
+/// True when a program wrote this prompt rather than a person pasting it: an
+/// SDK caller, or a parent agent writing a subagent's task. Either repeats by
+/// design and has no home in CLAUDE.md. A user entry over the parser's
+/// large-line threshold — routine for generated prompts — comes back without
+/// its root flags, so those are read off the raw line instead: the ends of it,
+/// since the fields sit either side of the message that made the line large.
+function isMachineWrittenPrompt(entry: Record<string, unknown>, line: string | Buffer): boolean {
+  if (entry['promptSource'] === 'sdk' || entry['isSidechain'] === true) return true
+  const edge = (start: number, end: number): string =>
+    typeof line === 'string' ? line.slice(start, end) : line.subarray(start, end).toString('utf-8')
+  const head = edge(0, MACHINE_PROMPT_HEAD_BYTES)
+  const tail = edge(Math.max(MACHINE_PROMPT_HEAD_BYTES, line.length - MACHINE_PROMPT_HEAD_BYTES), line.length)
+  return MACHINE_PROMPT_PATTERN.test(head) || MACHINE_PROMPT_PATTERN.test(tail)
+}
+
+/// A session's opening block, or null when it is too small to matter or is
+/// not a paste at all: system reminders carry CLAUDE.md and hook output,
+/// slash command wrappers refer to a file that already exists. `chars` is a
+/// floor: the parser caps the text of a very large user entry, so a huge
+/// block is sized at that cap rather than its true length.
+function toSessionOpener(text: string, project: string): SessionOpener | null {
+  if (text.length < RECURRING_CONTEXT_MIN_CHARS) return null
+  const head = text.trimStart()
+  if (head.startsWith('<system-reminder>') || head.startsWith('<command-name>') || head.startsWith('<command-message>')) return null
+  // Normalizing before the cap is what lets a re-flowed paste hash the same;
+  // the pre-slice keeps the work per session bounded however long the block
+  // is, with slack for whitespace that expands under re-flow.
+  const normalized = normalizeOpener(text.slice(0, OPTIMIZE_TEXT_CAP * RECURRING_CONTEXT_NORMALIZE_SLACK))
+    .slice(0, OPTIMIZE_TEXT_CAP)
+  return {
+    hash: createHash('sha1').update(normalized).digest('hex'),
+    chars: text.length,
+    project,
+    preview: normalized.slice(0, RECURRING_CONTEXT_PREVIEW_CHARS),
+  }
 }
 
 function inRange(timestamp: string | undefined, range: DateRange | undefined): boolean {
@@ -490,8 +715,12 @@ export async function scanJsonlFile(
   const cwds: string[] = []
   const apiCalls: ApiCallMeta[] = []
   const userMessages: string[] = []
+  const openers: SessionOpener[] = []
   const sessionId = basename(filePath, '.jsonl')
   let lastVersion = ''
+  // The opening block is the first user message carrying text; anything
+  // later in the session is not what the user opens with.
+  let sawUserText = false
 
   const skipThreshold = dateRange
     ? new Date(dateRange.start.getTime() - 86_400_000).toISOString()
@@ -521,6 +750,11 @@ export async function scanJsonlFile(
       const msgContent = msg?.content
       if (typeof msgContent === 'string') {
         userMessages.push(msgContent.slice(0, OPTIMIZE_TEXT_CAP))
+        if (!sawUserText) {
+          sawUserText = true
+          const opener = isMachineWrittenPrompt(entry, line) ? null : toSessionOpener(msgContent, project)
+          if (opener) openers.push(opener)
+        }
       } else if (Array.isArray(msgContent)) {
         let remaining = OPTIMIZE_TEXT_CAP
         for (const block of msgContent) {
@@ -529,6 +763,11 @@ export async function scanJsonlFile(
             const text = block.text.slice(0, remaining)
             userMessages.push(text)
             remaining -= text.length
+            if (!sawUserText) {
+              sawUserText = true
+              const opener = isMachineWrittenPrompt(entry, line) ? null : toSessionOpener(block.text, project)
+              if (opener) openers.push(opener)
+            }
           }
         }
       }
@@ -561,15 +800,27 @@ export async function scanJsonlFile(
     }
   }
 
-  return { calls, cwds, apiCalls, userMessages }
+  return { calls, cwds, apiCalls, userMessages, openers }
 }
 
-async function scanSessions(dateRange?: DateRange): Promise<ScanData> {
+// The session scan reads Claude Code transcripts only, so a `--provider` that
+// excludes Claude leaves nothing for it to do. Callers must also skip the
+// detectors it feeds (see `claudeOnly` in scanAndDetect) — the empty scan
+// returned here is an absence of measurement, not a measurement of absence.
+export function providerCoversClaude(provider?: string): boolean {
+  return !provider || provider === 'all' || provider === 'claude'
+}
+
+async function scanSessions(dateRange?: DateRange, provider?: string): Promise<ScanData> {
+  if (!providerCoversClaude(provider)) {
+    return { toolCalls: [], projectCwds: new Set(), apiCalls: [], userMessages: [], openers: [] }
+  }
   const sources = await discoverAllSessions('claude')
   const allCalls: ToolCall[] = []
   const allCwds = new Set<string>()
   const allApiCalls: ApiCallMeta[] = []
   const allUserMessages: string[] = []
+  const allOpeners: SessionOpener[] = []
 
   const tasks: Array<{ file: string; project: string }> = []
   for (const source of sources) {
@@ -581,14 +832,15 @@ async function scanSessions(dateRange?: DateRange): Promise<ScanData> {
   }
 
   await runWithConcurrency(tasks, FILE_READ_CONCURRENCY, async ({ file, project }) => {
-    const { calls, cwds, apiCalls, userMessages } = await scanJsonlFile(file, project, dateRange)
+    const { calls, cwds, apiCalls, userMessages, openers } = await scanJsonlFile(file, project, dateRange)
     allCalls.push(...calls)
     for (const cwd of cwds) allCwds.add(cwd)
     allApiCalls.push(...apiCalls)
     allUserMessages.push(...userMessages)
+    allOpeners.push(...openers)
   })
 
-  return { toolCalls: allCalls, projectCwds: allCwds, apiCalls: allApiCalls, userMessages: allUserMessages }
+  return { toolCalls: allCalls, projectCwds: allCwds, apiCalls: allApiCalls, userMessages: allUserMessages, openers: allOpeners }
 }
 
 // ============================================================================
@@ -1811,7 +2063,7 @@ export function findDeferralEnvSetting(
     const content = readSessionFileSync(path)
     if (content === null) continue
     const match = content.match(linePattern)
-    if (match) return { value: match[1]!, scope: 'shell profile', path }
+    if (match) return { value: match[1]!, scope: SHELL_PROFILE_SCOPE, path }
   }
   return null
 }
@@ -2583,6 +2835,60 @@ export function detectBashBloat(): WasteFinding | null {
   }
 }
 
+/// The same long block opening many sessions: a spec, a repo dump, a standing
+/// brief. Every repeat is input tokens for context that could live in
+/// CLAUDE.md or in a file read on demand. The first paste is the honest cost
+/// of saying it once, so only the repeats count as savings.
+export function detectRecurringContext(openers: SessionOpener[]): WasteFinding | null {
+  type Group = { sessions: number; chars: number; preview: string; projects: Set<string> }
+  const groups = new Map<string, Group>()
+  for (const o of openers) {
+    const g = groups.get(o.hash)
+    if (!g) {
+      groups.set(o.hash, { sessions: 1, chars: o.chars, preview: o.preview, projects: new Set([o.project]) })
+      continue
+    }
+    g.sessions++
+    // Only the hashed prefix is known to match, so size the block by the
+    // smallest occurrence rather than claiming the longest.
+    g.chars = Math.min(g.chars, o.chars)
+    g.projects.add(o.project)
+  }
+
+  const repeated = [...groups.values()]
+    .filter(g => g.sessions >= RECURRING_CONTEXT_MIN_SESSIONS)
+    .map(g => ({ ...g, tokens: Math.round((g.sessions - 1) * g.chars * BASH_TOKENS_PER_CHAR) }))
+    .sort((a, b) => b.tokens - a.tokens)
+  if (repeated.length === 0) return null
+
+  const tokensSaved = repeated.reduce((sum, g) => sum + g.tokens, 0)
+  const top = repeated[0]
+  const preview = repeated.slice(0, RECURRING_CONTEXT_PREVIEW)
+  const list = preview
+    .map(g => {
+      const where = g.projects.size === 1
+        ? [...g.projects][0].split('-').filter(Boolean).pop() ?? [...g.projects][0]
+        : `${g.projects.size} projects`
+      return `"${g.preview}..." — ${g.sessions} sessions in ${where}, ~${formatTokens(g.tokens)} tokens`
+    })
+    .join('; ')
+  const extra = repeated.length > preview.length ? `; +${repeated.length - preview.length} more` : ''
+
+  return {
+    id: 'recurring-context',
+    title: `Same ${(top.chars / 1024).toFixed(1)} KB block pasted at the start of ${top.sessions} sessions`,
+    explanation: `These sessions open with a block you have pasted before, so you pay input tokens for the same context every time: ${list}${extra}. Standing rules belong in CLAUDE.md; reference material belongs in a file Claude reads on demand. Only the repeats are counted, not the first paste.`,
+    impact: tokensSaved >= RECURRING_CONTEXT_HIGH_IMPACT_TOKENS ? 'high' : tokensSaved >= RECURRING_CONTEXT_MEDIUM_IMPACT_TOKENS ? 'medium' : 'low',
+    tokensSaved,
+    fix: {
+      type: 'paste',
+      destination: 'prompt',
+      label: 'Ask Claude to give this block a permanent home:',
+      text: `I open many sessions by pasting this block:\n"${top.preview}..."\nMove it into CLAUDE.md if it is a standing rule, or into a file you read on demand if it is reference material, then tell me the one-line pointer to start sessions with instead.`,
+    },
+  }
+}
+
 function sessionTokenTotal(session: ProjectSummary['sessions'][number]): number {
   return session.totalInputTokens
     + session.totalOutputTokens
@@ -2909,9 +3215,17 @@ export function detectSessionOutliers(projects: ProjectSummary[], excludedSessio
   }
 
   const outliers: Outlier[] = []
+  // Modelled costs (Kiro, Cursor, some Cline sessions) are not comparable
+  // against provider-reported ones, so they leave the peer math. Providers
+  // that only ever estimate would lose the finding entirely, so those fall
+  // back to the full set and the finding reports itself as estimated.
+  let usedEstimatedCosts = false
 
   for (const project of projects) {
-    const sessions = project.sessions.filter(s => s.totalCostUSD > 0)
+    const costed = project.sessions.filter(s => s.totalCostUSD > 0)
+    const exact = costed.filter(s => (s.totalEstimatedCostUSD ?? 0) === 0)
+    const sessions = exact.length >= MIN_SESSIONS_FOR_OUTLIER ? exact : costed
+    const fellBack = sessions.length > exact.length
     if (sessions.length < MIN_SESSIONS_FOR_OUTLIER) continue
 
     const totalCost = sessions.reduce((sum, s) => sum + s.totalCostUSD, 0)
@@ -2930,6 +3244,7 @@ export function detectSessionOutliers(projects: ProjectSummary[], excludedSessio
       // "tighter constraint" advice here.
       if (excludedSessionIds?.has(session.sessionId)) continue
 
+      if (fellBack) usedEstimatedCosts = true
       outliers.push({
         project: project.project,
         sessionId: session.sessionId,
@@ -2959,6 +3274,7 @@ export function detectSessionOutliers(projects: ProjectSummary[], excludedSessio
     explanation: `Sessions costing more than ${SESSION_OUTLIER_MULTIPLIER}x their peer-session average in the same project: ${list}${extra}. These usually come from broad prompts, runaway loops, or context-heavy work that should be split into smaller sessions.`,
     impact: outliers.length >= 3 || totalExcessCost >= 10 ? 'high' : 'medium',
     tokensSaved,
+    ...(usedEstimatedCosts ? { basis: 'estimated' as const } : {}),
     fix: {
       type: 'paste',
       destination: 'session-opener',
@@ -3083,7 +3399,7 @@ export function computeInputCostRate(projects: ProjectSummary[]): number {
 type CacheEntry = { data: OptimizeResult; ts: number }
 const resultCache = new Map<string, CacheEntry>()
 
-export function cacheKey(projects: ProjectSummary[], dateRange: DateRange | undefined): string {
+export function cacheKey(projects: ProjectSummary[], dateRange: DateRange | undefined, provider?: string): string {
   const dr = dateRange ? `${dateRange.start.getTime()}-${dateRange.end.getTime()}` : 'all'
   // Fingerprint enough of the dataset that two materially different inputs
   // cannot collide onto one cached OptimizeResult. Project count + api-call
@@ -3100,23 +3416,27 @@ export function cacheKey(projects: ProjectSummary[], dateRange: DateRange | unde
   }
   // Costs scaled to whole micro-dollars so float jitter cannot thrash the key.
   const fingerprint = `${projects.length}:${calls}:${Math.round(cost * 1e6)}:${Math.round(savings * 1e6)}:${Math.round(proxied * 1e6)}`
-  return `${dr}:${fingerprint}`
+  // The provider decides whether the Claude session scan runs at all, so two
+  // filters that happen to share a project fingerprint must not share a result.
+  return `${provider ?? 'all'}:${dr}:${fingerprint}`
 }
 
 export async function scanAndDetect(
   projects: ProjectSummary[],
   dateRange?: DateRange,
+  provider?: string,
 ): Promise<OptimizeResult> {
   if (projects.length === 0) {
     return { findings: [], costRate: 0, healthScore: 100, healthGrade: 'A', modelRecommendations: [] }
   }
 
-  const key = cacheKey(projects, dateRange)
+  const key = cacheKey(projects, dateRange, provider)
   const cached = resultCache.get(key)
   if (cached && Date.now() - cached.ts < RESULT_CACHE_TTL_MS) return cached.data
 
   const costRate = computeInputCostRate(projects)
-  const { toolCalls, projectCwds, apiCalls, userMessages } = await scanSessions(dateRange)
+  const scanCoversClaude = providerCoversClaude(provider)
+  const { toolCalls, projectCwds, apiCalls, userMessages, openers } = await scanSessions(dateRange, provider)
   const mcpCoverage = aggregateMcpCoverage(projects)
 
   const findings: WasteFinding[] = []
@@ -3131,38 +3451,51 @@ export async function scanAndDetect(
   )
   const firstSessionIds = findYoungProjectFirstSessionIds(projects)
   const outlierExclusions = new Set([...lowWorthSessionIds, ...contextBloatVisibleIds, ...firstSessionIds])
+  // Detectors fed by the session scan or by `~/.claude` config only mean
+  // anything when the run covers Claude. Under a different `--provider` they
+  // must be skipped rather than handed an empty scan: emptiness reads as
+  // "never invoked", so every skill, agent and command would be reported as
+  // unused when it was simply not measured.
+  const claudeOnly = (detect: () => WasteFinding | null): (() => WasteFinding | null) =>
+    scanCoversClaude ? detect : () => null
   const syncDetectors: Array<() => WasteFinding | null> = [
-    () => detectCacheBloat(apiCalls, projects, dateRange),
-    () => detectLowReadEditRatio(toolCalls),
-    () => detectJunkReads(toolCalls, dateRange),
-    () => detectDuplicateReads(toolCalls, dateRange),
-    () => detectUnusedMcp(toolCalls, projects, projectCwds, mcpCoverage),
+    claudeOnly(() => detectCacheBloat(apiCalls, projects, dateRange)),
+    claudeOnly(() => detectLowReadEditRatio(toolCalls)),
+    claudeOnly(() => detectJunkReads(toolCalls, dateRange)),
+    claudeOnly(() => detectDuplicateReads(toolCalls, dateRange)),
+    claudeOnly(() => detectUnusedMcp(toolCalls, projects, projectCwds, mcpCoverage)),
     () => detectMcpToolCoverage(projects, mcpCoverage),
     () => detectMcpProfileAdvisor(projects, mcpCoverage),
     // mcp-deferral-gaps family (#614): detection only, no apply plans yet.
-    () => detectMcpDeferralOff(toolCalls, projects, projectCwds, apiCalls),
-    () => detectMcpAlwaysLoadHygiene(projects, projectCwds, apiCalls, mcpCoverage),
-    () => detectMcpDeferThreshold(projects, projectCwds),
+    claudeOnly(() => detectMcpDeferralOff(toolCalls, projects, projectCwds, apiCalls)),
+    claudeOnly(() => detectMcpAlwaysLoadHygiene(projects, projectCwds, apiCalls, mcpCoverage)),
+    claudeOnly(() => detectMcpDeferThreshold(projects, projectCwds)),
     () => detectCapabilityReliability(projects),
     () => detectLowWorthSessions(projects),
     () => detectContextBloat(projects, lowWorthSessionIds),
     () => detectSessionOutliers(projects, outlierExclusions),
-    () => detectBloatedClaudeMd(projectCwds),
-    () => detectBashBloat(),
+    claudeOnly(() => detectBloatedClaudeMd(projectCwds)),
+    claudeOnly(() => detectBashBloat()),
+    claudeOnly(() => detectRecurringContext(openers)),
   ]
   for (const detect of syncDetectors) {
     const finding = detect()
     if (finding) findings.push(finding)
   }
 
-  const ghostResults = await Promise.all([
-    detectGhostAgents(toolCalls),
-    detectGhostSkills(toolCalls),
-    detectGhostCommands(userMessages),
-  ])
+  const ghostResults = scanCoversClaude
+    ? await Promise.all([
+      detectGhostAgents(toolCalls),
+      detectGhostSkills(toolCalls),
+      detectGhostCommands(userMessages),
+    ])
+    : []
   for (const f of ghostResults) if (f) findings.push(f)
 
+  // Urgency first, then class: every surface lists the apply-able fixes
+  // before the habit nudges, and orders by urgency inside each group.
   findings.sort((a, b) => urgencyScore(b) - urgencyScore(a))
+  findings.sort((a, b) => CLASS_ORDER[findingClass(a)] - CLASS_ORDER[findingClass(b)])
   const { score, grade } = computeHealth(findings)
   
   const modelRecommendations: ModelDefaultRecommendation[] = []
@@ -3247,7 +3580,7 @@ function renderFinding(n: number, f: WasteFinding, costRate: number): string[] {
   lines.push('')
   lines.push(wrap(f.explanation, PANEL_WIDTH - 4, '  '))
   lines.push('')
-  lines.push(chalk.hex(GOLD)(`  Potential savings: ${savings}`))
+  lines.push(chalk.hex(GOLD)(`  Potential savings: ${savings}`) + chalk.dim(`  ${findingBasis(f)}`))
   lines.push('')
 
   // Destination header — issue #277. Tells the user where each suggestion
@@ -3290,7 +3623,26 @@ function renderWorkflowSection(reworkedFiles: ReworkedFile[], coachingNotes: str
   return lines
 }
 
-function renderOptimize(
+const APPLIED_FIX_COLORS: Record<AppliedFix['verdict'], string> = {
+  worked: GREEN,
+  partial: GOLD,
+  'no-effect': RED,
+  pending: DIM,
+}
+
+// Closes the loop after --apply: every still-applied fix gets its measured
+// verdict back here, on every run.
+function renderAppliedFixes(appliedFixes: AppliedFix[]): string[] {
+  if (appliedFixes.length === 0) return []
+  const lines = [chalk.bold.hex(ORANGE)('  Applied fixes'), '']
+  for (const fix of appliedFixes) {
+    lines.push(chalk.hex(APPLIED_FIX_COLORS[fix.verdict])(`  ${appliedFixGlyph(fix)} ${formatAppliedFix(fix)}`))
+  }
+  lines.push('')
+  return lines
+}
+
+export function renderOptimize(
   findings: WasteFinding[],
   costRate: number,
   periodLabel: string,
@@ -3304,6 +3656,7 @@ function renderOptimize(
   appliedHeader?: string,
   previouslyApplied?: Record<string, string>,
   modelRecommendations?: ModelDefaultRecommendation[],
+  appliedFixes: AppliedFix[] = [],
 ): string {
   const lines: string[] = []
   lines.push('')
@@ -3311,12 +3664,16 @@ function renderOptimize(
   lines.push(chalk.hex(DIM)('  ' + SEP.repeat(PANEL_WIDTH)))
 
   const issueSuffix = findings.length > 0 ? `, ${findings.length} issue${findings.length > 1 ? 's' : ''}` : ''
+  const measured = findings.filter(f => findingBasis(f) === 'measured').length
   lines.push('  ' + [
     `${sessionCount} sessions`,
     `${callCount.toLocaleString()} calls`,
     chalk.hex(GOLD)(formatCost(periodCost)),
     `Health: ${chalk.bold.hex(GRADE_COLORS[healthGrade])(healthGrade)}${chalk.dim(` (${healthScore}/100${issueSuffix})`)}`,
   ].join(chalk.hex(DIM)('   ')))
+  if (findings.length > 0) {
+    lines.push(chalk.dim(`  ${measured} measured · ${findings.length - measured} estimated`))
+  }
   if (appliedHeader) lines.push('  ' + chalk.hex(GREEN)(appliedHeader))
   lines.push('')
 
@@ -3327,6 +3684,7 @@ function renderOptimize(
     lines.push(chalk.dim('  token waste: junk directory reads, duplicate file reads, unused'))
     lines.push(chalk.dim('  agents/skills/MCP servers, bloated CLAUDE.md, and more.'))
     lines.push('')
+    lines.push(...renderAppliedFixes(appliedFixes))
     lines.push(...renderWorkflowSection(reworkedFiles, coachingNotes))
     return lines.join('\n')
   }
@@ -3336,21 +3694,33 @@ function renderOptimize(
   const pctRaw = periodCost > 0 ? (totalCost / periodCost) * 100 : 0
   const pct = pctRaw >= 1 ? pctRaw.toFixed(0) : pctRaw.toFixed(1)
 
+  const totals = classTotals(findings, costRate)
   const costText = costRate > 0 ? ` (~${formatCost(totalCost)}, ~${pct}% of spend)` : ''
-  lines.push(chalk.hex(GREEN)(`  Potential savings: ~${formatTokens(totalTokens)} tokens${costText}`))
+  // The headline is the whole board; name the apply-able slice separately so
+  // it never reads as "what CodeBurn can fix for you".
+  const applyable = costRate > 0 && totals.fix.count > 0 ? ` — apply-able: ~${formatCost(totals.fix.savingsUSD)}` : ''
+  lines.push(chalk.hex(GREEN)(`  Potential savings: ~${formatTokens(totalTokens)} tokens${costText}${applyable}`))
   lines.push('')
 
-  for (let i = 0; i < findings.length; i++) {
-    const f = findings[i]!
-    const appliedOn = previouslyApplied?.[f.id]
-    const shown = appliedOn ? { ...f, title: `${f.title} (previously applied ${appliedOn}, re-flagged)` } : f
-    lines.push(...renderFinding(i + 1, shown, costRate))
+  // One block per class, in fix -> nudge -> keep order; numbering runs
+  // continuously across the blocks so `--only` picks stay unambiguous.
+  let n = 0
+  for (const cls of ['fix', 'nudge', 'keep'] as const) {
+    const group = findings.filter(f => findingClass(f) === cls)
+    if (group.length === 0) continue
+    lines.push(chalk.bold.hex(ORANGE)(`  ${classHeaderLine(cls, totals[cls], costRate)}`))
+    lines.push('')
+    for (const f of group) {
+      const appliedOn = previouslyApplied?.[f.id]
+      const shown = appliedOn ? { ...f, title: `${f.title} (previously applied ${appliedOn}, re-flagged)` } : f
+      lines.push(...renderFinding(++n, shown, costRate))
+    }
   }
 
   lines.push(chalk.hex(DIM)('  ' + SEP.repeat(PANEL_WIDTH)))
-  lines.push(chalk.dim('  Estimates only.'))
   lines.push('')
 
+  lines.push(...renderAppliedFixes(appliedFixes))
   lines.push(...renderWorkflowSection(reworkedFiles, coachingNotes))
 
   if (modelRecommendations && modelRecommendations.length > 0) {
@@ -3388,7 +3758,7 @@ export async function runOptimize(
   projects: ProjectSummary[],
   periodLabel: string,
   dateRange?: DateRange,
-  opts: { format?: 'text' | 'json'; appliedHeader?: string; previouslyApplied?: Record<string, string> } = {},
+  opts: { format?: 'text' | 'json'; appliedHeader?: string; previouslyApplied?: Record<string, string>; appliedFixes?: AppliedFix[]; provider?: string } = {},
 ): Promise<void> {
   const format = opts.format ?? 'text'
   if (projects.length === 0 && format === 'text') {
@@ -3400,19 +3770,19 @@ export async function runOptimize(
     process.stderr.write(chalk.dim('  Analyzing your sessions...\n'))
   }
 
-  const result = await scanAndDetect(projects, dateRange)
+  const result = await scanAndDetect(projects, dateRange, opts.provider)
   const { findings, costRate, healthScore, healthGrade } = result
   const sessions = projects.flatMap(p => p.sessions)
   const periodCost = projects.reduce((s, p) => s + p.totalCostUSD, 0)
   const callCount = projects.reduce((s, p) => s + p.totalApiCalls, 0)
 
   if (format === 'json') {
-    console.log(JSON.stringify(buildOptimizeJsonReport(projects, periodLabel, result, dateRange), null, 2))
+    console.log(JSON.stringify(buildOptimizeJsonReport(projects, periodLabel, result, dateRange, opts.appliedFixes), null, 2))
     return
   }
 
   const { topReworkedFiles, coachingNotes } = buildWorkflowReport(projects)
-  const output = renderOptimize(findings, costRate, periodLabel, periodCost, sessions.length, callCount, healthScore, healthGrade, topReworkedFiles, coachingNotes, opts.appliedHeader, opts.previouslyApplied, result.modelRecommendations)
+  const output = renderOptimize(findings, costRate, periodLabel, periodCost, sessions.length, callCount, healthScore, healthGrade, topReworkedFiles, coachingNotes, opts.appliedHeader, opts.previouslyApplied, result.modelRecommendations, opts.appliedFixes)
   console.log(output)
 }
 
@@ -3421,6 +3791,7 @@ export function buildOptimizeJsonReport(
   periodLabel: string,
   result: OptimizeResult,
   dateRange?: DateRange,
+  appliedFixes: AppliedFix[] = [],
 ): OptimizeJsonReport {
   const sessions = projects.flatMap(p => p.sessions)
   const periodCostUSD = projects.reduce((s, p) => s + p.totalCostUSD, 0)
@@ -3448,6 +3819,10 @@ export function buildOptimizeJsonReport(
       potentialSavingsCostUSD,
       potentialSavingsPercent,
       costRateUSD: result.costRate,
+      measuredSavingsUSD: result.findings
+        .filter(f => findingBasis(f) === 'measured')
+        .reduce((s, f) => s + f.tokensSaved * result.costRate, 0),
+      byClass: classTotals(result.findings, result.costRate),
     },
     findings: result.findings.map(f => ({
       id: f.id,
@@ -3457,9 +3832,21 @@ export function buildOptimizeJsonReport(
       trend: f.trend ?? null,
       tokensSaved: f.tokensSaved,
       estimatedSavingsUSD: f.tokensSaved * result.costRate,
+      class: findingClass(f),
+      basis: findingBasis(f),
       fix: f.fix,
     })),
     ...buildWorkflowReport(projects),
     modelRecommendations: result.modelRecommendations,
+    appliedFixes: appliedFixes.map(f => ({
+      id: f.id,
+      kind: f.kind,
+      findingId: f.findingId,
+      appliedAt: f.appliedAt,
+      verdict: f.verdict,
+      estimatedTokens: f.estimatedTokens,
+      realizedTokens: f.realizedTokens,
+      undoCommand: f.undoCommand,
+    })),
   }
 }

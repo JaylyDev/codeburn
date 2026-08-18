@@ -13,6 +13,9 @@ import { runAction } from '../src/act/apply.js'
 import { undoAction } from '../src/act/undo.js'
 import { readRecords, shortId } from '../src/act/journal.js'
 import {
+  FINDING_BASIS,
+  FINDING_CLASS,
+  findingClass,
   detectBloatedClaudeMd,
   detectDuplicateReads,
   detectJunkReads,
@@ -668,9 +671,17 @@ describe('runOptimizeApply end-to-end', () => {
       expect(out).toContain(`Applied ${shortId(rec.id)}`)
       expect(out).toContain(`Undo anytime: codeburn act undo ${shortId(rec.id)}`)
     }
+    expect(out).toContain('CodeBurn will re-measure these on your next optimize run after 3 days.')
     expect(JSON.parse(await readFile(join(fx.home, '.claude.json'), 'utf-8')).mcpServers).toEqual({})
     expect(existsSync(join(fx.home, '.claude', 'skills', '.archived', 'foo'))).toBe(true)
     expect(existsSync(join(fx.home, '.zshrc'))).toBe(true)
+  })
+
+  it('does not promise a re-measure when nothing was applied', async () => {
+    const { fx, findings } = await threeFindingFixture()
+    const io = makeIo('q\n')
+    await runOptimizeApply([], undefined, applyOpts(fx, io, { findings }))
+    expect(io.stdout()).not.toContain('re-measure')
   })
 
   it('interactive pick "2" applies only the second plan', async () => {
@@ -889,5 +900,81 @@ describe('stale-plan detection', () => {
     }, fx.actionsDir)
     expect(rec.status).toBe('applied')
     expect(await readFile(p, 'utf-8')).toBe('overwritten')
+  })
+})
+
+describe('finding class', () => {
+  it('covers every finding id with a class and a basis', () => {
+    expect(Object.keys(FINDING_BASIS).sort()).toEqual(Object.keys(FINDING_CLASS).sort())
+  })
+
+  it("classes a finding 'fix' exactly when a plan can be built for it", async () => {
+    const fx = await makeFixture()
+    const claudeJson = join(fx.home, '.claude.json')
+    await writeFile(claudeJson, JSON.stringify({ mcpServers: { srv: { command: 's' } } }, null, 2) + '\n')
+    const settings = join(fx.project, '.claude', 'settings.json')
+    await mkdir(join(fx.project, '.claude'), { recursive: true })
+    await writeFile(settings, JSON.stringify({ env: { ENABLE_TOOL_SEARCH: 'auto' } }, null, 2) + '\n')
+    const mcpJson = join(fx.project, '.mcp.json')
+    await writeFile(mcpJson, JSON.stringify({ mcpServers: { pinned: { command: 'x', alwaysLoad: true } } }, null, 2) + '\n')
+    await mkdir(join(fx.home, '.claude', 'skills', 'ghost'), { recursive: true })
+    await mkdir(join(fx.home, '.claude', 'agents'), { recursive: true })
+    await mkdir(join(fx.home, '.claude', 'commands'), { recursive: true })
+    await writeFile(join(fx.home, '.claude', 'agents', 'ghost.md'), 'x')
+    await writeFile(join(fx.home, '.claude', 'commands', 'ghost.md'), 'x')
+
+    const CLAUDE_MD_FIX: WasteAction = { type: 'paste', destination: 'claude-md', label: '', text: 'rule' }
+    const SHELL_FIX: WasteAction = { type: 'paste', destination: 'shell-config', label: '', text: 'export X=1' }
+    const PROMPT_FIX: WasteAction = { type: 'paste', destination: 'prompt', label: '', text: 'ask' }
+    const OPENER_FIX: WasteAction = { type: 'paste', destination: 'session-opener', label: '', text: 'o' }
+
+    // One representative finding per id, carrying the payload its plan
+    // builder needs. Ids without a builder get a plain prompt fix.
+    const representatives: Record<FindingId, WasteFinding> = {
+      'read-edit-ratio': makeFinding('read-edit-ratio', CLAUDE_MD_FIX),
+      'build-folder-reads': makeFinding('build-folder-reads', CLAUDE_MD_FIX),
+      'redundant-rereads': makeFinding('redundant-rereads', PROMPT_FIX),
+      'warmup-heavy': makeFinding('warmup-heavy', SHELL_FIX),
+      'unused-mcp': makeFinding('unused-mcp', CMD_FIX, { kind: 'mcp-remove', servers: ['srv'] }),
+      'mcp-low-coverage': makeFinding('mcp-low-coverage', CMD_FIX, { kind: 'mcp-remove', servers: ['srv'] }),
+      'mcp-project-scope': makeFinding('mcp-project-scope', PROMPT_FIX, {
+        kind: 'mcp-project-scope',
+        servers: [{ server: 'srv', keepProjects: [fx.project], removeProjects: [] }],
+      }),
+      'mcp-deferral-off': makeFinding('mcp-deferral-off', CMD_FIX, {
+        kind: 'defer-enable', cause: 'env-false', settingPath: settings, settingScope: 'project settings', value: 'false',
+      }),
+      'mcp-alwaysload-hygiene': makeFinding('mcp-alwaysload-hygiene', PROMPT_FIX, {
+        kind: 'defer-alwaysload',
+        servers: [{ server: 'pinned', paths: [mcpJson] }],
+      }),
+      'mcp-defer-threshold': makeFinding('mcp-defer-threshold', PROMPT_FIX, {
+        kind: 'defer-threshold', settingPath: settings, settingScope: 'project settings',
+        value: 'auto', recommendedPercent: 2, removeOverride: false,
+      }),
+      'retry-heavy-capabilities': makeFinding('retry-heavy-capabilities', PROMPT_FIX),
+      'low-worth-sessions': makeFinding('low-worth-sessions', OPENER_FIX),
+      'context-heavy-sessions': makeFinding('context-heavy-sessions', OPENER_FIX),
+      'cost-outliers': makeFinding('cost-outliers', OPENER_FIX),
+      'claude-md-too-long': makeFinding('claude-md-too-long', PROMPT_FIX),
+      'bash-output-cap': makeFinding('bash-output-cap', SHELL_FIX),
+      'unused-agents': makeFinding('unused-agents', CMD_FIX, { kind: 'archive', names: ['ghost'] }),
+      'unused-skills': makeFinding('unused-skills', CMD_FIX, { kind: 'archive', names: ['ghost'] }),
+      'unused-commands': makeFinding('unused-commands', CMD_FIX, { kind: 'archive', names: ['ghost'] }),
+      'recurring-context': makeFinding('recurring-context', PROMPT_FIX),
+    }
+
+    const planCtx: PlanContext = { homeDir: fx.home, cwd: fx.project, shell: '/bin/zsh', claudeVersion: () => '2.1.130' }
+    for (const finding of Object.values(representatives)) {
+      const hasPlan = planFor(finding, planCtx) !== null
+      expect([finding.id, hasPlan]).toEqual([finding.id, findingClass(finding) === 'fix'])
+    }
+  })
+
+  it("drops to 'nudge' when the instance lacks the payload its plan needs", () => {
+    const finding = makeFinding('mcp-deferral-off', { type: 'paste', destination: 'shell-config', label: '', text: 'x' })
+    expect(FINDING_CLASS['mcp-deferral-off']).toBe('fix')
+    expect(findingClass(finding)).toBe('nudge')
+    expect(planFor(finding)).toBeNull()
   })
 })
