@@ -8,6 +8,7 @@ import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
 import { ProxyAgent, fetch as undiciFetch } from 'undici'
 
+import { getCodeburnCacheDir } from './cache-dir.js'
 import {
   buildPersistentCodeburnLookupPath,
   resolvePersistentCodeburnPathFromWhichOutput,
@@ -22,9 +23,11 @@ const EXPECTED_BUNDLE_ID = 'org.agentseal.codeburn-menubar'
 const VERSIONED_ASSET_PATTERN = /^CodeBurnMenubar-v.+\.zip$/
 const APP_PROCESS_NAME = 'CodeBurnMenubar'
 const SUPPORTED_OS = 'darwin'
-/// The Windows tray app (windows/) is released as an .msi under its own tag, so this command
-/// points at it rather than pretending to install anything.
-const WINDOWS_RELEASE_PAGE = 'https://github.com/getagentseal/codeburn/releases?q=windows-v'
+/// The Windows tray app (windows/) ships as an .msi under its own `windows-v*` tag. GitHub
+/// rewrites the spaces in the bundle name to dots when it stores the asset, so both the asset
+/// name and its download URL carry `CodeBurn.Menubar_...`.
+const WINDOWS_PRODUCT_NAME = 'CodeBurn Menubar'
+const WINDOWS_ASSET_PATTERN = /^CodeBurn\.Menubar_.+_x64_en-US\.msi$/
 const MIN_MACOS_MAJOR = 14
 const PERSISTED_CLI_PATH = join(homedir(), 'Library', 'Application Support', 'CodeBurn', 'codeburn-cli-path.v1')
 const PERSISTENT_CLI_REQUIRED_MESSAGE =
@@ -34,8 +37,45 @@ export type InstallResult = { installedPath: string; launched: boolean }
 
 export type ReleaseAsset = { name: string; browser_download_url: string }
 export type ReleaseResponse = { tag_name: string; assets: ReleaseAsset[] }
+/// `zip` is the platform's primary asset: the mac bundle zip, or the Windows .msi.
 export type ResolvedAssets = { release: ReleaseResponse; zip: ReleaseAsset; checksum: ReleaseAsset }
-export type InstallOptions = { force?: boolean; cliVersion?: string }
+export type InstallOptions = {
+  force?: boolean
+  cliVersion?: string
+  platform?: string
+  windows?: WindowsInstallHooks
+}
+
+/// What differs per platform between the mac and Windows installs: which release tag holds the
+/// build, and which asset in it is the installable. Everything downstream - versioned URL first,
+/// release-API scan as fallback, retrying download, checksum verify - is shared.
+export type ReleaseSpec = {
+  tagPrefix: string
+  assetPattern: RegExp
+  assetName: (version: string) => string
+  missingAsset: (tag: string) => string
+  noRelease: string
+}
+
+const MAC_RELEASE: ReleaseSpec = {
+  tagPrefix: 'mac-v',
+  assetPattern: VERSIONED_ASSET_PATTERN,
+  assetName: version => `CodeBurnMenubar-v${version}.zip`,
+  missingAsset: tag =>
+    `No ${APP_BUNDLE_NAME} versioned zip found in release ${tag}. ` +
+    `Check https://github.com/getagentseal/codeburn/releases.`,
+  noRelease: 'No mac-v* release with a CodeBurnMenubar-v*.zip and checksum was found.',
+}
+
+export const WINDOWS_RELEASE: ReleaseSpec = {
+  tagPrefix: 'windows-v',
+  assetPattern: WINDOWS_ASSET_PATTERN,
+  assetName: version => `CodeBurn.Menubar_${version}_x64_en-US.msi`,
+  missingAsset: tag =>
+    `No ${WINDOWS_PRODUCT_NAME} .msi found in release ${tag}. ` +
+    `Check https://github.com/getagentseal/codeburn/releases.`,
+  noRelease: 'No windows-v* release with a CodeBurn.Menubar_*.msi and checksum was found.',
+}
 type ProxyEnv = Partial<Record<'HTTPS_PROXY' | 'https_proxy' | 'HTTP_PROXY' | 'http_proxy' | 'NO_PROXY' | 'no_proxy', string>>
 type FetchOptions = Parameters<typeof undiciFetch>[1]
 type HeaderGetter = { get(name: string): string | null }
@@ -50,6 +90,10 @@ type FetchLikeResponse = {
   text(): Promise<string>
 }
 type FetchImpl = (url: string, options?: FetchOptions) => Promise<FetchLikeResponse>
+/// The release-API lookup reads JSON instead of streaming a body, so it takes its own narrow
+/// response shape rather than widening FetchLikeResponse for every asset download fake.
+export type ReleaseApiFetch = (url: string, options?: FetchOptions) =>
+  Promise<{ ok: boolean; status: number; headers: HeaderGetter; json(): Promise<unknown> }>
 
 /// Release-asset delivery (github.com -> Azure blob) occasionally returns a transient 5xx or
 /// drops the socket. Three attempts with a short exponential backoff (0.5s, then 1s) rides out
@@ -99,14 +143,9 @@ function fetchWithProxy(url: string, options: FetchOptions = {}) {
   return undiciFetch(url, dispatcher ? { ...options, dispatcher } : options)
 }
 
-export function resolveMenubarReleaseAssets(release: ReleaseResponse): ResolvedAssets {
-  const zip = release.assets.find(a => VERSIONED_ASSET_PATTERN.test(a.name))
-  if (!zip) {
-    throw new Error(
-      `No ${APP_BUNDLE_NAME} versioned zip found in release ${release.tag_name}. ` +
-      `Check https://github.com/getagentseal/codeburn/releases.`
-    )
-  }
+export function resolveMenubarReleaseAssets(release: ReleaseResponse, spec: ReleaseSpec = MAC_RELEASE): ResolvedAssets {
+  const zip = release.assets.find(a => spec.assetPattern.test(a.name))
+  if (!zip) throw new Error(spec.missingAsset(release.tag_name))
   const checksum = release.assets.find(a => a.name === `${zip.name}.sha256`)
   if (!checksum) {
     throw new Error(`Missing checksum asset ${zip.name}.sha256 in release ${release.tag_name}.`)
@@ -114,28 +153,28 @@ export function resolveMenubarReleaseAssets(release: ReleaseResponse): ResolvedA
   return { release, zip, checksum }
 }
 
-export function resolveLatestMenubarReleaseAssets(releases: ReleaseResponse[]): ResolvedAssets {
+export function resolveLatestMenubarReleaseAssets(releases: ReleaseResponse[], spec: ReleaseSpec = MAC_RELEASE): ResolvedAssets {
   for (const release of releases) {
-    if (!release.tag_name.startsWith('mac-v')) continue
+    if (!release.tag_name.startsWith(spec.tagPrefix)) continue
     try {
-      return resolveMenubarReleaseAssets(release)
+      return resolveMenubarReleaseAssets(release, spec)
     } catch {
       continue
     }
   }
-  throw new Error('No mac-v* release with a CodeBurnMenubar-v*.zip and checksum was found.')
+  throw new Error(spec.noRelease)
 }
 
 function normalizeCliVersion(cliVersion: string): string {
   return cliVersion.trim().replace(/^v/, '')
 }
 
-export function resolveVersionedMenubarReleaseAssets(cliVersion: string): ResolvedAssets {
+export function resolveVersionedMenubarReleaseAssets(cliVersion: string, spec: ReleaseSpec = MAC_RELEASE): ResolvedAssets {
   const version = normalizeCliVersion(cliVersion)
   if (!version) throw new Error('Cannot resolve CodeBurn Menubar release without a CLI version.')
 
-  const tagName = `mac-v${version}`
-  const zipName = `CodeBurnMenubar-v${version}.zip`
+  const tagName = `${spec.tagPrefix}${version}`
+  const zipName = spec.assetName(version)
   const checksumName = `${zipName}.sha256`
   const releaseBase = `${RELEASE_DOWNLOAD_BASE}/${tagName}`
   const zip = { name: zipName, browser_download_url: `${releaseBase}/${zipName}` }
@@ -187,12 +226,6 @@ async function exists(path: string): Promise<boolean> {
 }
 
 async function ensureSupportedPlatform(): Promise<void> {
-  if (platform() === 'win32') {
-    throw new Error(
-      'The Windows menubar ships as an installer, not through this command. ' +
-        `Download the .msi from ${WINDOWS_RELEASE_PAGE} and run it.`,
-    )
-  }
   if (platform() !== SUPPORTED_OS) {
     throw new Error(`The menubar app is macOS only (detected: ${platform()}).`)
   }
@@ -216,8 +249,8 @@ async function sysProductVersion(): Promise<string> {
   })
 }
 
-async function fetchLatestReleaseAssets(): Promise<ResolvedAssets> {
-  const response = await fetchWithProxy(RELEASE_API, {
+async function fetchLatestReleaseAssets(spec: ReleaseSpec = MAC_RELEASE, fetchImpl?: ReleaseApiFetch): Promise<ResolvedAssets> {
+  const response = await (fetchImpl ?? fetchWithProxy)(RELEASE_API, {
     headers: {
       'User-Agent': 'codeburn-menubar-installer',
       Accept: 'application/vnd.github+json',
@@ -227,7 +260,7 @@ async function fetchLatestReleaseAssets(): Promise<ResolvedAssets> {
     throw new HttpStatusError(formatGitHubReleaseLookupError(response.status, response.headers), response.status)
   }
   const body = await response.json() as ReleaseResponse[]
-  return resolveLatestMenubarReleaseAssets(body)
+  return resolveLatestMenubarReleaseAssets(body, spec)
 }
 
 /// 5xx means "GitHub/the CDN is unhappy right now" and is worth another attempt. 4xx is not:
@@ -482,7 +515,165 @@ async function killRunningApp(): Promise<void> {
   }
 }
 
+/// Windows mirror of the mac install below: pin the release to the CLI's own version, fall back
+/// to the newest windows-v* release, verify the sha256 before anything executes the file, hand
+/// the .msi to msiexec, then launch what it installed.
+const WINDOWS_UNINSTALL_KEYS = [
+  'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+]
+/// 3010 is "installed, reboot to finish"; 1602 is the user closing the UAC/installer prompt.
+const MSI_EXIT_REBOOT_REQUIRED = 3010
+const MSI_EXIT_USER_CANCEL = 1602
+
+export type WindowsInstallHooks = {
+  fetchOptions?: AssetFetchOptions
+  apiFetch?: ReleaseApiFetch
+  runInstaller?: (exe: string, args: string[]) => Promise<number>
+  queryRegistry?: () => Promise<string>
+  launch?: (exePath: string) => void
+  log?: (message: string) => void
+  stagingDir?: string
+  env?: NodeJS.ProcessEnv
+}
+
+export type InstalledWindowsMenubar = { version: string; exePath: string }
+
+/// Windows' `CreateProcess` searches the current directory before `PATH`, so spawning `msiexec`
+/// or `reg` by bare name lets anything dropped next to the CLI impersonate a system tool. Same
+/// rule the tray app follows (windows/src-tauri/src/cli.rs: system32_path).
+export function resolveSystem32Path(exe: string, env: NodeJS.ProcessEnv = process.env): string {
+  const root = env.SystemRoot
+  const base = root && /^[a-zA-Z]:[\\/]/.test(root) ? root.replace(/[\\/]+$/, '') : 'C:\\Windows'
+  return `${base}\\System32\\${exe}`
+}
+
+/// Reads `reg query ... /s` output, which prints one blank-line separated block per subkey.
+export function parseInstalledWindowsMenubar(regOutput: string): InstalledWindowsMenubar | undefined {
+  for (const block of regOutput.split(/\r?\n\s*\r?\n/)) {
+    const values = new Map<string, string>()
+    for (const line of block.split(/\r?\n/)) {
+      const match = /^\s+(.+?)\s{4}REG_\w+\s{4}(.*)$/.exec(line)
+      if (match) values.set(match[1]!.trim(), match[2]!.trim())
+    }
+    if (values.get('DisplayName') !== WINDOWS_PRODUCT_NAME) continue
+    const location = values.get('InstallLocation')
+    // DisplayIcon is `<exe>[,<index>]` and points at the installed binary when there is no
+    // InstallLocation to join onto.
+    const icon = values.get('DisplayIcon')?.split(',')[0]?.trim()
+    const exePath = location
+      ? `${location.replace(/[\\/]+$/, '')}\\${WINDOWS_PRODUCT_NAME}.exe`
+      : icon
+    if (!exePath) continue
+    return { version: values.get('DisplayVersion') ?? '', exePath }
+  }
+  return undefined
+}
+
+async function queryWindowsUninstallRegistry(env: NodeJS.ProcessEnv): Promise<string> {
+  const reg = resolveSystem32Path('reg.exe', env)
+  // reg exits non-zero for a hive the machine does not have; an empty block is the right answer.
+  const outputs = await Promise.all(
+    WINDOWS_UNINSTALL_KEYS.map(key => captureCommand(reg, ['query', key, '/s']).catch(() => '')),
+  )
+  return outputs.join('\n\n')
+}
+
+async function runMsiexec(exe: string, args: string[]): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(exe, args, { stdio: 'inherit' })
+    proc.on('error', reject)
+    proc.on('close', code => resolve(code ?? 1))
+  })
+}
+
+function launchWindowsApp(exePath: string): void {
+  const proc = spawn(exePath, [], { detached: true, stdio: 'ignore' })
+  proc.on('error', err => console.error(`Could not launch ${exePath}: ${err.message}`))
+  proc.unref()
+}
+
+async function stageWindowsInstaller(
+  assets: ResolvedAssets,
+  stagingDir: string,
+  hooks: WindowsInstallHooks,
+  log: (message: string) => void,
+): Promise<string> {
+  const { zip: msi, checksum } = assets
+  const msiPath = join(stagingDir, msi.name)
+  log(`Downloading ${msi.name}...`)
+  await downloadToFile(msi.browser_download_url, msiPath, hooks.fetchOptions)
+  log('Verifying checksum...')
+  await verifyChecksum(msiPath, checksum.browser_download_url, hooks.fetchOptions)
+  return msiPath
+}
+
+async function installWindowsMenubarApp(options: InstallOptions): Promise<InstallResult> {
+  const hooks = options.windows ?? {}
+  const log = hooks.log ?? console.log
+  const env = hooks.env ?? process.env
+  const queryRegistry = hooks.queryRegistry ?? (() => queryWindowsUninstallRegistry(env))
+  const launch = hooks.launch ?? launchWindowsApp
+  const cliVersion = options.cliVersion ? normalizeCliVersion(options.cliVersion) : ''
+
+  const installed = parseInstalledWindowsMenubar(await queryRegistry())
+  if (installed && !options.force && (!cliVersion || installed.version === cliVersion)) {
+    launch(installed.exePath)
+    log('Launched CodeBurn Menubar.')
+    return { installedPath: installed.exePath, launched: true }
+  }
+
+  let assets: ResolvedAssets
+  if (cliVersion) {
+    log(`Resolving CodeBurn Menubar v${cliVersion}...`)
+    assets = resolveVersionedMenubarReleaseAssets(cliVersion, WINDOWS_RELEASE)
+  } else {
+    log('Looking up the latest CodeBurn Menubar release...')
+    assets = await fetchLatestReleaseAssets(WINDOWS_RELEASE, hooks.apiFetch)
+  }
+
+  const stagingDir = hooks.stagingDir ?? await (async () => {
+    await mkdir(getCodeburnCacheDir(), { recursive: true })
+    return mkdtemp(join(getCodeburnCacheDir(), 'menubar-'))
+  })()
+  try {
+    let msiPath: string
+    try {
+      msiPath = await stageWindowsInstaller(assets, stagingDir, hooks, log)
+    } catch (err) {
+      if (!cliVersion || !isMissingDirectAssetError(err)) throw err
+      log(`CodeBurn Menubar v${cliVersion} assets were not found. Looking up the latest CodeBurn Menubar release...`)
+      assets = await fetchLatestReleaseAssets(WINDOWS_RELEASE, hooks.apiFetch)
+      msiPath = await stageWindowsInstaller(assets, stagingDir, hooks, log)
+    }
+
+    log('Installing...')
+    const msiexec = resolveSystem32Path('msiexec.exe', env)
+    const exitCode = await (hooks.runInstaller ?? runMsiexec)(msiexec, ['/i', msiPath, '/passive', '/norestart'])
+    if (exitCode === MSI_EXIT_USER_CANCEL) {
+      log('Installation was cancelled; nothing was installed.')
+      return { installedPath: '', launched: false }
+    }
+    if (exitCode !== 0 && exitCode !== MSI_EXIT_REBOOT_REQUIRED) {
+      throw new Error(`msiexec exited with ${exitCode} while installing ${assets.zip.name}.`)
+    }
+    if (exitCode === MSI_EXIT_REBOOT_REQUIRED) log('Windows wants a restart to finish the install.')
+
+    const nowInstalled = parseInstalledWindowsMenubar(await queryRegistry())
+    if (!nowInstalled) {
+      throw new Error('CodeBurn Menubar installed, but it was not found in the uninstall registry; start it from the Start menu.')
+    }
+    launch(nowInstalled.exePath)
+    log('Launched CodeBurn Menubar.')
+    return { installedPath: nowInstalled.exePath, launched: true }
+  } finally {
+    if (!hooks.stagingDir) await rm(stagingDir, { recursive: true, force: true })
+  }
+}
+
 export async function installMenubarApp(options: InstallOptions = {}): Promise<InstallResult> {
+  if ((options.platform ?? platform()) === 'win32') return installWindowsMenubarApp(options)
   await ensureSupportedPlatform()
   await persistCodeburnPath()
 
