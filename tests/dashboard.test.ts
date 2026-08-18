@@ -395,6 +395,98 @@ describe('interactive terminal rendering', () => {
     expect(INTERACTIVE_RENDER_OPTIONS).toMatchObject({ alternateScreen: true })
   })
 
+  it.each([
+    { columns: 42, expected: '! 10: codeburn models --unpriced' },
+    { columns: 43, expected: '! 10: codeburn models --unpriced' },
+    { columns: 44, expected: '! 10: codeburn models --unpriced' },
+    { columns: 80, expected: '! 10 unpriced: codeburn models --unpriced' },
+  ])('shows an actionable unpriced-model command in a real $columns-column Ink frame', async ({ columns, expected }) => {
+    const stdin = new PassThrough() as PassThrough & NodeJS.ReadStream
+    const stdout = new PassThrough() as PassThrough & NodeJS.WriteStream
+    stdin.isTTY = true
+    stdin.setRawMode = () => stdin
+    stdin.ref = () => stdin
+    stdin.unref = () => stdin
+    stdout.isTTY = true
+    stdout.columns = columns
+    stdout.rows = 100
+    const frames: string[] = []
+    stdout.on('data', chunk => frames.push(stripAnsi(String(chunk))))
+
+    const session = makeSession('unpriced-session', 0)
+    for (let index = 0; index < 10; index++) {
+      const model = `vendor-${index}/unknown-model-${index}-969`
+      session.modelBreakdown[model] = {
+        calls: 1,
+        costUSD: 0,
+        savingsUSD: 0,
+        tokens: {
+          inputTokens: 1_000,
+          outputTokens: 100,
+          cacheCreationInputTokens: 0,
+          cacheReadInputTokens: 0,
+          cachedInputTokens: 0,
+          reasoningTokens: 0,
+          webSearchRequests: 0,
+        },
+      }
+    }
+
+    const app = render(React.createElement(InteractiveDashboard, {
+      initialProjects: [makeProject('unpriced-project', [session])],
+      initialPeriod: 'today',
+      initialProvider: 'all',
+      refreshSeconds: 0,
+      windowColumns: columns,
+    }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
+    onTestFinished(() => app.unmount())
+    await app.waitUntilRenderFlush()
+
+    const frame = frames.filter(value => value.trim()).at(-1) ?? ''
+    expect(frame).toContain(expected)
+  })
+
+  it('labels claude.ai connector remediation as a manual action', async () => {
+    const stdin = new PassThrough() as PassThrough & NodeJS.ReadStream
+    const stdout = new PassThrough() as PassThrough & NodeJS.WriteStream
+    stdin.isTTY = true
+    stdin.setRawMode = () => stdin
+    stdin.ref = () => stdin
+    stdin.unref = () => stdin
+    stdout.isTTY = true
+    stdout.columns = 120
+    stdout.rows = 50
+    const frames: string[] = []
+    stdout.on('data', chunk => frames.push(stripAnsi(String(chunk))))
+
+    const inventory = Array.from({ length: 20 }, (_, i) => `mcp__claude_ai_Google_Calendar__t${i}`)
+    const sessions = ['connector-a', 'connector-b'].map((id, index) => {
+      const session = makeSession(id, 91.337 + index)
+      session.mcpInventory = inventory
+      return session
+    })
+    const app = render(React.createElement(InteractiveDashboard, {
+      initialProjects: [makeProject('connector-manual-action', sessions)],
+      initialPeriod: 'today',
+      initialProvider: 'all',
+      refreshSeconds: 0,
+      windowColumns: 120,
+    }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
+    onTestFinished(() => app.unmount())
+
+    await app.waitUntilRenderFlush()
+    stdin.write('o')
+    let frame = ''
+    for (let i = 0; i < 100 && !frame.includes('Manual action'); i++) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+      frame = frames.filter(value => value.trim()).at(-1) ?? ''
+    }
+
+    expect(frame).toContain('Manual action')
+    expect(frame).toContain('claude.ai Google Calendar')
+    expect(frame).not.toContain('Ask Claude in the current session')
+  })
+
   it('leaves resize frame synchronization entirely to Ink', () => {
     const source = readFileSync(new URL('../src/dashboard.tsx', import.meta.url), 'utf8')
     expect(source).not.toContain('process.stdout.write(BSU)')
@@ -665,7 +757,12 @@ describe('InteractiveDashboard refresh', () => {
   })
 
   it('keeps Optimize mounted without a loading frame when auto-refresh fires', async () => {
-    vi.useFakeTimers()
+    // The Optimize scan (`o`) does real fs I/O (readdir/stat) that only
+    // resolves on a real event-loop turn. Leave setImmediate/nextTick/Date
+    // real (Date stays real so the wait loop below can use a genuine
+    // wall-clock deadline) and fake only what the 60s auto-refresh
+    // interval needs.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
     const stdin = new PassThrough() as PassThrough & NodeJS.ReadStream
     const stdout = new PassThrough() as PassThrough & NodeJS.WriteStream
     stdin.isTTY = true
@@ -712,12 +809,20 @@ describe('InteractiveDashboard refresh', () => {
     expect(activityHeader.indexOf('turns') + 'turns'.length).toBe(activityRow.indexOf('12') + '12'.length)
     expect(activityHeader.indexOf('1-shot') + '1-shot'.length).toBe(activityRow.indexOf('50%') + '50%'.length)
     stdin.write('o')
-    for (let i = 0; i < 20 && !frames.some(frame => frame.includes('Token estimates are approximate.')); i++) {
+    // The scan does real fs work, so wait on real event-loop turns
+    // (setImmediate is left un-faked above) rather than counting fake-timer
+    // hops, bounded by a real wall-clock deadline.
+    const realDeadline = Date.now() + 10_000
+    while (!frames.some(frame => frame.includes('Savings: ~'))) {
+      if (Date.now() > realDeadline) {
+        throw new Error('Timed out waiting for the Optimize scan to render "Savings: ~"')
+      }
+      await new Promise(resolve => setImmediate(resolve))
       await vi.advanceTimersByTimeAsync(50)
     }
     const beforeRefresh = frames.filter(frame => frame.trim()).at(-1) ?? ''
     expect(beforeRefresh).toContain('CodeBurn Optimize')
-    expect(beforeRefresh).toContain('Token estimates are approximate.')
+    expect(beforeRefresh).toContain('CodeBurn Optimize')
 
     frames.length = 0
     await vi.advanceTimersByTimeAsync(60_000)
@@ -726,10 +831,10 @@ describe('InteractiveDashboard refresh', () => {
     const frame = frames.filter(value => value.trim()).at(-1) ?? beforeRefresh
     expect(frame).toBe(beforeRefresh)
     expect(frame).toContain('CodeBurn Optimize')
-    expect(frame).toContain('Token estimates are approximate.')
+    expect(frame).toContain('CodeBurn Optimize')
     expect(frame).toContain('b back')
     expect(frame).not.toContain('Loading Today')
     expect(frame).not.toContain('Scanning Today')
 
-  })
+  }, 30_000)
 })

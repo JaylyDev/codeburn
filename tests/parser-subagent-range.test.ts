@@ -4,6 +4,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 
 import { parseAllSessions, filterProjectsByDays, clearSessionCache } from '../src/parser.js'
+import { clearLoadCacheMemo } from '../src/session-cache.js'
 import { loadPricing } from '../src/models.js'
 import { aggregateByPr, prLinkedTotals } from '../src/sessions-report.js'
 
@@ -64,8 +65,16 @@ describe('subagent fold across a date-range boundary', () => {
     const projects = await parseAllSessions(range, 'claude')
 
     // The child session is present (its work is in range) as a standalone session.
-    const childPresent = projects.some(p => p.sessions.some(s => s.sessionId === `agent-${AGENT}`))
-    expect(childPresent).toBe(true)
+    const child = projects.flatMap(p => p.sessions).find(s => s.sessionId === `agent-${AGENT}`)
+    expect(child).toBeDefined()
+    expect(child!.isSidechain).toBe(true)
+    // Drop both in-process memo layers so the second parse reloads the persisted
+    // session cache. The marker must survive that warm-disk path too, not only
+    // the cold transcript parse.
+    clearSessionCache()
+    clearLoadCacheMemo()
+    const warmProjects = await parseAllSessions(range, 'claude')
+    expect(warmProjects.flatMap(p => p.sessions).find(s => s.sessionId === `agent-${AGENT}`)?.isSidechain).toBe(true)
     // The anchor parent (0 in-range turns) must NOT contaminate the sessions list;
     // it lives in subagentAnchors only.
     const anchorInSessions = projects.some(p => p.sessions.some(s => s.sessionId === PARENT))
@@ -101,6 +110,7 @@ describe('subagent fold across a date-range boundary', () => {
     const dayFiltered = filterProjectsByDays(projects, new Set(['2026-07-20']))
     expect(dayFiltered.some(p => p.sessions.some(s => s.sessionId === PARENT))).toBe(false) // parent no longer a session
     expect(dayFiltered.some(p => (p.subagentAnchors ?? []).some(s => s.sessionId === PARENT))).toBe(true) // kept as anchor
+    expect(dayFiltered.flatMap(p => p.sessions).find(s => s.sessionId === `agent-${AGENT}`)?.isSidechain).toBe(true)
 
     // The child's spend still folds to the PR through the anchor.
     const row = aggregateByPr(dayFiltered).find(r => r.url === PR)

@@ -21,9 +21,16 @@ import {
   detectUnusedMcp,
   detectBashBloat,
   detectGhostCommands,
+  detectDuplicateReads,
+  detectJunkReads,
+  detectLowReadEditRatio,
   loadMcpConfigs,
+  localMcpServerNames,
   scanJsonlFile,
   scanAndDetect,
+  detectRecurringContext,
+  renderOptimize,
+  type SessionOpener,
   type ToolCall,
 } from '../src/optimize.js'
 import {
@@ -173,6 +180,32 @@ describe('loadMcpConfigs', () => {
   })
 })
 
+describe('localMcpServerNames', () => {
+  it('adds the ~/.claude.json top-level and per-project servers to the config names', () => {
+    const root = makeFixtureRoot()
+    const projectDir = join(root, 'myapp')
+    mkdirSync(projectDir, { recursive: true })
+    writeFile(join(projectDir, '.mcp.json'), JSON.stringify({ mcpServers: { fromMcpJson: {} } }))
+    writeFile(join(FAKE_HOME_FOR_MOCK, '.claude.json'), JSON.stringify({
+      mcpServers: { 'claude_ai_homegrown': {}, 'plugin:ctx:ctx': {} },
+      projects: { [projectDir]: { mcpServers: { scoped: {} } } },
+    }))
+
+    const names = localMcpServerNames([projectDir])
+
+    expect([...names].sort()).toEqual(['claude_ai_homegrown', 'fromMcpJson', 'plugin_ctx_ctx', 'scoped'])
+  })
+
+  it('contributes no names when ~/.claude.json cannot be parsed', () => {
+    const root = makeFixtureRoot()
+    const projectDir = join(root, 'myapp')
+    mkdirSync(projectDir, { recursive: true })
+    writeFile(join(FAKE_HOME_FOR_MOCK, '.claude.json'), '{ not valid json')
+
+    expect(localMcpServerNames([projectDir]).size).toBe(0)
+  })
+})
+
 describe('detectUnusedMcp', () => {
   it('flags servers configured but never called', () => {
     const root = makeFixtureRoot()
@@ -297,6 +330,78 @@ describe('scanJsonlFile', () => {
     expect(result.calls[0].name).toBe('Read')
   })
 
+  it('marks tool calls from sidechain transcript entries', async () => {
+    const root = makeFixtureRoot()
+    const filePath = join(root, 'agent-reviewer.jsonl')
+    const now = new Date().toISOString()
+    writeFile(filePath, JSON.stringify({
+      type: 'assistant', isSidechain: true, timestamp: now,
+      message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: '/x/foo.ts' } }] },
+    }))
+
+    const result = await scanJsonlFile(filePath, 'p1', undefined)
+
+    expect(result.calls).toHaveLength(1)
+    expect(result.calls[0]!.isSidechain).toBe(true)
+  })
+
+  it('classifies every tool call in a transcript when a later large entry marks it as sidechain', async () => {
+    const root = makeFixtureRoot()
+    const filePath = join(root, 'agent-reviewer.jsonl')
+    const now = new Date().toISOString()
+    const assistant = (name: string, isSidechain?: boolean, padding = '') => JSON.stringify({
+      type: 'assistant',
+      ...(isSidechain === true ? { isSidechain: true } : {}),
+      timestamp: now,
+      cwd: '/x',
+      padding,
+      message: {
+        model: 'claude-sonnet-4-5',
+        usage: { cache_creation_input_tokens: 1 },
+        content: [{ type: 'tool_use', name, input: { file_path: `/x/${name}.ts` } }],
+      },
+    })
+    writeFile(filePath, [
+      JSON.stringify({ type: 'user', timestamp: now, cwd: '/x', message: { content: 'delegate this' } }),
+      assistant('Read'),
+      assistant('Edit', true, 'x'.repeat(40_000)),
+      assistant('Bash'),
+    ].join('\n'))
+
+    const result = await scanJsonlFile(filePath, 'p1', undefined)
+
+    expect(result.calls.map(call => [call.name, call.isSidechain])).toEqual([
+      ['Read', true],
+      ['Edit', true],
+      ['Bash', true],
+    ])
+    expect(result.apiCalls).toHaveLength(3)
+    expect(result.cwds).toHaveLength(4)
+    expect(result.userMessages).toEqual(['delegate this'])
+  })
+
+  it('keeps sidechain calls out of duplicate reads but in junk reads and the read:edit ratio', () => {
+    const sidechain = { sessionId: 'agent-reviewer', project: 'p1', isSidechain: true }
+    const editCalls = Array.from({ length: 10 }, (_, index) => ({
+      name: 'Edit', input: { file_path: `/src/${index}.ts` }, ...sidechain,
+    }))
+    const junkReads = Array.from({ length: 6 }, () => ({
+      name: 'Read', input: { file_path: '/app/node_modules/pkg/index.js' }, ...sidechain,
+    }))
+    const repeatReads = Array.from({ length: 6 }, () => ({
+      name: 'Read', input: { file_path: '/app/src/a.ts' }, ...sidechain,
+    }))
+
+    // A subagent editing without reading, or reading into node_modules, is the
+    // same waste as the parent doing it, and the CLAUDE.md rule both suggest
+    // binds subagents too - so the full call population feeds them.
+    expect(detectLowReadEditRatio(editCalls)?.id).toBe('read-edit-ratio')
+    expect(detectJunkReads(junkReads)?.id).toBe('build-folder-reads')
+    // A re-read is only waste when the context already held the file; a
+    // sidechain starts fresh and has to read it.
+    expect(detectDuplicateReads(repeatReads)).toBeNull()
+  })
+
   it('skips malformed JSONL lines without crashing', async () => {
     const root = makeFixtureRoot()
     const filePath = join(root, 'session.jsonl')
@@ -359,6 +464,136 @@ describe('scanJsonlFile', () => {
     const result = await scanJsonlFile(filePath, 'p1', { start, end: today })
     expect(result.calls).toHaveLength(1)
     expect((result.calls[0].input as Record<string, unknown>).file_path).toBe('/new')
+  })
+})
+
+// ============================================================================
+// detectRecurringContext
+// ============================================================================
+
+describe('detectRecurringContext', () => {
+  // ~2.2 KB, comfortably over the 1.5 KB floor.
+  const BRIEF = 'PROJECT BRIEF\n' + 'Ship the invoice importer behind a flag. '.repeat(53)
+  const TOKENS_PER_CHAR = 0.25
+
+  type Opener = { text: string; project?: string }
+
+  async function openersFor(sessions: Opener[]): Promise<SessionOpener[]> {
+    const root = makeFixtureRoot()
+    const now = new Date().toISOString()
+    const openers: SessionOpener[] = []
+    for (const [i, { text, project }] of sessions.entries()) {
+      const filePath = join(root, `s${i}.jsonl`)
+      writeFile(filePath, JSON.stringify({ type: 'user', timestamp: now, message: { content: text } }))
+      const result = await scanJsonlFile(filePath, project ?? 'my-app', undefined)
+      openers.push(...result.openers)
+    }
+    return openers
+  }
+
+  const repeat = (n: number, text = BRIEF, project?: string): Opener[] =>
+    Array.from({ length: n }, () => ({ text, project }))
+
+  it('flags a block that opens the session threshold worth of sessions', async () => {
+    const finding = detectRecurringContext(await openersFor(repeat(5)))
+    expect(finding).not.toBeNull()
+    expect(finding!.id).toBe('recurring-context')
+    expect(finding!.title).toBe(`Same ${(BRIEF.length / 1024).toFixed(1)} KB block pasted at the start of 5 sessions`)
+    // Only the four repeats are recoverable; the first paste is the honest cost.
+    expect(finding!.tokensSaved).toBe(Math.round(4 * BRIEF.length * TOKENS_PER_CHAR))
+    expect(finding!.fix.type).toBe('paste')
+    expect(finding!.fix.type === 'paste' && finding!.fix.destination).toBe('prompt')
+  })
+
+  it('renders the finding with its preview and destination header', async () => {
+    const finding = detectRecurringContext(await openersFor(repeat(5)))!
+    const out = renderOptimize([finding], 0.00001, '30 Days', 10, 5, 100, 80, 'B', [], [])
+      .replace(/\u001b\[[0-9;]*m/g, '')
+    expect(out).toContain(finding.title)
+    expect(out).toContain('PROJECT BRIEF Ship the invoice importer')
+    expect(out).toContain('Ask Claude in the current session')
+    expect(out).toContain('Move it into CLAUDE.md if it is a standing rule')
+  })
+
+  it('stays quiet below the session threshold', async () => {
+    expect(detectRecurringContext(await openersFor(repeat(4)))).toBeNull()
+  })
+
+  it('ignores short openers however often they repeat', async () => {
+    expect(detectRecurringContext(await openersFor(repeat(20, 'continue')))).toBeNull()
+    expect(detectRecurringContext(await openersFor(repeat(20, 'yes')))).toBeNull()
+  })
+
+  it('groups sessions whose block differs only in whitespace', async () => {
+    const reflowed = BRIEF.replace(/ /g, '  ').replace(/\n/g, '\n\n')
+    const finding = detectRecurringContext(await openersFor([...repeat(3), ...repeat(2, reflowed)]))
+    expect(finding).not.toBeNull()
+    expect(finding!.title).toContain('start of 5 sessions')
+  })
+
+  it('ignores injected system reminders and slash-command wrappers', async () => {
+    expect(detectRecurringContext(await openersFor(repeat(6, `<system-reminder>${BRIEF}</system-reminder>`)))).toBeNull()
+    expect(detectRecurringContext(await openersFor(repeat(6, `<command-name>/brief</command-name>${BRIEF}`)))).toBeNull()
+  })
+
+  it('skips prompts a program wrote: SDK sessions and subagent transcripts', async () => {
+    const root = makeFixtureRoot()
+    const now = new Date().toISOString()
+    const openers: SessionOpener[] = []
+    for (const [i, entry] of [{ promptSource: 'sdk' }, { isSidechain: true }].entries()) {
+      for (let j = 0; j < 6; j++) {
+        const filePath = join(root, `machine-${i}-${j}.jsonl`)
+        writeFile(filePath, JSON.stringify({ type: 'user', timestamp: now, ...entry, message: { content: BRIEF } }))
+        openers.push(...(await scanJsonlFile(filePath, 'my-app', undefined)).openers)
+      }
+    }
+    expect(openers).toEqual([])
+    expect(detectRecurringContext(openers)).toBeNull()
+  })
+
+  // Over 32 KB the JSONL parser returns a reduced entry without the root
+  // flags, so the markers have to be read off the raw line.
+  it('skips machine-written prompts too large for the parser to keep flags on', async () => {
+    const root = makeFixtureRoot()
+    const now = new Date().toISOString()
+    const huge = BRIEF + 'x'.repeat(40_000)
+    const openers: SessionOpener[] = []
+    for (let i = 0; i < 6; i++) {
+      const filePath = join(root, `huge-${i}.jsonl`)
+      // Field order matters: the flags land past the head, behind the very
+      // message that made the line large.
+      writeFile(filePath, JSON.stringify({
+        isSidechain: false, type: 'user', message: { content: huge }, timestamp: now, promptSource: 'sdk',
+      }))
+      openers.push(...(await scanJsonlFile(filePath, 'my-app', undefined)).openers)
+    }
+    expect(openers).toEqual([])
+  })
+
+  it('only counts the first message of a session as its opener', async () => {
+    const root = makeFixtureRoot()
+    const now = new Date().toISOString()
+    const openers: SessionOpener[] = []
+    for (let i = 0; i < 6; i++) {
+      const filePath = join(root, `late-${i}.jsonl`)
+      writeFile(filePath, [
+        JSON.stringify({ type: 'user', timestamp: now, message: { content: 'go on' } }),
+        JSON.stringify({ type: 'user', timestamp: now, message: { content: BRIEF } }),
+      ].join('\n'))
+      openers.push(...(await scanJsonlFile(filePath, 'my-app', undefined)).openers)
+    }
+    expect(detectRecurringContext(openers)).toBeNull()
+  })
+
+  it('names the project when the block is confined to one, and counts them otherwise', async () => {
+    const single = detectRecurringContext(await openersFor(repeat(5, BRIEF, '-Users-me-Projects-codeburn')))
+    expect(single!.explanation).toContain('5 sessions in codeburn')
+
+    const spread = detectRecurringContext(await openersFor([
+      ...repeat(3, BRIEF, '-Users-me-Projects-codeburn'),
+      ...repeat(2, BRIEF, '-Users-me-Projects-dash'),
+    ]))
+    expect(spread!.explanation).toContain('5 sessions in 2 projects')
   })
 })
 
