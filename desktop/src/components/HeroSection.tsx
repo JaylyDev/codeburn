@@ -27,7 +27,7 @@ export function HeroSection({ payload, currency, periodLabel, isToday }: Props) 
         <div className="hero-meta">
           {payload ? (
             <>
-              <span className="hero-calls">{plural(payload.current.calls, 'call').replace(/^(\d+)/, m => Number(m).toLocaleString())}</span>
+              <span className="hero-calls">{payload.current.calls.toLocaleString()} {payload.current.calls === 1 ? 'call' : 'calls'}</span>
               <span className="hero-sessions">{plural(payload.current.sessions, 'session')}</span>
             </>
           ) : (
