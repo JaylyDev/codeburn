@@ -484,6 +484,7 @@ Sync sends token counts, costs, models, and projects, never prompts or code. Thi
 | `codeburn models --by-task` | Break each model into per-task-type rows |
 | `codeburn models --by-agent` | Break each model into per-agent rows: which agent drove which model's spend (`(main)` covers non-agent sessions; `--min-cost 0` shows sub-cent agents) |
 | `codeburn models --top 10` | Only the 10 most expensive models |
+| `codeburn models --unpriced` | Only models with usage that currently price at $0 — the copyable form of the unpriced-models warning |
 | `codeburn models --format markdown` | Emit a paste-friendly markdown table |
 | `codeburn models --task feature` | Filter to feature-development work |
 | `codeburn models --provider claude` | Filter to a single provider |

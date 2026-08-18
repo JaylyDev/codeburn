@@ -776,6 +776,55 @@ describe('models CLI breakdown flags', () => {
     }
   })
 
+  // `--top` is applied inside aggregateModels, before the unpriced filter runs,
+  // on rows sorted by cost + savings descending. Unpriced rows are $0 on both,
+  // so they sort last and a small --top removed exactly the rows --unpriced
+  // exists to surface: the user was told they had no unpriced models.
+  it('keeps unpriced rows when --unpriced is combined with --top', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-models-unpriced-top-'))
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'models-unpriced-top')
+      await mkdir(projectDir, { recursive: true })
+      const assistant = (id: string, model: string, timestamp: string, input: number) => JSON.stringify({
+        type: 'assistant',
+        sessionId: 'models-unpriced-top-session',
+        timestamp,
+        cwd: '/tmp/models-unpriced-top',
+        message: {
+          id, type: 'message', role: 'assistant', model,
+          content: [{ type: 'text', text: id }],
+          usage: { input_tokens: input, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        },
+      })
+      await writeFile(join(projectDir, 'session.jsonl'), [
+        JSON.stringify({
+          type: 'user',
+          sessionId: 'models-unpriced-top-session',
+          timestamp: '2026-05-09T00:00:00.000Z',
+          cwd: '/tmp/models-unpriced-top',
+          message: { role: 'user', content: 'Two priced models outrank the unpriced one.' },
+        }),
+        // Both priced models cost more than the $0 unpriced row, so they take
+        // both --top slots unless the filter runs first.
+        assistant('opus', 'claude-opus-4-6', '2026-05-09T00:01:00.000Z', 5000),
+        assistant('sonnet', 'claude-sonnet-4-6', '2026-05-09T00:02:00.000Z', 3000),
+        assistant('unpriced', 'zz-unpriced-frontier-model', '2026-05-09T00:03:00.000Z', 2000),
+      ].join('\n') + '\n')
+
+      const res = spawnSync(
+        process.execPath,
+        ['--import', 'tsx', 'src/cli.ts', 'models', '--unpriced', '--top', '2', '--from', '2026-05-09', '--to', '2026-05-09', '--provider', 'claude', '--format', 'json'],
+        { cwd: process.cwd(), env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'), TZ: 'UTC' }, encoding: 'utf-8', timeout: 30_000 },
+      )
+
+      expect(res.status, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0)
+      const rows = JSON.parse(res.stdout) as Array<{ model: string }>
+      expect(rows.map(row => row.model)).toEqual(['zz-unpriced-frontier-model'])
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
   it('rejects --by-task and --by-agent together with a clear error and exit 1', () => {
     const res = spawnSync(
       process.execPath,

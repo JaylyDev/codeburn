@@ -2100,11 +2100,17 @@ program
     }
 
     const projects = await parseAllSessions(range, opts.provider)
+    const topN = typeof opts.top === 'number' && Number.isFinite(opts.top) ? opts.top : undefined
     let rows = await aggregateModels(projects, {
       byTask: !!opts.byTask,
       byAgent: !!opts.byAgent,
       taskFilter: opts.task,
-      topN: typeof opts.top === 'number' && Number.isFinite(opts.top) ? opts.top : undefined,
+      // `aggregateModels` slices to topN on rows sorted by cost + savings
+      // descending. Unpriced rows are $0 on both (findUnpricedModels excludes
+      // anything with a local-savings baseline), so they always sort last and
+      // `--top` would remove exactly the rows `--unpriced` exists to show.
+      // Take the whole set here and slice after filtering instead.
+      topN: opts.unpriced ? undefined : topN,
       minCost: typeof opts.minCost === 'number' && Number.isFinite(opts.minCost) ? opts.minCost : (opts.unpriced ? 0 : 0.01),
     })
     if (opts.unpriced) {
@@ -2114,6 +2120,7 @@ program
         cost: row.costUSD,
         tokens: row.totalTokens,
       }]).length > 0)
+      if (topN !== undefined) rows = rows.slice(0, topN)
     }
 
     const fmt = (opts.format ?? 'table').toLowerCase()
