@@ -1043,6 +1043,15 @@ export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Pr
     const files = plan.groups.get(bucket)!
     const onDisk = from ? await loadShard(join(dir, from)) : null
     if (!onDisk) return writeShard(provider, bucket, files)
+    // A file whose month this run never loaded has no visible cache entry, so it
+    // looks uncached and is re-parsed into the same bucket — re-deriving the
+    // entry the shard already holds. Republishing then churns the shard's nonce
+    // name on every run for content that never changed (#1032), so a merge that
+    // neither adds, changes nor removes an entry keeps the published shard.
+    const adds = Object.entries(files).some(([path, file]) =>
+      onDisk[path] === undefined || JSON.stringify(onDisk[path]) !== JSON.stringify(file))
+    const removes = [...plan.moved].some(path => onDisk[path] !== undefined && files[path] === undefined)
+    if (!adds && !removes) return { name: from!, until: untilMonth(onDisk) }
     for (const path of plan.moved) delete onDisk[path]
     return writeShard(provider, bucket, { ...onDisk, ...files })
   }
