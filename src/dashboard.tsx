@@ -655,7 +655,7 @@ function ModelBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: 
       {unpriced.length > 0 && (
         <Text color="yellow" wrap={pw <= 44 ? 'wrap' : 'truncate-end'}>
           {pw <= 44
-            ? 'codeburn models --unpriced'
+            ? `! ${unpriced.length}: codeburn models --unpriced`
             : `! ${unpriced.length} unpriced: codeburn models --unpriced`}
         </Text>
       )}

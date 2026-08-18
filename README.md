@@ -516,11 +516,10 @@ Sync sends token counts, costs, models, and projects, never prompts or code. Thi
 | `codeburn models --by-task` | Break each model into per-task-type rows |
 | `codeburn models --by-agent` | Break each model into per-agent rows: which agent drove which model's spend (`(main)` covers non-agent sessions; `--min-cost 0` shows sub-cent agents) |
 | `codeburn models --top 10` | Only the 10 most expensive models |
-| `codeburn models --unpriced` | Only models with usage that currently price at $0 — the copyable form of the unpriced-models warning |
+| `codeburn models --unpriced` | Only models with usage that currently price at $0 — the copyable form of the unpriced-models warning. Shows raw model IDs (not friendly names) so they can be pasted into `model-alias`; JSON keeps them exact |
 | `codeburn models --format markdown` | Emit a paste-friendly markdown table |
 | `codeburn models --task feature` | Filter to feature-development work |
 | `codeburn models --provider claude` | Filter to a single provider |
-| `codeburn models --unpriced` | List models counted at $0 because pricing is unknown; JSON preserves exact raw IDs for `model-alias` |
 
 Left/right arrow keys switch between Today, 7 Days, 30 Days, Month, 6 Months, and Lifetime (use `--from` / `--to` for an exact historical window). Up/down scroll the full dashboard one line, Page Up/Page Down move one screen, and Home/End jump to either end. The main Daily Activity panel shows at least 10 dates from scrollable full history: use `j`/`k` to move one day, Shift+Space/Space to page, and `g`/`G` to jump to either end. Panels flow in the same order across three columns at maximum width, two at medium width, and one when narrow. In the three-column layout, all panels widen equally by one character for every three additional terminal columns until the dashboard reaches the lesser of 256 characters or the widest renderable source row. Press `q` to quit, `1` `2` `3` `4` `5` `6` as period shortcuts, `c` to open model comparison, or `o` to open optimize. Today, 7 Days, and concrete-day views refresh in place at most once per minute by default (`--refresh 0` to disable) without changing the active view or scroll position. The heavier aggregate views remain static between deliberate navigation changes. The dashboard also shows average cost per session and the five most expensive sessions across all projects.
 

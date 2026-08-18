@@ -396,9 +396,9 @@ describe('interactive terminal rendering', () => {
   })
 
   it.each([
-    { columns: 42, expected: 'codeburn models --unpriced' },
-    { columns: 43, expected: 'codeburn models --unpriced' },
-    { columns: 44, expected: 'codeburn models --unpriced' },
+    { columns: 42, expected: '! 10: codeburn models --unpriced' },
+    { columns: 43, expected: '! 10: codeburn models --unpriced' },
+    { columns: 44, expected: '! 10: codeburn models --unpriced' },
     { columns: 80, expected: '! 10 unpriced: codeburn models --unpriced' },
   ])('shows an actionable unpriced-model command in a real $columns-column Ink frame', async ({ columns, expected }) => {
     const stdin = new PassThrough() as PassThrough & NodeJS.ReadStream
