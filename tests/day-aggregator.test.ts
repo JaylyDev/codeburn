@@ -135,8 +135,8 @@ describe('aggregateProjectsIntoDays', () => {
         sessions: [{
           sessionId: 's1',
           project: 'p',
-          firstTimestamp: '2026-04-09T23:59:00Z',
-          lastTimestamp: '2026-04-10T00:10:00Z',
+          firstTimestamp: new Date(2026, 3, 9, 23, 59).toISOString(),
+          lastTimestamp: new Date(2026, 3, 10, 0, 10).toISOString(),
           totalCostUSD: 1,
           totalInputTokens: 0, totalOutputTokens: 0, totalCacheReadTokens: 0, totalCacheWriteTokens: 0,
           apiCalls: 0,

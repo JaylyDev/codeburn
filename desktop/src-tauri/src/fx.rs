@@ -83,7 +83,7 @@ impl FxCache {
 }
 
 fn is_valid(rate: f64) -> bool {
-    rate.is_finite() && rate >= MIN_VALID_FX_RATE && rate <= MAX_VALID_FX_RATE
+    rate.is_finite() && (MIN_VALID_FX_RATE..=MAX_VALID_FX_RATE).contains(&rate)
 }
 
 fn now_secs() -> u64 {

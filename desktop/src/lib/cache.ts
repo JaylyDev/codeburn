@@ -1,4 +1,6 @@
-const TTL = 300_000
+/// Per (period, provider) payload cache. Entries are served instantly on tab switches and
+/// refreshed in the background (stale-while-revalidate); `age` lets the caller decide
+/// whether a background refresh is due.
 
 interface CacheEntry<T> {
   data: T
@@ -14,15 +16,13 @@ export class PayloadCache<T> {
   }
 
   get(period: string, provider: string): T | null {
-    const entry = this.store.get(this.key(period, provider))
-    if (!entry) return null
-    if (Date.now() - entry.ts > TTL) return null
-    return entry.data
+    return this.store.get(this.key(period, provider))?.data ?? null
   }
 
-  getStale(period: string, provider: string): T | null {
+  /// Milliseconds since the entry was stored, or Infinity when absent.
+  age(period: string, provider: string): number {
     const entry = this.store.get(this.key(period, provider))
-    return entry ? entry.data : null
+    return entry ? Date.now() - entry.ts : Number.POSITIVE_INFINITY
   }
 
   set(period: string, provider: string, data: T): void {

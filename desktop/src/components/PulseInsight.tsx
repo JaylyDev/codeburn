@@ -21,7 +21,7 @@ export function PulseInsight({ payload, currency }: Props) {
       </div>
       <div className="pulse-tile">
         <div className="pulse-label">1-shot</div>
-        <div className="pulse-value pulse-value-accent">{oneShotText}</div>
+        <div className={`pulse-value ${oneShotRate == null ? '' : 'pulse-value-accent'}`}>{oneShotText}</div>
       </div>
       <div className="pulse-tile">
         <div className="pulse-label">Cost / session</div>

@@ -1,9 +1,12 @@
-import { useState } from 'react'
 import type { MenubarPayload } from '../lib/payload'
 import type { CurrencyState } from '../lib/currency'
 import { formatCompactCurrency } from '../lib/currency'
+import { CollapsibleSection } from './CollapsibleSection'
 
-const MIN_BAR_PCT = 2
+/// Column widths shared with the header captions (mac: Cost 54 / Turns 52 / 1-shot 44).
+export const COL_COST = 54
+export const COL_COUNT = 52
+export const COL_ONESHOT = 44
 
 type Props = {
   payload: MenubarPayload
@@ -11,47 +14,39 @@ type Props = {
 }
 
 export function ActivitySection({ payload, currency }: Props) {
-  const [expanded, setExpanded] = useState(true)
   const activities = payload.current.topActivities
   if (activities.length === 0) return null
-
   const maxCost = Math.max(...activities.map(a => a.cost), 0.01)
 
   return (
-    <section className="activity-section">
-      <button className="section-header" onClick={() => setExpanded(!expanded)}>
-        <div className="section-header-left">
-          <span className="section-dot" />
-          <span className="section-caption">Activity</span>
+    <CollapsibleSection
+      caption="Activity"
+      columns={[
+        { label: 'Cost', width: COL_COST },
+        { label: 'Turns', width: COL_COUNT },
+        { label: '1-shot', width: COL_ONESHOT },
+      ]}
+    >
+      {activities.map(a => (
+        <div key={a.name} className="data-row">
+          <FixedBar fraction={a.cost / maxCost} />
+          <span className="row-name">{a.name}</span>
+          <span className="row-cost" style={{ minWidth: COL_COST }}>{formatCompactCurrency(a.cost, currency)}</span>
+          <span className="row-count" style={{ minWidth: COL_COUNT }}>{a.turns}</span>
+          <span className="row-oneshot" style={{ minWidth: COL_ONESHOT }}>
+            {a.oneShotRate == null ? '-' : `${Math.round(a.oneShotRate * 100)}%`}
+          </span>
         </div>
-        <div className="section-header-right">
-          <span className="col-header">Cost</span>
-          <span className="col-header col-header-sm">Turns</span>
-          <span className="col-header col-header-sm">1-shot</span>
-          <span className={`chevron ${expanded ? 'chevron-open' : ''}`}>›</span>
-        </div>
-      </button>
+      ))}
+    </CollapsibleSection>
+  )
+}
 
-      {expanded && (
-        <div className="section-body">
-          {activities.map(a => (
-            <div key={a.name} className="activity-row">
-              <div className="row-bar-container">
-                <div
-                  className="row-bar-fill"
-                  style={{ width: `${Math.max(MIN_BAR_PCT, (a.cost / maxCost) * 100)}%` }}
-                />
-              </div>
-              <div className="row-label">{a.name}</div>
-              <div className="row-cost">{formatCompactCurrency(a.cost, currency)}</div>
-              <div className="row-turns">{a.turns}</div>
-              <div className="row-oneshot">
-                {a.oneShotRate == null ? '-' : `${Math.round(a.oneShotRate * 100)}%`}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </section>
+export function FixedBar({ fraction }: { fraction: number }) {
+  const pct = Math.min(Math.max(fraction, 0), 1) * 100
+  return (
+    <span className="fixed-bar" aria-hidden="true">
+      <span className="fixed-bar-fill" style={{ width: `${pct}%` }} />
+    </span>
   )
 }

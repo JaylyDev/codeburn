@@ -4,7 +4,7 @@ import { exportCsv, exportJson, type PeriodExport } from './export.js'
 import { loadPricing } from './models.js'
 import { parseAllSessions, filterProjectsByName } from './parser.js'
 import { convertCost } from './currency.js'
-import { renderStatusBar } from './format.js'
+import { localDateString, renderStatusBar } from './format.js'
 import { type PeriodData, type ProviderCost } from './menubar-json.js'
 import { buildMenubarPayload } from './menubar-json.js'
 import { addNewDays, getDaysInRange, loadDailyCache, saveDailyCache, withDailyCacheLock } from './daily-cache.js'
@@ -25,7 +25,12 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000
 const BACKFILL_DAYS = 365
 
 function toDateString(date: Date): string {
-  return date.toISOString().slice(0, 10)
+  return localDateString(date)
+}
+
+function localMidnightAfter(dateStr: string): Date {
+  const [y, m, d] = dateStr.split('-').map(Number)
+  return new Date(y!, m! - 1, d! + 1)
 }
 
 function getDateRange(period: string): { range: DateRange; label: string } {
@@ -35,12 +40,12 @@ function getDateRange(period: string): { range: DateRange; label: string } {
   switch (period) {
     case 'today': {
       const start = new Date(now.getFullYear(), now.getMonth(), now.getDate())
-      return { range: { start, end }, label: `Today (${start.toISOString().slice(0, 10)})` }
+      return { range: { start, end }, label: `Today (${toDateString(start)})` }
     }
     case 'yesterday': {
       const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)
       const yesterdayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 23, 59, 59, 999)
-      return { range: { start, end: yesterdayEnd }, label: `Yesterday (${start.toISOString().slice(0, 10)})` }
+      return { range: { start, end: yesterdayEnd }, label: `Yesterday (${toDateString(start)})` }
     }
     case 'week': {
       const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7)
@@ -334,7 +339,7 @@ program
       const now = new Date()
       const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate())
       const yesterdayEnd = new Date(todayStart.getTime() - 1)
-      const yesterdayStr = toDateString(new Date(todayStart.getTime() - MS_PER_DAY))
+      const yesterdayStr = toDateString(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1))
       const isAllProviders = pf === 'all'
 
       // The daily cache is provider-agnostic: always backfill it from .all so subsequent
@@ -342,7 +347,7 @@ program
       const cache = await withDailyCacheLock(async () => {
         let c = await loadDailyCache()
         const gapStart = c.lastComputedDate
-          ? new Date(new Date(`${c.lastComputedDate}T00:00:00.000Z`).getTime() + MS_PER_DAY)
+          ? localMidnightAfter(c.lastComputedDate)
           : new Date(todayStart.getTime() - BACKFILL_DAYS * MS_PER_DAY)
 
         if (gapStart.getTime() <= yesterdayEnd.getTime()) {

@@ -21,7 +21,6 @@ fn config_path() -> PathBuf {
     codeburn_config_dir().join("config.json")
 }
 
-#[cfg(unix)]
 fn lock_path() -> PathBuf {
     codeburn_config_dir().join(".config.lock")
 }
@@ -40,6 +39,8 @@ impl CurrencyConfig {
 
         #[cfg(unix)]
         let _lock = unix_lock::acquire()?;
+        #[cfg(windows)]
+        let _lock = windows_lock::acquire()?;
 
         let mut disk: serde_json::Value = match fs::read(config_path()) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({})),
@@ -103,5 +104,58 @@ mod unix_lock {
 
     extern "C" {
         fn flock(fd: i32, operation: i32) -> i32;
+    }
+}
+
+/// Windows has no flock; a create-new lock file gives the same mutual exclusion against
+/// the CLI's own writer. Stale locks (crash mid-write) are ignored once older than
+/// STALE_LOCK_SECS so a single crash can never wedge currency changes forever.
+#[cfg(windows)]
+mod windows_lock {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::thread::sleep;
+    use std::time::{Duration, SystemTime};
+    use anyhow::{anyhow, Result};
+
+    const RETRY_INTERVAL: Duration = Duration::from_millis(40);
+    const MAX_RETRIES: u32 = 50;
+    const STALE_LOCK_SECS: u64 = 30;
+
+    pub struct Guard {
+        path: PathBuf,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    pub fn acquire() -> Result<Guard> {
+        let path = super::lock_path();
+        for _ in 0..MAX_RETRIES {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Ok(Guard { path }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if is_stale(&path) {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    sleep(RETRY_INTERVAL);
+                }
+                Err(err) => return Err(anyhow!("failed to open config lock: {err}")),
+            }
+        }
+        Err(anyhow!("config lock is held by another process"))
+    }
+
+    fn is_stale(path: &PathBuf) -> bool {
+        fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .map(|age| age.as_secs() > STALE_LOCK_SECS)
+            .unwrap_or(false)
     }
 }

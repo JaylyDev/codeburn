@@ -78,7 +78,13 @@ npm --prefix .. run build
 CODEBURN_BIN="node $(pwd)/../dist/cli.js" npm run tauri dev
 ```
 
-`CODEBURN_BIN` is validated against a strict allowlist (alphanumerics plus `._/-` and space) before use; anything else falls back to the `codeburn` name resolved through `PATH`.
+`CODEBURN_BIN` is validated against a strict allowlist (alphanumerics plus `._/-` and space; `\ : ( )` also allowed on Windows) before use; anything else falls back to auto-resolution.
+
+Without `CODEBURN_BIN` the app looks for `codeburn` (`codeburn.cmd` / `codeburn.exe` on Windows) on the inherited `PATH`, then in the usual npm and node prefixes (`%APPDATA%\npm`, `%LOCALAPPDATA%\Programs\nodejs`, pnpm, Volta, scoop, `/opt/homebrew/bin`, `~/.npm-global/bin`), and finally on Windows in the live user and machine `PATH` read from the registry, so a CLI installed after the tray app was launched is still found. If nothing is found, or `codeburn --version` is older than `MIN_CLI_VERSION` (`src-tauri/src/cli.rs`), the popover shows a setup screen with the install command and a "Check again" button.
+
+## Plan / quota
+
+The Plan pill (visible on the Claude tab, or when Claude is the only detected provider) reads Claude Code's OAuth credentials from `~/.claude/.credentials.json`, calls `https://api.anthropic.com/api/oauth/usage`, refreshes the token once on 401, and stores one snapshot per window under `~/.cache/codeburn/subscription-snapshots.json` (`CODEBURN_CACHE_DIR` override) so a freshly reset window can still show last cycle's final. This is the same file format the macOS app writes. Nothing is logged: the credential blob never leaves the Rust side.
 
 ## Build a production package
 
@@ -94,7 +100,8 @@ npm run tauri build
 
 - **Process spawn**: every call into the codeburn CLI goes through `CodeburnCli::fetch_menubar_payload`, which builds argv explicitly and runs the binary directly (no `sh -c`). `CODEBURN_BIN` is allowlisted before use.
 - **Pipes**: stdout is capped at 20 MB, stderr at 256 KB, total wall time at 60 s. A hung CLI cannot pin file descriptors or memory.
-- **Config writes**: `~/.config/codeburn/config.json` writes run under a POSIX `flock` on `~/.config/codeburn/.config.lock` so a concurrent CLI invocation and this app cannot race.
+- **Config writes**: `~/.config/codeburn/config.json` writes run under a POSIX `flock` on `~/.config/codeburn/.config.lock` (a create-new lock file with stale-lock recovery on Windows) so a concurrent CLI invocation and this app cannot race.
+- **Credentials**: the Plan view reads `~/.claude/.credentials.json` with a 64 KB cap and refuses symlinks; tokens are only ever sent to the Anthropic usage and token endpoints over TLS.
 - **FX fetches**: Frankfurter response is parsed as JSON and the rate is clamped to `[0.0001, 1_000_000]` before it touches displayed numbers. Stale cache preferred over poisoned fresh data.
 - **CSP**: `connect-src` restricted to `self`, `ipc:`, and `https://api.frankfurter.app`. No inline scripts.
 
@@ -107,7 +114,7 @@ npm run tauri build
 
 1. ~~Scaffold Tauri 2.x + shared tokens + placeholder icons~~
 2. ~~Data wiring: `fetch_payload` + React rendering of hero, activity, models~~
-3. Full popover parity with mac/ (trend chart, forecast, pulse, stats, plan pills)
+3. ~~Full popover parity with mac/ (trend chart, forecast, pulse, stats, plan pills)~~
 4. ~~Currency picker instant switch + Frankfurter fetch~~
 5. ~~Linux release workflow (`ubuntu-latest`): `.deb`, `.AppImage`, `.rpm`~~ (Flatpak manifest still TODO)
 6. ~~Windows release workflow (`windows-latest`): `.msi`~~

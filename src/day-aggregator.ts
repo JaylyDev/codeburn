@@ -1,4 +1,5 @@
 import type { DailyEntry } from './daily-cache.js'
+import { localDateString } from './format.js'
 import type { PeriodData } from './menubar-json.js'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 
@@ -21,7 +22,7 @@ function emptyEntry(date: string): DailyEntry {
 }
 
 function dateKey(iso: string): string {
-  return iso.slice(0, 10)
+  return localDateString(new Date(iso))
 }
 
 export function aggregateProjectsIntoDays(projects: ProjectSummary[]): DailyEntry[] {

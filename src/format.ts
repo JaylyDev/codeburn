@@ -17,7 +17,7 @@ export function formatTokens(n: number): string {
 /// out to Intl.DateTimeFormat for every turn in a loop and avoids the UTC drift that bites
 /// `Date.toISOString().slice(0,10)` whenever the user runs this between local midnight and
 /// UTC midnight.
-function localDateString(d: Date): string {
+export function localDateString(d: Date): string {
   const y = d.getFullYear()
   const m = String(d.getMonth() + 1).padStart(2, '0')
   const day = String(d.getDate()).padStart(2, '0')

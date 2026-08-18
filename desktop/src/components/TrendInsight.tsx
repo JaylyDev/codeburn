@@ -1,26 +1,22 @@
 import { useState } from 'react'
-import type { DailyEntry } from '../lib/payload'
+import type { DailyEntry, DailyModel } from '../lib/payload'
 import type { CurrencyState } from '../lib/currency'
-import { formatCompactCurrency, formatCurrency } from '../lib/currency'
+import { formatCompactCurrency, formatCurrency, formatTokens } from '../lib/currency'
 import { todayKey, formatDateKey, addDays, startOfDay, prettyDate, shortDate } from '../lib/dates'
+import { ArrowUpRight, ArrowDownRight } from './Icons'
 
-const TREND_DAYS = 19
+/// 19 columns of 13px bars with 4px gaps = 319px, the widest chart that fits the 332px
+/// content width of a 360px popover (mirrors mac trendDays / trendBarWidth / trendBarGap).
+export const TREND_DAYS = 19
 const MAX_TOOLTIP_MODELS = 4
 const MIN_BAR_PCT = 2
 
 type TrendBar = {
   date: string
   cost: number
-  inputTokens: number
-  outputTokens: number
+  tokens: number
   isToday: boolean
-  topModels: Array<{ name: string; totalTokens?: number; inputTokens?: number; outputTokens?: number }>
-}
-
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`
-  return `${Math.round(n)}`
+  topModels: DailyModel[]
 }
 
 function buildBars(days: DailyEntry[]): TrendBar[] {
@@ -29,14 +25,12 @@ function buildBars(days: DailyEntry[]): TrendBar[] {
   const tk = todayKey()
   const bars: TrendBar[] = []
   for (let i = TREND_DAYS - 1; i >= 0; i--) {
-    const d = addDays(today, -i)
-    const key = formatDateKey(d)
+    const key = formatDateKey(addDays(today, -i))
     const entry = byDate.get(key)
     bars.push({
       date: key,
       cost: entry?.cost ?? 0,
-      inputTokens: entry?.inputTokens ?? 0,
-      outputTokens: entry?.outputTokens ?? 0,
+      tokens: (entry?.inputTokens ?? 0) + (entry?.outputTokens ?? 0),
       isToday: key === tk,
       topModels: entry?.topModels ?? [],
     })
@@ -64,11 +58,11 @@ type Props = {
 export function TrendInsight({ days, currency }: Props) {
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null)
   const bars = buildBars(days)
-  const totalTokens = bars.reduce((s, b) => s + b.inputTokens + b.outputTokens, 0)
+  const totalTokens = bars.reduce((s, b) => s + b.tokens, 0)
   const useTokens = totalTokens > 0
-  const metric = (b: TrendBar) => useTokens ? b.inputTokens + b.outputTokens : b.cost
+  const metric = (b: TrendBar) => useTokens ? b.tokens : b.cost
   const maxVal = Math.max(...bars.map(metric), 0.01)
-  const avgVal = bars.length > 0 ? bars.reduce((s, b) => s + metric(b), 0) / bars.length : 0
+  const avgVal = bars.reduce((s, b) => s + metric(b), 0) / bars.length
   const totalCost = bars.reduce((s, b) => s + b.cost, 0)
   const peak = bars.filter(b => metric(b) > 0).sort((a, b) => metric(b) - metric(a))[0]
   const yd = formatDateKey(addDays(startOfDay(new Date()), -1))
@@ -77,18 +71,19 @@ export function TrendInsight({ days, currency }: Props) {
 
   const fmtVal = (v: number) => useTokens ? `${formatTokens(v)} tok` : formatCompactCurrency(v, currency)
   const heroText = useTokens ? `${formatTokens(totalTokens)} tokens` : formatCurrency(totalCost, currency)
+  const hovered = hoveredIdx !== null ? bars[hoveredIdx] : null
 
   return (
     <div className="trend-insight">
-      <div className="trend-header">
-        <div className="trend-header-left">
-          <div className="trend-sublabel">Last {TREND_DAYS} days</div>
-          <div className="trend-hero-value">{heroText}</div>
+      <div className="insight-header">
+        <div>
+          <div className="insight-sublabel">Last {TREND_DAYS} days</div>
+          <div className="insight-hero">{heroText}</div>
         </div>
         {delta !== null && (
-          <div className="trend-delta">
-            <span className="trend-delta-arrow">{delta >= 0 ? '↗' : '↘'}</span>
-            {delta >= 0 ? '+' : ''}{Math.round(delta)}% vs prior {TREND_DAYS}d
+          <div className="delta-badge">
+            {delta >= 0 ? <ArrowUpRight size={9} /> : <ArrowDownRight size={9} />}
+            <span>{delta >= 0 ? '+' : ''}{Math.round(delta)}% vs prior {TREND_DAYS}d</span>
           </div>
         )}
       </div>
@@ -97,19 +92,20 @@ export function TrendInsight({ days, currency }: Props) {
         <div className="trend-bars">
           {bars.map((bar, i) => {
             const val = metric(bar)
-            const pct = maxVal > 0 ? (val / maxVal) * 100 : 0
-            const isHovered = hoveredIdx === i
+            const pct = (val / maxVal) * 100
+            const cls = [
+              'trend-bar',
+              bar.isToday ? 'trend-bar-today' : '',
+              val <= 0 ? 'trend-bar-empty' : '',
+              hoveredIdx === i ? 'trend-bar-hovered' : '',
+            ].join(' ')
             return (
               <div
                 key={bar.date}
                 className="trend-bar-col"
                 onMouseEnter={() => setHoveredIdx(i)}
               >
-                <div className="trend-bar-spacer" />
-                <div
-                  className={`trend-bar ${bar.isToday ? 'trend-bar-today' : ''} ${isHovered ? 'trend-bar-hovered' : ''}`}
-                  style={{ height: `${Math.max(MIN_BAR_PCT, pct)}%` }}
-                />
+                <div className={cls} style={{ height: `${Math.max(MIN_BAR_PCT, pct)}%` }} />
               </div>
             )
           })}
@@ -118,24 +114,25 @@ export function TrendInsight({ days, currency }: Props) {
           className="trend-avg-line"
           style={{ bottom: `${Math.min((avgVal / maxVal) * 100, 100)}%` }}
         />
-        {hoveredIdx !== null && bars[hoveredIdx] && (
-          <div className="trend-tooltip">
-            <div className="trend-tooltip-header">
-              <span>{prettyDate(bars[hoveredIdx].date)}</span>
-              <span className="trend-tooltip-value">{fmtVal(metric(bars[hoveredIdx]))}</span>
+        {hovered && (
+          <div className="bar-tooltip" role="tooltip">
+            <div className="bar-tooltip-header">
+              <span>{prettyDate(hovered.date)}</span>
+              <span className="bar-tooltip-value">{fmtVal(metric(hovered))}</span>
             </div>
-            {bars[hoveredIdx].topModels.slice(0, MAX_TOOLTIP_MODELS).map(m => (
-              <div key={m.name} className="trend-tooltip-model">
-                <span className="trend-tooltip-dot" />
-                <span className="trend-tooltip-name">{m.name}</span>
-                <span className="trend-tooltip-tokens">{formatTokens((m.totalTokens ?? 0) || ((m.inputTokens ?? 0) + (m.outputTokens ?? 0)))} tok</span>
+            {hovered.topModels.slice(0, MAX_TOOLTIP_MODELS).map(m => (
+              <div key={m.name} className="bar-tooltip-model">
+                <span className="bar-tooltip-dot" />
+                <span className="bar-tooltip-name">{m.name}</span>
+                <span className="bar-tooltip-tokens">{formatTokens(m.inputTokens + m.outputTokens)} tok</span>
+                <span className="bar-tooltip-split">({formatTokens(m.inputTokens)}/{formatTokens(m.outputTokens)})</span>
               </div>
             ))}
           </div>
         )}
       </div>
 
-      <div className="trend-mini-stats">
+      <div className="mini-stats">
         <div className="mini-stat">
           <div className="mini-stat-label">Avg/day</div>
           <div className="mini-stat-value">{fmtVal(avgVal)}</div>

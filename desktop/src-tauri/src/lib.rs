@@ -1,6 +1,9 @@
+mod autostart;
 mod cli;
 mod config;
 mod fx;
+mod plan;
+mod tray_badge;
 #[cfg(target_os = "linux")]
 mod tray_linux;
 
@@ -9,21 +12,25 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 static LAST_HIDDEN_MS: AtomicI64 = AtomicI64::new(0);
 
-use tauri::{AppHandle, Manager, WindowEvent};
-#[cfg(not(target_os = "linux"))]
-use tauri::Emitter;
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 #[cfg(target_os = "linux")]
 use tauri::Listener;
 
 #[cfg(not(target_os = "linux"))]
 use tauri::{
-    menu::{Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconEvent},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 
 use crate::cli::CodeburnCli;
 use crate::config::CurrencyConfig;
 use crate::fx::FxCache;
+
+const TRAY_ID: &str = "codeburn-tray";
+/// Second tray icon that carries today's spend as text, sitting next to the logo. The
+/// closest Windows and Linux panels get to the macOS menubar title.
+const BADGE_TRAY_ID: &str = "codeburn-badge";
+const POPOVER_LABEL: &str = "popover";
 
 /// Shared application state. Wraps the CLI handle + currency config + FX cache so every
 /// Tauri command sees the same instances. Interior Mutex keeps things simple; the state is
@@ -33,6 +40,7 @@ pub struct AppState {
     pub cli: Mutex<CodeburnCli>,
     pub config: Mutex<CurrencyConfig>,
     pub fx: FxCache,
+    pub plan: plan::PlanClient,
     #[cfg(target_os = "linux")]
     pub linux_tray: tray_linux::LinuxTrayHandle,
 }
@@ -50,6 +58,7 @@ pub fn run() {
                 cli: Mutex::new(CodeburnCli::resolve()),
                 config: Mutex::new(CurrencyConfig::load_or_default()),
                 fx: FxCache::new(),
+                plan: plan::PlanClient::new(),
                 #[cfg(target_os = "linux")]
                 linux_tray: linux_tray.clone(),
             };
@@ -61,8 +70,10 @@ pub fn run() {
             #[cfg(target_os = "linux")]
             init_tray_linux(app.handle().clone(), linux_tray);
 
-            if let Some(window) = app.get_webview_window("popover") {
+            if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
                 let _ = window.hide();
+                #[cfg(target_os = "windows")]
+                round_window_corners(&window);
             }
 
             Ok(())
@@ -74,8 +85,7 @@ pub fn run() {
                     let _ = window.hide();
                 }
                 WindowEvent::Focused(false) => {
-                    let now = now_ms();
-                    LAST_HIDDEN_MS.store(now, Ordering::Relaxed);
+                    LAST_HIDDEN_MS.store(now_ms(), Ordering::Relaxed);
                     let _ = window.hide();
                 }
                 _ => {}
@@ -83,9 +93,18 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::fetch_payload,
+            commands::cli_status,
             commands::set_currency,
             commands::open_terminal_command,
+            commands::open_claude_login,
             commands::quit_app,
+            commands::hide_popover,
+            commands::set_tray_tooltip,
+            commands::set_tray_badge,
+            commands::app_version,
+            commands::plan_usage,
+            commands::launch_at_login,
+            commands::set_launch_at_login,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -98,28 +117,68 @@ pub fn run() {
 
 #[cfg(not(target_os = "linux"))]
 fn build_tray_tauri(app: &AppHandle) -> tauri::Result<()> {
-    let Some(tray) = app.tray_by_id("codeburn-tray") else {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return Ok(());
     };
 
+    let open = MenuItem::with_id(app, "open", "Open CodeBurn", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
     let theme = MenuItem::with_id(app, "toggle_theme", "Toggle Dark/Light", true, None::<&str>)?;
     let report = MenuItem::with_id(app, "report", "Open Full Report", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit CodeBurn", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&refresh, &theme, &report, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &open,
+            &refresh,
+            &theme,
+            &report,
+            &PredefinedMenuItem::separator(app)?,
+            &quit,
+        ],
+    )?;
 
-    tray.set_menu(Some(menu))?;
+    tray.set_menu(Some(menu.clone()))?;
     tray.set_show_menu_on_left_click(false)?;
+    let _ = tray.set_tooltip(Some("CodeBurn"));
+    tray.on_menu_event(on_tray_menu_event);
+    tray.on_tray_icon_event(on_tray_icon_event);
 
-    tray.on_menu_event(|app, event| match event.id.as_ref() {
+    // The badge icon starts fully transparent and hidden; the frontend shows it once it has
+    // today's spend. Registering it right after the logo puts it beside the logo in the tray.
+    let blank = tauri::image::Image::new_owned(
+        vec![0u8; (BLANK_ICON_SIZE * BLANK_ICON_SIZE * 4) as usize],
+        BLANK_ICON_SIZE,
+        BLANK_ICON_SIZE,
+    );
+    TrayIconBuilder::with_id(BADGE_TRAY_ID)
+        .icon(blank)
+        .tooltip("CodeBurn")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(on_tray_menu_event)
+        .on_tray_icon_event(on_tray_icon_event)
+        .build(app)?
+        .set_visible(false)?;
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+const BLANK_ICON_SIZE: u32 = 16;
+
+#[cfg(not(target_os = "linux"))]
+fn on_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
+    match event.id.as_ref() {
         "quit" => app.exit(0),
+        "open" => show_popover(app, None),
         "refresh" => {
-            if let Some(window) = app.get_webview_window("popover") {
+            if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
                 let _ = window.emit("codeburn://refresh", ());
             }
         }
         "toggle_theme" => {
-            if let Some(window) = app.get_webview_window("popover") {
+            if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
                 let _ = window.emit("codeburn://toggle-theme", ());
             }
         }
@@ -127,30 +186,27 @@ fn build_tray_tauri(app: &AppHandle) -> tauri::Result<()> {
             let _ = cli::spawn_in_terminal(app, &["report"]);
         }
         _ => {}
-    });
+    }
+}
 
-    tray.on_tray_icon_event(|tray, event| {
-        match event {
-            TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                position,
-                ..
-            } => {
-                toggle_popover(tray.app_handle(), Some((position.x as i32, position.y as i32)));
-            }
-            TrayIconEvent::DoubleClick {
-                button: MouseButton::Left,
-                position,
-                ..
-            } => {
-                toggle_popover(tray.app_handle(), Some((position.x as i32, position.y as i32)));
-            }
-            _ => {}
+#[cfg(not(target_os = "linux"))]
+fn on_tray_icon_event(tray: &tauri::tray::TrayIcon, event: TrayIconEvent) {
+    match event {
+        TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            position,
+            ..
         }
-    });
-
-    Ok(())
+        | TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            position,
+            ..
+        } => {
+            toggle_popover(tray.app_handle(), Some((position.x as i32, position.y as i32)));
+        }
+        _ => {}
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -187,10 +243,28 @@ fn parse_click(payload: &str) -> Option<(i32, i32)> {
     Some((x, y))
 }
 
-/// Show or hide the popover. When `anchor` is `Some((x, y))`, position the popover
-/// centered horizontally on the click and just below it (Linux path, anchored to the
-/// StatusNotifier Activate coordinates). When `None`, snap it to the top-right of the
-/// primary monitor (non-Linux fallback + menu-driven invocations).
+/// Undecorated windows are square by default; ask DWM for the Windows 11 rounded corner so
+/// the acrylic backdrop is clipped to the same shape as the popover card. Silently ignored
+/// on Windows 10, where the corners stay square.
+#[cfg(target_os = "windows")]
+fn round_window_corners(window: &tauri::WebviewWindow) {
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    };
+    let Ok(hwnd) = window.hwnd() else { return };
+    let preference: u32 = DWMWCP_ROUND as u32;
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd.0 as _,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            &preference as *const u32 as *const std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+}
+
+/// A blur immediately followed by the tray click that caused it would re-open the popover;
+/// ignore show requests inside this window after a hide.
 const TOGGLE_DEBOUNCE_MS: i64 = 300;
 
 fn now_ms() -> i64 {
@@ -201,7 +275,7 @@ fn now_ms() -> i64 {
 }
 
 fn toggle_popover(app: &AppHandle, anchor: Option<(i32, i32)>) {
-    let Some(window) = app.get_webview_window("popover") else {
+    let Some(window) = app.get_webview_window(POPOVER_LABEL) else {
         return;
     };
     if window.is_visible().unwrap_or(false) {
@@ -213,63 +287,86 @@ fn toggle_popover(app: &AppHandle, anchor: Option<(i32, i32)>) {
     if now_ms() - last < TOGGLE_DEBOUNCE_MS {
         return;
     }
+    show_popover(app, anchor);
+}
+
+fn show_popover(app: &AppHandle, anchor: Option<(i32, i32)>) {
+    let Some(window) = app.get_webview_window(POPOVER_LABEL) else {
+        return;
+    };
+    // Position before showing so the first frame is already in place (no jump).
+    position_popover(&window, anchor);
     let _ = window.show();
     let _ = window.unminimize();
     position_popover(&window, anchor);
     let _ = window.set_focus();
+    let _ = window.emit("codeburn://shown", ());
 }
 
+/// Places the popover against the taskbar / panel edge of the monitor that owns the click
+/// (or the cursor, when the request came from a menu). The work area already excludes the
+/// taskbar on Windows and panels on Linux, so we never need to guess their heights: the
+/// popover sits `MARGIN` inside the work area, horizontally centred on the anchor and
+/// clamped to the screen.
 fn position_popover(window: &tauri::WebviewWindow, anchor: Option<(i32, i32)>) {
     const POPOVER_WIDTH_LOGICAL: f64 = 360.0;
     const POPOVER_HEIGHT_LOGICAL: f64 = 660.0;
-    const MARGIN_LOGICAL: f64 = 12.0;
-    const TOP_PANEL_LOGICAL: f64 = 36.0;
-    const TASKBAR_LOGICAL: f64 = 52.0;
+    const MARGIN_LOGICAL: f64 = 8.0;
 
-    let Ok(Some(monitor)) = window.primary_monitor() else {
+    let point = anchor
+        .filter(|(x, y)| *x > 0 || *y > 0)
+        .map(|(x, y)| (x as f64, y as f64))
+        .or_else(|| window.cursor_position().ok().map(|p| (p.x, p.y)));
+
+    let monitor = point
+        .and_then(|(x, y)| window.monitor_from_point(x, y).ok().flatten())
+        .or_else(|| window.primary_monitor().ok().flatten());
+    let Some(monitor) = monitor else {
         return;
     };
+
     let scale = monitor.scale_factor();
+    let pop_w = (POPOVER_WIDTH_LOGICAL * scale).round() as i32;
+    let pop_h = (POPOVER_HEIGHT_LOGICAL * scale).round() as i32;
+    let margin = (MARGIN_LOGICAL * scale).round() as i32;
+
+    let area = monitor.work_area();
+    let area_x = area.position.x;
+    let area_y = area.position.y;
+    let area_w = area.size.width as i32;
+    let area_h = area.size.height as i32;
     let screen = monitor.size();
-    let pop_w = (POPOVER_WIDTH_LOGICAL * scale) as i32;
-    let pop_h = (POPOVER_HEIGHT_LOGICAL * scale) as i32;
-    let margin = (MARGIN_LOGICAL * scale) as i32;
-    let panel = (TOP_PANEL_LOGICAL * scale) as i32;
-    let taskbar = (TASKBAR_LOGICAL * scale) as i32;
-    let screen_w = screen.width as i32;
-    let screen_h = screen.height as i32;
+    let screen_pos = monitor.position();
 
-    let usable_anchor = anchor.filter(|(ax, ay)| *ax > 0 || *ay > 0);
+    let (anchor_x, anchor_y) = point
+        .map(|(x, y)| (x as i32, y as i32))
+        .unwrap_or((area_x + area_w - pop_w / 2 - margin, area_y + area_h));
 
-    let (x, y) = match usable_anchor {
-        Some((click_x, click_y)) => {
-            let desired_x = click_x - pop_w / 2;
-            let max_x = (screen_w - pop_w - margin).max(margin);
-            let clamped_x = desired_x.clamp(margin, max_x);
-            let below_midpoint = click_y > screen_h / 2;
-            let desired_y = if below_midpoint {
-                click_y - pop_h - taskbar
-            } else {
-                click_y + margin
-            };
-            let max_y = (screen_h - pop_h - taskbar).max(margin);
-            let clamped_y = desired_y.clamp(margin, max_y);
-            (clamped_x, clamped_y)
-        }
-        None => {
-            let x = (screen_w - pop_w - margin).max(0);
-            let y = (screen_h - pop_h - taskbar).max(panel);
-            (x, y)
-        }
+    let min_x = area_x + margin;
+    let max_x = (area_x + area_w - pop_w - margin).max(min_x);
+    let x = (anchor_x - pop_w / 2).clamp(min_x, max_x);
+
+    // Which edge holds the taskbar? Whichever side the work area was trimmed on. If the
+    // taskbar is at the top (or the anchor is in the top half with no bottom taskbar) the
+    // popover drops down from the top edge; otherwise it rises from the bottom edge.
+    let trimmed_top = area_y > screen_pos.y;
+    let trimmed_bottom = (area_y + area_h) < (screen_pos.y + screen.height as i32);
+    let anchor_in_top_half = anchor_y < screen_pos.y + (screen.height as i32) / 2;
+    let open_downward = trimmed_top || (!trimmed_bottom && anchor_in_top_half);
+
+    let y = if open_downward {
+        area_y + margin
+    } else {
+        (area_y + area_h - pop_h - margin).max(area_y + margin)
     };
 
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
 }
 
 mod commands {
-    use super::AppState;
+    use super::{AppState, POPOVER_LABEL};
     use serde_json::Value;
-    use tauri::{AppHandle, State};
+    use tauri::{AppHandle, Manager, State};
 
     #[tauri::command]
     pub async fn fetch_payload(
@@ -284,13 +381,31 @@ mod commands {
             .map_err(|e| e.to_string())
     }
 
+    /// Re-resolves the CLI each call so a freshly installed `codeburn` is picked up
+    /// without restarting the tray app.
+    #[tauri::command]
+    pub async fn cli_status(state: State<'_, AppState>) -> Result<crate::cli::CliStatus, String> {
+        let fresh = crate::cli::CodeburnCli::resolve();
+        let status = fresh.status().await;
+        if status.found {
+            if let Ok(mut guard) = state.cli.lock() {
+                *guard = fresh;
+            }
+        }
+        Ok(status)
+    }
+
     #[tauri::command]
     pub async fn set_currency(
         code: String,
         state: State<'_, AppState>,
     ) -> Result<crate::fx::CurrencyApplied, String> {
         let symbol = crate::fx::symbol_for(&code);
-        let rate = state.fx.rate_for(&code).await.unwrap_or(1.0);
+        let rate = state
+            .fx
+            .rate_for(&code)
+            .await
+            .ok_or_else(|| format!("Exchange rate for {code} is unavailable right now"))?;
         state
             .config
             .lock()
@@ -307,7 +422,88 @@ mod commands {
     }
 
     #[tauri::command]
+    pub fn open_claude_login(app: AppHandle) -> Result<(), String> {
+        crate::cli::spawn_claude_login(&app).map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
     pub fn quit_app(app: AppHandle) {
         app.exit(0);
+    }
+
+    #[tauri::command]
+    pub fn hide_popover(app: AppHandle) {
+        if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
+            super::LAST_HIDDEN_MS.store(super::now_ms(), std::sync::atomic::Ordering::Relaxed);
+            let _ = window.hide();
+        }
+    }
+
+    /// The tray cannot render text on Windows, so today's spend lives in the tooltip.
+    #[tauri::command]
+    pub fn set_tray_tooltip(app: AppHandle, text: String) {
+        #[cfg(not(target_os = "linux"))]
+        for id in [super::TRAY_ID, super::BADGE_TRAY_ID] {
+            if let Some(tray) = app.tray_by_id(id) {
+                let _ = tray.set_tooltip(Some(text.as_str()));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = (app, text);
+        }
+    }
+
+    /// `text` is a short spend string ("$87", "142", "1.2K"); `None` hides the badge icon.
+    #[tauri::command]
+    pub fn set_tray_badge(app: AppHandle, text: Option<String>) -> Result<(), String> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let Some(badge) = app.tray_by_id(super::BADGE_TRAY_ID) else {
+                return Ok(());
+            };
+            match text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                Some(t) => {
+                    let icon = crate::tray_badge::render(
+                        t,
+                        crate::tray_badge::small_icon_size(),
+                        crate::tray_badge::taskbar_is_dark(),
+                    );
+                    // Windows can only modify an icon that is currently shown, so show
+                    // first (re-adds the previous bitmap) and then swap the bitmap.
+                    badge.set_visible(true).map_err(|e| e.to_string())?;
+                    badge.set_icon(Some(icon)).map_err(|e| e.to_string())?;
+                }
+                None => {
+                    badge.set_visible(false).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = (app, text);
+        }
+        Ok(())
+    }
+
+    #[tauri::command]
+    pub fn app_version(app: AppHandle) -> String {
+        app.package_info().version.to_string()
+    }
+
+    #[tauri::command]
+    pub fn launch_at_login() -> bool {
+        crate::autostart::is_enabled()
+    }
+
+    #[tauri::command]
+    pub fn set_launch_at_login(enabled: bool) -> Result<bool, String> {
+        crate::autostart::set_enabled(enabled).map_err(|e| e.to_string())?;
+        Ok(crate::autostart::is_enabled())
+    }
+
+    #[tauri::command]
+    pub async fn plan_usage(state: State<'_, AppState>) -> Result<crate::plan::PlanUsage, String> {
+        state.plan.fetch().await.map_err(|e| e.to_string())
     }
 }
