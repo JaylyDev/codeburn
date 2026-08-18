@@ -3195,7 +3195,9 @@ export function findContextBloatCandidates(projects: ProjectSummary[]): ContextB
 
     for (const session of sessions) {
       const inputTokens = sessionEffectiveContextTokens(session)
-      const outputTokens = session.totalOutputTokens
+      // Reasoning is stored separately from ordinary output, but both are
+      // generated tokens for this detector. Reports already use their sum.
+      const outputTokens = session.totalOutputTokens + session.totalReasoningTokens
       const ratio = inputTokens / Math.max(outputTokens, 1)
       const currentMs = new Date(session.firstTimestamp).getTime()
       const gapMs = previousTimestampMs !== null ? currentMs - previousTimestampMs : null
