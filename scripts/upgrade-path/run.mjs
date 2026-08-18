@@ -332,7 +332,7 @@ check(JSON.stringify(stripGenerated(warm.menubar)) === JSON.stringify(stripGener
 const afterMtimes = shardMtimes(upgradeCache)
 const republished = Object.keys(afterMtimes).filter(n => n !== 'envelope.json' && beforeMtimes[n] !== afterMtimes[n])
 const retired = Object.keys(beforeMtimes).filter(n => n !== 'envelope.json' && !(n in afterMtimes))
-const churnNote = 'known defect, follow-up issue pending: a date-ranged run republishes the month shards it skipped'
+const churnNote = 'known defect, see #1032: a date-ranged run republishes the month shards it skipped'
 if (retired.length) console.log(`  note  ${retired.length} shard(s) republished under a new name with identical content (${churnNote}): ${retired.join(', ')}`)
 else if (republished.length) console.log(`  note  ${republished.length} shard(s) rewritten in place (${churnNote}): ${republished.join(', ')}`)
 else ok('no shard republished on an unchanged corpus')
