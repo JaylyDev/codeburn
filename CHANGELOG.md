@@ -23,6 +23,7 @@
 - **One rule for every cache file.** `CODEBURN_CACHE_DIR` when set, otherwise `~/.cache/codeburn`. `XDG_CACHE_HOME` is no longer consulted; the sync ledger, the only file that ever honored it, is merged into the canonical location on first read and the legacy copy is retired, so nothing is re-uploaded after the move. (#972)
 
 ### Fixed (Desktop & Menubar)
+- **First launch no longer asks to control System Events.** The macOS menubar registered its login item by driving System Events over AppleScript, which made macOS put up an Automation consent dialog the first time the app ran. It now registers itself through `SMAppService.mainApp`, an in-process call that needs no Automation grant; there is no AppleScript fallback, so a failure logs and leaves the login item unset rather than bringing the prompt back. The same `codeburn.loginItemRegistered` guard still limits this to the first launch, so a login item you removed by hand stays removed. (#1026)
 - **The resident `codeburn serve` child.** The first real panel request is also the cache warm-up, so startup never runs an artificial warm-up query beside a duplicate one-shot child; each served command carries its own read-only option allowlist, and anything outside it falls back to a normal spawn; the child exits when its stdin closes, so it can never outlive the app. Requests whose response exceeds the 16 MiB frame limit still replace the child, but that deliberate kill no longer spends the resident's unexpected-death budget. (#972)
 
 ### Fixed
