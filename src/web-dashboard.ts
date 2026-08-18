@@ -90,6 +90,15 @@ function openBrowser(url: string): void {
   }
 }
 
+export function injectDashboardBootstrap(html: string, payload: unknown): string {
+  const json = JSON.stringify(payload)
+  if (json === undefined) throw new TypeError('dashboard bootstrap payload is not serializable')
+  // Keep the JSON safe at the boundary where it enters an HTML script. This is
+  // deliberately inside the helper so callers cannot forget the escape.
+  const safeJson = json.replace(/</g, String.fromCharCode(92) + 'u003c')
+  return html.replace('<script type="module"', () => `<script>window.__CODEBURN_BOOTSTRAP__=${safeJson}</script>\n    <script type="module"`)
+}
+
 export async function runWebDashboard(opts: {
   period: string
   provider: string
@@ -180,9 +189,7 @@ export async function runWebDashboard(opts: {
     const html = await readFile(filePath, 'utf8')
     const payload = await getLocalPayload(opts.period, opts.provider, opts.from, opts.to)
     const devices = [{ id: 'local', name: hostname(), local: true, payload }]
-    // Escape every '<' so a device/model/project name can't close the <script>.
-    const json = JSON.stringify({ devices }).replace(/</g, String.fromCharCode(92) + 'u003c')
-    const injected = html.replace('<script type="module"', `<script>window.__CODEBURN_BOOTSTRAP__=${json}</script>\n    <script type="module"`)
+    const injected = injectDashboardBootstrap(html, { devices })
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
     res.end(injected)
   }

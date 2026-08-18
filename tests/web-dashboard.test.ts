@@ -6,7 +6,42 @@ import type { Server } from 'http'
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
-import { runWebDashboard } from '../src/web-dashboard.js'
+import { injectDashboardBootstrap, runWebDashboard } from '../src/web-dashboard.js'
+
+describe('web dashboard bootstrap injection', () => {
+  it('keeps replacement syntax in a payload value literal', () => {
+    const payloadValue = "$`|$'|$&|$1"
+    const payload = { devices: [{ name: payloadValue }] }
+    const html = '<!doctype html><script type="module" src="/app.js"></script>'
+
+    const injected = injectDashboardBootstrap(html, payload)
+
+    expect(injected).toContain(`window.__CODEBURN_BOOTSTRAP__=${JSON.stringify(payload)}</script>`)
+    expect(injected).toContain(`"name":"${payloadValue}"`)
+  })
+
+  it('escapes script-closing payload values and preserves the served bootstrap payload', () => {
+    const hostileName = '</script><script>globalThis.bootstrapPwned = true</script>'
+    const payload = {
+      devices: [{
+        id: 'local',
+        name: hostileName,
+        payload: { current: { topProjects: [{ name: hostileName }] } },
+      }],
+    }
+    const html = '<!doctype html><script type="module" src="/app.js"></script>'
+
+    const servedHtml = injectDashboardBootstrap(html, payload)
+    const marker = 'window.__CODEBURN_BOOTSTRAP__='
+    const start = servedHtml.indexOf(marker) + marker.length
+    const end = servedHtml.indexOf('</script>', start)
+    const serialized = servedHtml.slice(start, end)
+
+    expect(serialized).not.toContain('</script')
+    expect(serialized).toContain('\\u003c/script>')
+    expect(JSON.parse(serialized)).toEqual(payload)
+  })
+})
 
 // Regression guard for the original bug: a bad `period` query used to hit
 // process.exit(1) and kill the long-running dashboard server. The handlers must
