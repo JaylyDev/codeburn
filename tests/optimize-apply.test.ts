@@ -723,6 +723,7 @@ describe('finding class', () => {
       'unused-agents': makeFinding('unused-agents', CMD_FIX, { kind: 'archive', names: ['ghost'] }),
       'unused-skills': makeFinding('unused-skills', CMD_FIX, { kind: 'archive', names: ['ghost'] }),
       'unused-commands': makeFinding('unused-commands', CMD_FIX, { kind: 'archive', names: ['ghost'] }),
+      'recurring-context': makeFinding('recurring-context', PROMPT_FIX),
     }
 
     const planCtx: PlanContext = { homeDir: fx.home, cwd: fx.project, shell: '/bin/zsh', claudeVersion: () => '2.1.130' }

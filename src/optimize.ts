@@ -1,5 +1,7 @@
 import chalk from 'chalk'
+import stripAnsi from 'strip-ansi'
 import { isReadShapedBashCommand } from './bash-utils.js'
+import { createHash } from 'crypto'
 import { readdir, stat } from 'fs/promises'
 import { existsSync, statSync } from 'fs'
 import { basename, join } from 'path'
@@ -169,6 +171,17 @@ const DEFER_THRESHOLD_DEFAULT_PERCENT = 10
 const DEFER_THRESHOLD_MAX_PERCENT = 100
 const DEFER_THRESHOLD_MIN_TOKENS_PER_SESSION = 5_000
 const DEFER_THRESHOLD_MEDIUM_IMPACT_TOKENS = 200_000
+// "recurring-context": the same block opening session after session. 1.5 KB
+// is roughly 400 tokens at BASH_TOKENS_PER_CHAR — below that a repeated
+// opener costs too little to be worth a habit change, and five sessions is
+// where "I keep pasting this" stops looking like coincidence.
+const RECURRING_CONTEXT_MIN_CHARS = 1_500
+const RECURRING_CONTEXT_MIN_SESSIONS = 5
+const RECURRING_CONTEXT_NORMALIZE_SLACK = 4
+const RECURRING_CONTEXT_PREVIEW = 3
+const RECURRING_CONTEXT_PREVIEW_CHARS = 80
+const RECURRING_CONTEXT_MEDIUM_IMPACT_TOKENS = 50_000
+const RECURRING_CONTEXT_HIGH_IMPACT_TOKENS = 200_000
 
 // ============================================================================
 // Scoring constants
@@ -264,6 +277,7 @@ export type FindingId =
   | 'unused-agents'
   | 'unused-skills'
   | 'unused-commands'
+  | 'recurring-context'
 
 /// How a finding is meant to be acted on:
 /// - `fix`   CodeBurn can write the change itself (`codeburn optimize --apply`)
@@ -301,6 +315,7 @@ export const FINDING_CLASS: Record<FindingId, FindingClass> = {
   'unused-agents': 'fix',
   'unused-skills': 'fix',
   'unused-commands': 'fix',
+  'recurring-context': 'nudge',
 }
 
 /// Ids whose plan is built from the `apply` payload: without it the plan
@@ -340,6 +355,10 @@ export const FINDING_BASIS: Record<FindingId, FindingBasis> = {
   'unused-agents': 'estimated',            // count x TOKENS_PER_AGENT_DEF
   'unused-skills': 'estimated',            // count x TOKENS_PER_SKILL_DEF
   'unused-commands': 'estimated',          // count x TOKENS_PER_COMMAND_DEF
+  // Provider usage is per API call: the first turn's input tokens mix the
+  // system prompt, tool schemas and CLAUDE.md in with the pasted block, so
+  // nothing counted isolates the block. Its size is modelled from its bytes.
+  'recurring-context': 'estimated',        // block chars x BASH_TOKENS_PER_CHAR x repeats
 }
 
 /// Scope label for a setting that lives in ~/.zshrc / ~/.bashrc. The MCP
@@ -510,11 +529,22 @@ export type ApiCallMeta = {
   recent?: boolean
 }
 
+/// One session's opening paste. `hash` groups sessions that open with the
+/// same block; `chars` is the block's length, a floor for a block long
+/// enough that the parser capped its text.
+export type SessionOpener = {
+  hash: string
+  chars: number
+  project: string
+  preview: string
+}
+
 type ScanData = {
   toolCalls: ToolCall[]
   projectCwds: Set<string>
   apiCalls: ApiCallMeta[]
   userMessages: string[]
+  openers: SessionOpener[]
 }
 
 // ============================================================================
@@ -601,6 +631,53 @@ type ScanFileResult = {
   cwds: string[]
   apiCalls: ApiCallMeta[]
   userMessages: string[]
+  openers: SessionOpener[]
+}
+
+/// Whitespace-insensitive so the same block reflowed by a different paste
+/// still groups, and ANSI-free so terminal output pasted twice matches.
+function normalizeOpener(text: string): string {
+  return stripAnsi(text).replace(/\s+/g, ' ').trim()
+}
+
+const MACHINE_PROMPT_HEAD_BYTES = 2048
+const MACHINE_PROMPT_PATTERN = /"promptSource"\s*:\s*"sdk"|"isSidechain"\s*:\s*true/
+
+/// True when a program wrote this prompt rather than a person pasting it: an
+/// SDK caller, or a parent agent writing a subagent's task. Either repeats by
+/// design and has no home in CLAUDE.md. A user entry over the parser's
+/// large-line threshold — routine for generated prompts — comes back without
+/// its root flags, so those are read off the raw line instead: the ends of it,
+/// since the fields sit either side of the message that made the line large.
+function isMachineWrittenPrompt(entry: Record<string, unknown>, line: string | Buffer): boolean {
+  if (entry['promptSource'] === 'sdk' || entry['isSidechain'] === true) return true
+  const edge = (start: number, end: number): string =>
+    typeof line === 'string' ? line.slice(start, end) : line.subarray(start, end).toString('utf-8')
+  const head = edge(0, MACHINE_PROMPT_HEAD_BYTES)
+  const tail = edge(Math.max(MACHINE_PROMPT_HEAD_BYTES, line.length - MACHINE_PROMPT_HEAD_BYTES), line.length)
+  return MACHINE_PROMPT_PATTERN.test(head) || MACHINE_PROMPT_PATTERN.test(tail)
+}
+
+/// A session's opening block, or null when it is too small to matter or is
+/// not a paste at all: system reminders carry CLAUDE.md and hook output,
+/// slash command wrappers refer to a file that already exists. `chars` is a
+/// floor: the parser caps the text of a very large user entry, so a huge
+/// block is sized at that cap rather than its true length.
+function toSessionOpener(text: string, project: string): SessionOpener | null {
+  if (text.length < RECURRING_CONTEXT_MIN_CHARS) return null
+  const head = text.trimStart()
+  if (head.startsWith('<system-reminder>') || head.startsWith('<command-name>') || head.startsWith('<command-message>')) return null
+  // Normalizing before the cap is what lets a re-flowed paste hash the same;
+  // the pre-slice keeps the work per session bounded however long the block
+  // is, with slack for whitespace that expands under re-flow.
+  const normalized = normalizeOpener(text.slice(0, OPTIMIZE_TEXT_CAP * RECURRING_CONTEXT_NORMALIZE_SLACK))
+    .slice(0, OPTIMIZE_TEXT_CAP)
+  return {
+    hash: createHash('sha1').update(normalized).digest('hex'),
+    chars: text.length,
+    project,
+    preview: normalized.slice(0, RECURRING_CONTEXT_PREVIEW_CHARS),
+  }
 }
 
 function inRange(timestamp: string | undefined, range: DateRange | undefined): boolean {
@@ -625,8 +702,12 @@ export async function scanJsonlFile(
   const cwds: string[] = []
   const apiCalls: ApiCallMeta[] = []
   const userMessages: string[] = []
+  const openers: SessionOpener[] = []
   const sessionId = basename(filePath, '.jsonl')
   let lastVersion = ''
+  // The opening block is the first user message carrying text; anything
+  // later in the session is not what the user opens with.
+  let sawUserText = false
 
   const skipThreshold = dateRange
     ? new Date(dateRange.start.getTime() - 86_400_000).toISOString()
@@ -656,6 +737,11 @@ export async function scanJsonlFile(
       const msgContent = msg?.content
       if (typeof msgContent === 'string') {
         userMessages.push(msgContent.slice(0, OPTIMIZE_TEXT_CAP))
+        if (!sawUserText) {
+          sawUserText = true
+          const opener = isMachineWrittenPrompt(entry, line) ? null : toSessionOpener(msgContent, project)
+          if (opener) openers.push(opener)
+        }
       } else if (Array.isArray(msgContent)) {
         let remaining = OPTIMIZE_TEXT_CAP
         for (const block of msgContent) {
@@ -664,6 +750,11 @@ export async function scanJsonlFile(
             const text = block.text.slice(0, remaining)
             userMessages.push(text)
             remaining -= text.length
+            if (!sawUserText) {
+              sawUserText = true
+              const opener = isMachineWrittenPrompt(entry, line) ? null : toSessionOpener(block.text, project)
+              if (opener) openers.push(opener)
+            }
           }
         }
       }
@@ -696,7 +787,7 @@ export async function scanJsonlFile(
     }
   }
 
-  return { calls, cwds, apiCalls, userMessages }
+  return { calls, cwds, apiCalls, userMessages, openers }
 }
 
 // The session scan reads Claude Code transcripts only, so a `--provider` that
@@ -709,13 +800,14 @@ export function providerCoversClaude(provider?: string): boolean {
 
 async function scanSessions(dateRange?: DateRange, provider?: string): Promise<ScanData> {
   if (!providerCoversClaude(provider)) {
-    return { toolCalls: [], projectCwds: new Set(), apiCalls: [], userMessages: [] }
+    return { toolCalls: [], projectCwds: new Set(), apiCalls: [], userMessages: [], openers: [] }
   }
   const sources = await discoverAllSessions('claude')
   const allCalls: ToolCall[] = []
   const allCwds = new Set<string>()
   const allApiCalls: ApiCallMeta[] = []
   const allUserMessages: string[] = []
+  const allOpeners: SessionOpener[] = []
 
   const tasks: Array<{ file: string; project: string }> = []
   for (const source of sources) {
@@ -727,14 +819,15 @@ async function scanSessions(dateRange?: DateRange, provider?: string): Promise<S
   }
 
   await runWithConcurrency(tasks, FILE_READ_CONCURRENCY, async ({ file, project }) => {
-    const { calls, cwds, apiCalls, userMessages } = await scanJsonlFile(file, project, dateRange)
+    const { calls, cwds, apiCalls, userMessages, openers } = await scanJsonlFile(file, project, dateRange)
     allCalls.push(...calls)
     for (const cwd of cwds) allCwds.add(cwd)
     allApiCalls.push(...apiCalls)
     allUserMessages.push(...userMessages)
+    allOpeners.push(...openers)
   })
 
-  return { toolCalls: allCalls, projectCwds: allCwds, apiCalls: allApiCalls, userMessages: allUserMessages }
+  return { toolCalls: allCalls, projectCwds: allCwds, apiCalls: allApiCalls, userMessages: allUserMessages, openers: allOpeners }
 }
 
 // ============================================================================
@@ -2636,6 +2729,60 @@ export function detectBashBloat(): WasteFinding | null {
   }
 }
 
+/// The same long block opening many sessions: a spec, a repo dump, a standing
+/// brief. Every repeat is input tokens for context that could live in
+/// CLAUDE.md or in a file read on demand. The first paste is the honest cost
+/// of saying it once, so only the repeats count as savings.
+export function detectRecurringContext(openers: SessionOpener[]): WasteFinding | null {
+  type Group = { sessions: number; chars: number; preview: string; projects: Set<string> }
+  const groups = new Map<string, Group>()
+  for (const o of openers) {
+    const g = groups.get(o.hash)
+    if (!g) {
+      groups.set(o.hash, { sessions: 1, chars: o.chars, preview: o.preview, projects: new Set([o.project]) })
+      continue
+    }
+    g.sessions++
+    // Only the hashed prefix is known to match, so size the block by the
+    // smallest occurrence rather than claiming the longest.
+    g.chars = Math.min(g.chars, o.chars)
+    g.projects.add(o.project)
+  }
+
+  const repeated = [...groups.values()]
+    .filter(g => g.sessions >= RECURRING_CONTEXT_MIN_SESSIONS)
+    .map(g => ({ ...g, tokens: Math.round((g.sessions - 1) * g.chars * BASH_TOKENS_PER_CHAR) }))
+    .sort((a, b) => b.tokens - a.tokens)
+  if (repeated.length === 0) return null
+
+  const tokensSaved = repeated.reduce((sum, g) => sum + g.tokens, 0)
+  const top = repeated[0]
+  const preview = repeated.slice(0, RECURRING_CONTEXT_PREVIEW)
+  const list = preview
+    .map(g => {
+      const where = g.projects.size === 1
+        ? [...g.projects][0].split('-').filter(Boolean).pop() ?? [...g.projects][0]
+        : `${g.projects.size} projects`
+      return `"${g.preview}..." — ${g.sessions} sessions in ${where}, ~${formatTokens(g.tokens)} tokens`
+    })
+    .join('; ')
+  const extra = repeated.length > preview.length ? `; +${repeated.length - preview.length} more` : ''
+
+  return {
+    id: 'recurring-context',
+    title: `Same ${(top.chars / 1024).toFixed(1)} KB block pasted at the start of ${top.sessions} sessions`,
+    explanation: `These sessions open with a block you have pasted before, so you pay input tokens for the same context every time: ${list}${extra}. Standing rules belong in CLAUDE.md; reference material belongs in a file Claude reads on demand. Only the repeats are counted, not the first paste.`,
+    impact: tokensSaved >= RECURRING_CONTEXT_HIGH_IMPACT_TOKENS ? 'high' : tokensSaved >= RECURRING_CONTEXT_MEDIUM_IMPACT_TOKENS ? 'medium' : 'low',
+    tokensSaved,
+    fix: {
+      type: 'paste',
+      destination: 'prompt',
+      label: 'Ask Claude to give this block a permanent home:',
+      text: `I open many sessions by pasting this block:\n"${top.preview}..."\nMove it into CLAUDE.md if it is a standing rule, or into a file you read on demand if it is reference material, then tell me the one-line pointer to start sessions with instead.`,
+    },
+  }
+}
+
 function sessionTokenTotal(session: ProjectSummary['sessions'][number]): number {
   return session.totalInputTokens
     + session.totalOutputTokens
@@ -3183,7 +3330,7 @@ export async function scanAndDetect(
 
   const costRate = computeInputCostRate(projects)
   const scanCoversClaude = providerCoversClaude(provider)
-  const { toolCalls, projectCwds, apiCalls, userMessages } = await scanSessions(dateRange, provider)
+  const { toolCalls, projectCwds, apiCalls, userMessages, openers } = await scanSessions(dateRange, provider)
   const mcpCoverage = aggregateMcpCoverage(projects)
 
   const findings: WasteFinding[] = []
@@ -3223,6 +3370,7 @@ export async function scanAndDetect(
     () => detectSessionOutliers(projects, outlierExclusions),
     claudeOnly(() => detectBloatedClaudeMd(projectCwds)),
     claudeOnly(() => detectBashBloat()),
+    claudeOnly(() => detectRecurringContext(openers)),
   ]
   for (const detect of syncDetectors) {
     const finding = detect()
