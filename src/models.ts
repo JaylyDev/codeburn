@@ -307,7 +307,7 @@ const BUILTIN_ALIASES: Record<string, string> = {
   // reports that quote literal slugs (e.g. forum.cursor.com/t/154933).
   'claude-4-sonnet':                'claude-sonnet-4',
   'claude-4-sonnet-1m':             'claude-sonnet-4',
-  'claude-4-sonnet-thinking':       'claude-sonnet-4-5',
+  'claude-4-sonnet-thinking':       'claude-sonnet-4',
   'claude-4.5-sonnet':              'claude-sonnet-4-5',
   'claude-4.5-sonnet-thinking':     'claude-sonnet-4-5',
   'claude-4.6-sonnet':              'claude-sonnet-4-6',
@@ -791,6 +791,11 @@ function shouldWarnAboutUnknownModel(name: string): boolean {
   return true
 }
 
+/** Render provider-supplied model IDs without terminal control characters. */
+export function sanitizeModelForDisplay(model: string): string {
+  return model.replace(/[\x00-\x1F\x7F-\x9F]/g, '?').slice(0, 200)
+}
+
 export function calculateCost(
   model: string,
   inputTokens: number,
@@ -808,7 +813,7 @@ export function calculateCost(
       // Strip control characters and cap length: model names come from JSONL
       // payloads written by external tools, so a hostile or corrupt file
       // could embed terminal escape sequences here.
-      const safeName = model.replace(/[\x00-\x1F\x7F-\x9F]/g, '?').slice(0, 200)
+      const safeName = sanitizeModelForDisplay(model)
       const aliasHint = `Map it with: codeburn model-alias "${safeName}" <known-model>, or track local-model savings with: codeburn model-savings "${safeName}" <baseline-model>`
       process.stderr.write(
         `codeburn: no pricing data for model "${safeName}" — costs for this model will show $0. ` +

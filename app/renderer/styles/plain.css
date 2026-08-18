@@ -640,6 +640,9 @@ td:first-child { font-size: var(--fs-body); font-weight: var(--fw-body); }
 .opt-waste { min-width: 0; }
 .opt-summary { padding: 0 0 10px; color: var(--mut); font-size: 11.5px; font-variant-numeric: tabular-nums; }
 .opt-findings { display: grid; min-width: 0; }
+.opt-group { padding: 11px 0 5px; color: var(--mut2); font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
+.opt-group:first-child { padding-top: 0; }
+.opt-group + .opt-finding { border-top: 0; }
 .opt-finding { display: grid; align-items: center; column-gap: 12px; min-height: 43px; border-top: 1px solid var(--line2); }
 .opt-finding:first-child { border-top: 0; }
 .opt-finding-legacy { grid-template-columns: 28px minmax(0, 1fr) 104px 86px; }
@@ -668,6 +671,15 @@ td:first-child { font-size: var(--fs-body); font-weight: var(--fw-body); }
 .opt-fix-code { max-width: 100%; overflow-x: auto; margin: 0; padding: 10px 11px; border: 1px solid var(--line); border-radius: 6px; background: var(--phead); color: var(--ink); font-family: var(--mono); font-size: 11px; line-height: 1.5; white-space: pre; }
 .opt-fix-command .opt-fix-code code::before { content: '$ '; color: var(--mut2); user-select: none; }
 .opt-copy { flex: 0 0 auto; padding: 4px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--mut); font: inherit; font-size: 10.5px; cursor: pointer; }
+.opt-applied { padding-top: 12px; }
+.opt-applied-row { display: grid; grid-template-columns: 16px minmax(0, 1fr) 110px 140px; align-items: center; column-gap: 12px; min-height: 34px; border-top: 1px solid var(--line2); }
+.opt-applied-glyph { color: var(--mut2); font-family: var(--mono); font-size: 12px; }
+.opt-applied-verdict { color: var(--mut); font-size: 10.5px; }
+.opt-applied-worked .opt-applied-glyph, .opt-applied-worked .opt-applied-verdict { color: var(--ok); }
+.opt-applied-partial .opt-applied-glyph, .opt-applied-partial .opt-applied-verdict { color: var(--warn); }
+.opt-applied-no-effect .opt-applied-glyph, .opt-applied-no-effect .opt-applied-verdict { color: var(--bad); }
+.opt-applied-hint { padding: 9px 0 0; }
+.opt-applied-hint code { font-family: var(--mono); }
 .opt-copy:hover, .opt-copy:focus-visible { border-color: var(--accent); color: var(--ink); outline: none; }
 .ov-analytics-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: stretch; }
 .ov-analytics-row > :only-child { grid-column: 1 / -1; }

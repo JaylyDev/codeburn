@@ -212,6 +212,13 @@ describe('model default recommendations', () => {
 
     expect(recommendModelDefault(project, { now: NOW })).toBeNull()
   })
+
+  it('never recommends an actionable default from sidechain-only behavior', () => {
+    const project = recommendationProject()
+    project.sessions[0]!.isSidechain = true
+
+    expect(recommendModelDefault(project, { now: NOW })).toBeNull()
+  })
 })
 
 describe('model default apply plan', () => {

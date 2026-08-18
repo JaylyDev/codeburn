@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { aggregateModelStats, type ModelStats } from '../compare-stats.js'
+import { withUserStartedSessions } from '../session-population.js'
 import type { ProjectSummary } from '../types.js'
 import { sha256File } from './backup.js'
 import type { ActionPlan } from './types.js'
@@ -73,15 +74,16 @@ function isDebuggingHeavy(project: ProjectSummary): boolean {
 }
 
 export function recommendModelDefault(project: ProjectSummary, opts: { now?: Date } = {}): ModelDefaultRecommendation | null {
+  const behavioralProject = withUserStartedSessions(project)
   const now = opts.now ?? new Date()
-  const stats = aggregateModelStats([project])
+  const stats = aggregateModelStats([behavioralProject])
     .filter(s => s.model !== '<synthetic>' && s.editTurns >= MIN_EDIT_TURNS)
     .sort((a, b) => b.editTurns - a.editTurns || b.editCost - a.editCost)
 
   const current = stats[0]
   if (!current) return null
 
-  const providers = providerByModel(project)
+  const providers = providerByModel(behavioralProject)
   const provider = providers.get(current.model)
   if (!provider || !isRecent(current.lastSeen, now)) return null
 
@@ -89,7 +91,7 @@ export function recommendModelDefault(project: ProjectSummary, opts: { now?: Dat
   const currentCost = costPerEdit(current)
   if (!Number.isFinite(currentCost) || currentCost <= 0) return null
 
-  const debuggingHeavy = isDebuggingHeavy(project)
+  const debuggingHeavy = isDebuggingHeavy(behavioralProject)
   const tolerance = debuggingHeavy ? 0 : ONE_SHOT_TOLERANCE
 
   const candidates = stats

@@ -1,7 +1,8 @@
 import { existsSync } from 'fs'
 import { dirname } from 'node:path'
 import type { DateRange, ProjectSummary, SessionSummary } from '../types.js'
-import type { ActionBaseline, ActionKind, ActionRecord } from './types.js'
+import type { ActionBaseline, ActionKind, ActionRecord, AppliedFix, AppliedVerdict } from './types.js'
+import { REPORT_MIN_AGE_DAYS, VERDICT_WORKED_RATIO } from './types.js'
 import type { FindingPlan } from './plans.js'
 import {
   AVG_TOKENS_PER_READ,
@@ -20,7 +21,8 @@ import {
 } from '../optimize.js'
 import { parseAllSessions } from '../parser.js'
 import { computeYield, type YieldSummary } from '../yield.js'
-import { defaultActionsDir, readRecords } from './journal.js'
+import { defaultActionsDir, readRecords, shortId } from './journal.js'
+import { undoAction } from './undo.js'
 import { renderTable } from '../text-table.js'
 import { formatTokens } from '../format.js'
 import { formatCost } from '../currency.js'
@@ -28,7 +30,6 @@ import { formatCost } from '../currency.js'
 const DAY_MS = 24 * 60 * 60 * 1000
 const WINDOW_CAP_DAYS = 30
 const BASELINE_WINDOW_DAYS = 14
-const REPORT_MIN_AGE_DAYS = 3
 const MIN_POST_WINDOW_SESSIONS = 20
 const VOLUME_SHIFT_FACTOR = 2
 
@@ -59,6 +60,8 @@ const ARCHIVE_DEF_TOKENS: Partial<Record<ActionKind, number>> = {
 // 'pending' means the applied change has not taken effect in any post-apply
 // session yet (e.g. deferral before a client restart) - distinct from
 // 'reverted', which asserts the user undid it.
+export { REPORT_MIN_AGE_DAYS }
+
 export type RealizedStatus = 'measured' | 'reverted' | 'not-measurable' | 'pending'
 
 export type ActReportRow = {
@@ -102,6 +105,8 @@ export type ActReport = {
   // findingId -> earliest apply date of an active applied action; drives the
   // optimize "(previously applied ..., re-flagged)" title suffix.
   appliedByFinding: Record<string, string>
+  // One entry per active applied action, including ones too young to measure.
+  appliedFixes: AppliedFix[]
 }
 
 export type ActReportOptions = {
@@ -470,6 +475,63 @@ function isSaneRecord(r: ActionRecord): boolean {
   return typeof r.at === 'string' && typeof r.status === 'string' && !Number.isNaN(new Date(r.at).getTime())
 }
 
+// Turn the measured rows plus the still-young entries into one verdict per
+// active applied action. No second reconciliation: everything measurable comes
+// straight off the row `act report` already computed.
+function buildAppliedFixes(active: ActionRecord[], rows: ActReportRow[], now: Date): AppliedFix[] {
+  const byId = new Map(rows.map(r => [r.id, r]))
+  return active.map(rec => {
+    const row = byId.get(rec.id)
+    const base = {
+      id: rec.id,
+      kind: rec.kind,
+      findingId: rec.findingId ?? null,
+      appliedAt: rec.at,
+      ageDays: ageDays(rec.at, now),
+      undoCommand: `codeburn act undo ${shortId(rec.id)}`,
+    }
+    // No row means too young to measure; a row that is not a measured token
+    // row (not-measurable, not yet in effect, reverted by the user, or a
+    // correlation-only kind) has no reduction to judge either.
+    if (!row) return { ...base, verdict: 'pending' as const, estimatedTokens: rec.baseline?.estimatedTokens ?? 0, realizedTokens: 0, note: '' }
+    if (row.status !== 'measured' || !isTokenKind(row.kind)) {
+      return { ...base, verdict: 'pending' as const, estimatedTokens: row.estimatedForWindow, realizedTokens: 0, note: row.note }
+    }
+    const estimatedTokens = row.estimatedForWindow
+    const realizedTokens = row.realizedTokens
+    const verdict: AppliedVerdict = realizedTokens <= 0
+      ? 'no-effect'
+      : estimatedTokens <= 0 || realizedTokens >= estimatedTokens * VERDICT_WORKED_RATIO ? 'worked' : 'partial'
+    return { ...base, verdict, estimatedTokens, realizedTokens, note: row.note }
+  })
+}
+
+// --auto-revert: undo the fixes that measured no reduction at all. CLAUDE.md
+// rules are never undone unattended, matching the --yes guardrail - the file
+// belongs to whatever project the user happened to be in.
+export async function autoRevertNoEffect(
+  fixes: AppliedFix[], opts: { actionsDir?: string } = {},
+): Promise<{ lines: string[]; revertedIds: Set<string> }> {
+  const lines: string[] = []
+  const revertedIds = new Set<string>()
+  for (const fix of fixes) {
+    if (fix.verdict !== 'no-effect') continue
+    const label = fix.findingId ?? fix.kind
+    if (fix.kind === 'claude-md-rule') {
+      lines.push(`Not auto-reverted: ${label} edits a CLAUDE.md. Revert: ${fix.undoCommand}`)
+      continue
+    }
+    try {
+      const record = await undoAction({ id: fix.id }, { actionsDir: opts.actionsDir })
+      revertedIds.add(fix.id)
+      lines.push(`Reverted ${shortId(record.id)}: ${record.description}`)
+    } catch (err) {
+      lines.push(`Could not revert ${label}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  return { lines, revertedIds }
+}
+
 export async function computeActReport(opts: ActReportOptions = {}): Promise<ActReport> {
   const now = opts.now ?? new Date()
   const rawRecords = await readRecords(opts.actionsDir ?? defaultActionsDir())
@@ -497,6 +559,7 @@ export async function computeActReport(opts: ActReportOptions = {}): Promise<Act
     observedDays: 0,
     malformedRecords,
     appliedByFinding,
+    appliedFixes: buildAppliedFixes(active, [], now),
   }
 
   const eligible = active.filter(r => ageDays(r.at, now) > REPORT_MIN_AGE_DAYS)
@@ -550,6 +613,7 @@ export async function computeActReport(opts: ActReportOptions = {}): Promise<Act
     observedDays,
     malformedRecords,
     appliedByFinding,
+    appliedFixes: buildAppliedFixes(active, rows, now),
   }
 }
 
@@ -651,6 +715,7 @@ export function buildActReportJson(report: ActReport): unknown {
       activeActions: report.activeCount,
       observedDays: report.observedDays,
     },
+    appliedFixes: report.appliedFixes,
     footer: HONEST_FOOTER,
   }
 }
@@ -666,7 +731,8 @@ type CaptureCtx = {
   now: Date
 }
 
-function mcpServersFromApply(finding: WasteFinding): string[] {
+function mcpServersFromApply(finding: WasteFinding, affectedMcpServers?: string[]): string[] {
+  if (affectedMcpServers) return affectedMcpServers
   if (finding.apply?.kind === 'mcp-remove') return finding.apply.servers
   if (finding.apply?.kind === 'mcp-project-scope') return finding.apply.servers.map(s => s.server)
   return []
@@ -684,24 +750,37 @@ function deferServers(finding: WasteFinding, ctx: CaptureCtx): string[] {
   return observedMcpServers(ctx.projects)
 }
 
-export function captureBaseline(finding: WasteFinding, kind: ActionKind, ctx: CaptureCtx): ActionBaseline | undefined {
+export function captureBaseline(
+  finding: WasteFinding,
+  kind: ActionKind,
+  ctx: CaptureCtx,
+  affectedMcpServers?: string[],
+): ActionBaseline | undefined {
   const common = {
     windowDays: ctx.windowDays,
     capturedAt: ctx.now.toISOString(),
-    estimatedTokens: Math.max(0, Math.round(finding.tokensSaved)),
+    estimatedTokens: Math.max(0, Math.round(finding.applyTokensSaved ?? finding.tokensSaved)),
   }
 
   if (MCP_KINDS.has(kind)) {
-    const servers = mcpServersFromApply(finding)
+    const servers = mcpServersFromApply(finding, affectedMcpServers)
     if (servers.length === 0) return undefined
     const covByServer = new Map(ctx.coverage.map(c => [c.server, c]))
     const metrics: Record<string, number> = {}
     for (const server of servers) {
       const cov = covByServer.get(server)
-      const tools = cov && cov.toolsAvailable > 0 ? cov.toolsAvailable : TOOLS_PER_MCP_SERVER
+      // Removal realizes only the unused schema that the low-coverage
+      // detector estimated. If coverage is unavailable, omit the numeric
+      // claim instead of inventing a five-tool baseline.
+      const tools = finding.id === 'mcp-low-coverage'
+        ? cov?.unusedTools.length ?? 0
+        : cov && cov.toolsAvailable > 0 ? cov.toolsAvailable : TOOLS_PER_MCP_SERVER
       metrics[server] = tools * TOKENS_PER_MCP_TOOL
     }
-    return { ...common, sessions: countSessionsLoading(ctx.projects, servers), metrics }
+    const estimatedTokens = finding.applyTokensSavedByServer
+      ? Math.round(servers.reduce((sum, server) => sum + (finding.applyTokensSavedByServer?.[server] ?? 0), 0))
+      : common.estimatedTokens
+    return { ...common, estimatedTokens, sessions: countSessionsLoading(ctx.projects, servers), metrics }
   }
 
   if (DEFER_KINDS.has(kind)) {
@@ -750,7 +829,8 @@ export async function captureBaselinesForPlans(
   const projects = await loadProjects({ start, end: now })
   const ctx: CaptureCtx = { projects, coverage: aggregateMcpCoverage(projects), windowDays: BASELINE_WINDOW_DAYS, now }
   for (const fp of applicable) {
-    const baseline = captureBaseline(fp.finding, fp.plan!.kind, ctx)
+    if (fp.plan!.mcpSavingsUncertain) continue
+    const baseline = captureBaseline(fp.finding, fp.plan!.kind, ctx, fp.plan!.affectedMcpServers)
     if (baseline) fp.plan!.baseline = baseline
   }
 }
