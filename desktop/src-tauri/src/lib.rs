@@ -454,8 +454,7 @@ mod commands {
         }
     }
 
-    /// `text` is a short spend string ("$87", "142", "1.2K"); `None` restores the flame.
-    /// Anything wider than the 16px design grid is rejected so the icon never clips.
+    /// `text` is a short spend string ("$87", "142", "1.2K"); `None` hides the badge icon.
     #[tauri::command]
     pub fn set_tray_badge(app: AppHandle, text: Option<String>) -> Result<(), String> {
         #[cfg(not(target_os = "linux"))]
@@ -465,9 +464,6 @@ mod commands {
             };
             match text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
                 Some(t) => {
-                    if !crate::tray_badge::fits(t) {
-                        return Err(format!("badge text too wide: {t}"));
-                    }
                     let icon = crate::tray_badge::render(
                         t,
                         crate::tray_badge::small_icon_size(),

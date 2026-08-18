@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { XIcon } from './Icons'
 
 const AUTO_DISMISS_MS = 8_000
@@ -9,10 +9,14 @@ type Props = {
 }
 
 export function ErrorToast({ message, onDismiss }: Props) {
+  // Keep the latest handler in a ref so re-renders of the parent do not restart the timer.
+  const dismissRef = useRef(onDismiss)
+  dismissRef.current = onDismiss
+
   useEffect(() => {
-    const id = setTimeout(onDismiss, AUTO_DISMISS_MS)
+    const id = setTimeout(() => dismissRef.current(), AUTO_DISMISS_MS)
     return () => clearTimeout(id)
-  }, [message, onDismiss])
+  }, [message])
 
   return (
     <div className="error-toast" role="alert">

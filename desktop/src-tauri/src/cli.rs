@@ -63,6 +63,14 @@ impl CodeburnCli {
         if raw.is_empty() {
             return Self::default_program();
         }
+        // A bare path (which may contain spaces, e.g. under Program Files) is used whole;
+        // only otherwise is the value split into program + leading arguments.
+        if is_safe_arg(&raw) && std::path::Path::new(&raw).is_file() {
+            return CodeburnCli {
+                program: raw,
+                extra_args: vec![],
+            };
+        }
         let parts: Vec<String> = raw.split_whitespace().map(String::from).collect();
         if parts.iter().all(|p| is_safe_arg(p)) {
             if let Some((first, rest)) = parts.split_first() {
@@ -382,14 +390,12 @@ pub fn spawn_in_terminal(app: &AppHandle, subcommand: &[&str]) -> Result<()> {
     spawn_program_in_terminal(app, &cli, subcommand)
 }
 
-/// The Plan view's "Connect Claude" runs Claude Code's own login flow, not codeburn.
+/// The Plan view's "Connect Claude" runs Claude Code's own login flow, not codeburn. The
+/// bare name is deliberate: on Windows the console shell resolves `claude.exe` (native
+/// installer) or `claude.cmd` (npm) through PATHEXT.
 pub fn spawn_claude_login(app: &AppHandle) -> Result<()> {
-    #[cfg(windows)]
-    let program = "claude.cmd";
-    #[cfg(not(windows))]
-    let program = "claude";
     let cli = CodeburnCli {
-        program: program.to_string(),
+        program: "claude".to_string(),
         extra_args: vec![],
     };
     spawn_program_in_terminal(app, &cli, &["login"])

@@ -339,7 +339,7 @@ program
       const now = new Date()
       const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate())
       const yesterdayEnd = new Date(todayStart.getTime() - 1)
-      const yesterdayStr = toDateString(new Date(todayStart.getTime() - MS_PER_DAY))
+      const yesterdayStr = toDateString(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1))
       const isAllProviders = pf === 'all'
 
       // The daily cache is provider-agnostic: always backfill it from .all so subsequent

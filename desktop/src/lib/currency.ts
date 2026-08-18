@@ -55,11 +55,13 @@ const BADGE_MILLION = 1_000_000
 export function trayBadgeText(usdAmount: number, currency: CurrencyState): string {
   const v = Math.max(0, usdAmount * currency.rate)
   const symbol = currency.code === 'USD' ? '$' : ''
-  if (v < 10) return `${symbol}${v.toFixed(1)}`
-  if (v < 100) return `${symbol}${Math.round(v)}`
-  if (v < BADGE_THOUSAND) return `${Math.round(v)}`
-  if (v < 10 * BADGE_THOUSAND) return `${(v / BADGE_THOUSAND).toFixed(1)}K`
-  if (v < 100 * BADGE_THOUSAND) return `${Math.round(v / BADGE_THOUSAND)}K`
+  // Thresholds sit at the rounding boundary of the format above them, so "9.96" becomes
+  // "$10" rather than "$10.0" and "999.7" becomes "1.0K" rather than "1000".
+  if (v < 9.95) return `${symbol}${v.toFixed(1)}`
+  if (v < 99.5) return `${symbol}${Math.round(v)}`
+  if (v < 999.5) return `${Math.round(v)}`
+  if (v < 9_950) return `${(v / BADGE_THOUSAND).toFixed(1)}K`
+  if (v < 999_500) return `${Math.round(v / BADGE_THOUSAND)}K`
   return `${(v / BADGE_MILLION).toFixed(1)}M`
 }
 

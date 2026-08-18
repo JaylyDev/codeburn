@@ -54,7 +54,10 @@ pub fn render(text: &str, size: u32, dark_taskbar: bool) -> Image<'static> {
     if let Some(image) = render_with_font(text, size, color) {
         return image;
     }
-    render_pixel_font(text, size, dark_taskbar)
+    // The pixel font cannot shrink, so trim from the right until the string fits.
+    let mut trimmed: String = text.to_string();
+    while !fits(&trimmed) && trimmed.pop().is_some() {}
+    render_pixel_font(&trimmed, size, dark_taskbar)
 }
 
 /// Bold sans faces shipped with Windows, best first. Bahnschrift's condensed numerals fit
@@ -194,9 +197,8 @@ fn render_pixel_font(text: &str, size: u32, dark_taskbar: bool) -> Image<'static
     Image::new_owned(rgba, size, size)
 }
 
-/// Whether the text fits the 16px design grid; the frontend keeps strings to 4 slots but
-/// this is the authority.
-pub fn fits(text: &str) -> bool {
+/// Whether the text fits the 16px pixel-font grid (the font path scales itself to fit).
+fn fits(text: &str) -> bool {
     text_width(text) <= BASE_ICON_SIZE as usize
 }
 

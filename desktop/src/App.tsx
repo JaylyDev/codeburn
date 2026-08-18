@@ -82,6 +82,11 @@ export function App() {
         provider: prov,
         includeOptimize: opts.includeOptimize,
       })
+      // A quiet (no-optimize) refresh must not wipe findings a previous full fetch had.
+      if (!opts.includeOptimize) {
+        const previous = payloadCache.get(p, prov)
+        if (previous) json.optimize = previous.optimize
+      }
       payloadCache.set(p, prov, json)
       if (isSelected()) setPayload(json)
       if (p === 'today' && prov === 'all') setTodayPayload(json)
