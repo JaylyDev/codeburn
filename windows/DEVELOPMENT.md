@@ -112,15 +112,21 @@ process, so the cadence follows popover visibility.
 
 The Plan pill (visible on the Claude tab, or when Claude is the only detected provider) reads
 Claude Code's OAuth credentials from `~/.claude/.credentials.json`, calls
-`https://api.anthropic.com/api/oauth/usage`, refreshes the token once on 401, and stores one
-snapshot per window under `~/.cache/codeburn/subscription-snapshots.json` (`CODEBURN_CACHE_DIR`
-override) so a freshly reset window can still show last cycle's final. This is the same file
-format the macOS app writes. Nothing is logged: the credential blob never leaves the Rust side.
+`https://api.anthropic.com/api/oauth/usage`, and stores one snapshot per window under
+`~/.cache/codeburn/subscription-snapshots.json` (`CODEBURN_CACHE_DIR` override) so a freshly
+reset window can still show last cycle's final. This is the same file format the macOS app
+writes. Nothing is logged: the credential blob never leaves the Rust side.
+
+On a 401 we do **not** call the token refresh endpoint. Claude's refresh token is single-use
+and rotates, so spending it would invalidate the token Claude Code itself is holding and break
+the user's login. Like `ClaudeCredentialStore.refreshAfter401` on macOS, we re-read Claude's
+own credential file for a token it has already rotated, and report a transient failure when
+there isn't one yet.
 
 ## Build a production package
 
 ```bash
-# Windows (.msi + NSIS .exe): run from a Windows host
+# Windows (.msi): run from a Windows host
 npm run tauri build
 
 # Linux (experimental): produces .deb, .rpm, .AppImage under src-tauri/target/release/bundle/
@@ -139,13 +145,14 @@ npm run tauri build
 - **Config writes**: `~/.config/codeburn/config.json` writes run under a POSIX `flock` on
   `~/.config/codeburn/.config.lock`. On Windows the same path uses a create-new lock file. Note
   that this lock is advisory *between instances of this app only* - the codeburn CLI does not
-  take it - so it narrows, but does not eliminate, a concurrent-write race. A lock left behind
-  by a crash is never deleted by another process; it expires after 30 s of inactivity and the
-  next writer retries.
+  take it - so it narrows, but does not eliminate, a concurrent-write race. A live holder keeps
+  its file handle open and Windows will not unlink an open file, so the staleness sweep can only
+  ever reclaim a lock whose owner is gone (after 30 s).
 - **Snapshot writes**: `subscription-snapshots.json` refuses a symlinked target and is written
   0600 on unix, mirroring `mac/Sources/CodeBurnMenubar/Security/SafeFile.swift`.
 - **Credentials**: the Plan view reads `~/.claude/.credentials.json` with a 64 KB cap and refuses
-  symlinks; tokens are only ever sent to the Anthropic usage and token endpoints over TLS.
+  symlinks; the access token is only ever sent to the Anthropic usage endpoint over TLS, and the
+  refresh token is never read or sent at all.
 - **FX fetches**: Frankfurter response is parsed as JSON and the rate is clamped to
   `[0.0001, 1_000_000]` before it touches displayed numbers. Stale cache preferred over poisoned
   fresh data.
@@ -158,8 +165,8 @@ npm run tauri build
   `cargo clippy -D warnings` and `cargo test` on windows-latest + ubuntu-latest, plus a release
   build smoke on Windows.
 - `windows-v*` tag (e.g. `windows-v0.9.20`) triggers
-  `.github/workflows/release-menubar-windows.yml`; publishes the `.msi` and NSIS `.exe` to a
-  "Windows Menubar vX" release. Unsigned for now, so Windows SmartScreen prompts on first run
+  `.github/workflows/release-menubar-windows.yml`; publishes the `.msi` (plus its sha256) to
+  a "Windows Menubar vX" release. Unsigned for now, so Windows SmartScreen prompts on first run
   until a signing cert is in place.
 
 ## Pending work
