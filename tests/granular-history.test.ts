@@ -45,7 +45,7 @@ function apiCall(options: {
   }
 }
 
-function project(sessions: Array<{ id: string; project?: string; title?: string; calls: ParsedApiCall[] }>): ProjectSummary {
+function project(sessions: Array<{ id: string; project?: string; title?: string; lastTimestamp?: string; calls: ParsedApiCall[] }>): ProjectSummary {
   return {
     project: 'demo',
     projectPath: '/repos/demo',
@@ -58,7 +58,7 @@ function project(sessions: Array<{ id: string; project?: string; title?: string;
       project: session.project ?? 'demo',
       title: session.title,
       firstTimestamp: session.calls[0]?.timestamp ?? '',
-      lastTimestamp: session.calls.at(-1)?.timestamp ?? '',
+      lastTimestamp: session.lastTimestamp ?? session.calls.at(-1)?.timestamp ?? '',
       totalCostUSD: session.calls.reduce((sum, call) => sum + call.costUSD, 0),
       totalSavingsUSD: 0,
       totalInputTokens: session.calls.reduce((sum, call) => sum + call.usage.inputTokens, 0),
@@ -120,10 +120,10 @@ describe('granular history', () => {
     ])], { start, end }, end)
 
     expect(history.sessionSeries.map(series => series.label)).toEqual([
-      'Refactor billing module · sessio…3456 (claude)',
-      'repos/demo · sessio…3457 (claude)',
-      'repos/demo · sessio…3458 (claude)',
-      'repos/demo · sessio…3459 (claude)',
+      'sessio…3456 (claude) · Refactor billing module',
+      'sessio…3457 (claude) · repos/demo',
+      'sessio…3458 (claude) · repos/demo',
+      'sessio…3459 (claude) · repos/demo',
     ])
   })
 
@@ -138,10 +138,31 @@ describe('granular history', () => {
 
     expect(history.sessionSeries.map(series => series.id)).toEqual(['session_0', 'session_1'])
     expect(history.sessionSeries.map(series => series.label)).toEqual([
-      'Refactor billing module · sessio…1111 (claude)',
-      'Refactor billing module · sessio…2222 (claude)',
+      'sessio…1111 (claude) · Refactor billing module',
+      'sessio…2222 (claude) · Refactor billing module',
     ])
     expect(new Set(history.sessionSeries.map(series => series.label)).size).toBe(2)
+  })
+
+  it('keeps the disambiguator inside the visible legend prefix for long shared title prefixes', () => {
+    const timestamp = '2026-07-15T12:05:00.000Z'
+    const start = new Date('2026-07-15T00:00:00.000Z')
+    const end = new Date('2026-07-15T23:59:59.999Z')
+    const sharedPrefix = 'same long title prefix '.repeat(5)
+    const history = buildGranularHistory([project([
+      { id: 'a1b2c3-session-7f01', title: `${sharedPrefix}alpha`, calls: [apiCall({ timestamp, cost: 1 })] },
+      { id: 'd4e5f6-session-8a02', title: `${sharedPrefix}beta`, calls: [apiCall({ timestamp, cost: 1 })] },
+    ])], { start, end }, end)
+
+    // 160px at the chart's 10px font fits roughly 31-32 lowercase glyphs;
+    // compare a conservative prefix that must be visible in that budget.
+    const visibleCharacterBudget = 24
+    const visiblePrefixes = history.sessionSeries.map(series => series.label.slice(0, visibleCharacterBudget))
+    expect(new Set(visiblePrefixes).size).toBe(2)
+    expect(history.sessionSeries.map(series => series.label)).toEqual(expect.arrayContaining([
+      expect.stringMatching(/^a1b2c3…7f01 \(claude\) · /),
+      expect.stringMatching(/^d4e5f6…8a02 \(claude\) · /),
+    ]))
   })
 
   it('sanitises control characters and ANSI escapes in session titles', () => {
@@ -154,7 +175,7 @@ describe('granular history', () => {
       calls: [apiCall({ timestamp, cost: 1 })],
     }])], { start, end }, end)
 
-    expect(history.sessionSeries[0]?.label).toBe('Refactor billing module · sessio…3456 (claude)')
+    expect(history.sessionSeries[0]?.label).toBe('sessio…3456 (claude) · Refactor billing module')
     expect(history.sessionSeries[0]?.label).not.toContain('\x1b')
     expect(history.sessionSeries[0]?.label).not.toContain('\x00')
   })
@@ -169,7 +190,7 @@ describe('granular history', () => {
       calls: [apiCall({ timestamp, cost: 1 })],
     }])], { start, end }, end)
 
-    expect(history.sessionSeries[0]?.label).toBe('x'.repeat(80) + ' · sessio…3456 (claude)')
+    expect(history.sessionSeries[0]?.label).toBe('sessio…3456 (claude) · ' + 'x'.repeat(80))
   })
 
   it('caps session titles by code point without splitting an emoji', () => {
@@ -184,9 +205,9 @@ describe('granular history', () => {
     }])], { start, end }, end)
 
     const label = history.sessionSeries[0]?.label ?? ''
-    const titlePrefix = label.slice(0, label.indexOf(' · '))
-    expect(titlePrefix).toBe('x'.repeat(79) + '😀')
-    expect([...titlePrefix]).toEqual([...('x'.repeat(79) + '😀')])
+    const titlePart = label.slice(label.indexOf(' · ') + 3)
+    expect(titlePart).toBe('x'.repeat(79) + '😀')
+    expect([...titlePart]).toEqual([...('x'.repeat(79) + '😀')])
   })
 
   it('prefers a title from any duplicate session summary sharing a key', () => {
@@ -194,12 +215,22 @@ describe('granular history', () => {
     const start = new Date('2026-07-15T00:00:00.000Z')
     const end = new Date('2026-07-15T23:59:59.999Z')
     const history = buildGranularHistory([project([
-      { id: 'session-cache-collision-123456', calls: [apiCall({ timestamp, cost: 1 })] },
-      { id: 'session-cache-collision-123456', title: 'Recovered session title', calls: [apiCall({ timestamp, cost: 2 })] },
+      {
+        id: 'session-cache-collision-123456',
+        title: 'A stale session title',
+        lastTimestamp: '2026-07-15T12:06:00.000Z',
+        calls: [apiCall({ timestamp, cost: 1 })],
+      },
+      {
+        id: 'session-cache-collision-123456',
+        title: 'Z recovered session title',
+        lastTimestamp: '2026-07-15T12:07:00.000Z',
+        calls: [apiCall({ timestamp, cost: 2 })],
+      },
     ])], { start, end }, end)
 
     expect(history.sessionSeries).toHaveLength(1)
-    expect(history.sessionSeries[0]?.label).toBe('Recovered session title · sessio…3456 (claude)')
+    expect(history.sessionSeries[0]?.label).toBe('sessio…3456 (claude) · Z recovered session title')
   })
 
   it('fills idle buckets and keeps separate model and session lines from real call timestamps', () => {
@@ -238,8 +269,8 @@ describe('granular history', () => {
 
     // Labels use the real projectPath's last two segments, not the sanitized
     // project name.
-    const alpha = history.sessionSeries.find(series => series.label === 'repos/demo · sessio…3456 (claude)')!
-    const beta = history.sessionSeries.find(series => series.label === 'repos/demo · sessio…4321 (codex)')!
+    const alpha = history.sessionSeries.find(series => series.label === 'sessio…3456 (claude) · repos/demo')!
+    const beta = history.sessionSeries.find(series => series.label === 'sessio…4321 (codex) · repos/demo')!
     expect(sumSeries(history, 'sessions', alpha.id, 'cost')).toBe(1.75)
     expect(sumSeries(history, 'sessions', beta.id, 'tokens')).toBe(300)
     // Cache reads are intentionally not folded into the browser's Tokens line.
@@ -311,8 +342,8 @@ describe('granular history', () => {
 
     expect(history.sessionSeries).toHaveLength(2)
     expect(history.sessionSeries.map(series => series.label)).toEqual(expect.arrayContaining([
-      expect.stringContaining('alpha ·'),
-      expect.stringContaining('beta ·'),
+      expect.stringContaining('repos/alpha'),
+      expect.stringContaining('repos/beta'),
     ]))
   })
 
@@ -329,8 +360,8 @@ describe('granular history', () => {
     const labels = history.sessionSeries.map(series => series.label)
 
     expect(labels).toEqual([
-      'Same task · shared…3456 (claude) · repos/alpha',
-      'Same task · shared…3456 (claude) · repos/beta',
+      'shared…3456 (claude) · Same task · repos/alpha',
+      'shared…3456 (claude) · Same task · repos/beta',
     ])
     expect(new Set(labels).size).toBe(2)
   })
@@ -339,17 +370,18 @@ describe('granular history', () => {
     const timestamp = '2026-07-15T12:05:00.000Z'
     const alpha = project([{ id: 'sameid', title: 'Task', calls: [apiCall({ timestamp, cost: 1 })] }])
     const beta = project([{ id: 'sameid', title: 'Task', calls: [apiCall({ timestamp, cost: 1 })] }])
-    const shaped = project([{ id: 'repos/alpha', title: 'Task · sameid (claude)', calls: [apiCall({ timestamp, cost: 1 })] }])
+    const shaped = project([{ id: 'sameid', title: 'Task · repos/alpha (claude)', calls: [apiCall({ timestamp, cost: 1 })] }])
     alpha.projectPath = '/repos/alpha (claude)'
     beta.projectPath = '/repos/beta (claude)'
     shaped.projectPath = '/other/shaped'
     const start = new Date('2026-07-15T00:00:00.000Z')
     const end = new Date('2026-07-15T23:59:59.999Z')
 
-    const history = buildGranularHistory([alpha, beta, shaped], { start, end }, end)
-    const labels = history.sessionSeries.map(series => series.label)
+    const labelsFor = (projects: ProjectSummary[]) => buildGranularHistory(projects, { start, end }, end).sessionSeries.map(series => series.label)
+    const labels = labelsFor([alpha, beta, shaped])
 
     expect(new Set(labels).size).toBe(labels.length)
+    expect(labels.slice().sort()).toEqual(labelsFor([shaped, beta, alpha]).slice().sort())
   })
 
   it('aligns quarter-hour buckets to local wall time in a fractional-offset timezone', () => {

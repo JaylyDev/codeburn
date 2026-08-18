@@ -7,9 +7,9 @@ const ONE_HOUR = 60
 const ONE_DAY = 24 * 60
 const MINUTE_MS = 60 * 1000
 const MAX_SERIES_PER_METRIC = 6
-// Keep metadata bounded for both the max-w-40 legend and the tooltip: 80
-// characters preserves a useful title without letting the parser's 200-char
-// transcript cap dominate either UI surface.
+// Keep metadata bounded for the legend and tooltip: 80 characters preserves a
+// useful title without letting the parser's 200-char transcript cap dominate
+// either UI surface.
 const MAX_SESSION_TITLE_LENGTH = 80
 
 export type GranularSeries = {
@@ -47,12 +47,17 @@ type RawBucket = {
   sessions: Map<string, Totals>
 }
 
+type SessionTitleCandidate = {
+  title: string
+  lastTimestamp: string
+}
+
 type SessionLabelInfo = {
   provider: string
   projectPath: string
   projectNames: Set<string>
   sessionId: string
-  titleCandidates: Set<string>
+  titleCandidates: Map<string, SessionTitleCandidate>
 }
 
 type SessionLabelEntry = {
@@ -134,27 +139,54 @@ function cleanSessionTitle(title: string | undefined): string | undefined {
   return Array.from(cleaned).slice(0, MAX_SESSION_TITLE_LENGTH).join('').trimEnd() || undefined
 }
 
+// SessionSummary.lastTimestamp is normally an ISO timestamp, but fixtures and
+// older cache entries can be incomplete. Valid timestamps win over invalid
+// ones; two invalid values are an exact tie and are resolved alphabetically by
+// the caller.
+function compareTimestamps(a: string, b: string): number {
+  const aMs = Date.parse(a)
+  const bMs = Date.parse(b)
+  const aValid = Number.isFinite(aMs)
+  const bValid = Number.isFinite(bMs)
+  if (aValid && bValid) return aMs - bMs
+  if (aValid) return 1
+  if (bValid) return -1
+  return 0
+}
+
 function preferredProjectName(projectNames: Set<string>): string {
   return [...projectNames].sort()[0] ?? 'Unknown project'
 }
 
-function preferredSessionTitle(titleCandidates: Set<string>): string | undefined {
-  return [...titleCandidates]
-    .map(cleanSessionTitle)
-    .filter((title): title is string => title !== undefined)
-    .sort()[0]
+function preferredSessionTitle(titleCandidates: Map<string, SessionTitleCandidate>): string | undefined {
+  const cleaned = [...titleCandidates.values()]
+    .map(candidate => {
+      const title = cleanSessionTitle(candidate.title)
+      return title === undefined ? undefined : { title, lastTimestamp: candidate.lastTimestamp }
+    })
+    .filter((candidate): candidate is SessionTitleCandidate => candidate !== undefined)
+
+  cleaned.sort((a, b) => {
+    const timestampOrder = compareTimestamps(b.lastTimestamp, a.lastTimestamp)
+    if (timestampOrder !== 0) return timestampOrder
+    return a.title < b.title ? -1 : a.title > b.title ? 1 : 0
+  })
+  return cleaned[0]?.title
 }
 
 function buildSessionLabels(inputs: Map<string, SessionLabelInfo>): Map<string, string> {
+  // Stable raw-key order makes the residual used-label guard independent of
+  // project/session discovery order when a title happens to match another
+  // label shape.
   const entries: SessionLabelEntry[] = [...inputs.entries()].map(([key, info]) => {
     const sessionLabel = preferredSessionTitle(info.titleCandidates)
       ?? shortProjectLabel(info.projectPath, preferredProjectName(info.projectNames))
     return {
       key,
       info,
-      baseLabel: `${sessionLabel} · ${shortSessionId(info.sessionId)} (${info.provider})`,
+      baseLabel: `${shortSessionId(info.sessionId)} (${info.provider}) · ${sessionLabel}`,
     }
-  })
+  }).sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
   const byBaseLabel = new Map<string, SessionLabelEntry[]>()
   for (const entry of entries) {
     const group = byBaseLabel.get(entry.baseLabel) ?? []
@@ -323,10 +355,18 @@ export function buildGranularHistory(
             projectPath: project.projectPath,
             projectNames: new Set<string>(),
             sessionId: session.sessionId,
-            titleCandidates: new Set<string>(),
+            titleCandidates: new Map<string, SessionTitleCandidate>(),
           }
           labelInfo.projectNames.add(projectName)
-          if (session.title !== undefined) labelInfo.titleCandidates.add(session.title)
+          if (session.title !== undefined) {
+            const existingTitle = labelInfo.titleCandidates.get(session.title)
+            if (!existingTitle || compareTimestamps(session.lastTimestamp, existingTitle.lastTimestamp) > 0) {
+              labelInfo.titleCandidates.set(session.title, {
+                title: session.title,
+                lastTimestamp: session.lastTimestamp,
+              })
+            }
+          }
           sessionLabelInputs.set(sessionKey, labelInfo)
           callCount++
         }
