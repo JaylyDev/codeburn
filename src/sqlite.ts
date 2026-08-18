@@ -1,7 +1,8 @@
 import { createRequire } from 'node:module'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync } from 'node:fs'
 import { createHash, randomBytes } from 'node:crypto'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { getCodeburnCacheDir } from './cache-dir.js'
 
@@ -157,24 +158,27 @@ type DatabaseFingerprint = {
   ino: number
   mtimeMs: number
   sizeBytes: number
+  walBytes: number
 }
 
-type CachedDatabaseMetadata = {
-  version: number
-  sourcePath: string
-  fingerprint: DatabaseFingerprint
+/// A superseded copy is dropped once it has gone this long without being used.
+/// The delay is what keeps a concurrent reader of the previous copy from having
+/// its file yanked out from under it.
+const CACHE_ENTRY_MAX_AGE_MS = 24 * 60 * 60 * 1000
+const warnedDatabases = new Set<string>()
+
+/// One notice per source path per run: a provider may discover many sessions
+/// from the same database, and the first notice already says what happened.
+function warnSqliteOnce(path: string, message: string): void {
+  if (warnedDatabases.has(path)) return
+  warnedDatabases.add(path)
+  process.stderr.write(message)
 }
 
-const SQLITE_CACHE_VERSION = 1
-const warnedReadonlyDatabases = new Set<string>()
-
-/// A read-only SQLite connection can still need sidecar files. This notice is
-/// intentionally once per source path: a provider may discover many sessions
-/// from the same database, and the fallback is already doing the useful work.
+/// A read-only SQLite connection can still need sidecar files.
 export function warnSqliteReadonlyOnce(path: string): void {
-  if (warnedReadonlyDatabases.has(path)) return
-  warnedReadonlyDatabases.add(path)
-  process.stderr.write(
+  warnSqliteOnce(
+    path,
     `codeburn: SQLite database ${path} is in a read-only directory and needs sidecar files; using a cache copy when necessary. ` +
     'The original database is not modified.\n',
   )
@@ -184,6 +188,10 @@ function errorCode(err: unknown): string | undefined {
   if (typeof err !== 'object' || err === null || !('code' in err)) return undefined
   const code = err.code
   return typeof code === 'string' ? code : undefined
+}
+
+function describeError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
 }
 
 /// This deliberately mirrors fingerprintSqliteFile/fingerprintFile in
@@ -203,6 +211,7 @@ function fingerprintDatabase(path: string): DatabaseFingerprint {
     ino: main.ino,
     mtimeMs: wal ? Math.max(main.mtimeMs, wal.mtimeMs) : main.mtimeMs,
     sizeBytes: main.size + (wal?.size ?? 0),
+    walBytes: wal?.size ?? 0,
   }
 }
 
@@ -211,42 +220,17 @@ function sameFingerprint(a: DatabaseFingerprint, b: DatabaseFingerprint): boolea
     a.dev === b.dev &&
     a.ino === b.ino &&
     a.mtimeMs === b.mtimeMs &&
-    a.sizeBytes === b.sizeBytes
+    a.sizeBytes === b.sizeBytes &&
+    a.walBytes === b.walBytes
   )
 }
 
-function isDatabaseFingerprint(value: unknown): value is DatabaseFingerprint {
-  if (typeof value !== 'object' || value === null) return false
-  const candidate = value as Partial<DatabaseFingerprint>
-  return (
-    typeof candidate.dev === 'number' &&
-    typeof candidate.ino === 'number' &&
-    typeof candidate.mtimeMs === 'number' &&
-    typeof candidate.sizeBytes === 'number'
-  )
-}
-
-function readCachedMetadata(path: string): CachedDatabaseMetadata | null {
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'))
-    if (typeof parsed !== 'object' || parsed === null) return null
-    const candidate = parsed as { version?: unknown; sourcePath?: unknown; fingerprint?: unknown }
-    if (
-      candidate.version !== SQLITE_CACHE_VERSION ||
-      typeof candidate.sourcePath !== 'string' ||
-      !isDatabaseFingerprint(candidate.fingerprint)
-    ) return null
-    return { version: SQLITE_CACHE_VERSION, sourcePath: candidate.sourcePath, fingerprint: candidate.fingerprint }
-  } catch {
-    return null
-  }
-}
-
-function unlinkIfPresent(path: string): void {
+function unlinkQuietly(path: string): void {
   try {
     unlinkSync(path)
-  } catch (err) {
-    if (errorCode(err) !== 'ENOENT') throw err
+  } catch {
+    // Already gone, or still held open by another CodeBurn on Windows. Either
+    // way the next run's eviction pass gets another chance at it.
   }
 }
 
@@ -260,26 +244,85 @@ function copyOptionalFile(sourcePath: string, destinationPath: string): boolean 
   }
 }
 
+function sourceKeyOf(sourcePath: string): string {
+  return createHash('sha256').update(sourcePath, 'utf8').digest('hex').slice(0, 32)
+}
+
+/// The copy is named after the source it came from AND the fingerprint it was
+/// taken at, so a refresh publishes a new file rather than overwriting one that
+/// another process may still have open.
+function cacheEntryName(sourceKey: string, fingerprint: DatabaseFingerprint): string {
+  const parts = `${fingerprint.dev}:${fingerprint.ino}:${fingerprint.mtimeMs}:${fingerprint.sizeBytes}:${fingerprint.walBytes}`
+  return `${sourceKey}.${createHash('sha256').update(parts).digest('hex').slice(0, 16)}.db`
+}
+
+function dropCopy(cacheDir: string, name: string): void {
+  unlinkQuietly(join(cacheDir, name))
+  unlinkQuietly(join(cacheDir, name + '-wal'))
+  unlinkQuietly(join(cacheDir, name + '-shm'))
+}
+
+/// Superseded copies are cleaned up here rather than by overwriting them: keep
+/// the one in use plus at most one predecessor, and drop anything untouched for
+/// a day, which is also what a source path that no longer exists looks like.
+/// Reuse touches the copy, so its mtime is last-use rather than copy time.
+function evictSupersededCopies(cacheDir: string, sourceKey: string, keepName: string): void {
+  let names: string[]
+  try {
+    names = readdirSync(cacheDir)
+  } catch {
+    return
+  }
+  const now = Date.now()
+  const superseded: { name: string, mtimeMs: number }[] = []
+  for (const name of names) {
+    if (!name.endsWith('.db') || name === keepName) continue
+    let mtimeMs: number
+    try {
+      mtimeMs = statSync(join(cacheDir, name)).mtimeMs
+    } catch {
+      continue
+    }
+    if (name.startsWith(`${sourceKey}.`)) superseded.push({ name, mtimeMs })
+    else if (now - mtimeMs > CACHE_ENTRY_MAX_AGE_MS) dropCopy(cacheDir, name)
+  }
+  superseded.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  for (const [index, entry] of superseded.entries()) {
+    if (index > 0 || now - entry.mtimeMs > CACHE_ENTRY_MAX_AGE_MS) dropCopy(cacheDir, entry.name)
+  }
+}
+
+/// A concurrent CodeBurn may have published the same copy first. The name is
+/// the fingerprint, so the content is identical by construction and losing that
+/// race is not an error.
+function publish(tempPath: string, finalPath: string): void {
+  try {
+    renameSync(tempPath, finalPath)
+  } catch (err) {
+    if (!existsSync(finalPath)) throw err
+  }
+}
+
 function readOnlyCachePath(sourcePath: string, fingerprint: DatabaseFingerprint): string {
   const cacheDir = join(getCodeburnCacheDir(), 'sqlite-ro')
   mkdirSync(cacheDir, { recursive: true, mode: 0o700 })
 
-  const sourceKey = createHash('sha256').update(sourcePath, 'utf8').digest('hex')
-  const cachePath = join(cacheDir, `${sourceKey}.db`)
-  const metadataPath = `${cachePath}.json`
-  const cached = readCachedMetadata(metadataPath)
-  if (
-    existsSync(cachePath) &&
-    cached?.sourcePath === sourcePath &&
-    sameFingerprint(cached.fingerprint, fingerprint)
-  ) {
+  const sourceKey = sourceKeyOf(sourcePath)
+  const name = cacheEntryName(sourceKey, fingerprint)
+  const cachePath = join(cacheDir, name)
+  if (existsSync(cachePath)) {
+    const now = new Date()
+    try {
+      utimesSync(cachePath, now, now)
+    } catch {
+      // mtime is only the eviction clock; a copy we cannot touch still reads.
+    }
+    evictSupersededCopies(cacheDir, sourceKey, name)
     return cachePath
   }
 
   const tempBase = `${cachePath}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`
   const tempWal = tempBase + '-wal'
-  const tempMetadata = `${metadataPath}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`
-
   try {
     copyFileSync(sourcePath, tempBase)
     const copiedWal = copyOptionalFile(sourcePath + '-wal', tempWal)
@@ -291,28 +334,22 @@ function readOnlyCachePath(sourcePath: string, fingerprint: DatabaseFingerprint)
       throw new Error('SQLite database changed while preparing its read-only cache copy')
     }
 
-    unlinkIfPresent(cachePath)
-    unlinkIfPresent(cachePath + '-wal')
-    unlinkIfPresent(cachePath + '-shm')
-    renameSync(tempBase, cachePath)
-    if (copiedWal) renameSync(tempWal, cachePath + '-wal')
-
-    const metadata: { version: number; sourcePath: string; fingerprint: DatabaseFingerprint } = {
-      version: SQLITE_CACHE_VERSION,
-      sourcePath,
-      fingerprint,
-    }
-    writeFileSync(tempMetadata, JSON.stringify(metadata), { encoding: 'utf8', mode: 0o600 })
-    renameSync(tempMetadata, metadataPath)
+    // The -wal goes first: a reader that can see the database must never find it
+    // without the sidecar holding its most recent rows.
+    if (copiedWal) publish(tempWal, cachePath + '-wal')
+    publish(tempBase, cachePath)
+    evictSupersededCopies(cacheDir, sourceKey, name)
     return cachePath
   } finally {
-    unlinkIfPresent(tempBase)
-    unlinkIfPresent(tempWal)
-    unlinkIfPresent(tempMetadata)
+    unlinkQuietly(tempBase)
+    unlinkQuietly(tempWal)
   }
 }
 
 function openReadonlyCache(path: string, originalError: unknown): DatabaseSyncInstance {
+  const Driver = DatabaseSync
+  if (Driver === null) throw new Error(getSqliteLoadError())
+
   let fingerprint: DatabaseFingerprint
   try {
     fingerprint = fingerprintDatabase(path)
@@ -321,9 +358,29 @@ function openReadonlyCache(path: string, originalError: unknown): DatabaseSyncIn
     // inaccessible between the failed query and the fallback probe.
     throw originalError
   }
-  const cachedPath = readOnlyCachePath(path, fingerprint)
-  const Driver = DatabaseSync
-  if (Driver === null) throw new Error(getSqliteLoadError())
+
+  // An absent or empty -wal holds no frames, so there is nothing to go stale and
+  // nothing worth copying: immutable lets SQLite skip the -shm it cannot create
+  // and read the source in place.
+  if (fingerprint.walBytes === 0) {
+    try {
+      return new Driver(`${pathToFileURL(path).href}?immutable=1`, { readOnly: true })
+    } catch {
+      // Older node:sqlite builds may not enable URI filenames. Copy instead.
+    }
+  }
+
+  let cachedPath: string
+  try {
+    cachedPath = readOnlyCachePath(path, fingerprint)
+  } catch (err) {
+    warnSqliteOnce(
+      path,
+      `codeburn: SQLite database ${path} is in a read-only directory and its cache copy could not be written ` +
+      `(${describeError(err)}); skipping this database.\n`,
+    )
+    throw originalError
+  }
   return new Driver(cachedPath, { readOnly: true })
 }
 
