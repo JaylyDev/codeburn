@@ -129,6 +129,34 @@ describe('Optimize', () => {
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
   })
 
+  it('lists applied fixes with a glyph per verdict and the undo hint', async () => {
+    const report = makeOptimizeReport()
+    report.appliedFixes = [
+      { id: 'a1', kind: 'archive-skill', findingId: 'unused-skills', appliedAt: '2026-07-06T00:00:00.000Z', verdict: 'worked', estimatedTokens: 300_000, realizedTokens: 280_000, undoCommand: 'codeburn act undo a1' },
+      { id: 'b2', kind: 'defer-threshold', findingId: 'mcp-defer-threshold', appliedAt: '2026-07-07T00:00:00.000Z', verdict: 'partial', estimatedTokens: 600_000, realizedTokens: 420_000, undoCommand: 'codeburn act undo b2' },
+      { id: 'c3', kind: 'shell-config', findingId: 'bash-output-cap', appliedAt: '2026-07-05T00:00:00.000Z', verdict: 'no-effect', estimatedTokens: 41_000, realizedTokens: 0, undoCommand: 'codeburn act undo c3' },
+      { id: 'd4', kind: 'mcp-remove', findingId: null, appliedAt: '2026-07-09T00:00:00.000Z', verdict: 'pending', estimatedTokens: 0, realizedTokens: 0, undoCommand: 'codeburn act undo d4' },
+    ]
+    getOptimizeReport.mockResolvedValue(report)
+    render(<Optimize period="30days" provider="all" />)
+
+    await screen.findByText('Applied fixes')
+    const rows = [...document.querySelectorAll('.opt-applied-row')]
+    expect(rows.map(r => r.className.split(' ')[1])).toEqual([
+      'opt-applied-worked', 'opt-applied-partial', 'opt-applied-no-effect', 'opt-applied-pending',
+    ])
+    expect(rows[0]!.textContent).toContain('unused-skills')
+    expect(rows[0]!.textContent).toContain('est. 300K \u2192 280K')
+    expect(rows[3]!.textContent).toContain('mcp-remove')
+    expect(screen.getByText('codeburn act undo c3')).toBeTruthy()
+  })
+
+  it('omits the applied-fixes list when nothing is applied', async () => {
+    render(<Optimize period="30days" provider="all" />)
+    await screen.findByText('Opus is doing your small talk')
+    expect(document.querySelector('.opt-applied')).toBeNull()
+  })
+
   it('groups Waste findings under the fix / habits / FYI headers in order', async () => {
     render(<Optimize period="30days" provider="all" />)
 

@@ -7,6 +7,7 @@ import { formatCost } from '../currency.js'
 import { formatTokens } from '../format.js'
 import { runAction } from './apply.js'
 import { shortId } from './journal.js'
+import { REPORT_MIN_AGE_DAYS } from './types.js'
 import { planFindings, type FindingPlan, type PlanContext } from './plans.js'
 
 export type ApplyOptions = {
@@ -176,15 +177,20 @@ export async function runOptimizeApply(
   } catch { /* baseline is optional; apply proceeds without it */ }
 
   print()
+  let applied = 0
   for (const fp of selected) {
     try {
       const record = await runAction(fp.plan!, opts.actionsDir)
+      applied++
       print(`  Applied ${chalk.bold(shortId(record.id))}  ${record.description}`)
       print(chalk.dim(`    Undo anytime: codeburn act undo ${shortId(record.id)}`))
     } catch (e) {
       errout.write(chalk.red(`  Failed to apply ${fp.finding.id}: ${e instanceof Error ? e.message : String(e)}`) + '\n')
       process.exitCode = 1
     }
+  }
+  if (applied > 0) {
+    print(chalk.dim(`  CodeBurn will re-measure these on your next optimize run after ${REPORT_MIN_AGE_DAYS} days.`))
   }
   print()
 }

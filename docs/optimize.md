@@ -68,6 +68,40 @@ or name it explicitly:
 codeburn optimize --apply --only read-edit-ratio
 ```
 
+## After you apply
+
+Applying a fix is a claim, so CodeBurn checks it. Every `codeburn optimize` run re-measures the
+fixes still in place and prints them under `Applied fixes`, one line each:
+
+| Line | Verdict | Meaning |
+|---|---|---|
+| `✓ unused-skills (7d ago): est. 300.0K -> measured 280.0K` | worked | at least 70% of the estimate showed up in your sessions |
+| `~ mcp-defer-threshold (5d ago): est. 600.0K -> measured 420.0K (-30% vs estimate)` | partial | it helped, but under its estimate |
+| `✗ bash-output-cap (6d ago): est. 41.0K -> measured 0 - did not help. Revert: codeburn act undo 3f2a1c04` | no-effect | no measured reduction at all |
+| `… mcp-remove (1d ago): measuring, check back after 3 days` | measuring | too young, or the change has not taken effect in a session yet |
+
+The estimate shown is the at-apply estimate scaled to the measured window, so the two numbers are
+comparable. Both come from the same reconciliation `codeburn act report` prints — there is one set of
+numbers, not two — and they are **measured**: provider-counted usage over the post-apply window.
+Anything that cannot be measured (no baseline captured, a fix you reverted by hand, a
+correlation-only kind like `guard-install`) stays on the `measuring` line with the reason, never a
+claimed saving.
+
+`--format json` carries the same list as `appliedFixes[]`, and the section appears in the dashboard
+TUI and the desktop app.
+
+### `--auto-revert`
+
+```bash
+codeburn optimize --auto-revert
+```
+
+Off by default. It undoes exactly the fixes whose verdict is `no-effect`, through the same code path
+as `codeburn act undo` (backups restored, drift check applied, the revert journaled). It never
+touches a `partial` or still-measuring fix, and it never auto-reverts a `claude-md-rule` — those land
+in whatever project directory you were in, the same reason `--yes` skips them, so it prints the undo
+command and leaves the file alone.
+
 ## measured vs estimated
 
 Each finding also carries a `basis`, printed next to its savings and summarised in the header as

@@ -433,9 +433,17 @@ describe('runOptimizeApply end-to-end', () => {
       expect(out).toContain(`Applied ${shortId(rec.id)}`)
       expect(out).toContain(`Undo anytime: codeburn act undo ${shortId(rec.id)}`)
     }
+    expect(out).toContain('CodeBurn will re-measure these on your next optimize run after 3 days.')
     expect(JSON.parse(await readFile(join(fx.home, '.claude.json'), 'utf-8')).mcpServers).toEqual({})
     expect(existsSync(join(fx.home, '.claude', 'skills', '.archived', 'foo'))).toBe(true)
     expect(existsSync(join(fx.home, '.zshrc'))).toBe(true)
+  })
+
+  it('does not promise a re-measure when nothing was applied', async () => {
+    const { fx, findings } = await threeFindingFixture()
+    const io = makeIo('q\n')
+    await runOptimizeApply([], undefined, applyOpts(fx, io, { findings }))
+    expect(io.stdout()).not.toContain('re-measure')
   })
 
   it('interactive pick "2" applies only the second plan', async () => {

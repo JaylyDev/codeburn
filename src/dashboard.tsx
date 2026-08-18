@@ -11,6 +11,7 @@ import { aggregateModelTotals } from './model-breakdown.js'
 import { buildDurablePeriod } from './usage-aggregator.js'
 import { getAllProviders } from './providers/index.js'
 import { classHeaderLine, classTotals, findingBasis, findingClass, scanAndDetect, type FindingClass, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
+import { appliedFixGlyph, formatAppliedFix, type AppliedFix } from './act/types.js'
 import { aggregateFileChurn, buildCoachingNotes, computePricingCoverage, medianTimeToFirstEditMs, scanUserCorrections, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 import { estimateContextBudget, type ContextBudget } from './context-budget.js'
 import { dateKey } from './day-aggregator.js'
@@ -1094,7 +1095,14 @@ const GRADE_COLORS: Record<string, string> = { A: '#5BF5A0', B: '#5BF5A0', C: GO
 // off the alt-buffer top and the user couldn't see the StatusBar at all.
 const FINDINGS_WINDOW_SIZE = 3
 
-function OptimizeView({ findings, costRate, projects, label, width, healthScore, healthGrade, cursor }: { findings: WasteFinding[]; costRate: number; projects: ProjectSummary[]; label: string; width: number; healthScore: number; healthGrade: string; cursor: number }) {
+const APPLIED_FIX_COLORS: Record<AppliedFix['verdict'], string> = {
+  worked: '#5BF5A0',
+  partial: GOLD,
+  'no-effect': '#F55B5B',
+  pending: DIM,
+}
+
+function OptimizeView({ findings, costRate, projects, label, width, healthScore, healthGrade, cursor, appliedFixes = [] }: { findings: WasteFinding[]; costRate: number; projects: ProjectSummary[]; label: string; width: number; healthScore: number; healthGrade: string; cursor: number; appliedFixes?: AppliedFix[] }) {
   const periodCost = projects.reduce((s, p) => s + p.totalCostUSD, 0)
   const totalTokens = findings.reduce((s, f) => s + f.tokensSaved, 0)
   const totalCost = totalTokens * costRate
@@ -1132,6 +1140,16 @@ function OptimizeView({ findings, costRate, projects, label, width, healthScore,
           </Fragment>
         )
       })}
+      {appliedFixes.length > 0 && (
+        <Box flexDirection="column" paddingX={1} width={width}>
+          <Text bold color={ORANGE} wrap="truncate-end">Applied fixes</Text>
+          {appliedFixes.map(fix => (
+            <Text key={fix.id} color={APPLIED_FIX_COLORS[fix.verdict]} wrap="truncate-end">
+              {appliedFixGlyph(fix)} {formatAppliedFix(fix)}
+            </Text>
+          ))}
+        </Box>
+      )}
     </Box>
   )
 }
@@ -1313,6 +1331,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   const [detectedProviders, setDetectedProviders] = useState<string[]>([])
   const [view, setView] = useState<View>('dashboard')
   const [optimizeResult, setOptimizeResult] = useState<OptimizeResult | null>(null)
+  const [appliedFixes, setAppliedFixes] = useState<AppliedFix[]>([])
   const [optimizeLoading, setOptimizeLoading] = useState(false)
   const [projectBudgets, setProjectBudgets] = useState<Map<string, ContextBudget>>(new Map())
   const [planUsages, setPlanUsages] = useState<PlanUsage[]>(initialPlanUsages ?? [])
@@ -1473,6 +1492,12 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
     try {
       const result = await scanAndDetect(projects, currentRange(), activeProvider)
       if (reloadGenerationRef.current === generation) setOptimizeResult(result)
+      // Best effort: a bad journal never keeps the findings off screen.
+      try {
+        const { computeActReport } = await import('./act/report.js')
+        const applied = await computeActReport()
+        if (reloadGenerationRef.current === generation) setAppliedFixes(applied.appliedFixes)
+      } catch { /* the applied section is optional */ }
     } catch (error) {
       console.error(error)
     } finally {
@@ -1637,7 +1662,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
         {view === 'compare'
           ? <CompareView projects={projects} onBack={() => setView('dashboard')} />
           : view === 'optimize' && optimizeResult
-            ? <OptimizeView findings={optimizeResult.findings} costRate={optimizeResult.costRate} projects={projects} label={headerLabel} width={dashWidth} healthScore={optimizeResult.healthScore} healthGrade={optimizeResult.healthGrade} cursor={findingsCursor} />
+            ? <OptimizeView findings={optimizeResult.findings} costRate={optimizeResult.costRate} projects={projects} label={headerLabel} width={dashWidth} healthScore={optimizeResult.healthScore} healthGrade={optimizeResult.healthGrade} cursor={findingsCursor} appliedFixes={appliedFixes} />
             : <DashboardContent projects={projects} period={period} columns={columns} maxContentWidth={maxContentWidth} activeProvider={activeProvider} budgets={projectBudgets} planUsages={planUsages} label={headerLabel} dayMode={isDayMode} dailyHistoryProjects={dailyHistoryProjects} dailyHistoryPageSize={dailyHistoryPageSize} scrollableDailyHistory={scrollableDailyHistory} dailyHistoryCursor={Math.min(dailyHistoryCursor, dailyHistoryMaxCursor)} durable={durable} />}
         {coachingNote && (
           <Box width={dashWidth} paddingX={1}>

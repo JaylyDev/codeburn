@@ -186,11 +186,12 @@ codeburn optimize --apply --yes       # apply every appliable fix without prompt
 codeburn act list                     # every change CodeBurn has made
 codeburn act undo --last              # roll the most recent change back
 codeburn act report                   # realized vs estimated savings
+codeburn optimize --auto-revert       # undo the applied fixes that measured no reduction
 ```
 
 `codeburn optimize` finds the waste; `--apply` fixes the config-class findings for you: settings values, environment variables, archiving unused agents and skills. Every change is backed up and journaled before it lands. `codeburn act list` shows the history and `codeburn act undo <id>` restores the original files (it refuses if the files changed since being applied, unless you pass `--force`).
 
-The loop closes on honesty: once an applied fix is at least 3 days old, `codeburn act report` compares its estimated savings against what your sessions actually did, and later `codeburn optimize` runs show that realized figure in the header. Estimates get checked against reality, not just claimed.
+The loop closes on honesty: once an applied fix is at least 3 days old, `codeburn act report` compares its estimated savings against what your sessions actually did, and every later `codeburn optimize` run lists it under `Applied fixes` with a plain verdict — worked, under its estimate, or did not help, with the undo command for that last case. `--auto-revert` undoes the ones that did nothing (never `CLAUDE.md` rules). Estimates get checked against reality, not just claimed.
 
 ## Guard your budget
 

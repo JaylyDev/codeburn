@@ -102,6 +102,50 @@ function WasteRows({ report }: { report: Polled<OptimizeJsonReport> }) {
         {report.data.summary.findingCount.toLocaleString('en-US')} findings · {formatUsd(report.data.summary.potentialSavingsCostUSD)} potential · health {report.data.summary.healthScore}/100
       </div>
       <ActionableFindingRows findings={report.data.findings} byClass={report.data.summary.byClass} />
+      <AppliedFixRows fixes={report.data.appliedFixes ?? []} />
+    </div>
+  )
+}
+
+type AppliedFix = NonNullable<OptimizeJsonReport['appliedFixes']>[number]
+
+const VERDICT_GLYPH: Record<AppliedFix['verdict'], string> = {
+  worked: '\u2713',
+  partial: '~',
+  'no-effect': '\u2717',
+  pending: '\u2026',
+}
+
+const VERDICT_LABEL: Record<AppliedFix['verdict'], string> = {
+  worked: 'worked',
+  partial: 'under estimate',
+  'no-effect': 'did not help',
+  pending: 'measuring',
+}
+
+// Closes the loop after `optimize --apply`: what each applied fix actually
+// measured, and for the ones that did nothing, how to put them back.
+function AppliedFixRows({ fixes }: { fixes: AppliedFix[] }) {
+  if (!fixes.length) return null
+
+  return (
+    <div className="opt-findings opt-applied">
+      <div className="opt-group">Applied fixes</div>
+      {fixes.map(fix => (
+        <div className={`opt-applied-row opt-applied-${fix.verdict}`} key={fix.id}>
+          <span className="opt-applied-glyph" aria-hidden="true">{VERDICT_GLYPH[fix.verdict]}</span>
+          <b className="opt-finding-title">{fix.findingId ?? fix.kind}</b>
+          <span className="opt-applied-verdict">{VERDICT_LABEL[fix.verdict]}</span>
+          <span className="opt-finding-tokens">
+            {fix.verdict === 'pending'
+              ? '\u2014'
+              : `est. ${formatCompact(fix.estimatedTokens)} \u2192 ${formatCompact(fix.realizedTokens)}`}
+          </span>
+        </div>
+      ))}
+      {fixes.some(fix => fix.verdict === 'no-effect') && (
+        <div className="opt-summary opt-applied-hint">Revert one that did not help: <code>{fixes.find(fix => fix.verdict === 'no-effect')!.undoCommand}</code></div>
+      )}
     </div>
   )
 }
