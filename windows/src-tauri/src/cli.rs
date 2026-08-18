@@ -18,13 +18,20 @@ const MAX_STDERR_BYTES: usize = 256 * 1024;
 const FETCH_TIMEOUT_SECS: u64 = 60;
 const VERSION_TIMEOUT_SECS: u64 = 20;
 
-/// Oldest CLI that emits the `menubar-json` shape this app renders (history.daily with
-/// per-day model breakdown, providers map). Older CLIs get the setup screen instead of a
-/// half-rendered popover.
-pub const MIN_CLI_VERSION: (u32, u32, u32) = (0, 7, 0);
+/// Oldest CLI this app can talk to. 0.9.9 is the first release whose
+/// `status --format menubar-json` accepts `--no-optimize`, which every quiet background
+/// refresh passes; it also emits all the payload fields the popover reads
+/// (`current.providers`, `current.cacheHitPercent`, `history.daily[].topModels`). Older CLIs
+/// get the setup screen instead of a half-rendered popover or a stream of spawn failures.
+pub const MIN_CLI_VERSION: (u32, u32, u32) = (0, 9, 9);
 
 #[cfg(windows)]
 const WINDOWS_CLI_NAMES: [&str; 2] = ["codeburn.cmd", "codeburn.exe"];
+
+#[cfg(windows)]
+const CLAUDE_NAMES: [&str; 2] = ["claude.cmd", "claude.exe"];
+#[cfg(not(windows))]
+const CLAUDE_NAMES: [&str; 1] = ["claude"];
 
 /// Alphanumerics plus `._/-` and space, with `\`, `:`, `(`, `)` also allowed on Windows
 /// so a user-supplied `CODEBURN_BIN` path like `C:\Users\...\codeburn.cmd` is accepted.
@@ -247,14 +254,32 @@ pub fn parse_version(text: &str) -> Option<(u32, u32, u32)> {
 /// changed the user's PATH, so we also read the live PATH from the registry on Windows and
 /// probe the standard npm / node install prefixes.
 fn locate_cli() -> Option<String> {
+    find_in_search_dirs(&candidate_names())
+}
+
+/// Same search for Claude Code's own binary, so "Connect Claude" spawns an absolute path
+/// instead of letting the console shell resolve a bare `claude`.
+fn locate_claude() -> Option<String> {
+    find_in_search_dirs(&CLAUDE_NAMES)
+}
+
+fn find_in_search_dirs(names: &[&str]) -> Option<String> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(path) = env::var_os("PATH") {
         dirs.extend(env::split_paths(&path));
     }
     dirs.extend(extra_search_dirs());
+    find_in_dirs(&dirs, names)
+}
 
-    for dir in dirs {
-        for name in candidate_names() {
+/// The absolute-only filter is the security boundary, so it lives here where every search
+/// goes through it. `env::split_paths` yields an empty `PathBuf` for `;;` or a trailing `;`,
+/// and the registry PATH can hold relative entries too; `PathBuf::from("").join("codeburn.cmd")`
+/// resolves against the current directory, which for a tray app launched at login is
+/// whatever Explorer handed it. A binary planted there must never win.
+fn find_in_dirs(dirs: &[PathBuf], names: &[&str]) -> Option<String> {
+    for dir in dirs.iter().filter(|d| d.is_absolute()) {
+        for name in names {
             let candidate = dir.join(name);
             if candidate.is_file() {
                 return Some(candidate.to_string_lossy().into_owned());
@@ -313,21 +338,42 @@ fn extra_search_dirs() -> Vec<PathBuf> {
     out
 }
 
+/// Windows' `CreateProcess` searches the current directory before `PATH`, so spawning
+/// `reg` or `cmd` by bare name lets anything dropped next to the app impersonate a system
+/// tool -- and the tray badge re-runs `reg query` every refresh. Always spawn the real one
+/// out of `%SystemRoot%\System32`, falling back to the documented default when the
+/// environment variable is missing or relative.
+#[cfg(windows)]
+pub fn system32_path(exe: &str) -> PathBuf {
+    let root = env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    root.join("System32").join(exe)
+}
+
+/// `system32_path` plus the CREATE_NO_WINDOW flag every one of these callers wants.
+#[cfg(windows)]
+pub fn system_command(exe: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let mut cmd = std::process::Command::new(system32_path(exe));
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 /// Reads the user and machine PATH values from the registry via `reg.exe` so a PATH edit
 /// made after this process started (npm install adds `%APPDATA%\npm`) is still honoured.
 #[cfg(windows)]
 fn registry_path_dirs() -> Vec<PathBuf> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
     let mut out = Vec::new();
     let keys = [
         r"HKCU\Environment",
         r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
     ];
     for key in keys {
-        let output = std::process::Command::new("reg")
+        let output = system_command("reg.exe")
             .args(["query", key, "/v", "Path"])
-            .creation_flags(CREATE_NO_WINDOW)
             .output();
         let Ok(output) = output else { continue };
         let text = String::from_utf8_lossy(&output.stdout);
@@ -391,11 +437,14 @@ pub fn spawn_in_terminal(app: &AppHandle, subcommand: &[&str]) -> Result<()> {
 }
 
 /// The Plan view's "Connect Claude" runs Claude Code's own login flow, not codeburn. The
-/// bare name is deliberate: on Windows the console shell resolves `claude.exe` (native
-/// installer) or `claude.cmd` (npm) through PATHEXT.
+/// binary is located up front rather than handed to the console shell as a bare name, so
+/// the same absolute-directory rule that protects the codeburn lookup applies here too.
 pub fn spawn_claude_login(app: &AppHandle) -> Result<()> {
+    let program = locate_claude().ok_or_else(|| {
+        anyhow!("Claude Code was not found on this machine. Install it, then try again.")
+    })?;
     let cli = CodeburnCli {
-        program: "claude".to_string(),
+        program,
         extra_args: vec![],
     };
     spawn_program_in_terminal(app, &cli, &["login"])
@@ -408,27 +457,32 @@ fn spawn_program_in_terminal(_app: &AppHandle, cli: &CodeburnCli, subcommand: &[
 
     #[cfg(target_os = "linux")]
     {
-        let terminals: [&[&str]; 4] = [
-            &["x-terminal-emulator", "-e"],
-            &["gnome-terminal", "--", "bash", "-lc"],
-            &["konsole", "-e"],
-            &["xterm", "-e"],
-        ];
-        for term in &terminals {
-            let program = term[0];
-            let extras = &term[1..];
-            if which::which(program).is_ok() {
-                let mut command_parts: Vec<String> = vec![cli.program.clone()];
-                command_parts.extend(cli.extra_args.clone());
-                command_parts.extend(subcommand.iter().map(|s| s.to_string()));
-                // gnome-terminal wants the whole command as a single argv after `--`
-                // followed by `bash -lc`. The allowlist guarantees no quoting is needed.
-                let composite = command_parts.join(" ");
-                let mut cmd = std::process::Command::new(program);
-                cmd.args(extras);
-                cmd.arg(&composite);
-                cmd.spawn().with_context(|| format!("failed to launch {}", program))?;
-                return Ok(());
+        let mut command_parts: Vec<String> = vec![cli.program.clone()];
+        command_parts.extend(cli.extra_args.clone());
+        command_parts.extend(subcommand.iter().map(|s| s.to_string()));
+        // Terminal emulators take the command as one string that a shell then parses
+        // (gnome-terminal explicitly hands it to `bash -lc`). `cli.program` reaches here
+        // from PATH resolution, not only from the allowlisted CODEBURN_BIN, so re-check
+        // every part before joining; anything a shell could reinterpret skips the terminal
+        // and goes through the argv-only detached spawn below.
+        if command_parts.iter().all(|p| is_safe_arg(p)) {
+            let composite = command_parts.join(" ");
+            let terminals: [&[&str]; 4] = [
+                &["x-terminal-emulator", "-e"],
+                &["gnome-terminal", "--", "bash", "-lc"],
+                &["konsole", "-e"],
+                &["xterm", "-e"],
+            ];
+            for term in &terminals {
+                let program = term[0];
+                let extras = &term[1..];
+                if which::which(program).is_ok() {
+                    let mut cmd = std::process::Command::new(program);
+                    cmd.args(extras);
+                    cmd.arg(&composite);
+                    cmd.spawn().with_context(|| format!("failed to launch {}", program))?;
+                    return Ok(());
+                }
             }
         }
         // Fallback: run detached, output lost -- better than silently doing nothing.
@@ -448,14 +502,16 @@ fn spawn_program_in_terminal(_app: &AppHandle, cli: &CodeburnCli, subcommand: &[
         // explicit empty title. `/K` keeps the console open for non-interactive commands
         // (export) so the user can read where the file went; the TUI (report/optimize)
         // owns the window until the user quits it either way.
-        let is_codeburn = cli.program.starts_with("codeburn");
-        let program = if std::path::Path::new(&cli.program).is_absolute() || !is_codeburn {
-            cli.program.clone()
-        } else {
+        // Only the unresolved default name is worth a second lookup; anything else is
+        // either already absolute or a CODEBURN_BIN the user chose.
+        let program = if cli.program == default_program_name() {
             locate_cli().unwrap_or_else(|| cli.program.clone())
+        } else {
+            cli.program.clone()
         };
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.arg("/C").arg("start").arg("").arg("cmd").arg("/K").arg(&program);
+        let cmd_exe = system32_path("cmd.exe");
+        let mut cmd = system_command("cmd.exe");
+        cmd.arg("/C").arg("start").arg("").arg(&cmd_exe).arg("/K").arg(&program);
         for a in &cli.extra_args {
             cmd.arg(a);
         }
@@ -488,12 +544,58 @@ mod which {
 
     pub fn which(program: &str) -> Result<PathBuf, ()> {
         let path = env::var_os("PATH").ok_or(())?;
-        for dir in env::split_paths(&path) {
-            let candidate = dir.join(program);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-        Err(())
+        let dirs: Vec<PathBuf> = env::split_paths(&path).collect();
+        super::find_in_dirs(&dirs, &[program]).map(PathBuf::from).ok_or(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `;;` / trailing-`;` case: an empty PATH entry must not turn into a
+    /// current-directory lookup, which is how a planted binary would win at login.
+    #[test]
+    fn find_in_dirs_skips_empty_and_relative_entries() {
+        let dir = std::env::temp_dir();
+        let name = "codeburn-menubar-locate-probe";
+        let planted = dir.join(name);
+        std::fs::write(&planted, b"probe").unwrap();
+
+        // Empty and relative entries are ignored even though the file is reachable
+        // through them once the process CWD is the temp dir.
+        let unsafe_dirs = vec![PathBuf::from(""), PathBuf::from("."), PathBuf::from("..")];
+        assert_eq!(find_in_dirs(&unsafe_dirs, &[name]), None);
+
+        // The same name behind an absolute entry is found.
+        let found = find_in_dirs(std::slice::from_ref(&dir), &[name]).expect("absolute entry should match");
+        assert!(PathBuf::from(&found).is_absolute());
+        assert!(found.ends_with(name));
+
+        // An unsafe entry ahead of a good one cannot shadow it.
+        let mixed = vec![PathBuf::from(""), dir.clone()];
+        assert_eq!(find_in_dirs(&mixed, &[name]), Some(found));
+
+        std::fs::remove_file(&planted).ok();
+    }
+
+    #[test]
+    fn parse_version_reads_bare_and_prefixed_output() {
+        assert_eq!(parse_version("0.9.9"), Some((0, 9, 9)));
+        assert_eq!(parse_version("codeburn 0.9.20\n"), Some((0, 9, 20)));
+        assert_eq!(parse_version("1.0"), Some((1, 0, 0)));
+        assert_eq!(parse_version("0.10.0-beta.1"), Some((0, 10, 0)));
+        assert_eq!(parse_version("no version here"), None);
+    }
+
+    /// The gate is a plain tuple compare, so the only thing worth pinning is that the
+    /// versions on either side of MIN_CLI_VERSION land on the right side of it.
+    #[test]
+    fn version_gate_rejects_only_older_clis() {
+        assert_eq!(MIN_CLI_VERSION, (0, 9, 9));
+        assert!(parse_version("0.9.8").unwrap() < MIN_CLI_VERSION);
+        assert!(parse_version("0.9.9").unwrap() >= MIN_CLI_VERSION);
+        assert!(parse_version("0.9.20").unwrap() >= MIN_CLI_VERSION);
+        assert!(parse_version("0.10.0").unwrap() >= MIN_CLI_VERSION);
     }
 }

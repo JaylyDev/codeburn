@@ -83,10 +83,11 @@ pub fn run() {
                 WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
                     let _ = window.hide();
+                    mark_hidden(window.app_handle());
                 }
                 WindowEvent::Focused(false) => {
-                    LAST_HIDDEN_MS.store(now_ms(), Ordering::Relaxed);
                     let _ = window.hide();
+                    mark_hidden(window.app_handle());
                 }
                 _ => {}
             }
@@ -274,13 +275,21 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// Every path that hides the popover goes through here, so the debounce stamp and the
+/// frontend's visibility signal can never drift apart. The frontend drops to its idle
+/// refresh cadence on `codeburn://hidden` and comes back on `codeburn://shown`.
+fn mark_hidden(app: &AppHandle) {
+    LAST_HIDDEN_MS.store(now_ms(), Ordering::Relaxed);
+    let _ = app.emit("codeburn://hidden", ());
+}
+
 fn toggle_popover(app: &AppHandle, anchor: Option<(i32, i32)>) {
     let Some(window) = app.get_webview_window(POPOVER_LABEL) else {
         return;
     };
     if window.is_visible().unwrap_or(false) {
-        LAST_HIDDEN_MS.store(now_ms(), Ordering::Relaxed);
         let _ = window.hide();
+        mark_hidden(app);
         return;
     }
     let last = LAST_HIDDEN_MS.load(Ordering::Relaxed);
@@ -434,8 +443,8 @@ mod commands {
     #[tauri::command]
     pub fn hide_popover(app: AppHandle) {
         if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
-            super::LAST_HIDDEN_MS.store(super::now_ms(), std::sync::atomic::Ordering::Relaxed);
             let _ = window.hide();
+            super::mark_hidden(&app);
         }
     }
 

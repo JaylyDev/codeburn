@@ -925,7 +925,6 @@ code { font-family: var(--font-mono); }
 .settings-row-hint { margin-top: 1px; font-size: 10.5px; line-height: 1.35; color: var(--label-2); word-break: break-word; }
 .settings-row-control { flex-shrink: 0; display: flex; align-items: center; }
 .settings-error { font-size: 10.5px; color: var(--danger); padding-bottom: 6px; }
-.settings a.btn { text-decoration: none; }
 
 .toggle {
   position: relative;
@@ -1108,7 +1107,16 @@ code { font-family: var(--font-mono); }
   box-shadow: inset 0 0.5px 0 var(--fill-18);
 }
 .star-banner-icon { color: var(--brand-accent); flex-shrink: 0; }
-.star-banner-link { font-size: 10.5px; font-weight: 500; color: var(--label); text-decoration: none; }
+.star-banner-link {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--label);
+  text-decoration: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
 .star-banner-cta { color: var(--brand-accent); text-decoration: underline; }
 .star-banner-spacer { flex: 1; }
 .star-banner-close {

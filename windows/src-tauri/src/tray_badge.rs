@@ -80,6 +80,13 @@ const FONT_MAX_FRACTION: f32 = 0.95;
 const FONT_MIN_FRACTION: f32 = 0.5;
 const FONT_STEP_PX: f32 = 0.5;
 
+/// Read and parsed once: the badge re-renders on every refresh and the font file does not
+/// change under a running session.
+fn font() -> Option<&'static fontdue::Font> {
+    static FONT: std::sync::OnceLock<Option<fontdue::Font>> = std::sync::OnceLock::new();
+    FONT.get_or_init(load_font).as_ref()
+}
+
 fn load_font() -> Option<fontdue::Font> {
     for path in FONT_CANDIDATES {
         if let Ok(bytes) = std::fs::read(path) {
@@ -111,12 +118,12 @@ fn layout(font: &fontdue::Font, text: &str, px: f32) -> (Vec<Raster>, f32, i32, 
 }
 
 fn render_with_font(text: &str, size: u32, color: [u8; 3]) -> Option<Image<'static>> {
-    let font = load_font()?;
+    let font = font()?;
     let limit = size as f32;
     let mut px = limit * FONT_MAX_FRACTION;
     let mut chosen = None;
     while px >= limit * FONT_MIN_FRACTION {
-        let (glyphs, width, top, bottom) = layout(&font, text, px);
+        let (glyphs, width, top, bottom) = layout(font, text, px);
         let height = (top - bottom) as f32;
         if width <= limit && height <= limit {
             chosen = Some((glyphs, width, top, bottom));
@@ -219,16 +226,15 @@ pub fn small_icon_size() -> u32 {
 /// with the taskbar, not the popover.
 #[cfg(target_os = "windows")]
 pub fn taskbar_is_dark() -> bool {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    let output = std::process::Command::new("reg")
+    // Absolute `reg.exe` out of System32 -- this runs on every badge refresh, so a bare
+    // name here would be the single most reliably triggered planted-binary path.
+    let output = crate::cli::system_command("reg.exe")
         .args([
             "query",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
             "/v",
             "SystemUsesLightTheme",
         ])
-        .creation_flags(CREATE_NO_WINDOW)
         .output();
     match output {
         Ok(out) => {

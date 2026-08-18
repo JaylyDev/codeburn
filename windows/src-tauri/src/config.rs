@@ -91,6 +91,8 @@ mod unix_lock {
             .create(true)
             .read(true)
             .write(true)
+            // A lock file only ever needs to exist; its contents are irrelevant.
+            .truncate(false)
             .open(super::lock_path())
             .with_context(|| "failed to open config lock")?;
 
@@ -107,9 +109,18 @@ mod unix_lock {
     }
 }
 
-/// Windows has no flock; a create-new lock file gives the same mutual exclusion against
-/// the CLI's own writer. Stale locks (crash mid-write) are ignored once older than
-/// STALE_LOCK_SECS so a single crash can never wedge currency changes forever.
+/// Windows has no flock; a create-new lock file is the closest equivalent.
+///
+/// What this actually buys: mutual exclusion between writers that take this lock, which
+/// today means only other instances of this app. The codeburn CLI writes `config.json`
+/// without taking it, so a concurrent CLI write still races us -- the rename below keeps the
+/// file from ever being torn, but a simultaneous CLI edit can still be the one that wins.
+///
+/// A lock file left behind by a crash is treated as abandoned once it is older than
+/// STALE_LOCK_SECS (three orders of magnitude longer than the read-modify-rename it guards),
+/// so one crash cannot wedge currency changes forever. Upgrading to `LockFileEx`, which the
+/// OS releases on process death and needs no staleness heuristic, only becomes worth it if
+/// the CLI ever starts taking the lock too.
 #[cfg(windows)]
 mod windows_lock {
     use std::fs;
@@ -124,10 +135,15 @@ mod windows_lock {
 
     pub struct Guard {
         path: PathBuf,
+        /// Kept open for the lifetime of the guard: Windows will not unlink a file that is
+        /// still open, so holding the handle is what stops the stale sweep below from ever
+        /// deleting a lock whose owner is alive.
+        file: Option<fs::File>,
     }
 
     impl Drop for Guard {
         fn drop(&mut self) {
+            self.file.take();
             let _ = fs::remove_file(&self.path);
         }
     }
@@ -136,10 +152,16 @@ mod windows_lock {
         let path = super::lock_path();
         for _ in 0..MAX_RETRIES {
             match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Ok(Guard { path }),
+                Ok(file) => {
+                    return Ok(Guard {
+                        path,
+                        file: Some(file),
+                    })
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if is_stale(&path) {
-                        let _ = fs::remove_file(&path);
+                    // Only proceed on a successful unlink: a live holder still has the file
+                    // open, so this fails for anything but an abandoned lock.
+                    if is_stale(&path) && fs::remove_file(&path).is_ok() {
                         continue;
                     }
                     sleep(RETRY_INTERVAL);

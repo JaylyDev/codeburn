@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { openUrl } from '@tauri-apps/plugin-opener'
 import { readSetting, writeSetting } from '../lib/settings'
 import { StarIcon, XIcon } from './Icons'
 
@@ -16,10 +17,10 @@ export function StarBanner() {
   return (
     <div className="star-banner">
       <StarIcon size={10} className="star-banner-icon" />
-      <a className="star-banner-link" href={GITHUB_URL} target="_blank" rel="noopener noreferrer">
+      <button type="button" className="star-banner-link" onClick={() => openUrl(GITHUB_URL)}>
         <span>Enjoying CodeBurn?</span>{' '}
         <span className="star-banner-cta">Star us on GitHub</span>
-      </a>
+      </button>
       <span className="star-banner-spacer" />
       <button type="button" className="star-banner-close" onClick={dismiss} title="Hide this banner" aria-label="Hide this banner">
         <XIcon size={9} />

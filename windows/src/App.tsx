@@ -33,10 +33,14 @@ import { SettingsPanel, type ThemeChoice } from './components/SettingsPanel'
 
 const payloadCache = new PayloadCache<MenubarPayload>()
 
-/// Background cadence. Every tick refreshes today/all (tray tooltip, provider badges) and
-/// the visible period/provider; entries younger than STALE_MS are left alone when the
-/// popover is re-opened.
-const REFRESH_INTERVAL_MS = 60_000
+/// Background cadence, mirroring mac/Sources/CodeBurnMenubar/RefreshCadence.swift: every
+/// fetch is a full Node process, so the popover being closed has to cost less than it being
+/// open. Visible, a tick refreshes today/all plus the selected period/provider with optimize
+/// findings; hidden, a slower tick refreshes only today/all and skips optimize, since the
+/// tray badge and tooltip are the only things anyone can see. Entries younger than STALE_MS
+/// are left alone when the popover is re-opened.
+const REFRESH_ACTIVE_MS = 60_000
+const REFRESH_IDLE_MS = 120_000
 const STALE_MS = 60_000
 
 type FetchOptions = {
@@ -63,6 +67,8 @@ export function App() {
   const [theme, setTheme] = useState(() => currentTheme())
   const [trayBadge, setTrayBadge] = useState(() => readSetting('trayBadge') !== 'off')
   const [showSettings, setShowSettings] = useState(false)
+  // The window starts hidden and is shown by a tray click, which emits `codeburn://shown`.
+  const [popoverVisible, setPopoverVisible] = useState(false)
   const [themeChoice, setThemeChoice] = useState<ThemeChoice>(() => {
     const saved = readSetting('theme')
     return saved === 'dark' || saved === 'light' ? saved : 'system'
@@ -88,10 +94,13 @@ export function App() {
         if (previous) json.optimize = previous.optimize
       }
       payloadCache.set(p, prov, json)
-      if (isSelected()) setPayload(json)
+      if (isSelected()) {
+        setPayload(json)
+        // "updated Xs ago" describes what the user is looking at, so only a fetch of the
+        // visible key may stamp it - a background today/all tick must not.
+        setLastUpdated(new Date())
+      }
       if (p === 'today' && prov === 'all') setTodayPayload(json)
-      setLastUpdated(new Date())
-      setCliStatus(prev => (prev && !(prev.found && prev.compatible) ? { ...prev, found: true, compatible: true, error: null } : prev))
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       if (message.includes('CLI not found')) {
@@ -114,17 +123,9 @@ export function App() {
     await fetchKey(p, prov, opts)
   }, [fetchKey])
 
-  const probeCli = useCallback(async () => {
-    setCliChecking(true)
-    try {
-      setCliStatus(await invoke<CliStatus>('cli_status'))
-    } catch {
-      // Leave the status unknown; the data views already tell the user if fetches fail.
-    } finally {
-      setCliChecking(false)
-    }
-  }, [])
-
+  /// The single source of truth for the CLI gate. Nothing else writes a "compatible"
+  /// verdict: a payload that happens to parse does not prove the CLI is new enough, and a
+  /// probe from the settings panel must not be able to invent one either.
   const checkCli = useCallback(async () => {
     setCliChecking(true)
     try {
@@ -140,33 +141,50 @@ export function App() {
     }
   }, [refreshAll])
 
+  const cliReady = cliStatus !== null && cliStatus.found && cliStatus.compatible
+
+  // Probe the gate before the first fetch: an old CLI emits a payload missing fields the
+  // popover reads, which used to blank the whole window instead of showing the setup screen.
   useEffect(() => {
     invoke<string>('app_version').then(setVersion).catch(() => {})
-    refreshAll({ includeOptimize: true, showOverlay: true })
-    const id = setInterval(() => refreshAll({ includeOptimize: true, showOverlay: false }), REFRESH_INTERVAL_MS)
+    checkCli()
+    // Startup only; checkCli is re-run from the setup screen and settings on demand.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    if (!cliReady) return
+    const tick = popoverVisible
+      ? () => refreshAll({ includeOptimize: true, showOverlay: false })
+      : () => fetchKey('today', 'all', { includeOptimize: false, showOverlay: false })
+    const id = setInterval(tick, popoverVisible ? REFRESH_ACTIVE_MS : REFRESH_IDLE_MS)
     return () => clearInterval(id)
-  }, [refreshAll])
+  }, [cliReady, popoverVisible, refreshAll, fetchKey])
 
   useEffect(() => {
     const cached = payloadCache.get(period, provider)
     setPayload(cached)
+    if (!cliReady) return
     if (!cached) {
       fetchKey(period, provider, { includeOptimize: true, showOverlay: true })
     } else if (payloadCache.age(period, provider) > STALE_MS) {
       fetchKey(period, provider, { includeOptimize: true, showOverlay: false })
     }
-  }, [period, provider, fetchKey])
+  }, [period, provider, cliReady, fetchKey])
 
   useEffect(() => {
     const unlistenRefresh = listen('codeburn://refresh', () => refreshAll({ includeOptimize: true, showOverlay: true }))
     const unlistenShown = listen('codeburn://shown', () => {
+      setPopoverVisible(true)
       const { period: p, provider: prov } = selection.current
       if (payloadCache.age(p, prov) > STALE_MS) refreshAll({ includeOptimize: true, showOverlay: false })
     })
+    const unlistenHidden = listen('codeburn://hidden', () => setPopoverVisible(false))
     const unlistenTheme = listen('codeburn://toggle-theme', () => toggleTheme())
     return () => {
       unlistenRefresh.then(fn => fn())
       unlistenShown.then(fn => fn())
+      unlistenHidden.then(fn => fn())
       unlistenTheme.then(fn => fn())
     }
   }, [refreshAll])
@@ -189,16 +207,18 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
-  useEffect(() => {
-    if (!todayPayload) return
-    const text = `CodeBurn · ${formatCurrency(todayPayload.current.cost, currency)} today`
-    invoke('set_tray_tooltip', { text }).catch(() => {})
-  }, [todayPayload, currency])
+  const todayCost = todayPayload?.current?.cost ?? null
 
   useEffect(() => {
-    const text = trayBadge && todayPayload ? trayBadgeText(todayPayload.current.cost, currency) : null
+    if (todayCost === null) return
+    const text = `CodeBurn · ${formatCurrency(todayCost, currency)} today`
+    invoke('set_tray_tooltip', { text }).catch(() => {})
+  }, [todayCost, currency])
+
+  useEffect(() => {
+    const text = trayBadge && todayCost !== null ? trayBadgeText(todayCost, currency) : null
     invoke('set_tray_badge', { text }).catch(err => setError(`Tray badge: ${String(err)}`))
-  }, [todayPayload, currency, trayBadge])
+  }, [todayCost, currency, trayBadge])
 
 
   const chooseTheme = (choice: ThemeChoice) => {
@@ -245,9 +265,13 @@ export function App() {
   const activeInsight = visibleModes.includes(insight) ? insight : 'trend'
 
   const cliBlocked = cliStatus !== null && (!cliStatus.found || !cliStatus.compatible)
-  const isFilteredEmpty = payload !== null && provider !== 'all' && payload.current.cost <= 0 && payload.current.calls === 0
+  // The version gate above is what keeps these fields present; the optional reads are the
+  // backstop that turns a surprising payload into an empty state rather than a blank window.
+  const isFilteredEmpty = payload !== null && provider !== 'all'
+    && (payload.current?.cost ?? 0) <= 0 && (payload.current?.calls ?? 0) === 0
   const neverAnyData = payload !== null && provider === 'all'
-    && payload.current.calls === 0 && payload.current.sessions === 0 && payload.history.daily.length === 0
+    && (payload.current?.calls ?? 0) === 0 && (payload.current?.sessions ?? 0) === 0
+    && (payload.history?.daily?.length ?? 0) === 0
 
   const footnote = [version ? `CodeBurn v${version}` : 'CodeBurn', lastUpdated ? `updated ${relativePast(lastUpdated)}` : null]
     .filter(Boolean)
@@ -280,7 +304,6 @@ export function App() {
             onTrayBadge={setTrayBadgePref}
             cliStatus={cliStatus}
             onCheckCli={checkCli}
-            onProbeCli={probeCli}
             cliChecking={cliChecking}
             onQuit={() => invoke('quit_app').catch(() => {})}
           />
@@ -302,12 +325,12 @@ export function App() {
                   {activeInsight === 'plan' && (
                     <PlanInsight payload={payload} currency={currency} onOpenTerminal={openTerminal} onConnectClaude={connectClaude} />
                   )}
-                  {activeInsight === 'trend' && <TrendInsight days={payload?.history.daily ?? []} currency={currency} />}
-                  {activeInsight === 'forecast' && <ForecastInsight days={payload?.history.daily ?? []} currency={currency} />}
+                  {activeInsight === 'trend' && <TrendInsight days={payload?.history?.daily ?? []} currency={currency} />}
+                  {activeInsight === 'forecast' && <ForecastInsight days={payload?.history?.daily ?? []} currency={currency} />}
                   {activeInsight === 'pulse' && payload && <PulseInsight payload={payload} currency={currency} />}
                   {activeInsight === 'stats' && payload && <StatsInsight payload={payload} currency={currency} period={period} />}
                 </div>
-                {payload && (
+                {payload?.current && (
                   <>
                     <ActivitySection payload={payload} currency={currency} />
                     <ModelsSection

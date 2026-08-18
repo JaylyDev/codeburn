@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { openUrl } from '@tauri-apps/plugin-opener'
 import type { CurrencyState } from '../lib/currency'
 import { CURRENCY_CODES } from '../lib/currency'
 import { homePath } from '../lib/platform'
@@ -26,23 +27,22 @@ type Props = {
   onTrayBadge: (on: boolean) => void
   cliStatus: CliStatus | null
   onCheckCli: () => void
-  onProbeCli: () => void
   cliChecking: boolean
   onQuit: () => void
 }
 
 export function SettingsPanel({
   onBack, version, currency, onCurrency, themeChoice, onThemeChoice, trayBadge, onTrayBadge,
-  cliStatus, onCheckCli, onProbeCli, cliChecking, onQuit,
+  cliStatus, onCheckCli, cliChecking, onQuit,
 }: Props) {
   const [loginItem, setLoginItem] = useState<boolean | null>(null)
   const [loginError, setLoginError] = useState<string | null>(null)
 
+  // No CLI probe here: App owns the gate and probes it on mount, so the panel only ever
+  // displays what that probe found. Its own probe could otherwise fail transiently and drop
+  // a working app onto the setup screen.
   useEffect(() => {
     invoke<boolean>('launch_at_login').then(setLoginItem).catch(() => setLoginItem(false))
-    if (!cliStatus) onProbeCli()
-    // Probe once when the panel opens; cliStatus arriving later must not re-trigger it.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const toggleLogin = async () => {
@@ -118,7 +118,7 @@ export function SettingsPanel({
       <div className="settings-group">
         <div className="settings-group-label">About</div>
         <Row label={`CodeBurn Desktop ${version ? `v${version}` : ''}`} hint="Tracks AI coding spend from local session logs. Nothing leaves this machine except the Claude usage check.">
-          <a className="btn" href={GITHUB_URL} target="_blank" rel="noopener noreferrer">GitHub</a>
+          <button type="button" className="btn" onClick={() => openUrl(GITHUB_URL)}>GitHub</button>
         </Row>
         <Row label="Quit CodeBurn" hint="Removes the tray icon until you launch it again.">
           <button type="button" className="btn" onClick={onQuit}>Quit</button>

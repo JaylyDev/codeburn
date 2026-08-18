@@ -2,20 +2,21 @@
 //! executable. Linux: an XDG autostart .desktop file. No extra crates; both are a few
 //! lines of `reg` / plain file IO.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use anyhow::Context;
 
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 const APP_NAME: &str = "CodeBurn";
 
 #[cfg(target_os = "windows")]
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
+/// Absolute `reg.exe` out of System32 -- see `cli::system_command`.
 #[cfg(target_os = "windows")]
 fn reg(args: &[&str]) -> Result<std::process::Output> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    std::process::Command::new("reg")
+    crate::cli::system_command("reg.exe")
         .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .with_context(|| "failed to run reg.exe")
 }

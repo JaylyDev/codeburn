@@ -1,18 +1,17 @@
 //! Claude subscription usage (the "Plan" insight). Mirrors the macOS SubscriptionClient:
-//! read Claude Code's OAuth credentials, call the usage endpoint, refresh once on 401, and
-//! keep a rolling snapshot file so a freshly reset window can still show last cycle's final.
+//! read Claude Code's OAuth credentials, call the usage endpoint, adopt a token Claude Code
+//! has already rotated on 401 (never spending the shared refresh token), and keep a rolling
+//! snapshot file so a freshly reset window can still show last cycle's final.
 
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 const CREDENTIALS_RELATIVE_PATH: &str = ".claude/.credentials.json";
-const OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const REFRESH_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const BETA_HEADER: &str = "oauth-2025-04-20";
 const USER_AGENT: &str = "claude-code/2.1.0";
@@ -78,24 +77,28 @@ impl PlanClient {
 
         let response = match fetch_usage(&creds.access_token).await {
             Ok(r) => r,
+            // Parity with mac/Sources/CodeBurnMenubar/Data/ClaudeCredentialStore.swift
+            // (`refreshAfter401`): Claude's refresh token is single-use and rotates, so
+            // spending it here would invalidate the token Claude Code itself is holding and
+            // break the user's `claude` login. Instead re-read Claude's own store for a
+            // token it has already rotated; if there is nothing fresher yet, report a
+            // transient failure and let the next refresh pick it up.
             Err(FetchError::Unauthorized) => {
-                let Some(refresh) = creds.refresh_token.as_deref().filter(|t| !t.is_empty()) else {
+                let rotated = load_credentials()
+                    .ok()
+                    .flatten()
+                    .map(|c| c.access_token)
+                    .filter(|t| *t != creds.access_token);
+                let Some(token) = rotated else {
                     return Ok(PlanUsage::Failed {
-                        message: "Claude session expired and no refresh token is available. Run `claude login`.".into(),
+                        message: "Claude is refreshing its session. This clears itself once Claude Code renews the token; run `claude login` if it persists.".into(),
                     });
                 };
-                match refresh_access_token(refresh).await {
-                    Ok(token) => match fetch_usage(&token).await {
-                        Ok(r) => r,
-                        Err(err) => {
-                            return Ok(PlanUsage::Failed {
-                                message: err.to_string(),
-                            })
-                        }
-                    },
+                match fetch_usage(&token).await {
+                    Ok(r) => r,
                     Err(err) => {
                         return Ok(PlanUsage::Failed {
-                            message: format!("Token refresh failed: {err}"),
+                            message: err.to_string(),
                         })
                     }
                 }
@@ -144,7 +147,6 @@ impl PlanClient {
 
 struct StoredCredentials {
     access_token: String,
-    refresh_token: Option<String>,
     rate_limit_tier: Option<String>,
 }
 
@@ -158,8 +160,6 @@ struct CredentialsRoot {
 struct OAuthBlock {
     #[serde(rename = "accessToken")]
     access_token: Option<String>,
-    #[serde(rename = "refreshToken")]
-    refresh_token: Option<String>,
     #[serde(rename = "rateLimitTier")]
     rate_limit_tier: Option<String>,
 }
@@ -195,7 +195,6 @@ fn load_credentials() -> Result<Option<StoredCredentials>> {
     }
     Ok(Some(StoredCredentials {
         access_token: token,
-        refresh_token: oauth.refresh_token,
         rate_limit_tier: oauth.rate_limit_tier,
     }))
 }
@@ -253,11 +252,6 @@ struct Window {
     resets_at: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct TokenRefreshResponse {
-    access_token: String,
-}
-
 #[derive(Debug, thiserror::Error)]
 enum FetchError {
     #[error("Claude session is no longer authorized")]
@@ -301,27 +295,6 @@ async fn fetch_usage(token: &str) -> Result<UsageResponse, FetchError> {
         .map_err(|e| FetchError::Other(format!("Decode failed: {e}")))
 }
 
-async fn refresh_access_token(refresh_token: &str) -> Result<String> {
-    let response = client()
-        .map_err(|e| anyhow!(e.to_string()))?
-        .post(REFRESH_URL)
-        .header("Accept", "application/json")
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", OAUTH_CLIENT_ID),
-        ])
-        .send()
-        .await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        bail!("{} {}", status.as_u16(), truncate(&body, 200));
-    }
-    let decoded: TokenRefreshResponse = response.json().await?;
-    Ok(decoded.access_token)
-}
-
 fn truncate(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max).collect();
     if text.chars().count() > max {
@@ -345,31 +318,53 @@ struct Snapshot {
     effective_tokens: Option<f64>,
 }
 
-fn snapshots_path() -> PathBuf {
-    let dir = std::env::var_os("CODEBURN_CACHE_DIR")
+/// None when there is no cache dir and no home dir: writing the snapshot store into the
+/// process's current directory would scatter a file wherever the tray happened to be
+/// launched from, so we simply skip snapshots instead.
+fn snapshots_path() -> Option<PathBuf> {
+    std::env::var_os("CODEBURN_CACHE_DIR")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".cache").join("codeburn")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    dir.join(SNAPSHOT_FILENAME)
+        .map(|dir| dir.join(SNAPSHOT_FILENAME))
 }
 
 fn load_snapshots() -> Vec<Snapshot> {
-    fs::read(snapshots_path())
-        .ok()
+    snapshots_path()
+        .and_then(|p| fs::read(p).ok())
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
 
+/// Mirrors `mac/Sources/CodeBurnMenubar/Security/SafeFile.swift`: write to a temp file with
+/// owner-only permissions and rename over the target, and refuse a target that has been
+/// replaced by a symlink pointing somewhere else.
 fn save_snapshots(all: &[Snapshot]) {
-    let path = snapshots_path();
+    let Some(path) = snapshots_path() else { return };
+    if let Ok(meta) = fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() {
+            return;
+        }
+    }
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if let Ok(bytes) = serde_json::to_vec_pretty(all) {
-        let tmp = path.with_extension("tmp");
-        if fs::write(&tmp, bytes).is_ok() {
-            let _ = fs::rename(&tmp, &path);
-        }
+    let Ok(bytes) = serde_json::to_vec_pretty(all) else { return };
+    let tmp = path.with_extension("tmp");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let Ok(mut file) = options.open(&tmp) else { return };
+    use std::io::Write;
+    if file.write_all(&bytes).is_ok() && file.flush().is_ok() {
+        drop(file);
+        let _ = fs::rename(&tmp, &path);
+    } else {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
     }
 }
 
