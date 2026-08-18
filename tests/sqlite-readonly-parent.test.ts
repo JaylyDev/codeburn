@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   isSqliteReadonlyError,
   openDatabase,
+  sqliteSupportsUriFilenames,
 } from '../src/sqlite.js'
 import {
   discoverSqliteSessions,
@@ -158,7 +159,7 @@ describe('SQLite read-only parent fallback', () => {
     expect(cachedDatabaseFiles()).toEqual([])
   })
 
-  it('reads a read-only parent with no -wal in place, without copying it', ({ skip }) => {
+  it('reads a read-only parent with no -wal, in place where it can and by copy where it cannot', ({ skip }) => {
     const dbPath = join(sourceRoot, 'state.vscdb')
     createClosedWalDatabase(dbPath)
     expect(existsSync(dbPath + '-wal')).toBe(false)
@@ -169,9 +170,10 @@ describe('SQLite read-only parent fallback', () => {
 
     expect(existsSync(dbPath + '-wal')).toBe(false)
     expect(existsSync(dbPath + '-shm')).toBe(false)
-    // No WAL frames exist, so immutable reads the source in place: nothing to go
-    // stale, nothing to copy.
-    expect(cachedDatabaseFiles()).toEqual([])
+    // No WAL frames exist, so there is nothing to go stale and nothing worth
+    // copying: immutable reads the source in place. node:sqlite only honours
+    // URI filenames on newer builds, and on the 22.13 floor the copy stands in.
+    expect(cachedDatabaseFiles()).toHaveLength(sqliteSupportsUriFilenames() ? 0 : 1)
   })
 
   it('opens directly when a read-only parent already has WAL sidecars', ({ skip }) => {

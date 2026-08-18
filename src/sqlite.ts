@@ -153,6 +153,29 @@ function isSqliteSidecarError(err: unknown): boolean {
   return typeof errcode === 'number' && (errcode & 0xff) === 14
 }
 
+let uriFilenamesSupported: boolean | null = null
+
+/// node:sqlite only enables SQLITE_OPEN_URI from Node 22.15 on (measured: 22.13
+/// and 22.14 fail, 22.15 and later work). Below that a `file:...` location is
+/// taken literally and fails as CANTOPEN, so the immutable open is not attempted
+/// there. The probe is an in-memory URI rather than a version comparison: it
+/// answers the question directly and touches no filesystem either way.
+export function sqliteSupportsUriFilenames(): boolean {
+  if (uriFilenamesSupported !== null) return uriFilenamesSupported
+  uriFilenamesSupported = false
+  const Driver = loadDriver() ? DatabaseSync : null
+  if (Driver !== null) {
+    try {
+      new Driver('file:codeburn-uri-probe?mode=memory', { readOnly: true }).close()
+      uriFilenamesSupported = true
+    } catch {
+      // An older build: locations are plain paths, and the copy fallback covers
+      // exactly the case the immutable open would have.
+    }
+  }
+  return uriFilenamesSupported
+}
+
 type DatabaseFingerprint = {
   dev: number
   ino: number
@@ -362,11 +385,11 @@ function openReadonlyCache(path: string, originalError: unknown): DatabaseSyncIn
   // An absent or empty -wal holds no frames, so there is nothing to go stale and
   // nothing worth copying: immutable lets SQLite skip the -shm it cannot create
   // and read the source in place.
-  if (fingerprint.walBytes === 0) {
+  if (fingerprint.walBytes === 0 && sqliteSupportsUriFilenames()) {
     try {
       return new Driver(`${pathToFileURL(path).href}?immutable=1`, { readOnly: true })
     } catch {
-      // Older node:sqlite builds may not enable URI filenames. Copy instead.
+      // Understood but refused: the copy covers it.
     }
   }
 
