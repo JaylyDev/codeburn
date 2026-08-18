@@ -108,7 +108,7 @@ Also runs via `bunx codeburn` or `pnpm dlx codeburn`, or `brew install codeburn`
 codeburn menubar
 ```
 
-On Windows the same view is a tray app; see [Windows](#windows). On Linux, a GNOME Shell extension gives it in the top panel; see [Linux (GNOME)](#linux-gnome).
+The same command installs the tray app on Windows; see [Windows](#windows). On Linux, a GNOME Shell extension gives it in the top panel; see [Linux (GNOME)](#linux-gnome).
 
 Requires **Node.js 22.13+** and at least one supported tool with session data on disk. For Cursor and OpenCode, `better-sqlite3` installs automatically.
 
@@ -333,7 +333,13 @@ Allowed values are `terminal` (macOS Terminal.app, the default) and `iterm2`. An
 
 ### Windows
 
-Windows gets the same ambient view from the system tray. Download the `.msi` from the [latest Windows Menubar release](https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.20) and run it; `codeburn menubar` on Windows just points you at that page.
+Windows gets the same ambient view from the system tray, from the same one command:
+
+```powershell
+codeburn menubar
+```
+
+It downloads the `.msi` for your CLI version, verifies its sha256, runs it through `msiexec /passive`, and launches the tray app. Re-run with `--force` to reinstall; an already-installed matching version is just launched. You can also download the `.msi` yourself from the [latest Windows Menubar release](https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.20).
 
 Today's spend sits in the tray as a number beside the flame icon (turn it off in Settings, and the tooltip always carries it). Click for the same popover the macOS app shows: agent tabs, period switcher, Trend, Forecast, Pulse, Stats and Plan insights, activity and model breakdowns, optimize findings, and CSV/JSON export. Settings covers launch at login, the tray number, theme, and currency. It refreshes every 60 seconds while the popover is open and every 2 minutes while it is closed.
 

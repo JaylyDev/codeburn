@@ -174,6 +174,12 @@ npm run tauri build
   `.github/workflows/release-menubar-windows.yml`; publishes the `.msi` (plus its sha256) to
   a "Windows Menubar vX" release. Unsigned for now, so Windows SmartScreen prompts on first run
   until a signing cert is in place.
+- `codeburn menubar` installs from those assets (`src/menubar-installer.ts`): it pins the tag to
+  the CLI's own version (`windows-v<cliVersion>`), falls back to a scan of the newest `windows-v*`
+  release carrying both assets, verifies the sha256 before anything executes the file, then runs
+  `%SystemRoot%\System32\msiexec.exe /i <msi> /passive /norestart` and launches the exe named by
+  the product's Uninstall registry key. Renaming the bundle or the MSI asset breaks that lookup —
+  `WINDOWS_RELEASE` and `WINDOWS_PRODUCT_NAME` in the installer have to move with it.
 
 ## Pending work
 

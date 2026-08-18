@@ -1311,12 +1311,13 @@ program
 
 program
   .command('menubar')
-  .description('Install and launch the macOS menubar app (one command, no clone)')
-  .option('--force', 'Reinstall even if an older copy is already in ~/Applications')
+  .description('Install and launch the menubar app on macOS and Windows (one command, no clone)')
+  .option('--force', 'Reinstall even if a copy is already installed')
   .action(async (opts: { force?: boolean }) => {
     try {
       const result = await installMenubarApp({ force: opts.force, cliVersion: version })
-      console.log(`\n  Ready. ${result.installedPath}\n`)
+      // A cancelled Windows installer leaves nothing to point at.
+      if (result.installedPath) console.log(`\n  Ready. ${result.installedPath}\n`)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       console.error(`\n  Menubar install failed: ${message}\n`)
