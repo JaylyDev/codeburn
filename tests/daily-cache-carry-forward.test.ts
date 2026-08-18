@@ -712,3 +712,102 @@ describe('adoption union across older cache files', () => {
     expect(hydrated.complete).toBe(true)
   })
 })
+
+describe('partial survival: a truncated fresh slice cannot delete a settled baseline', () => {
+  // The real 0.9.20 -> next upgrade loss: transcripts age out per FILE, so a
+  // mostly-forgotten day still gets a handful of turns from surviving later
+  // files. The fresh slice is non-empty but truncated, and before this guard it
+  // replaced the baseline outright ($1,685.17 / 12,530 calls -> $385.44 / 560).
+  const settled = daysAgoStr(33)
+
+  it('keeps the baseline slice when the fresh derivation lost calls on a settled day', () => {
+    const fresh = day(settled, { claude: slice(385.44, 560, { sessions: 0, inputTokens: 10 }) })
+    const baseline = day(settled, { claude: slice(1685.17, 12530, { sessions: 214, inputTokens: 500 }) })
+    const merged = mergeDayEntries([fresh], [baseline], true, undefined, true)
+    const m = merged[0]!
+    expect(m.providers['claude']).toMatchObject({ cost: 1685.17, calls: 12530, sessions: 214 })
+    // Day totals track the swap - they must equal the kept slice, not the sum.
+    expect(m.cost).toBeCloseTo(1685.17, 5)
+    expect(m.calls).toBe(12530)
+    expect(m.sessions).toBe(214)
+    expect(m.inputTokens).toBe(500)
+    expect(m.carried).toBe(true)
+  })
+
+  it('a truncated slice cannot take other providers down with it', () => {
+    const fresh = day(settled, { claude: slice(10, 5), codex: slice(7, 3) })
+    const baseline = day(settled, { claude: slice(100, 50) })
+    const m = mergeDayEntries([fresh], [baseline], true, undefined, true)[0]!
+    expect(m.providers['claude']).toMatchObject({ cost: 100, calls: 50 })
+    expect(m.providers['codex']).toMatchObject({ cost: 7, calls: 3 })
+    expect(m.cost).toBeCloseTo(107, 5)
+    expect(m.calls).toBe(53)
+  })
+
+  it('the fresh slice wins on equal calls at a different cost (the Grok re-pricing)', () => {
+    const fresh = day(settled, { grok: slice(11.89, 21, { sessions: 21, outputTokens: 900 }) })
+    const baseline = day(settled, { grok: slice(3.29, 21, { sessions: 21, outputTokens: 200 }) })
+    const m = mergeDayEntries([fresh], [baseline], true, undefined, true)[0]!
+    expect(m.providers['grok']).toMatchObject({ cost: 11.89, calls: 21, outputTokens: 900 })
+    expect(m.cost).toBeCloseTo(11.89, 5)
+    expect(m.carried).toBeUndefined()
+  })
+
+  it('a fresh slice with FEWER sessions but equal calls still wins (sessions drift on healthy days)', () => {
+    const fresh = day(settled, { claude: slice(1021.11, 3295, { sessions: 71 }) })
+    const baseline = day(settled, { claude: slice(1021.11, 3295, { sessions: 72 }) })
+    const m = mergeDayEntries([fresh], [baseline], true, undefined, true)[0]!
+    expect(m.providers['claude']!.sessions).toBe(71)
+  })
+
+  it('recent days stay authoritative: a shrink inside the settle window is honored', () => {
+    const recent = daysAgoStr(2)
+    const fresh = day(recent, { claude: slice(20, 4) })
+    const baseline = day(recent, { claude: slice(90, 40) })
+    const m = mergeDayEntries([fresh], [baseline], true, undefined, true)[0]!
+    expect(m.providers['claude']).toMatchObject({ cost: 20, calls: 4 })
+    expect(m.cost).toBe(20)
+  })
+
+  it('the adoption union is unguarded: the newer schema still wins per (date, provider)', () => {
+    const newer = day(settled, { claude: slice(50, 5) })
+    const older = day(settled, { claude: slice(100, 10) })
+    const m = mergeDayEntries([newer], [older], true)[0]!
+    expect(m.providers['claude']).toMatchObject({ cost: 50, calls: 5 })
+  })
+
+  it('end-to-end: a version-bump re-derive whose transcripts aged out keeps the full day', async () => {
+    const cache: DailyCache = {
+      version: DAILY_CACHE_VERSION,
+      savingsConfigHash: 'cfg-A',
+      tzKey: currentTzKey(),
+      lastComputedDate: daysAgoStr(1),
+      days: [day(settled, { claude: slice(1685.17, 12530, { sessions: 214 }) })],
+      complete: false, // what a version bump / adoption leaves behind
+    }
+    await saveDailyCache(cache)
+    const truncated = [day(settled, { claude: slice(385.44, 560, { sessions: 0 }) })]
+    const out = await ensureCacheHydrated(noSessions, () => truncated, 'cfg-A')
+    const kept = out.days.find(d => d.date === settled)!
+    expect(kept.providers['claude']).toMatchObject({ cost: 1685.17, calls: 12530 })
+    expect(kept.cost).toBeCloseTo(1685.17, 5)
+    // A --period all payload sums the kept slices, not the truncated ones.
+    const period = buildPeriodDataFromDays(out.days, 'all')
+    expect(period.cost).toBeCloseTo(1685.17, 5)
+    expect(period.calls).toBe(12530)
+  })
+
+  it('a fully sourceless day is still carried whole (v14 behavior, unchanged)', async () => {
+    const cache: DailyCache = {
+      version: DAILY_CACHE_VERSION,
+      savingsConfigHash: 'cfg-A',
+      tzKey: currentTzKey(),
+      lastComputedDate: daysAgoStr(1),
+      days: [day(settled, { claude: slice(230.06, 400) })],
+      complete: false,
+    }
+    await saveDailyCache(cache)
+    const out = await ensureCacheHydrated(noSessions, () => [], 'cfg-A')
+    expect(out.days[0]).toMatchObject({ date: settled, cost: 230.06, calls: 400, carried: true })
+  })
+})
