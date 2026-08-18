@@ -1,10 +1,14 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 
 import {
   aggregateMcpCoverage,
+  buildOptimizeJsonReport,
+  classTotals,
+  findingClass,
   detectMcpProfileAdvisor,
   detectMcpToolCoverage,
   estimateMcpSchemaCost,
+  runOptimize,
 } from '../src/optimize.js'
 import type {
   ClassifiedTurn,
@@ -313,6 +317,23 @@ describe('estimateMcpSchemaCost', () => {
     expect(cost.cacheWriteTokens).toBe(24_000)
   })
 
+  it('does not count a duplicated server identifier twice', () => {
+    const inventory = Array.from({ length: 20 }, (_, i) => `mcp__svc__t${i}`)
+    const sessions = [makeSession({
+      inventory,
+      turns: [makeTurn([makeCall({ cacheCreation: 50_000 })])],
+    })]
+
+    const cost = estimateMcpSchemaCost(
+      { svc: 20 },
+      [project(sessions)],
+      ['svc', 'svc'],
+    )
+
+    expect(cost.cacheWriteTokens).toBe(8_000)
+    expect(cost.effectiveInputTokens).toBe(10_000)
+  })
+
   it('still works with the single-server signature (backward compat)', () => {
     const turns = [makeTurn([makeCall({ cacheCreation: 50_000 })])]
     const sessions = [makeSession({
@@ -331,6 +352,174 @@ describe('estimateMcpSchemaCost', () => {
 describe('detectMcpToolCoverage', () => {
   it('returns null when no inventory exists at all', () => {
     expect(detectMcpToolCoverage([project([makeSession({})])])).toBeNull()
+  })
+
+  it('keeps claude.ai connector evidence but emits manual guidance instead of a local remove command', () => {
+    const server = 'claude_ai_Netlify'
+    const inventory = Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`)
+    const turns = [makeTurn([makeCall({ cacheCreation: 50_000 })])]
+    const sessions = [
+      makeSession({ sessionId: 'a', inventory, turns }),
+      makeSession({ sessionId: 'b', inventory, turns }),
+    ]
+
+    const finding = detectMcpToolCoverage([project(sessions)])
+
+    expect(finding).not.toBeNull()
+    expect(finding!.tokensSaved).toBe(20_000)
+    // Keep the transcript namespace as evidence, but name the connector the
+    // way users actually see it in /mcp and claude.ai Settings.
+    expect(finding!.explanation).toContain(server)
+    expect(finding!.explanation).toContain('claude.ai Netlify')
+    expect(finding!.explanation).toContain('/mcp')
+    expect(finding!.explanation).toContain('claude.ai Settings > Connectors')
+    expect(finding!.fix.type).toBe('paste')
+    if (finding!.fix.type === 'paste') {
+      expect(finding!.fix.destination).toBe('manual')
+      expect(finding!.fix.text).toContain('/mcp')
+      expect(finding!.fix.text).toContain('claude.ai Netlify')
+      expect(finding!.fix.text).not.toContain(server)
+      expect(finding!.fix.text).toContain('claude.ai Settings > Connectors')
+    }
+    expect(JSON.stringify(finding)).not.toContain('claude mcp remove')
+    expect(finding!.apply).toBeUndefined()
+  })
+
+  it('renders connector-only remediation as a manual action, never an Ask Claude prompt', async () => {
+    const server = 'claude_ai_Google_Calendar'
+    const inventory = Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`)
+    const turns = [makeTurn([makeCall({ cacheCreation: 50_000 })])]
+    const projects = [project([
+      makeSession({ sessionId: 'a', inventory, turns }),
+      makeSession({ sessionId: 'b', inventory, turns }),
+    ])]
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+
+    try {
+      await runOptimize(projects, 'Test period')
+      const output = log.mock.calls.map(args => args.join(' ')).join('\n')
+      expect(output).toContain('Manual action')
+      expect(output).toContain('claude.ai Google Calendar')
+      expect(output).not.toContain('Ask Claude in the current session')
+    } finally {
+      log.mockRestore()
+    }
+  })
+
+  it('keeps the public optimize JSON envelope while marking connector guidance manual', () => {
+    const server = 'claude_ai_Slack'
+    const coverage = [{
+      server,
+      toolsAvailable: 20,
+      toolsInvoked: 0,
+      unusedTools: Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+      invocations: 0,
+      loadedSessions: 2,
+      coverageRatio: 0,
+    }]
+    const finding = detectMcpToolCoverage([], coverage)!
+
+    const report = buildOptimizeJsonReport([], 'Test period', {
+      findings: [finding],
+      costRate: 0,
+      healthScore: 90,
+      healthGrade: 'A',
+    })
+
+    expect(report.findings[0]).toMatchObject({
+      id: 'mcp-low-coverage',
+      tokensSaved: 0,
+      fix: {
+        type: 'paste',
+        destination: 'manual',
+        text: expect.stringContaining('claude.ai Slack'),
+      },
+    })
+    expect(report.findings[0]).not.toHaveProperty('apply')
+    expect(report.findings[0]).not.toHaveProperty('applyTokensSaved')
+    expect(report.findings[0]).not.toHaveProperty('applyTokensSavedByServer')
+    expect(report.findings[0]).not.toHaveProperty('manualFollowUp')
+  })
+
+  it('intersects globally unused tool identities with each session inventory', () => {
+    const server = 'filesystem'
+    const coverage = [{
+      server,
+      toolsAvailable: 20,
+      toolsInvoked: 0,
+      unusedTools: Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+      invocations: 0,
+      loadedSessions: 2,
+      coverageRatio: 0,
+    }]
+    const sessions = [5, 20].map((count, index) => makeSession({
+      sessionId: `s${index}`,
+      inventory: Array.from({ length: count }, (_, i) => `mcp__${server}__t${i}`),
+      turns: [makeTurn([makeCall({ cacheCreation: 50_000 })])],
+    }))
+
+    const finding = detectMcpToolCoverage([project(sessions)], coverage)
+
+    // 5*400 and 20*400, each at 1.25x cache-write pricing.
+    expect(finding).toMatchObject({ tokensSaved: 12_500 })
+    expect(finding!.applyTokensSavedByServer?.filesystem).toBe(12_500)
+  })
+
+  it('conserves simultaneous cache-write and cache-read buckets with fractional shares', () => {
+    const inventory = [
+      ...Array.from({ length: 15 }, (_, i) => `mcp__filesystem__t${i}`),
+      ...Array.from({ length: 11 }, (_, i) => `mcp__claude_ai_Slack__t${i}`),
+    ]
+    const coverage: McpServerCoverage[] = [
+      {
+        server: 'filesystem', toolsAvailable: 15, toolsInvoked: 0,
+        unusedTools: inventory.slice(0, 15), invocations: 0, loadedSessions: 2, coverageRatio: 0,
+      },
+      {
+        server: 'claude_ai_Slack', toolsAvailable: 11, toolsInvoked: 0,
+        unusedTools: inventory.slice(15), invocations: 0, loadedSessions: 2, coverageRatio: 0,
+      },
+    ]
+    // Duplicate inventory entries must not increase the schema share.
+    const sessionInventory = [...inventory, inventory[0]!, inventory[15]!]
+    const sessions = ['a', 'b'].map(sessionId => makeSession({
+      sessionId,
+      inventory: sessionInventory,
+      turns: [makeTurn([makeCall({ cacheCreation: 5_001, cacheRead: 3_333 })])],
+    }))
+
+    const finding = detectMcpToolCoverage([project(sessions)], coverage)!
+    const total = 2 * (5_001 * 1.25 + 3_333 * 0.10)
+    const local = total * (15 / 26)
+
+    expect(finding.tokensSaved).toBe(Math.round(total))
+    expect(finding.applyTokensSaved).toBe(Math.round(local))
+    expect(finding.applyTokensSavedByServer?.filesystem).toBeCloseTo(local, 8)
+  })
+
+  it('pluralises manual guidance when only claude.ai connectors are flagged', () => {
+    const coverage = ['claude_ai_Slack', 'claude_ai_Google_Calendar'].map(server => ({
+      server,
+      toolsAvailable: 20,
+      toolsInvoked: 0,
+      unusedTools: Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+      invocations: 0,
+      loadedSessions: 2,
+      coverageRatio: 0,
+    }))
+
+    const finding = detectMcpToolCoverage([], coverage)
+
+    expect(finding).not.toBeNull()
+    expect(finding!.fix).toMatchObject({
+      type: 'paste',
+      destination: 'manual',
+      label: 'Manage the underused claude.ai connectors where they load:',
+    })
+    if (finding!.fix.type === 'paste') {
+      expect(finding!.fix.text).toContain('manage them in claude.ai Settings > Connectors')
+    }
+    expect(finding!.apply).toBeUndefined()
   })
 
   it('does not flag a server with healthy coverage', () => {
@@ -379,7 +568,91 @@ describe('detectMcpToolCoverage', () => {
     expect(finding!.explanation).toContain('1/30')
     expect(finding!.fix.type).toBe('command')
     expect((finding!.fix as { text: string }).text).toContain("claude mcp remove 'hf'")
+    expect(finding!.apply).toEqual({ kind: 'mcp-remove', servers: ['hf'] })
     expect(finding!.tokensSaved).toBeGreaterThan(0)
+  })
+
+  it('keeps mixed connector guidance visible while making only the local server executable', () => {
+    const inventory = ['filesystem', 'claude_ai_Slack'].flatMap(server =>
+      Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+    )
+    const sessions: SessionSummary[] = [
+      makeSession({ sessionId: 'mixed-a', inventory, turns: [makeTurn([makeCall({ cacheCreation: 50_000 })])] }),
+      makeSession({ sessionId: 'mixed-b', inventory, turns: [makeTurn([makeCall({ cacheCreation: 50_000 })])] }),
+    ]
+
+    const finding = detectMcpToolCoverage([project(sessions)])
+
+    expect(finding).not.toBeNull()
+    // The finding describes both opportunities: 40 unused tool schemas across
+    // two sessions = 40K effective tokens. The automatic mutation owns only
+    // the 20 local schemas = 20K; the connector portion remains manual.
+    expect(finding).toMatchObject({ tokensSaved: 40_000, applyTokensSaved: 20_000 })
+    expect(finding!.explanation).toContain('claude_ai_Slack')
+    expect(finding!.explanation).toContain('/mcp')
+    expect(finding!.explanation).toContain('claude.ai Settings > Connectors')
+    expect(finding!.fix).toEqual({
+      type: 'command',
+      label: 'Remove the underused local server, or trim its tools in your MCP config:',
+      text: "claude mcp remove 'filesystem'",
+    })
+    expect(finding!.apply).toEqual({ kind: 'mcp-remove', servers: ['filesystem'] })
+  })
+
+  it('attributes a capped mixed cache bucket proportionally to the local action', () => {
+    const inventory = ['filesystem', 'claude_ai_Slack'].flatMap(server =>
+      Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+    )
+    const sessions = ['a', 'b'].map(sessionId => makeSession({
+      sessionId,
+      inventory,
+      turns: [makeTurn([makeCall({ cacheCreation: 10_000 })])],
+    }))
+
+    const finding = detectMcpToolCoverage([project(sessions)])
+
+    // Each call's 10K cache bucket is shared evenly by two 8K schemas.
+    // Total: 2 * 10K * 1.25 = 25K. The local mutation owns half.
+    expect(finding).toMatchObject({ tokensSaved: 25_000, applyTokensSaved: 12_500 })
+  })
+
+  it('charges only the flagged servers actually loaded in each session', () => {
+    const sessions = ['filesystem', 'claude_ai_Slack'].flatMap(server =>
+      ['a', 'b'].map(suffix => makeSession({
+        sessionId: `${server}-${suffix}`,
+        inventory: Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+        turns: [makeTurn([makeCall({ cacheCreation: 50_000 })])],
+      })),
+    )
+
+    const finding = detectMcpToolCoverage([project(sessions)])
+
+    // Four sessions each load one 8K schema. The combined finding must not
+    // charge both schemas to every session merely because both are flagged.
+    expect(finding).toMatchObject({ tokensSaved: 40_000, applyTokensSaved: 20_000 })
+  })
+
+  it('disambiguates a claude.ai connector from a similarly named local server', () => {
+    const sessions: SessionSummary[] = []
+    for (const server of ['claude_ai_Netlify', 'netlify']) {
+      const inventory = Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`)
+      sessions.push(
+        makeSession({ sessionId: `${server}-a`, inventory }),
+        makeSession({ sessionId: `${server}-b`, inventory }),
+      )
+    }
+
+    const finding = detectMcpToolCoverage([project(sessions)])
+
+    expect(finding).not.toBeNull()
+    expect(finding!.explanation).toContain('claude_ai_Netlify')
+    expect(finding!.explanation).toContain('separate from any similarly named local MCP server')
+    expect(finding!.fix.type).toBe('command')
+    if (finding!.fix.type === 'command') {
+      expect(finding!.fix.text).toBe("claude mcp remove 'netlify'")
+      expect(finding!.fix.text).not.toContain('claude_ai_Netlify')
+    }
+    expect(finding!.apply).toEqual({ kind: 'mcp-remove', servers: ['netlify'] })
   })
 
   it('escalates impact to high when token waste crosses the threshold', () => {
@@ -652,5 +925,130 @@ describe('detectMcpProfileAdvisor', () => {
     }]
 
     expect(detectMcpProfileAdvisor(projects, coverage)).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Connector findings under the fix/nudge/keep classification (#1019)
+// ---------------------------------------------------------------------------
+
+describe('connector findings and finding class', () => {
+  const inventoryFor = (servers: string[]) => servers.flatMap(server =>
+    Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+  )
+  const twoSessions = (servers: string[]) => ['a', 'b'].map(sessionId => makeSession({
+    sessionId,
+    inventory: inventoryFor(servers),
+    turns: [makeTurn([makeCall({ cacheCreation: 50_000 })])],
+  }))
+
+  it('classifies a connector-only finding as a nudge, since nothing is appliable', () => {
+    const finding = detectMcpToolCoverage([project(twoSessions(['claude_ai_Gmail']))])
+
+    expect(finding).not.toBeNull()
+    expect(finding!.apply).toBeUndefined()
+    expect(findingClass(finding!)).toBe('nudge')
+    expect(finding!.tokensSaved).toBeGreaterThan(0)
+    // Never lands in the "apply-able" subtotal.
+    expect(classTotals([finding!], 0.00002).fix).toEqual({ tokensSaved: 0, savingsUSD: 0, count: 0 })
+  })
+
+  it('counts only the local subset of a mixed finding towards the apply-able subtotal', () => {
+    const finding = detectMcpToolCoverage([project(twoSessions(['filesystem', 'claude_ai_Slack']))])
+
+    expect(finding).not.toBeNull()
+    expect(findingClass(finding!)).toBe('fix')
+    expect(finding).toMatchObject({ tokensSaved: 40_000, applyTokensSaved: 20_000 })
+    expect(classTotals([finding!], 0.00002).fix).toEqual({ tokensSaved: 20_000, savingsUSD: 0.4, count: 1 })
+  })
+
+  it("leaves a local-only finding's subtotal at its full estimate", () => {
+    const finding = detectMcpToolCoverage([project(twoSessions(['filesystem']))])
+
+    expect(finding).not.toBeNull()
+    expect(finding!.applyTokensSaved).toBeUndefined()
+    expect(classTotals([finding!], 0.00002).fix.tokensSaved).toBe(finding!.tokensSaved)
+  })
+
+  it('charges each session only for the local schemas it actually loaded', () => {
+    // Same per-session scoping the connector split relies on, with no
+    // connector in play: two flagged local servers in disjoint sessions are
+    // charged one schema each, not both schemas everywhere.
+    const sessions = ['filesystem', 'playwright'].flatMap(server =>
+      ['a', 'b'].map(suffix => makeSession({
+        sessionId: `${server}-${suffix}`,
+        inventory: inventoryFor([server]),
+        turns: [makeTurn([makeCall({ cacheCreation: 50_000 })])],
+      })),
+    )
+
+    const finding = detectMcpToolCoverage([project(sessions)])
+
+    expect(finding).toMatchObject({ tokensSaved: 40_000 })
+    expect(finding!.applyTokensSaved).toBeUndefined()
+    expect(classTotals([finding!], 0.00002).fix.tokensSaved).toBe(40_000)
+  })
+
+  it('treats a claude_ai_* name owned by local config as a local server', () => {
+    const finding = detectMcpToolCoverage(
+      [project(twoSessions(['claude_ai_homegrown']))],
+      undefined,
+      new Set(['claude_ai_homegrown']),
+    )
+
+    expect(finding!.fix).toEqual({
+      type: 'command',
+      label: 'Remove the underused local server, or trim its tools in your MCP config:',
+      text: "claude mcp remove 'claude_ai_homegrown'",
+    })
+    expect(finding!.apply).toEqual({ kind: 'mcp-remove', servers: ['claude_ai_homegrown'] })
+    expect(findingClass(finding!)).toBe('fix')
+    // Local config owns the name, so the finding must not claim it is a connector.
+    expect(finding!.explanation).not.toContain('is a claude.ai connector namespace')
+    // ...but the transcript cannot rule out a same-name connector.
+    expect(finding!.explanation).toContain('If you also use a claude.ai connector named claude_ai_homegrown')
+    expect(finding!.manualFollowUp?.label).toBe('Check for a same-name claude.ai connector:')
+    // The whole estimate is appliable: nothing is reserved for a connector.
+    expect(finding!.applyTokensSaved).toBeUndefined()
+    expect(classTotals([finding!], 0.00002).fix.tokensSaved).toBe(finding!.tokensSaved)
+  })
+
+  it('keeps a claude_ai_* name absent from local config a connector', () => {
+    const finding = detectMcpToolCoverage(
+      [project(twoSessions(['claude_ai_Gmail']))],
+      undefined,
+      new Set(['filesystem', 'playwright']),
+    )
+
+    expect(finding!.fix.type).toBe('paste')
+    expect(finding!.apply).toBeUndefined()
+    expect(findingClass(finding!)).toBe('nudge')
+    expect(finding!.explanation).toContain('is a claude.ai connector namespace')
+  })
+
+  it('falls back to prefix-only when no local config could be read', () => {
+    // Unreadable or absent config contributes no names, which leaves every
+    // claude_ai_* namespace on the conservative connector path.
+    const finding = detectMcpToolCoverage([project(twoSessions(['claude_ai_homegrown']))])
+
+    expect(finding!.fix.type).toBe('paste')
+    expect(finding!.apply).toBeUndefined()
+    expect(findingClass(finding!)).toBe('nudge')
+  })
+
+  it('applies the local entry and notes the connector when a name collides', () => {
+    const finding = detectMcpToolCoverage(
+      [project(twoSessions(['filesystem', 'claude_ai_Slack']))],
+      undefined,
+      new Set(['filesystem', 'claude_ai_Slack']),
+    )
+
+    // Both are local: the removal owns both entries and nothing is deferred.
+    expect(finding!.apply).toEqual({ kind: 'mcp-remove', servers: ['filesystem', 'claude_ai_Slack'] })
+    expect(finding!.applyTokensSaved).toBeUndefined()
+    expect(classTotals([finding!], 0.00002).fix.tokensSaved).toBe(40_000)
+    expect(finding!.explanation).not.toContain('is a claude.ai connector namespace')
+    expect(finding!.manualFollowUp?.text)
+      .toBe('If you also use a claude.ai connector named claude_ai_Slack, manage it with /mcp or in claude.ai Settings > Connectors.')
   })
 })

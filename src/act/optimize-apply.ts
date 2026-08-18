@@ -7,12 +7,17 @@ import { formatCost } from '../currency.js'
 import { formatTokens } from '../format.js'
 import { runAction } from './apply.js'
 import { shortId } from './journal.js'
+import { REPORT_MIN_AGE_DAYS } from './types.js'
 import { planFindings, type FindingPlan, type PlanContext } from './plans.js'
 
 export type ApplyOptions = {
   yes?: boolean
   dryRun?: boolean
   only?: string
+  // Mirrors `optimize --provider`. The scan below only reads Claude
+  // transcripts, and this path does not just report findings, it plans and
+  // applies them - a Codex-scoped run must never offer to edit ~/.claude.
+  provider?: string
   actionsDir?: string
   ctx?: PlanContext
   // Test seams: crafted findings skip the session scan; streams default to
@@ -37,16 +42,47 @@ function changeLines(fp: FindingPlan): string[] {
   })
 }
 
+function planTokensSaved(fp: FindingPlan): number {
+  if (fp.plan?.mcpSavingsUncertain) return Number.NaN
+  const byServer = fp.finding.applyTokensSavedByServer
+  const affected = fp.plan?.affectedMcpServers
+  if (byServer && affected) return affected.reduce((sum, server) => sum + (byServer[server] ?? 0), 0)
+  return fp.finding.applyTokensSaved ?? fp.finding.tokensSaved
+}
+
+function manualActionLines(fp: FindingPlan): string[] {
+  if (fp.finding.manualFollowUp) {
+    return [fp.finding.manualFollowUp.label, fp.finding.manualFollowUp.text]
+  }
+  const action = fp.finding.fix
+  if (action.type === 'paste' && action.destination === 'manual') {
+    return [action.label, action.text]
+  }
+  return []
+}
+
 export function renderApplyList(appliable: FindingPlan[], manual: FindingPlan[], costRate: number): string {
   const lines: string[] = ['']
   lines.push(chalk.bold('  Appliable config-class fixes:'))
   appliable.forEach((fp, i) => {
     const f = fp.finding
-    const savings = `~${formatTokens(f.tokensSaved)} tokens${costRate > 0 ? `, ~${formatCost(f.tokensSaved * costRate)}` : ''}`
+    const actionTokensSaved = planTokensSaved(fp)
+    const savings = Number.isFinite(actionTokensSaved)
+      ? `~${formatTokens(actionTokensSaved)} tokens${costRate > 0 ? `, ~${formatCost(actionTokensSaved * costRate)}` : ''}`
+      : 'Savings not estimated'
     lines.push('')
     lines.push(`  ${i + 1}. ${f.title}  ${chalk.hex('#FFD700')(`(${savings})`)}`)
+    if (fp.plan?.affectedMcpServers?.length) {
+      const servers = fp.plan.affectedMcpServers.join(', ')
+      lines.push(chalk.yellow(`       Removes local MCP server${fp.plan.affectedMcpServers.length === 1 ? '' : 's'}: ${servers}`))
+    }
     for (const line of changeLines(fp)) lines.push(chalk.dim(`       ${line}`))
     for (const note of fp.notes) lines.push(chalk.yellow(`       ! ${note}`))
+    const manualLines = manualActionLines(fp)
+    if (manualLines.length > 0) {
+      lines.push(chalk.cyan('       Manual follow-up (not applied):'))
+      for (const line of manualLines) lines.push(chalk.cyan(`         ${line}`))
+    }
   })
   if (manual.length > 0) {
     lines.push('')
@@ -54,6 +90,7 @@ export function renderApplyList(appliable: FindingPlan[], manual: FindingPlan[],
     for (const fp of manual) {
       lines.push(chalk.dim(`    - ${fp.finding.title}  [${fp.finding.id}]  manual`))
       for (const note of fp.notes) lines.push(chalk.yellow(`        ! ${note}`))
+      for (const line of manualActionLines(fp)) lines.push(chalk.cyan(`        ${line}`))
     }
   }
   lines.push('')
@@ -103,7 +140,7 @@ export async function runOptimizeApply(
   let costRate = opts.costRate ?? 0
   if (!findings) {
     errout.write(chalk.dim('  Analyzing your sessions...\n'))
-    const scanned = await scanAndDetect(projects, dateRange)
+    const scanned = await scanAndDetect(projects, dateRange, opts.provider)
     findings = scanned.findings
     costRate = scanned.costRate
   }
@@ -129,6 +166,7 @@ export async function runOptimizeApply(
     print(chalk.dim('\n  No appliable config-class fixes for this period.'))
     for (const fp of manual) {
       for (const note of fp.notes) print(chalk.yellow(`  ! ${fp.finding.id}: ${note}`))
+      for (const line of manualActionLines(fp)) print(chalk.cyan(`  ${line}`))
     }
     print()
     return
@@ -172,15 +210,25 @@ export async function runOptimizeApply(
   } catch { /* baseline is optional; apply proceeds without it */ }
 
   print()
+  let applied = 0
   for (const fp of selected) {
     try {
       const record = await runAction(fp.plan!, opts.actionsDir)
+      applied++
       print(`  Applied ${chalk.bold(shortId(record.id))}  ${record.description}`)
       print(chalk.dim(`    Undo anytime: codeburn act undo ${shortId(record.id)}`))
+      const manualLines = manualActionLines(fp)
+      if (manualLines.length > 0) {
+        print(chalk.cyan('    Still requires manual action:'))
+        for (const line of manualLines) print(chalk.cyan(`      ${line}`))
+      }
     } catch (e) {
       errout.write(chalk.red(`  Failed to apply ${fp.finding.id}: ${e instanceof Error ? e.message : String(e)}`) + '\n')
       process.exitCode = 1
     }
+  }
+  if (applied > 0) {
+    print(chalk.dim(`  CodeBurn will re-measure these on your next optimize run after ${REPORT_MIN_AGE_DAYS} days.`))
   }
   print()
 }

@@ -505,7 +505,7 @@ describe('Cursor model variants resolve to pricing', () => {
     // Sonnet family
     ['claude-4-sonnet', 'claude-sonnet-4'],
     ['claude-4-sonnet-1m', 'claude-sonnet-4'],
-    ['claude-4-sonnet-thinking', 'claude-sonnet-4-5'],
+    ['claude-4-sonnet-thinking', 'claude-sonnet-4'],
     ['claude-4.5-sonnet', 'claude-sonnet-4-5'],
     ['claude-4.5-sonnet-thinking', 'claude-sonnet-4-5'],
     ['claude-4.6-sonnet', 'claude-sonnet-4-6'],
@@ -558,6 +558,14 @@ describe('Cursor model variants resolve to pricing', () => {
       expect(costs!.outputCostPerToken).toBe(expected!.outputCostPerToken)
     })
   }
+
+  // Regression for #912: Cursor's unversioned `claude-4-sonnet-thinking`
+  // slug is the thinking variant of Sonnet 4, not Sonnet 4.5. The two models
+  // currently share a price, so the display name pins the canonical identity
+  // independently of today's pricing coincidence.
+  it('keeps claude-4-sonnet-thinking in the Sonnet 4 model family', () => {
+    expect(getShortModelName('claude-4-sonnet-thinking')).toBe('Sonnet 4')
+  })
 })
 
 describe('Cursor house model pricing', () => {
