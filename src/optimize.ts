@@ -1,12 +1,12 @@
 import chalk from 'chalk'
 import stripAnsi from 'strip-ansi'
-import { isReadShapedBashCommand } from './bash-utils.js'
 import { createHash } from 'crypto'
 import { readdir, stat } from 'fs/promises'
 import { existsSync, statSync } from 'fs'
 import { basename, join } from 'path'
 import { homedir } from 'os'
 
+import { isReadShapedBashCommand } from './bash-utils.js'
 import { readSessionLines, readSessionFileSync } from './fs-utils.js'
 import { discoverAllSessions } from './providers/index.js'
 import { parseJsonlLine, shouldSkipLine } from './parser.js'
@@ -15,6 +15,7 @@ import { formatCost } from './currency.js'
 import { formatTokens } from './format.js'
 import { recommendModelDefault, type ModelDefaultRecommendation } from './act/model-defaults.js'
 import { appliedFixGlyph, formatAppliedFix, type AppliedFix } from './act/types.js'
+import { isUserStartedSession, userStartedProjects } from './session-population.js'
 import { aggregateFileChurn, buildCoachingNotes, scanUserCorrections, medianTimeToFirstEditMs, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 
 // ============================================================================
@@ -542,6 +543,7 @@ export type ToolCall = {
   sessionId: string
   project: string
   recent?: boolean
+  isSidechain?: boolean
 }
 
 export type ApiCallMeta = {
@@ -726,6 +728,7 @@ export async function scanJsonlFile(
   const openers: SessionOpener[] = []
   const sessionId = basename(filePath, '.jsonl')
   let lastVersion = ''
+  let fileIsSidechain = false
   // The opening block is the first user message carrying text; anything
   // later in the session is not what the user opens with.
   let sawUserText = false
@@ -743,6 +746,11 @@ export async function scanJsonlFile(
     const parsed = parseJsonlLine(line)
     if (!parsed) continue
     const entry = parsed as Record<string, unknown>
+
+    if (entry.isSidechain === true && !fileIsSidechain) {
+      fileIsSidechain = true
+      for (const call of calls) call.isSidechain = true
+    }
 
     if (entry.version && typeof entry.version === 'string') lastVersion = entry.version
 
@@ -804,6 +812,7 @@ export async function scanJsonlFile(
         sessionId,
         project,
         recent,
+        isSidechain: fileIsSidechain,
       })
     }
   }
@@ -999,6 +1008,11 @@ export function detectJunkReads(calls: ToolCall[], dateRange?: DateRange): Waste
 }
 
 export function detectDuplicateReads(calls: ToolCall[], dateRange?: DateRange): WasteFinding | null {
+  // A sidechain re-reading what its parent read is not a repeat: a subagent
+  // starts on a fresh context and has to read it. Junk reads and the
+  // read:edit ratio keep the full call population - that waste is waste
+  // whoever does it, and the CLAUDE.md rule they suggest binds subagents too.
+  calls = calls.filter(call => call.isSidechain !== true)
   const sessionFiles = new Map<string, Map<string, { count: number; recent: number }>>()
 
   for (const call of calls) {
@@ -1923,6 +1937,7 @@ function findCapabilityReliabilityCandidates(projects: ProjectSummary[]): Capabi
 }
 
 export function detectCapabilityReliability(projects: ProjectSummary[]): WasteFinding | null {
+  projects = userStartedProjects(projects)
   const candidates = findCapabilityReliabilityCandidates(projects)
   if (candidates.length === 0) return null
 
@@ -2947,6 +2962,22 @@ function sessionTokenTotal(session: ProjectSummary['sessions'][number]): number 
     + session.totalCacheWriteTokens
 }
 
+// Sidechain transcripts are real usage, so they stay in project totals and in
+// token/cost calibration. They are not user-started sessions, however, and
+// should never enter optimize heuristics whose unit is a human work session.
+// Keep that distinction local to optimize instead of deleting sidechains from
+// ProjectSummary, which would under-report the work delegated to subagents.
+function isOptimizeSession(session: ProjectSummary['sessions'][number]): boolean {
+  return isUserStartedSession(session)
+}
+
+function optimizeSessionCount(projects: ProjectSummary[]): number {
+  return projects.reduce(
+    (total, project) => total + project.sessions.filter(isOptimizeSession).length,
+    0,
+  )
+}
+
 function sessionEffectiveContextTokens(session: ProjectSummary['sessions'][number]): number {
   return session.totalInputTokens
     + session.totalCacheReadTokens * CACHE_READ_DISCOUNT
@@ -3055,6 +3086,7 @@ export function findLowWorthCandidates(projects: ProjectSummary[]): LowWorthCand
 
   for (const project of projects) {
     for (const session of project.sessions) {
+      if (!isOptimizeSession(session)) continue
       if (session.totalCostUSD < WORTH_IT_MIN_COST_USD) continue
       if (sessionDeliveryCommand(session)) continue
 
@@ -3155,7 +3187,7 @@ export function findContextBloatCandidates(projects: ProjectSummary[]): ContextB
   const candidates: ContextBloatCandidate[] = []
 
   for (const project of projects) {
-    const sessions = [...project.sessions].sort((a, b) =>
+    const sessions = project.sessions.filter(isOptimizeSession).sort((a, b) =>
       new Date(a.firstTimestamp).getTime() - new Date(b.firstTimestamp).getTime()
     )
     let previousInputTokens: number | null = null
@@ -3273,7 +3305,7 @@ export function detectSessionOutliers(projects: ProjectSummary[], excludedSessio
   let usedEstimatedCosts = false
 
   for (const project of projects) {
-    const costed = project.sessions.filter(s => s.totalCostUSD > 0)
+    const costed = project.sessions.filter(s => isOptimizeSession(s) && s.totalCostUSD > 0)
     const exact = costed.filter(s => (s.totalEstimatedCostUSD ?? 0) === 0)
     const sessions = exact.length >= MIN_SESSIONS_FOR_OUTLIER ? exact : costed
     const fellBack = sessions.length > exact.length
@@ -3339,7 +3371,7 @@ function findYoungProjectFirstSessionIds(projects: ProjectSummary[]): Set<string
   const firstSessionIds = new Set<string>()
 
   for (const project of projects) {
-    const costed = project.sessions.filter(s => s.totalCostUSD > 0)
+    const costed = project.sessions.filter(s => isOptimizeSession(s) && s.totalCostUSD > 0)
     if (costed.length >= YOUNG_PROJECT_SESSION_LIMIT) continue
 
     let firstSession: ProjectSummary['sessions'][number] | null = null
@@ -3458,15 +3490,25 @@ export function cacheKey(projects: ProjectSummary[], dateRange: DateRange | unde
   // stale findings when cost/tokens moved (e.g. a re-price) while call count
   // held - reachable in the long-lived menubar process within the 60s TTL.
   // Cost is scaled to whole micro-dollars so float jitter cannot thrash the key.
-  let calls = 0, cost = 0, savings = 0, proxied = 0
+  let calls = 0, cost = 0, savings = 0, proxied = 0, sessions = 0, sidechains = 0
+  const sidechainIdentities: string[] = []
   for (const p of projects) {
     calls += p.totalApiCalls
     cost += p.totalCostUSD
     savings += p.totalSavingsUSD
     proxied += p.totalProxiedCostUSD
+    sessions += p.sessions.length
+    for (const session of p.sessions) {
+      if (session.isSidechain !== true) continue
+      sidechains++
+      sidechainIdentities.push(`${p.projectPath}\0${session.sessionId}`)
+    }
   }
+  const sidechainDigest = createHash('sha256')
+    .update(sidechainIdentities.sort().join('\0'))
+    .digest('base64url')
   // Costs scaled to whole micro-dollars so float jitter cannot thrash the key.
-  const fingerprint = `${projects.length}:${calls}:${Math.round(cost * 1e6)}:${Math.round(savings * 1e6)}:${Math.round(proxied * 1e6)}`
+  const fingerprint = `${projects.length}:${sessions}:${sidechains}:${sidechainDigest}:${calls}:${Math.round(cost * 1e6)}:${Math.round(savings * 1e6)}:${Math.round(proxied * 1e6)}`
   // The provider decides whether the Claude session scan runs at all, so two
   // filters that happen to share a project fingerprint must not share a result.
   return `${provider ?? 'all'}:${dr}:${fingerprint}`
@@ -3486,6 +3528,7 @@ export async function scanAndDetect(
   if (cached && Date.now() - cached.ts < RESULT_CACHE_TTL_MS) return cached.data
 
   const costRate = computeInputCostRate(projects)
+  const behavioralProjects = userStartedProjects(projects)
   const scanCoversClaude = providerCoversClaude(provider)
   const { toolCalls, projectCwds, apiCalls, userMessages, openers } = await scanSessions(dateRange, provider)
   const mcpCoverage = aggregateMcpCoverage(projects)
@@ -3494,13 +3537,13 @@ export async function scanAndDetect(
   // Priority order for the per-session findings: low-worth → context-bloat →
   // outliers. Each later detector excludes sessions already named by an
   // earlier one so a single session is not listed in three findings.
-  const lowWorthSessionIds = new Set(findLowWorthCandidates(projects).map(c => c.sessionId))
+  const lowWorthSessionIds = new Set(findLowWorthCandidates(behavioralProjects).map(c => c.sessionId))
   const contextBloatVisibleIds = new Set(
-    findContextBloatCandidates(projects)
+    findContextBloatCandidates(behavioralProjects)
       .filter(c => !lowWorthSessionIds.has(c.sessionId))
       .map(c => c.sessionId),
   )
-  const firstSessionIds = findYoungProjectFirstSessionIds(projects)
+  const firstSessionIds = findYoungProjectFirstSessionIds(behavioralProjects)
   const outlierExclusions = new Set([...lowWorthSessionIds, ...contextBloatVisibleIds, ...firstSessionIds])
   // Detectors fed by the session scan or by `~/.claude` config only mean
   // anything when the run covers Claude. Under a different `--provider` they
@@ -3521,10 +3564,10 @@ export async function scanAndDetect(
     claudeOnly(() => detectMcpDeferralOff(toolCalls, projects, projectCwds, apiCalls)),
     claudeOnly(() => detectMcpAlwaysLoadHygiene(projects, projectCwds, apiCalls, mcpCoverage)),
     claudeOnly(() => detectMcpDeferThreshold(projects, projectCwds)),
-    () => detectCapabilityReliability(projects),
-    () => detectLowWorthSessions(projects),
-    () => detectContextBloat(projects, lowWorthSessionIds),
-    () => detectSessionOutliers(projects, outlierExclusions),
+    () => detectCapabilityReliability(behavioralProjects),
+    () => detectLowWorthSessions(behavioralProjects),
+    () => detectContextBloat(behavioralProjects, lowWorthSessionIds),
+    () => detectSessionOutliers(behavioralProjects, outlierExclusions),
     claudeOnly(() => detectBloatedClaudeMd(projectCwds)),
     claudeOnly(() => detectBashBloat()),
     claudeOnly(() => detectRecurringContext(openers)),
@@ -3550,7 +3593,7 @@ export async function scanAndDetect(
   const { score, grade } = computeHealth(findings)
   
   const modelRecommendations: ModelDefaultRecommendation[] = []
-  for (const project of projects) {
+  for (const project of behavioralProjects) {
     const rec = recommendModelDefault(project, { now: dateRange?.end })
     if (rec) modelRecommendations.push(rec)
   }
@@ -3717,7 +3760,7 @@ export function renderOptimize(
   const issueSuffix = findings.length > 0 ? `, ${findings.length} issue${findings.length > 1 ? 's' : ''}` : ''
   const measured = findings.filter(f => findingBasis(f) === 'measured').length
   lines.push('  ' + [
-    `${sessionCount} sessions`,
+    `${sessionCount} session${sessionCount === 1 ? '' : 's'}`,
     `${callCount.toLocaleString()} calls`,
     chalk.hex(GOLD)(formatCost(periodCost)),
     `Health: ${chalk.bold.hex(GRADE_COLORS[healthGrade])(healthGrade)}${chalk.dim(` (${healthScore}/100${issueSuffix})`)}`,
@@ -3823,7 +3866,7 @@ export async function runOptimize(
 
   const result = await scanAndDetect(projects, dateRange, opts.provider)
   const { findings, costRate, healthScore, healthGrade } = result
-  const sessions = projects.flatMap(p => p.sessions)
+  const sessionCount = optimizeSessionCount(projects)
   const periodCost = projects.reduce((s, p) => s + p.totalCostUSD, 0)
   const callCount = projects.reduce((s, p) => s + p.totalApiCalls, 0)
 
@@ -3833,7 +3876,7 @@ export async function runOptimize(
   }
 
   const { topReworkedFiles, coachingNotes } = buildWorkflowReport(projects)
-  const output = renderOptimize(findings, costRate, periodLabel, periodCost, sessions.length, callCount, healthScore, healthGrade, topReworkedFiles, coachingNotes, opts.appliedHeader, opts.previouslyApplied, result.modelRecommendations, opts.appliedFixes)
+  const output = renderOptimize(findings, costRate, periodLabel, periodCost, sessionCount, callCount, healthScore, healthGrade, topReworkedFiles, coachingNotes, opts.appliedHeader, opts.previouslyApplied, result.modelRecommendations, opts.appliedFixes)
   console.log(output)
 }
 
@@ -3844,7 +3887,6 @@ export function buildOptimizeJsonReport(
   dateRange?: DateRange,
   appliedFixes: AppliedFix[] = [],
 ): OptimizeJsonReport {
-  const sessions = projects.flatMap(p => p.sessions)
   const periodCostUSD = projects.reduce((s, p) => s + p.totalCostUSD, 0)
   const calls = projects.reduce((s, p) => s + p.totalApiCalls, 0)
   const potentialSavingsTokens = result.findings.reduce((s, f) => s + f.tokensSaved, 0)
@@ -3864,7 +3906,7 @@ export function buildOptimizeJsonReport(
       healthGrade: result.healthGrade,
       findingCount: result.findings.length,
       periodCostUSD,
-      sessions: sessions.length,
+      sessions: optimizeSessionCount(projects),
       calls,
       potentialSavingsTokens,
       potentialSavingsCostUSD,

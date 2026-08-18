@@ -157,6 +157,14 @@ codeburn optimize --format json         # setup health + findings as JSON
 
 `codeburn optimize` scans your sessions and your `~/.claude/` setup for waste patterns:
 
+For Claude Code, the optimize session count, the per-session findings, coaching,
+and model-default recommendations use user-started (main) sessions. Subagent
+sidechain transcripts are excluded from that population because their delegated
+context and delivery behavior are structurally different, and so is the re-read
+finding, since a subagent starts on a fresh context. Findings about how Claude
+uses tools (junk reads, read:edit ratio) and every spend, MCP, and
+configuration-overhead finding keep counting them.
+
 - Files Claude re-reads across sessions (same content, same context, over and over)
 - Low Read:Edit ratio (editing without reading leads to retries and wasted tokens)
 - Wasted bash output (uncapped `BASH_MAX_OUTPUT_LENGTH`, trailing noise)
@@ -508,6 +516,7 @@ Sync sends token counts, costs, models, and projects, never prompts or code. Thi
 | `codeburn models --by-task` | Break each model into per-task-type rows |
 | `codeburn models --by-agent` | Break each model into per-agent rows: which agent drove which model's spend (`(main)` covers non-agent sessions; `--min-cost 0` shows sub-cent agents) |
 | `codeburn models --top 10` | Only the 10 most expensive models |
+| `codeburn models --unpriced` | Only models with usage that currently price at $0 — the copyable form of the unpriced-models warning |
 | `codeburn models --format markdown` | Emit a paste-friendly markdown table |
 | `codeburn models --task feature` | Filter to feature-development work |
 | `codeburn models --provider claude` | Filter to a single provider |

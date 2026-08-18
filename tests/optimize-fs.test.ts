@@ -21,6 +21,9 @@ import {
   detectUnusedMcp,
   detectBashBloat,
   detectGhostCommands,
+  detectDuplicateReads,
+  detectJunkReads,
+  detectLowReadEditRatio,
   loadMcpConfigs,
   localMcpServerNames,
   scanJsonlFile,
@@ -325,6 +328,78 @@ describe('scanJsonlFile', () => {
     const result = await scanJsonlFile(filePath, 'p1', undefined)
     expect(result.calls).toHaveLength(1)
     expect(result.calls[0].name).toBe('Read')
+  })
+
+  it('marks tool calls from sidechain transcript entries', async () => {
+    const root = makeFixtureRoot()
+    const filePath = join(root, 'agent-reviewer.jsonl')
+    const now = new Date().toISOString()
+    writeFile(filePath, JSON.stringify({
+      type: 'assistant', isSidechain: true, timestamp: now,
+      message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: '/x/foo.ts' } }] },
+    }))
+
+    const result = await scanJsonlFile(filePath, 'p1', undefined)
+
+    expect(result.calls).toHaveLength(1)
+    expect(result.calls[0]!.isSidechain).toBe(true)
+  })
+
+  it('classifies every tool call in a transcript when a later large entry marks it as sidechain', async () => {
+    const root = makeFixtureRoot()
+    const filePath = join(root, 'agent-reviewer.jsonl')
+    const now = new Date().toISOString()
+    const assistant = (name: string, isSidechain?: boolean, padding = '') => JSON.stringify({
+      type: 'assistant',
+      ...(isSidechain === true ? { isSidechain: true } : {}),
+      timestamp: now,
+      cwd: '/x',
+      padding,
+      message: {
+        model: 'claude-sonnet-4-5',
+        usage: { cache_creation_input_tokens: 1 },
+        content: [{ type: 'tool_use', name, input: { file_path: `/x/${name}.ts` } }],
+      },
+    })
+    writeFile(filePath, [
+      JSON.stringify({ type: 'user', timestamp: now, cwd: '/x', message: { content: 'delegate this' } }),
+      assistant('Read'),
+      assistant('Edit', true, 'x'.repeat(40_000)),
+      assistant('Bash'),
+    ].join('\n'))
+
+    const result = await scanJsonlFile(filePath, 'p1', undefined)
+
+    expect(result.calls.map(call => [call.name, call.isSidechain])).toEqual([
+      ['Read', true],
+      ['Edit', true],
+      ['Bash', true],
+    ])
+    expect(result.apiCalls).toHaveLength(3)
+    expect(result.cwds).toHaveLength(4)
+    expect(result.userMessages).toEqual(['delegate this'])
+  })
+
+  it('keeps sidechain calls out of duplicate reads but in junk reads and the read:edit ratio', () => {
+    const sidechain = { sessionId: 'agent-reviewer', project: 'p1', isSidechain: true }
+    const editCalls = Array.from({ length: 10 }, (_, index) => ({
+      name: 'Edit', input: { file_path: `/src/${index}.ts` }, ...sidechain,
+    }))
+    const junkReads = Array.from({ length: 6 }, () => ({
+      name: 'Read', input: { file_path: '/app/node_modules/pkg/index.js' }, ...sidechain,
+    }))
+    const repeatReads = Array.from({ length: 6 }, () => ({
+      name: 'Read', input: { file_path: '/app/src/a.ts' }, ...sidechain,
+    }))
+
+    // A subagent editing without reading, or reading into node_modules, is the
+    // same waste as the parent doing it, and the CLAUDE.md rule both suggest
+    // binds subagents too - so the full call population feeds them.
+    expect(detectLowReadEditRatio(editCalls)?.id).toBe('read-edit-ratio')
+    expect(detectJunkReads(junkReads)?.id).toBe('build-folder-reads')
+    // A re-read is only waste when the context already held the file; a
+    // sidechain starts fresh and has to read it.
+    expect(detectDuplicateReads(repeatReads)).toBeNull()
   })
 
   it('skips malformed JSONL lines without crashing', async () => {

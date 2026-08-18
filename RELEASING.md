@@ -1,8 +1,10 @@
 # Releasing CodeBurn
 
-This document describes the actual steps a maintainer takes to cut a CLI or macOS menubar release. CLI releases are run by hand with `npm publish`; macOS menubar releases are automated by `.github/workflows/release-menubar.yml` when a `mac-v*` tag is pushed.
+This document describes the actual steps a maintainer takes to cut CLI, macOS menubar, and Electron desktop releases. CLI releases are run by hand with `npm publish`; macOS menubar releases are automated by `.github/workflows/release-menubar.yml` when a `mac-v*` tag is pushed.
 
-The Electron desktop app (`app/`) has no CI automation yet, but it is released manually under `desktop-v<version>` tags: build the artifacts on a macOS host (see `app/DISTRIBUTION.md`) and `gh release upload desktop-v<version> … --clobber` them onto the release. See `app/DISTRIBUTION.md` for how to build and distribute it as an ad-hoc-signed, non-notarized macOS build (plus unsigned Windows and Linux builds).
+The Electron desktop app (`app/`) is released manually under `desktop-v<version>` tags. Build macOS and Linux artifacts as described in `app/DISTRIBUTION.md`; the tag also runs the read-only `Build Windows installer` workflow on `windows-latest`. Download its `CodeBurn-Windows-Installer` artifact and upload both the `.exe` and `.exe.blockmap` with the other platform assets. The workflow never publishes release assets.
+
+Before announcing a desktop release, the release owner must confirm the live GitHub Release contains all four macOS `.dmg`/`.zip` files, the Linux `.AppImage`, `.deb`, and `.rpm`, and both Windows installer files. Publishing the Release runs the workflow's read-only live-asset verification job. If assets are uploaded after publication, rerun `Build Windows installer` with the `release_tag` input and require that verification job to pass. A failed or missing verification is a release blocker.
 
 ## Versioning
 
@@ -197,4 +199,4 @@ For the menubar, tag a new mac-v0.9.9 and let the workflow build and upload it. 
 
 ## Summary
 
-The CLI release is manual: bump the version, update `CHANGELOG.md`, commit, run `npm publish`, then tag and create a GitHub Release. The macOS menubar release is automated: pushing a `mac-v*` tag fires `.github/workflows/release-menubar.yml`, which builds, signs, zips, and publishes the bundle. The homebrew-core formula is updated automatically or via `brew bump-formula-pr`.
+The CLI release is manual: bump the version, update `CHANGELOG.md`, commit, run `npm publish`, then tag and create a GitHub Release. The macOS menubar release is automated: pushing a `mac-v*` tag fires `.github/workflows/release-menubar.yml`, which builds, signs, zips, and publishes the bundle. The Electron desktop release is assembled manually under a `desktop-v*` tag, with the release-authoritative Windows NSIS installer built by the read-only `windows-latest` workflow. The homebrew-core formula is updated automatically or via `brew bump-formula-pr`.
