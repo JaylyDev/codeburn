@@ -214,11 +214,14 @@ describe('Optimize', () => {
       id: 'mcp-low-coverage', title: 'Underused claude.ai connector',
       explanation: 'The connector loads unused tools.', severity: 'medium',
       trend: null, tokensSaved: 2_000, estimatedSavingsUSD: 1,
+      // Connector-only: no appliable plan, so the finding is a nudge.
+      class: 'nudge', basis: 'estimated',
       fix: {
         type: 'paste', destination: 'manual', label: 'Manage the connector where it loads:',
         text: 'Open /mcp and disable claude.ai Google Calendar.',
       },
     })
+    report.summary.byClass.nudge = { tokensSaved: 19_400, savingsUSD: 9.7, count: 2 }
     getOptimizeReport.mockResolvedValue(report)
     render(<Optimize period="30days" provider="all" />)
     const row = await screen.findByRole('button', { name: /Underused claude.ai connector/ })

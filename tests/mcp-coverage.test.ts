@@ -3,6 +3,8 @@ import { describe, it, expect, vi } from 'vitest'
 import {
   aggregateMcpCoverage,
   buildOptimizeJsonReport,
+  classTotals,
+  findingClass,
   detectMcpProfileAdvisor,
   detectMcpToolCoverage,
   estimateMcpSchemaCost,
@@ -923,5 +925,60 @@ describe('detectMcpProfileAdvisor', () => {
     }]
 
     expect(detectMcpProfileAdvisor(projects, coverage)).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Connector findings under the fix/nudge/keep classification (#1019)
+// ---------------------------------------------------------------------------
+
+describe('connector findings and finding class', () => {
+  const inventoryFor = (servers: string[]) => servers.flatMap(server =>
+    Array.from({ length: 20 }, (_, i) => `mcp__${server}__t${i}`),
+  )
+  const twoSessions = (servers: string[]) => ['a', 'b'].map(sessionId => makeSession({
+    sessionId,
+    inventory: inventoryFor(servers),
+    turns: [makeTurn([makeCall({ cacheCreation: 50_000 })])],
+  }))
+
+  it('classifies a connector-only finding as a nudge, since nothing is appliable', () => {
+    const finding = detectMcpToolCoverage([project(twoSessions(['claude_ai_Gmail']))])
+
+    expect(finding).not.toBeNull()
+    expect(finding!.apply).toBeUndefined()
+    expect(findingClass(finding!)).toBe('nudge')
+    expect(finding!.tokensSaved).toBeGreaterThan(0)
+    // Never lands in the "apply-able" subtotal.
+    expect(classTotals([finding!], 0.00002).fix).toEqual({ tokensSaved: 0, savingsUSD: 0, count: 0 })
+  })
+
+  it('counts only the local subset of a mixed finding towards the apply-able subtotal', () => {
+    const finding = detectMcpToolCoverage([project(twoSessions(['filesystem', 'claude_ai_Slack']))])
+
+    expect(finding).not.toBeNull()
+    expect(findingClass(finding!)).toBe('fix')
+    expect(finding).toMatchObject({ tokensSaved: 40_000, applyTokensSaved: 20_000 })
+    expect(classTotals([finding!], 0.00002).fix).toEqual({ tokensSaved: 20_000, savingsUSD: 0.4, count: 1 })
+  })
+
+  it("leaves a local-only finding's subtotal at its full estimate", () => {
+    const finding = detectMcpToolCoverage([project(twoSessions(['filesystem']))])
+
+    expect(finding).not.toBeNull()
+    expect(finding!.applyTokensSaved).toBeUndefined()
+    expect(classTotals([finding!], 0.00002).fix.tokensSaved).toBe(finding!.tokensSaved)
+  })
+
+  it('treats a local server named like a connector namespace as manual only', () => {
+    // Known limitation: the namespace prefix is the only connector signal in
+    // the transcript, so a local server literally named claude_ai_* gets the
+    // manual /mcp guidance rather than a remove command. Conservative by
+    // design: CodeBurn never emits a command that could hit a connector.
+    const finding = detectMcpToolCoverage([project(twoSessions(['claude_ai_homegrown']))])
+
+    expect(finding!.fix.type).toBe('paste')
+    expect(finding!.apply).toBeUndefined()
+    expect(findingClass(finding!)).toBe('nudge')
   })
 })

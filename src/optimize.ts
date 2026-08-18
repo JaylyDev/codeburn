@@ -403,9 +403,17 @@ export function classTotals(findings: WasteFinding[], costRate: number): Record<
     keep: { tokensSaved: 0, savingsUSD: 0, count: 0 },
   }
   for (const f of findings) {
-    const t = totals[findingClass(f)]
-    t.tokensSaved += f.tokensSaved
-    t.savingsUSD += f.tokensSaved * costRate
+    const cls = findingClass(f)
+    // A `fix` whose plan owns only part of its estimate (a mixed local +
+    // claude.ai connector MCP finding) contributes only the apply-able
+    // subset, so this subtotal and the "apply-able" headline never promise
+    // what `--apply` cannot recover. The finding keeps the whole
+    // opportunity in its own `tokensSaved`, so the fix subtotal can be
+    // smaller than the findings listed under it.
+    const tokens = cls === 'fix' ? f.applyTokensSaved ?? f.tokensSaved : f.tokensSaved
+    const t = totals[cls]
+    t.tokensSaved += tokens
+    t.savingsUSD += tokens * costRate
     t.count++
   }
   return totals
