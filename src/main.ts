@@ -2105,21 +2105,29 @@ program
       byTask: !!opts.byTask,
       byAgent: !!opts.byAgent,
       taskFilter: opts.task,
-      // `aggregateModels` slices to topN on rows sorted by cost + savings
-      // descending. Unpriced rows are $0 on both (findUnpricedModels excludes
-      // anything with a local-savings baseline), so they always sort last and
-      // `--top` would remove exactly the rows `--unpriced` exists to show.
-      // Take the whole set here and slice after filtering instead.
+      // `aggregateModels` filters and slices before the unpriced filter. Its
+      // rows are sorted cost-first, so a small --top would remove exactly the
+      // rows `--unpriced` exists to show. Take the whole set here and slice
+      // after filtering and ranking instead.
       topN: opts.unpriced ? undefined : topN,
       minCost: typeof opts.minCost === 'number' && Number.isFinite(opts.minCost) ? opts.minCost : (opts.unpriced ? 0 : 0.01),
     })
     if (opts.unpriced) {
-      rows = rows.filter(row => findUnpricedModels([{
+      const unpriced = findUnpricedModels(rows.map(row => ({
         model: row.model,
         calls: row.calls,
         cost: row.costUSD,
         tokens: row.totalTokens,
-      }]).length > 0)
+      })))
+      const unpricedRank = new Map<string, number>()
+      for (const [rank, usage] of unpriced.entries()) {
+        // Breakdown modes can emit several rows for one model. Keep the first
+        // rank so all rows for that model stay together and N still counts rows.
+        if (!unpricedRank.has(usage.model)) unpricedRank.set(usage.model, rank)
+      }
+      rows = rows
+        .filter(row => unpricedRank.has(row.model))
+        .sort((a, b) => (unpricedRank.get(a.model)! - unpricedRank.get(b.model)!))
       if (topN !== undefined) rows = rows.slice(0, topN)
     }
 

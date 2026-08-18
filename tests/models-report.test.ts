@@ -776,10 +776,8 @@ describe('models CLI breakdown flags', () => {
     }
   })
 
-  // `--top` is applied inside aggregateModels, before the unpriced filter runs,
-  // on rows sorted by cost + savings descending. Unpriced rows are $0 on both,
-  // so they sort last and a small --top removed exactly the rows --unpriced
-  // exists to surface: the user was told they had no unpriced models.
+  // Unpriced rows all sort at $0 in aggregateModels, so the old implementation
+  // preserved transcript/Map order instead of findUnpricedModels' token order.
   it('keeps unpriced rows when --unpriced is combined with --top', async () => {
     const home = await mkdtemp(join(tmpdir(), 'codeburn-models-unpriced-top-'))
     try {
@@ -802,13 +800,13 @@ describe('models CLI breakdown flags', () => {
           sessionId: 'models-unpriced-top-session',
           timestamp: '2026-05-09T00:00:00.000Z',
           cwd: '/tmp/models-unpriced-top',
-          message: { role: 'user', content: 'Two priced models outrank the unpriced one.' },
+          message: { role: 'user', content: 'Three unpriced models arrive small-first.' },
         }),
-        // Both priced models cost more than the $0 unpriced row, so they take
-        // both --top slots unless the filter runs first.
-        assistant('opus', 'claude-opus-4-6', '2026-05-09T00:01:00.000Z', 5000),
-        assistant('sonnet', 'claude-sonnet-4-6', '2026-05-09T00:02:00.000Z', 3000),
-        assistant('unpriced', 'zz-unpriced-frontier-model', '2026-05-09T00:03:00.000Z', 2000),
+        // Transcript order is deliberately different from token order:
+        // 1.1k, 9.1k, 5.1k total tokens. The two largest must survive --top 2.
+        assistant('small', 'zz-unpriced-small', '2026-05-09T00:01:00.000Z', 1000),
+        assistant('largest', 'zz-unpriced-largest', '2026-05-09T00:02:00.000Z', 9000),
+        assistant('middle', 'zz-unpriced-middle', '2026-05-09T00:03:00.000Z', 5000),
       ].join('\n') + '\n')
 
       const res = spawnSync(
@@ -819,7 +817,8 @@ describe('models CLI breakdown flags', () => {
 
       expect(res.status, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0)
       const rows = JSON.parse(res.stdout) as Array<{ model: string }>
-      expect(rows.map(row => row.model)).toEqual(['zz-unpriced-frontier-model'])
+      expect(rows).toHaveLength(2)
+      expect(rows.map(row => row.model)).toEqual(['zz-unpriced-largest', 'zz-unpriced-middle'])
     } finally {
       await rm(home, { recursive: true, force: true })
     }
