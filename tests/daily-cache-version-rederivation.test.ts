@@ -10,8 +10,12 @@ import {
   type DailyEntry,
 } from '../src/daily-cache.js'
 
-const PRE_FIX_DAILY_VERSION = 18
-const cacheRoot = join(tmpdir(), `codeburn-grok-daily-${process.pid}-${Date.now()}`)
+// The last SHIPPED daily-cache version before the Grok accounting change, so
+// this models the real 17 -> 19 upgrade path users hit. (v18 existed only as an
+// unreleased draft.) Anything below MIN_SUPPORTED_VERSION is untrusted, which
+// is what makes the re-derivation global rather than Grok-scoped.
+const PRE_FIX_DAILY_VERSION = 17
+const cacheRoot = join(tmpdir(), `codeburn-daily-rederive-${process.pid}-${Date.now()}`)
 
 function day(date: string, cost: number): DailyEntry {
   return {
@@ -63,8 +67,12 @@ afterEach(async () => {
   await rm(cacheRoot, { recursive: true, force: true })
 })
 
-describe('Grok daily-cache accounting rederivation', () => {
-  it('re-derives a v18 Grok day while preserving the old cache as the baseline', async () => {
+// Raising MIN_SUPPORTED_VERSION re-derives EVERY day from EVERY provider, not
+// only Grok - the daily cache has no per-provider invalidation. A Grok day is
+// used here because Grok is the provider whose totals the bump exists to
+// correct; the mechanism under test is version-wide.
+describe('daily-cache re-derivation on a DAILY_CACHE_VERSION bump', () => {
+  it('re-derives a day from a below-minimum v17 cache while preserving the old file', async () => {
     const date = toDateString(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000))
     const yesterday = toDateString(new Date(Date.now() - 24 * 60 * 60 * 1000))
     const oldPath = join(cacheRoot, `daily-cache.v${PRE_FIX_DAILY_VERSION}.json`)

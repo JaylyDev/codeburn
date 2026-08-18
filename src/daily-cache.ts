@@ -8,10 +8,17 @@ import type { DateRange, ProjectSummary } from './types.js'
 
 // Bumped to 19: Grok authoritative usage now keeps one session-level rollup
 // from top-level totals, clamps reasoning to reported output, and labels mixed
-// authoritative/heuristic coverage. Days already finalized at v18 contain the
-// per-model split from the previous draft, so raising MIN_SUPPORTED_VERSION
-// forces a one-time re-derivation; v14 carry-forward keeps source-less history
-// intact.
+// authoritative/heuristic coverage. Every day finalized under the previous
+// accounting carries the old Grok totals, and the daily cache has no
+// per-provider invalidation, so raising MIN_SUPPORTED_VERSION is the only
+// lever: it forces a one-time re-derivation of ALL days, for every provider,
+// not just Grok. That pass reads the warm session cache (CACHE_VERSION is
+// unchanged and only PROVIDER_PARSE_VERSIONS.grok moved), so it costs seconds
+// rather than a full re-parse, and adoptOlderDailyCaches keeps the superseded
+// file as the baseline for days no source can still re-derive.
+//
+// The shipped predecessor is v17; v18 was an unreleased draft of this change
+// and only exists in pre-release checkouts. 19 clears both.
 //
 // Bumped to 17: copilot CLI sessions were misclassified as VS Code transcripts
 // (#944), so days finalized at v16 or earlier carry output-only copilot costs —

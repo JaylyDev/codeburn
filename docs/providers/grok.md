@@ -21,7 +21,7 @@ JSON + JSONL. `summary.json` holds the session id, cwd, timestamps, and `current
 
 **Estimated fallback.** Older sessions without any valid `turn_completed.usage` record use the running context fill (`totalTokens` per chunk) and the existing compaction-aware per-turn curve. That path remains flagged `costIsEstimated`; a completed record is never blended with the heuristic.
 
-If a session spans a CLI upgrade and has both completed records and streamed turns without a matching record, the all-or-nothing authoritative path keeps the recorded totals, drops the uncovered turns, and marks the emitted row `costIsEstimated: true`. A later parse can fill an open turn once it writes a record; pre-upgrade turns that never do are dropped.
+**Mixed sessions undercount.** The choice between the two paths is per session, not per turn. If a session has at least one usable `turn_completed` record, the whole session is billed from the summed records and any turn WITHOUT a record contributes nothing at all - its tokens are dropped, not estimated, so such a session reads low. The row is marked `costIsEstimated: true` rather than claiming full provider coverage. This is deliberate: blending the heuristic into real records would reintroduce the roughly 5x output over-count this parser exists to remove. It happens when a session straddles a CLI upgrade or a run dies before writing its last record; an open turn is filled by a later parse once it writes one, pre-upgrade turns never are. Measured on a 568-session corpus, 1 turn out of 566 was uncovered.
 
 ## Pricing
 
@@ -38,6 +38,7 @@ Per `grok:<session-dir>:<updated_at>:<id>`.
 ## Quirks
 
 - **Two token paths.** Completed turns carry provider usage; sessions from older CLI versions have only the context curve and therefore remain estimates (likely an upper bound, since re-sent context is cached server-side and not exposed in those files).
+- **A turn with no `turn_completed` record is dropped inside an otherwise-covered session** (see Token model). The session still reports, marked estimated, but reads low by those turns.
 - **No bash-command capture.** Tool names come from `signals.toolsUsed`; per-command bash text is not extracted, so `bashCommands` is empty.
 - **Whole-session timestamp.** Spend is attributed to `updated_at`, since the context curve is cumulative.
 - **Subscription vs API.** Grok Build runs via either a metered xAI API account (tiered) or a SuperGrok subscription; the session files do not record which.
