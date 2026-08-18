@@ -9,7 +9,7 @@ import { StaleBanner } from '../components/StaleBanner'
 import { type Polled, usePolled } from '../hooks/usePolled'
 import { formatCompact, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
-import type { DateRange, MenubarPayload, OptimizeJsonReport, Period, SessionYieldJson, WasteAction, YieldJsonReport } from '../lib/types'
+import type { DateRange, FindingClass, MenubarPayload, OptimizeJsonReport, Period, SessionYieldJson, WasteAction, YieldJsonReport } from '../lib/types'
 
 type OptimizeTab = 'waste' | 'reverts' | 'abandoned' | 'fixes'
 
@@ -114,6 +114,12 @@ const IMPACT_ICON: Record<'high' | 'medium' | 'low', string> = {
   low: '↓',
 }
 
+const CLASS_HEADERS: Record<FindingClass, string> = {
+  fix: 'Fix now (apply-able)',
+  nudge: 'Habits',
+  keep: 'FYI',
+}
+
 function actionText(fix: WasteAction): string {
   return fix.type === 'file-content' ? fix.content : fix.text
 }
@@ -132,10 +138,14 @@ function ActionableFindingRows({ findings }: { findings: OptimizeFinding[] }) {
 
   return (
     <div className="opt-findings">
-      {findings.map(finding => {
+      {findings.map((finding, i) => {
         const expanded = expandedId === finding.id
+        // Findings arrive class-sorted from the CLI, so a header goes in
+        // wherever the class changes.
+        const showHeader = finding.class !== findings[i - 1]?.class
         return (
           <Fragment key={finding.id}>
+            {showHeader && <div className="opt-group">{CLASS_HEADERS[finding.class]}</div>}
             <button
               className="opt-finding opt-finding-toggle"
               type="button"
@@ -153,7 +163,7 @@ function ActionableFindingRows({ findings }: { findings: OptimizeFinding[] }) {
                 )}
               </span>
               <span className="opt-finding-savings">{formatUsd(finding.estimatedSavingsUSD)}</span>
-              <span className="opt-finding-tokens">{formatCompact(finding.tokensSaved)} tokens</span>
+              <span className="opt-finding-tokens">{formatCompact(finding.tokensSaved)} tokens · {finding.basis}</span>
               <span className="opt-finding-chevron" aria-hidden="true">›</span>
             </button>
             {expanded && (

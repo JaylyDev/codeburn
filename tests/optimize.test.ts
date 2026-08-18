@@ -26,6 +26,9 @@ import {
   computeHealth,
   computeTrend,
   buildOptimizeJsonReport,
+  renderOptimize,
+  findingBasis,
+  type FindingId,
   type ToolCall,
   type ApiCallMeta,
   type WasteFinding,
@@ -1004,6 +1007,29 @@ describe('detectSessionOutliers', () => {
     expect(finding!.tokensSaved).toBeGreaterThan(0)
   })
 
+  it('keeps estimated-cost sessions out of the peer math', () => {
+    const project = projectWithSessions([1, 1, 1, 10])
+    // The expensive session is priced from modelled tokens, so it is not
+    // comparable against the provider-reported peers and never gets flagged.
+    project.sessions[3]!.totalEstimatedCostUSD = project.sessions[3]!.totalCostUSD
+    expect(detectSessionOutliers([project])).toBeNull()
+  })
+
+  it('falls back to estimated costs when nothing else is priced, and says so', () => {
+    const project = projectWithSessions([1, 1, 1, 10])
+    for (const s of project.sessions) s.totalEstimatedCostUSD = s.totalCostUSD
+    const finding = detectSessionOutliers([project])
+    expect(finding).not.toBeNull()
+    expect(finding!.basis).toBe('estimated')
+    expect(findingBasis(finding!)).toBe('estimated')
+  })
+
+  it('reports measured basis when every peer cost is provider-reported', () => {
+    const finding = detectSessionOutliers([projectWithSessions([1, 1, 1, 10])])
+    expect(finding!.basis).toBeUndefined()
+    expect(findingBasis(finding!)).toBe('measured')
+  })
+
   it('ignores tiny absolute-cost outliers', () => {
     expect(detectSessionOutliers([projectWithSessions([0.01, 0.01, 0.01, 0.2])])).toBeNull()
   })
@@ -1240,6 +1266,7 @@ describe('buildOptimizeJsonReport', () => {
       healthGrade: 'C',
       findings: [
         {
+          id: 'claude-md-too-long',
           title: 'Trim stale context',
           explanation: 'Old instructions are loaded every turn.',
           impact: 'medium',
@@ -1283,16 +1310,52 @@ describe('buildOptimizeJsonReport', () => {
       potentialSavingsPercent: 20,
       costRateUSD: 0.00002,
     })
+    expect(report.summary.measuredSavingsUSD).toBe(0)
     expect(report.findings[0]).toMatchObject({
       title: 'Trim stale context',
       severity: 'medium',
       trend: 'active',
       tokensSaved: 50_000,
       estimatedSavingsUSD: 1,
+      class: 'nudge',
+      basis: 'estimated',
       fix: {
         type: 'paste',
         destination: 'claude-md',
       },
     })
+  })
+})
+
+describe('renderOptimize grouping', () => {
+  const plain = (s: string): string => s.replace(/\[[0-9;]*m/g, '')
+
+  function finding(id: FindingId, title: string): WasteFinding {
+    return {
+      id,
+      title,
+      explanation: 'why',
+      impact: 'medium',
+      tokensSaved: 1000,
+      fix: { type: 'paste', destination: 'prompt', label: 'ask', text: 'ask' },
+    }
+  }
+
+  it('groups findings under fix / habits / FYI with continuous numbering and a basis split', () => {
+    const findings = [
+      finding('bash-output-cap', 'Cap bash output'),
+      finding('claude-md-too-long', 'Trim CLAUDE.md'),
+      finding('context-heavy-sessions', 'Context-heavy sessions'),
+    ]
+    const out = plain(renderOptimize(findings, 0.00001, '7 Days', 10, 5, 100, 80, 'B', [], []))
+
+    const headers = ['Fix now (apply-able)', 'Habits', 'FYI'].map(h => out.indexOf(h))
+    expect(headers.every(i => i >= 0)).toBe(true)
+    expect(headers).toEqual([...headers].sort((a, b) => a - b))
+    expect(out).toContain('1. Cap bash output')
+    expect(out).toContain('2. Trim CLAUDE.md')
+    expect(out).toContain('3. Context-heavy sessions')
+    expect(out).toContain('1 measured · 2 estimated')
+    expect(out).not.toContain('Estimates only.')
   })
 })

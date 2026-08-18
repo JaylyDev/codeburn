@@ -264,6 +264,113 @@ export type FindingId =
   | 'unused-skills'
   | 'unused-commands'
 
+/// How a finding is meant to be acted on:
+/// - `fix`   CodeBurn can write the change itself (`codeburn optimize --apply`)
+/// - `nudge` behavioural, the user changes a habit
+/// - `keep`  informational; the cost may well be justified
+export type FindingClass = 'fix' | 'nudge' | 'keep'
+
+/// Where a finding's `tokensSaved` number comes from:
+/// - `measured`  summed from provider-counted usage on the parsed calls
+/// - `estimated` a schema/heuristic model (per-tool sizes, recovery fractions)
+/// A detector that mixes the two counts as `estimated`.
+export type FindingBasis = 'measured' | 'estimated'
+
+/// Static class per finding id. `fix` entries are exactly the ids `buildPlan`
+/// (src/act/plans.ts) routes to a plan builder; tests assert the two lists
+/// stay equal. Instances that lack the payload their builder needs fall back
+/// to `nudge` via `findingClass`.
+export const FINDING_CLASS: Record<FindingId, FindingClass> = {
+  'read-edit-ratio': 'fix',          // CLAUDE.md rule block
+  'build-folder-reads': 'fix',       // CLAUDE.md rule block
+  'redundant-rereads': 'nudge',
+  'warmup-heavy': 'nudge',
+  'unused-mcp': 'fix',
+  'mcp-low-coverage': 'fix',
+  'mcp-project-scope': 'fix',
+  'mcp-deferral-off': 'fix',
+  'mcp-alwaysload-hygiene': 'fix',
+  'mcp-defer-threshold': 'fix',
+  'retry-heavy-capabilities': 'nudge',
+  'low-worth-sessions': 'nudge',
+  'context-heavy-sessions': 'keep',  // context-heavy work is often load-bearing
+  'cost-outliers': 'nudge',
+  'claude-md-too-long': 'nudge',     // trimming is a judgement call, not a rule block
+  'bash-output-cap': 'fix',
+  'unused-agents': 'fix',
+  'unused-skills': 'fix',
+  'unused-commands': 'fix',
+}
+
+/// Ids whose plan is built from the `apply` payload: without it the plan
+/// builder returns null, so the finding is only a nudge.
+const CLASS_NEEDS_APPLY: ReadonlySet<FindingId> = new Set<FindingId>([
+  'unused-mcp',
+  'mcp-low-coverage',
+  'mcp-project-scope',
+  'mcp-deferral-off',
+  'mcp-alwaysload-hygiene',
+  'mcp-defer-threshold',
+  'unused-agents',
+  'unused-skills',
+  'unused-commands',
+])
+
+/// Static basis per finding id. Only the two session-level detectors sum
+/// provider-counted tokens end to end; everything else multiplies a modelled
+/// per-unit size or a recovery fraction.
+export const FINDING_BASIS: Record<FindingId, FindingBasis> = {
+  'read-edit-ratio': 'estimated',          // reads x AVG_TOKENS_PER_READ
+  'build-folder-reads': 'estimated',       // reads x AVG_TOKENS_PER_READ
+  'redundant-rereads': 'estimated',        // reads x AVG_TOKENS_PER_READ
+  'warmup-heavy': 'estimated',             // observed median minus a modelled baseline
+  'unused-mcp': 'estimated',               // tools x TOKENS_PER_MCP_TOOL x sessions
+  'mcp-low-coverage': 'estimated',         // schema-size model, only capped by observed cache tokens
+  'mcp-project-scope': 'estimated',        // same schema-size model
+  'mcp-deferral-off': 'estimated',         // schema-size model x affected sessions
+  'mcp-alwaysload-hygiene': 'estimated',   // tools x TOKENS_PER_MCP_TOOL x loaded sessions
+  'mcp-defer-threshold': 'estimated',      // definition-size model x sessions
+  'retry-heavy-capabilities': 'estimated', // real turn tokens x recovery fraction
+  'low-worth-sessions': 'estimated',       // real session tokens x recovery fraction
+  'context-heavy-sessions': 'measured',    // counted input/cache tokens above the target ratio
+  'cost-outliers': 'measured',             // counted session tokens above the peer average
+  'claude-md-too-long': 'estimated',       // lines x CLAUDEMD_TOKENS_PER_LINE
+  'bash-output-cap': 'estimated',          // chars x BASH_TOKENS_PER_CHAR
+  'unused-agents': 'estimated',            // count x TOKENS_PER_AGENT_DEF
+  'unused-skills': 'estimated',            // count x TOKENS_PER_SKILL_DEF
+  'unused-commands': 'estimated',          // count x TOKENS_PER_COMMAND_DEF
+}
+
+/// Scope label for a setting that lives in ~/.zshrc / ~/.bashrc. Plans never
+/// rewrite shell profiles, they only report them.
+export const SHELL_PROFILE_SCOPE = 'shell profile'
+
+export function findingClass(f: WasteFinding): FindingClass {
+  const base = FINDING_CLASS[f.id]
+  if (base !== 'fix') return base
+  if (CLASS_NEEDS_APPLY.has(f.id) && !f.apply) return 'nudge'
+  const apply = f.apply
+  if ((apply?.kind === 'defer-enable' || apply?.kind === 'defer-threshold') && apply.settingScope === SHELL_PROFILE_SCOPE) {
+    return 'nudge'
+  }
+  // Of the deferral causes only these two have a plan; the rest are manual
+  // advice (Vertex policy, an outdated Claude Code, an unverified proxy).
+  if (apply?.kind === 'defer-enable' && apply.cause !== 'env-false' && apply.cause !== 'proxy-verified') return 'nudge'
+  return 'fix'
+}
+
+export function findingBasis(f: WasteFinding): FindingBasis {
+  return f.basis ?? FINDING_BASIS[f.id]
+}
+
+const CLASS_ORDER: Record<FindingClass, number> = { fix: 0, nudge: 1, keep: 2 }
+
+export const CLASS_HEADERS: Record<FindingClass, string> = {
+  fix: 'Fix now (apply-able)  — codeburn optimize --apply',
+  nudge: 'Habits',
+  keep: 'FYI',
+}
+
 // Cause taxonomy for defer-enable plans (mcp-deferral-off findings).
 // 'proxy-verified' is never produced by the detector today: it is reserved
 // for the #614 part-3 proxy verifier, which upgrades 'proxy-unknown' once a
@@ -303,6 +410,9 @@ export type WasteFinding = {
   fix: WasteAction
   trend?: Trend
   apply?: FindingApply
+  /// Set only when a detector's basis varies per run (see detectSessionOutliers);
+  /// otherwise `FINDING_BASIS[id]` applies. Read through `findingBasis`.
+  basis?: FindingBasis
 }
 
 export type OptimizeResult = {
@@ -330,6 +440,9 @@ export type OptimizeJsonReport = {
     potentialSavingsCostUSD: number
     potentialSavingsPercent: number | null
     costRateUSD: number
+    /// Portion of `potentialSavingsCostUSD` coming from `measured`-basis
+    /// findings. The total keeps its old meaning: measured plus estimated.
+    measuredSavingsUSD: number
   }
   findings: Array<{
     id: FindingId
@@ -339,6 +452,8 @@ export type OptimizeJsonReport = {
     trend: Trend | null
     tokensSaved: number
     estimatedSavingsUSD: number
+    class: FindingClass
+    basis: FindingBasis
     fix: WasteAction
   }>
   /// Files most reworked by edit-family calls, relative to project root (top 15).
@@ -1716,7 +1831,7 @@ export function findDeferralEnvSetting(
     const content = readSessionFileSync(path)
     if (content === null) continue
     const match = content.match(linePattern)
-    if (match) return { value: match[1]!, scope: 'shell profile', path }
+    if (match) return { value: match[1]!, scope: SHELL_PROFILE_SCOPE, path }
   }
   return null
 }
@@ -2814,9 +2929,17 @@ export function detectSessionOutliers(projects: ProjectSummary[], excludedSessio
   }
 
   const outliers: Outlier[] = []
+  // Modelled costs (Kiro, Cursor, some Cline sessions) are not comparable
+  // against provider-reported ones, so they leave the peer math. Providers
+  // that only ever estimate would lose the finding entirely, so those fall
+  // back to the full set and the finding reports itself as estimated.
+  let usedEstimatedCosts = false
 
   for (const project of projects) {
-    const sessions = project.sessions.filter(s => s.totalCostUSD > 0)
+    const costed = project.sessions.filter(s => s.totalCostUSD > 0)
+    const exact = costed.filter(s => (s.totalEstimatedCostUSD ?? 0) === 0)
+    const sessions = exact.length >= MIN_SESSIONS_FOR_OUTLIER ? exact : costed
+    const fellBack = sessions.length > exact.length
     if (sessions.length < MIN_SESSIONS_FOR_OUTLIER) continue
 
     const totalCost = sessions.reduce((sum, s) => sum + s.totalCostUSD, 0)
@@ -2835,6 +2958,7 @@ export function detectSessionOutliers(projects: ProjectSummary[], excludedSessio
       // "tighter constraint" advice here.
       if (excludedSessionIds?.has(session.sessionId)) continue
 
+      if (fellBack) usedEstimatedCosts = true
       outliers.push({
         project: project.project,
         sessionId: session.sessionId,
@@ -2864,6 +2988,7 @@ export function detectSessionOutliers(projects: ProjectSummary[], excludedSessio
     explanation: `Sessions costing more than ${SESSION_OUTLIER_MULTIPLIER}x their peer-session average in the same project: ${list}${extra}. These usually come from broad prompts, runaway loops, or context-heavy work that should be split into smaller sessions.`,
     impact: outliers.length >= 3 || totalExcessCost >= 10 ? 'high' : 'medium',
     tokensSaved,
+    ...(usedEstimatedCosts ? { basis: 'estimated' as const } : {}),
     fix: {
       type: 'paste',
       destination: 'session-opener',
@@ -3080,7 +3205,10 @@ export async function scanAndDetect(
     : []
   for (const f of ghostResults) if (f) findings.push(f)
 
+  // Urgency first, then class: every surface lists the apply-able fixes
+  // before the habit nudges, and orders by urgency inside each group.
   findings.sort((a, b) => urgencyScore(b) - urgencyScore(a))
+  findings.sort((a, b) => CLASS_ORDER[findingClass(a)] - CLASS_ORDER[findingClass(b)])
   const { score, grade } = computeHealth(findings)
   
   const modelRecommendations: ModelDefaultRecommendation[] = []
@@ -3164,7 +3292,7 @@ function renderFinding(n: number, f: WasteFinding, costRate: number): string[] {
   lines.push('')
   lines.push(wrap(f.explanation, PANEL_WIDTH - 4, '  '))
   lines.push('')
-  lines.push(chalk.hex(GOLD)(`  Potential savings: ${savings}`))
+  lines.push(chalk.hex(GOLD)(`  Potential savings: ${savings}`) + chalk.dim(`  ${findingBasis(f)}`))
   lines.push('')
 
   // Destination header — issue #277. Tells the user where each suggestion
@@ -3207,7 +3335,7 @@ function renderWorkflowSection(reworkedFiles: ReworkedFile[], coachingNotes: str
   return lines
 }
 
-function renderOptimize(
+export function renderOptimize(
   findings: WasteFinding[],
   costRate: number,
   periodLabel: string,
@@ -3228,12 +3356,16 @@ function renderOptimize(
   lines.push(chalk.hex(DIM)('  ' + SEP.repeat(PANEL_WIDTH)))
 
   const issueSuffix = findings.length > 0 ? `, ${findings.length} issue${findings.length > 1 ? 's' : ''}` : ''
+  const measured = findings.filter(f => findingBasis(f) === 'measured').length
   lines.push('  ' + [
     `${sessionCount} sessions`,
     `${callCount.toLocaleString()} calls`,
     chalk.hex(GOLD)(formatCost(periodCost)),
     `Health: ${chalk.bold.hex(GRADE_COLORS[healthGrade])(healthGrade)}${chalk.dim(` (${healthScore}/100${issueSuffix})`)}`,
   ].join(chalk.hex(DIM)('   ')))
+  if (findings.length > 0) {
+    lines.push(chalk.dim(`  ${measured} measured · ${findings.length - measured} estimated`))
+  }
   if (appliedHeader) lines.push('  ' + chalk.hex(GREEN)(appliedHeader))
   lines.push('')
 
@@ -3257,15 +3389,22 @@ function renderOptimize(
   lines.push(chalk.hex(GREEN)(`  Potential savings: ~${formatTokens(totalTokens)} tokens${costText}`))
   lines.push('')
 
-  for (let i = 0; i < findings.length; i++) {
-    const f = findings[i]!
-    const appliedOn = previouslyApplied?.[f.id]
-    const shown = appliedOn ? { ...f, title: `${f.title} (previously applied ${appliedOn}, re-flagged)` } : f
-    lines.push(...renderFinding(i + 1, shown, costRate))
+  // One block per class, in fix -> nudge -> keep order; numbering runs
+  // continuously across the blocks so `--only` picks stay unambiguous.
+  let n = 0
+  for (const cls of ['fix', 'nudge', 'keep'] as const) {
+    const group = findings.filter(f => findingClass(f) === cls)
+    if (group.length === 0) continue
+    lines.push(chalk.bold.hex(ORANGE)(`  ${CLASS_HEADERS[cls]}`))
+    lines.push('')
+    for (const f of group) {
+      const appliedOn = previouslyApplied?.[f.id]
+      const shown = appliedOn ? { ...f, title: `${f.title} (previously applied ${appliedOn}, re-flagged)` } : f
+      lines.push(...renderFinding(++n, shown, costRate))
+    }
   }
 
   lines.push(chalk.hex(DIM)('  ' + SEP.repeat(PANEL_WIDTH)))
-  lines.push(chalk.dim('  Estimates only.'))
   lines.push('')
 
   lines.push(...renderWorkflowSection(reworkedFiles, coachingNotes))
@@ -3365,6 +3504,9 @@ export function buildOptimizeJsonReport(
       potentialSavingsCostUSD,
       potentialSavingsPercent,
       costRateUSD: result.costRate,
+      measuredSavingsUSD: result.findings
+        .filter(f => findingBasis(f) === 'measured')
+        .reduce((s, f) => s + f.tokensSaved * result.costRate, 0),
     },
     findings: result.findings.map(f => ({
       id: f.id,
@@ -3374,6 +3516,8 @@ export function buildOptimizeJsonReport(
       trend: f.trend ?? null,
       tokensSaved: f.tokensSaved,
       estimatedSavingsUSD: f.tokensSaved * result.costRate,
+      class: findingClass(f),
+      basis: findingBasis(f),
       fix: f.fix,
     })),
     ...buildWorkflowReport(projects),

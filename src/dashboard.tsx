@@ -1,6 +1,6 @@
 import { homedir } from 'os'
 
-import React, { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
+import React, { Fragment, useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, type DOMElement } from 'ink'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost, formatTokens, markEstimated, carriedCostNote } from './format.js'
@@ -10,7 +10,7 @@ import { findUnpricedModels, isExpectedFreeModel, loadPricing } from './models.j
 import { aggregateModelTotals } from './model-breakdown.js'
 import { buildDurablePeriod } from './usage-aggregator.js'
 import { getAllProviders } from './providers/index.js'
-import { scanAndDetect, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
+import { CLASS_HEADERS, findingBasis, findingClass, scanAndDetect, type FindingClass, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
 import { aggregateFileChurn, buildCoachingNotes, computePricingCoverage, medianTimeToFirstEditMs, scanUserCorrections, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 import { estimateContextBudget, type ContextBudget } from './context-budget.js'
 import { dateKey } from './day-aggregator.js'
@@ -1079,7 +1079,7 @@ function FindingPanel({ index, finding, costRate, width }: { index: number; find
         {trendBadge && <Text color="#5BF5A0">{trendBadge}</Text>}
       </Text>
       <Text dimColor wrap="wrap">{finding.explanation}</Text>
-      <Text color={GOLD}>Savings: ~{formatTokens(finding.tokensSaved)} tokens (~{formatCost(costSaved)})</Text>
+      <Text color={GOLD}>Savings: ~{formatTokens(finding.tokensSaved)} tokens (~{formatCost(costSaved)})<Text dimColor>  {findingBasis(finding)}</Text></Text>
       <Text> </Text>
       <FindingAction action={finding.fix} />
     </Box>
@@ -1119,8 +1119,18 @@ function OptimizeView({ findings, costRate, projects, label, width, healthScore,
           <Text dimColor>Showing {start + 1}–{end} of {total} · j/k to scroll</Text>
         )}
       </Box>
-      {visible.map((f, i) => <FindingPanel key={start + i} index={start + i + 1} finding={f} costRate={costRate} width={width} />)}
-      <Box paddingX={1} width={width}><Text dimColor>Token estimates are approximate.</Text></Box>
+      {visible.map((f, i) => {
+        // Findings arrive class-sorted, so a header goes in wherever the class
+        // changes (including the top of the window after paging).
+        const cls = findingClass(f)
+        const previous: FindingClass | null = i > 0 ? findingClass(visible[i - 1]!) : null
+        return (
+          <Fragment key={start + i}>
+            {cls !== previous && <Box paddingX={1} width={width}><Text bold color={ORANGE}>{CLASS_HEADERS[cls]}</Text></Box>}
+            <FindingPanel index={start + i + 1} finding={f} costRate={costRate} width={width} />
+          </Fragment>
+        )
+      })}
     </Box>
   )
 }
