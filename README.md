@@ -52,9 +52,10 @@
       <code>npx codeburn</code>
     </td>
     <td align="center" width="50%">
-      <strong>macOS Menubar</strong><br/>
+      <strong>Menubar</strong><br/>
       <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/menubar-app.jpg" alt="CodeBurn macOS menubar" /><br/>
-      <code>codeburn menubar</code>
+      <code>codeburn menubar</code><br/>
+      <a href="https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.20"><img src="https://img.shields.io/badge/Windows-Tray_app_(.msi)-F97316?logo=windows&logoColor=white" alt="Download the CodeBurn Windows menubar" /></a>
     </td>
   </tr>
 </table>
@@ -107,7 +108,7 @@ Also runs via `bunx codeburn` or `pnpm dlx codeburn`, or `brew install codeburn`
 codeburn menubar
 ```
 
-On Linux, a GNOME Shell extension gives the same panel view; see [Linux (GNOME)](#linux-gnome).
+On Windows the same view is a tray app; see [Windows](#windows). On Linux, a GNOME Shell extension gives it in the top panel; see [Linux (GNOME)](#linux-gnome).
 
 Requires **Node.js 22.13+** and at least one supported tool with session data on disk. For Cursor and OpenCode, `better-sqlite3` installs automatically.
 
@@ -288,6 +289,8 @@ Pairing is PIN-authorized and stays on your local network. You can also discover
 
 ## Menu bar
 
+### macOS
+
 ```bash
 codeburn menubar
 ```
@@ -328,6 +331,14 @@ defaults write org.agentseal.codeburn-menubar CodeBurnPreferredTerminal -string 
 
 Allowed values are `terminal` (macOS Terminal.app, the default) and `iterm2`. Anything else falls back to `terminal`. Only terminals that can script a command into a live window are offered; if the chosen app is missing or fails to accept the command, CodeBurn tries Terminal.app and then runs the command in the background, logging each step to Console.app. Takes effect on the next launch of a command, no relaunch needed.
 
+### Windows
+
+Windows gets the same ambient view from the system tray. Download the `.msi` from the [latest Windows Menubar release](https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.20) and run it; `codeburn menubar` on Windows just points you at that page.
+
+Today's spend sits in the tray as a number beside the flame icon (turn it off in Settings, and the tooltip always carries it). Click for the same popover the macOS app shows: agent tabs, period switcher, Trend, Forecast, Pulse, Stats and Plan insights, activity and model breakdowns, optimize findings, and CSV/JSON export. Settings covers launch at login, the tray number, theme, and currency. It refreshes every 60 seconds while the popover is open and every 2 minutes while it is closed.
+
+The tray app reads everything through the CLI, so install that first (`npm install -g codeburn`) — it needs **codeburn 0.9.9 or newer**, and shows a setup screen with the install command until it finds one. Source and build instructions are in [`windows/`](windows/) ([windows/DEVELOPMENT.md](windows/DEVELOPMENT.md)). The `.msi` is unsigned for now, so SmartScreen prompts on first run.
+
 ### Linux (GNOME)
 
 Linux gets the same ambient view through a GNOME Shell extension (GNOME 45+): spend in the top panel, period switcher, compact mode, and daily budget alerts. It lives in [`gnome/`](gnome/):
@@ -338,7 +349,7 @@ git clone https://github.com/getagentseal/codeburn && cd codeburn/gnome
 gnome-extensions enable codeburn@codeburn.dev
 ```
 
-See [gnome/README.md](gnome/README.md) for settings and development notes. On Windows, `codeburn web` is the always-on view for now.
+See [gnome/README.md](gnome/README.md) for settings and development notes. The Tauri tray app in `windows/` also builds and runs on Linux, but it is experimental and unreleased there — the GNOME extension is the supported Linux surface.
 
 ## CodeBurn in your agent (MCP)
 

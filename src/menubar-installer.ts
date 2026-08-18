@@ -22,6 +22,9 @@ const EXPECTED_BUNDLE_ID = 'org.agentseal.codeburn-menubar'
 const VERSIONED_ASSET_PATTERN = /^CodeBurnMenubar-v.+\.zip$/
 const APP_PROCESS_NAME = 'CodeBurnMenubar'
 const SUPPORTED_OS = 'darwin'
+/// The Windows tray app (windows/) is released as an .msi under its own tag, so this command
+/// points at it rather than pretending to install anything.
+const WINDOWS_RELEASE_PAGE = 'https://github.com/getagentseal/codeburn/releases?q=windows-v'
 const MIN_MACOS_MAJOR = 14
 const PERSISTED_CLI_PATH = join(homedir(), 'Library', 'Application Support', 'CodeBurn', 'codeburn-cli-path.v1')
 const PERSISTENT_CLI_REQUIRED_MESSAGE =
@@ -184,6 +187,12 @@ async function exists(path: string): Promise<boolean> {
 }
 
 async function ensureSupportedPlatform(): Promise<void> {
+  if (platform() === 'win32') {
+    throw new Error(
+      'The Windows menubar ships as an installer, not through this command. ' +
+        `Download the .msi from ${WINDOWS_RELEASE_PAGE} and run it.`,
+    )
+  }
   if (platform() !== SUPPORTED_OS) {
     throw new Error(`The menubar app is macOS only (detected: ${platform()}).`)
   }
