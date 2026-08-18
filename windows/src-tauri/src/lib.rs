@@ -3,6 +3,10 @@ mod cli;
 mod config;
 mod fx;
 mod plan;
+/// The spend-in-the-tray badge is a second tray icon, which only the Tauri tray backend
+/// provides; Linux runs its own SNI tray (`tray_linux`) and has no equivalent, so the
+/// whole module is compiled out there rather than sitting unused.
+#[cfg(not(target_os = "linux"))]
 mod tray_badge;
 #[cfg(target_os = "linux")]
 mod tray_linux;
@@ -26,9 +30,11 @@ use crate::cli::CodeburnCli;
 use crate::config::CurrencyConfig;
 use crate::fx::FxCache;
 
+#[cfg(not(target_os = "linux"))]
 const TRAY_ID: &str = "codeburn-tray";
 /// Second tray icon that carries today's spend as text, sitting next to the logo. The
-/// closest Windows and Linux panels get to the macOS menubar title.
+/// closest the Windows notification area gets to the macOS menubar title.
+#[cfg(not(target_os = "linux"))]
 const BADGE_TRAY_ID: &str = "codeburn-badge";
 const POPOVER_LABEL: &str = "popover";
 
@@ -41,8 +47,6 @@ pub struct AppState {
     pub config: Mutex<CurrencyConfig>,
     pub fx: FxCache,
     pub plan: plan::PlanClient,
-    #[cfg(target_os = "linux")]
-    pub linux_tray: tray_linux::LinuxTrayHandle,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -51,24 +55,18 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            #[cfg(target_os = "linux")]
-            let linux_tray = tray_linux::LinuxTrayHandle::empty();
-
-            let state = AppState {
+            app.manage(AppState {
                 cli: Mutex::new(CodeburnCli::resolve()),
                 config: Mutex::new(CurrencyConfig::load_or_default()),
                 fx: FxCache::new(),
                 plan: plan::PlanClient::new(),
-                #[cfg(target_os = "linux")]
-                linux_tray: linux_tray.clone(),
-            };
-            app.manage(state);
+            });
 
             #[cfg(not(target_os = "linux"))]
             build_tray_tauri(app.handle())?;
 
             #[cfg(target_os = "linux")]
-            init_tray_linux(app.handle().clone(), linux_tray);
+            init_tray_linux(app.handle().clone(), tray_linux::LinuxTrayHandle::empty());
 
             if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
                 let _ = window.hide();
@@ -466,6 +464,14 @@ mod commands {
     /// `text` is a short spend string ("$87", "142", "1.2K"); `None` hides the badge icon.
     #[tauri::command]
     pub fn set_tray_badge(app: AppHandle, text: Option<String>) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            // Unreachable from the UI: the frontend hides the control wherever the badge is
+            // unsupported (lib/platform.ts). Saying so beats reporting a success that never
+            // happened.
+            let _ = (app, text);
+            Err("the tray spend badge needs a second tray icon, which the Linux SNI tray does not provide".to_string())
+        }
         #[cfg(not(target_os = "linux"))]
         {
             let Some(badge) = app.tray_by_id(super::BADGE_TRAY_ID) else {
@@ -487,12 +493,8 @@ mod commands {
                     badge.set_visible(false).map_err(|e| e.to_string())?;
                 }
             }
+            Ok(())
         }
-        #[cfg(target_os = "linux")]
-        {
-            let _ = (app, text);
-        }
-        Ok(())
     }
 
     #[tauri::command]

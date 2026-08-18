@@ -8,6 +8,7 @@ import { USD, formatCurrency, trayBadgeText } from './lib/currency'
 import { PayloadCache } from './lib/cache'
 import { relativePast } from './lib/dates'
 import { applyTheme, currentTheme, readSetting, writeSetting } from './lib/settings'
+import { TRAY_BADGE_SUPPORTED } from './lib/platform'
 import { AgentTabStrip, detectedProviders } from './components/AgentTabStrip'
 import type { Provider } from './components/AgentTabStrip'
 import { ModelsSection } from './components/ModelsSection'
@@ -65,7 +66,7 @@ export function App() {
   const [version, setVersion] = useState('')
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [theme, setTheme] = useState(() => currentTheme())
-  const [trayBadge, setTrayBadge] = useState(() => readSetting('trayBadge') !== 'off')
+  const [trayBadge, setTrayBadge] = useState(() => TRAY_BADGE_SUPPORTED && readSetting('trayBadge') !== 'off')
   const [showSettings, setShowSettings] = useState(false)
   // The window starts hidden and is shown by a tray click, which emits `codeburn://shown`.
   const [popoverVisible, setPopoverVisible] = useState(false)
@@ -216,6 +217,7 @@ export function App() {
   }, [todayCost, currency])
 
   useEffect(() => {
+    if (!TRAY_BADGE_SUPPORTED) return
     const text = trayBadge && todayCost !== null ? trayBadgeText(todayCost, currency) : null
     invoke('set_tray_badge', { text }).catch(err => setError(`Tray badge: ${String(err)}`))
   }, [todayCost, currency, trayBadge])

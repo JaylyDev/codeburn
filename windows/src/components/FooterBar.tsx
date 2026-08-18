@@ -1,5 +1,6 @@
 import type { CurrencyState } from '../lib/currency'
 import { CURRENCY_CODES } from '../lib/currency'
+import { TRAY_BADGE_SUPPORTED } from '../lib/platform'
 import { DropMenu } from './DropMenu'
 import { CoinIcon, DownloadIcon, EllipsisIcon, RefreshIcon, TerminalIcon } from './Icons'
 
@@ -64,7 +65,9 @@ export function FooterBar({
         className="dropmenu-more"
         items={[
           { id: 'settings', label: settingsOpen ? 'Back to overview' : 'Settings…' },
-          { id: 'badge', label: "Show today's cost in tray", checked: trayBadge, separatorBefore: true },
+          ...(TRAY_BADGE_SUPPORTED
+            ? [{ id: 'badge', label: "Show today's cost in tray", checked: trayBadge, separatorBefore: true }]
+            : []),
           { id: 'theme', label: themeLabel },
           { id: 'quit', label: 'Quit CodeBurn', separatorBefore: true },
         ]}

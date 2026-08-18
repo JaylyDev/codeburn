@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { openUrl } from '@tauri-apps/plugin-opener'
 import type { CurrencyState } from '../lib/currency'
 import { CURRENCY_CODES } from '../lib/currency'
-import { homePath } from '../lib/platform'
+import { homePath, TRAY_BADGE_SUPPORTED } from '../lib/platform'
 import type { CliStatus } from './SetupState'
 import { DropMenu } from './DropMenu'
 import { ChevronDown, ChevronRight } from './Icons'
@@ -70,9 +70,11 @@ export function SettingsPanel({
           <Toggle on={loginItem === true} disabled={loginItem === null} onToggle={toggleLogin} />
         </Row>
         {loginError && <div className="settings-error">{loginError}</div>}
-        <Row label="Show today's cost in the tray" hint="A second tray icon carrying the number, next to the logo.">
-          <Toggle on={trayBadge} onToggle={() => onTrayBadge(!trayBadge)} />
-        </Row>
+        {TRAY_BADGE_SUPPORTED && (
+          <Row label="Show today's cost in the tray" hint="A second tray icon carrying the number, next to the logo.">
+            <Toggle on={trayBadge} onToggle={() => onTrayBadge(!trayBadge)} />
+          </Row>
+        )}
       </div>
 
       <div className="settings-group">

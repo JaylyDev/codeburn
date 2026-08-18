@@ -8,6 +8,12 @@ Linux (ksni / AppIndicator) support is compiled and kept working for dev, but it
 **experimental and unreleased** - Linux users should use the GNOME extension in `../gnome/`.
 The releases this repo cuts from here are Windows only.
 
+Not everything crosses over: the spend badge is a second tray icon carrying the number as its
+bitmap, which only the Windows notification area provides. `tray_badge` is compiled out on
+Linux, the `set_tray_badge` command reports it as unsupported there, and the frontend hides
+the control behind `TRAY_BADGE_SUPPORTED` in `src/lib/platform.ts`. Anything else that is
+Windows-only must be cfg-gated the same way, or the ubuntu leg of CI fails on dead code.
+
 ## Architecture
 
 ```
