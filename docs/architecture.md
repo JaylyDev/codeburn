@@ -144,7 +144,7 @@ All three use atomic write (temp file + `rename`) and write with mode `0o600`. A
 
 ### Optimize Detectors
 
-`src/optimize.ts` exports 14 detectors. Each returns a `WasteFinding | null`. They are composed by `runOptimize()` which collects findings, ranks them by impact, and returns them with `WasteAction` objects (paste-to-CLAUDE.md, paste-to-session-opener, prompt-now, edit shell config).
+`src/optimize.ts` exports 19 detectors. Each returns a `WasteFinding | null`. They are composed by `runOptimize()` which collects findings, ranks them by impact, and returns them with `WasteAction` objects (paste-to-CLAUDE.md, paste-to-session-opener, prompt-now, edit shell config).
 
 | Detector | Line | What it catches |
 |---|---|---|

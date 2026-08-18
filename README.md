@@ -167,6 +167,12 @@ codeburn optimize --format json         # setup health + findings as JSON
 - Possibly low-worth expensive sessions with no edit turns or repeated retries
   when no `git`/`gh` delivery command is observed
 
+Findings are grouped into three classes: **Fix now** (CodeBurn can apply it for you), **Habits**
+(you change how you drive the next session), and **FYI** (informational, the cost may be justified).
+Each one says whether its savings number is `measured` from provider-counted usage or `estimated`
+from a model. See [docs/optimize.md](docs/optimize.md) for what is scanned, what `--apply` may write,
+and how to read the health grade.
+
 Each finding shows the estimated token and dollar savings plus a ready-to-paste fix: a `CLAUDE.md` line, an environment variable, or a `mv` command to archive unused items. Findings are ranked by urgency (impact weighted against observed waste) and rolled up into an A to F setup health grade. Repeat runs classify each finding as new, improving, or resolved against a 48-hour recent window.
 
 You can also open it inline from the dashboard: press `o` when a finding count appears in the status bar, `b` to return.
