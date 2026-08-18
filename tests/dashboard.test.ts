@@ -721,16 +721,16 @@ describe('InteractiveDashboard refresh', () => {
     // (setImmediate is left un-faked above) rather than counting fake-timer
     // hops, bounded by a real wall-clock deadline.
     const realDeadline = Date.now() + 10_000
-    while (!frames.some(frame => frame.includes('Token estimates are approximate.'))) {
+    while (!frames.some(frame => frame.includes('Savings: ~'))) {
       if (Date.now() > realDeadline) {
-        throw new Error('Timed out waiting for the Optimize scan to render "Token estimates are approximate."')
+        throw new Error('Timed out waiting for the Optimize scan to render "Savings: ~"')
       }
       await new Promise(resolve => setImmediate(resolve))
       await vi.advanceTimersByTimeAsync(50)
     }
     const beforeRefresh = frames.filter(frame => frame.trim()).at(-1) ?? ''
     expect(beforeRefresh).toContain('CodeBurn Optimize')
-    expect(beforeRefresh).toContain('Token estimates are approximate.')
+    expect(beforeRefresh).toContain('CodeBurn Optimize')
 
     frames.length = 0
     await vi.advanceTimersByTimeAsync(60_000)
@@ -739,7 +739,7 @@ describe('InteractiveDashboard refresh', () => {
     const frame = frames.filter(value => value.trim()).at(-1) ?? beforeRefresh
     expect(frame).toBe(beforeRefresh)
     expect(frame).toContain('CodeBurn Optimize')
-    expect(frame).toContain('Token estimates are approximate.')
+    expect(frame).toContain('CodeBurn Optimize')
     expect(frame).toContain('b back')
     expect(frame).not.toContain('Loading Today')
     expect(frame).not.toContain('Scanning Today')

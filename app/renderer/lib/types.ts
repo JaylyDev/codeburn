@@ -407,6 +407,8 @@ export type WasteAction =
   | { type: 'command'; label: string; text: string }
   | { type: 'file-content'; label: string; path: string; content: string }
 
+export type FindingClass = 'fix' | 'nudge' | 'keep'
+
 export type OptimizeJsonReport = {
   period: { label: string; start: string | null; end: string | null }
   summary: {
@@ -420,6 +422,8 @@ export type OptimizeJsonReport = {
     potentialSavingsCostUSD: number
     potentialSavingsPercent: number | null
     costRateUSD: number
+    measuredSavingsUSD: number
+    byClass: Record<FindingClass, { tokensSaved: number; savingsUSD: number; count: number }>
   }
   findings: Array<{
     id: string
@@ -429,6 +433,8 @@ export type OptimizeJsonReport = {
     trend: 'active' | 'improving' | null
     tokensSaved: number
     estimatedSavingsUSD: number
+    class: FindingClass
+    basis: 'measured' | 'estimated'
     fix: WasteAction
   }>
 }

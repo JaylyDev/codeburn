@@ -9,6 +9,7 @@ import {
   ALWAYSLOAD_STARTUP_CAP_SECONDS,
   ENABLE_TOOL_SEARCH_VAR,
   parseVersion,
+  SHELL_PROFILE_SCOPE,
   versionPredates,
 } from '../optimize.js'
 import type { WasteFinding } from '../optimize.js'
@@ -386,7 +387,6 @@ const NEXT_SESSION_NOTE = 'takes effect on the next session (this config is read
 
 // findDeferralEnvSetting (src/optimize.ts) reports shell-profile hits with
 // exactly this scope string; the plan layer keys its refusal on it.
-const SHELL_PROFILE_SCOPE = 'shell profile'
 
 const SHELL_TOOL_SEARCH_LINE = new RegExp(`^\\s*(?:export\\s+)?${ENABLE_TOOL_SEARCH_VAR}\\s*=.*$`, 'm')
 
