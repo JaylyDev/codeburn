@@ -499,6 +499,28 @@ describe('scoped load', () => {
       .toEqual(['/live/apr.jsonl', '/live/jun.jsonl', '/live/jun2.jsonl', '/live/mar.jsonl'])
   })
 
+  it('keeps the unloaded month\'s shard name when a re-parse re-derives the same entry', async () => {
+    await seedThreeMonths()
+    // The March entry is invisible to a June-scoped run, so the reconcile
+    // re-parses that file and writes the identical entry straight back. Nothing
+    // changed, so the March shard must keep its name run after run (#1032).
+    const nameOf = async (): Promise<string> => (await envelope()).providers['claude']!.shards['2026-03']!.name
+    const before = await nameOf()
+    for (let run = 0; run < 2; run++) {
+      clearLoadCacheMemo()
+      const scoped = await loadCache(juneScope)
+      scoped.providers['claude']!.files['/live/mar.jsonl'] = fileSpanning('2026-03-10T10:00:00Z')
+      markCacheDirty(scoped, 'claude', '/live/mar.jsonl')
+      await saveCache(scoped)
+      expect(await nameOf(), `March republished on run ${run + 1}`).toBe(before)
+    }
+
+    clearLoadCacheMemo()
+    const full = await loadCache()
+    expect(Object.keys(full.providers['claude']!.files).sort())
+      .toEqual(['/live/apr.jsonl', '/live/jun.jsonl', '/live/mar.jsonl'])
+  })
+
   it('merges rather than replaces when a re-parse lands in an unloaded month', async () => {
     await seedThreeMonths()
     clearLoadCacheMemo()
