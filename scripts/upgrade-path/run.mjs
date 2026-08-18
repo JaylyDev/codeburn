@@ -323,17 +323,96 @@ check(JSON.stringify(stripGenerated(warm.menubar)) === JSON.stringify(stripGener
   'warm run reports the same payload as the run that migrated the cache')
 
 // Republication without a content change is wasted I/O, not a correctness
-// problem, so it is reported rather than failed. It is real: a date-RANGED
-// query (`status --format json`, the statusline/menubar fast path) currently
-// republishes the month shards its range skipped, on every run, even when
-// nothing changed — the identical-bodies check above is what proves the
-// content survives it.
+// problem, so it is reported rather than failed. It is real, and it has a
+// follow-up issue: a date-RANGED query (`status --format json`, the
+// statusline/menubar fast path) republishes the month shards its range skipped,
+// on every run, even when nothing changed — partially defeating #1007's
+// "a warm launch rewrites only the month that changed". The identical-bodies
+// check above is what proves the content survives it.
 const afterMtimes = shardMtimes(upgradeCache)
 const republished = Object.keys(afterMtimes).filter(n => n !== 'envelope.json' && beforeMtimes[n] !== afterMtimes[n])
 const retired = Object.keys(beforeMtimes).filter(n => n !== 'envelope.json' && !(n in afterMtimes))
-if (retired.length) console.log(`  note  ${retired.length} shard(s) republished under a new name with identical content: ${retired.join(', ')}`)
-else if (republished.length) console.log(`  note  ${republished.length} shard(s) rewritten in place: ${republished.join(', ')}`)
+const churnNote = 'known defect, follow-up issue pending: a date-ranged run republishes the month shards it skipped'
+if (retired.length) console.log(`  note  ${retired.length} shard(s) republished under a new name with identical content (${churnNote}): ${retired.join(', ')}`)
+else if (republished.length) console.log(`  note  ${republished.length} shard(s) rewritten in place (${churnNote}): ${republished.join(', ')}`)
 else ok('no shard republished on an unchanged corpus')
+
+// ── 8. partial source aging (release blocker, track C) ───────────────────────
+// Claude Code deletes its transcripts after ~30 days, so between one run and the
+// next a day can go from fully sourced to PARTIALLY sourced. The daily cache's
+// never-lose contract says a schema bump re-derives what it can and carries
+// forward what it cannot — but on a partially-sourced day the re-derivation
+// produces a smaller slice from the surviving files and that slice REPLACES the
+// baseline one instead of being unioned with it, so the aged-out portion is lost.
+// A day that aged out completely is carried forward correctly, which is what
+// makes the partial case a hole rather than a missing feature.
+//
+// Runs last, and on its own cache dir, so mutating the corpus cannot disturb the
+// parity comparison above.
+
+step('never-lose across partial source aging')
+const agingCache = join(CACHES, 'aging')
+mkdirSync(agingCache, { recursive: true })
+
+// A fresh 0.9.20 cache, taken while every transcript still exists.
+capture(oldBin, agingCache, join(PAYLOADS, 'aging-baseline'))
+const baseDaily = JSON.parse(readFileSync(join(agingCache, OLD_DAILY_CACHE), 'utf8'))
+const sliceOf = (cache, date) => cache.days.find(d => d.date === date)?.providers?.claude
+
+// Group transcripts by the day their turns land on. Sidechain files are left out:
+// deleting a parent's subagent transcript entangles this with spawn-link
+// carry-forward, which is a different contract.
+const projectsDir = join(HOME, '.claude', 'projects')
+const byDay = new Map()
+for (const rel of readdirSync(projectsDir, { recursive: true })) {
+  const relPath = String(rel)
+  if (!relPath.endsWith('.jsonl') || relPath.includes('subagents')) continue
+  const full = join(projectsDir, relPath)
+  const first = readFileSync(full, 'utf8').split('\n', 1)[0]
+  const date = JSON.parse(first).timestamp?.slice(0, 10)
+  if (!date || !sliceOf(baseDaily, date)) continue
+  if (!byDay.has(date)) byDay.set(date, [])
+  byDay.get(date).push(full)
+}
+
+// Densest days first, oldest among equals — the ones a retention window reaches
+// first, and the ones where losing the aged-out portion shows up largest.
+const candidates = [...byDay.entries()].filter(([, files]) => files.length >= 2)
+  .sort((a, b) => (b[1].length - a[1].length) || a[0].localeCompare(b[0]))
+
+let aged = []
+if (candidates.length < 3) fail(`need 3 multi-transcript claude days to age out, found ${candidates.length}`)
+else {
+  for (const [date, files] of candidates.slice(0, 2)) {
+    // Keep exactly one file, so the day is still sourced — just not fully.
+    for (const f of files.slice(1)) rmSync(f)
+    aged.push({ date, kind: 'partially sourceless', kept: 1, removed: files.length - 1 })
+  }
+  const [goneDate, goneFiles] = candidates[2]
+  for (const f of goneFiles) rmSync(f)
+  aged.push({ date: goneDate, kind: 'fully sourceless', kept: 0, removed: goneFiles.length })
+  for (const a of aged) ok(`${a.date}: ${a.kind} (removed ${a.removed} of ${a.removed + a.kept} transcripts)`)
+
+  capture(newBin, agingCache, join(PAYLOADS, 'aging-upgraded'))
+  const upDaily = JSON.parse(readFileSync(join(agingCache, NEW_DAILY_CACHE), 'utf8'))
+  const usd = n => `$${n.toFixed(6)}`
+
+  for (const a of aged) {
+    const b = sliceOf(baseDaily, a.date)
+    const u = sliceOf(upDaily, a.date)
+    if (!u) { fail(`${a.date} (${a.kind}): the claude slice is gone entirely; baseline had ${usd(b.cost)} over ${b.calls} calls`); continue }
+    // A fully sourceless day has nothing to re-derive, so it must come back
+    // EXACTLY. A partially sourceless one may legitimately grow (a re-parse
+    // under new accounting), but must never shrink.
+    const exact = a.kind === 'fully sourceless'
+    const costOk = exact ? Math.abs(u.cost - b.cost) < 1e-9 : u.cost >= b.cost - 1e-9
+    const callsOk = exact ? u.calls === b.calls : u.calls >= b.calls
+    const loss = costOk && callsOk ? '' :
+      ` — LOST ${usd(b.cost - u.cost)} (${(100 * (b.cost - u.cost) / b.cost).toFixed(1)}%) and ${b.calls - u.calls} calls`
+    check(costOk && callsOk,
+      `${a.date} (${a.kind}): cost ${usd(b.cost)} -> ${usd(u.cost)}, calls ${b.calls} -> ${u.calls}${loss}`)
+  }
+}
 
 // ── done ─────────────────────────────────────────────────────────────────────
 
