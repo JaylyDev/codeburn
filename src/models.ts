@@ -307,7 +307,7 @@ const BUILTIN_ALIASES: Record<string, string> = {
   // reports that quote literal slugs (e.g. forum.cursor.com/t/154933).
   'claude-4-sonnet':                'claude-sonnet-4',
   'claude-4-sonnet-1m':             'claude-sonnet-4',
-  'claude-4-sonnet-thinking':       'claude-sonnet-4-5',
+  'claude-4-sonnet-thinking':       'claude-sonnet-4',
   'claude-4.5-sonnet':              'claude-sonnet-4-5',
   'claude-4.5-sonnet-thinking':     'claude-sonnet-4-5',
   'claude-4.6-sonnet':              'claude-sonnet-4-6',
