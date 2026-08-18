@@ -49,6 +49,11 @@ function makeOptimizeReport(): OptimizeJsonReport {
       sessions: 88, calls: 1220, potentialSavingsTokens: 184_000,
       potentialSavingsCostUSD: 94.4, potentialSavingsPercent: 15.4, costRateUSD: 0.0005,
       measuredSavingsUSD: 27.8,
+      byClass: {
+        fix: { tokensSaved: 18_200, savingsUSD: 9.1, count: 1 },
+        nudge: { tokensSaved: 17_400, savingsUSD: 8.7, count: 1 },
+        keep: { tokensSaved: 4_800, savingsUSD: 2.4, count: 1 },
+      },
     },
     findings: [
       {
@@ -129,7 +134,11 @@ describe('Optimize', () => {
 
     await screen.findByText('Opus is doing your small talk')
     const groups = document.querySelectorAll('.opt-group')
-    expect([...groups].map(g => g.textContent)).toEqual(['Fix now (apply-able)', 'Habits', 'FYI'])
+    expect([...groups].map(g => g.textContent)).toEqual([
+      'Fix now (apply-able) · 18.2K tokens · $9.10 · 1 finding',
+      'Habits · 17.4K tokens · $8.70 · 1 finding',
+      'FYI · 4.8K tokens · $2.40 · 1 finding',
+    ])
   })
 
   it('renders tabs and actionable Waste findings with impact, savings, explanation, and copy-paste fix', async () => {

@@ -1311,6 +1311,15 @@ describe('buildOptimizeJsonReport', () => {
       costRateUSD: 0.00002,
     })
     expect(report.summary.measuredSavingsUSD).toBe(0)
+    expect(report.summary.byClass).toEqual({
+      fix: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+      nudge: { tokensSaved: 50_000, savingsUSD: 1, count: 1 },
+      keep: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+    })
+    const classes = Object.values(report.summary.byClass)
+    expect(classes.reduce((s, c) => s + c.tokensSaved, 0)).toBe(report.summary.potentialSavingsTokens)
+    expect(classes.reduce((s, c) => s + c.savingsUSD, 0)).toBeCloseTo(report.summary.potentialSavingsCostUSD, 10)
+    expect(classes.reduce((s, c) => s + c.count, 0)).toBe(report.summary.findingCount)
     expect(report.findings[0]).toMatchObject({
       title: 'Trim stale context',
       severity: 'medium',
@@ -1349,9 +1358,15 @@ describe('renderOptimize grouping', () => {
     ]
     const out = plain(renderOptimize(findings, 0.00001, '7 Days', 10, 5, 100, 80, 'B', [], []))
 
-    const headers = ['Fix now (apply-able)', 'Habits', 'FYI'].map(h => out.indexOf(h))
+    const headers = [
+      'Fix now (apply-able) · ~1.0K tokens (~$0.010) · 1 finding — codeburn optimize --apply',
+      'Habits · ~1.0K tokens (~$0.010) · 1 finding',
+      'FYI · ~1.0K tokens (~$0.010) · 1 finding',
+    ].map(h => out.indexOf(h))
     expect(headers.every(i => i >= 0)).toBe(true)
     expect(headers).toEqual([...headers].sort((a, b) => a - b))
+    // Headline is the whole board; the apply-able slice is named separately.
+    expect(out).toContain('Potential savings: ~3.0K tokens (~$0.030, ~0.3% of spend) — apply-able: ~$0.010')
     expect(out).toContain('1. Cap bash output')
     expect(out).toContain('2. Trim CLAUDE.md')
     expect(out).toContain('3. Context-heavy sessions')

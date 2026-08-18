@@ -101,7 +101,7 @@ function WasteRows({ report }: { report: Polled<OptimizeJsonReport> }) {
       <div className="opt-summary">
         {report.data.summary.findingCount.toLocaleString('en-US')} findings · {formatUsd(report.data.summary.potentialSavingsCostUSD)} potential · health {report.data.summary.healthScore}/100
       </div>
-      <ActionableFindingRows findings={report.data.findings} />
+      <ActionableFindingRows findings={report.data.findings} byClass={report.data.summary.byClass} />
     </div>
   )
 }
@@ -124,7 +124,7 @@ function actionText(fix: WasteAction): string {
   return fix.type === 'file-content' ? fix.content : fix.text
 }
 
-function ActionableFindingRows({ findings }: { findings: OptimizeFinding[] }) {
+function ActionableFindingRows({ findings, byClass }: { findings: OptimizeFinding[]; byClass: OptimizeJsonReport['summary']['byClass'] }) {
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [copiedId, setCopiedId] = useState<string | null>(null)
 
@@ -145,7 +145,11 @@ function ActionableFindingRows({ findings }: { findings: OptimizeFinding[] }) {
         const showHeader = finding.class !== findings[i - 1]?.class
         return (
           <Fragment key={finding.id}>
-            {showHeader && <div className="opt-group">{CLASS_HEADERS[finding.class]}</div>}
+            {showHeader && (
+              <div className="opt-group">
+                {CLASS_HEADERS[finding.class]} · {formatCompact(byClass[finding.class].tokensSaved)} tokens · {formatUsd(byClass[finding.class].savingsUSD)} · {byClass[finding.class].count} {byClass[finding.class].count === 1 ? 'finding' : 'findings'}
+              </div>
+            )}
             <button
               className="opt-finding opt-finding-toggle"
               type="button"

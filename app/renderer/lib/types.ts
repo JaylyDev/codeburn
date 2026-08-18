@@ -423,6 +423,7 @@ export type OptimizeJsonReport = {
     potentialSavingsPercent: number | null
     costRateUSD: number
     measuredSavingsUSD: number
+    byClass: Record<FindingClass, { tokensSaved: number; savingsUSD: number; count: number }>
   }
   findings: Array<{
     id: string

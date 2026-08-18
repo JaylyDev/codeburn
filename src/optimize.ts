@@ -341,8 +341,10 @@ export const FINDING_BASIS: Record<FindingId, FindingBasis> = {
   'unused-commands': 'estimated',          // count x TOKENS_PER_COMMAND_DEF
 }
 
-/// Scope label for a setting that lives in ~/.zshrc / ~/.bashrc. Plans never
-/// rewrite shell profiles, they only report them.
+/// Scope label for a setting that lives in ~/.zshrc / ~/.bashrc. The MCP
+/// deferral plans (defer-enable, defer-threshold) refuse to rewrite an
+/// override found there and report it instead; bash-output-cap does append
+/// its own marker block to the shell rc.
 export const SHELL_PROFILE_SCOPE = 'shell profile'
 
 export function findingClass(f: WasteFinding): FindingClass {
@@ -366,9 +368,34 @@ export function findingBasis(f: WasteFinding): FindingBasis {
 const CLASS_ORDER: Record<FindingClass, number> = { fix: 0, nudge: 1, keep: 2 }
 
 export const CLASS_HEADERS: Record<FindingClass, string> = {
-  fix: 'Fix now (apply-able)  — codeburn optimize --apply',
+  fix: 'Fix now (apply-able)',
   nudge: 'Habits',
   keep: 'FYI',
+}
+
+export type ClassTotals = { tokensSaved: number; savingsUSD: number; count: number }
+
+export function classTotals(findings: WasteFinding[], costRate: number): Record<FindingClass, ClassTotals> {
+  const totals: Record<FindingClass, ClassTotals> = {
+    fix: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+    nudge: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+    keep: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+  }
+  for (const f of findings) {
+    const t = totals[findingClass(f)]
+    t.tokensSaved += f.tokensSaved
+    t.savingsUSD += f.tokensSaved * costRate
+    t.count++
+  }
+  return totals
+}
+
+/// Group header with its own subtotal, shared by the CLI and the TUI so the
+/// two never drift apart.
+export function classHeaderLine(cls: FindingClass, totals: ClassTotals, costRate: number): string {
+  const cost = costRate > 0 ? ` (~${formatCost(totals.savingsUSD)})` : ''
+  const suffix = cls === 'fix' ? ' — codeburn optimize --apply' : ''
+  return `${CLASS_HEADERS[cls]} · ~${formatTokens(totals.tokensSaved)} tokens${cost} · ${totals.count} finding${totals.count === 1 ? '' : 's'}${suffix}`
 }
 
 // Cause taxonomy for defer-enable plans (mcp-deferral-off findings).
@@ -443,6 +470,9 @@ export type OptimizeJsonReport = {
     /// Portion of `potentialSavingsCostUSD` coming from `measured`-basis
     /// findings. The total keeps its old meaning: measured plus estimated.
     measuredSavingsUSD: number
+    /// Per-class subtotals; the three counts and token sums add up to
+    /// `findingCount` and `potentialSavingsTokens`.
+    byClass: Record<FindingClass, ClassTotals>
   }
   findings: Array<{
     id: FindingId
@@ -3385,8 +3415,12 @@ export function renderOptimize(
   const pctRaw = periodCost > 0 ? (totalCost / periodCost) * 100 : 0
   const pct = pctRaw >= 1 ? pctRaw.toFixed(0) : pctRaw.toFixed(1)
 
+  const totals = classTotals(findings, costRate)
   const costText = costRate > 0 ? ` (~${formatCost(totalCost)}, ~${pct}% of spend)` : ''
-  lines.push(chalk.hex(GREEN)(`  Potential savings: ~${formatTokens(totalTokens)} tokens${costText}`))
+  // The headline is the whole board; name the apply-able slice separately so
+  // it never reads as "what CodeBurn can fix for you".
+  const applyable = costRate > 0 && totals.fix.count > 0 ? ` — apply-able: ~${formatCost(totals.fix.savingsUSD)}` : ''
+  lines.push(chalk.hex(GREEN)(`  Potential savings: ~${formatTokens(totalTokens)} tokens${costText}${applyable}`))
   lines.push('')
 
   // One block per class, in fix -> nudge -> keep order; numbering runs
@@ -3395,7 +3429,7 @@ export function renderOptimize(
   for (const cls of ['fix', 'nudge', 'keep'] as const) {
     const group = findings.filter(f => findingClass(f) === cls)
     if (group.length === 0) continue
-    lines.push(chalk.bold.hex(ORANGE)(`  ${CLASS_HEADERS[cls]}`))
+    lines.push(chalk.bold.hex(ORANGE)(`  ${classHeaderLine(cls, totals[cls], costRate)}`))
     lines.push('')
     for (const f of group) {
       const appliedOn = previouslyApplied?.[f.id]
@@ -3507,6 +3541,7 @@ export function buildOptimizeJsonReport(
       measuredSavingsUSD: result.findings
         .filter(f => findingBasis(f) === 'measured')
         .reduce((s, f) => s + f.tokensSaved * result.costRate, 0),
+      byClass: classTotals(result.findings, result.costRate),
     },
     findings: result.findings.map(f => ({
       id: f.id,

@@ -10,7 +10,7 @@ import { findUnpricedModels, isExpectedFreeModel, loadPricing } from './models.j
 import { aggregateModelTotals } from './model-breakdown.js'
 import { buildDurablePeriod } from './usage-aggregator.js'
 import { getAllProviders } from './providers/index.js'
-import { CLASS_HEADERS, findingBasis, findingClass, scanAndDetect, type FindingClass, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
+import { classHeaderLine, classTotals, findingBasis, findingClass, scanAndDetect, type FindingClass, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
 import { aggregateFileChurn, buildCoachingNotes, computePricingCoverage, medianTimeToFirstEditMs, scanUserCorrections, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 import { estimateContextBudget, type ContextBudget } from './context-budget.js'
 import { dateKey } from './day-aggregator.js'
@@ -1105,6 +1105,7 @@ function OptimizeView({ findings, costRate, projects, label, width, healthScore,
   const start = total === 0 ? 0 : Math.min(cursor, Math.max(0, total - FINDINGS_WINDOW_SIZE))
   const end = Math.min(start + FINDINGS_WINDOW_SIZE, total)
   const visible = findings.slice(start, end)
+  const totals = classTotals(findings, costRate)
   return (
     <Box flexDirection="column" width={width}>
       <Box flexDirection="column" borderStyle="round" borderColor={ORANGE} paddingX={1} width={width}>
@@ -1126,7 +1127,7 @@ function OptimizeView({ findings, costRate, projects, label, width, healthScore,
         const previous: FindingClass | null = i > 0 ? findingClass(visible[i - 1]!) : null
         return (
           <Fragment key={start + i}>
-            {cls !== previous && <Box paddingX={1} width={width}><Text bold color={ORANGE}>{CLASS_HEADERS[cls]}</Text></Box>}
+            {cls !== previous && <Box paddingX={1} width={width}><Text bold color={ORANGE} wrap="truncate-end">{classHeaderLine(cls, totals[cls], costRate)}</Text></Box>}
             <FindingPanel index={start + i + 1} finding={f} costRate={costRate} width={width} />
           </Fragment>
         )
