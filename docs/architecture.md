@@ -142,6 +142,8 @@ Three caches under `~/.cache/codeburn/` (override with `CODEBURN_CACHE_DIR`):
 
 All three use atomic write (temp file + `rename`) and write with mode `0o600`. All three carry a numeric `version` field; bumping it forces a recompute next run.
 
+The session cache (`src/session-cache.ts`) sits beside them as a directory of per-provider-month shards. A date-ranged query reads only the shards whose months can contribute a turn to that range; `CODEBURN_CACHE_SCOPE=all` turns that off and reads every shard, whatever the range. It is a read policy only — it is not part of any provider's env fingerprint, so setting or unsetting it never invalidates the cache.
+
 ### Optimize Detectors
 
 `src/optimize.ts` exports 20 detectors. Each returns a `WasteFinding | null`. They are composed by `runOptimize()` which collects findings, ranks them by impact, and returns them with `WasteAction` objects (paste-to-CLAUDE.md, paste-to-session-opener, prompt-now, edit shell config).

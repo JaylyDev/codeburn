@@ -44,7 +44,25 @@ function largeAssistantLine(): string {
   })
 }
 
+// The fields sit either side of the message that makes the line large, which
+// is where a generated prompt puts them in the wild.
+function largeMachineWrittenLine(): string {
+  return JSON.stringify({
+    isSidechain: true,
+    type: 'user',
+    message: { role: 'user', content: 'brief ' + 'x'.repeat(40_000) },
+    timestamp: '2026-05-01T00:00:00Z',
+    promptSource: 'sdk',
+  })
+}
+
 describe('large JSONL compact scanner', () => {
+  it('keeps the flags marking a program-written prompt', () => {
+    const parsed = parseJsonlLine(largeMachineWrittenLine())
+    expect(parsed?.promptSource).toBe('sdk')
+    expect(parsed?.isSidechain).toBe(true)
+  })
+
   it('extracts user text from array content without full JSON.parse', () => {
     const parsed = parseJsonlLine(largeUserLine())
     expect(parsed?.type).toBe('user')

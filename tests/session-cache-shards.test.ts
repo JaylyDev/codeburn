@@ -516,6 +516,24 @@ describe('scoped load', () => {
       .toEqual(['/live/apr.jsonl', '/live/jun.jsonl', '/live/mar.jsonl'])
   })
 
+  it('CODEBURN_CACHE_SCOPE=all reads every month and memoizes as unscoped', async () => {
+    await seedThreeMonths()
+    clearLoadCacheMemo()
+    const unscoped = await loadCache()
+
+    clearLoadCacheMemo()
+    process.env['CODEBURN_CACHE_SCOPE'] = 'all'
+    try {
+      const forced = await loadCache(juneScope)
+      expect(forced).toEqual(unscoped)
+      // Memoized as a full load, so a resident serve reuses it for any range.
+      delete process.env['CODEBURN_CACHE_SCOPE']
+      expect(await loadCache(juneScope)).toBe(forced)
+    } finally {
+      delete process.env['CODEBURN_CACHE_SCOPE']
+    }
+  })
+
   it('never scopes a provider whose fingerprint moved, or a durable one', async () => {
     const cache: SessionCache = {
       version: CACHE_VERSION,
