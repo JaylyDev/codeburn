@@ -14,10 +14,15 @@ type Props = {
   onQuit: () => void
   themeLabel: string
   footnote: string
+  trayBadge: boolean
+  onToggleTrayBadge: () => void
+  onOpenSettings: () => void
+  settingsOpen: boolean
 }
 
 export function FooterBar({
   currency, onCurrency, loading, onRefresh, onExport, onOpenReport, onToggleTheme, onQuit, themeLabel, footnote,
+  trayBadge, onToggleTrayBadge, onOpenSettings, settingsOpen,
 }: Props) {
   return (
     <footer className="footer">
@@ -58,11 +63,15 @@ export function FooterBar({
         label={<EllipsisIcon size={12} />}
         className="dropmenu-more"
         items={[
+          { id: 'settings', label: settingsOpen ? 'Back to overview' : 'Settings…' },
+          { id: 'badge', label: "Show today's cost in tray", checked: trayBadge, separatorBefore: true },
           { id: 'theme', label: themeLabel },
           { id: 'quit', label: 'Quit CodeBurn', separatorBefore: true },
         ]}
         footnote={footnote}
         onSelect={id => {
+          if (id === 'settings') onOpenSettings()
+          if (id === 'badge') onToggleTrayBadge()
           if (id === 'theme') onToggleTheme()
           if (id === 'quit') onQuit()
         }}

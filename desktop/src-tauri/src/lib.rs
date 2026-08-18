@@ -1,7 +1,9 @@
+mod autostart;
 mod cli;
 mod config;
 mod fx;
 mod plan;
+mod tray_badge;
 #[cfg(target_os = "linux")]
 mod tray_linux;
 
@@ -17,7 +19,7 @@ use tauri::Listener;
 #[cfg(not(target_os = "linux"))]
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 
 use crate::cli::CodeburnCli;
@@ -25,6 +27,9 @@ use crate::config::CurrencyConfig;
 use crate::fx::FxCache;
 
 const TRAY_ID: &str = "codeburn-tray";
+/// Second tray icon that carries today's spend as text, sitting next to the logo. The
+/// closest Windows and Linux panels get to the macOS menubar title.
+const BADGE_TRAY_ID: &str = "codeburn-badge";
 const POPOVER_LABEL: &str = "popover";
 
 /// Shared application state. Wraps the CLI handle + currency config + FX cache so every
@@ -95,8 +100,11 @@ pub fn run() {
             commands::quit_app,
             commands::hide_popover,
             commands::set_tray_tooltip,
+            commands::set_tray_badge,
             commands::app_version,
             commands::plan_usage,
+            commands::launch_at_login,
+            commands::set_launch_at_login,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -130,11 +138,38 @@ fn build_tray_tauri(app: &AppHandle) -> tauri::Result<()> {
         ],
     )?;
 
-    tray.set_menu(Some(menu))?;
+    tray.set_menu(Some(menu.clone()))?;
     tray.set_show_menu_on_left_click(false)?;
     let _ = tray.set_tooltip(Some("CodeBurn"));
+    tray.on_menu_event(on_tray_menu_event);
+    tray.on_tray_icon_event(on_tray_icon_event);
 
-    tray.on_menu_event(|app, event| match event.id.as_ref() {
+    // The badge icon starts fully transparent and hidden; the frontend shows it once it has
+    // today's spend. Registering it right after the logo puts it beside the logo in the tray.
+    let blank = tauri::image::Image::new_owned(
+        vec![0u8; (BLANK_ICON_SIZE * BLANK_ICON_SIZE * 4) as usize],
+        BLANK_ICON_SIZE,
+        BLANK_ICON_SIZE,
+    );
+    TrayIconBuilder::with_id(BADGE_TRAY_ID)
+        .icon(blank)
+        .tooltip("CodeBurn")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(on_tray_menu_event)
+        .on_tray_icon_event(on_tray_icon_event)
+        .build(app)?
+        .set_visible(false)?;
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+const BLANK_ICON_SIZE: u32 = 16;
+
+#[cfg(not(target_os = "linux"))]
+fn on_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
+    match event.id.as_ref() {
         "quit" => app.exit(0),
         "open" => show_popover(app, None),
         "refresh" => {
@@ -151,30 +186,27 @@ fn build_tray_tauri(app: &AppHandle) -> tauri::Result<()> {
             let _ = cli::spawn_in_terminal(app, &["report"]);
         }
         _ => {}
-    });
+    }
+}
 
-    tray.on_tray_icon_event(|tray, event| {
-        match event {
-            TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                position,
-                ..
-            } => {
-                toggle_popover(tray.app_handle(), Some((position.x as i32, position.y as i32)));
-            }
-            TrayIconEvent::DoubleClick {
-                button: MouseButton::Left,
-                position,
-                ..
-            } => {
-                toggle_popover(tray.app_handle(), Some((position.x as i32, position.y as i32)));
-            }
-            _ => {}
+#[cfg(not(target_os = "linux"))]
+fn on_tray_icon_event(tray: &tauri::tray::TrayIcon, event: TrayIconEvent) {
+    match event {
+        TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            position,
+            ..
         }
-    });
-
-    Ok(())
+        | TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            position,
+            ..
+        } => {
+            toggle_popover(tray.app_handle(), Some((position.x as i32, position.y as i32)));
+        }
+        _ => {}
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -411,8 +443,10 @@ mod commands {
     #[tauri::command]
     pub fn set_tray_tooltip(app: AppHandle, text: String) {
         #[cfg(not(target_os = "linux"))]
-        if let Some(tray) = app.tray_by_id(super::TRAY_ID) {
-            let _ = tray.set_tooltip(Some(text));
+        for id in [super::TRAY_ID, super::BADGE_TRAY_ID] {
+            if let Some(tray) = app.tray_by_id(id) {
+                let _ = tray.set_tooltip(Some(text.as_str()));
+            }
         }
         #[cfg(target_os = "linux")]
         {
@@ -420,9 +454,56 @@ mod commands {
         }
     }
 
+    /// `text` is a short spend string ("$87", "142", "1.2K"); `None` restores the flame.
+    /// Anything wider than the 16px design grid is rejected so the icon never clips.
+    #[tauri::command]
+    pub fn set_tray_badge(app: AppHandle, text: Option<String>) -> Result<(), String> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let Some(badge) = app.tray_by_id(super::BADGE_TRAY_ID) else {
+                return Ok(());
+            };
+            match text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                Some(t) => {
+                    if !crate::tray_badge::fits(t) {
+                        return Err(format!("badge text too wide: {t}"));
+                    }
+                    let icon = crate::tray_badge::render(
+                        t,
+                        crate::tray_badge::small_icon_size(),
+                        crate::tray_badge::taskbar_is_dark(),
+                    );
+                    // Windows can only modify an icon that is currently shown, so show
+                    // first (re-adds the previous bitmap) and then swap the bitmap.
+                    badge.set_visible(true).map_err(|e| e.to_string())?;
+                    badge.set_icon(Some(icon)).map_err(|e| e.to_string())?;
+                }
+                None => {
+                    badge.set_visible(false).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = (app, text);
+        }
+        Ok(())
+    }
+
     #[tauri::command]
     pub fn app_version(app: AppHandle) -> String {
         app.package_info().version.to_string()
+    }
+
+    #[tauri::command]
+    pub fn launch_at_login() -> bool {
+        crate::autostart::is_enabled()
+    }
+
+    #[tauri::command]
+    pub fn set_launch_at_login(enabled: bool) -> Result<bool, String> {
+        crate::autostart::set_enabled(enabled).map_err(|e| e.to_string())?;
+        Ok(crate::autostart::is_enabled())
     }
 
     #[tauri::command]

@@ -1,14 +1,7 @@
 /// First-run copy for a machine where the CLI ran fine but found no sessions. Paths are
 /// shown the way the reader's own OS spells them.
 
-const IS_WINDOWS = navigator.userAgent.includes('Windows')
-
-const HOME = IS_WINDOWS ? '%USERPROFILE%' : '~'
-const SEP = IS_WINDOWS ? '\\' : '/'
-
-function homePath(...parts: string[]): string {
-  return [HOME, ...parts].join(SEP) + SEP
-}
+import { homePath } from '../lib/platform'
 
 const SOURCES: Array<{ path: string | null; tool: string }> = [
   { path: homePath('.claude', 'projects'), tool: 'Claude Code' },

@@ -4,7 +4,7 @@ import { listen } from '@tauri-apps/api/event'
 
 import type { MenubarPayload } from './lib/payload'
 import type { CurrencyState } from './lib/currency'
-import { USD, formatCurrency } from './lib/currency'
+import { USD, formatCurrency, trayBadgeText } from './lib/currency'
 import { PayloadCache } from './lib/cache'
 import { relativePast } from './lib/dates'
 import { applyTheme, currentTheme, readSetting, writeSetting } from './lib/settings'
@@ -29,6 +29,7 @@ import { PeriodTabs, PERIOD_LABELS } from './components/PeriodTabs'
 import type { Period } from './components/PeriodTabs'
 import { FooterBar } from './components/FooterBar'
 import { ErrorToast } from './components/ErrorToast'
+import { SettingsPanel, type ThemeChoice } from './components/SettingsPanel'
 
 const payloadCache = new PayloadCache<MenubarPayload>()
 
@@ -60,6 +61,12 @@ export function App() {
   const [version, setVersion] = useState('')
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [theme, setTheme] = useState(() => currentTheme())
+  const [trayBadge, setTrayBadge] = useState(() => readSetting('trayBadge') !== 'off')
+  const [showSettings, setShowSettings] = useState(false)
+  const [themeChoice, setThemeChoice] = useState<ThemeChoice>(() => {
+    const saved = readSetting('theme')
+    return saved === 'dark' || saved === 'light' ? saved : 'system'
+  })
 
   const selection = useRef({ period, provider })
   selection.current = { period, provider }
@@ -101,6 +108,17 @@ export function App() {
     }
     await fetchKey(p, prov, opts)
   }, [fetchKey])
+
+  const probeCli = useCallback(async () => {
+    setCliChecking(true)
+    try {
+      setCliStatus(await invoke<CliStatus>('cli_status'))
+    } catch {
+      // Leave the status unknown; the data views already tell the user if fetches fail.
+    } finally {
+      setCliChecking(false)
+    }
+  }, [])
 
   const checkCli = useCallback(async () => {
     setCliChecking(true)
@@ -172,10 +190,25 @@ export function App() {
     invoke('set_tray_tooltip', { text }).catch(() => {})
   }, [todayPayload, currency])
 
+  useEffect(() => {
+    const text = trayBadge && todayPayload ? trayBadgeText(todayPayload.current.cost, currency) : null
+    invoke('set_tray_badge', { text }).catch(err => setError(`Tray badge: ${String(err)}`))
+  }, [todayPayload, currency, trayBadge])
+
+
+  const chooseTheme = (choice: ThemeChoice) => {
+    applyTheme(choice === 'system' ? null : choice)
+    setThemeChoice(choice)
+    setTheme(currentTheme())
+  }
+
   const toggleTheme = () => {
-    const next = currentTheme() === 'dark' ? 'light' : 'dark'
-    applyTheme(next)
-    setTheme(next)
+    chooseTheme(currentTheme() === 'dark' ? 'light' : 'dark')
+  }
+
+  const setTrayBadgePref = (on: boolean) => {
+    setTrayBadge(on)
+    writeSetting('trayBadge', on ? 'on' : 'off')
   }
 
   const applyCurrency = async (code: string) => {
@@ -225,12 +258,28 @@ export function App() {
         <div className="subhead">AI Coding Cost Tracker</div>
       </header>
 
-      {!cliBlocked && (
+      {!cliBlocked && !showSettings && (
         <AgentTabStrip selected={provider} onSelect={setProvider} payload={todayPayload} currency={currency} />
       )}
 
       <div className="main-content">
-        {cliBlocked && cliStatus ? (
+        {showSettings ? (
+          <SettingsPanel
+            onBack={() => setShowSettings(false)}
+            version={version}
+            currency={currency}
+            onCurrency={applyCurrency}
+            themeChoice={themeChoice}
+            onThemeChoice={chooseTheme}
+            trayBadge={trayBadge}
+            onTrayBadge={setTrayBadgePref}
+            cliStatus={cliStatus}
+            onCheckCli={checkCli}
+            onProbeCli={probeCli}
+            cliChecking={cliChecking}
+            onQuit={() => invoke('quit_app').catch(() => {})}
+          />
+        ) : cliBlocked && cliStatus ? (
           <SetupState status={cliStatus} checking={cliChecking} onCheckAgain={checkCli} />
         ) : (
           <>
@@ -283,6 +332,10 @@ export function App() {
         onToggleTheme={toggleTheme}
         onQuit={() => invoke('quit_app').catch(() => {})}
         themeLabel={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+        trayBadge={trayBadge}
+        onToggleTrayBadge={() => setTrayBadgePref(!trayBadge)}
+        onOpenSettings={() => setShowSettings(s => !s)}
+        settingsOpen={showSettings}
         footnote={footnote}
       />
 

@@ -5,6 +5,7 @@ const KEYS = {
   theme: 'codeburn.theme',
   insight: 'codeburn.insight',
   starBannerDismissed: 'codeburn.starBannerDismissed',
+  trayBadge: 'codeburn.trayBadge',
 } as const
 
 type Key = keyof typeof KEYS

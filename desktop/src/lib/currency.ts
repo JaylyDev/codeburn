@@ -46,6 +46,23 @@ export function formatTokens(n: number): string {
   return `${Math.round(n)}`
 }
 
+const BADGE_THOUSAND = 1_000
+const BADGE_MILLION = 1_000_000
+
+/// The spend string drawn into the tray icon. Budget is a 16px-wide pixel grid, so at most
+/// four glyph slots: "$9.5", "$87", "142", "1.2K", "12K", "0.1M". The `$` only fits when
+/// there are two digits or fewer, and only USD has a glyph in the icon font.
+export function trayBadgeText(usdAmount: number, currency: CurrencyState): string {
+  const v = Math.max(0, usdAmount * currency.rate)
+  const symbol = currency.code === 'USD' ? '$' : ''
+  if (v < 10) return `${symbol}${v.toFixed(1)}`
+  if (v < 100) return `${symbol}${Math.round(v)}`
+  if (v < BADGE_THOUSAND) return `${Math.round(v)}`
+  if (v < 10 * BADGE_THOUSAND) return `${(v / BADGE_THOUSAND).toFixed(1)}K`
+  if (v < 100 * BADGE_THOUSAND) return `${Math.round(v / BADGE_THOUSAND)}K`
+  return `${(v / BADGE_MILLION).toFixed(1)}M`
+}
+
 export function plural(n: number, singular: string, pluralForm = `${singular}s`): string {
   return `${n} ${n === 1 ? singular : pluralForm}`
 }
