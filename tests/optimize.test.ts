@@ -52,6 +52,7 @@ function projectWithSessions(costs: number[], project = 'app'): ProjectSummary {
       totalCostUSD: cost,
       totalInputTokens: tokens,
       totalOutputTokens: tokens,
+      totalReasoningTokens: 0,
       totalCacheReadTokens: 0,
       totalCacheWriteTokens: 0,
       apiCalls: 1,
@@ -105,6 +106,7 @@ function contextSession(
     totalCostUSD: 1,
     totalInputTokens: 0,
     totalOutputTokens: 0,
+    totalReasoningTokens: 0,
     totalCacheReadTokens: 0,
     totalCacheWriteTokens: 0,
     apiCalls: 1,
@@ -359,6 +361,18 @@ describe('detectContextBloat', () => {
       contextSession(0, {
         totalInputTokens: 100_000,
         totalOutputTokens: 5_000,
+      }),
+    ])
+
+    expect(detectContextBloat([project])).toBeNull()
+  })
+
+  it('counts reasoning with output when measuring context pressure', () => {
+    const project = projectWithContextSessions([
+      contextSession(0, {
+        totalInputTokens: 100_000,
+        totalOutputTokens: 3_500,
+        totalReasoningTokens: 2_000,
       }),
     ])
 

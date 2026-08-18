@@ -283,7 +283,10 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // transcripts (both carry producer 'copilot-agent'), skipping the shutdown
   // input/cache rollup; this bump re-parses them so the missing tokens land.
   copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1',
-  grok: 'estimated-cost-v1',
+  // authoritative-usage-v4: persist one Grok session call from top-level
+  // authoritative totals, use modelUsage only for priced attribution, clamp
+  // reasoning per record, and label mixed sessions estimated.
+  grok: 'authoritative-usage-v4',
   hermes: 'reasoning-output-accounting-v1-est-cost',
   'lingtai-tui': 'token-ledger-registry-activity-v3',
   'ibm-bob': 'worktree-project-grouping-v1',

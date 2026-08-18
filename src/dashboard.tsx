@@ -1460,14 +1460,14 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
     const generation = reloadGenerationRef.current
     setOptimizeLoading(true)
     try {
-      const result = await scanAndDetect(projects, currentRange(), activeProvider)
+      const result = await scanAndDetect(projects, currentRange())
       if (reloadGenerationRef.current === generation) setOptimizeResult(result)
     } catch (error) {
       console.error(error)
     } finally {
       if (reloadGenerationRef.current === generation) setOptimizeLoading(false)
     }
-  }, [optimizeAvailable, projects, currentRange, optimizeLoading, optimizeResult, activeProvider])
+  }, [optimizeAvailable, projects, currentRange, optimizeLoading, optimizeResult])
 
   useEffect(() => {
     const refreshIntervalMs = getRefreshIntervalMs(refreshSeconds ?? 0)

@@ -6,6 +6,13 @@ import { join } from 'path'
 import { getCodeburnCacheDir } from './cache-dir.js'
 import type { DateRange, ProjectSummary } from './types.js'
 
+// Bumped to 19: Grok authoritative usage now keeps one session-level rollup
+// from top-level totals, clamps reasoning to reported output, and labels mixed
+// authoritative/heuristic coverage. Days already finalized at v18 contain the
+// per-model split from the previous draft, so raising MIN_SUPPORTED_VERSION
+// forces a one-time re-derivation; v14 carry-forward keeps source-less history
+// intact.
+//
 // Bumped to 17: copilot CLI sessions were misclassified as VS Code transcripts
 // (#944), so days finalized at v16 or earlier carry output-only copilot costs —
 // the session.shutdown rollup's input/cache tokens were dropped. Raising
@@ -74,8 +81,8 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 17
-const MIN_SUPPORTED_VERSION = 17
+export const DAILY_CACHE_VERSION = 19
+const MIN_SUPPORTED_VERSION = 19
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including
