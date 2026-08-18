@@ -923,6 +923,27 @@ export function loadMcpConfigs(projectCwds: Iterable<string>, homeDir = homedir(
   return servers
 }
 
+/// Server names owned by readable local MCP config, normalized the way
+/// transcript namespaces are (":" -> "_"). `loadMcpConfigs` covers
+/// settings.json and .mcp.json; `~/.claude.json` adds the top-level and
+/// per-project `mcpServers` containers the remove plan also edits.
+///
+/// A `claude_ai_*` namespace listed here is a local server that happens to
+/// carry the connector prefix, not a claude.ai connector. Config we cannot
+/// read simply contributes no names, which leaves those namespaces on the
+/// conservative connector path.
+export function localMcpServerNames(projectCwds: Iterable<string>, homeDir = homedir()): Set<string> {
+  const names = new Set(loadMcpConfigs(projectCwds, homeDir).keys())
+  const userJson = readJsonFile(join(homeDir, '.claude.json'))
+  const projects = (userJson?.['projects'] ?? {}) as Record<string, { mcpServers?: unknown } | null>
+  const containers = [userJson?.['mcpServers'], ...Object.values(projects).map(entry => entry?.mcpServers)]
+  for (const container of containers) {
+    if (!container || typeof container !== 'object') continue
+    for (const name of Object.keys(container)) names.add(name.replace(/:/g, '_'))
+  }
+  return names
+}
+
 // ============================================================================
 // Detectors
 // ============================================================================
@@ -1342,6 +1363,7 @@ function estimateMcpSchemaCostAttributed(
 export function detectMcpToolCoverage(
   projects: ProjectSummary[],
   coverage = aggregateMcpCoverage(projects),
+  localServerNames: ReadonlySet<string> = new Set(),
 ): WasteFinding | null {
   if (coverage.length === 0) return null
 
@@ -1360,6 +1382,10 @@ export function detectMcpToolCoverage(
   const flaggedServers: string[] = []
   const localServers: string[] = []
   const connectorServers: string[] = []
+  // Local, but named like a connector: the transcript cannot tell the two
+  // apart, so the removal targets the config entry and the guidance warns
+  // about a possible same-name connector instead of asserting one.
+  const ambiguousServers: string[] = []
 
   for (const c of flagged) {
     unusedToolsByServer[c.server] = c.unusedTools
@@ -1368,9 +1394,10 @@ export function detectMcpToolCoverage(
     lines.push(
       `${c.server}: ${c.toolsInvoked}/${c.toolsAvailable} tools used (${pct}% coverage) across ${c.loadedSessions} session${c.loadedSessions === 1 ? '' : 's'}`,
     )
-    if (c.server.startsWith('claude_ai_')) {
+    if (c.server.startsWith('claude_ai_') && !localServerNames.has(c.server)) {
       connectorServers.push(c.server)
     } else {
+      if (c.server.startsWith('claude_ai_')) ambiguousServers.push(c.server)
       localServers.push(c.server)
       removeCommands.push(`claude mcp remove '${c.server}'`)
     }
@@ -1396,10 +1423,12 @@ export function detectMcpToolCoverage(
       ? 'high'
       : 'medium'
   // `claude_ai_*` is Claude Code's transcript namespace for server-side
-  // claude.ai connectors. Those connectors are not local mcpServers entries,
-  // so `claude mcp remove` and the file-editing apply plan cannot own them.
+  // claude.ai connectors, which are not local mcpServers entries, so
+  // `claude mcp remove` and the file-editing apply plan cannot own them --
+  // unless readable local config claims the exact name (`ambiguousServers`).
   // Coverage is aggregate here; project-level config attribution is deliberately
   // out of scope, hence the instruction to inspect /mcp per affected project.
+  const one = connectorServers.length === 1
   const connectorLabels = connectorServers.map(server =>
     `claude.ai ${server.slice('claude_ai_'.length).replaceAll('_', ' ')}`,
   )
@@ -1407,14 +1436,28 @@ export function detectMcpToolCoverage(
     `${connectorLabels[index]} (${server})`,
   )
   const connectorGuidance = connectorServers.length > 0
-    ? ` ${connectorEvidence.join(', ')} ${connectorServers.length === 1 ? 'is a claude.ai connector namespace' : 'are claude.ai connector namespaces'}, separate from any similarly named local MCP server. Transcript inventory is aggregated across the selected projects; use /mcp in each project where ${connectorServers.length === 1 ? 'it loads' : 'they load'}, or manage ${connectorServers.length === 1 ? 'it' : 'them'} in claude.ai Settings > Connectors.`
+    ? ` ${connectorEvidence.join(', ')} ${one ? 'is a claude.ai connector namespace' : 'are claude.ai connector namespaces'}, separate from any similarly named local MCP server. Transcript inventory is aggregated across the selected projects; use /mcp in each project where ${one ? 'it loads' : 'they load'}, or manage ${one ? 'it' : 'them'} in claude.ai Settings > Connectors.`
     : ''
-  const connectorAction = connectorServers.length > 0
+  const oneAmbiguous = ambiguousServers.length === 1
+  const ambiguousNote = ambiguousServers.length > 0
+    ? `If you also use ${oneAmbiguous ? 'a claude.ai connector' : 'claude.ai connectors'} named ${ambiguousServers.join(', ')}, manage ${oneAmbiguous ? 'it' : 'them'} with /mcp or in claude.ai Settings > Connectors.`
+    : ''
+  const ambiguousGuidance = ambiguousServers.length > 0
+    ? ` ${ambiguousServers.join(', ')} ${oneAmbiguous ? 'is a local MCP config entry whose name matches' : 'are local MCP config entries whose names match'} the claude.ai connector namespace, so the removal below edits local config only. ${ambiguousNote}`
+    : ''
+  const connectorText = [
+    connectorServers.length > 0
+      ? `Open /mcp in each affected project and disable ${connectorLabels.join(', ')}, or manage ${one ? 'it' : 'them'} in claude.ai Settings > Connectors.`
+      : '',
+    ambiguousNote,
+  ].filter(Boolean).join(' ')
+  const connectorAction = connectorText
     ? {
-        label: connectorServers.length === 1
-          ? 'Manage the underused claude.ai connector where it loads:'
-          : 'Manage the underused claude.ai connectors where they load:',
-        text: `Open /mcp in each affected project and disable ${connectorLabels.join(', ')}, or manage ${connectorServers.length === 1 ? 'it' : 'them'} in claude.ai Settings > Connectors.`,
+        label: connectorServers.length === 0
+          ? 'Check for a same-name claude.ai connector:'
+          : one ? 'Manage the underused claude.ai connector where it loads:'
+            : 'Manage the underused claude.ai connectors where they load:',
+        text: connectorText,
       }
     : undefined
   const fix: WasteAction = localServers.length > 0
@@ -1438,7 +1481,7 @@ export function detectMcpToolCoverage(
     explanation:
       `Schema for unused tools is loaded into the system prompt every session and ` +
       `carried in the cached prefix on every turn. ` +
-      `${lines.join('; ')}.${connectorGuidance}`,
+      `${lines.join('; ')}.${connectorGuidance}${ambiguousGuidance}`,
     impact,
     tokensSaved,
     ...(applyTokensSaved !== undefined ? { applyTokensSaved } : {}),
@@ -3472,7 +3515,7 @@ export async function scanAndDetect(
     claudeOnly(() => detectJunkReads(toolCalls, dateRange)),
     claudeOnly(() => detectDuplicateReads(toolCalls, dateRange)),
     claudeOnly(() => detectUnusedMcp(toolCalls, projects, projectCwds, mcpCoverage)),
-    () => detectMcpToolCoverage(projects, mcpCoverage),
+    () => detectMcpToolCoverage(projects, mcpCoverage, localMcpServerNames(projectCwds)),
     () => detectMcpProfileAdvisor(projects, mcpCoverage),
     // mcp-deferral-gaps family (#614): detection only, no apply plans yet.
     claudeOnly(() => detectMcpDeferralOff(toolCalls, projects, projectCwds, apiCalls)),

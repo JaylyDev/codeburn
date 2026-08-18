@@ -22,6 +22,7 @@ import {
   detectBashBloat,
   detectGhostCommands,
   loadMcpConfigs,
+  localMcpServerNames,
   scanJsonlFile,
   scanAndDetect,
   detectRecurringContext,
@@ -173,6 +174,32 @@ describe('loadMcpConfigs', () => {
     writeFile(join(projectDir, '.mcp.json'), '{ not valid json')
     expect(() => loadMcpConfigs([projectDir])).not.toThrow()
     expect(loadMcpConfigs([projectDir]).size).toBe(0)
+  })
+})
+
+describe('localMcpServerNames', () => {
+  it('adds the ~/.claude.json top-level and per-project servers to the config names', () => {
+    const root = makeFixtureRoot()
+    const projectDir = join(root, 'myapp')
+    mkdirSync(projectDir, { recursive: true })
+    writeFile(join(projectDir, '.mcp.json'), JSON.stringify({ mcpServers: { fromMcpJson: {} } }))
+    writeFile(join(FAKE_HOME_FOR_MOCK, '.claude.json'), JSON.stringify({
+      mcpServers: { 'claude_ai_homegrown': {}, 'plugin:ctx:ctx': {} },
+      projects: { [projectDir]: { mcpServers: { scoped: {} } } },
+    }))
+
+    const names = localMcpServerNames([projectDir])
+
+    expect([...names].sort()).toEqual(['claude_ai_homegrown', 'fromMcpJson', 'plugin_ctx_ctx', 'scoped'])
+  })
+
+  it('contributes no names when ~/.claude.json cannot be parsed', () => {
+    const root = makeFixtureRoot()
+    const projectDir = join(root, 'myapp')
+    mkdirSync(projectDir, { recursive: true })
+    writeFile(join(FAKE_HOME_FOR_MOCK, '.claude.json'), '{ not valid json')
+
+    expect(localMcpServerNames([projectDir]).size).toBe(0)
   })
 })
 

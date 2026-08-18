@@ -989,15 +989,66 @@ describe('connector findings and finding class', () => {
     expect(classTotals([finding!], 0.00002).fix.tokensSaved).toBe(40_000)
   })
 
-  it('treats a local server named like a connector namespace as manual only', () => {
-    // Known limitation: the namespace prefix is the only connector signal in
-    // the transcript, so a local server literally named claude_ai_* gets the
-    // manual /mcp guidance rather than a remove command. Conservative by
-    // design: CodeBurn never emits a command that could hit a connector.
+  it('treats a claude_ai_* name owned by local config as a local server', () => {
+    const finding = detectMcpToolCoverage(
+      [project(twoSessions(['claude_ai_homegrown']))],
+      undefined,
+      new Set(['claude_ai_homegrown']),
+    )
+
+    expect(finding!.fix).toEqual({
+      type: 'command',
+      label: 'Remove the underused local server, or trim its tools in your MCP config:',
+      text: "claude mcp remove 'claude_ai_homegrown'",
+    })
+    expect(finding!.apply).toEqual({ kind: 'mcp-remove', servers: ['claude_ai_homegrown'] })
+    expect(findingClass(finding!)).toBe('fix')
+    // Local config owns the name, so the finding must not claim it is a connector.
+    expect(finding!.explanation).not.toContain('is a claude.ai connector namespace')
+    // ...but the transcript cannot rule out a same-name connector.
+    expect(finding!.explanation).toContain('If you also use a claude.ai connector named claude_ai_homegrown')
+    expect(finding!.manualFollowUp?.label).toBe('Check for a same-name claude.ai connector:')
+    // The whole estimate is appliable: nothing is reserved for a connector.
+    expect(finding!.applyTokensSaved).toBeUndefined()
+    expect(classTotals([finding!], 0.00002).fix.tokensSaved).toBe(finding!.tokensSaved)
+  })
+
+  it('keeps a claude_ai_* name absent from local config a connector', () => {
+    const finding = detectMcpToolCoverage(
+      [project(twoSessions(['claude_ai_Gmail']))],
+      undefined,
+      new Set(['filesystem', 'playwright']),
+    )
+
+    expect(finding!.fix.type).toBe('paste')
+    expect(finding!.apply).toBeUndefined()
+    expect(findingClass(finding!)).toBe('nudge')
+    expect(finding!.explanation).toContain('is a claude.ai connector namespace')
+  })
+
+  it('falls back to prefix-only when no local config could be read', () => {
+    // Unreadable or absent config contributes no names, which leaves every
+    // claude_ai_* namespace on the conservative connector path.
     const finding = detectMcpToolCoverage([project(twoSessions(['claude_ai_homegrown']))])
 
     expect(finding!.fix.type).toBe('paste')
     expect(finding!.apply).toBeUndefined()
     expect(findingClass(finding!)).toBe('nudge')
+  })
+
+  it('applies the local entry and notes the connector when a name collides', () => {
+    const finding = detectMcpToolCoverage(
+      [project(twoSessions(['filesystem', 'claude_ai_Slack']))],
+      undefined,
+      new Set(['filesystem', 'claude_ai_Slack']),
+    )
+
+    // Both are local: the removal owns both entries and nothing is deferred.
+    expect(finding!.apply).toEqual({ kind: 'mcp-remove', servers: ['filesystem', 'claude_ai_Slack'] })
+    expect(finding!.applyTokensSaved).toBeUndefined()
+    expect(classTotals([finding!], 0.00002).fix.tokensSaved).toBe(40_000)
+    expect(finding!.explanation).not.toContain('is a claude.ai connector namespace')
+    expect(finding!.manualFollowUp?.text)
+      .toBe('If you also use a claude.ai connector named claude_ai_Slack, manage it with /mcp or in claude.ai Settings > Connectors.')
   })
 })
