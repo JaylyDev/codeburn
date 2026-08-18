@@ -380,22 +380,25 @@ describe('scanJsonlFile', () => {
     expect(result.userMessages).toEqual(['delegate this'])
   })
 
-  it('excludes marked sidechain calls from raw human-behavior detectors', () => {
+  it('keeps sidechain calls out of duplicate reads but in junk reads and the read:edit ratio', () => {
+    const sidechain = { sessionId: 'agent-reviewer', project: 'p1', isSidechain: true }
     const editCalls = Array.from({ length: 10 }, (_, index) => ({
-      name: 'Edit', input: { file_path: `/src/${index}.ts` },
-      sessionId: 'agent-reviewer', project: 'p1', isSidechain: true,
+      name: 'Edit', input: { file_path: `/src/${index}.ts` }, ...sidechain,
     }))
     const junkReads = Array.from({ length: 6 }, () => ({
-      name: 'Read', input: { file_path: '/app/node_modules/pkg/index.js' },
-      sessionId: 'agent-reviewer', project: 'p1', isSidechain: true,
+      name: 'Read', input: { file_path: '/app/node_modules/pkg/index.js' }, ...sidechain,
     }))
     const repeatReads = Array.from({ length: 6 }, () => ({
-      name: 'Read', input: { file_path: '/app/src/a.ts' },
-      sessionId: 'agent-reviewer', project: 'p1', isSidechain: true,
+      name: 'Read', input: { file_path: '/app/src/a.ts' }, ...sidechain,
     }))
 
-    expect(detectLowReadEditRatio(editCalls)).toBeNull()
-    expect(detectJunkReads(junkReads)).toBeNull()
+    // A subagent editing without reading, or reading into node_modules, is the
+    // same waste as the parent doing it, and the CLAUDE.md rule both suggest
+    // binds subagents too - so the full call population feeds them.
+    expect(detectLowReadEditRatio(editCalls)?.id).toBe('read-edit-ratio')
+    expect(detectJunkReads(junkReads)?.id).toBe('build-folder-reads')
+    // A re-read is only waste when the context already held the file; a
+    // sidechain starts fresh and has to read it.
     expect(detectDuplicateReads(repeatReads)).toBeNull()
   })
 

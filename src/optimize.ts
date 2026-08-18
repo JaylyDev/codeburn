@@ -958,7 +958,6 @@ export function localMcpServerNames(projectCwds: Iterable<string>, homeDir = hom
 // ============================================================================
 
 export function detectJunkReads(calls: ToolCall[], dateRange?: DateRange): WasteFinding | null {
-  calls = calls.filter(call => call.isSidechain !== true)
   const dirCounts = new Map<string, number>()
   let totalJunkReads = 0
   let recentJunkReads = 0
@@ -1009,6 +1008,10 @@ export function detectJunkReads(calls: ToolCall[], dateRange?: DateRange): Waste
 }
 
 export function detectDuplicateReads(calls: ToolCall[], dateRange?: DateRange): WasteFinding | null {
+  // A sidechain re-reading what its parent read is not a repeat: a subagent
+  // starts on a fresh context and has to read it. Junk reads and the
+  // read:edit ratio keep the full call population - that waste is waste
+  // whoever does it, and the CLAUDE.md rule they suggest binds subagents too.
   calls = calls.filter(call => call.isSidechain !== true)
   const sessionFiles = new Map<string, Map<string, { count: number; recent: number }>>()
 
@@ -2618,7 +2621,6 @@ export const EDIT_TOOL_NAMES = new Set(['Edit', 'Write', 'FileEditTool', 'FileWr
 export const BASH_TOOL_NAMES = new Set(['Bash', 'BashTool', 'PowerShellTool'])
 
 export function detectLowReadEditRatio(calls: ToolCall[]): WasteFinding | null {
-  calls = calls.filter(call => call.isSidechain !== true)
   let reads = 0
   let edits = 0
   let recentEdits = 0
