@@ -100,7 +100,7 @@ export type CachedFile = {
   // is re-parsed only when the file changes (fingerprint differs). Carries no
   // turns, so it contributes no usage. (issue #441 follow-up)
   failed?: boolean
-  // Rich-session-capture, Claude session-level (capture-only; no report yet).
+  // Rich-session-capture, Claude session-level.
   // `title` is the LAST `ai-title` entry's text; `prLinks` accumulates every
   // `pr-link` entry's URL. `isSidechain` is true when any entry is a sidechain:
   // parentUuid references an intra-file entry uuid, not another session id, so it

@@ -157,6 +157,14 @@ codeburn optimize --format json         # setup health + findings as JSON
 
 `codeburn optimize` scans your sessions and your `~/.claude/` setup for waste patterns:
 
+For Claude Code, the optimize session count, the per-session findings, coaching,
+and model-default recommendations use user-started (main) sessions. Subagent
+sidechain transcripts are excluded from that population because their delegated
+context and delivery behavior are structurally different, and so is the re-read
+finding, since a subagent starts on a fresh context. Findings about how Claude
+uses tools (junk reads, read:edit ratio) and every spend, MCP, and
+configuration-overhead finding keep counting them.
+
 - Files Claude re-reads across sessions (same content, same context, over and over)
 - Low Read:Edit ratio (editing without reading leads to retries and wasted tokens)
 - Wasted bash output (uncapped `BASH_MAX_OUTPUT_LENGTH`, trailing noise)

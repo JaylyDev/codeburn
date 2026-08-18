@@ -21,6 +21,7 @@ function largeUserLine(): string {
 function largeAssistantLine(): string {
   return JSON.stringify({
     type: 'assistant',
+    isSidechain: true,
     sessionId: 's1',
     timestamp: '2026-05-01T00:00:01Z',
     cwd: '/repo',
@@ -55,6 +56,7 @@ describe('large JSONL compact scanner', () => {
 
   it('extracts capped tool inputs needed by optimize', () => {
     const parsed = parseJsonlLine(Buffer.from(largeAssistantLine()))
+    expect(parsed?.isSidechain).toBe(true)
     const msg = parsed?.message
     expect(msg?.role).toBe('assistant')
     if (msg?.role !== 'assistant') return

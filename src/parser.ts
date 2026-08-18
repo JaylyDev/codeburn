@@ -557,7 +557,7 @@ function extractObjectFields(
   return captured
 }
 
-const LARGE_ROOT_FIELDS = ['type', 'timestamp', 'sessionId', 'cwd', 'gitBranch', 'attachment', 'message'] as const
+const LARGE_ROOT_FIELDS = ['type', 'timestamp', 'sessionId', 'cwd', 'gitBranch', 'attachment', 'message', 'isSidechain'] as const
 const LARGE_ASSISTANT_MESSAGE_FIELDS = ['model', 'usage', 'id', 'content'] as const
 
 function parseLargeJsonl(line: string | Buffer): JournalEntry | null {
@@ -571,6 +571,9 @@ function parseLargeJsonl(line: string | Buffer): JournalEntry | null {
   if (!type) return null
 
   const entry: JournalEntry = { type }
+  if (root['isSidechain']?.kind === 'scalar' && source.slice(root['isSidechain'].start, root['isSidechain'].end) === 'true') {
+    entry.isSidechain = true
+  }
   const timestamp = readJsonString(source, root['timestamp'])
   const sessionId = readJsonString(source, root['sessionId'])
   const cwd = readJsonString(source, root['cwd'])
@@ -2350,6 +2353,7 @@ async function scanProjectDirs(
     // on a resumed session) and derive the agent id from the `agent-<agentId>`
     // filename. A sidechain whose parent id was never captured stays standalone.
     if (cachedFile.isSidechain) {
+      session.isSidechain = true
       if (cachedFile.parentSessionId) session.parentSessionId = cachedFile.parentSessionId
       session.agentId = sessionId.startsWith('agent-') ? sessionId.slice('agent-'.length) : sessionId
     }
@@ -3575,6 +3579,7 @@ function carryLinkageFields(rebuilt: SessionSummary, original: SessionSummary): 
   if (original.prLinks?.length) rebuilt.prLinks = original.prLinks
   if (original.prAttributionSource) rebuilt.prAttributionSource = original.prAttributionSource
   if (original.workingDirectory) rebuilt.workingDirectory = original.workingDirectory
+  if (original.isSidechain) rebuilt.isSidechain = true
   // prRefsAtRangeStart is NOT copied here: a narrower slice needs it recomputed at
   // the new boundary (see recomputeRangeStartPrRefs), not the wide range's value.
   if (original.parentSessionId) rebuilt.parentSessionId = original.parentSessionId
