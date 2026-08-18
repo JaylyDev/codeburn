@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, readdirSync, statSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
@@ -153,6 +153,38 @@ describe('SQLite read-only parent fallback', () => {
 
     expect(readValue(dbPath)).toBe(1)
     expect(cachedDatabaseFiles()).toEqual([])
+  })
+
+  it('reads un-checkpointed WAL rows when the parent is read-only and the -shm is absent', ({ skip }) => {
+    const originDir = join(sourceRoot, 'origin')
+    mkdirSync(originDir)
+    const originPath = join(originDir, 'state.vscdb')
+    const writer = new NativeDatabase(originPath)
+    writer.exec('PRAGMA journal_mode=WAL')
+    writer.exec('CREATE TABLE values_table (c INTEGER)')
+    writer.prepare('INSERT INTO values_table (c) VALUES (?)').run(1)
+    writer.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    writer.exec('PRAGMA wal_autocheckpoint=0')
+    writer.prepare('INSERT INTO values_table (c) VALUES (?)').run(2)
+
+    // A database copied off a live source (snapshot, rsync, unclean unmount) keeps
+    // its -wal but not its -shm. SQLite reports that as SQLITE_CANTOPEN, not
+    // SQLITE_READONLY, and the un-checkpointed row lives only in the -wal.
+    const dbPath = join(sourceRoot, 'state.vscdb')
+    copyFileSync(originPath, dbPath)
+    copyFileSync(originPath + '-wal', dbPath + '-wal')
+    writer.close()
+    expect(existsSync(dbPath + '-shm')).toBe(false)
+    if (!makeSourceParentReadOnly(skip)) return
+
+    const db = openDatabase(dbPath)
+    try {
+      expect(db.query<{ c: number }>('SELECT c FROM values_table ORDER BY c')).toEqual([{ c: 1 }, { c: 2 }])
+    } finally {
+      db.close()
+    }
+    expect(existsSync(dbPath + '-shm')).toBe(false)
+    expect(cachedDatabaseFiles()).toHaveLength(1)
   })
 
   it('reuses an unchanged fallback copy instead of copying the database again', ({ skip }) => {

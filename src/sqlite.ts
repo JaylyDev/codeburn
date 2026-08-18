@@ -142,6 +142,16 @@ export function isSqliteReadonlyError(err: unknown): boolean {
   )
 }
 
+/// A read-only parent reports SQLITE_READONLY_DIRECTORY when it must create the
+/// sidecars from scratch, but SQLITE_CANTOPEN when a `-wal` is present and the
+/// `-shm` it needs to index it is not. openReadonlyCache re-throws the original
+/// error when the database itself is missing, which is the other CANTOPEN.
+function isSqliteSidecarError(err: unknown): boolean {
+  if (isSqliteReadonlyError(err)) return true
+  const errcode = (err as { errcode?: unknown } | null)?.errcode
+  return typeof errcode === 'number' && (errcode & 0xff) === 14
+}
+
 type DatabaseFingerprint = {
   dev: number
   ino: number
@@ -268,13 +278,11 @@ function readOnlyCachePath(sourcePath: string, fingerprint: DatabaseFingerprint)
 
   const tempBase = `${cachePath}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`
   const tempWal = tempBase + '-wal'
-  const tempShm = tempBase + '-shm'
   const tempMetadata = `${metadataPath}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`
 
   try {
     copyFileSync(sourcePath, tempBase)
     const copiedWal = copyOptionalFile(sourcePath + '-wal', tempWal)
-    const copiedShm = copyOptionalFile(sourcePath + '-shm', tempShm)
 
     // Do not publish a cache made from a moving database. A live WAL writer will
     // normally make the direct open succeed once its sidecars exist; this check
@@ -288,7 +296,6 @@ function readOnlyCachePath(sourcePath: string, fingerprint: DatabaseFingerprint)
     unlinkIfPresent(cachePath + '-shm')
     renameSync(tempBase, cachePath)
     if (copiedWal) renameSync(tempWal, cachePath + '-wal')
-    if (copiedShm) renameSync(tempShm, cachePath + '-shm')
 
     const metadata: { version: number; sourcePath: string; fingerprint: DatabaseFingerprint } = {
       version: SQLITE_CACHE_VERSION,
@@ -301,7 +308,6 @@ function readOnlyCachePath(sourcePath: string, fingerprint: DatabaseFingerprint)
   } finally {
     unlinkIfPresent(tempBase)
     unlinkIfPresent(tempWal)
-    unlinkIfPresent(tempShm)
     unlinkIfPresent(tempMetadata)
   }
 }
@@ -331,10 +337,10 @@ export function openDatabase(path: string): SqliteDatabase {
   try {
     db = new DatabaseSync(path, { readOnly: true })
   } catch (err) {
-    if (!isSqliteReadonlyError(err)) throw err
+    if (!isSqliteSidecarError(err)) throw err
     fallbackUsed = true
-    warnSqliteReadonlyOnce(path)
     db = openReadonlyCache(path, err)
+    warnSqliteReadonlyOnce(path)
   }
   try {
     db.exec?.('PRAGMA busy_timeout = 1000')
@@ -347,16 +353,16 @@ export function openDatabase(path: string): SqliteDatabase {
       try {
         return db.prepare(sql).all(...params) as T[]
       } catch (err) {
-        if (!isSqliteReadonlyError(err)) throw err
+        if (!isSqliteSidecarError(err)) throw err
         if (fallbackUsed) throw err
         fallbackUsed = true
-        warnSqliteReadonlyOnce(path)
         try {
           db.close()
         } catch {
           // The failed connection may already have been closed by node:sqlite.
         }
         db = openReadonlyCache(path, err)
+        warnSqliteReadonlyOnce(path)
         try {
           db.exec?.('PRAGMA busy_timeout = 1000')
         } catch {
