@@ -1,7 +1,8 @@
 import { homedir } from 'os'
+import { EventEmitter } from 'node:events'
 
-import React, { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
-import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, type DOMElement } from 'ink'
+import React, { Fragment, useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
+import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, type DOMElement, type Instance, type RenderOptions } from 'ink'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost, formatTokens, markEstimated, carriedCostNote } from './format.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
@@ -10,7 +11,8 @@ import { findUnpricedModels, isExpectedFreeModel, loadPricing } from './models.j
 import { aggregateModelTotals } from './model-breakdown.js'
 import { buildDurablePeriod } from './usage-aggregator.js'
 import { getAllProviders } from './providers/index.js'
-import { scanAndDetect, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
+import { classHeaderLine, classTotals, findingBasis, findingClass, scanAndDetect, type FindingClass, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
+import { appliedFixGlyph, formatAppliedFix, type AppliedFix } from './act/types.js'
 import { aggregateFileChurn, buildCoachingNotes, computePricingCoverage, medianTimeToFirstEditMs, scanUserCorrections, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 import { estimateContextBudget, type ContextBudget } from './context-budget.js'
 import { dateKey } from './day-aggregator.js'
@@ -30,6 +32,138 @@ export type DailyActivityRow = {
 
 export const DAILY_ACTIVITY_PAGE_SIZE = 10
 export const INTERACTIVE_RENDER_OPTIONS = { alternateScreen: true } as const
+export const RESIZE_DEBOUNCE_MS = 150
+
+export type TerminalSize = { columns: number; rows: number }
+export type DebouncedResizeStream = NodeJS.WriteStream & {
+  dispose(): void
+  onSettledResize(listener: (size: TerminalSize) => void): () => void
+}
+
+function normalizeTerminalDimension(value: number | undefined, fallback: number): number {
+  return Number.isFinite(value) && value! > 0 ? Math.floor(value!) : fallback
+}
+
+function terminalSizeOf(source: NodeJS.WriteStream): TerminalSize {
+  return {
+    columns: normalizeTerminalDimension(source.columns, 80),
+    rows: normalizeTerminalDimension(source.rows, 24),
+  }
+}
+
+const RESIZE_LISTENER_METHODS = new Set<PropertyKey>([
+  'addListener', 'on', 'once', 'prependListener', 'prependOnceListener', 'off', 'removeListener',
+])
+
+export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs: number): DebouncedResizeStream {
+  let resizeTimer: ReturnType<typeof setTimeout> | undefined
+  let disposed = false
+  let { columns, rows } = terminalSizeOf(source)
+  const resizeEvents = new EventEmitter()
+  const settledResizeListeners = new Set<(size: TerminalSize) => void>()
+
+  const resize = () => {
+    if (disposed) return
+    if (resizeTimer) clearTimeout(resizeTimer)
+    resizeTimer = setTimeout(() => {
+      resizeTimer = undefined
+      if (disposed) return
+      const next = terminalSizeOf(source)
+      const changed = next.columns !== columns || next.rows !== rows
+      columns = next.columns
+      rows = next.rows
+      if (!changed) return
+      // Rerender first so the settled view owns the first paint at the new
+      // size; then notify Ink/useWindowSize. Writes are never intercepted, so
+      // a mid-burst state update still reaches the terminal even when net
+      // size is unchanged.
+      for (const listener of [...settledResizeListeners]) listener(next)
+      resizeEvents.emit('resize')
+    }, delayMs)
+  }
+  source.on('resize', resize)
+
+  const dispose = () => {
+    if (disposed) return
+    disposed = true
+    source.off('resize', resize)
+    if (resizeTimer) clearTimeout(resizeTimer)
+    resizeTimer = undefined
+    resizeEvents.removeAllListeners()
+    settledResizeListeners.clear()
+  }
+
+  const stream = new Proxy(source as DebouncedResizeStream, {
+    get(target, property) {
+      if (property === 'dispose') return dispose
+      if (property === 'onSettledResize') {
+        return (listener: (size: TerminalSize) => void) => {
+          if (disposed) return () => {}
+          settledResizeListeners.add(listener)
+          return () => settledResizeListeners.delete(listener)
+        }
+      }
+      if (property === 'columns') return columns
+      if (property === 'rows') return rows
+      if (RESIZE_LISTENER_METHODS.has(property)) {
+        return (event: string | symbol, ...args: unknown[]) => {
+          if (event === 'resize') {
+            if (!disposed) {
+              Reflect.apply(Reflect.get(resizeEvents, property) as (...args: unknown[]) => unknown, resizeEvents, [event, ...args])
+            }
+            return stream
+          }
+          Reflect.apply(Reflect.get(target, property, target) as (...args: unknown[]) => unknown, target, [event, ...args])
+          return stream
+        }
+      }
+      const value = Reflect.get(target, property, target)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+  return stream
+}
+
+function DisposeOnUnmount({ dispose, children }: { dispose: () => void; children: React.ReactNode }) {
+  useLayoutEffect(() => dispose, [dispose])
+  return children
+}
+
+export type DebouncedInteractiveInstance = Instance & {
+  dispose(): void
+  stdout: DebouncedResizeStream
+}
+
+export function renderDebouncedInteractive(
+  source: NodeJS.WriteStream,
+  view: (size: TerminalSize) => React.ReactElement,
+  options: Omit<RenderOptions, 'stdout'> = INTERACTIVE_RENDER_OPTIONS,
+): DebouncedInteractiveInstance {
+  const stdout = createDebouncedResizeStream(source, RESIZE_DEBOUNCE_MS)
+  let size = { columns: stdout.columns, rows: stdout.rows }
+  let unsubscribe = () => {}
+  let disposed = false
+  const dispose = () => {
+    if (disposed) return
+    disposed = true
+    unsubscribe()
+    stdout.dispose()
+  }
+  const dashboard = () => <DisposeOnUnmount dispose={dispose}>{view(size)}</DisposeOnUnmount>
+  let app: Instance
+  try {
+    app = render(dashboard(), { ...options, stdout })
+  } catch (error) {
+    dispose()
+    throw error
+  }
+  unsubscribe = stdout.onSettledResize(nextSize => {
+    if (disposed) return
+    size = nextSize
+    app.rerender(dashboard())
+  })
+  return Object.assign(app, { dispose, stdout })
+}
 
 export function getDailyActivityPageSize(columnCount: 1 | 2 | 3, projectRows: number, activityRows: number, dayMode = false): number {
   if (dayMode) return 1
@@ -652,8 +786,10 @@ function ModelBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: 
         )
       })}
       {unpriced.length > 0 && (
-        <Text color="yellow" wrap="truncate-end">
-          {`! ${unpriced.length} model${unpriced.length === 1 ? '' : 's'} unpriced at $0, fix: codeburn model-alias (${unpriced.slice(0, 2).map(u => u.model).join(', ')}${unpriced.length > 2 ? ', ...' : ''})`}
+        <Text color="yellow" wrap={pw <= 44 ? 'wrap' : 'truncate-end'}>
+          {pw <= 44
+            ? `! ${unpriced.length}: codeburn models --unpriced`
+            : `! ${unpriced.length} unpriced: codeburn models --unpriced`}
         </Text>
       )}
       {anyEstimated && (
@@ -1046,6 +1182,8 @@ function actionDestinationHeader(action: WasteAction): string {
           return '── Ask Claude in the current session '.padEnd(64, '─')
         case 'shell-config':
           return '── Add to your shell config '.padEnd(64, '─')
+        case 'manual':
+          return '── Manual action '.padEnd(64, '─')
         default:
           return '── Suggested action '.padEnd(64, '─')
       }
@@ -1079,7 +1217,7 @@ function FindingPanel({ index, finding, costRate, width }: { index: number; find
         {trendBadge && <Text color="#5BF5A0">{trendBadge}</Text>}
       </Text>
       <Text dimColor wrap="wrap">{finding.explanation}</Text>
-      <Text color={GOLD}>Savings: ~{formatTokens(finding.tokensSaved)} tokens (~{formatCost(costSaved)})</Text>
+      <Text color={GOLD}>Savings: ~{formatTokens(finding.tokensSaved)} tokens (~{formatCost(costSaved)})<Text dimColor>  {findingBasis(finding)}</Text></Text>
       <Text> </Text>
       <FindingAction action={finding.fix} />
     </Box>
@@ -1094,7 +1232,14 @@ const GRADE_COLORS: Record<string, string> = { A: '#5BF5A0', B: '#5BF5A0', C: GO
 // off the alt-buffer top and the user couldn't see the StatusBar at all.
 const FINDINGS_WINDOW_SIZE = 3
 
-function OptimizeView({ findings, costRate, projects, label, width, healthScore, healthGrade, cursor }: { findings: WasteFinding[]; costRate: number; projects: ProjectSummary[]; label: string; width: number; healthScore: number; healthGrade: string; cursor: number }) {
+const APPLIED_FIX_COLORS: Record<AppliedFix['verdict'], string> = {
+  worked: '#5BF5A0',
+  partial: GOLD,
+  'no-effect': '#F55B5B',
+  pending: DIM,
+}
+
+function OptimizeView({ findings, costRate, projects, label, width, healthScore, healthGrade, cursor, appliedFixes = [] }: { findings: WasteFinding[]; costRate: number; projects: ProjectSummary[]; label: string; width: number; healthScore: number; healthGrade: string; cursor: number; appliedFixes?: AppliedFix[] }) {
   const periodCost = projects.reduce((s, p) => s + p.totalCostUSD, 0)
   const totalTokens = findings.reduce((s, f) => s + f.tokensSaved, 0)
   const totalCost = totalTokens * costRate
@@ -1105,6 +1250,7 @@ function OptimizeView({ findings, costRate, projects, label, width, healthScore,
   const start = total === 0 ? 0 : Math.min(cursor, Math.max(0, total - FINDINGS_WINDOW_SIZE))
   const end = Math.min(start + FINDINGS_WINDOW_SIZE, total)
   const visible = findings.slice(start, end)
+  const totals = classTotals(findings, costRate)
   return (
     <Box flexDirection="column" width={width}>
       <Box flexDirection="column" borderStyle="round" borderColor={ORANGE} paddingX={1} width={width}>
@@ -1119,8 +1265,28 @@ function OptimizeView({ findings, costRate, projects, label, width, healthScore,
           <Text dimColor>Showing {start + 1}–{end} of {total} · j/k to scroll</Text>
         )}
       </Box>
-      {visible.map((f, i) => <FindingPanel key={start + i} index={start + i + 1} finding={f} costRate={costRate} width={width} />)}
-      <Box paddingX={1} width={width}><Text dimColor>Token estimates are approximate.</Text></Box>
+      {visible.map((f, i) => {
+        // Findings arrive class-sorted, so a header goes in wherever the class
+        // changes (including the top of the window after paging).
+        const cls = findingClass(f)
+        const previous: FindingClass | null = i > 0 ? findingClass(visible[i - 1]!) : null
+        return (
+          <Fragment key={start + i}>
+            {cls !== previous && <Box paddingX={1} width={width}><Text bold color={ORANGE} wrap="truncate-end">{classHeaderLine(cls, totals[cls], costRate)}</Text></Box>}
+            <FindingPanel index={start + i + 1} finding={f} costRate={costRate} width={width} />
+          </Fragment>
+        )
+      })}
+      {appliedFixes.length > 0 && (
+        <Box flexDirection="column" paddingX={1} width={width}>
+          <Text bold color={ORANGE} wrap="truncate-end">Applied fixes</Text>
+          {appliedFixes.map(fix => (
+            <Text key={fix.id} color={APPLIED_FIX_COLORS[fix.verdict]} wrap="truncate-end">
+              {appliedFixGlyph(fix)} {formatAppliedFix(fix)}
+            </Text>
+          ))}
+        </Box>
+      )}
     </Box>
   )
 }
@@ -1302,6 +1468,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   const [detectedProviders, setDetectedProviders] = useState<string[]>([])
   const [view, setView] = useState<View>('dashboard')
   const [optimizeResult, setOptimizeResult] = useState<OptimizeResult | null>(null)
+  const [appliedFixes, setAppliedFixes] = useState<AppliedFix[]>([])
   const [optimizeLoading, setOptimizeLoading] = useState(false)
   const [projectBudgets, setProjectBudgets] = useState<Map<string, ContextBudget>>(new Map())
   const [planUsages, setPlanUsages] = useState<PlanUsage[]>(initialPlanUsages ?? [])
@@ -1460,14 +1627,20 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
     const generation = reloadGenerationRef.current
     setOptimizeLoading(true)
     try {
-      const result = await scanAndDetect(projects, currentRange())
+      const result = await scanAndDetect(projects, currentRange(), activeProvider)
       if (reloadGenerationRef.current === generation) setOptimizeResult(result)
+      // Best effort: a bad journal never keeps the findings off screen.
+      try {
+        const { computeActReport } = await import('./act/report.js')
+        const applied = await computeActReport()
+        if (reloadGenerationRef.current === generation) setAppliedFixes(applied.appliedFixes)
+      } catch { /* the applied section is optional */ }
     } catch (error) {
       console.error(error)
     } finally {
       if (reloadGenerationRef.current === generation) setOptimizeLoading(false)
     }
-  }, [optimizeAvailable, projects, currentRange, optimizeLoading, optimizeResult])
+  }, [optimizeAvailable, projects, currentRange, optimizeLoading, optimizeResult, activeProvider])
 
   useEffect(() => {
     const refreshIntervalMs = getRefreshIntervalMs(refreshSeconds ?? 0)
@@ -1626,7 +1799,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
         {view === 'compare'
           ? <CompareView projects={projects} onBack={() => setView('dashboard')} />
           : view === 'optimize' && optimizeResult
-            ? <OptimizeView findings={optimizeResult.findings} costRate={optimizeResult.costRate} projects={projects} label={headerLabel} width={dashWidth} healthScore={optimizeResult.healthScore} healthGrade={optimizeResult.healthGrade} cursor={findingsCursor} />
+            ? <OptimizeView findings={optimizeResult.findings} costRate={optimizeResult.costRate} projects={projects} label={headerLabel} width={dashWidth} healthScore={optimizeResult.healthScore} healthGrade={optimizeResult.healthGrade} cursor={findingsCursor} appliedFixes={appliedFixes} />
             : <DashboardContent projects={projects} period={period} columns={columns} maxContentWidth={maxContentWidth} activeProvider={activeProvider} budgets={projectBudgets} planUsages={planUsages} label={headerLabel} dayMode={isDayMode} dailyHistoryProjects={dailyHistoryProjects} dailyHistoryPageSize={dailyHistoryPageSize} scrollableDailyHistory={scrollableDailyHistory} dailyHistoryCursor={Math.min(dailyHistoryCursor, dailyHistoryMaxCursor)} durable={durable} />}
         {coachingNote && (
           <Box width={dashWidth} paddingX={1}>
@@ -1698,23 +1871,13 @@ export async function renderDashboard(period: Period = 'week', provider: string 
   const label = initialDay ? formatDayRangeLabel(initialDay) : customRangeLabel
   patchStdoutForWindows()
   if (isTTY) {
-    let windowColumns = process.stdout.columns
-    const dashboard = () => (
-      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={period} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={windowColumns} />
-    )
-    const app = render(
-      dashboard(),
-      INTERACTIVE_RENDER_OPTIONS,
-    )
-    const resize = () => {
-      windowColumns = process.stdout.columns
-      app.rerender(dashboard())
-    }
-    process.stdout.prependListener('resize', resize)
+    const app = renderDebouncedInteractive(process.stdout, ({ columns }) => (
+      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={period} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={columns} />
+    ))
     try {
       await app.waitUntilExit()
     } finally {
-      process.stdout.off('resize', resize)
+      app.dispose()
     }
   } else {
     const { unmount } = render(<StaticDashboard projects={filteredProjects} period={period} activeProvider={provider} planUsages={planUsages} label={label} dayMode={initialDay != null} durable={initialDurable} />, { patchConsole: false })

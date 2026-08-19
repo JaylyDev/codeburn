@@ -99,9 +99,14 @@ enum ClaudeSubscriptionService {
     }
 
     /// Reset everything — used on user-initiated disconnect.
-    static func disconnect() {
-        ClaudeCredentialStore.resetBootstrap()
-        clearUsageBlock()
+    /// Returns the delete outcome so callers only tear down UI state once the
+    /// credential material is actually gone. A failed delete leaves the usage
+    /// block intact too, so a retry starts from the same state.
+    @discardableResult
+    static func disconnect() -> ClaudeCredentialStore.CacheDeleteResult {
+        let result = ClaudeCredentialStore.resetBootstrap()
+        if result.isSuccess { clearUsageBlock() }
+        return result
     }
 
     // MARK: - Internal

@@ -2,7 +2,16 @@ import { readdir } from 'fs/promises'
 import { join } from 'path'
 
 import { calculateCost } from '../models.js'
-import { isSqliteAvailable, getSqliteLoadError, openDatabase, blobToText, isSqliteBusyError, type SqliteDatabase } from '../sqlite.js'
+import {
+  isSqliteAvailable,
+  getSqliteLoadError,
+  openDatabase,
+  blobToText,
+  isSqliteBusyError,
+  isSqliteReadonlyError,
+  warnSqliteReadonlyOnce,
+  type SqliteDatabase,
+} from '../sqlite.js'
 import { buildAssistantCall, parseTimestamp, sanitize, type MessageData, type PartData } from './session-message.js'
 import type {
   SessionSource,
@@ -310,7 +319,8 @@ export async function discoverSqliteSessions(
     let db: SqliteDatabase
     try {
       db = openDatabase(dbPath)
-    } catch {
+    } catch (err) {
+      if (isSqliteReadonlyError(err)) warnSqliteReadonlyOnce(dbPath)
       continue
     }
 

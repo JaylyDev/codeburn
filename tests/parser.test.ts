@@ -24,6 +24,7 @@ import type { SessionSource, SessionParser, ParsedProviderCall } from '../src/pr
 let _synthSources: SessionSource[] = []
 let _synthDurable = false
 let _synthYields: ParsedProviderCall[] = []
+let _synthParseCalls = 0
 let _synthOnParse: (() => void | Promise<void>) | null = null
 
 vi.mock('../src/providers/index.js', async (importOriginal) => {
@@ -54,6 +55,7 @@ vi.mock('../src/providers/index.js', async (importOriginal) => {
           createSessionParser(_s: SessionSource, _k: Set<string>): SessionParser {
             return {
               async *parse(): AsyncGenerator<ParsedProviderCall> {
+                _synthParseCalls++
                 await _synthOnParse?.()
                 for (const call of _synthYields) {
                   // Respect seenKeys so that when multiple sources share the same
@@ -193,6 +195,7 @@ beforeEach(async () => {
   _synthSources = []
   _synthDurable = false
   _synthYields  = []
+  _synthParseCalls = 0
   _synthOnParse = null
 })
 
@@ -360,7 +363,7 @@ describe('(d) non-durable provider evicts deleted sources', () => {
 // (e) 90-day age-out: orphan ≥ 91d old is pruned; ≤ 89d is retained
 // ═══════════════════════════════════════════════════════════════════════════
 describe('(e) 90-day age-out for durable providers', () => {
-  it('prunes an orphaned cache entry whose newest call is 91 days old', async () => {
+  it('keeps a discovered 91-day source persisted until discovery removes it', async () => {
     const synthFile = join(tmpHome, 'synth-age.txt')
     await writeFile(synthFile, 'placeholder')
 
@@ -380,15 +383,76 @@ describe('(e) 90-day age-out for durable providers', () => {
       userMessage: 'old', sessionId: 'synth-old',
     }]
 
-    // First parse: cached with 91d-old timestamp → immediately pruned by 90-day check
+    // First refresh: a still-discovered durable source is live and persisted,
+    // regardless of the age of its newest call.
     const proj1 = await parseAllSessions(undefined, 'test-synthetic')
-    expect(totalOutput(proj1)).toBe(0)  // pruned right away
+    expect.soft(totalOutput(proj1)).toBe(8)
+    expect.soft(_synthParseCalls).toBe(1)
 
-    // Confirm: entry is not in the persistent cache after first parse
+    const cache1 = await loadCache()
+    const persisted1 = cache1.providers['test-synthetic']?.files[synthFile]
+    expect.soft(persisted1).toBeDefined()
+
+    // Second refresh: force the public seam through the persisted cache. The
+    // unchanged fingerprint must serve the cached parse without invoking the
+    // provider parser again.
     clearSessionCache()
-    _synthSources = []  // no longer discovered
     const proj2 = await parseAllSessions(undefined, 'test-synthetic')
-    expect(totalOutput(proj2)).toBe(0)
+    expect.soft(totalOutput(proj2)).toBe(8)
+    expect.soft(_synthParseCalls).toBe(1)
+
+    const cache2 = await loadCache()
+    expect.soft(cache2.providers['test-synthetic']?.files[synthFile]?.fingerprint)
+      .toEqual(persisted1?.fingerprint)
+
+    // Third refresh: once discovery removes the old source, it becomes an
+    // orphan and the durable 90-day age-out prunes it from results and disk.
+    clearSessionCache()
+    _synthSources = []
+    const proj3 = await parseAllSessions(undefined, 'test-synthetic')
+    expect.soft(totalOutput(proj3)).toBe(0)
+
+    const cache3 = await loadCache()
+    expect.soft(cache3.providers['test-synthetic']?.files[synthFile]).toBeUndefined()
+  })
+
+  it('keeps a discovered 91-day source through a month-scoped refresh', async () => {
+    const synthFile = join(tmpHome, 'synth-scoped.txt')
+    await writeFile(synthFile, 'placeholder')
+
+    const ts91dAgo = new Date(Date.now() - 91 * 24 * 60 * 60 * 1000).toISOString()
+
+    _synthDurable = true
+    _synthSources = [{ path: synthFile, project: 'test', provider: 'test-synthetic' }]
+    _synthYields  = [{
+      provider: 'test-synthetic', model: 'gpt-4o',
+      inputTokens: 10, outputTokens: 8,
+      cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0,
+      costUSD: 0.002, tools: [], bashCommands: [],
+      timestamp: ts91dAgo,
+      speed: 'standard',
+      deduplicationKey: 'synth-age-out-91d-scoped',
+      userMessage: 'old', sessionId: 'synth-old-scoped',
+    }]
+
+    expect.soft(totalOutput(await parseAllSessions(undefined, 'test-synthetic'))).toBe(8)
+
+    // A today-ranged refresh loads under a month scope that excludes the entry's
+    // shard. Durable providers are never scoped, so the age-out still sees the
+    // entry as discovered and the save must carry its month across intact.
+    clearSessionCache()
+    const today = new Date()
+    const start = new Date(today); start.setHours(0, 0, 0, 0)
+    const end   = new Date(today); end.setHours(23, 59, 59, 999)
+    expect.soft(totalOutput(await parseAllSessions({ start, end }, 'test-synthetic'))).toBe(0)
+
+    clearSessionCache()
+    expect.soft(totalOutput(await parseAllSessions(undefined, 'test-synthetic'))).toBe(8)
+    expect.soft(_synthParseCalls).toBe(1)
+
+    const cache = await loadCache()
+    expect.soft(cache.providers['test-synthetic']?.files[synthFile]).toBeDefined()
   })
 
   it('retains an orphaned cache entry whose newest call is 89 days old', async () => {
