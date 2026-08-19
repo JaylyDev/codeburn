@@ -37,6 +37,10 @@ jobs:
       # tests spawn deliberately. Quarantined (reports, never gates): the process
       # suite still races its own takeover window even serially on slow runners -
       # tracked in #904; drop continue-on-error once that race is settled.
+      # Step-level timeout so a stalled lock suite fails soft here instead of
+      # tripping the job's 15-minute budget, which kills the whole job as
+      # "cancelled" and hides the parallel suite's green result.
       - name: Cache-lock suite (serial, quarantined)
         continue-on-error: true
+        timeout-minutes: 5
         run: npm run test:locks
