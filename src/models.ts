@@ -231,6 +231,7 @@ export async function loadPricing(): Promise<void> {
     pricingCache = mergeSnapshotFallbacks(cached)
     sortedPricingKeys = null
     lowercasePricingIndex = null
+    knownNamespaces = null
     return
   }
 
@@ -238,6 +239,7 @@ export async function loadPricing(): Promise<void> {
     pricingCache = mergeSnapshotFallbacks(await fetchAndCachePricing())
     sortedPricingKeys = null
     lowercasePricingIndex = null
+    knownNamespaces = null
   } catch {
     // snapshot already loaded at init; nothing more to do
   }
@@ -245,8 +247,8 @@ export async function loadPricing(): Promise<void> {
 
 // Known model name variants that providers emit but LiteLLM/fallback don't index under.
 // OMP emits 'anthropic--claude-4.6-opus' (double-dash, dot version, tier-last).
-// getCanonicalName strips any 'provider/' prefix first, so only the post-strip
-// forms need to be listed here.
+// getCanonicalName strips a KNOWN vendor/router prefix first, so only the
+// post-strip forms need to be listed here.
 const BUILTIN_ALIASES: Record<string, string> = {
   'anthropic--claude-4.6-opus':    'claude-opus-4-6',
   'anthropic--claude-4.6-sonnet':  'claude-sonnet-4-6',
@@ -610,22 +612,46 @@ function getCanonicalName(model: string): string {
   )
 }
 
-// Only these first path segments are vendor/router identity. An unknown
-// `provider/model` must stay unpriced — do not treat `/` as authority.
-const KNOWN_NAMESPACES = new Set([
-  'anthropic', 'openai', 'azure', 'azure_ai', 'openrouter', 'google',
-  'gemini', 'vertex_ai', 'bedrock', 'xiaomi', 'deepseek', 'moonshot',
-  'minimax', 'mistral', 'meta-llama', 'meta', 'cohere', 'together_ai',
-  'groq', 'fireworks_ai', 'xai', 'databricks', 'snowflake', 'novita',
-  'nvidia', 'cerebras', 'kimi', 'alibaba', 'dashscope', 'z-ai',
+// Namespaces the pricing catalog itself uses, plus the ones below. An unknown
+// `provider/model` must stay unpriced — do not treat `/` as authority. Derived
+// rather than hand-listed so a vendor LiteLLM already knows (`x-ai/`, `qwen/`,
+// `nousresearch/`, …) is never dropped by a stale list.
+const EXTRA_NAMESPACES = [
+  // Routing wrappers (see ROUTER_PREFIXES); no catalog lists them.
   'cp', 'cline-pass', 'cline-free', 'cmd', 'antigravity',
-])
+  // LiteLLM route prefixes that never appear as a key prefix.
+  'litellm_proxy', 'openai_like',
+  // Vendor spellings the catalog indexes under another name: `zhipu` is `z-ai`,
+  // `mimo` is `xiaomi` (BUILTIN_ALIASES maps the bare MiMo ids to `xiaomi/`),
+  // and `kimi/` is a client-side prefix (Codex records `kimi/k3[1m]`).
+  'zhipu', 'mimo', 'kimi',
+]
+
+// Local runners. Their catalog rows are $0 stubs, so an unlisted local tag must
+// not strip down to a priced cloud row and invent spend (#968).
+const LOCAL_NAMESPACES = ['ollama']
+
+let knownNamespaces: Set<string> | null = null
+
+function getKnownNamespaces(): Set<string> {
+  if (knownNamespaces) return knownNamespaces
+  const set = new Set(EXTRA_NAMESPACES)
+  for (const keys of [pricingCache.keys(), fallbackCosts.keys()]) {
+    for (const key of keys) {
+      const idx = key.indexOf('/')
+      if (idx > 0) set.add(key.slice(0, idx).toLowerCase())
+    }
+  }
+  for (const local of LOCAL_NAMESPACES) set.delete(local)
+  knownNamespaces = set
+  return set
+}
 
 function stripKnownFirstNamespace(model: string): string {
   const idx = model.indexOf('/')
   if (idx <= 0) return model
   const head = model.slice(0, idx).toLowerCase()
-  if (KNOWN_NAMESPACES.has(head)) return model.slice(idx + 1)
+  if (getKnownNamespaces().has(head)) return model.slice(idx + 1)
   return model
 }
 
@@ -638,7 +664,9 @@ const ROUTER_PREFIXES = [
   /^cline-free\//i,
   /^cmd\//i,
   /^antigravity\//i,
-  /^xiaomi\//i,
+  // `xiaomi/` is NOT peeled: it is the vendor namespace LiteLLM prices under,
+  // and BUILTIN_ALIASES maps the bare MiMo ids INTO it. Peeling would pull the
+  // opposite way. It stays a known namespace via the catalog-derived set.
 ]
 
 function routedModelCandidates(model: string): string[] {
@@ -703,6 +731,10 @@ export function getModelCosts(model: string): ModelCosts | null {
 
   for (const candidate of routedModelCandidates(model)) {
     const aliased = resolveAlias(candidate)
+    // A user's declared price for the bare id must win over the catalog row a
+    // routed spelling of it would otherwise hit.
+    const candidateOverride = getPriceOverrideExact(candidate, aliased)
+    if (candidateOverride) return candidateOverride
     if (pricingCache.has(aliased)) return pricingCache.get(aliased)!
     if (pricingCache.has(candidate)) return pricingCache.get(candidate)!
   }
@@ -1055,7 +1087,11 @@ function deriveClaudeShortName(canonical: string): string | undefined {
 
 export function getShortModelName(model: string): string {
   if (autoModelNames[model]) return autoModelNames[model]
-  const canonical = resolveAlias(getCanonicalName(model))
+  // Before aliasing: `glm-5.3` prices via the `glm-5p2` sibling, so resolving
+  // first would label a namespaced GLM-5.3 as "GLM-5.2".
+  const stripped = getCanonicalName(model)
+  if (autoModelNames[stripped]) return autoModelNames[stripped]
+  const canonical = resolveAlias(stripped)
   const claude = deriveClaudeShortName(canonical)
   if (claude) return claude
   for (const [key, name] of SORTED_SHORT_NAMES) {
@@ -1102,6 +1138,7 @@ export function restorePricingState(snapshot: PricingSnapshot): void {
   pricingCache = snapshot.pricing
   sortedPricingKeys = null
   lowercasePricingIndex = null
+  knownNamespaces = null
   setModelAliases(snapshot.aliases)
   setPriceOverrides(snapshot.priceOverrides)
   setLocalModelSavings(snapshot.localModelSavings)
