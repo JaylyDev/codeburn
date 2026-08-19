@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 /// Serializes credential-store test harnesses that mutate process-wide seams.
@@ -21,6 +22,9 @@ enum KeychainCredentialCacheError: Error, LocalizedError, Equatable {
     case readFailed(service: String, status: OSStatus)
     case writeFailed(service: String, status: OSStatus)
     case deleteFailed(service: String, status: OSStatus)
+    /// Keychain is locked or consent was refused. Transient — callers keep the
+    /// last known token and must not treat it as "the item is gone".
+    case unavailable(service: String, status: OSStatus)
 
     var errorDescription: String? {
         switch self {
@@ -30,12 +34,30 @@ enum KeychainCredentialCacheError: Error, LocalizedError, Equatable {
             return "Keychain write failed for \(service) (status \(status))."
         case let .deleteFailed(service, status):
             return "Keychain delete failed for \(service) (status \(status))."
+        case .unavailable:
+            return "Keychain unavailable — unlock your login keychain to refresh quota."
         }
+    }
+
+    /// Statuses that mean "we were not allowed to look right now", as opposed to
+    /// "the item does not exist". `errSecInteractionNotAllowed` (-25308) is what
+    /// a locked keychain returns once UI is suppressed.
+    static func isUnavailable(_ status: OSStatus) -> Bool {
+        status == errSecInteractionNotAllowed
+            || status == errSecAuthFailed
+            || status == errSecUserCanceled
+            || status == errSecInteractionRequired
     }
 }
 
 /// Published CodeBurn Keychain identities. Keep these exact — Electron contracts
-/// on the Codex pair, and historical items use the same names.
+/// on the Codex pair (`app/electron/quota/codex.ts`), and installs going back to
+/// May 2026 already hold items under these names.
+///
+/// Deliberately NOT derived from `CFBundleIdentifier`: the Electron app hardcodes
+/// the same strings, so a per-bundle suffix would break that contract. The
+/// tradeoff is that a dev/beta build sharing this source shares the item — patch
+/// these constants when running a second build alongside the release.
 enum CodeBurnKeychainIdentity {
     static let claudeService = "org.agentseal.codeburn.menubar.claude.oauth.v1"
     static let codexService = "org.agentseal.codeburn.menubar.codex.oauth.v1"
@@ -43,17 +65,53 @@ enum CodeBurnKeychainIdentity {
 }
 
 struct LiveKeychainCredentialCache: KeychainCredentialCaching {
+    /// True when the default (login) keychain exists and is currently locked.
+    /// Returns false when the state cannot be determined, so an unexpected
+    /// failure degrades to "just try the read" rather than a hard outage.
+    ///
+    /// `SecKeychain*` is soft-deprecated with no replacement that reports
+    /// file-keychain lock state — `kSecUseDataProtectionKeychain` would move our
+    /// item to a different store and orphan every existing install. The
+    /// This is the one intentional deprecation warning in the file; annotating it
+    /// away only moves the warning to the call site, so it is left visible.
+    private func isDefaultKeychainLocked() -> Bool {
+        var status: SecKeychainStatus = 0
+        guard SecKeychainGetStatus(nil, &status) == errSecSuccess else { return false }
+        return (status & SecKeychainStatus(kSecUnlockStateStatus)) == 0
+    }
+
     func read(service: String, account: String) throws -> Data? {
+        // Reads happen on the background refresh timer, so they must never be
+        // able to raise UI. Measured on macOS 15 against a locked test keychain:
+        // NEITHER `kSecUseAuthenticationUI: …Fail` NOR
+        // `LAContext.interactionNotAllowed` suppresses the unlock panel for a
+        // file-based keychain — both govern the data-protection keychain, while
+        // unlocking is a keychain-level operation securityd drives itself. The
+        // only thing that reliably avoids the panel is not issuing the read at
+        // all, so check lock state first. Same class of bug as the
+        // partition-list re-prompt in #490.
+        if isDefaultKeychainLocked() {
+            throw KeychainCredentialCacheError.unavailable(
+                service: service, status: errSecInteractionNotAllowed)
+        }
+        // Still pass a non-interactive context: it is the supported way to keep
+        // a data-protection-backed item from raising biometric/passcode UI.
+        let context = LAContext()
+        context.interactionNotAllowed = true
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecMatchLimit as String: kSecMatchLimitOne,
             kSecReturnData as String: true,
+            kSecUseAuthenticationContext as String: context,
         ]
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }
+        if KeychainCredentialCacheError.isUnavailable(status) {
+            throw KeychainCredentialCacheError.unavailable(service: service, status: status)
+        }
         guard status == errSecSuccess, let data = result as? Data else {
             throw KeychainCredentialCacheError.readFailed(service: service, status: status)
         }
@@ -165,6 +223,10 @@ final class ControllableKeychainCredentialCache: KeychainCredentialCaching, @unc
 
     func read(service: String, account: String) throws -> Data? {
         if failRead {
+            // Mirror the live adapter's mapping so tests exercise the same branch.
+            if KeychainCredentialCacheError.isUnavailable(readStatus) {
+                throw KeychainCredentialCacheError.unavailable(service: service, status: readStatus)
+            }
             throw KeychainCredentialCacheError.readFailed(service: service, status: readStatus)
         }
         return try inner.read(service: service, account: account)
