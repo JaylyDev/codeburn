@@ -3250,6 +3250,21 @@ async function parseProviderSources(
     }
   }
 
+  // Read the durable record LAST. Copilot reconciles a session.shutdown rollup
+  // against the session-store rows written up to it, and the two live in
+  // different files: a session that shuts down mid-pass appends its rollup to
+  // events.jsonl AND its last row to the store, and whichever we read first is
+  // the one that can be short. Rows commit strictly before their leg's
+  // shutdown line, so reading the store after every journal makes our row set
+  // a superset of what any rollup we read can claim — the short direction (a
+  // rollup reconciled against rows that had not landed yet) becomes
+  // unreachable, and only the harmless direction is left: a row with no
+  // journal partner yet, which serves its own tokens and pairs on the next
+  // pass. Ordering costs nothing; the parse loop already runs in array order.
+  if (changedSources.some(c => c.source.retainWhilePresent)) {
+    changedSources.sort((a, b) => Number(a.source.retainWhilePresent ?? false) - Number(b.source.retainWhilePresent ?? false))
+  }
+
   // Parser dedup: cross-provider keys + cached file keys.
   // Separate from seenKeys so parsing doesn't suppress query-time output.
   const parserDedup = new Set(seenKeys)
@@ -3433,6 +3448,29 @@ async function parseProviderSources(
     if (didParse && providerName === 'antigravity') {
       const liveIds = new Set(sources.map(s => antigravityCascadeIdFromPath(s.path)))
       await flushAntigravityCache(liveIds, antigravityCacheDir)
+    }
+  }
+
+  // The other half of "read the durable record last": a store served from
+  // cache is never re-read, so ordering cannot help it. If it was unchanged at
+  // classification but has moved by the time the journals are parsed, the rows
+  // we just reconciled a rollup against are stale by exactly the window the
+  // ordering closes for a changed store. That is a partial hydration, not a
+  // wrong number to seal — hold the daily watermark and let the next refresh,
+  // which will see the store as changed and re-read it, finalize the day.
+  // Deliberately not applied to a store we DID re-read: it was read after
+  // every journal, so a row landing afterwards belongs to a session whose
+  // shutdown line we cannot have seen yet.
+  if (!readOnly && !deferredRetryableSource) {
+    for (const { source } of unchangedSources) {
+      if (!source.retainWhilePresent) continue
+      const now = await fingerprintFile(source.path)
+      const used = section.files[source.path]?.fingerprint
+      if (!now || !used) continue
+      if (now.mtimeMs !== used.mtimeMs || now.sizeBytes !== used.sizeBytes || now.ino !== used.ino) {
+        deferredRetryableSource = true
+        break
+      }
     }
   }
 

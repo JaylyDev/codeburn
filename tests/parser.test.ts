@@ -29,7 +29,7 @@ let _synthSources: SessionSource[] = []
 let _synthDurable = false
 let _synthYields: ParsedProviderCall[] = []
 let _synthParseCalls = 0
-let _synthOnParse: (() => void | Promise<void>) | null = null
+let _synthOnParse: ((source: SessionSource) => void | Promise<void>) | null = null
 
 vi.mock('../src/providers/index.js', async (importOriginal) => {
   type Mod = typeof import('../src/providers/index.js')
@@ -60,7 +60,7 @@ vi.mock('../src/providers/index.js', async (importOriginal) => {
             return {
               async *parse(): AsyncGenerator<ParsedProviderCall> {
                 _synthParseCalls++
-                await _synthOnParse?.()
+                await _synthOnParse?.(_s)
                 for (const call of _synthYields) {
                   // Respect seenKeys so that when multiple sources share the same
                   // dedup key, only the first source yields it (mirrors real parsers).
@@ -693,6 +693,79 @@ describe.skipIf(!isSqliteAvailable())('(f2) durable history survives a bump on a
     expect(totalOutput(await parseAllSessions(undefined, 'copilot'))).toBe(150)
     clearSessionCache()
     expect(totalOutput(await parseAllSessions(undefined, 'copilot'))).toBe(150)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// (f3) Cross-source snapshot ordering for the durable record. Copilot
+//      reconciles a session.shutdown rollup against the session-store rows
+//      written up to it; the two are different files, so a session that shuts
+//      down mid-pass can leave whichever we read first short. Reading the
+//      store LAST makes the row set a superset of anything a rollup we read
+//      can claim, and a store we did not re-read (unchanged at classification)
+//      that moves during the pass is a partial hydration, not a number to
+//      seal. (#946 review, blocker 2.)
+// ═══════════════════════════════════════════════════════════════════════════
+describe('(f3) durable-record read ordering and mid-pass fence', () => {
+  it('parses a retainWhilePresent source after every other changed source', async () => {
+    const storeFile = join(tmpHome, 'ordering-store.txt')
+    const journalA = join(tmpHome, 'ordering-a.txt')
+    const journalB = join(tmpHome, 'ordering-b.txt')
+    for (const f of [storeFile, journalA, journalB]) await writeFile(f, 'v1')
+
+    // Deliberately listed FIRST: discovery order must not decide this.
+    _synthDurable = true
+    _synthSources = [
+      { path: storeFile, project: 'test', provider: 'test-synthetic', retainWhilePresent: true },
+      { path: journalA, project: 'test', provider: 'test-synthetic' },
+      { path: journalB, project: 'test', provider: 'test-synthetic' },
+    ]
+    _synthYields = []
+
+    const order: string[] = []
+    _synthOnParse = (source) => { order.push(source.path) }
+    await parseAllSessions(undefined, 'test-synthetic')
+    _synthOnParse = null
+
+    expect(order).toHaveLength(3)
+    expect(order[order.length - 1]).toBe(storeFile)
+  })
+
+  it('reports partial hydration when a cache-served store moves during the pass', async () => {
+    const storeFile = join(tmpHome, 'fence-store.txt')
+    const journal = join(tmpHome, 'fence-journal.txt')
+    await writeFile(storeFile, 'rows-v1')
+    await writeFile(journal, 'journal-v1')
+
+    _synthDurable = true
+    _synthSources = [
+      { path: storeFile, project: 'test', provider: 'test-synthetic', retainWhilePresent: true },
+      { path: journal, project: 'test', provider: 'test-synthetic' },
+    ]
+    _synthYields = []
+
+    // Warm both entries so the store can be served from cache next pass.
+    await parseAllSessions(undefined, 'test-synthetic')
+    expect(isSessionHydrationComplete()).toBe(true)
+
+    // Only the journal changed, so only the journal is re-read — and while it
+    // is being read, the store grows. This is the exact window the ordering
+    // cannot close: the rows we are about to reconcile the journal against
+    // were pinned before the journal was read.
+    clearSessionCache()
+    await writeFile(journal, 'journal-v2-longer')
+    _synthOnParse = async (source) => {
+      if (source.path === journal) await writeFile(storeFile, 'rows-v2-longer')
+    }
+    await parseAllSessions(undefined, 'test-synthetic')
+    _synthOnParse = null
+    expect(isSessionHydrationComplete()).toBe(false)
+
+    // The next refresh sees the store as changed, re-reads it last, and the
+    // fence lifts on its own — it holds a day back, it does not wedge.
+    clearSessionCache()
+    await parseAllSessions(undefined, 'test-synthetic')
+    expect(isSessionHydrationComplete()).toBe(true)
   })
 })
 
