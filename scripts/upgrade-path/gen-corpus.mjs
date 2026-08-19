@@ -363,6 +363,79 @@ function genCursor() {
   return existsSync(dbPath + '-wal') ? 3 : 2
 }
 
+// ── copilot ─────────────────────────────────────────────────────────────────
+// The OTel span store VS Code's Copilot Chat writes. It is here for one thing
+// the transcript providers cannot exercise: a DURABLE source that keeps its
+// file forever while the extension prunes rows out of it. run.mjs caches this
+// with the published CLI, prunes conversations, then upgrades — the cache is
+// the only remaining record of the pruned days, and a parse-version bump must
+// not take them with it. Platform-specific default path, no override var,
+// matching the rest of this corpus.
+
+const COPILOT_MODELS = ['gpt-4.1', 'claude-sonnet-4-5']
+
+function copilotOtelDbPath() {
+  if (process.platform === 'darwin') {
+    return join(HOME, 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db')
+  }
+  if (process.platform === 'win32') {
+    const appdata = process.env['APPDATA'] ?? join(HOME, 'AppData', 'Roaming')
+    return join(appdata, 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db')
+  }
+  return join(HOME, '.config', 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db')
+}
+
+function genCopilot() {
+  const { DatabaseSync } = require_('node:sqlite')
+  const dbPath = copilotOtelDbPath()
+  mkdirSync(join(dbPath, '..'), { recursive: true })
+  for (const suffix of ['', '-wal', '-shm']) rmSync(dbPath + suffix, { force: true })
+
+  const db = new DatabaseSync(dbPath)
+  db.exec(`
+    CREATE TABLE spans (
+      span_id        TEXT    PRIMARY KEY NOT NULL,
+      trace_id       TEXT    NOT NULL,
+      operation_name TEXT,
+      start_time_ms  INTEGER NOT NULL DEFAULT 0,
+      response_model TEXT
+    );
+    CREATE TABLE span_attributes (
+      id      INTEGER PRIMARY KEY AUTOINCREMENT,
+      span_id TEXT    NOT NULL,
+      key     TEXT    NOT NULL,
+      value   TEXT
+    );
+  `)
+  const insSpan = db.prepare('INSERT INTO spans (span_id, trace_id, operation_name, start_time_ms, response_model) VALUES (?, ?, ?, ?, ?)')
+  const insAttr = db.prepare('INSERT INTO span_attributes (span_id, key, value) VALUES (?, ?, ?)')
+
+  // Two spans a day over the last 40 days, so pruning by day leaves a valid,
+  // still-populated DB rather than an empty one — "extant but pruned" is the
+  // shape that matters, and an empty DB would also pass a naive carry-forward.
+  let n = 0
+  for (let day = SPAN_DAYS - 40; day < SPAN_DAYS; day++) {
+    for (let i = 0; i < 2; i++) {
+      const spanId = `cp-span-${String(n).padStart(4, '0')}`
+      const model = COPILOT_MODELS[n % COPILOT_MODELS.length]
+      const ts = at(day, 9 + i * 4, between(0, 59))
+      insSpan.run(spanId, `cp-trace-${day}-${i}`, 'chat', ts.getTime(), model)
+      const attrs = {
+        'gen_ai.conversation.id': `cp-conv-${day}-${i}`,
+        'gen_ai.response.model': model,
+        'gen_ai.usage.input_tokens': between(2000, 20000),
+        'gen_ai.usage.output_tokens': between(200, 3000),
+        'gen_ai.usage.cache_read.input_tokens': between(0, 8000),
+        'gen_ai.usage.cache_creation.input_tokens': 0,
+      }
+      for (const [k, v] of Object.entries(attrs)) insAttr.run(spanId, k, String(v))
+      n++
+    }
+  }
+  db.close()
+  return n
+}
+
 // ── run ──────────────────────────────────────────────────────────────────────
 
 const counts = {
@@ -373,5 +446,6 @@ const counts = {
   dsh: genDsh(),
   grok: genGrok(),
   cursor: genCursor(),
+  copilot: genCopilot(),
 }
 console.log(JSON.stringify(counts))

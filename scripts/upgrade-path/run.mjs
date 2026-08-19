@@ -414,6 +414,79 @@ else {
   }
 }
 
+// ── 9. durable history across a bump on an extant, pruned source ─────────────
+//
+// The other never-lose direction. A durable SQLite source keeps its file
+// forever while the provider prunes rows out of it, so "the source path is
+// gone" is not the test for whether the cache is the last remaining record.
+// A parse-version bump rebuilds the provider section, and if it drops entries
+// whose file still exists it deletes exactly the history nothing can rebuild.
+// This build bumps PROVIDER_PARSE_VERSIONS.copilot, so it takes that path for
+// real. (#946 review.)
+
+step('durable history across a bump on an extant, pruned source')
+const prunedCache = join(CACHES, 'pruned')
+mkdirSync(prunedCache, { recursive: true })
+
+const copilotDb = process.platform === 'darwin'
+  ? join(HOME, 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db')
+  : process.platform === 'win32'
+    ? join(process.env['APPDATA'] ?? join(HOME, 'AppData', 'Roaming'), 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db')
+    : join(HOME, '.config', 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db')
+
+// providerDetails carries the internal provider id; the `providers` map is
+// keyed by lowercased DISPLAY name, which is not stable to match on.
+const copilotOf = payload =>
+  (payload.menubar?.current?.providerDetails ?? []).find(d => d.id === 'copilot')
+const prunedBase = capture(oldBin, prunedCache, join(PAYLOADS, 'pruned-baseline'))
+const beforeSlice = copilotOf(prunedBase)
+
+if (!beforeSlice || !(beforeSlice.cost > 0)) {
+  skip(`${OLD_VERSION} reported no copilot usage to prune (nothing to protect)`)
+} else {
+  ok(`baseline copilot: $${beforeSlice.cost.toFixed(6)}`)
+
+  // Prune HALF the conversations, leaving the DB present, valid and still
+  // populated: the surviving rows are what the bump re-parses, the pruned ones
+  // exist only in the cache from here on.
+  let pruned = 0
+  try {
+    const { DatabaseSync } = await import('node:sqlite')
+    const db = new DatabaseSync(copilotDb)
+    const ids = db.prepare('SELECT span_id FROM spans ORDER BY span_id').all().map(r => r.span_id)
+    const doomed = ids.filter((_, i) => i % 2 === 0)
+    const delSpan = db.prepare('DELETE FROM spans WHERE span_id = ?')
+    const delAttr = db.prepare('DELETE FROM span_attributes WHERE span_id = ?')
+    for (const id of doomed) { delAttr.run(id); delSpan.run(id) }
+    pruned = doomed.length
+    const left = db.prepare('SELECT COUNT(*) AS n FROM spans').get().n
+    db.close()
+    ok(`pruned ${pruned} of ${ids.length} spans; ${left} remain in a DB that still exists`)
+  } catch (err) {
+    skip(`could not prune the copilot store (${err.message})`)
+  }
+
+  if (pruned > 0) {
+    const prunedUp = capture(newBin, prunedCache, join(PAYLOADS, 'pruned-upgraded'))
+    const afterSlice = copilotOf(prunedUp)
+    if (!afterSlice) {
+      fail(`the copilot slice is gone entirely after the bump; baseline had $${beforeSlice.cost.toFixed(6)}`)
+    } else {
+      // The bump may legitimately ADD (this build reads per-request rows the
+      // baseline never had). It must never subtract.
+      const costOk = afterSlice.cost >= beforeSlice.cost - 1e-9
+      const lost = costOk ? '' : ` — LOST $${(beforeSlice.cost - afterSlice.cost).toFixed(6)} (${(100 * (beforeSlice.cost - afterSlice.cost) / beforeSlice.cost).toFixed(1)}%)`
+      check(costOk, `copilot cost across the bump: $${beforeSlice.cost.toFixed(6)} -> $${afterSlice.cost.toFixed(6)}${lost}`)
+
+      // And persisted, not merely served: a second run reads the cache the
+      // bump rewrote, so a carry-forward that only survived in memory fails.
+      const warm = copilotOf(capture(newBin, prunedCache, join(PAYLOADS, 'pruned-warm')))
+      check(!!warm && warm.cost >= beforeSlice.cost - 1e-9,
+        `and again from the rewritten cache: $${(warm?.cost ?? 0).toFixed(6)}`)
+    }
+  }
+}
+
 // ── done ─────────────────────────────────────────────────────────────────────
 
 console.log(`\n${failures ? `FAILED: ${failures} check(s)` : 'PASSED'}${skipped ? ` (${skipped} skipped)` : ''}`)
