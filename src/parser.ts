@@ -3392,6 +3392,7 @@ async function parseProviderSources(
         }
         const canonicalCalls = await Promise.all(providerCalls.map(canonicalizeProviderCallProject))
         const turns = providerCallsToCachedTurns(canonicalCalls)
+        const prLinks = [...new Set(canonicalCalls.flatMap(call => call.prLinks ?? []))]
 
         // Store/merge parsed turns into the cache.
         // Durable providers use a union-by-deduplicationKey merge: existing turns
@@ -3418,8 +3419,9 @@ async function parseProviderSources(
               .filter(t => t.calls.length > 0)
             existingEntry.turns = [...existingEntry.turns, ...newTurns]
             existingEntry.fingerprint = fp
+            if (prLinks.length) existingEntry.prLinks = [...new Set([...(existingEntry.prLinks ?? []), ...prLinks])]
           } else {
-            section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns }
+            section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns, ...(prLinks.length ? { prLinks } : {}) }
           }
         } else {
           // Non-durable: overwrite (clearedPaths already deleted stale entry above)
@@ -3429,8 +3431,9 @@ async function parseProviderSources(
           const existingCacheEntry = section.files[source.path]
           if (existingCacheEntry) {
             existingCacheEntry.turns = [...existingCacheEntry.turns, ...turns]
+            if (prLinks.length) existingCacheEntry.prLinks = [...new Set([...(existingCacheEntry.prLinks ?? []), ...prLinks])]
           } else {
-            section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns }
+            section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns, ...(prLinks.length ? { prLinks } : {}) }
           }
         }
         didParse = true

@@ -478,14 +478,25 @@ function planColor(planUsage: PlanUsage): string {
       : '#5BF58C'
 }
 
-function planStatusText(planUsage: PlanUsage): string {
+// Headline and status share one line's worth of terminal each, both truncated
+// end-first, so the headline stays short enough to keep the percentage visible
+// at 80 columns and the status leads with the disclaimer, not the arithmetic.
+export function planBudgetHeadline(planUsage: PlanUsage): string {
+  return `${planLabel(planUsage)}: ${formatCost(planUsage.spentApiEquivalentUsd)} API-equivalent / ${formatCost(planUsage.budgetUsd)} budget`
+}
+
+export function planStatusText(planUsage: PlanUsage): string {
+  // The period is anniversary-based (plan.resetDay, 1-28, settable per plan via
+  // `codeburn plan set --reset-day`), so this is a monthly budget window, not a
+  // calendar month. The headline already says "budget"; do not repeat it here.
+  const detail = `Not a live provider window. Projected: ${formatCost(planUsage.projectedMonthUsd)}. Next budget reset in ${planUsage.daysUntilReset} days.`
   if (planUsage.status === 'under') {
-    return `Well within plan. Projected month: ${formatCost(planUsage.projectedMonthUsd)} (reset in ${planUsage.daysUntilReset} days).`
+    return `Well within budget. ${detail}`
   }
   if (planUsage.status === 'near') {
-    return `Approaching plan limit. Projected month: ${formatCost(planUsage.projectedMonthUsd)} (reset in ${planUsage.daysUntilReset} days).`
+    return `Approaching budget. ${detail}`
   }
-  return `${(planUsage.spentApiEquivalentUsd / Math.max(planUsage.budgetUsd, 1)).toFixed(1)}x your subscription value. Projected month: ${formatCost(planUsage.projectedMonthUsd)} (reset in ${planUsage.daysUntilReset} days).`
+  return `${(planUsage.spentApiEquivalentUsd / Math.max(planUsage.budgetUsd, 1)).toFixed(1)}x the sticker price. ${detail}`
 }
 
 function Overview({ projects, label, width, planUsages, durable }: { projects: ProjectSummary[]; label: string; width: number; planUsages?: PlanUsage[]; durable?: DurableOverview }) {
@@ -541,7 +552,7 @@ function Overview({ projects, label, width, planUsages, durable }: { projects: P
             return (
               <React.Fragment key={planUsage.plan.provider}>
                 <Text wrap="truncate-end">
-                  <Text color={color}>{planLabel(planUsage)}: {formatCost(planUsage.spentApiEquivalentUsd)} API-equivalent vs {formatCost(planUsage.budgetUsd)} plan</Text>
+                  <Text color={color}>{planBudgetHeadline(planUsage)}</Text>
                   <Text>  </Text>
                   <Text color={color}>{renderPlanBar(planUsage.percentUsed, PLAN_BAR_WIDTH)}</Text>
                   <Text> </Text>

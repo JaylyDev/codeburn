@@ -73,6 +73,8 @@ export type ParsedProviderCall = {
   sessionId: string
   project?: string
   projectPath?: string
+  // GitHub PR URLs observed in this call's transcript (Hermes and similar).
+  prLinks?: string[]
   // Exact provider-recorded cwd, kept separately because projectPath may later
   // canonicalize a linked worktree to its main repository.
   workingDirectory?: string
