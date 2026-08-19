@@ -43,6 +43,7 @@ enum CodexCredentialStore {
         keychainCache = LiveKeychainCredentialCache()
         lastCacheDeleteResult = nil
         lastLegacyCleanupFailed = false
+        unlinkLegacyOverride = nil
         lock.withLock { memoryCache = nil }
     }
 
@@ -133,7 +134,9 @@ enum CodexCredentialStore {
         lock.withLock { memoryCache = nil }
         let result = deleteOurCache()
         lastCacheDeleteResult = result
-        isBootstrapCompleted = false
+        if result.keychainDeletedOrAbsent {
+            isBootstrapCompleted = false
+        }
         return result
     }
 
@@ -145,6 +148,7 @@ enum CodexCredentialStore {
 
     nonisolated(unsafe) static var lastCacheDeleteResult: CacheDeleteResult?
     nonisolated(unsafe) static var lastLegacyCleanupFailed = false
+    nonisolated(unsafe) static var unlinkLegacyOverride: ((URL) throws -> Void)?
 
 
     // MARK: - Public API
@@ -368,10 +372,15 @@ enum CodexCredentialStore {
             return
         }
         do {
-            try FileManager.default.removeItem(at: url)
+            if let unlinkLegacyOverride {
+                try unlinkLegacyOverride(url)
+            } else {
+                try FileManager.default.removeItem(at: url)
+            }
             lastLegacyCleanupFailed = false
         } catch {
             lastLegacyCleanupFailed = true
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         }
     }
 

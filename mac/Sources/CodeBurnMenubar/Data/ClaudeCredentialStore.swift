@@ -56,6 +56,7 @@ enum ClaudeCredentialStore {
         keychainCache = LiveKeychainCredentialCache()
         lastCacheDeleteResult = nil
         lastLegacyCleanupFailed = false
+        unlinkLegacyOverride = nil
         lock.withLock { memoryCache = nil }
     }
 
@@ -134,7 +135,11 @@ enum ClaudeCredentialStore {
         lock.withLock { memoryCache = nil }
         let result = deleteOurCache()
         lastCacheDeleteResult = result
-        isBootstrapCompleted = false
+        // A failed Keychain delete must not pretend the provider is disconnected.
+        // Clearing the flag hides Disconnect and orphans the remaining item.
+        if result.keychainDeletedOrAbsent {
+            isBootstrapCompleted = false
+        }
         return result
     }
 
@@ -150,6 +155,8 @@ enum ClaudeCredentialStore {
 
     /// Last legacy-unlink failure after a verified Keychain write (cleanup retry signal).
     nonisolated(unsafe) static var lastLegacyCleanupFailed = false
+    /// Test seam: force legacy unlink to throw so we can assert the 0600 repair.
+    nonisolated(unsafe) static var unlinkLegacyOverride: ((URL) throws -> Void)?
 
 
     // MARK: - Public API
@@ -490,11 +497,16 @@ enum ClaudeCredentialStore {
             return
         }
         do {
-            try FileManager.default.removeItem(at: url)
+            if let unlinkLegacyOverride {
+                try unlinkLegacyOverride(url)
+            } else {
+                try FileManager.default.removeItem(at: url)
+            }
             lastLegacyCleanupFailed = false
         } catch {
-            // Retain valid Keychain item + 0600 file; surface for later retry.
             lastLegacyCleanupFailed = true
+            // Verified Keychain item exists — leftover plaintext must not stay 0644.
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         }
     }
 

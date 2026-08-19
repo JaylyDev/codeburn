@@ -136,6 +136,17 @@ enum SafeFile {
         }
         defer { Darwin.close(fd) }
 
+        var opened = stat()
+        guard fstat(fd, &opened) == 0 else {
+            throw Error.readFailed(path, errno)
+        }
+        guard (opened.st_mode & S_IFMT) == S_IFREG else {
+            throw SecureReadError.notRegularFile(path)
+        }
+        guard opened.st_uid == expectedOwner else {
+            throw SecureReadError.wrongOwner(path)
+        }
+
         if fchmod(fd, 0o600) != 0 {
             throw SecureReadError.chmodFailed(path, errno)
         }
@@ -153,16 +164,22 @@ enum SafeFile {
             throw Error.sizeLimitExceeded(path, size)
         }
 
-        var data = Data(count: max(size, 0))
-        let readBytes: Int = data.withUnsafeMutableBytes { buffer -> Int in
-            guard let base = buffer.baseAddress else { return 0 }
-            return Darwin.read(fd, base, buffer.count)
+        var data = Data()
+        data.reserveCapacity(max(size, 0))
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        while data.count < maxBytes {
+            let n = chunk.withUnsafeMutableBytes { buffer -> Int in
+                guard let base = buffer.baseAddress else { return 0 }
+                return Darwin.read(fd, base, buffer.count)
+            }
+            guard n >= 0 else {
+                throw Error.readFailed(path, errno)
+            }
+            if n == 0 { break }
+            data.append(contentsOf: chunk.prefix(n))
         }
-        guard readBytes >= 0 else {
-            throw Error.readFailed(path, errno)
-        }
-        if readBytes < data.count {
-            data = data.prefix(readBytes)
+        if data.count > maxBytes {
+            throw Error.sizeLimitExceeded(path, data.count)
         }
         return data
     }

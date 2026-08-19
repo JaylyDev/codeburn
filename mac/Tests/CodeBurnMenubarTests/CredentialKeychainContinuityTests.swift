@@ -289,6 +289,7 @@ struct CredentialKeychainContinuityTests {
                 expiresAt: nil,
                 rateLimitTier: nil
             ))
+            ClaudeCredentialStore.isBootstrapCompleted = true
             let controllable = ControllableKeychainCredentialCache(inner: harness.fakeKeychain)
             controllable.failDelete = true
             ClaudeCredentialStore.keychainCache = controllable
@@ -297,6 +298,30 @@ struct CredentialKeychainContinuityTests {
             #expect(!failed.isSuccess)
             #expect(failed.keychainDeletedOrAbsent == false)
             #expect(ClaudeCredentialStore.lastCacheDeleteResult?.isSuccess == false)
+            #expect(ClaudeCredentialStore.isBootstrapCompleted == true)
+        }
+    }
+
+    @Test("failed unlink after verified Keychain repairs leftover JSON to 0600")
+    func failedUnlinkRepairsLegacyMode() throws {
+        try withHarness { _ in
+            let record = ClaudeCredentialStore.CredentialRecord(
+                accessToken: accessSentinel,
+                refreshToken: refreshSentinel,
+                expiresAt: Date(timeIntervalSince1970: 1_900_000_000),
+                rateLimitTier: "default"
+            )
+            try ClaudeCredentialStore.writeOurCache(record: record)
+            try writeLegacyClaude0644(record: record)
+            ClaudeCredentialStore.isBootstrapCompleted = true
+            ClaudeCredentialStore.unlinkLegacyOverride = { _ in
+                throw POSIXError(.EPERM)
+            }
+            ClaudeCredentialStore.clearMemoryCacheForTesting()
+            _ = try ClaudeCredentialStore.currentRecord()
+            #expect(ClaudeCredentialStore.lastLegacyCleanupFailed == true)
+            #expect(FileManager.default.fileExists(atPath: ClaudeCredentialStore.cacheFileURL().path))
+            #expect(posixMode(at: ClaudeCredentialStore.cacheFileURL()) == 0o600)
         }
     }
 

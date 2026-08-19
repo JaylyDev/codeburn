@@ -1069,6 +1069,13 @@ final class AppStore {
         // resumes after this point detects the disconnect and discards its
         // result instead of re-populating the cleared state.
         claudeRefreshGen &+= 1
+        if let result = ClaudeCredentialStore.lastCacheDeleteResult, !result.keychainDeletedOrAbsent {
+            // Keychain item still present — keep Connect/Disconnect on the
+            // connected path so the user can retry delete.
+            subscriptionError = "Could not fully remove the local Claude credential cache. Disconnect again to retry."
+            NotificationCenter.default.post(name: .codeBurnSubscriptionDisconnected, object: nil)
+            return
+        }
         subscription = nil
         if let result = ClaudeCredentialStore.lastCacheDeleteResult, !result.isSuccess {
             subscriptionError = "Could not fully remove the local Claude credential cache."
@@ -1137,6 +1144,11 @@ final class AppStore {
     func disconnectCodex() {
         CodexSubscriptionService.disconnect()
         codexRefreshGen &+= 1
+        if let result = CodexCredentialStore.lastCacheDeleteResult, !result.keychainDeletedOrAbsent {
+            codexError = "Could not fully remove the local Codex credential cache. Disconnect again to retry."
+            NotificationCenter.default.post(name: .codeBurnSubscriptionDisconnected, object: nil)
+            return
+        }
         codexUsage = nil
         if let result = CodexCredentialStore.lastCacheDeleteResult, !result.isSuccess {
             codexError = "Could not fully remove the local Codex credential cache."
