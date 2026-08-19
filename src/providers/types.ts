@@ -8,13 +8,15 @@ export type SessionSource = {
   sourceLabel?: string
   sourcePath?: string
   sourceKind?: 'claude-config' | 'claude-desktop'
-  // Durable providers only: while this exact path is still discovered, its
-  // cached entry is exempt from the 90-day age-out — the file IS the durable
-  // record (copilot's session-store.db), so pruning it would drop crash-only
-  // rows the source still holds and force a full re-read on the next refresh.
-  // Orphaned paths (no longer discovered) age out normally, and unflagged
-  // durable sources age out even while their file remains on disk (the cap
-  // bounds cache growth for provider-pruned journals).
+  // This file IS the durable record of its provider's usage — copilot's
+  // session-store.db, whose crash-only rows have no rollup to fall back to —
+  // rather than a journal the provider could re-emit. Two effects:
+  //   * it is parsed AFTER every other source of its provider in a pass, and
+  //     one served from cache that moves mid-pass marks the pass incomplete,
+  //     so a rollup is never reconciled against rows that had not landed;
+  //   * it is exempt from the 90-day age-out while still discovered. Since
+  //     #992 that exemption is redundant (only ORPHANS age out) — kept as the
+  //     explicit statement of intent, not as the thing enforcing it.
   retainWhilePresent?: boolean
 }
 
