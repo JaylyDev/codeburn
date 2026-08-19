@@ -232,7 +232,7 @@ function PlanPanel({ plan }: { plan: JsonPlanSummary }) {
     ? `${formatConverted(plan.spent)} · ${fmtPct(plan.percentUsed)}${overage > 0 ? ` · ${formatConverted(overage)} over` : ''}`
     : `${formatConverted(plan.spent)} this cycle`
   const detail = hasBudget
-    ? `${formatConverted(plan.budget)} / calendar month · API-equivalent budget, not live quota · ${plan.provider}`
+    ? `${formatConverted(plan.budget)} / month budget · API-equivalent, not a live provider window · ${plan.provider}`
     : `${plan.provider} · pay as you go, no plan`
 
   return (

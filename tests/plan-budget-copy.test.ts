@@ -24,15 +24,18 @@ function usage(overrides: Partial<PlanUsage> = {}): PlanUsage {
   }
 }
 
+// The TUI truncates both lines end-first at the terminal width, so the row is
+// headline + two spaces + the 10-cell bar + a space + the percentage.
+const PLAN_ROW_TAIL = '  ' + '#'.repeat(10) + ' '
+function planRow(planUsage: PlanUsage): string {
+  return planBudgetHeadline(planUsage) + PLAN_ROW_TAIL + planUsage.percentUsed.toFixed(1) + '%'
+}
+
 describe('plan budget copy', () => {
-  it('labels SuperGrok as a calendar-month budget, not a live window', () => {
-    const text = planBudgetHeadline(usage())
-    expect(text).toContain('/mo budget')
-    expect(text).not.toMatch(/\bplan\b/)
+  it('labels SuperGrok as a budget, not a live window', () => {
+    expect(planBudgetHeadline(usage())).toBe('SuperGrok Heavy: $33.82 API-equivalent / $300.00 budget')
     const status = planStatusText(usage())
-    expect(status).toContain('not a live provider window')
-    expect(status).toContain('Calendar-month budget')
-    expect(status).not.toMatch(/Well within plan/)
+    expect(status).toBe('Well within budget. Not a live provider window. Projected: $40.00. Next budget reset in 13 days.')
   })
 
   it('uses the same budget language for every preset, not only Grok', () => {
@@ -48,7 +51,36 @@ describe('plan budget copy', () => {
       spentApiEquivalentUsd: 8.2,
       status: 'near',
     })
-    expect(planBudgetHeadline(cursor)).toContain('/mo budget')
+    expect(planBudgetHeadline(cursor)).toBe('Cursor Pro: $8.20 API-equivalent / $20.00 budget')
     expect(planStatusText(cursor)).toContain('Approaching budget')
+  })
+
+  // computePeriodFromResetDay builds an anniversary window from plan.resetDay
+  // (1-28, settable with `codeburn plan set --reset-day`), so a plan that resets
+  // on the 15th is NOT on a calendar month and must never be called one.
+  it('never calls an anniversary reset window a calendar month', () => {
+    for (const resetDay of [1, 15, 28]) {
+      const status = planStatusText(usage({
+        plan: { id: 'supergrok-heavy', monthlyUsd: 300, provider: 'grok', resetDay, setAt: '2026-08-01T00:00:00.000Z' },
+        daysUntilReset: 4,
+      }))
+      expect(status).not.toMatch(/calendar/i)
+      expect(status).toContain('Next budget reset in 4 days.')
+    }
+  })
+
+  // The row and the status each get one truncate-end line. At 80 columns the
+  // percentage must survive on the row and the projection on the status line.
+  it('keeps the percentage and the projection readable at 80 columns', () => {
+    for (const planUsage of [
+      usage(),
+      usage({ status: 'over', spentApiEquivalentUsd: 640, percentUsed: 213.3 }),
+      usage({ plan: { id: 'custom', monthlyUsd: 300, provider: 'openrouter', resetDay: 1, setAt: '2026-08-01T00:00:00.000Z' } }),
+    ]) {
+      const row = planRow(planUsage)
+      expect(row.length).toBeLessThanOrEqual(80)
+      expect(row.slice(0, 80)).toContain(`${planUsage.percentUsed.toFixed(1)}%`)
+      expect(planStatusText(planUsage).slice(0, 80)).toContain('Projected: $40.00.')
+    }
   })
 })
