@@ -119,7 +119,7 @@ describe('Plans', () => {
 
     expect(screen.getByRole('heading', { name: 'Budget plans' })).toBeInTheDocument()
     expect(screen.getByText('Cursor Pro')).toBeInTheDocument()
-    expect(screen.getByText('$20.00 / month · cursor')).toBeInTheDocument()
+    expect(screen.getByText('$20.00 / calendar month · API-equivalent budget, not live quota · cursor')).toBeInTheDocument()
     expect(screen.getByText('$8.20 · 41%')).toBeInTheDocument()
     const cursorFill = container.querySelector('[data-testid="plan-track-cursor"] i')
     expect(cursorFill).toHaveStyle({ width: '41%' })

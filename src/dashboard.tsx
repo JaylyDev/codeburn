@@ -344,14 +344,19 @@ function planColor(planUsage: PlanUsage): string {
       : '#5BF58C'
 }
 
-function planStatusText(planUsage: PlanUsage): string {
+export function planBudgetHeadline(planUsage: PlanUsage): string {
+  return `${planLabel(planUsage)}: ${formatCost(planUsage.spentApiEquivalentUsd)} API-equivalent vs ${formatCost(planUsage.budgetUsd)}/mo budget`
+}
+
+export function planStatusText(planUsage: PlanUsage): string {
+  const calendar = `Calendar-month budget, not a live provider window. Projected: ${formatCost(planUsage.projectedMonthUsd)}. Next calendar reset in ${planUsage.daysUntilReset} days.`
   if (planUsage.status === 'under') {
-    return `Well within plan. Projected month: ${formatCost(planUsage.projectedMonthUsd)} (reset in ${planUsage.daysUntilReset} days).`
+    return `Well within budget. ${calendar}`
   }
   if (planUsage.status === 'near') {
-    return `Approaching plan limit. Projected month: ${formatCost(planUsage.projectedMonthUsd)} (reset in ${planUsage.daysUntilReset} days).`
+    return `Approaching budget. ${calendar}`
   }
-  return `${(planUsage.spentApiEquivalentUsd / Math.max(planUsage.budgetUsd, 1)).toFixed(1)}x your subscription value. Projected month: ${formatCost(planUsage.projectedMonthUsd)} (reset in ${planUsage.daysUntilReset} days).`
+  return `${(planUsage.spentApiEquivalentUsd / Math.max(planUsage.budgetUsd, 1)).toFixed(1)}x the sticker price. ${calendar}`
 }
 
 function Overview({ projects, label, width, planUsages, durable }: { projects: ProjectSummary[]; label: string; width: number; planUsages?: PlanUsage[]; durable?: DurableOverview }) {
@@ -407,7 +412,7 @@ function Overview({ projects, label, width, planUsages, durable }: { projects: P
             return (
               <React.Fragment key={planUsage.plan.provider}>
                 <Text wrap="truncate-end">
-                  <Text color={color}>{planLabel(planUsage)}: {formatCost(planUsage.spentApiEquivalentUsd)} API-equivalent vs {formatCost(planUsage.budgetUsd)} plan</Text>
+                  <Text color={color}>{planBudgetHeadline(planUsage)}</Text>
                   <Text>  </Text>
                   <Text color={color}>{renderPlanBar(planUsage.percentUsed, PLAN_BAR_WIDTH)}</Text>
                   <Text> </Text>
