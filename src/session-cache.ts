@@ -59,6 +59,9 @@ export type CachedCall = {
   // predates the columns.
   nanoAiu?: number
   requestMultiplier?: number
+  // Copilot shutdown rollups only: stamp of the last successful in-session
+  // compaction before this leg. See ParsedProviderCall.compactedAt.
+  compactedAt?: string
 }
 
 export type CachedTurn = {
@@ -562,6 +565,7 @@ function validateCall(c: unknown): c is CachedCall {
     && isOptionalNum(o['toolWaitMs'])
     && isOptionalNum(o['nanoAiu'])
     && isOptionalNum(o['requestMultiplier'])
+    && isOptionalString(o['compactedAt'])
     && isStringArray(o['tools'])
     && isStringArray(o['bashCommands'])
     && isStringArray(o['skills'])

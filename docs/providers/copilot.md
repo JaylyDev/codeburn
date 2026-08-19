@@ -70,6 +70,32 @@ see the #927 ruling in `src/session-cache.ts`).
   dropped and each rollup leg's usage beyond the rows in its own interval
   serves once as a synthesized residual call at that leg's timestamp. Sessions
   with no rows (pre-store CLI builds) keep the rollup path unchanged.
+- **A leg's interval starts at its last successful compaction, not at the
+  previous leg.** In-session compaction resets the CLI's rollup counters, so a
+  leg containing one describes only its post-compaction requests. Running the
+  subtraction from the previous leg would cancel that leg's usage against the
+  whole pre-compaction conversation and leave the residual short by exactly
+  that much — invisible while the store is complete (the floor hides it),
+  permanent once a partial snapshot is sealed into a day. Pre-compaction rows
+  still serve; they just stop cancelling usage the rollup never claimed.
+  Recognized events, from `@github/copilot` 1.0.80: `session.compaction_start`
+  (nothing needed from it) and `session.compaction_complete`, whose `success`
+  is read and every other field ignored. Only `success: true` anchors; a failed
+  or absent compaction falls back to the previous-leg interval. Multiple
+  compactions in one leg: the last wins. The stamp rides on the cached rollup
+  call as `compactedAt`.
+  *Accepted, bounded over-serve:* the summarization call has its own usage
+  (`compactionTokensUsed`, charged through the CLI's ordinary `recordUsage`).
+  If it also writes an `assistant_usage_events` row — likely, since it carries
+  the same `copilotUsage.totalNanoAiu` envelope every request does, but the
+  writer is native and not verifiable from the JS bundle — that row sits just
+  before the compaction stamp and so falls outside the interval, while the
+  post-reset rollup counts it. One summarization request per compaction can
+  therefore serve twice. Deliberately not subtracted from the payload: the
+  triggering request completes immediately before the compaction too, so any
+  grace window wide enough to catch the summarization row also catches a real
+  request and turns an over-serve into a loss. Resolvable by anyone with a real
+  store: check whether a row exists at the compaction stamp.
 - **Behavioral weight.** Rollups and residuals are aggregate accounting: tokens
   and cost count, but never api-call / model-call / turn weight. A store row
   pairs with its per-turn call by timestamp adjacency (2-minute window,

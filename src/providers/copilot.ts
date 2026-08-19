@@ -216,6 +216,17 @@ type SessionShutdownData = {
   sessionStartTime?: number
 }
 
+// In-session compaction. The CLI emits compaction_start when it decides to
+// summarize and compaction_complete when the summarization call returns; only
+// the latter carries `success`, and only a successful one resets the
+// session.shutdown rollup counters. Every other field here is read
+// tolerantly - the payload also carries token counts, the summarization
+// call's own usage (compactionTokensUsed), messagesRemoved, model, requestId
+// and a manual/background `trigger`, none of which this parser needs.
+type SessionCompactionCompleteData = {
+  success?: boolean
+}
+
 type CopilotEvent =
   | { type: 'session.start'; data: SessionStartData; timestamp?: string }
   | { type: 'session.model_change'; data: ModelChangeData; timestamp?: string }
@@ -225,6 +236,8 @@ type CopilotEvent =
   | { type: 'subagent.started'; data: SubagentSelectedData; timestamp?: string }
   | { type: 'subagent.completed'; data: SubagentSelectedData; timestamp?: string }
   | { type: 'session.shutdown'; data: SessionShutdownData; timestamp?: string }
+  | { type: 'session.compaction_start'; data: Record<string, unknown>; timestamp?: string }
+  | { type: 'session.compaction_complete'; data: SessionCompactionCompleteData; timestamp?: string }
 
 type ChatJournalPathSegment = string | number
 type ChatSessionRequest = Record<string, unknown>
@@ -761,6 +774,11 @@ function createJsonlParser(
       // timestamp, which the date-range filters silently drop.
       let lastEventTimestamp = ''
 
+      // Stamp of the most recent SUCCESSFUL session.compaction_complete seen so
+      // far. Carried onto each shutdown leg because a compaction resets the
+      // rollup counters, so the leg only describes requests after this point.
+      let lastCompactionTs = ''
+
       // A resumed session appends one session.shutdown PER LEG, each carrying
       // CUMULATIVE per-model totals. Emitting each rollup whole would need the
       // cache to update a prior call in place — the durable merge is
@@ -790,6 +808,26 @@ function createJsonlParser(
           currentModel = (event.data as ModelChangeData).newModel ?? currentModel
           continue
         }
+
+        // In-session compaction RESETS the session.shutdown rollup counters,
+        // so a leg that contains one describes only its post-compaction
+        // requests. Carrying the compaction's stamp onto the leg lets the
+        // serve-time reconciliation start that leg's store-row interval here
+        // instead of at the previous leg, which is the difference between
+        // subtracting only the requests the rollup actually covers and
+        // subtracting the whole pre-compaction conversation from it.
+        // compaction_start is recognized but carries nothing we need: only a
+        // COMPLETE with success:true reset anything (a failed or abandoned
+        // compaction leaves the counters alone).
+        if (event.type === 'session.compaction_complete') {
+          const data = event.data as SessionCompactionCompleteData | undefined
+          const ts = typeof event.timestamp === 'string' ? event.timestamp : ''
+          if (data?.success === true && ts && !Number.isNaN(new Date(ts).getTime())) {
+            lastCompactionTs = ts
+          }
+          continue
+        }
+        if (event.type === 'session.compaction_start') continue
 
         if (event.type === 'subagent.selected') {
           selectedSubagentType = (event.data as SubagentSelectedData).agentName
@@ -950,6 +988,7 @@ function createJsonlParser(
               speed: 'standard' as const,
               deduplicationKey: dedupKey,
               userMessage: '',
+              ...(lastCompactionTs ? { compactedAt: lastCompactionTs } : {}),
             }
           }
           continue

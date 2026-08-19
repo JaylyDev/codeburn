@@ -2522,6 +2522,7 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
     ...(call.editFailed ? { editFailed: call.editFailed } : {}),
     ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
     ...(call.requestMultiplier != null ? { requestMultiplier: call.requestMultiplier } : {}),
+    ...(call.compactedAt ? { compactedAt: call.compactedAt } : {}),
     activeDurationMs: call.activeDurationMs,
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
@@ -3552,7 +3553,7 @@ async function parseProviderSources(
   let copilotRecon: {
     storeKeys: Set<string>
     storeCalls: Map<string, CopilotStamped[]>
-    rollupLegs: Map<string, Array<CopilotStamped & { rawTs: string }>>
+    rollupLegs: Map<string, Array<CopilotStamped & { rawTs: string; compactedAtMs: number }>>
     supplementaryStoreKeys: Set<string>
     sessionProject: Map<string, string>
     storeProject: Map<string, string>
@@ -3569,7 +3570,7 @@ async function parseProviderSources(
     const seenAggKeys = new Set<string>()
     const storeKeys = new Set<string>()
     const storeCalls = new Map<string, CopilotStamped[]>()
-    const rollupLegs = new Map<string, Array<CopilotStamped & { rawTs: string }>>()
+    const rollupLegs = new Map<string, Array<CopilotStamped & { rawTs: string; compactedAtMs: number }>>()
     const storeRowIds = new Map<string, Array<{ ts: number; dedupKey: string }>>()
     const perTurnTs = new Map<string, number[]>()
     const sessionProject = new Map<string, string>()
@@ -3636,7 +3637,8 @@ async function parseProviderSources(
             if (c.project && !storeProject.has(turn.sessionId)) storeProject.set(turn.sessionId, c.project)
           } else {
             const legs = rollupLegs.get(aggKey) ?? []
-            legs.push({ ...stamped, rawTs: c.timestamp })
+            const compactedAtMs = c.compactedAt ? new Date(c.compactedAt).getTime() : NaN
+            legs.push({ ...stamped, rawTs: c.timestamp, compactedAtMs: Number.isNaN(compactedAtMs) ? -Infinity : compactedAtMs })
             rollupLegs.set(aggKey, legs)
           }
         }
@@ -3870,7 +3872,7 @@ async function parseProviderSources(
       // strict (prev, ts] rule would hand all their rows to the first and
       // mint a full-delta residual for the second, double-counting. Coalesce
       // them into one leg so the shared instant subtracts its rows once.
-      const coalesced: Array<CopilotStamped & { rawTs: string }> = []
+      const coalesced: Array<CopilotStamped & { rawTs: string; compactedAtMs: number }> = []
       for (const leg of legs) {
         const last = coalesced[coalesced.length - 1]
         if (last && last.ts === leg.ts) {
@@ -3878,6 +3880,7 @@ async function parseProviderSources(
           last.cacheRead += leg.cacheRead
           last.cacheWrite += leg.cacheWrite
           last.reasoning += leg.reasoning
+          last.compactedAtMs = Math.max(last.compactedAtMs, leg.compactedAtMs)
         } else {
           coalesced.push({ ...leg })
         }
@@ -3888,9 +3891,19 @@ async function parseProviderSources(
       for (let legIdx = 0; legIdx < coalesced.length; legIdx++) {
         const leg = coalesced[legIdx]!
         const covered = { input: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 }
+        // An in-session compaction RESETS the CLI's rollup counters, so a leg
+        // containing one describes only its post-compaction requests. Starting
+        // its interval at the previous leg would subtract the whole
+        // pre-compaction conversation from a rollup that never counted it, and
+        // the residual would come out short by exactly that much — the
+        // undercount is invisible while the store is complete (the floor hides
+        // it) and permanent once a partial snapshot is sealed into a day.
+        // Anchor at the compaction instead: pre-compaction rows still SERVE,
+        // they just stop cancelling usage the rollup never claimed.
+        const intervalStart = Math.max(prevLegTs, leg.compactedAtMs)
         while (rowIdx < rows.length && rows[rowIdx]!.ts <= leg.ts) {
           const row = rows[rowIdx]!
-          if (row.ts > prevLegTs) {
+          if (row.ts > intervalStart) {
             covered.input += row.input
             covered.cacheRead += row.cacheRead
             covered.cacheWrite += row.cacheWrite

@@ -54,6 +54,12 @@ export type ParsedProviderCall = {
   locAdded?: number
   locRemoved?: number
   editFailed?: number
+  // Copilot shutdown rollups only: the stamp of the last SUCCESSFUL in-session
+  // compaction before this leg. A compaction resets the CLI's rollup counters,
+  // so the leg describes only the requests after it; serve-time reconciliation
+  // starts the leg's store-row subtraction interval here instead of at the
+  // previous leg. Omitted when the leg contains no compaction.
+  compactedAt?: string
   // Copilot session-store billing metadata, captured only — no report consumes
   // these yet (pricing/display design is upstream #890). total_nano_aiu is the
   // request's charged AI-credit amount in nano-AIU (1e9 nano-AIU = 1 credit =

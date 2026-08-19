@@ -1705,6 +1705,144 @@ describe.skipIf(!isSqliteAvailable())('(o) absence epoch: served totals are inde
 // rollup stands until rows actually land, partially-landed rows are topped
 // up by the residual to the rollup's own totals, and full coverage retires
 // the residual — counted once at every step and zero at none.
+// ═══════════════════════════════════════════════════════════════════════════
+// (c1) In-session compaction anchors the leg's store-row interval
+// ═══════════════════════════════════════════════════════════════════════════
+// The CLI's session.shutdown rollup RESETS its counters at a successful
+// in-session compaction (confirmed against @github/copilot 1.0.80:
+// `session.compaction_complete` with success:true, whose compactionTokensUsed
+// the CLI charges through its own recordUsage path). A leg containing one
+// therefore describes only its POST-compaction requests, and subtracting the
+// whole pre-compaction conversation from it makes the residual short by
+// exactly that much. The floor hides the error while the store is complete;
+// a partial snapshot turns it into a permanent undercount once a day seals.
+// (#946 review, blocker 2, the half the read-ordering fence cannot reach.)
+describe.skipIf(!isSqliteAvailable())('(c1) compaction-anchored residual intervals', () => {
+  // One session, one model, laid out as: row(s), an optional compaction, then
+  // a single shutdown rollup covering only what follows the compaction.
+  const writeCompactedSession = async (
+    sessionStateDir: string,
+    sessionId: string,
+    at: (offsetSec: number) => string,
+    opts: { compaction?: { atSec: number; success: boolean }; rollupInput: number },
+  ): Promise<void> => {
+    const dir = join(sessionStateDir, sessionId)
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'workspace.yaml'), `id: ${sessionId}\ncwd: /home/user/testproj\n`)
+    const lines = [
+      JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: 'claude-sonnet-4-5' } }),
+    ]
+    if (opts.compaction) {
+      lines.push(JSON.stringify({
+        type: 'session.compaction_start',
+        timestamp: at(opts.compaction.atSec - 1),
+        data: { currentTokens: 180000, tokenLimit: 200000, trigger: 'automatic' },
+      }))
+      // Real payload shape, extra fields included on purpose: the parser must
+      // read `success` and tolerate everything else.
+      lines.push(JSON.stringify({
+        type: 'session.compaction_complete',
+        timestamp: at(opts.compaction.atSec),
+        data: {
+          success: opts.compaction.success,
+          kind: opts.compaction.success ? 'background' : 'manualFailure',
+          compactionTokensUsed: { inputTokens: 1200, outputTokens: 300, copilotUsage: { totalNanoAiu: 4000000 } },
+          preCompactionTokens: 180000, postCompactionTokens: 20000,
+          messagesRemoved: 42, tokensRemoved: 160000, trigger: 'automatic',
+          model: 'claude-sonnet-4-5', requestId: 'req-x', duration: 900,
+        },
+      }))
+    }
+    lines.push(JSON.stringify({
+      type: 'session.shutdown',
+      timestamp: at(20),
+      data: {
+        shutdownType: 'routine',
+        modelMetrics: {
+          'claude-sonnet-4-5': {
+            requests: { count: 1, cost: 1 },
+            usage: { inputTokens: opts.rollupInput, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 },
+          },
+        },
+      },
+    }))
+    await writeFile(join(dir, 'events.jsonl'), lines.join('\n') + '\n')
+  }
+
+  const setup = async (name: string) => {
+    const sessionStateDir = join(tmpHome, `cmp-state-${name}`)
+    await mkdir(sessionStateDir, { recursive: true })
+    const dbPath = join(tmpHome, `cmp-store-${name}.db`)
+    vi.stubEnv('CODEBURN_COPILOT_SESSION_STATE_DIR', sessionStateDir)
+    vi.stubEnv('CODEBURN_COPILOT_SESSION_STORE_DB', dbPath)
+    vi.stubEnv('CODEBURN_COPILOT_DISABLE_OTEL', '1')
+    vi.stubEnv('CODEBURN_COPILOT_WS_STORAGE_DIR', join(tmpHome, 'no-ws'))
+    vi.stubEnv('CODEBURN_COPILOT_GLOBAL_STORAGE_DIR', join(tmpHome, 'no-global'))
+    vi.stubEnv('CODEBURN_COPILOT_JETBRAINS_DIR', join(tmpHome, 'no-jb'))
+    const base = Date.now() - 5 * 24 * 60 * 60 * 1000
+    const at = (offsetSec: number): string => new Date(base + offsetSec * 1000).toISOString()
+    createStoreDb(dbPath)
+    return { sessionStateDir, dbPath, at }
+  }
+
+  const totalInput = (projects: Awaited<ReturnType<typeof parseAllSessions>>): number =>
+    projects.flatMap(p => p.sessions).flatMap(s => s.turns).flatMap(t => t.assistantCalls)
+      .reduce((sum, c) => sum + c.usage.inputTokens, 0)
+
+  it("totals the maintainer's compaction repro at 300 with the post-compaction row missing", async () => {
+    const { sessionStateDir, dbPath, at } = await setup('repro')
+    // Row A: 100 tokens, BEFORE the compaction. Request B's row has not landed
+    // in this snapshot. The sole rollup carries 200 — request B only.
+    insertStoreRow(dbPath, 'sess-cmp', 100, 0, 0, at(5))
+    await writeCompactedSession(sessionStateDir, 'sess-cmp', at, {
+      compaction: { atSec: 10, success: true }, rollupInput: 200,
+    })
+
+    // A(100) served as a row + a residual of the full 200 the rollup claims,
+    // because no row in (compaction, shutdown] can account for any of it.
+    // Anchoring at the previous leg instead subtracts A and reports 200.
+    expect(totalInput(await parseAllSessions(undefined, 'copilot'))).toBe(300)
+
+    // Idempotent through the cache: compactedAt is persisted with the leg.
+    clearSessionCache()
+    expect(totalInput(await parseAllSessions(undefined, 'copilot'))).toBe(300)
+  })
+
+  it('does not double once the post-compaction row lands', async () => {
+    const { sessionStateDir, dbPath, at } = await setup('complete')
+    insertStoreRow(dbPath, 'sess-cmp2', 100, 0, 0, at(5))   // pre-compaction
+    insertStoreRow(dbPath, 'sess-cmp2', 200, 0, 0, at(15))  // post-compaction, = the rollup
+    await writeCompactedSession(sessionStateDir, 'sess-cmp2', at, {
+      compaction: { atSec: 10, success: true }, rollupInput: 200,
+    })
+
+    // The post-compaction row covers the leg exactly, so the residual retires
+    // to zero and the total is the two rows. Same answer the missing-row case
+    // converges to, which is the point.
+    expect(totalInput(await parseAllSessions(undefined, 'copilot'))).toBe(300)
+  })
+
+  it('ignores a FAILED compaction — nothing reset, so nothing to anchor', async () => {
+    const { sessionStateDir, dbPath, at } = await setup('failed')
+    insertStoreRow(dbPath, 'sess-cmp3', 100, 0, 0, at(5))
+    await writeCompactedSession(sessionStateDir, 'sess-cmp3', at, {
+      compaction: { atSec: 10, success: false }, rollupInput: 200,
+    })
+
+    // A failed compaction leaves the counters alone, so the rollup really does
+    // cover row A: 100 (row) + 100 (residual) = 200, unchanged behaviour.
+    expect(totalInput(await parseAllSessions(undefined, 'copilot'))).toBe(200)
+  })
+
+  it('leaves a leg with no compaction on the previous-leg interval', async () => {
+    const { sessionStateDir, dbPath, at } = await setup('none')
+    insertStoreRow(dbPath, 'sess-cmp4', 100, 0, 0, at(5))
+    await writeCompactedSession(sessionStateDir, 'sess-cmp4', at, { rollupInput: 200 })
+
+    expect(totalInput(await parseAllSessions(undefined, 'copilot'))).toBe(200)
+  })
+})
+
 describe.skipIf(!isSqliteAvailable())('(p) reconciliation never outruns the served store rows', () => {
   it('serves the rollup total at every stage while rows progressively land', async () => {
     const { dbPath, at, writeSession, sumUsage } = await setupCopilotStoreEnv()
