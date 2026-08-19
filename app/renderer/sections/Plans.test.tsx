@@ -214,7 +214,7 @@ describe('Plans', () => {
 
     render(<Plans period="30days" />)
 
-    expect(await screen.findByText('€20.00 / month · cursor')).toBeInTheDocument()
+    expect(await screen.findByText('€20.00 / calendar month · API-equivalent budget, not live quota · cursor')).toBeInTheDocument()
     expect(screen.getByText('€8.20 · 41%')).toBeInTheDocument()
   })
 
