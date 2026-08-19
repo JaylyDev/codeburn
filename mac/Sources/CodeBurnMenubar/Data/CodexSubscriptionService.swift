@@ -79,7 +79,7 @@ enum CodexSubscriptionService {
     }
 
     static func disconnect() {
-        CodexCredentialStore.resetBootstrap()
+        _ = CodexCredentialStore.resetBootstrap()
         clearUsageBlock()
     }
 

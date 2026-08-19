@@ -5,7 +5,7 @@ import Security
 /// ClaudeCredentialStore but reads from ~/.codex/auth.json — Codex CLI
 /// already stores its tokens as plaintext JSON in the home directory, so
 /// no keychain prompt is involved on bootstrap. After the user clicks
-/// Connect we cache a copy under ~/Library/Application Support/CodeBurn so
+/// Connect we cache a CodeBurn-owned copy in the macOS Keychain so
 /// we keep using rotated tokens after refresh.
 enum CodexCredentialStore {
     private static let bootstrapCompletedKey = "codeburn.codex.bootstrapCompleted"
@@ -23,8 +23,36 @@ enum CodexCredentialStore {
 
     private static let cacheFilename = "codex-credentials.v1.json"
 
+    static let ourKeychainService = CodeBurnKeychainIdentity.codexService
+    static let ourKeychainAccount = CodeBurnKeychainIdentity.account
+
     private static let lock = NSLock()
     private nonisolated(unsafe) static var memoryCache: CachedRecord?
+
+    // MARK: - Injectable seams (tests + staged Keychain migration)
+
+    nonisolated(unsafe) static var applicationSupportDirectoryOverride: URL?
+    nonisolated(unsafe) static var homeDirectoryOverride: URL?
+    nonisolated(unsafe) static var userDefaultsOverride: UserDefaults?
+    nonisolated(unsafe) static var keychainCache: any KeychainCredentialCaching = LiveKeychainCredentialCache()
+
+    static func resetTestSeams() {
+        applicationSupportDirectoryOverride = nil
+        homeDirectoryOverride = nil
+        userDefaultsOverride = nil
+        keychainCache = LiveKeychainCredentialCache()
+        lastCacheDeleteResult = nil
+        lastLegacyCleanupFailed = false
+        lock.withLock { memoryCache = nil }
+    }
+
+    private static var defaults: UserDefaults {
+        userDefaultsOverride ?? .standard
+    }
+
+    private static var homeDirectory: URL {
+        homeDirectoryOverride ?? FileManager.default.homeDirectoryForCurrentUser
+    }
 
     struct CachedRecord {
         let record: CredentialRecord
@@ -97,15 +125,27 @@ enum CodexCredentialStore {
     // MARK: - Bootstrap state
 
     static var isBootstrapCompleted: Bool {
-        get { UserDefaults.standard.bool(forKey: bootstrapCompletedKey) }
-        set { UserDefaults.standard.set(newValue, forKey: bootstrapCompletedKey) }
+        get { defaults.bool(forKey: bootstrapCompletedKey) }
+        set { defaults.set(newValue, forKey: bootstrapCompletedKey) }
     }
 
-    static func resetBootstrap() {
+    static func resetBootstrap() -> CacheDeleteResult {
         lock.withLock { memoryCache = nil }
-        deleteOurCache()
+        let result = deleteOurCache()
+        lastCacheDeleteResult = result
         isBootstrapCompleted = false
+        return result
     }
+
+    struct CacheDeleteResult: Equatable {
+        var keychainDeletedOrAbsent: Bool
+        var legacyDeletedOrAbsent: Bool
+        var isSuccess: Bool { keychainDeletedOrAbsent && legacyDeletedOrAbsent }
+    }
+
+    nonisolated(unsafe) static var lastCacheDeleteResult: CacheDeleteResult?
+    nonisolated(unsafe) static var lastLegacyCleanupFailed = false
+
 
     // MARK: - Public API
 
@@ -170,7 +210,7 @@ enum CodexCredentialStore {
     // MARK: - Bootstrap source: ~/.codex/auth.json
 
     private static func readCodexAuth() throws -> CredentialRecord {
-        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(codexAuthPath)
+        let url = homeDirectory.appendingPathComponent(codexAuthPath)
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw StoreError.bootstrapNoSource
         }
@@ -231,7 +271,7 @@ enum CodexCredentialStore {
     /// key (OPENAI_API_KEY, auth_mode, ...) and only rewrites the tokens dict and
     /// last_refresh. Keeps the CLI and the menubar on the same rotated grant.
     private static func writeBackToCodexAuth(record: CredentialRecord) {
-        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(codexAuthPath)
+        let url = homeDirectory.appendingPathComponent(codexAuthPath)
         var json: [String: Any] = [:]
         if let data = try? SafeFile.read(from: url.path, maxBytes: maxCredentialBytes),
            let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -250,40 +290,117 @@ enum CodexCredentialStore {
         guard let out = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) else {
             return
         }
-        try? out.write(to: url, options: .atomic)
+        try? SafeFile.write(out, to: url.path, mode: 0o600)
     }
 
-    // MARK: - Local cache file
+    // MARK: - Local cache (injectable Application Support + Keychain seam)
 
-    private static func cacheFileURL() -> URL {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+    static func cacheFileURL() -> URL {
+        let support = applicationSupportDirectoryOverride
+            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? homeDirectory.appendingPathComponent("Library/Application Support")
         return support
             .appendingPathComponent("CodeBurn", isDirectory: true)
             .appendingPathComponent(cacheFilename)
     }
 
+    /// Production-used write path. Persists rotation fields to the CodeBurn
+    /// Keychain item. After verified read-back, unlinks any legacy JSON.
+    static func writeOurCache(record: CredentialRecord) throws {
+        let data = try JSONEncoder().encode(record)
+        try keychainCache.upsert(
+            service: ourKeychainService,
+            account: ourKeychainAccount,
+            data: data
+        )
+        guard let readBack = try keychainCache.read(service: ourKeychainService, account: ourKeychainAccount),
+              let roundTrip = try? JSONDecoder().decode(CredentialRecord.self, from: readBack),
+              roundTrip.accessToken == record.accessToken,
+              roundTrip.refreshToken == record.refreshToken,
+              roundTrip.idToken == record.idToken,
+              roundTrip.accountId == record.accountId
+        else {
+            throw StoreError.fileWriteFailed("keychain read-back mismatch")
+        }
+        tryUnlinkLegacyAfterVerifiedKeychain()
+    }
+
     private static func readOurCache() throws -> CredentialRecord? {
+        if let data = try keychainCache.read(service: ourKeychainService, account: ourKeychainAccount),
+           let record = try? JSONDecoder().decode(CredentialRecord.self, from: data) {
+            tryUnlinkLegacyAfterVerifiedKeychain()
+            return record
+        }
+        return try migrateLegacyFileIfPresent()
+    }
+
+    private static func migrateLegacyFileIfPresent() throws -> CredentialRecord? {
         let url = cacheFileURL()
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        let data = try SafeFile.read(from: url.path, maxBytes: maxCredentialBytes)
-        guard let record = try? JSONDecoder().decode(CredentialRecord.self, from: data) else { return nil }
-        return record
+
+        let data: Data
+        do {
+            data = try SafeFile.readAfterSecuringPermissions(
+                from: url.path,
+                maxBytes: maxCredentialBytes
+            )
+        } catch {
+            return nil
+        }
+
+        guard let decoded = try? JSONDecoder().decode(CredentialRecord.self, from: data) else {
+            return nil
+        }
+
+        do {
+            try writeOurCache(record: decoded)
+            return decoded
+        } catch {
+            lastLegacyCleanupFailed = false
+            return decoded
+        }
     }
 
-    private static func writeOurCache(record: CredentialRecord) throws {
-        try writeOurFileCache(record: record)
-    }
-
-    private static func writeOurFileCache(record: CredentialRecord) throws {
+    private static func tryUnlinkLegacyAfterVerifiedKeychain() {
         let url = cacheFileURL()
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let data = try JSONEncoder().encode(record)
-        try data.write(to: url, options: [.atomic, .completeFileProtection])
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            lastLegacyCleanupFailed = false
+            return
+        }
+        do {
+            try FileManager.default.removeItem(at: url)
+            lastLegacyCleanupFailed = false
+        } catch {
+            lastLegacyCleanupFailed = true
+        }
     }
 
-    private static func deleteOurCache() {
-        try? FileManager.default.removeItem(at: cacheFileURL())
+    @discardableResult
+    private static func deleteOurCache() -> CacheDeleteResult {
+        var keychainOK = true
+        do {
+            try keychainCache.delete(service: ourKeychainService, account: ourKeychainAccount)
+        } catch {
+            keychainOK = false
+        }
+
+        var legacyOK = true
+        let url = cacheFileURL()
+        if FileManager.default.fileExists(atPath: url.path) {
+            do {
+                try FileManager.default.removeItem(at: url)
+            } catch {
+                legacyOK = false
+            }
+        }
+        return CacheDeleteResult(
+            keychainDeletedOrAbsent: keychainOK,
+            legacyDeletedOrAbsent: legacyOK
+        )
+    }
+
+    static func clearMemoryCacheForTesting() {
+        lock.withLock { memoryCache = nil }
     }
 
     private static func cacheInMemory(_ record: CredentialRecord) {

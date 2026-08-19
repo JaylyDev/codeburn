@@ -1070,7 +1070,11 @@ final class AppStore {
         // result instead of re-populating the cleared state.
         claudeRefreshGen &+= 1
         subscription = nil
-        subscriptionError = nil
+        if let result = ClaudeCredentialStore.lastCacheDeleteResult, !result.isSuccess {
+            subscriptionError = "Could not fully remove the local Claude credential cache."
+        } else {
+            subscriptionError = nil
+        }
         subscriptionLoadState = .notBootstrapped
         capacityEstimates = [:]
         Task.detached { await SubscriptionSnapshotStore.clearAll() }
@@ -1134,7 +1138,11 @@ final class AppStore {
         CodexSubscriptionService.disconnect()
         codexRefreshGen &+= 1
         codexUsage = nil
-        codexError = nil
+        if let result = CodexCredentialStore.lastCacheDeleteResult, !result.isSuccess {
+            codexError = "Could not fully remove the local Codex credential cache."
+        } else {
+            codexError = nil
+        }
         codexLoadState = .notBootstrapped
         NotificationCenter.default.post(name: .codeBurnSubscriptionDisconnected, object: nil)
     }

@@ -100,7 +100,7 @@ enum ClaudeSubscriptionService {
 
     /// Reset everything — used on user-initiated disconnect.
     static func disconnect() {
-        ClaudeCredentialStore.resetBootstrap()
+        _ = ClaudeCredentialStore.resetBootstrap()
         clearUsageBlock()
     }
 

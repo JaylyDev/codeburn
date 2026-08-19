@@ -101,6 +101,72 @@ enum SafeFile {
         return data
     }
 
+    enum SecureReadError: Swift.Error, Equatable {
+        case notRegularFile(String)
+        case wrongOwner(String)
+        case chmodFailed(String, Int32)
+        case modeVerifyFailed(String, mode_t)
+    }
+
+    /// Legacy credential migration path: open with `O_NOFOLLOW`, refuse non-regular /
+    /// non-owned files, `fchmod(0600)` and verify mode, then read bounded bytes from
+    /// the same descriptor. Permissions are repaired before any secret byte is read.
+    static func readAfterSecuringPermissions(
+        from path: String,
+        maxBytes: Int = defaultReadLimit,
+        expectedOwner: uid_t = geteuid()
+    ) throws -> Data {
+        var linkInfo = stat()
+        guard lstat(path, &linkInfo) == 0 else {
+            throw Error.readFailed(path, errno)
+        }
+        if (linkInfo.st_mode & S_IFMT) == S_IFLNK {
+            throw Error.symlinkDetected(path)
+        }
+        guard (linkInfo.st_mode & S_IFMT) == S_IFREG else {
+            throw SecureReadError.notRegularFile(path)
+        }
+        guard linkInfo.st_uid == expectedOwner else {
+            throw SecureReadError.wrongOwner(path)
+        }
+
+        let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW)
+        guard fd >= 0 else {
+            throw Error.readFailed(path, errno)
+        }
+        defer { Darwin.close(fd) }
+
+        if fchmod(fd, 0o600) != 0 {
+            throw SecureReadError.chmodFailed(path, errno)
+        }
+        var verified = stat()
+        guard fstat(fd, &verified) == 0 else {
+            throw Error.readFailed(path, errno)
+        }
+        let mode = verified.st_mode & 0o777
+        guard mode == 0o600 else {
+            throw SecureReadError.modeVerifyFailed(path, mode)
+        }
+
+        let size = Int(verified.st_size)
+        if size > maxBytes {
+            throw Error.sizeLimitExceeded(path, size)
+        }
+
+        var data = Data(count: max(size, 0))
+        let readBytes: Int = data.withUnsafeMutableBytes { buffer -> Int in
+            guard let base = buffer.baseAddress else { return 0 }
+            return Darwin.read(fd, base, buffer.count)
+        }
+        guard readBytes >= 0 else {
+            throw Error.readFailed(path, errno)
+        }
+        if readBytes < data.count {
+            data = data.prefix(readBytes)
+        }
+        return data
+    }
+
     /// Runs `body` while holding an exclusive POSIX advisory lock on `path`. The lock file is
     /// created if missing (with 0o600 permissions) and released on scope exit, so other
     /// codeburn processes (the CLI running in a terminal, say) block on the same file instead
