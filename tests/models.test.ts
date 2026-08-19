@@ -59,6 +59,17 @@ describe('getModelCosts', () => {
     expect(lower!.inputCostPerToken).toBe(upper!.inputCostPerToken)
     expect(lower!.outputCostPerToken).toBe(upper!.outputCostPerToken)
   })
+
+  it('prices glm-5.3 (Hermes / Cline spelling) instead of leaving it unpriced', () => {
+    const lower = getModelCosts('glm-5.3')
+    const upper = getModelCosts('GLM-5.3')
+    const sibling = getModelCosts('glm-5p2')
+    expect(lower).not.toBeNull()
+    expect(upper).not.toBeNull()
+    expect(sibling).not.toBeNull()
+    expect(lower!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
+    expect(upper!.outputCostPerToken).toBe(sibling!.outputCostPerToken)
+  })
 })
 
 describe('getShortModelName', () => {
@@ -113,6 +124,8 @@ describe('getShortModelName', () => {
     expect(getShortModelName('GLM-5.2')).toBe('GLM-5.2')
     expect(getShortModelName('glm-5.2')).toBe('GLM-5.2')
     expect(getShortModelName('glm-5p1')).toBe('GLM-5.2')
+    expect(getShortModelName('glm-5.3')).toBe('GLM-5.3')
+    expect(getShortModelName('GLM-5.3')).toBe('GLM-5.3')
     // Grok Build prices via the grok-build-0.1 sibling.
     expect(getShortModelName('grok-build')).toBe('Grok Build')
     expect(getShortModelName('grok-build-0.1')).toBe('Grok Build')

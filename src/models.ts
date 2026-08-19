@@ -363,6 +363,10 @@ const BUILTIN_ALIASES: Record<string, string> = {
   // sessions table, so it misses the capitalized alias above and goes
   // unpriced. Map the lowercase spelling to the same sibling.
   'glm-5.2':                        'glm-5p1',
+  // GLM-5.3 is not in the LiteLLM snapshot yet. Price as the nearest
+  // released sibling (GLM-5.2 / glm-5p2). Hermes stores the id lowercased.
+  'GLM-5.3':                        'glm-5p2',
+  'glm-5.3':                        'glm-5p2',
 }
 
 let userAliases: Record<string, string> = {}
@@ -845,6 +849,8 @@ export function calculateCost(
 }
 
 const autoModelNames: Record<string, string> = {
+  'glm-5.3': 'GLM-5.3',
+  'GLM-5.3': 'GLM-5.3',
   'cursor-auto': 'Cursor (auto)',
   'cursor-agent-auto': 'Cursor (auto)',
   'copilot-auto': 'Copilot (auto)',

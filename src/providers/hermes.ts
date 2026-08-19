@@ -87,6 +87,29 @@ function getHermesHome(override?: string): string {
   return override ?? process.env['HERMES_HOME'] ?? join(homedir(), '.hermes')
 }
 
+function displayProjectForProfile(profile: string): string {
+  return profile === 'default' ? 'hermes' : sanitizeProject(profile)
+}
+
+function extractGithubPullUrls(...texts: Array<string | null | undefined>): string[] {
+  const found = new Set<string>()
+  const re = /https:\/\/github\.com\/[^/\s"'<>]+\/[^/\s"'<>]+\/pull\/\d+/gi
+  for (const text of texts) {
+    if (!text) continue
+    for (const match of text.matchAll(re)) {
+      try {
+        const url = new URL(match[0])
+        if (url.protocol !== 'https:') continue
+        if (!/^\/[^/]+\/[^/]+\/pull\/\d+$/.test(url.pathname)) continue
+        found.add(`${url.origin}${url.pathname}`)
+      } catch {
+        // skip malformed
+      }
+    }
+  }
+  return [...found].sort()
+}
+
 function sanitizeProject(raw: string): string {
   const trimmed = raw.trim()
   if (!trimmed) return 'hermes'
@@ -291,7 +314,7 @@ async function discoverFromDb(dbPath: string, profile: string): Promise<SessionS
 
     return rows.map(row => ({
       path: encodeSourcePath(dbPath, row.id),
-      project: sanitizeProject(profile),
+      project: displayProjectForProfile(profile),
       provider: 'hermes',
     }))
   } catch (err) {
@@ -383,11 +406,16 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
         const cwd = row.cwd?.trim()
         const projectInfo = cwd
           ? { project: sanitizeProject(cwd), projectPath: cwd }
-          : inferProject(messages, sanitizeProject(profile))
+          : inferProject(messages, displayProjectForProfile(profile))
         const timestamp = parseTimestamp(row.started_at)
         const dedupKey = `hermes:${profile}:${row.id}`
         if (seenKeys.has(dedupKey)) return
         seenKeys.add(dedupKey)
+
+        const prLinks = extractGithubPullUrls(
+          ...messages.map(msg => msg.content),
+          ...messages.map(msg => msg.tool_calls),
+        )
 
         // Hermes bills reasoning tokens at the output rate (same as Gemini).
         // The LiteLLM model table is used as a fallback when Hermes has not
@@ -432,6 +460,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
           sessionId: row.id,
           project: projectInfo.project,
           projectPath: projectInfo.projectPath,
+          ...(prLinks.length > 0 ? { prLinks } : {}),
         }
       } catch (err) {
         // A transient lock on the live state.db must propagate so the caller

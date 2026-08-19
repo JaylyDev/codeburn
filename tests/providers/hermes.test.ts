@@ -222,7 +222,7 @@ skipUnlessSqlite('hermes provider', () => {
     expect(sessions).toHaveLength(1)
     expect(sessions[0]!.provider).toBe('hermes')
     expect(sessions[0]!.path).toBe(`${dbPath}#hermes-session=session-1`)
-    expect(sessions[0]!.project).toBe('default')
+    expect(sessions[0]!.project).toBe('hermes')
   })
 
   it('parses session-level token usage and tool calls from messages', async () => {
@@ -407,7 +407,7 @@ skipUnlessSqlite('hermes provider', () => {
       `${profileDbPath}#hermes-session=profile-session`,
       `${rootDbPath}#hermes-session=root-session`,
     ].sort())
-    expect(discovered.map(s => s.project).sort()).toEqual(['coder', 'default'])
+    expect(discovered.map(s => s.project).sort()).toEqual(['coder', 'hermes'])
 
     const rootCalls = await collectCalls(tmpDir, `${rootDbPath}#hermes-session=root-session`)
     const profileCalls = await collectCalls(tmpDir, `${profileDbPath}#hermes-session=profile-session`)
@@ -495,8 +495,29 @@ skipUnlessSqlite('hermes provider', () => {
     const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=sibling-session`)
     expect(calls[0]).toMatchObject({
       deduplicationKey: 'hermes:default:sibling-session',
-      project: 'default',
+      project: 'hermes',
     })
+  })
+
+  it('captures GitHub pull URLs from Hermes transcript text', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'pr-session',
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('pr-session', 'assistant', 'Opened https://github.com/getagentseal/codeburn/pull/1037 for review', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=pr-session`)
+    expect(calls[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/1037'])
+    expect(calls[0]?.project).toBe('hermes')
   })
 
   it('infers projects from Windows current working directory messages', async () => {
