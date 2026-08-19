@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, rm, utimes, writeFile } from 'fs/promises'
 import { basename, dirname, join } from 'path'
-import { tmpdir } from 'os'
+import { tmpdir, homedir } from 'os'
 import { createRequire } from 'node:module'
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -540,6 +540,53 @@ skipUnlessSqlite('hermes provider', () => {
 
     const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=tool-pr-noise`)
     expect(calls[0]?.prLinks).toBeUndefined()
+  })
+
+  it('treats ACP sessions as the Buzz app, not a Hermes folder', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'acp-session',
+        source: 'acp',
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('acp-session', 'user', 'hello from buzz', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=acp-session`)
+    expect(calls[0]).toMatchObject({
+      provider: 'buzz',
+      project: 'buzz',
+    })
+  })
+
+  it('does not treat $HOME as a project', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'home-cwd',
+        source: 'desktop',
+        cwd: homedir(),
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('home-cwd', 'user', 'hi', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=home-cwd`)
+    expect(calls[0]?.provider).toBe('hermes')
+    expect(calls[0]?.project).toBe('hermes')
   })
 
   it('infers projects from Windows current working directory messages', async () => {

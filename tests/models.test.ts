@@ -71,6 +71,8 @@ describe('getModelCosts', () => {
     expect(upper!.outputCostPerToken).toBe(sibling!.outputCostPerToken)
     expect(getModelCosts('cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
     expect(getModelCosts('omniroute:cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
+    expect(getModelCosts('glm-5.4')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
+    expect(getModelCosts('cmd/deepseek/deepseek-v4-flash')).not.toBeNull()
   })
 })
 

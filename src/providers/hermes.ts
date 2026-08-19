@@ -12,6 +12,7 @@ type HermesSessionRow = {
   source: string | null
   model: string | null
   cwd: string | null
+  git_repo_root: string | null
   billing_provider: string | null
   input_tokens: number | null
   output_tokens: number | null
@@ -271,6 +272,38 @@ function collectTools(messages: HermesMessageRow[]): { tools: string[]; toolSequ
   }
 }
 
+function isRealWorkspace(cwd: string | null | undefined): cwd is string {
+  if (!cwd?.trim()) return false
+  const normalized = cwd.replace(/\\/g, '/').replace(/\/+$/, '')
+  if (normalized === '/' || normalized === homedir() || normalized === homedir().replace(/\\/g, '/')) return false
+  if (/\.app\/Contents\//.test(normalized)) return false
+  return true
+}
+
+function hermesSurfaceProvider(source: string | null | undefined): 'hermes' | 'buzz' {
+  return source === 'acp' ? 'buzz' : 'hermes'
+}
+
+function resolveHermesWorkspace(
+  row: HermesSessionRow,
+  messages: HermesMessageRow[],
+): { project: string; projectPath?: string; provider: 'hermes' | 'buzz' } {
+  const provider = hermesSurfaceProvider(row.source)
+  const repo = row.git_repo_root?.trim()
+  if (isRealWorkspace(repo)) {
+    return { project: sanitizeProject(basename(repo)), projectPath: repo, provider }
+  }
+  const cwd = row.cwd?.trim()
+  if (isRealWorkspace(cwd)) {
+    return { project: sanitizeProject(cwd), projectPath: cwd, provider }
+  }
+  const inferred = inferProject(messages, '')
+  if (isRealWorkspace(inferred.projectPath)) {
+    return { ...inferred, provider }
+  }
+  return { project: provider, provider }
+}
+
 function inferProject(messages: HermesMessageRow[], fallback: string): { project: string; projectPath?: string } {
   const cwdPattern = /^Current working directory:\s*([a-zA-Z]:\\[^\r\n`"]+|\/[^\r\n`"\\]+)/m
   for (const msg of messages) {
@@ -355,6 +388,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
                   ${nullableColumn(columns, 'source')},
                   ${nullableColumn(columns, 'model')},
                   ${nullableColumn(columns, 'cwd')},
+                  ${nullableColumn(columns, 'git_repo_root')},
                   ${nullableColumn(columns, 'billing_provider')},
                   ${numberColumn(columns, 'input_tokens')},
                   ${numberColumn(columns, 'output_tokens')},
@@ -400,13 +434,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
 
         const model = row.model ?? 'unknown'
         const { tools, toolSequence, bashCommands } = collectTools(messages)
-        // Hermes records the session's working directory in sessions.cwd.
-        // Prefer it; fall back to scraping a "Current working directory:" line
-        // from the transcript (older builds), then to the profile name.
-        const cwd = row.cwd?.trim()
-        const projectInfo = cwd
-          ? { project: sanitizeProject(cwd), projectPath: cwd }
-          : inferProject(messages, displayProjectForProfile(profile))
+        const workspace = resolveHermesWorkspace(row, messages)
         const timestamp = parseTimestamp(row.started_at)
         const dedupKey = `hermes:${profile}:${row.id}`
         if (seenKeys.has(dedupKey)) return
@@ -439,7 +467,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
         const costIsEstimated = recordedCost === null
 
         result = {
-          provider: 'hermes',
+          provider: workspace.provider,
           model,
           inputTokens,
           outputTokens,
@@ -459,8 +487,8 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
           toolSequence: toolSequence.length > 0 ? toolSequence : undefined,
           userMessage: firstUserMessage(messages),
           sessionId: row.id,
-          project: projectInfo.project,
-          projectPath: projectInfo.projectPath,
+          project: workspace.project,
+          projectPath: workspace.projectPath,
           ...(prLinks.length > 0 ? { prLinks } : {}),
         }
       } catch (err) {

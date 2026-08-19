@@ -609,6 +609,51 @@ function getCanonicalName(model: string): string {
     .replace(/\[[^\]]*\]$/, '') // strip context tag: Codex records Kimi as k3[1m], so kimi/k3[1m] -> k3
 }
 
+// Routing wrappers (OmniRoute, Cline Pass, cmd/, …) are not model ids.
+// Peel them so any plan/gateway spelling of the same model shares one price.
+const ROUTER_PREFIXES = [
+  /^omniroute:/i,
+  /^cp\//i,
+  /^cline-pass\//i,
+  /^cline-free\//i,
+  /^cmd\//i,
+  /^antigravity\//i,
+  /^xiaomi\//i,
+]
+
+function routedModelCandidates(model: string): string[] {
+  const ids: string[] = []
+  const seen = new Set<string>()
+  const push = (value: string) => {
+    if (!value || seen.has(value)) return
+    seen.add(value)
+    ids.push(value)
+  }
+  push(model)
+  let current = getCanonicalName(model)
+  push(current)
+  let peeled = true
+  while (peeled) {
+    peeled = false
+    for (const prefix of ROUTER_PREFIXES) {
+      const next = current.replace(prefix, '')
+      if (next && next !== current) {
+        current = next
+        push(current)
+        peeled = true
+      }
+    }
+  }
+  if (current.includes('/')) push(current.slice(current.lastIndexOf('/') + 1))
+  const leaf = current.includes('/') ? current.slice(current.lastIndexOf('/') + 1) : current
+  if (/^glm-5(?:\.\d+)?$/i.test(leaf)) {
+    push('glm-5p2')
+    push('glm-5p1')
+    push('glm-5')
+  }
+  return ids
+}
+
 function stripKnownPricingVariantSuffix(model: string): string | null {
   const withoutColonSuffix = model.replace(/:(thinking|cloud)$/i, '')
   if (withoutColonSuffix !== model) return withoutColonSuffix
@@ -641,14 +686,10 @@ export function getModelCosts(model: string): ModelCosts | null {
 
   if (pricingCache.has(canonical)) return pricingCache.get(canonical)!
 
-  // Gateway ids such as cp/cline-pass/glm-5.3 survive one prefix strip as
-  // cline-pass/glm-5.3. Price the last path segment through the same aliases
-  // getShortModelName already uses for the label.
-  if (canonical.includes('/')) {
-    const segment = canonical.slice(canonical.lastIndexOf('/') + 1)
-    const aliasedSegment = resolveAlias(segment)
-    if (pricingCache.has(aliasedSegment)) return pricingCache.get(aliasedSegment)!
-    if (pricingCache.has(segment)) return pricingCache.get(segment)!
+  for (const candidate of routedModelCandidates(model)) {
+    const aliased = resolveAlias(candidate)
+    if (pricingCache.has(aliased)) return pricingCache.get(aliased)!
+    if (pricingCache.has(candidate)) return pricingCache.get(candidate)!
   }
 
   const prefixOverride = getPriceOverridePrefix(canonical)
