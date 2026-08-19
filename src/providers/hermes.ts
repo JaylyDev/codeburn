@@ -155,7 +155,20 @@ function resolveGitCommonDir(gitDir: string): string {
   return join(gitDir, rel)
 }
 
+// Memoized per repo root: every session in the same repo would otherwise
+// re-read .git/config. Process-lifetime only, so a remote URL change needs a
+// restart (a resident `serve` child included).
+const originIdentityByRoot = new Map<string, { owner: string; repo: string } | null>()
+
 function githubOwnerRepoFromRoot(repoRoot: string): { owner: string; repo: string } | null {
+  const memo = originIdentityByRoot.get(repoRoot)
+  if (memo !== undefined) return memo
+  const identity = readGithubOwnerRepoFromRoot(repoRoot)
+  originIdentityByRoot.set(repoRoot, identity)
+  return identity
+}
+
+function readGithubOwnerRepoFromRoot(repoRoot: string): { owner: string; repo: string } | null {
   try {
     let gitDir = join(repoRoot, '.git')
     if (!existsSync(gitDir)) return null
