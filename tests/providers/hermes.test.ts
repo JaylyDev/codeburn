@@ -520,6 +520,28 @@ skipUnlessSqlite('hermes provider', () => {
     expect(calls[0]?.project).toBe('hermes')
   })
 
+  it('ignores GitHub pull URLs that only appear in tool dumps', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'tool-pr-noise',
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('tool-pr-noise', 'tool', 'https://github.com/getagentseal/codeburn/pull/677 https://github.com/getagentseal/codeburn/pull/691', 1779549201)
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('tool-pr-noise', 'assistant', 'Closed the stale draft. Next is Keychain.', 1779549202)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=tool-pr-noise`)
+    expect(calls[0]?.prLinks).toBeUndefined()
+  })
+
   it('infers projects from Windows current working directory messages', async () => {
     const dbPath = createHermesDb(tmpDir)
     withTestDb(dbPath, (db) => {

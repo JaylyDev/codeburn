@@ -413,8 +413,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
         seenKeys.add(dedupKey)
 
         const prLinks = extractGithubPullUrls(
-          ...messages.map(msg => msg.content),
-          ...messages.map(msg => msg.tool_calls),
+          ...messages
+            .filter(msg => msg.role === 'assistant' || msg.role === 'user')
+            .map(msg => msg.content),
         )
 
         // Hermes bills reasoning tokens at the output rate (same as Gemini).
