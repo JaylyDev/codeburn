@@ -211,6 +211,11 @@ export type SessionSummary = {
   /// correlations performed after all saved sessions have been parsed.
   prAttributionSource?: 'transcript' | 'explicit-reference' | 'working-directory' | 'launcher-prompt'
   source?: SessionSourceMetadata
+  /// Claude Code only: true when this record is a subagent (sidechain)
+  /// transcript rather than a user-started parent session. Sidechain spend is
+  /// real and remains in every cost/token/call aggregate; consumers that reason
+  /// about human session populations may exclude it explicitly.
+  isSidechain?: boolean
   // Claude Code only: agent type of a subagent transcript session
   // (`workflow-subagent`, `Explore`, `general-purpose`, …); undefined for
   // ordinary sessions. Drives the Claude-scoped agent-type breakdown.

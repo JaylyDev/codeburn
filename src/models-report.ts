@@ -4,6 +4,7 @@ import stripAnsi from 'strip-ansi'
 import { isBehavioralCall } from './behavioral-weight.js'
 import { codexCredits } from './codex-credits.js'
 import { formatCost, formatTokens } from './format.js'
+import { sanitizeModelForDisplay } from './models.js'
 import { getProvider } from './providers/index.js'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 
@@ -160,7 +161,9 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
     const p = await getProvider(name)
     const entry = {
       displayName: p?.displayName ?? name,
-      formatModel: p ? (m: string) => p.modelDisplayName(m) : (m: string) => m,
+      formatModel: p
+        ? (m: string) => sanitizeModelForDisplay(p.modelDisplayName(m))
+        : sanitizeModelForDisplay,
     }
     providerCache.set(name, entry)
     return entry

@@ -105,7 +105,7 @@ export type CachedFile = {
   // is re-parsed only when the file changes (fingerprint differs). Carries no
   // turns, so it contributes no usage. (issue #441 follow-up)
   failed?: boolean
-  // Rich-session-capture, Claude session-level (capture-only; no report yet).
+  // Rich-session-capture, Claude session-level.
   // `title` is the LAST `ai-title` entry's text; `prLinks` accumulates every
   // `pr-link` entry's URL. `isSidechain` is true when any entry is a sidechain:
   // parentUuid references an intra-file entry uuid, not another session id, so it
@@ -230,6 +230,7 @@ export const PROVIDER_ENV_VARS: Record<string, string[]> = {
   hermes: ['HERMES_HOME'],
   'lingtai-tui': ['LINGTAI_HOME', 'LINGTAI_TUI_HOME', 'LINGTAI_TUI_GLOBAL_DIR'],
   droid: ['FACTORY_DIR'],
+  dsh: ['DSH_HOME'],
   cursor: ['CODEBURN_CURSOR_MAX_BUBBLES'],
   // XDG_DATA_HOME is stale here (cursor-agent never reads it) but deliberately
   // kept: removing it would force a re-parse to fix nothing.
@@ -304,7 +305,14 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // they still contribute. v2 (over the never-released v1): store dedup keys
   // grew a content discriminator so a same-path DB reset cannot alias rows.
   copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1-session-store-v2',
-  grok: 'estimated-cost-v1',
+  // authoritative-usage-v4: persist one Grok session call from top-level
+  // authoritative totals, use modelUsage only for priced attribution, clamp
+  // reasoning per record, and label mixed sessions estimated.
+  grok: 'authoritative-usage-v4',
+  // seed-aware-v1: the parser now skips the parent events a forked session
+  // replays (double-counted before), takes the model from the reporting
+  // assistant/message, and keeps agent-injected context out of the preview.
+  dsh: 'seed-aware-v1',
   hermes: 'reasoning-output-accounting-v1-est-cost',
   'lingtai-tui': 'token-ledger-registry-activity-v3',
   'ibm-bob': 'worktree-project-grouping-v1',
@@ -807,8 +815,15 @@ async function loadShard(path: string): Promise<Record<string, CachedFile> | nul
  * full: the first because its cache is the only surviving record of pruned
  * usage, the second because a fingerprint change discards the whole section and
  * must see every entry it is discarding.
+ *
+ * `CODEBURN_CACHE_SCOPE=all` is the escape hatch: it drops the scope here, at
+ * the one place every caller routes through, so a suspect scoped read can be
+ * compared against a full one without a rebuild. It is a READ policy and
+ * deliberately not part of any env fingerprint (PROVIDER_ENV_VARS) — setting or
+ * unsetting it must never invalidate a cache, only change how much of it is read.
  */
 export async function loadCache(scope?: CacheLoadScope): Promise<SessionCache> {
+  if (process.env['CODEBURN_CACHE_SCOPE'] === 'all') scope = undefined
   const dir = sessionCacheDir()
   const envelope = await readEnvelope(dir)
   if (!envelope) return afterMissingShardCache()
@@ -1056,6 +1071,15 @@ export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Pr
     const files = plan.groups.get(bucket)!
     const onDisk = from ? await loadShard(join(dir, from)) : null
     if (!onDisk) return writeShard(provider, bucket, files)
+    // A file whose month this run never loaded has no visible cache entry, so it
+    // looks uncached and is re-parsed into the same bucket — re-deriving the
+    // entry the shard already holds. Republishing then churns the shard's nonce
+    // name on every run for content that never changed (#1032), so a merge that
+    // neither adds, changes nor removes an entry keeps the published shard.
+    const adds = Object.entries(files).some(([path, file]) =>
+      onDisk[path] === undefined || JSON.stringify(onDisk[path]) !== JSON.stringify(file))
+    const removes = [...plan.moved].some(path => onDisk[path] !== undefined && files[path] === undefined)
+    if (!adds && !removes) return { name: from!, until: untilMonth(onDisk) }
     for (const path of plan.moved) delete onDisk[path]
     return writeShard(provider, bucket, { ...onDisk, ...files })
   }

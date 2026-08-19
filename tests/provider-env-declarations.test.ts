@@ -34,6 +34,7 @@ const FILE_PROVIDERS: Record<string, string[]> = {
   'codex.ts': ['codex'],
   'copilot.ts': ['copilot'],
   'droid.ts': ['droid'],
+  'dsh.ts': ['dsh'],
   'hermes.ts': ['hermes'],
   'lingtai-tui.ts': ['lingtai-tui'],
   // Its only literal read is CODEBURN_CURSOR_MAX_BUBBLES (cursor.ts:692).

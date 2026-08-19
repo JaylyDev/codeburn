@@ -6,24 +6,41 @@ import { join } from 'path'
 import { getCodeburnCacheDir } from './cache-dir.js'
 import type { DateRange, ProjectSummary } from './types.js'
 
-// Bumped to 19, deliberately skipping 18: an earlier head of this same change
-// (#946) was pushed publicly claiming v18 under DIFFERENT accounting — no
-// supplementary-call weighting, whole-session rollup suppression — and
-// adoptOlderDailyCaches/isMigratableCache would take those days forward as
-// finalized without re-deriving them. A distinct version is the only thing
-// that stops one version number meaning two accountings.
+// Bumped to 21: copilot input/cache tokens for sessions covered by the CLI's
+// session-store.db move from one shutdown-rollup lump (stamped at session end)
+// to per-request DB rows with real timestamps, supplementary accounting calls
+// (rollups, residuals, paired rows) stop counting as api/model calls, and
+// reasoning tokens leave the copilot cost recompute (they are inside the
+// output the per-turn calls already bill). Per-day attribution, call counts and
+// costs all move, so days finalized under an earlier version would disagree
+// with the live parse.
 //
-// v18 (never released): copilot input/cache tokens for sessions covered by the CLI's
-// session-store.db moved from one shutdown-rollup lump (stamped at session
-// end) to per-request DB rows with real timestamps, supplementary accounting
-// calls (rollups, covered rows) stopped counting as api/model calls, and
-// reasoning tokens left the copilot cost recompute (they are inside the
-// output the per-turn calls already bill). Per-day attribution, call counts
-// and costs all move, so days finalized at v17 would disagree with the live
-// parse. Re-derivation rides the v14 carry-forward semantics; sourceless
-// days carry forward as-is.
+// 20 is NOT free: an unmerged head of #1040 (codex model attribution) claims
+// it, and 18 was burned by an earlier public head of THIS change under
+// different accounting (whole-session rollup suppression, no supplementary
+// weight). isMigratableCache/adoptOlderDailyCaches carry a same-or-newer
+// version forward as FINALIZED without re-deriving it, so a number can never
+// mean two accountings. 21 is the first number no other head claims.
 //
-// v17: copilot CLI sessions were misclassified as VS Code transcripts
+// Bumped to 19: Grok authoritative usage now keeps one session-level rollup
+// from top-level totals, clamps reasoning to reported output, and labels mixed
+// authoritative/heuristic coverage. Every day finalized under the previous
+// accounting carries the old Grok totals, and the daily cache has no
+// per-provider invalidation, so raising MIN_SUPPORTED_VERSION is the only
+// lever: it forces a one-time re-derivation of ALL days, for every provider,
+// not just Grok. That pass reads the warm session cache (CACHE_VERSION is
+// unchanged and only PROVIDER_PARSE_VERSIONS.grok moved), so it costs seconds
+// rather than a full re-parse, and adoptOlderDailyCaches keeps the superseded
+// file as the baseline for days no source can still re-derive. Days whose
+// sources only PARTLY survive are held by the partial-survival guard in
+// mergeDayEntries, which is what makes a global re-derive safe to force: on a
+// real 108-day cache the 17 -> 19 pass moves Grok cost and tokens and nothing
+// else - the day-by-day call counts come back identical.
+//
+// The shipped predecessor is v17; v18 was an unreleased draft of this change
+// and only exists in pre-release checkouts. 19 clears both.
+//
+// Bumped to 17: copilot CLI sessions were misclassified as VS Code transcripts
 // (#944), so days finalized at v16 or earlier carry output-only copilot costs —
 // the session.shutdown rollup's input/cache tokens were dropped. Raising
 // MIN_SUPPORTED_VERSION forces the one-time re-derivation under the
@@ -91,8 +108,8 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 19
-const MIN_SUPPORTED_VERSION = 19
+export const DAILY_CACHE_VERSION = 21
+const MIN_SUPPORTED_VERSION = 21
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including
@@ -859,6 +876,52 @@ function hasPositiveDayContent(day: DailyEntry): boolean {
   return false
 }
 
+/// PARTIAL SURVIVAL (the v14 never-lose contract, extended past all-or-nothing).
+/// v14 protected a (date, provider) slice only when the fresh derivation found
+/// NOTHING there. But transcripts age out per FILE, not per day: Claude Code
+/// deletes them after ~30 days, and turn-anchored bucketing means a handful of
+/// turns from surviving later files still land on a mostly-aged-out day. The
+/// fresh slice is then non-empty but truncated, and replacing the baseline with
+/// it silently deletes the rest (measured on a real cache upgrading 17 -> 19:
+/// 2026-07-16 fell from $1,685.17 / 12,530 calls to $385.44 / 560 calls).
+///
+/// So a fresh slice replaces a settled baseline slice only when it carries at
+/// least as many CALLS — the same or more evidence. Fewer calls means the
+/// source set demonstrably lost data, and the baseline is kept whole.
+///
+/// Why calls and not sessions: session counts shrink routinely on days whose
+/// sources are entirely intact (a session's turns re-attribute to a neighbouring
+/// day), measured at 1-5 sessions on recent days whose call counts were
+/// identical across the re-derivation. A sessions test would freeze stale slices
+/// on healthy days. Why not cost/tokens: those are re-priced accounting on the
+/// same evidence — exactly what a legitimate re-derivation changes (#1015 Grok
+/// keeps its per-day calls and raises cost, and is unaffected by this guard).
+///
+/// Why no source-set test instead: a day entry records no source files, counts
+/// or fingerprints, and the session cache is keyed by file rather than by day,
+/// so "were this day's sources all present?" cannot be answered from the cache.
+/// The calls comparison is the available proxy.
+///
+/// TRADE-OFF: a future fix that legitimately REDUCES calls on a settled day
+/// (deduplication) is blocked, and that day keeps the older, higher value until
+/// its slice is re-derived under an equal-or-greater call count. That is the
+/// "estimate high, never lose" direction v14 already chose over silent loss.
+///
+/// Recent days stay authoritative: within the settle window their session files
+/// are still on disk, so a shrink there is a real change (the user deleted a
+/// transcript), not aged-out sources. Seven days is far inside the ~30-day
+/// retention floor of the shortest-lived source we know of, so any shrink older
+/// than that is source loss with overwhelming likelihood.
+const SETTLE_DAYS = 7
+
+function settleCutoffDate(now: Date): string {
+  return toDateString(new Date(now.getFullYear(), now.getMonth(), now.getDate() - SETTLE_DAYS))
+}
+
+function isPartialSurvival(date: string, baseline: ProviderDaySlice, fresh: ProviderDaySlice, settleCutoff: string): boolean {
+  return date < settleCutoff && fresh.calls < baseline.calls
+}
+
 /// Index `freshUnderOldTz` (the same parse re-aggregated under the cache's OLD
 /// tzKey) by date then provider, so the merge can subtract exactly what the
 /// fresh parse still explains under the old bucketing.
@@ -889,21 +952,34 @@ function buildTzSubtraction(days: DailyEntry[]): ReadonlyMap<string, ReadonlyMap
 ///    nothing — its day-level totals cannot be attributed without slices.
 /// A primary slice blocks a secondary one only when it carries DATA; a
 /// zero-data placeholder (sessions only) is merged into, not treated as a
-/// re-derivation of the provider's day.
+/// re-derivation of the provider's day — UNLESS that data is a strict shrink of
+/// the baseline on a settled day, see `isPartialSurvival`.
 /// `subtract`, present ONLY on the tz-change re-derive, maps (date, provider)
 /// to the content the fresh parse still attributes there under the OLD
 /// bucketing. Every baseline slice the merge would otherwise carry has that
 /// content subtracted first (clamped at 0, dropped when nothing positive
 /// remains), so turns that re-bucketed across local midnight are not counted on
-/// both their old and new days. Absent (undefined) on every other path, which
-/// keeps those merges byte-identical to the pre-fix behavior.
+/// both their old and new days. What remains is by construction content NO
+/// surviving source explains, so it is added even when the fresh slice for that
+/// (date, provider) already carries data — the tz path's form of the
+/// partial-survival rule, exact instead of heuristic. Absent (undefined) on
+/// every other path, which keeps those merges byte-identical to the pre-fix
+/// behavior apart from that rule.
 export function mergeDayEntries(
   primary: DailyEntry[],
   secondary: DailyEntry[],
   markSecondaryCarried: boolean,
   subtract?: ReadonlyMap<string, ReadonlyMap<string, ProviderDaySlice>>,
+  /// Set ONLY by the complete-parse re-derive, where `primary` is a fresh
+  /// derivation from live sources and `secondary` is the cache baseline: a
+  /// primary slice with fewer calls there means sources aged out, so the
+  /// baseline wins on settled days (`isPartialSurvival`). The adoption union
+  /// leaves it off - both sides are cache generations there and the newer
+  /// schema deliberately wins per (date, provider).
+  guardPartialSurvival = false,
 ): DailyEntry[] {
   const byDate = new Map<string, DailyEntry>()
+  const settleCutoff = settleCutoffDate(new Date())
   for (const day of primary) byDate.set(day.date, structuredClone(day))
   for (const day of secondary) {
     const existing = byDate.get(day.date)
@@ -930,7 +1006,6 @@ export function mergeDayEntries(
       // day) still carry a real session count — worth preserving.
       if (!hasSliceData(slice) && !(slice.sessions ?? 0)) continue
       const existingSlice = Object.hasOwn(existing.providers, provider) ? existing.providers[provider] : undefined
-      if (existingSlice && hasSliceData(existingSlice)) continue
       let toAdd = slice
       let residual = false
       if (subtract) {
@@ -945,6 +1020,13 @@ export function mergeDayEntries(
           // 1 - max would drop the source-gone sessions the residual carries).
           residual = true
         }
+      }
+      if (existingSlice && hasSliceData(existingSlice) && !residual) {
+        if (!guardPartialSurvival || !isPartialSurvival(day.date, slice, existingSlice, settleCutoff)) continue
+        // The baseline holds more evidence than the sources can still produce:
+        // swap the fresh slice back out for it (inverse of addSliceIntoDay, so
+        // the day's totals and nested maps stay reconciled with its slices).
+        subtractSliceFromDay(existing, provider, existingSlice)
       }
       addSliceIntoDay(existing, provider, toAdd, residual)
       if (markSecondaryCarried) existing.carried = true
@@ -1108,7 +1190,7 @@ export async function ensureCacheHydrated(
         tzSubtraction = buildTzSubtraction(aggregateDaysInTz(wideProjects, c.tzKey))
       }
       const merged = parseWasComplete
-        ? mergeDayEntries(freshDays, baseline, true, tzSubtraction)
+        ? mergeDayEntries(freshDays, baseline, true, tzSubtraction, true)
         : mergeDayEntries(baseline, freshDays, false)
       c = {
         version: DAILY_CACHE_VERSION,

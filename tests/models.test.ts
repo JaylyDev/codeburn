@@ -310,6 +310,13 @@ describe('user aliases via setModelAliases', () => {
     expect(getModelCosts('anthropic--claude-4.6-opus')).toEqual(getModelCosts('claude-sonnet-4-5'))
   })
 
+  it('user alias whose source already has a short name displays the target', () => {
+    setModelAliases({ 'gpt-4o': 'claude-opus-4-6' })
+    expect(getModelCosts('gpt-4o')).toEqual(getModelCosts('claude-opus-4-6'))
+    expect(getShortModelName('gpt-4o')).toBe('Opus 4.6')
+    setModelAliases({})
+  })
+
   it('resetting aliases restores builtins', () => {
     setModelAliases({ 'anthropic--claude-4.6-opus': 'claude-sonnet-4-5' })
     setModelAliases({})
@@ -505,7 +512,7 @@ describe('Cursor model variants resolve to pricing', () => {
     // Sonnet family
     ['claude-4-sonnet', 'claude-sonnet-4'],
     ['claude-4-sonnet-1m', 'claude-sonnet-4'],
-    ['claude-4-sonnet-thinking', 'claude-sonnet-4-5'],
+    ['claude-4-sonnet-thinking', 'claude-sonnet-4'],
     ['claude-4.5-sonnet', 'claude-sonnet-4-5'],
     ['claude-4.5-sonnet-thinking', 'claude-sonnet-4-5'],
     ['claude-4.6-sonnet', 'claude-sonnet-4-6'],
@@ -558,6 +565,14 @@ describe('Cursor model variants resolve to pricing', () => {
       expect(costs!.outputCostPerToken).toBe(expected!.outputCostPerToken)
     })
   }
+
+  // Regression for #912: Cursor's unversioned `claude-4-sonnet-thinking`
+  // slug is the thinking variant of Sonnet 4, not Sonnet 4.5. The two models
+  // currently share a price, so the display name pins the canonical identity
+  // independently of today's pricing coincidence.
+  it('keeps claude-4-sonnet-thinking in the Sonnet 4 model family', () => {
+    expect(getShortModelName('claude-4-sonnet-thinking')).toBe('Sonnet 4')
+  })
 })
 
 describe('Cursor house model pricing', () => {
@@ -729,6 +744,10 @@ describe('provider pricing suffix variants', () => {
 describe('observed provider model aliases', () => {
   const cases: Array<[string, string]> = [
     ['MiMo-V2-Flash', 'xiaomi/mimo-v2-flash'],
+    ['mimo-v2.5-pro', 'xiaomi/mimo-v2.5-pro'],
+    ['MiMo-v2.5-Pro', 'xiaomi/mimo-v2.5-pro'],
+    ['mimo-v2.5', 'xiaomi/mimo-v2.5'],
+    ['MiMo-v2.5', 'xiaomi/mimo-v2.5'],
     ['KAT-Coder-Pro-V1', 'kwaipilot/kat-coder-pro'],
     // Kimi Code wires report bare `k3` in llm.request.model; it must price
     // through the kimi-k3 table entry, not fall through to $0.
@@ -748,6 +767,39 @@ describe('observed provider model aliases', () => {
 
   it('k3 shows the Kimi K3 display name', () => {
     expect(getShortModelName('k3')).toBe('Kimi K3')
+  })
+
+  it('does not recurse on vendor-requalified MiMo aliases', () => {
+    expect(getShortModelName('mimo-v2.5')).toBe('MiMo v2.5')
+    expect(getShortModelName('MiMo-v2.5')).toBe('MiMo v2.5')
+    expect(getShortModelName('cline-pass/mimo-v2.5')).toBe('MiMo v2.5')
+    expect(getShortModelName('cline-pass/mimo-v2.5-pro')).toBe('MiMo v2.5 Pro')
+  })
+
+  // The `mimo-v2-flash -> xiaomi/mimo-v2-flash` alias shipped before this
+  // change and already cycled: strip the namespace, alias it back, take the
+  // leaf, repeat. Every display surface (overview's model table included)
+  // threw RangeError on a real MiMo v2 Flash session. Pin the shipped ids.
+  it('resolves the already-shipped MiMo v2 Flash alias without blowing the stack', () => {
+    for (const id of ['mimo-v2-flash', 'MiMo-V2-Flash', 'cline-pass/mimo-v2-flash', 'mimo/mimo-v2-flash']) {
+      expect(() => getShortModelName(id)).not.toThrow()
+      expect(getShortModelName(id)).toBe('MiMo v2 Flash')
+      expect(getModelCosts(id)).toEqual(getModelCosts('xiaomi/mimo-v2-flash'))
+    }
+  })
+
+  it('names the base MiMo 2.5 row without swallowing the Pro tier', () => {
+    expect(getShortModelName('mimo-v2.5')).toBe('MiMo v2.5')
+    expect(getShortModelName('mimo-v2.5-pro')).toBe('MiMo v2.5 Pro')
+    expect(getModelCosts('mimo-v2.5')).not.toEqual(getModelCosts('mimo-v2.5-pro'))
+  })
+
+  it('stays unary so Array.map cannot feed the index as cycle state', () => {
+    expect(['mimo-v2.5', 'gpt-4o', 'cline-pass/mimo-v2.5-pro'].map(getShortModelName)).toEqual([
+      'MiMo v2.5',
+      'GPT-4o',
+      'MiMo v2.5 Pro',
+    ])
   })
 
   it('does not map dated Qwen3 Max to a reseller price without provider context', () => {

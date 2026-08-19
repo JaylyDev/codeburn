@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import Observation
+import ServiceManagement
 
 private let refreshIntervalSeconds: UInt64 = 30
 private let forceRefreshWatchdogSeconds: TimeInterval = 90
@@ -281,32 +282,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         let key = "codeburn.loginItemRegistered"
         guard !UserDefaults.standard.bool(forKey: key) else { return }
 
-        let appPath = Bundle.main.bundlePath
-        let script = "tell application \"System Events\" to make login item at end with properties {path:\(appleScriptStringLiteral(appPath)), hidden:false}"
-
-        let process = Process()
-        process.launchPath = "/usr/bin/osascript"
-        process.arguments = ["-e", script]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-
+        // Registers in-process. The old path told System Events to make the login
+        // item, which made macOS ask for Automation access on first launch (#1026).
+        // No AppleScript fallback: a failure here must not bring that prompt back.
         do {
-            try process.run()
-            process.waitUntilExit()
-            if process.terminationStatus == 0 {
-                UserDefaults.standard.set(true, forKey: key)
+            if SMAppService.mainApp.status != .enabled {
+                try SMAppService.mainApp.register()
             }
+            UserDefaults.standard.set(true, forKey: key)
         } catch {
-            NSLog("CodeBurn: Login item registration failed: \(error)")
+            NSLog("CodeBurn: login item registration failed: \(error.localizedDescription)")
         }
-    }
-
-    private func appleScriptStringLiteral(_ value: String) -> String {
-        var escaped = value.replacingOccurrences(of: "\\", with: "\\\\")
-        escaped = escaped.replacingOccurrences(of: "\"", with: "\\\"")
-        escaped = escaped.replacingOccurrences(of: "\r", with: "")
-        escaped = escaped.replacingOccurrences(of: "\n", with: "")
-        return "\"\(escaped)\""
     }
 
     private var lastRefreshTime: Date = .distantPast

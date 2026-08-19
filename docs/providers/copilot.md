@@ -41,7 +41,8 @@ instead of trying to dedupe across stores.
   wrong-schema, OTel is skipped and the JSONL/transcript sources are used as a fallback.
 - **Durable cache (monotonic totals).** Copilot is marked `durableSources`: OTel-derived
   cache entries are never evicted when VS Code prunes old spans from the DB, so
-  month-to-date totals do not drop as the DB rotates. Entries age out after 90 days.
+  month-to-date totals do not drop as the DB rotates. Orphaned entries age out after
+  90 days; sources still present in discovery remain cached regardless of call age.
 - **Upgrade note.** The first run after upgrading to the OTel version bumps the copilot
   parse version, which discards the prior copilot cache. Spans already pruned from the DB
   before the upgrade cannot be recovered, so monotonicity starts from the upgrade point,

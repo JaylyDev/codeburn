@@ -559,7 +559,7 @@ function extractObjectFields(
   return captured
 }
 
-const LARGE_ROOT_FIELDS = ['type', 'timestamp', 'sessionId', 'cwd', 'gitBranch', 'attachment', 'message'] as const
+const LARGE_ROOT_FIELDS = ['type', 'timestamp', 'sessionId', 'cwd', 'gitBranch', 'attachment', 'message', 'isSidechain', 'promptSource'] as const
 const LARGE_ASSISTANT_MESSAGE_FIELDS = ['model', 'usage', 'id', 'content'] as const
 
 function parseLargeJsonl(line: string | Buffer): JournalEntry | null {
@@ -573,14 +573,19 @@ function parseLargeJsonl(line: string | Buffer): JournalEntry | null {
   if (!type) return null
 
   const entry: JournalEntry = { type }
+  if (root['isSidechain']?.kind === 'scalar' && source.slice(root['isSidechain'].start, root['isSidechain'].end) === 'true') {
+    entry.isSidechain = true
+  }
   const timestamp = readJsonString(source, root['timestamp'])
   const sessionId = readJsonString(source, root['sessionId'])
   const cwd = readJsonString(source, root['cwd'])
   const gitBranch = readJsonString(source, root['gitBranch'])
+  const promptSource = readJsonString(source, root['promptSource'])
   if (timestamp !== undefined) entry.timestamp = timestamp
   if (sessionId !== undefined) entry.sessionId = sessionId
   if (cwd !== undefined) entry.cwd = cwd
   if (gitBranch !== undefined) entry.gitBranch = gitBranch
+  if (promptSource !== undefined) entry.promptSource = promptSource
   const addedNames = extractLargeAddedNames(source, root['attachment'])
   if (addedNames.length > 0) {
     ;(entry as Record<string, unknown>)['attachment'] = { type: 'deferred_tools_delta', addedNames }
@@ -2361,6 +2366,7 @@ async function scanProjectDirs(
     // on a resumed session) and derive the agent id from the `agent-<agentId>`
     // filename. A sidechain whose parent id was never captured stays standalone.
     if (cachedFile.isSidechain) {
+      session.isSidechain = true
       if (cachedFile.parentSessionId) session.parentSessionId = cachedFile.parentSessionId
       session.agentId = sessionId.startsWith('agent-') ? sessionId.slice('agent-'.length) : sessionId
     }
@@ -3429,13 +3435,12 @@ async function parseProviderSources(
     }
   }
 
-  // 90-day age-out for durable providers: remove entries whose newest call is
-  // older than 90 days so the cache doesn't grow unboundedly. One scoped
-  // exemption: a source that declared retainWhilePresent and is still
-  // discovered IS the durable record itself (copilot's session-store.db) —
-  // pruning it would drop crash-only rows the file still holds and force a
-  // full re-read on the next refresh. Everything else — orphans, and ordinary
-  // still-present journal files — ages out on the pre-existing schedule.
+  // 90-day age-out for durable providers: prune only orphaned entries whose
+  // newest call is older than 90 days. Still-discovered sources remain live
+  // regardless of age and keep their persisted fingerprint for reuse (#992).
+  // retainWhilePresent (copilot's session-store.db, the durable record itself)
+  // states the same intent explicitly for a still-discovered source; under the
+  // orphan-only rule it is currently redundant rather than load-bearing.
   if (!readOnly && provider.durableSources) {
     const retainPaths = new Set(sources.filter(s => s.retainWhilePresent).map(s => s.path))
     const cutoffMs = Date.now() - 90 * 24 * 60 * 60 * 1000
@@ -3446,7 +3451,7 @@ async function parseProviderSources(
         .map(c => new Date(c.timestamp).getTime())
         .filter(ts => !isNaN(ts))
         .reduce((max, ts) => Math.max(max, ts), 0)
-      if (newestTs > 0 && newestTs < cutoffMs) {
+      if (!allDiscoveredFiles.has(cachedPath) && newestTs > 0 && newestTs < cutoffMs) {
         delete section.files[cachedPath]
         markCacheDirty(diskCache, providerName, cachedPath)
       }
@@ -4091,6 +4096,7 @@ function carryLinkageFields(rebuilt: SessionSummary, original: SessionSummary): 
   if (original.prLinks?.length) rebuilt.prLinks = original.prLinks
   if (original.prAttributionSource) rebuilt.prAttributionSource = original.prAttributionSource
   if (original.workingDirectory) rebuilt.workingDirectory = original.workingDirectory
+  if (original.isSidechain) rebuilt.isSidechain = true
   // prRefsAtRangeStart is NOT copied here: a narrower slice needs it recomputed at
   // the new boundary (see recomputeRangeStartPrRefs), not the wide range's value.
   if (original.parentSessionId) rebuilt.parentSessionId = original.parentSessionId

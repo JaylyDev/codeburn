@@ -2,7 +2,7 @@ import { isAbsolute } from 'path'
 import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
-import { findUnpricedModels, loadPricing, setModelAliases, setPriceOverrides, setLocalModelSavings, setProxyPaths, normalizeProxyPath } from './models.js'
+import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setProxyPaths, normalizeProxyPath } from './models.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
 import { getProvider } from './providers/index.js'
@@ -12,6 +12,7 @@ import { toDateString } from './daily-cache.js'
 import { dateKey } from './day-aggregator.js'
 import { isBehavioralCall, isBehavioralTurn } from './behavioral-weight.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
+import type { AppliedFix } from './act/types.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
 import { buildPeriodData, buildMenubarPayloadForRange, buildDurablePeriod, type DurablePeriod } from './usage-aggregator.js'
 import { renderDashboard } from './dashboard.js'
@@ -1320,12 +1321,13 @@ program
 
 program
   .command('menubar')
-  .description('Install and launch the macOS menubar app (one command, no clone)')
-  .option('--force', 'Reinstall even if an older copy is already in ~/Applications')
+  .description('Install and launch the menubar app on macOS and Windows (one command, no clone)')
+  .option('--force', 'Reinstall even if a copy is already installed')
   .action(async (opts: { force?: boolean }) => {
     try {
       const result = await installMenubarApp({ force: opts.force, cliVersion: version })
-      console.log(`\n  Ready. ${result.installedPath}\n`)
+      // A cancelled Windows installer leaves nothing to point at.
+      if (result.installedPath) console.log(`\n  Ready. ${result.installedPath}\n`)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       console.error(`\n  Menubar install failed: ${message}\n`)
@@ -1816,6 +1818,7 @@ program
   .option('--yes', 'With --apply: apply every appliable fix without prompting')
   .option('--dry-run', 'With --apply: print the plan and exit without changing anything')
   .option('--only <ids>', 'With --apply: restrict to a comma-separated list of finding ids')
+  .option('--auto-revert', 'Undo applied fixes that measured no reduction (never CLAUDE.md rules)')
   .action(async (opts) => {
     assertProvider(opts.provider, 'optimize')
     const format = opts.json ? 'json' : opts.format
@@ -1841,28 +1844,35 @@ program
     const projects = await parseAllSessions(range, opts.provider)
     if (opts.apply) {
       const { runOptimizeApply } = await import('./act/optimize-apply.js')
-      await runOptimizeApply(projects, range, { yes: opts.yes, dryRun: opts.dryRun, only: opts.only })
+      await runOptimizeApply(projects, range, { yes: opts.yes, dryRun: opts.dryRun, only: opts.only, provider: opts.provider })
       return
     }
     assertFormat(format, ['text', 'json'], 'optimize')
-    if (format === 'text') {
-      // Surface realized savings from applied actions. Best effort: optimize
-      // must never fail because of journal contents, so any error just drops
-      // the header. computeActReport returns fast without scanning when the
-      // journal has no eligible applied actions, so users who never opted in
-      // see identical output.
-      let appliedHeader: string | undefined
-      let previouslyApplied: Record<string, string> | undefined
-      try {
-        const { computeActReport, buildOptimizeAppliedHeader } = await import('./act/report.js')
-        const applied = await computeActReport()
-        appliedHeader = buildOptimizeAppliedHeader(applied) ?? undefined
-        previouslyApplied = applied.appliedByFinding
-      } catch { /* the header is optional; never block the findings */ }
-      await runOptimize(projects, label, range, { format, appliedHeader, previouslyApplied })
-    } else {
-      await runOptimize(projects, label, range, { format })
-    }
+    // Surface realized savings from applied actions, and re-measure every one
+    // of them. Best effort: optimize must never fail because of journal
+    // contents, so any error just drops the extras. computeActReport returns
+    // fast without scanning when the journal has no applied actions, so users
+    // who never opted in see identical output.
+    let appliedHeader: string | undefined
+    let previouslyApplied: Record<string, string> | undefined
+    let appliedFixes: AppliedFix[] | undefined
+    try {
+      const { computeActReport, buildOptimizeAppliedHeader, autoRevertNoEffect } = await import('./act/report.js')
+      const applied = await computeActReport()
+      appliedHeader = buildOptimizeAppliedHeader(applied) ?? undefined
+      previouslyApplied = applied.appliedByFinding
+      appliedFixes = applied.appliedFixes
+      if (opts.autoRevert) {
+        const { lines, revertedIds } = await autoRevertNoEffect(appliedFixes)
+        appliedFixes = appliedFixes.filter(f => !revertedIds.has(f.id))
+        // JSON output must stay parseable, so the revert log goes to stderr there.
+        for (const line of lines) {
+          if (format === 'json') process.stderr.write(`  ${line}\n`)
+          else console.log(`  ${line}`)
+        }
+      }
+    } catch { /* the applied section is optional; never block the findings */ }
+    await runOptimize(projects, label, range, { format, appliedHeader, previouslyApplied, appliedFixes, provider: opts.provider })
   })
 
 program
@@ -2085,6 +2095,7 @@ program
   .option('--by-agent', 'One row per (provider, model, agent) instead of one row per (provider, model). Claude subagent transcripts only; other providers and main sessions bucket under "main"')
   .option('--top <n>', 'Show only the top N rows', (v: string) => parseInt(v, 10))
   .option('--min-cost <usd>', 'Hide rows below this cost threshold', (v: string) => parseFloat(v))
+  .option('--unpriced', 'Show only models with usage that currently price at $0')
   .option('--no-totals', 'Suppress the footer totals row')
   .option('--format <format>', 'Output format: table, markdown, json, csv', 'table')
   .action(async (opts) => {
@@ -2109,27 +2120,60 @@ program
     }
 
     const projects = await parseAllSessions(range, opts.provider)
-    const rows = await aggregateModels(projects, {
+    const topN = typeof opts.top === 'number' && Number.isFinite(opts.top) ? opts.top : undefined
+    let rows = await aggregateModels(projects, {
       byTask: !!opts.byTask,
       byAgent: !!opts.byAgent,
       taskFilter: opts.task,
-      topN: typeof opts.top === 'number' && Number.isFinite(opts.top) ? opts.top : undefined,
-      minCost: typeof opts.minCost === 'number' && Number.isFinite(opts.minCost) ? opts.minCost : 0.01,
+      // `aggregateModels` filters and slices before the unpriced filter. Its
+      // rows are sorted cost-first, so a small --top would remove exactly the
+      // rows `--unpriced` exists to show. Take the whole set here and slice
+      // after filtering and ranking instead.
+      topN: opts.unpriced ? undefined : topN,
+      minCost: typeof opts.minCost === 'number' && Number.isFinite(opts.minCost) ? opts.minCost : (opts.unpriced ? 0 : 0.01),
     })
+    if (opts.unpriced) {
+      const unpriced = findUnpricedModels(rows.map(row => ({
+        model: row.model,
+        calls: row.calls,
+        cost: row.costUSD,
+        tokens: row.totalTokens,
+      })))
+      const unpricedRank = new Map<string, number>()
+      for (const [rank, usage] of unpriced.entries()) {
+        // Breakdown modes can emit several rows for one model. Keep the first
+        // rank so all rows for that model stay together and N still counts rows.
+        if (!unpricedRank.has(usage.model)) unpricedRank.set(usage.model, rank)
+      }
+      rows = rows
+        .filter(row => unpricedRank.has(row.model))
+        .sort((a, b) => (unpricedRank.get(a.model)! - unpricedRank.get(b.model)!))
+      if (topN !== undefined) rows = rows.slice(0, topN)
+    }
 
     const fmt = (opts.format ?? 'table').toLowerCase()
     if (rows.length === 0 && (fmt === 'table' || fmt === 'markdown')) {
-      process.stdout.write('No model usage found for the selected period.\n')
+      process.stdout.write(opts.unpriced
+        ? 'No unpriced models found for the selected period.\n'
+        : 'No model usage found for the selected period.\n')
       return
     }
+    // The friendly name is useless for `model-alias`, which keys on the raw ID.
+    // Sanitized because this bypasses the shared display path in models-report.
+    const renderRows = opts.unpriced && fmt !== 'json'
+      ? rows.map(row => ({ ...row, modelDisplayName: sanitizeModelForDisplay(row.model) }))
+      : rows
     if (fmt === 'json') {
       process.stdout.write(renderJson(rows) + '\n')
     } else if (fmt === 'csv') {
-      process.stdout.write(renderCsv(rows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent }) + '\n')
+      process.stdout.write(renderCsv(renderRows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent }) + '\n')
     } else if (fmt === 'markdown' || fmt === 'md') {
-      process.stdout.write(renderMarkdown(rows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent, showTotals: opts.totals !== false }) + '\n')
+      process.stdout.write(renderMarkdown(renderRows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent, showTotals: opts.totals !== false }) + '\n')
     } else if (fmt === 'table') {
-      process.stdout.write(renderTable(rows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent, showTotals: opts.totals !== false }) + '\n')
+      process.stdout.write(renderTable(renderRows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent, showTotals: opts.totals !== false }) + '\n')
+      // Never advise aliasing unconditionally: a subscription or flat-rate model
+      // is correctly $0, and mapping it onto another model's rate invents spend.
+      if (opts.unpriced) process.stdout.write('If a model is billed per token, map it with: codeburn model-alias "<model>" <known-model>. Subscription or flat-rate models are correctly $0.\n')
     } else {
       process.stderr.write(`codeburn: unknown --format "${opts.format}". Choose table, markdown, json, or csv.\n`)
       process.exit(1)

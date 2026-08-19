@@ -1,3 +1,5 @@
+import stripAnsi from 'strip-ansi'
+
 import type { DateRange, ProjectSummary } from './types.js'
 
 const FIFTEEN_MINUTES = 15
@@ -5,6 +7,10 @@ const ONE_HOUR = 60
 const ONE_DAY = 24 * 60
 const MINUTE_MS = 60 * 1000
 const MAX_SERIES_PER_METRIC = 6
+// Keep metadata bounded for the legend and tooltip: 80 characters preserves a
+// useful title without letting the parser's 200-char transcript cap dominate
+// either UI surface.
+const MAX_SESSION_TITLE_LENGTH = 80
 
 export type GranularSeries = {
   id: string
@@ -39,6 +45,25 @@ type RawBucket = {
   tokens: number
   models: Map<string, Totals>
   sessions: Map<string, Totals>
+}
+
+type SessionTitleCandidate = {
+  title: string
+  lastTimestamp: string
+}
+
+type SessionLabelInfo = {
+  provider: string
+  projectPath: string
+  projectNames: Set<string>
+  sessionId: string
+  titleCandidates: Map<string, SessionTitleCandidate>
+}
+
+type SessionLabelEntry = {
+  key: string
+  info: SessionLabelInfo
+  baseLabel: string
 }
 
 function nonNegative(value: number): number {
@@ -97,6 +122,114 @@ function topSeriesKeys(totals: Map<string, Totals>): Set<string> {
 function shortSessionId(sessionId: string): string {
   const trimmed = sessionId.trim()
   return trimmed.length > 12 ? `${trimmed.slice(0, 6)}…${trimmed.slice(-4)}` : trimmed || 'unknown'
+}
+
+function cleanSessionTitle(title: string | undefined): string | undefined {
+  if (title === undefined) return undefined
+
+  // Match the control-character range used by the model-name sanitizer. ANSI
+  // sequences are removed first; remaining controls become spaces so transcript
+  // line breaks cannot join words before internal whitespace is collapsed.
+  const cleaned = stripAnsi(title)
+    .replace(/[\x00-\x1F\x7F-\x9F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!cleaned) return undefined
+
+  return Array.from(cleaned).slice(0, MAX_SESSION_TITLE_LENGTH).join('').trimEnd() || undefined
+}
+
+// SessionSummary.lastTimestamp is normally an ISO timestamp, but fixtures and
+// older cache entries can be incomplete. Valid timestamps win over invalid
+// ones; two invalid values are an exact tie and are resolved alphabetically by
+// the caller.
+function compareTimestamps(a: string, b: string): number {
+  const aMs = Date.parse(a)
+  const bMs = Date.parse(b)
+  const aValid = Number.isFinite(aMs)
+  const bValid = Number.isFinite(bMs)
+  if (aValid && bValid) return aMs - bMs
+  if (aValid) return 1
+  if (bValid) return -1
+  return 0
+}
+
+function preferredProjectName(projectNames: Set<string>): string {
+  return [...projectNames].sort()[0] ?? 'Unknown project'
+}
+
+function preferredSessionTitle(titleCandidates: Map<string, SessionTitleCandidate>): string | undefined {
+  const cleaned = [...titleCandidates.values()]
+    .map(candidate => {
+      const title = cleanSessionTitle(candidate.title)
+      return title === undefined ? undefined : { title, lastTimestamp: candidate.lastTimestamp }
+    })
+    .filter((candidate): candidate is SessionTitleCandidate => candidate !== undefined)
+
+  cleaned.sort((a, b) => {
+    const timestampOrder = compareTimestamps(b.lastTimestamp, a.lastTimestamp)
+    if (timestampOrder !== 0) return timestampOrder
+    return a.title < b.title ? -1 : a.title > b.title ? 1 : 0
+  })
+  return cleaned[0]?.title
+}
+
+function buildSessionLabels(inputs: Map<string, SessionLabelInfo>): Map<string, string> {
+  // Stable raw-key order makes the residual used-label guard independent of
+  // project/session discovery order when a title happens to match another
+  // label shape.
+  const entries: SessionLabelEntry[] = [...inputs.entries()].map(([key, info]) => {
+    const sessionLabel = preferredSessionTitle(info.titleCandidates)
+      ?? shortProjectLabel(info.projectPath, preferredProjectName(info.projectNames))
+    return {
+      key,
+      info,
+      baseLabel: `${shortSessionId(info.sessionId)} (${info.provider}) · ${sessionLabel}`,
+    }
+  }).sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+  const byBaseLabel = new Map<string, SessionLabelEntry[]>()
+  for (const entry of entries) {
+    const group = byBaseLabel.get(entry.baseLabel) ?? []
+    group.push(entry)
+    byBaseLabel.set(entry.baseLabel, group)
+  }
+
+  const labels = new Map<string, string>()
+  const usedLabels = new Set<string>()
+  const setUniqueLabel = (entry: SessionLabelEntry, candidate: string): void => {
+    let label = candidate
+    if (usedLabels.has(label)) {
+      const identity = `${candidate} · ${entry.info.projectPath} · ${entry.info.sessionId}`
+      label = identity
+      let suffix = 2
+      while (usedLabels.has(label)) label = `${identity} · ${suffix++}`
+    }
+    labels.set(entry.key, label)
+    usedLabels.add(label)
+  }
+  for (const group of byBaseLabel.values()) {
+    if (group.length === 1) {
+      setUniqueLabel(group[0]!, group[0]!.baseLabel)
+      continue
+    }
+
+    const projectLabels = group.map(entry => shortProjectLabel(entry.info.projectPath, preferredProjectName(entry.info.projectNames)))
+    if (new Set(projectLabels).size === group.length) {
+      for (let i = 0; i < group.length; i++) {
+        const entry = group[i]!
+        setUniqueLabel(entry, `${entry.baseLabel} · ${projectLabels[i]}`)
+      }
+      continue
+    }
+
+    // A short project label can still collide (for example two worktrees with
+    // the same final path segments). The full path + id is only used for this
+    // residual collision, and is unique because provider/path/id form the key.
+    for (const entry of group) {
+      setUniqueLabel(entry, `${entry.baseLabel} · ${entry.info.projectPath} · ${entry.info.sessionId}`)
+    }
+  }
+  return labels
 }
 
 // Legend labels: the sanitized project dir ("-Users-name-Projects-app") is
@@ -184,7 +317,7 @@ export function buildGranularHistory(
   const modelTotals = new Map<string, Totals>()
   const sessionTotals = new Map<string, Totals>()
   const modelLabels = new Map<string, string>()
-  const sessionLabels = new Map<string, string>()
+  const sessionLabelInputs = new Map<string, SessionLabelInfo>()
   let callCount = 0
 
   for (const project of projects) {
@@ -214,7 +347,27 @@ export function buildGranularHistory(
           add(modelTotals, modelKey, cost, tokens)
           add(sessionTotals, sessionKey, cost, tokens)
           modelLabels.set(modelKey, modelKey === '<synthetic>' ? 'Other model' : modelKey)
-          sessionLabels.set(sessionKey, `${shortProjectLabel(project.projectPath, projectName)} · ${shortSessionId(session.sessionId)} (${call.provider})`)
+          // Collect raw metadata first. Titles are cleaned once per distinct
+          // session-key candidate after all calls are aggregated, so a late
+          // cache title can win without putting sanitisation on the call path.
+          const labelInfo = sessionLabelInputs.get(sessionKey) ?? {
+            provider: call.provider,
+            projectPath: project.projectPath,
+            projectNames: new Set<string>(),
+            sessionId: session.sessionId,
+            titleCandidates: new Map<string, SessionTitleCandidate>(),
+          }
+          labelInfo.projectNames.add(projectName)
+          if (session.title !== undefined) {
+            const existingTitle = labelInfo.titleCandidates.get(session.title)
+            if (!existingTitle || compareTimestamps(session.lastTimestamp, existingTitle.lastTimestamp) > 0) {
+              labelInfo.titleCandidates.set(session.title, {
+                title: session.title,
+                lastTimestamp: session.lastTimestamp,
+              })
+            }
+          }
+          sessionLabelInputs.set(sessionKey, labelInfo)
           callCount++
         }
       }
@@ -225,6 +378,7 @@ export function buildGranularHistory(
     return { bucketMinutes, modelSeries: [], sessionSeries: [], points: [] }
   }
 
+  const sessionLabels = buildSessionLabels(sessionLabelInputs)
   const modelProjection = projectSeries(rawBuckets, 'models', modelTotals, modelLabels)
   const sessionProjection = projectSeries(rawBuckets, 'sessions', sessionTotals, sessionLabels)
   return {

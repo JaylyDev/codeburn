@@ -4,8 +4,8 @@
 //   (b) OTel-prune monotonic  — OTel DB rows pruned      → total unchanged
 //   (c) no double-count       — same source parsed twice  → counted once
 //   (d) non-durable evicts    — deleted source for non-durable provider IS removed
-//   (e) 90-day age-out        — ≥ 91d pruned (orphans AND unflagged discovered
-//                               sources); retainWhilePresent + discovered kept
+//   (e) 90-day age-out        — only ORPHANS ≥ 91d are pruned (#992); a still-
+//                               discovered source stays, flagged or not
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtemp, mkdir, writeFile, rm, unlink } from 'fs/promises'
@@ -28,6 +28,7 @@ import type { SessionSource, SessionParser, ParsedProviderCall } from '../src/pr
 let _synthSources: SessionSource[] = []
 let _synthDurable = false
 let _synthYields: ParsedProviderCall[] = []
+let _synthParseCalls = 0
 let _synthOnParse: (() => void | Promise<void>) | null = null
 
 vi.mock('../src/providers/index.js', async (importOriginal) => {
@@ -58,6 +59,7 @@ vi.mock('../src/providers/index.js', async (importOriginal) => {
           createSessionParser(_s: SessionSource, _k: Set<string>): SessionParser {
             return {
               async *parse(): AsyncGenerator<ParsedProviderCall> {
+                _synthParseCalls++
                 await _synthOnParse?.()
                 for (const call of _synthYields) {
                   // Respect seenKeys so that when multiple sources share the same
@@ -197,6 +199,7 @@ beforeEach(async () => {
   _synthSources = []
   _synthDurable = false
   _synthYields  = []
+  _synthParseCalls = 0
   _synthOnParse = null
 })
 
@@ -364,7 +367,7 @@ describe('(d) non-durable provider evicts deleted sources', () => {
 // (e) 90-day age-out: orphan ≥ 91d old is pruned; ≤ 89d is retained
 // ═══════════════════════════════════════════════════════════════════════════
 describe('(e) 90-day age-out for durable providers', () => {
-  it('prunes a 91-day-old entry even while its unflagged source is still discovered', async () => {
+  it('keeps a discovered 91-day source persisted until discovery removes it', async () => {
     const synthFile = join(tmpHome, 'synth-age.txt')
     await writeFile(synthFile, 'placeholder')
 
@@ -384,17 +387,76 @@ describe('(e) 90-day age-out for durable providers', () => {
       userMessage: 'old', sessionId: 'synth-old',
     }]
 
-    // Unflagged durable sources age out on the ordinary schedule even while
-    // the file remains on disk (the pre-existing cap on cache growth for
-    // provider-pruned journals). Only a retainWhilePresent source — the
-    // copilot session-store, which IS the durable record — is exempt.
+    // First refresh: a still-discovered durable source is live and persisted,
+    // regardless of the age of its newest call.
     const proj1 = await parseAllSessions(undefined, 'test-synthetic')
-    expect(totalOutput(proj1)).toBe(0)
+    expect.soft(totalOutput(proj1)).toBe(8)
+    expect.soft(_synthParseCalls).toBe(1)
 
-    // Stable on the next pass too (re-parsed, then aged out again).
+    const cache1 = await loadCache()
+    const persisted1 = cache1.providers['test-synthetic']?.files[synthFile]
+    expect.soft(persisted1).toBeDefined()
+
+    // Second refresh: force the public seam through the persisted cache. The
+    // unchanged fingerprint must serve the cached parse without invoking the
+    // provider parser again.
     clearSessionCache()
     const proj2 = await parseAllSessions(undefined, 'test-synthetic')
-    expect(totalOutput(proj2)).toBe(0)
+    expect.soft(totalOutput(proj2)).toBe(8)
+    expect.soft(_synthParseCalls).toBe(1)
+
+    const cache2 = await loadCache()
+    expect.soft(cache2.providers['test-synthetic']?.files[synthFile]?.fingerprint)
+      .toEqual(persisted1?.fingerprint)
+
+    // Third refresh: once discovery removes the old source, it becomes an
+    // orphan and the durable 90-day age-out prunes it from results and disk.
+    clearSessionCache()
+    _synthSources = []
+    const proj3 = await parseAllSessions(undefined, 'test-synthetic')
+    expect.soft(totalOutput(proj3)).toBe(0)
+
+    const cache3 = await loadCache()
+    expect.soft(cache3.providers['test-synthetic']?.files[synthFile]).toBeUndefined()
+  })
+
+  it('keeps a discovered 91-day source through a month-scoped refresh', async () => {
+    const synthFile = join(tmpHome, 'synth-scoped.txt')
+    await writeFile(synthFile, 'placeholder')
+
+    const ts91dAgo = new Date(Date.now() - 91 * 24 * 60 * 60 * 1000).toISOString()
+
+    _synthDurable = true
+    _synthSources = [{ path: synthFile, project: 'test', provider: 'test-synthetic' }]
+    _synthYields  = [{
+      provider: 'test-synthetic', model: 'gpt-4o',
+      inputTokens: 10, outputTokens: 8,
+      cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0,
+      costUSD: 0.002, tools: [], bashCommands: [],
+      timestamp: ts91dAgo,
+      speed: 'standard',
+      deduplicationKey: 'synth-age-out-91d-scoped',
+      userMessage: 'old', sessionId: 'synth-old-scoped',
+    }]
+
+    expect.soft(totalOutput(await parseAllSessions(undefined, 'test-synthetic'))).toBe(8)
+
+    // A today-ranged refresh loads under a month scope that excludes the entry's
+    // shard. Durable providers are never scoped, so the age-out still sees the
+    // entry as discovered and the save must carry its month across intact.
+    clearSessionCache()
+    const today = new Date()
+    const start = new Date(today); start.setHours(0, 0, 0, 0)
+    const end   = new Date(today); end.setHours(23, 59, 59, 999)
+    expect.soft(totalOutput(await parseAllSessions({ start, end }, 'test-synthetic'))).toBe(0)
+
+    clearSessionCache()
+    expect.soft(totalOutput(await parseAllSessions(undefined, 'test-synthetic'))).toBe(8)
+    expect.soft(_synthParseCalls).toBe(1)
+
+    const cache = await loadCache()
+    expect.soft(cache.providers['test-synthetic']?.files[synthFile]).toBeDefined()
   })
 
   it('retains a 91-day-old entry whose still-discovered source declares retainWhilePresent', async () => {
@@ -1285,17 +1347,16 @@ describe.skipIf(!isSqliteAvailable())('(l) age-out exempts still-discovered stor
       }
     }
 
-    // Both runs: the store rows must serve — never zero. The session's
-    // events.jsonl is itself >90d old and follows the ordinary durable
-    // schedule (pruned even while on disk), so its per-turn output and
-    // rollup drop out; only the retainWhilePresent store keeps this
-    // session's record, exactly the crash-only-rows guarantee the flag
-    // exists for.
+    // Both runs: the store rows must serve — never zero. Under the orphan-only
+    // age-out (#992) the >90d events.jsonl is still discovered, so its per-turn
+    // output stays too; the rollup's input/cache is reconciled away against the
+    // rows exactly as on a fresh session, which is what makes the >90d case
+    // indistinguishable from any other. Idempotent across the cache round-trip.
     const first = sumUsage(await parseAllSessions(undefined, 'copilot'))
-    expect(first).toEqual({ input: 600, cacheRead: 17000, output: 0 })
+    expect(first).toEqual({ input: 600, cacheRead: 17000, output: 25 })
     clearSessionCache()
     const second = sumUsage(await parseAllSessions(undefined, 'copilot'))
-    expect(second).toEqual({ input: 600, cacheRead: 17000, output: 0 })
+    expect(second).toEqual({ input: 600, cacheRead: 17000, output: 25 })
   })
 })
 
@@ -2457,9 +2518,11 @@ describe.skipIf(!isSqliteAvailable())('(sc) month-sharded cache integration for 
     })
 
     _synthDurable = true
-    _synthSources = [{ path: synthFile, project: 'test', provider: 'test-synthetic' }]
-    // A fresh-timestamped decoy: if the parse wrongly re-reads the unchanged
-    // file, this call would serve and break the zero assertion below.
+    // Orphaned: discovery no longer returns the seeded path, which under the
+    // orphan-only age-out (#992) is what makes the entry eligible at all.
+    _synthSources = []
+    // A fresh-timestamped decoy: if the parse wrongly re-reads the file it
+    // no longer discovers, this call would serve and break the zero assertion.
     _synthYields = [{
       provider: 'test-synthetic', model: 'gpt-4o',
       inputTokens: 10, outputTokens: 99,

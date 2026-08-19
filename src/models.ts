@@ -297,6 +297,10 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'k3-agent':                      'kimi-k3',
   'k2d6-agent':                    'kimi-k2p6',
   'mimo-v2-flash':                 'xiaomi/mimo-v2-flash',
+  // Hermes / Xiaomi token-plan sessions store the bare id. LiteLLM's row is
+  // namespaced. Same class as mimo-v2-flash above — do not invent a rate.
+  'mimo-v2.5-pro':                 'xiaomi/mimo-v2.5-pro',
+  'mimo-v2.5':                     'xiaomi/mimo-v2.5',
   'kat-coder-pro-v1':              'kwaipilot/kat-coder-pro',
   // Cursor emits dot-version tier-last names plus tier/reasoning suffixes
   // that LiteLLM does not index (`-high`, `-low`, `-medium`, `-thinking`,
@@ -307,7 +311,7 @@ const BUILTIN_ALIASES: Record<string, string> = {
   // reports that quote literal slugs (e.g. forum.cursor.com/t/154933).
   'claude-4-sonnet':                'claude-sonnet-4',
   'claude-4-sonnet-1m':             'claude-sonnet-4',
-  'claude-4-sonnet-thinking':       'claude-sonnet-4-5',
+  'claude-4-sonnet-thinking':       'claude-sonnet-4',
   'claude-4.5-sonnet':              'claude-sonnet-4-5',
   'claude-4.5-sonnet-thinking':     'claude-sonnet-4-5',
   'claude-4.6-sonnet':              'claude-sonnet-4-6',
@@ -791,6 +795,11 @@ function shouldWarnAboutUnknownModel(name: string): boolean {
   return true
 }
 
+/** Render provider-supplied model IDs without terminal control characters. */
+export function sanitizeModelForDisplay(model: string): string {
+  return model.replace(/[\x00-\x1F\x7F-\x9F]/g, '?').slice(0, 200)
+}
+
 export function calculateCost(
   model: string,
   inputTokens: number,
@@ -808,7 +817,7 @@ export function calculateCost(
       // Strip control characters and cap length: model names come from JSONL
       // payloads written by external tools, so a hostile or corrupt file
       // could embed terminal escape sequences here.
-      const safeName = model.replace(/[\x00-\x1F\x7F-\x9F]/g, '?').slice(0, 200)
+      const safeName = sanitizeModelForDisplay(model)
       const aliasHint = `Map it with: codeburn model-alias "${safeName}" <known-model>, or track local-model savings with: codeburn model-savings "${safeName}" <baseline-model>`
       process.stderr.write(
         `codeburn: no pricing data for model "${safeName}" — costs for this model will show $0. ` +
@@ -942,11 +951,17 @@ const SHORT_NAMES: Record<string, string> = {
   // The Grok Build harness reports the model it runs (`grok-4.5`), so this is
   // the model's own name; `grok-build*` ids still resolve to "Grok Build".
   'grok-4.5': 'Grok 4.5',
+  // The harness also reports a `-build` variant of that model. It is a distinct
+  // id and reports bucket by id, so without its own entry the prefix match gave
+  // it the same name as `grok-4.5` and the report showed two identical rows.
+  'grok-4.5-build': 'Grok 4.5 (build)',
   // ClinePass routes models as `cline-pass/<slug>`; getShortModelName's path
   // fallback strips the prefix and re-resolves the bare slug through this
   // table, the same way it handles `accounts/fireworks/models/<slug>`.
   'qwen3.7-max': 'Qwen 3.7 Max',
   'mimo-v2.5-pro': 'MiMo v2.5 Pro',
+  'mimo-v2.5': 'MiMo v2.5',
+  'mimo-v2-flash': 'MiMo v2 Flash',
   // Both spellings occur in the wild: OpenRouter gap-filled keys are lowercase
   // slugs while sessions report the capitalized name (see the case-insensitive
   // pricing index above). SHORT_NAMES matching is case-sensitive, so map both.
@@ -972,28 +987,57 @@ function deriveClaudeShortName(canonical: string): string | undefined {
   return `${CLAUDE_FAMILY[family]} ${major}${minor ? `.${minor}` : ''}`
 }
 
-export function getShortModelName(model: string): string {
-  if (autoModelNames[model]) return autoModelNames[model]
-  const canonical = resolveAlias(getCanonicalName(model))
-  const claude = deriveClaudeShortName(canonical)
+function lookupShortName(id: string): string | undefined {
+  const claude = deriveClaudeShortName(id)
   if (claude) return claude
   for (const [key, name] of SORTED_SHORT_NAMES) {
-    // Match on a version boundary, not a bare prefix: an unlisted future minor
-    // (e.g. gpt-5.6) must NOT collapse into the base "gpt-5" entry — it should
-    // fall through to its raw id rather than show a wrong name/tier.
-    if (canonical === key || canonical.startsWith(key + '-')) return name
+    if (id === key || id.startsWith(key + '-')) return name
   }
-  // getCanonicalName only strips the leading provider prefix, so a raw
-  // path-style id (e.g. accounts/fireworks/models/glm-5p2) still has slashes
-  // here. Take the last path segment and re-resolve it: the segment may itself
-  // be a known model slug (Fireworks fleet ids), earning a friendly name; a
-  // genuinely unmapped slug resolves to itself, preserving the raw-segment
-  // fallback for everything else.
+  return undefined
+}
+
+// Public API stays unary so Array.map/forEach cannot feed index as cycle state.
+export function getShortModelName(model: string): string {
+  return shortModelName(model, new Set())
+}
+
+function shortModelName(model: string, seen: Set<string>): string {
+  if (autoModelNames[model]) return autoModelNames[model]
+  if (seen.has(model)) {
+    const leaf = model.includes('/') ? model.slice(model.lastIndexOf('/') + 1) : model
+    return lookupShortName(leaf) ?? leaf
+  }
+  seen.add(model)
+
+  // User aliases win over built-in display names. A remap of gpt-4o must
+  // show the target, not "GPT-4o".
+  if (Object.hasOwn(userAliases, model)) {
+    return shortModelName(userAliases[model]!, seen)
+  }
+
+  const stripped = getCanonicalName(model)
+  if (stripped !== model) {
+    if (Object.hasOwn(userAliases, stripped)) {
+      return shortModelName(userAliases[stripped]!, seen)
+    }
+    const knownStripped = lookupShortName(stripped)
+    if (knownStripped && !Object.hasOwn(BUILTIN_ALIASES, stripped) && !Object.hasOwn(BUILTIN_ALIASES, stripped.toLowerCase())) {
+      return knownStripped
+    }
+  }
+
+  const canonical = resolveAlias(stripped)
+  const known = lookupShortName(canonical)
+  if (known) return known
+
   if (canonical.includes('/')) {
     const segment = canonical.slice(canonical.lastIndexOf('/') + 1)
-    return segment ? getShortModelName(segment) : canonical
+    if (!segment || seen.has(segment) || segment === stripped) {
+      return lookupShortName(segment) ?? segment
+    }
+    return shortModelName(segment, seen)
   }
-  return canonical
+  return lookupShortName(canonical) ?? canonical
 }
 
 // Pricing is process-global state assembled at CLI startup from the cached
