@@ -167,6 +167,10 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
   const foldedCategoryCost = new Map<string, Map<CategoryKey, number>>()
   const foldedTotalCost = new Map<string, number>()
   const foldedRawSeen = new Set<string>()
+  // Empty string on the row means both "none seen" and "conflict". Track
+  // distinct non-empty baselines separately so a later bucket cannot
+  // repopulate a conflict that was already detected.
+  const baselinesByKey = new Map<string, Set<string>>()
 
   for (const bucket of buckets.values()) {
     const meta = await resolveProvider(bucket.provider)
@@ -184,6 +188,11 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
         })
       : null
 
+    const baselines = baselinesByKey.get(resolvedKey) ?? new Set<string>()
+    if (bucket.savingsBaselineModel) baselines.add(bucket.savingsBaselineModel)
+    baselinesByKey.set(resolvedKey, baselines)
+    const resolvedBaseline = baselines.size === 1 ? [...baselines][0]! : ''
+
     const existing = rowsByKey.get(resolvedKey)
     if (existing) {
       existing.inputTokens += bucket.inputTokens
@@ -195,12 +204,7 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
       existing.savingsUSD += bucket.savingsUSD
       existing.calls += bucket.calls
       if (bucket.model < existing.model) existing.model = bucket.model
-      if (existing.savingsBaselineModel && bucket.savingsBaselineModel
-        && existing.savingsBaselineModel !== bucket.savingsBaselineModel) {
-        existing.savingsBaselineModel = ''
-      } else if (!existing.savingsBaselineModel && bucket.savingsBaselineModel) {
-        existing.savingsBaselineModel = bucket.savingsBaselineModel
-      }
+      existing.savingsBaselineModel = resolvedBaseline
       if (existing.credits === null || bucketCredits === null) existing.credits = null
       else existing.credits += bucketCredits
     } else {
@@ -218,7 +222,7 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
         totalTokens: total,
         costUSD: bucket.costUSD,
         savingsUSD: bucket.savingsUSD,
-        savingsBaselineModel: bucket.savingsBaselineModel,
+        savingsBaselineModel: resolvedBaseline,
         calls: bucket.calls,
         credits: bucketCredits,
       })

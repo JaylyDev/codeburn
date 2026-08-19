@@ -37,6 +37,8 @@ function makeCall(opts: {
   output?: number
   cacheWrite?: number
   cacheRead?: number
+  savingsUSD?: number
+  savingsBaselineModel?: string
 }): ParsedApiCall {
   return {
     provider: opts.provider,
@@ -58,6 +60,8 @@ function makeCall(opts: {
     timestamp: '2026-05-09T00:00:00.000Z',
     bashCommands: [],
     deduplicationKey: `${opts.provider}-${opts.model}-${opts.costUSD}`,
+    savingsUSD: opts.savingsUSD,
+    savingsBaselineModel: opts.savingsBaselineModel,
   }
 }
 
@@ -226,6 +230,29 @@ describe('aggregateModels', () => {
     expect(rows[0]!.calls).toBe(2)
     expect(rows[0]!.topCategory).toBe('testing')
     expect(rows[0]!.topCategoryShare).toBeCloseTo(0.246 / 0.265, 3)
+  })
+
+  it('clears a merged savings baseline when three raw ids disagree', async () => {
+    const rows = await aggregateModels([makeProject([
+      makeTurn('feature', [makeCall({
+        provider: 'cline-cli', model: 'glm-5p2',
+        costUSD: 1, savingsUSD: 2, savingsBaselineModel: 'gpt-4o',
+      })]),
+      makeTurn('feature', [makeCall({
+        provider: 'cline-cli', model: 'GLM-5.2',
+        costUSD: 1, savingsUSD: 2, savingsBaselineModel: 'claude-sonnet-4-6',
+      })]),
+      makeTurn('feature', [makeCall({
+        provider: 'cline-cli', model: 'accounts/fireworks/models/glm-5p2',
+        costUSD: 1, savingsUSD: 2, savingsBaselineModel: 'gpt-5',
+      })]),
+    ])])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.provider).toBe('cline-cli')
+    expect(rows[0]!.modelDisplayName).toBe('GLM-5.2')
+    expect(rows[0]!.savingsUSD).toBe(6)
+    expect(rows[0]!.savingsBaselineModel).toBe('')
+    expect(rows[0]!.calls).toBe(3)
   })
 
   it('does not merge the same display name across providers', async () => {
