@@ -297,6 +297,10 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'k3-agent':                      'kimi-k3',
   'k2d6-agent':                    'kimi-k2p6',
   'mimo-v2-flash':                 'xiaomi/mimo-v2-flash',
+  // Hermes / Xiaomi token-plan sessions store the bare id. LiteLLM's row is
+  // namespaced. Same class as mimo-v2-flash above — do not invent a rate.
+  'mimo-v2.5-pro':                 'xiaomi/mimo-v2.5-pro',
+  'mimo-v2.5':                     'xiaomi/mimo-v2.5',
   'kat-coder-pro-v1':              'kwaipilot/kat-coder-pro',
   // Cursor emits dot-version tier-last names plus tier/reasoning suffixes
   // that LiteLLM does not index (`-high`, `-low`, `-medium`, `-thinking`,
@@ -983,13 +987,17 @@ function deriveClaudeShortName(canonical: string): string | undefined {
 
 export function getShortModelName(model: string): string {
   if (autoModelNames[model]) return autoModelNames[model]
-  const canonical = resolveAlias(getCanonicalName(model))
+  const stripped = getCanonicalName(model)
+  // Pricing aliases may re-namespace a leaf (mimo-v2.5-pro → xiaomi/…).
+  // Display names live on the leaf. Look that up before following the alias
+  // or we recurse forever: strip → alias → last-segment → strip.
+  for (const [key, name] of SORTED_SHORT_NAMES) {
+    if (stripped === key || stripped.startsWith(key + '-')) return name
+  }
+  const canonical = resolveAlias(stripped)
   const claude = deriveClaudeShortName(canonical)
   if (claude) return claude
   for (const [key, name] of SORTED_SHORT_NAMES) {
-    // Match on a version boundary, not a bare prefix: an unlisted future minor
-    // (e.g. gpt-5.6) must NOT collapse into the base "gpt-5" entry — it should
-    // fall through to its raw id rather than show a wrong name/tier.
     if (canonical === key || canonical.startsWith(key + '-')) return name
   }
   // getCanonicalName only strips the leading provider prefix, so a raw

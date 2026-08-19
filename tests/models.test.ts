@@ -737,6 +737,8 @@ describe('provider pricing suffix variants', () => {
 describe('observed provider model aliases', () => {
   const cases: Array<[string, string]> = [
     ['MiMo-V2-Flash', 'xiaomi/mimo-v2-flash'],
+    ['mimo-v2.5-pro', 'xiaomi/mimo-v2.5-pro'],
+    ['MiMo-v2.5-Pro', 'xiaomi/mimo-v2.5-pro'],
     ['KAT-Coder-Pro-V1', 'kwaipilot/kat-coder-pro'],
     // Kimi Code wires report bare `k3` in llm.request.model; it must price
     // through the kimi-k3 table entry, not fall through to $0.
