@@ -502,7 +502,7 @@ skipUnlessSqlite('hermes provider', () => {
     })
   })
 
-  it('captures GitHub pull URLs from Hermes transcript text', async () => {
+  it('does not attribute pull URLs without an origin-backed workspace', async () => {
     const dbPath = createHermesDb(tmpDir)
     withTestDb(dbPath, (db) => {
       insertSession(db, {
@@ -519,15 +519,19 @@ skipUnlessSqlite('hermes provider', () => {
     })
 
     const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=pr-session`)
-    expect(calls[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/1037'])
+    expect(calls[0]?.prLinks).toBeUndefined()
     expect(calls[0]?.project).toBe('hermes')
   })
 
   it('captures GitHub pull URLs that are wrapped in prose punctuation', async () => {
+    const repo = join(tmpDir, 'punct-repo')
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await writeFile(join(repo, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/getagentseal/codeburn.git\n')
     const dbPath = createHermesDb(tmpDir)
     withTestDb(dbPath, (db) => {
       insertSession(db, {
         id: 'pr-punct',
+        gitRepoRoot: repo,
         inputTokens: 10,
         outputTokens: 5,
         cacheReadTokens: 0,
@@ -672,6 +676,159 @@ skipUnlessSqlite('hermes provider', () => {
     const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=pr-filter`)
     expect(calls[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/1037'])
     expect(calls[0]?.project).toBe('codeburn-src')
+  })
+
+  it('uses origin even when another remote is listed first', async () => {
+    const repo = join(tmpDir, 'multi-remote')
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await writeFile(
+      join(repo, '.git', 'config'),
+      [
+        '[remote "evil"]',
+        '\turl = https://github.com/evil/codeburn.git',
+        '[remote "origin"]',
+        '\turl = https://github.com/getagentseal/codeburn.git',
+        '',
+      ].join('\n'),
+    )
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'origin-wins',
+        gitRepoRoot: repo,
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run(
+          'origin-wins',
+          'assistant',
+          'https://github.com/evil/codeburn/pull/3 https://github.com/getagentseal/codeburn/pull/4',
+          1779549201,
+        )
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=origin-wins`)
+    expect(calls[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/4'])
+  })
+
+  it('emits no pull links when only upstream exists', async () => {
+    const repo = join(tmpDir, 'upstream-only')
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await writeFile(join(repo, '.git', 'config'), '[remote "upstream"]\n\turl = https://github.com/getagentseal/codeburn.git\n')
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'upstream-only',
+        gitRepoRoot: repo,
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('upstream-only', 'assistant', 'https://github.com/getagentseal/codeburn/pull/2', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=upstream-only`)
+    expect(calls[0]?.prLinks).toBeUndefined()
+  })
+
+  it('ignores unclosed fenced pull URLs', async () => {
+    const repo = join(tmpDir, 'unclosed-fence')
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await writeFile(join(repo, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/getagentseal/codeburn.git\n')
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'unclosed',
+        gitRepoRoot: repo,
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run(
+          'unclosed',
+          'assistant',
+          'Opened https://github.com/getagentseal/codeburn/pull/8\n~~~\nhttps://github.com/getagentseal/codeburn/pull/6',
+          1779549201,
+        )
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=unclosed`)
+    expect(calls[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/8'])
+  })
+
+  it('ignores unclosed backtick fences and non-GitHub origin', async () => {
+    const repo = join(tmpDir, 'unclosed-tick')
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await writeFile(join(repo, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/getagentseal/codeburn.git\n')
+    const other = join(tmpDir, 'gitlab-origin')
+    await mkdir(join(other, '.git'), { recursive: true })
+    await writeFile(join(other, '.git', 'config'), '[remote "origin"]\n\turl = git@gitlab.com:getagentseal/codeburn.git\n')
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'unclosed-tick',
+        gitRepoRoot: repo,
+        inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      insertSession(db, {
+        id: 'gitlab-origin',
+        gitRepoRoot: other,
+        inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0,
+        startedAt: 1779549300,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('unclosed-tick', 'assistant', 'Opened https://github.com/getagentseal/codeburn/pull/10\n```\nhttps://github.com/getagentseal/codeburn/pull/11', 1779549201)
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('gitlab-origin', 'assistant', 'https://github.com/getagentseal/codeburn/pull/12', 1779549301)
+    })
+
+    const tick = await collectCalls(tmpDir, `${dbPath}#hermes-session=unclosed-tick`)
+    expect(tick[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/10'])
+    const gitlab = await collectCalls(tmpDir, `${dbPath}#hermes-session=gitlab-origin`)
+    expect(gitlab[0]?.prLinks).toBeUndefined()
+  })
+
+  it('reads origin from a linked worktree commondir', async () => {
+    const common = join(tmpDir, 'main.git')
+    const worktreeGit = join(tmpDir, 'main.git', 'worktrees', 'wt')
+    const repo = join(tmpDir, 'linked-wt')
+    await mkdir(worktreeGit, { recursive: true })
+    await mkdir(repo, { recursive: true })
+    await writeFile(join(repo, '.git'), `gitdir: ${worktreeGit}\n`)
+    await writeFile(join(worktreeGit, 'commondir'), `${common}\n`)
+    await writeFile(join(common, 'config'), '[remote "origin"]\n\turl = git@github.com:getagentseal/codeburn.git\n')
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'wt-origin',
+        gitRepoRoot: repo,
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('wt-origin', 'assistant', 'https://github.com/getagentseal/codeburn/pull/9', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=wt-origin`)
+    expect(calls[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/9'])
   })
 
   it('rejects a slash-UNC path as a workspace on POSIX', async () => {

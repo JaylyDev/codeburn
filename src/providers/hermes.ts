@@ -94,10 +94,65 @@ function displayProjectForProfile(profile: string): string {
 }
 
 function stripCodeRegions(text: string): string {
-  return text
-    .replace(/^[ \t]{4,}.*$/gm, ' ')
-    .replace(/(`{3,}|~{3,})[^\n]*\n[\s\S]*?\1/g, ' ')
-    .replace(/`[^`]*`/g, ' ')
+  const out: string[] = []
+  let fence: { marker: string; length: number } | null = null
+  for (const line of text.split('\n')) {
+    const trimmed = line.replace(/\s+$/, '')
+    const open = trimmed.match(/^(\s*)([`~]{3,})(.*)$/)
+    if (!fence) {
+      if (open && !open[3].includes(open[2][0]!)) {
+        fence = { marker: open[2][0]!, length: open[2].length }
+        out.push(' ')
+        continue
+      }
+      if (/^[ \t]{4,}\S/.test(line)) {
+        out.push(' ')
+        continue
+      }
+      out.push(line.replace(/`[^`]*`/g, ' '))
+      continue
+    }
+    const close = trimmed.match(/^(\s*)([`~]{3,})\s*$/)
+    if (close && close[2][0] === fence.marker && close[2].length >= fence.length) {
+      fence = null
+    }
+    out.push(' ')
+  }
+  return out.join('\n')
+}
+
+function parseGitConfigSection(config: string, section: string, key: string): string | null {
+  const wanted = `[${section.toLowerCase()}]`
+  let inSection = false
+  for (const raw of config.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#') || line.startsWith(';')) continue
+    if (line.startsWith('[')) {
+      inSection = line.toLowerCase() === wanted
+      continue
+    }
+    if (!inSection) continue
+    const eq = line.indexOf('=')
+    if (eq < 0) continue
+    if (line.slice(0, eq).trim().toLowerCase() !== key.toLowerCase()) continue
+    return line.slice(eq + 1).trim()
+  }
+  return null
+}
+
+function githubOwnerRepoFromUrl(url: string): { owner: string; repo: string } | null {
+  const gh = url.match(/github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?$/i)
+  if (!gh) return null
+  return { owner: gh[1].toLowerCase(), repo: gh[2].replace(/\.git$/i, '').toLowerCase() }
+}
+
+function resolveGitCommonDir(gitDir: string): string {
+  const marker = join(gitDir, 'commondir')
+  if (!existsSync(marker)) return gitDir
+  const rel = readFileSync(marker, 'utf8').trim()
+  if (!rel) return gitDir
+  if (rel.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(rel)) return rel
+  return join(gitDir, rel)
 }
 
 function githubOwnerRepoFromRoot(repoRoot: string): { owner: string; repo: string } | null {
@@ -115,23 +170,15 @@ function githubOwnerRepoFromRoot(repoRoot: string): { owner: string; repo: strin
     } else if (st !== 'dir') {
       return null
     }
-    const config = readFileSync(join(gitDir, 'config'), 'utf8')
-    const urlMatch = config.match(/url\s*=\s*(.+)/i)
-    if (!urlMatch?.[1]) return null
-    const url = urlMatch[1].trim()
-    const gh = url.match(/github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?$/i)
-    if (!gh) return null
-    return { owner: gh[1].toLowerCase(), repo: gh[2].replace(/\.git$/i, '').toLowerCase() }
-  } catch {
-    return null
-  }
-}
-
-function statSyncSafe(path: string): 'file' | 'dir' | null {
-  try {
-    const st = statSync(path)
-    if (st.isFile()) return 'file'
-    if (st.isDirectory()) return 'dir'
+    const commonDir = resolveGitCommonDir(gitDir)
+    const configs = [join(gitDir, 'config'), join(commonDir, 'config')]
+    for (const configPath of configs) {
+      if (!existsSync(configPath)) continue
+      const url = parseGitConfigSection(readFileSync(configPath, 'utf8'), 'remote "origin"', 'url')
+      if (!url) continue
+      const identity = githubOwnerRepoFromUrl(url)
+      if (identity) return identity
+    }
     return null
   } catch {
     return null
@@ -140,9 +187,9 @@ function statSyncSafe(path: string): 'file' | 'dir' | null {
 
 function extractGithubPullUrls(
   texts: Array<string | null | undefined>,
-  identity?: { owner: string; repo: string } | 'none',
+  identity: { owner: string; repo: string } | null,
 ): string[] {
-  if (identity === 'none') return []
+  if (!identity) return []
   const found = new Set<string>()
   const re = /https:\/\/github\.com\/[^/\s"'<>]+\/[^/\s"'<>]+\/pull\/\d+/gi
   for (const text of texts) {
@@ -154,11 +201,8 @@ function extractGithubPullUrls(
         if (url.protocol !== 'https:') continue
         const pathMatch = url.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/\d+$/)
         if (!pathMatch) continue
-        if (identity) {
-          const owner = pathMatch[1].toLowerCase()
-          const repo = pathMatch[2].toLowerCase()
-          if (owner !== identity.owner || repo !== identity.repo) continue
-        }
+        if (pathMatch[1].toLowerCase() !== identity.owner) continue
+        if (pathMatch[2].toLowerCase() !== identity.repo) continue
         found.add(`${url.origin}${url.pathname}`)
       } catch {
         // skip malformed
@@ -166,6 +210,17 @@ function extractGithubPullUrls(
     }
   }
   return [...found].sort()
+}
+
+function statSyncSafe(path: string): 'file' | 'dir' | null {
+  try {
+    const st = statSync(path)
+    if (st.isFile()) return 'file'
+    if (st.isDirectory()) return 'dir'
+    return null
+  } catch {
+    return null
+  }
 }
 
 function sanitizeProject(raw: string): string {
@@ -499,8 +554,8 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
         seenKeys.add(dedupKey)
 
         const identity = workspace.projectPath
-          ? (githubOwnerRepoFromRoot(workspace.projectPath) ?? 'none')
-          : undefined
+          ? githubOwnerRepoFromRoot(workspace.projectPath)
+          : null
         const prLinks = extractGithubPullUrls(
           messages
             .filter(msg => msg.role === 'assistant' || msg.role === 'user')
