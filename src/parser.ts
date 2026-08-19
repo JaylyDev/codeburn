@@ -2932,14 +2932,31 @@ function getOrCreateProviderSection(cache: SessionCache, provider: string): Prov
   const section: ProviderSection = { envFingerprint: envFp, files: {} }
   // A fingerprint change (env override or parse-version bump) must re-parse
   // every present source, but for durable providers the cache is the ONLY
-  // remaining record of usage whose source rows were already pruned (OTel
-  // orphans). Discarding those with the section would permanently erase
-  // month-to-date history that cannot be re-derived, so carry forward exactly
-  // the entries whose source no longer exists; everything present on disk is
-  // dropped and re-parsed under the new fingerprint.
+  // remaining record of usage whose source rows were already pruned. Dropping
+  // an entry because its FILE still exists is not the same question: a
+  // still-present OTel/session-store DB routinely keeps its file while the CLI
+  // prunes rows out of it, so "path exists" was being read as "the source can
+  // re-derive this", and the bump silently deleted history nothing could
+  // rebuild (#946 review). Present or absent, the entry is carried forward;
+  // a present source additionally gets an impossible fingerprint parked on it
+  // so the new parse version re-reads it in full. The durable union merge
+  // appends only turns whose dedup keys are not already cached, so the re-read
+  // ADDS whatever the source still holds without duplicating or deleting what
+  // it has already lost.
+  //
+  // The contract this rests on: a parse-version bump must not RE-KEY calls the
+  // source can still re-derive. Same event, same deduplicationKey, or the
+  // union counts it twice. Changing a provider's key shape is therefore a
+  // cache-version (CACHE_VERSION) change, not a parse-version change.
   if (existing && DURABLE_PROVIDER_NAMES.has(provider)) {
+    if (existing.durable) section.durable = true
     for (const [path, file] of Object.entries(existing.files)) {
-      if (!existsSync(path)) section.files[path] = file
+      if (!existsSync(path)) {
+        section.files[path] = file
+        continue
+      }
+      const { lastCompleteLineOffset: _resumeOffset, failed: _failed, ...rest } = file
+      section.files[path] = { ...rest, fingerprint: { dev: 0, ino: 0, mtimeMs: 0, sizeBytes: -1 } }
     }
   }
   cache.providers[provider] = section

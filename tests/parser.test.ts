@@ -618,6 +618,85 @@ describe('(f) durable orphans survive a parse-version bump', () => {
 })
 
 // ═══════════════════════════════════════════════════════════════════════════
+// (f2) Version-bump survival for an EXTANT-but-pruned durable DB. The orphan
+//      carry-forward in (f) keyed on "the source path is gone", but a durable
+//      SQLite source keeps its file forever while the CLI prunes rows out of
+//      it — so a parse-version bump was deleting exactly the history only the
+//      cache still held (#946 review, blocker 1). Also pins the other
+//      direction: an intact source re-read under the bump must not DOUBLE,
+//      which is the dedup-key-stability contract the union merge rests on.
+// ═══════════════════════════════════════════════════════════════════════════
+describe.skipIf(!isSqliteAvailable())('(f2) durable history survives a bump on an extant, pruned DB', () => {
+  const stubOtelOnly = (dbPath: string): void => {
+    vi.stubEnv('CODEBURN_COPILOT_OTEL_DB', dbPath)
+    vi.stubEnv('CODEBURN_COPILOT_DISABLE_OTEL', '')
+    vi.stubEnv('CODEBURN_COPILOT_SESSION_STATE_DIR', join(tmpHome, 'no-jsonl'))
+    vi.stubEnv('CODEBURN_COPILOT_WS_STORAGE_DIR', join(tmpHome, 'no-ws'))
+  }
+
+  // Take the same code path a real PROVIDER_PARSE_VERSIONS bump takes: any
+  // mismatching persisted envFingerprint rebuilds the provider section.
+  const simulateVersionBump = async (): Promise<void> => {
+    clearSessionCache()
+    const disk = await readCacheOnDisk()
+    expect(disk.providers['copilot']).toBeDefined()
+    disk.providers['copilot']!.envFingerprint = '0000000000000000'
+    await writeCacheOnDisk(disk)
+  }
+
+  it('keeps a pruned conversation whose DB file still exists', async () => {
+    const dbPath = join(tmpHome, 'agent-traces.db')
+    stubOtelOnly(dbPath)
+
+    createOtelDb(dbPath)
+    insertOtelConv(dbPath, { spanId: 's1', traceId: 't1', convId: 'bump-c1', model: 'gpt-4.1', input: 500, output: 50 })
+    insertOtelConv(dbPath, { spanId: 's2', traceId: 't2', convId: 'bump-c2', model: 'gpt-4.1', input: 1000, output: 100 })
+    expect(totalOutput(await parseAllSessions(undefined, 'copilot'))).toBe(150)
+
+    // The CLI prunes conv-1. The DB file is still there, still valid, just
+    // smaller — the shape that "carry forward only vanished paths" missed.
+    clearSessionCache()
+    await rm(dbPath)
+    createOtelDb(dbPath)
+    insertOtelConv(dbPath, { spanId: 's2', traceId: 't2', convId: 'bump-c2', model: 'gpt-4.1', input: 1000, output: 100 })
+    expect(totalOutput(await parseAllSessions(undefined, 'copilot'))).toBe(150)
+
+    await simulateVersionBump()
+
+    // The bump re-reads the live DB (conv-2) and unions it with the cached
+    // conv-1 the DB can no longer produce. Nothing is lost, nothing doubles.
+    expect(totalOutput(await parseAllSessions(undefined, 'copilot'))).toBe(150)
+
+    // And it is PERSISTED, not just served: a cold read of the rewritten
+    // cache still has it, otherwise the loss is merely deferred one run.
+    clearSessionCache()
+    expect(totalOutput(await parseAllSessions(undefined, 'copilot'))).toBe(150)
+    const disk = await readCacheOnDisk()
+    const keys = Object.values(disk.providers['copilot']?.files ?? {})
+      .flatMap(f => f.turns).flatMap(t => t.calls).map(c => c.deduplicationKey)
+    expect(keys).toContain('copilot-otel:s1')
+  })
+
+  it('does not double an intact DB re-read under the bump', async () => {
+    const dbPath = join(tmpHome, 'agent-traces-intact.db')
+    stubOtelOnly(dbPath)
+
+    createOtelDb(dbPath)
+    insertOtelConv(dbPath, { spanId: 's1', traceId: 't1', convId: 'intact-c1', model: 'gpt-4.1', input: 500, output: 50 })
+    insertOtelConv(dbPath, { spanId: 's2', traceId: 't2', convId: 'intact-c2', model: 'gpt-4.1', input: 1000, output: 100 })
+    expect(totalOutput(await parseAllSessions(undefined, 'copilot'))).toBe(150)
+
+    await simulateVersionBump()
+
+    // Every row is still derivable, so the union must recognise all of them
+    // by dedup key and append nothing.
+    expect(totalOutput(await parseAllSessions(undefined, 'copilot'))).toBe(150)
+    clearSessionCache()
+    expect(totalOutput(await parseAllSessions(undefined, 'copilot'))).toBe(150)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
 // (g) Skill attribution is independent of turn category
 // ═══════════════════════════════════════════════════════════════════════════
 describe('(g) skill attribution is independent of turn category', () => {
