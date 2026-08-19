@@ -641,6 +641,16 @@ export function getModelCosts(model: string): ModelCosts | null {
 
   if (pricingCache.has(canonical)) return pricingCache.get(canonical)!
 
+  // Gateway ids such as cp/cline-pass/glm-5.3 survive one prefix strip as
+  // cline-pass/glm-5.3. Price the last path segment through the same aliases
+  // getShortModelName already uses for the label.
+  if (canonical.includes('/')) {
+    const segment = canonical.slice(canonical.lastIndexOf('/') + 1)
+    const aliasedSegment = resolveAlias(segment)
+    if (pricingCache.has(aliasedSegment)) return pricingCache.get(aliasedSegment)!
+    if (pricingCache.has(segment)) return pricingCache.get(segment)!
+  }
+
   const prefixOverride = getPriceOverridePrefix(canonical)
   if (prefixOverride) return prefixOverride
 
