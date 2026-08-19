@@ -78,9 +78,14 @@ enum CodexSubscriptionService {
         }
     }
 
-    static func disconnect() {
-        _ = CodexCredentialStore.resetBootstrap()
-        clearUsageBlock()
+    /// Returns the delete outcome so callers only tear down UI state once the
+    /// credential material is actually gone. A failed delete leaves the usage
+    /// block intact too, so a retry starts from the same state.
+    @discardableResult
+    static func disconnect() -> CodexCredentialStore.CacheDeleteResult {
+        let result = CodexCredentialStore.resetBootstrap()
+        if result.isSuccess { clearUsageBlock() }
+        return result
     }
 
     private static func fetchWithToken(_ token: String, allowOne401Recovery: Bool) async throws -> CodexUsage {

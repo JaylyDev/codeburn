@@ -1053,7 +1053,7 @@ final class AppStore {
             return false
         } catch {
             guard gen == claudeRefreshGen else { return false }
-            subscriptionError = sanitizeForUI(String(describing: error))
+            subscriptionError = sanitizeForUI(error.localizedDescription)
             subscriptionLoadState = .failed
             return false
         }
@@ -1064,24 +1064,20 @@ final class AppStore {
     /// account or tier) starts clean. capacityEstimates and the snapshot store
     /// would otherwise contaminate "Based on last cycle" projections.
     func disconnectSubscription() {
-        ClaudeSubscriptionService.disconnect()
+        let result = ClaudeSubscriptionService.disconnect()
         // Bump the generation token so any in-flight refreshSubscription that
         // resumes after this point detects the disconnect and discards its
         // result instead of re-populating the cleared state.
         claudeRefreshGen &+= 1
-        if let result = ClaudeCredentialStore.lastCacheDeleteResult, !result.isSuccess {
-            // Any leftover Keychain item or plaintext must keep Disconnect
-            // so the user can retry delete.
+        guard result.isSuccess else {
+            // Nothing was removed, so nothing is disconnected. Leave the
+            // connected state exactly as it was — the bootstrap flag is still
+            // set, Disconnect stays available, and the banner says to retry.
             subscriptionError = "Could not fully remove the local Claude credential cache. Disconnect again to retry."
-            NotificationCenter.default.post(name: .codeBurnSubscriptionDisconnected, object: nil)
             return
         }
         subscription = nil
-        if let result = ClaudeCredentialStore.lastCacheDeleteResult, !result.isSuccess {
-            subscriptionError = "Could not fully remove the local Claude credential cache."
-        } else {
-            subscriptionError = nil
-        }
+        subscriptionError = nil
         subscriptionLoadState = .notBootstrapped
         capacityEstimates = [:]
         Task.detached { await SubscriptionSnapshotStore.clearAll() }
@@ -1102,7 +1098,7 @@ final class AppStore {
         } catch let err as CodexSubscriptionService.FetchError {
             applyCodexFetchError(err)
         } catch {
-            codexError = sanitizeForUI(String(describing: error))
+            codexError = sanitizeForUI(error.localizedDescription)
             codexLoadState = .failed
         }
     }
@@ -1135,26 +1131,23 @@ final class AppStore {
             return false
         } catch {
             guard gen == codexRefreshGen else { return false }
-            codexError = sanitizeForUI(String(describing: error))
+            codexError = sanitizeForUI(error.localizedDescription)
             codexLoadState = .failed
             return false
         }
     }
 
     func disconnectCodex() {
-        CodexSubscriptionService.disconnect()
+        let result = CodexSubscriptionService.disconnect()
         codexRefreshGen &+= 1
-        if let result = CodexCredentialStore.lastCacheDeleteResult, !result.isSuccess {
+        guard result.isSuccess else {
+            // Nothing removed means nothing disconnected; keep state intact so
+            // Disconnect stays available for a retry.
             codexError = "Could not fully remove the local Codex credential cache. Disconnect again to retry."
-            NotificationCenter.default.post(name: .codeBurnSubscriptionDisconnected, object: nil)
             return
         }
         codexUsage = nil
-        if let result = CodexCredentialStore.lastCacheDeleteResult, !result.isSuccess {
-            codexError = "Could not fully remove the local Codex credential cache."
-        } else {
-            codexError = nil
-        }
+        codexError = nil
         codexLoadState = .notBootstrapped
         NotificationCenter.default.post(name: .codeBurnSubscriptionDisconnected, object: nil)
     }
@@ -1196,7 +1189,7 @@ final class AppStore {
             applyKimiFetchError(err)
         } catch {
             guard gen == kimiRefreshGen else { return }
-            kimiError = sanitizeForUI(String(describing: error))
+            kimiError = sanitizeForUI(error.localizedDescription)
             kimiLoadState = .failed
         }
     }
@@ -1230,7 +1223,7 @@ final class AppStore {
             return false
         } catch {
             guard gen == kimiRefreshGen else { return false }
-            kimiError = sanitizeForUI(String(describing: error))
+            kimiError = sanitizeForUI(error.localizedDescription)
             kimiLoadState = .failed
             return false
         }
