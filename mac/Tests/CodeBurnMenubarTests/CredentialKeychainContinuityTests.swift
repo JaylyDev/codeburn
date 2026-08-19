@@ -204,7 +204,6 @@ struct CredentialKeychainContinuityTests {
                 account: ClaudeCredentialStore.ourKeychainAccount
             )
             #expect(keys?.contains("refreshToken") != true)
-            #expect(ClaudeCredentialStore.lastLegacyCleanupFailed == false)
         }
     }
 
@@ -319,13 +318,18 @@ struct CredentialKeychainContinuityTests {
             }
             ClaudeCredentialStore.clearMemoryCacheForTesting()
             _ = try ClaudeCredentialStore.currentRecord()
-            #expect(ClaudeCredentialStore.lastLegacyCleanupFailed == true)
             #expect(FileManager.default.fileExists(atPath: ClaudeCredentialStore.cacheFileURL().path))
             #expect(posixMode(at: ClaudeCredentialStore.cacheFileURL()) == 0o600)
+
+            // No sticky flag: the next read retries the unlink on its own.
+            ClaudeCredentialStore.unlinkLegacyOverride = nil
+            ClaudeCredentialStore.clearMemoryCacheForTesting()
+            _ = try ClaudeCredentialStore.currentRecord()
+            #expect(!FileManager.default.fileExists(atPath: ClaudeCredentialStore.cacheFileURL().path))
         }
     }
 
-    @Test("failed tighten after failed unlink keeps leftover and retry signal")
+    @Test("failed tighten after failed unlink keeps leftover in place")
     func failedTightenLeavesRetrySignal() throws {
         try withHarness { _ in
             let record = ClaudeCredentialStore.CredentialRecord(
@@ -341,7 +345,6 @@ struct CredentialKeychainContinuityTests {
             ClaudeCredentialStore.tightenLegacyOverride = { _ in throw POSIXError(.EPERM) }
             ClaudeCredentialStore.clearMemoryCacheForTesting()
             _ = try ClaudeCredentialStore.currentRecord()
-            #expect(ClaudeCredentialStore.lastLegacyCleanupFailed == true)
             #expect(FileManager.default.fileExists(atPath: ClaudeCredentialStore.cacheFileURL().path))
         }
     }
@@ -378,6 +381,148 @@ struct CredentialKeychainContinuityTests {
             let missing = try ClaudeCredentialStore.currentRecord()
             #expect(missing == nil)
             #expect(ClaudeCredentialStore.isBootstrapCompleted == false)
+        }
+    }
+
+    // MARK: - Locked / denied Keychain
+
+    @Test("unavailable Keychain read is a miss, not a disconnect")
+    func unavailableKeychainKeepsBootstrap() throws {
+        try withHarness { harness in
+            try ClaudeCredentialStore.writeOurCache(record: .init(
+                accessToken: accessSentinel,
+                refreshToken: refreshSentinel,
+                expiresAt: Date(timeIntervalSince1970: 1_900_000_000),
+                rateLimitTier: "default"
+            ))
+            ClaudeCredentialStore.isBootstrapCompleted = true
+
+            let controllable = ControllableKeychainCredentialCache(inner: harness.fakeKeychain)
+            controllable.failRead = true
+            controllable.readStatus = errSecInteractionNotAllowed  // -25308
+            ClaudeCredentialStore.keychainCache = controllable
+            ClaudeCredentialStore.clearMemoryCacheForTesting()
+
+            // Must not throw and must not clear bootstrap: a locked keychain is
+            // "can't look right now", not "the user disconnected".
+            #expect(try ClaudeCredentialStore.currentRecord() == nil)
+            #expect(ClaudeCredentialStore.isBootstrapCompleted == true)
+        }
+    }
+
+    @Test("a genuine read failure still surfaces as an error")
+    func nonUnavailableReadStillThrows() throws {
+        try withHarness { harness in
+            ClaudeCredentialStore.isBootstrapCompleted = true
+            let controllable = ControllableKeychainCredentialCache(inner: harness.fakeKeychain)
+            controllable.failRead = true
+            controllable.readStatus = errSecDecode
+            ClaudeCredentialStore.keychainCache = controllable
+            ClaudeCredentialStore.clearMemoryCacheForTesting()
+
+            #expect(throws: KeychainCredentialCacheError.self) {
+                _ = try ClaudeCredentialStore.currentRecord()
+            }
+        }
+    }
+
+    @Test("Keychain errors render a readable message, not a struct dump")
+    func keychainErrorMessageIsReadable() {
+        let unavailable = KeychainCredentialCacheError.unavailable(
+            service: ClaudeCredentialStore.ourKeychainService,
+            status: errSecInteractionNotAllowed
+        )
+        let text = unavailable.localizedDescription
+        #expect(text.contains("Keychain unavailable"))
+        // AppStore renders errors via localizedDescription; a struct dump would
+        // read "unavailable(service:" and leak the raw item name.
+        #expect(!text.contains("unavailable(service:"))
+        #expect(!text.contains(ClaudeCredentialStore.ourKeychainService))
+    }
+
+    // MARK: - Recency between Keychain item and legacy file
+
+    @Test("newer legacy file beats an older Keychain item and is then unlinked")
+    func newerLegacyFileWins() throws {
+        try withHarness { harness in
+            // Keychain item from an old build: already expired.
+            try ClaudeCredentialStore.writeOurCache(record: .init(
+                accessToken: "cb-stale-keychain-token",
+                refreshToken: nil,
+                expiresAt: Date(timeIntervalSince1970: 1_700_000_000),
+                rateLimitTier: "default"
+            ))
+            // Legacy file written far later by the pre-migration build.
+            try writeLegacyClaude0644(record: .init(
+                accessToken: accessSentinel,
+                refreshToken: refreshSentinel,
+                expiresAt: Date(timeIntervalSince1970: 1_900_000_000),
+                rateLimitTier: "default"
+            ))
+            ClaudeCredentialStore.isBootstrapCompleted = true
+            ClaudeCredentialStore.clearMemoryCacheForTesting()
+
+            let record = try #require(try ClaudeCredentialStore.currentRecord())
+            #expect(record.accessToken == accessSentinel)
+            #expect(record.refreshToken == nil)
+            #expect(!FileManager.default.fileExists(atPath: ClaudeCredentialStore.cacheFileURL().path))
+            let keys = harness.fakeKeychain.storedKeys(
+                service: ClaudeCredentialStore.ourKeychainService,
+                account: ClaudeCredentialStore.ourKeychainAccount
+            )
+            #expect(keys?.contains("refreshToken") != true)
+        }
+    }
+
+    @Test("older legacy file loses to a newer Keychain item and is unlinked")
+    func olderLegacyFileLoses() throws {
+        try withHarness { _ in
+            try ClaudeCredentialStore.writeOurCache(record: .init(
+                accessToken: accessSentinel,
+                refreshToken: nil,
+                expiresAt: Date(timeIntervalSince1970: 1_900_000_000),
+                rateLimitTier: "default"
+            ))
+            try writeLegacyClaude0644(record: .init(
+                accessToken: "cb-stale-file-token",
+                refreshToken: refreshSentinel,
+                expiresAt: Date(timeIntervalSince1970: 1_700_000_000),
+                rateLimitTier: "default"
+            ))
+            ClaudeCredentialStore.isBootstrapCompleted = true
+            ClaudeCredentialStore.clearMemoryCacheForTesting()
+
+            let record = try #require(try ClaudeCredentialStore.currentRecord())
+            #expect(record.accessToken == accessSentinel)
+            #expect(!FileManager.default.fileExists(atPath: ClaudeCredentialStore.cacheFileURL().path))
+        }
+    }
+
+    @Test("Codex prefers the legacy file with the later lastRefresh")
+    func codexNewerLegacyFileWins() throws {
+        try withHarness { _ in
+            try CodexCredentialStore.writeOurCache(record: .init(
+                accessToken: "cb-stale-codex-access",
+                refreshToken: "cb-stale-codex-refresh",
+                idToken: nil,
+                accountId: accountSentinel,
+                expiresAt: nil,
+                lastRefresh: Date(timeIntervalSince1970: 1_700_000_000)
+            ))
+            try writeLegacyCodex0644(record: .init(
+                accessToken: accessSentinel,
+                refreshToken: refreshSentinel,
+                idToken: idSentinel,
+                accountId: accountSentinel,
+                expiresAt: nil,
+                lastRefresh: Date(timeIntervalSince1970: 1_800_000_000)
+            ))
+            CodexCredentialStore.isBootstrapCompleted = true
+            CodexCredentialStore.clearMemoryCacheForTesting()
+
+            let record = try #require(try CodexCredentialStore.currentRecord())
+            #expect(record.refreshToken == refreshSentinel)
+            #expect(!FileManager.default.fileExists(atPath: CodexCredentialStore.cacheFileURL().path))
         }
     }
 

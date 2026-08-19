@@ -42,7 +42,6 @@ enum CodexCredentialStore {
         userDefaultsOverride = nil
         keychainCache = LiveKeychainCredentialCache()
         lastCacheDeleteResult = nil
-        lastLegacyCleanupFailed = false
         unlinkLegacyOverride = nil
         tightenLegacyOverride = nil
         lock.withLock { memoryCache = nil }
@@ -148,7 +147,6 @@ enum CodexCredentialStore {
     }
 
     nonisolated(unsafe) static var lastCacheDeleteResult: CacheDeleteResult?
-    nonisolated(unsafe) static var lastLegacyCleanupFailed = false
     nonisolated(unsafe) static var unlinkLegacyOverride: ((URL) throws -> Void)?
     nonisolated(unsafe) static var tightenLegacyOverride: ((URL) throws -> Void)?
 
@@ -178,7 +176,18 @@ enum CodexCredentialStore {
         if let cached = lock.withLock({ memoryCache }), cached.isFresh {
             return cached.record
         }
-        if let stored = try readOurCache() {
+        let fetched: CredentialRecord?
+        do {
+            fetched = try readOurCache()
+        } catch let err as KeychainCredentialCacheError {
+            // Locked/denied keychain: serve the last known token rather than
+            // reporting the grant as missing.
+            if case .unavailable = err {
+                return lock.withLock { memoryCache }?.record
+            }
+            throw err
+        }
+        if let stored = fetched {
             cacheInMemory(stored)
             return stored
         }
@@ -331,65 +340,83 @@ enum CodexCredentialStore {
         tryUnlinkLegacyAfterVerifiedKeychain()
     }
 
+    /// Serializes migrate + unlink across processes so two menubar instances (or the
+    /// CLI) cannot race on the same legacy file. Only `SafeFile.Error` from acquiring
+    /// the lock is tolerated — `readOurCacheLocked` never lets one escape, because
+    /// `readLegacyFile` swallows its own read failures.
     private static func readOurCache() throws -> CredentialRecord? {
+        do {
+            return try SafeFile.withExclusiveLock(at: cacheFileURL().path + ".lock") {
+                try readOurCacheLocked()
+            }
+        } catch is SafeFile.Error {
+            return try readOurCacheLocked()
+        }
+    }
+
+    private static func readOurCacheLocked() throws -> CredentialRecord? {
         if let data = try keychainCache.read(service: ourKeychainService, account: ourKeychainAccount),
            let record = try? JSONDecoder().decode(CredentialRecord.self, from: data) {
+            // Only reached when auth.json is unreadable, but the Keychain item can
+            // still be older than the legacy file — and serving a spent rotating
+            // refresh token here ends in a terminal invalid_grant. Prefer the
+            // later `lastRefresh` before unlinking anything.
+            if let fresher = legacyRecordIfNewer(than: record) {
+                try? writeOurCache(record: fresher)
+                return fresher
+            }
             tryUnlinkLegacyAfterVerifiedKeychain()
             return record
         }
         return try migrateLegacyFileIfPresent()
     }
 
-    private static func migrateLegacyFileIfPresent() throws -> CredentialRecord? {
-        let url = cacheFileURL()
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-
-        let data: Data
-        do {
-            data = try SafeFile.readAfterSecuringPermissions(
-                from: url.path,
-                maxBytes: maxCredentialBytes
-            )
-        } catch {
-            return nil
-        }
-
-        guard let decoded = try? JSONDecoder().decode(CredentialRecord.self, from: data) else {
-            return nil
-        }
-
-        do {
-            try writeOurCache(record: decoded)
-            return decoded
-        } catch {
-            lastLegacyCleanupFailed = false
-            return decoded
-        }
+    /// Returns the legacy file's record when it refreshed strictly later than
+    /// `record`; nil when absent, unreadable, or not newer.
+    private static func legacyRecordIfNewer(than record: CredentialRecord) -> CredentialRecord? {
+        guard let legacy = readLegacyFile() else { return nil }
+        guard let legacyRefresh = legacy.lastRefresh else { return nil }
+        guard let currentRefresh = record.lastRefresh else { return legacy }
+        return legacyRefresh > currentRefresh ? legacy : nil
     }
 
+    /// Secure-read + decode the legacy JSON. Returns nil on symlink / ownership /
+    /// chmod / decode failure, leaving the file in place.
+    private static func readLegacyFile() -> CredentialRecord? {
+        let url = cacheFileURL()
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        guard let data = try? SafeFile.readAfterSecuringPermissions(
+            from: url.path,
+            maxBytes: maxCredentialBytes
+        ) else { return nil }
+        return try? JSONDecoder().decode(CredentialRecord.self, from: data)
+    }
+
+    private static func migrateLegacyFileIfPresent() throws -> CredentialRecord? {
+        guard let decoded = readLegacyFile() else { return nil }
+        // Keychain write/read-back failure leaves the repaired 0600 legacy file
+        // in place; the next read retries the migration.
+        try? writeOurCache(record: decoded)
+        return decoded
+    }
+
+    /// Unlink the redundant legacy JSON. Called on every successful cache read,
+    /// so a failure here is retried on the next read without a sticky flag.
     private static func tryUnlinkLegacyAfterVerifiedKeychain() {
         let url = cacheFileURL()
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            lastLegacyCleanupFailed = false
-            return
-        }
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
         do {
             if let unlinkLegacyOverride {
                 try unlinkLegacyOverride(url)
             } else {
                 try FileManager.default.removeItem(at: url)
             }
-            lastLegacyCleanupFailed = false
         } catch {
-            lastLegacyCleanupFailed = true
-            do {
-                if let tightenLegacyOverride {
-                    try tightenLegacyOverride(url)
-                } else {
-                    try SafeFile.tightenToOwnerReadWrite(at: url.path)
-                }
-            } catch {
-                // Still leftover, and 0600 is unproven. Retry signal stays set.
+            // Could not remove it — at least make sure it is not world-readable.
+            if let tightenLegacyOverride {
+                try? tightenLegacyOverride(url)
+            } else {
+                try? SafeFile.tightenToOwnerReadWrite(at: url.path)
             }
         }
     }
