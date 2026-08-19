@@ -10,7 +10,7 @@ import { findUnpricedModels, isExpectedFreeModel, loadPricing } from './models.j
 import { aggregateModelTotals } from './model-breakdown.js'
 import { buildDurablePeriod } from './usage-aggregator.js'
 import { getAllProviders } from './providers/index.js'
-import { classHeaderLine, classTotals, findingBasis, findingClass, optimizePasteHeader, optimizeRemediationCopy, scanAndDetect, type FindingClass, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
+import { classHeaderLine, classTotals, findingBasis, findingClass, optimizeTuiPasteHeader, scanAndDetect, type FindingClass, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
 import { appliedFixGlyph, formatAppliedFix, type AppliedFix } from './act/types.js'
 import { aggregateFileChurn, buildCoachingNotes, computePricingCoverage, medianTimeToFirstEditMs, scanUserCorrections, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 import { estimateContextBudget, type ContextBudget } from './context-budget.js'
@@ -1040,7 +1040,7 @@ function actionDestinationHeader(action: WasteAction, provider?: string): string
     case 'command':
       return '── Run this command '.padEnd(64, '─')
     case 'paste': {
-      return `── ${optimizePasteHeader(action.destination, optimizeRemediationCopy(provider))} `.padEnd(64, '─')
+      return optimizeTuiPasteHeader(action.destination, provider)
     }
   }
 }

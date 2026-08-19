@@ -199,6 +199,29 @@ const coreProviders: Provider[] = [claude, cline, clineCli, codewhale, codebuff,
 // when an optional module fails to load. Must stay in sync with getAllProviders.
 const lazyProviderNames = ['antigravity', 'forge', 'goose', 'cursor', 'opencode', 'cursor-agent', 'crush', 'warp', 'vercel-gateway', 'zcode', 'zed']
 
+// Display names for lazy providers. Must match the `displayName` on the
+// loaded Provider object; `providerDisplayName` + getAllProviders() test
+// is the drift check.
+const lazyProviderDisplayNames: Record<string, string> = {
+  antigravity: 'Antigravity',
+  forge: 'Forge',
+  goose: 'Goose',
+  cursor: 'Cursor',
+  opencode: 'OpenCode',
+  'cursor-agent': 'Cursor Agent',
+  crush: 'Crush',
+  warp: 'Warp',
+  'vercel-gateway': 'Vercel AI Gateway',
+  zcode: 'ZCode',
+  zed: 'Zed',
+}
+
+export function providerDisplayName(name: string): string {
+  const core = coreProviders.find(p => p.name === name)
+  if (core) return core.displayName
+  return lazyProviderDisplayNames[name] ?? name
+}
+
 // Canonical set of every provider name (core + lazy), used to validate the
 // --provider CLI flag. Computed lazily so importing this module never depends on
 // every provider object being defined at load time (e.g. under test mocks).

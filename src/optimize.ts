@@ -8,7 +8,7 @@ import { homedir } from 'os'
 
 import { isReadShapedBashCommand } from './bash-utils.js'
 import { readSessionLines, readSessionFileSync } from './fs-utils.js'
-import { discoverAllSessions } from './providers/index.js'
+import { discoverAllSessions, providerDisplayName } from './providers/index.js'
 import { parseJsonlLine, shouldSkipLine } from './parser.js'
 import type { DateRange, ProjectSummary, SessionSummary } from './types.js'
 import { formatCost } from './currency.js'
@@ -260,36 +260,19 @@ export type OptimizeRemediationCopy = {
   instructionFile: string
 }
 
-const REMEDIATION_AGENT_NAMES: Record<string, string> = {
-  claude: 'Claude',
-  codex: 'Codex',
-  cursor: 'Cursor',
-  copilot: 'Copilot',
-  gemini: 'Gemini',
-  opencode: 'OpenCode',
-  antigravity: 'Antigravity',
-  windsurf: 'Windsurf',
-  cline: 'Cline',
-  hermes: 'Hermes',
-  kimi: 'Kimi',
-  kimicode: 'Kimi Code',
-  'ibm-bob': 'IBM Bob',
-  pi: 'Pi',
-}
-
 const REMEDIATION_INSTRUCTION_FILES: Record<string, string> = {
   claude: 'CLAUDE.md',
   codex: 'AGENTS.md',
 }
 
-function humanizeProviderId(id: string): string {
-  return id.split(/[-_]/).map(part => part ? part[0]!.toUpperCase() + part.slice(1) : part).join(' ')
+export function isDefaultClaudeProvider(provider?: string): boolean {
+  return !provider || provider === 'all' || provider === 'claude'
 }
 
 export function optimizeRemediationCopy(provider?: string): OptimizeRemediationCopy {
   const key = !provider || provider === 'all' ? 'claude' : provider.toLowerCase()
   return {
-    agent: REMEDIATION_AGENT_NAMES[key] ?? humanizeProviderId(key),
+    agent: providerDisplayName(key),
     instructionFile: REMEDIATION_INSTRUCTION_FILES[key] ?? 'project instructions',
   }
 }
@@ -311,6 +294,38 @@ export function optimizePasteHeader(destination: PasteDestination | undefined, c
     case 'manual':         return 'Manual action'
     default:               return 'Suggested action'
   }
+}
+
+/// Exact pre-#1049 TUI strings for unset/`all`/`claude`. Non-Claude providers
+/// reuse the CLI header table so the two surfaces cannot drift on new copy.
+export function optimizeTuiPasteHeader(destination: PasteDestination | undefined, provider?: string): string {
+  if (isDefaultClaudeProvider(provider)) {
+    switch (destination) {
+      case 'claude-md':      return '── Suggested CLAUDE.md addition (permanent rule) '.padEnd(64, '─')
+      case 'session-opener': return '── One-time session opener (do not add to CLAUDE.md) '.padEnd(64, '─')
+      case 'prompt':         return '── Ask Claude in the current session '.padEnd(64, '─')
+      case 'shell-config':   return '── Add to your shell config '.padEnd(64, '─')
+      case 'manual':         return '── Manual action '.padEnd(64, '─')
+      default:               return '── Suggested action '.padEnd(64, '─')
+    }
+  }
+  return `── ${optimizePasteHeader(destination, optimizeRemediationCopy(provider))} `.padEnd(64, '─')
+}
+
+export function optimizeEmptyScanLines(provider?: string): [string, string, string] {
+  if (isDefaultClaudeProvider(provider)) {
+    return [
+      'CodeBurn optimize scans your Claude Code sessions and config for',
+      'token waste: junk directory reads, duplicate file reads, unused',
+      'agents/skills/MCP servers, bloated CLAUDE.md, and more.',
+    ]
+  }
+  const copy = optimizeRemediationCopy(provider)
+  return [
+    `CodeBurn optimize scans your ${copy.agent} sessions and config for`,
+    'token waste: junk directory reads, duplicate file reads, unused',
+    `agents/skills/MCP servers, bloated ${copy.instructionFile}, and more.`,
+  ]
 }
 
 export type WasteAction =
@@ -3826,9 +3841,9 @@ export function renderOptimize(
   if (findings.length === 0) {
     lines.push(chalk.hex(GREEN)('  Nothing to fix. Your setup is lean.'))
     lines.push('')
-    lines.push(chalk.dim(`  CodeBurn optimize scans your ${copy.agent} sessions and config for`))
-    lines.push(chalk.dim('  token waste: junk directory reads, duplicate file reads, unused'))
-    lines.push(chalk.dim(`  agents/skills/MCP servers, bloated ${copy.instructionFile}, and more.`))
+    for (const line of optimizeEmptyScanLines(provider)) {
+      lines.push(chalk.dim(`  ${line}`))
+    }
     lines.push('')
     lines.push(...renderAppliedFixes(appliedFixes))
     lines.push(...renderWorkflowSection(reworkedFiles, coachingNotes))
