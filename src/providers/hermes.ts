@@ -1,4 +1,5 @@
 import { readdir, stat } from 'fs/promises'
+import { existsSync, readFileSync, statSync } from 'fs'
 import { basename, dirname, join } from 'path'
 import { homedir } from 'os'
 
@@ -12,6 +13,7 @@ type HermesSessionRow = {
   source: string | null
   model: string | null
   cwd: string | null
+  git_repo_root: string | null
   billing_provider: string | null
   input_tokens: number | null
   output_tokens: number | null
@@ -85,6 +87,153 @@ const toolNameMap: Record<string, string> = {
 
 function getHermesHome(override?: string): string {
   return override ?? process.env['HERMES_HOME'] ?? join(homedir(), '.hermes')
+}
+
+function displayProjectForProfile(profile: string): string {
+  return profile === 'default' ? 'hermes' : sanitizeProject(profile)
+}
+
+function stripCodeRegions(text: string): string {
+  const out: string[] = []
+  let fence: { marker: string; length: number } | null = null
+  for (const line of text.split('\n')) {
+    const trimmed = line.replace(/\s+$/, '')
+    const open = trimmed.match(/^(\s*)([`~]{3,})(.*)$/)
+    if (!fence) {
+      if (open && !open[3].includes(open[2][0]!)) {
+        fence = { marker: open[2][0]!, length: open[2].length }
+        out.push(' ')
+        continue
+      }
+      if (/^[ \t]{4,}\S/.test(line)) {
+        out.push(' ')
+        continue
+      }
+      out.push(line.replace(/`[^`]*`/g, ' '))
+      continue
+    }
+    const close = trimmed.match(/^(\s*)([`~]{3,})\s*$/)
+    if (close && close[2][0] === fence.marker && close[2].length >= fence.length) {
+      fence = null
+    }
+    out.push(' ')
+  }
+  return out.join('\n')
+}
+
+function parseGitConfigSection(config: string, section: string, key: string): string | null {
+  const wanted = `[${section.toLowerCase()}]`
+  let inSection = false
+  for (const raw of config.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#') || line.startsWith(';')) continue
+    if (line.startsWith('[')) {
+      inSection = line.toLowerCase() === wanted
+      continue
+    }
+    if (!inSection) continue
+    const eq = line.indexOf('=')
+    if (eq < 0) continue
+    if (line.slice(0, eq).trim().toLowerCase() !== key.toLowerCase()) continue
+    return line.slice(eq + 1).trim()
+  }
+  return null
+}
+
+function githubOwnerRepoFromUrl(url: string): { owner: string; repo: string } | null {
+  const gh = url.match(/github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?$/i)
+  if (!gh) return null
+  return { owner: gh[1].toLowerCase(), repo: gh[2].replace(/\.git$/i, '').toLowerCase() }
+}
+
+function resolveGitCommonDir(gitDir: string): string {
+  const marker = join(gitDir, 'commondir')
+  if (!existsSync(marker)) return gitDir
+  const rel = readFileSync(marker, 'utf8').trim()
+  if (!rel) return gitDir
+  if (rel.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(rel)) return rel
+  return join(gitDir, rel)
+}
+
+// Memoized per repo root: every session in the same repo would otherwise
+// re-read .git/config. Process-lifetime only, so a remote URL change needs a
+// restart (a resident `serve` child included).
+const originIdentityByRoot = new Map<string, { owner: string; repo: string } | null>()
+
+function githubOwnerRepoFromRoot(repoRoot: string): { owner: string; repo: string } | null {
+  const memo = originIdentityByRoot.get(repoRoot)
+  if (memo !== undefined) return memo
+  const identity = readGithubOwnerRepoFromRoot(repoRoot)
+  originIdentityByRoot.set(repoRoot, identity)
+  return identity
+}
+
+function readGithubOwnerRepoFromRoot(repoRoot: string): { owner: string; repo: string } | null {
+  try {
+    let gitDir = join(repoRoot, '.git')
+    if (!existsSync(gitDir)) return null
+    const st = statSyncSafe(gitDir)
+    if (st === 'file') {
+      const body = readFileSync(gitDir, 'utf8')
+      const match = body.match(/^gitdir:\s*(.+?)\s*$/m)
+      if (!match?.[1]) return null
+      gitDir = match[1].startsWith('/') || /^[a-zA-Z]:[\\/]/.test(match[1])
+        ? match[1]
+        : join(repoRoot, match[1])
+    } else if (st !== 'dir') {
+      return null
+    }
+    const commonDir = resolveGitCommonDir(gitDir)
+    const configs = [join(gitDir, 'config'), join(commonDir, 'config')]
+    for (const configPath of configs) {
+      if (!existsSync(configPath)) continue
+      const url = parseGitConfigSection(readFileSync(configPath, 'utf8'), 'remote "origin"', 'url')
+      if (!url) continue
+      const identity = githubOwnerRepoFromUrl(url)
+      if (identity) return identity
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+function extractGithubPullUrls(
+  texts: Array<string | null | undefined>,
+  identity: { owner: string; repo: string } | null,
+): string[] {
+  if (!identity) return []
+  const found = new Set<string>()
+  const re = /https:\/\/github\.com\/[^/\s"'<>]+\/[^/\s"'<>]+\/pull\/\d+/gi
+  for (const text of texts) {
+    if (!text) continue
+    const searchable = stripCodeRegions(text)
+    for (const match of searchable.matchAll(re)) {
+      try {
+        const url = new URL(match[0])
+        if (url.protocol !== 'https:') continue
+        const pathMatch = url.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/\d+$/)
+        if (!pathMatch) continue
+        if (pathMatch[1].toLowerCase() !== identity.owner) continue
+        if (pathMatch[2].toLowerCase() !== identity.repo) continue
+        found.add(`${url.origin}${url.pathname}`)
+      } catch {
+        // skip malformed
+      }
+    }
+  }
+  return [...found].sort()
+}
+
+function statSyncSafe(path: string): 'file' | 'dir' | null {
+  try {
+    const st = statSync(path)
+    if (st.isFile()) return 'file'
+    if (st.isDirectory()) return 'dir'
+    return null
+  } catch {
+    return null
+  }
 }
 
 function sanitizeProject(raw: string): string {
@@ -248,6 +397,39 @@ function collectTools(messages: HermesMessageRow[]): { tools: string[]; toolSequ
   }
 }
 
+function isRealWorkspace(cwd: string | null | undefined): cwd is string {
+  if (!cwd?.trim()) return false
+  const trimmed = cwd.trim()
+  const isAbsolute = process.platform === 'win32'
+    ? /^[a-zA-Z]:[\\/]/.test(trimmed) || /^\\\\[^\\/]+\\/.test(trimmed)
+    : trimmed.startsWith('/') && !trimmed.startsWith('//')
+  if (!isAbsolute) return false
+  const normalized = trimmed.replace(/\\/g, '/').replace(/\/+$/, '')
+  if (normalized === '/' || normalized === homedir() || normalized === homedir().replace(/\\/g, '/')) return false
+  if (/\.app\/Contents\//.test(normalized)) return false
+  return true
+}
+
+function resolveHermesWorkspace(
+  row: HermesSessionRow,
+  messages: HermesMessageRow[],
+): { project: string; projectPath?: string; provider: 'hermes' } {
+  const provider = 'hermes' as const
+  const repo = row.git_repo_root?.trim()
+  if (isRealWorkspace(repo)) {
+    return { project: sanitizeProject(basename(repo)), projectPath: repo, provider }
+  }
+  const cwd = row.cwd?.trim()
+  if (isRealWorkspace(cwd)) {
+    return { project: sanitizeProject(cwd), projectPath: cwd, provider }
+  }
+  const inferred = inferProject(messages, '')
+  if (isRealWorkspace(inferred.projectPath)) {
+    return { ...inferred, provider }
+  }
+  return { project: provider, provider }
+}
+
 function inferProject(messages: HermesMessageRow[], fallback: string): { project: string; projectPath?: string } {
   const cwdPattern = /^Current working directory:\s*([a-zA-Z]:\\[^\r\n`"]+|\/[^\r\n`"\\]+)/m
   for (const msg of messages) {
@@ -291,7 +473,7 @@ async function discoverFromDb(dbPath: string, profile: string): Promise<SessionS
 
     return rows.map(row => ({
       path: encodeSourcePath(dbPath, row.id),
-      project: sanitizeProject(profile),
+      project: displayProjectForProfile(profile),
       provider: 'hermes',
     }))
   } catch (err) {
@@ -332,6 +514,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
                   ${nullableColumn(columns, 'source')},
                   ${nullableColumn(columns, 'model')},
                   ${nullableColumn(columns, 'cwd')},
+                  ${nullableColumn(columns, 'git_repo_root')},
                   ${nullableColumn(columns, 'billing_provider')},
                   ${numberColumn(columns, 'input_tokens')},
                   ${numberColumn(columns, 'output_tokens')},
@@ -377,17 +560,21 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
 
         const model = row.model ?? 'unknown'
         const { tools, toolSequence, bashCommands } = collectTools(messages)
-        // Hermes records the session's working directory in sessions.cwd.
-        // Prefer it; fall back to scraping a "Current working directory:" line
-        // from the transcript (older builds), then to the profile name.
-        const cwd = row.cwd?.trim()
-        const projectInfo = cwd
-          ? { project: sanitizeProject(cwd), projectPath: cwd }
-          : inferProject(messages, sanitizeProject(profile))
+        const workspace = resolveHermesWorkspace(row, messages)
         const timestamp = parseTimestamp(row.started_at)
         const dedupKey = `hermes:${profile}:${row.id}`
         if (seenKeys.has(dedupKey)) return
         seenKeys.add(dedupKey)
+
+        const identity = workspace.projectPath
+          ? githubOwnerRepoFromRoot(workspace.projectPath)
+          : null
+        const prLinks = extractGithubPullUrls(
+          messages
+            .filter(msg => msg.role === 'assistant' || msg.role === 'user')
+            .map(msg => msg.content),
+          identity,
+        )
 
         // Hermes bills reasoning tokens at the output rate (same as Gemini).
         // The LiteLLM model table is used as a fallback when Hermes has not
@@ -410,7 +597,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
         const costIsEstimated = recordedCost === null
 
         result = {
-          provider: 'hermes',
+          provider: workspace.provider,
           model,
           inputTokens,
           outputTokens,
@@ -430,8 +617,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
           toolSequence: toolSequence.length > 0 ? toolSequence : undefined,
           userMessage: firstUserMessage(messages),
           sessionId: row.id,
-          project: projectInfo.project,
-          projectPath: projectInfo.projectPath,
+          project: workspace.project,
+          projectPath: workspace.projectPath,
+          ...(prLinks.length > 0 ? { prLinks } : {}),
         }
       } catch (err) {
         // A transient lock on the live state.db must propagate so the caller

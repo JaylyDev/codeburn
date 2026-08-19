@@ -59,6 +59,68 @@ describe('getModelCosts', () => {
     expect(lower!.inputCostPerToken).toBe(upper!.inputCostPerToken)
     expect(lower!.outputCostPerToken).toBe(upper!.outputCostPerToken)
   })
+
+  it('prices glm-5.3 (Hermes / Cline spelling) instead of leaving it unpriced', () => {
+    const lower = getModelCosts('glm-5.3')
+    const upper = getModelCosts('GLM-5.3')
+    const sibling = getModelCosts('glm-5p2')
+    expect(lower).not.toBeNull()
+    expect(upper).not.toBeNull()
+    expect(sibling).not.toBeNull()
+    expect(lower!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
+    expect(upper!.outputCostPerToken).toBe(sibling!.outputCostPerToken)
+    expect(getModelCosts('cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
+    expect(getModelCosts('omniroute:cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
+    expect(getModelCosts('cmd/deepseek/deepseek-v4-flash')).not.toBeNull()
+    expect(getModelCosts('provider/org/glm-5.3')).toBeNull()
+    expect(getModelCosts('provider/glm-5.3')).toBeNull()
+    expect(getModelCosts('cp/provider/glm-5.3')).toBeNull()
+    expect(getModelCosts('omniroute:provider/glm-5.3')).toBeNull()
+    expect(getModelCosts('unknown/deepseek-v4-flash')).toBeNull()
+    expect(getModelCosts('z-ai/glm-5.2')).not.toBeNull()
+    expect(getModelCosts('z-ai/glm-5.3')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
+  })
+
+  // A price override on a synthetic bare id can only be reached if the leading
+  // segment was stripped, so these assert the namespace allowlist itself without
+  // pinning to any real model's presence in (or absence from) the snapshot.
+  it('strips vendor namespaces the pricing catalog knows and fails closed on the rest', () => {
+    setPriceOverrides({ 'zzz-namespace-probe': { input: 1, output: 2 } })
+
+    const known = ['anthropic', 'x-ai', 'xai', 'qwen', 'moonshotai', 'nousresearch', 'kimi',
+      'litellm_proxy', 'openai_like', 'zhipu', 'mimo', 'xiaomi',
+      'cp', 'cline-pass', 'cline-free', 'cmd', 'antigravity']
+    for (const ns of known) {
+      expect(getModelCosts(`${ns}/zzz-namespace-probe`), ns).not.toBeNull()
+    }
+
+    // Local runners and unknown vendors must never strip down to a priced row.
+    const unknown = ['ollama', 'local', 'lmstudio', 'hosted_vllm', 'unsloth', 'nosuchvendor']
+    for (const ns of unknown) {
+      expect(getModelCosts(`${ns}/zzz-namespace-probe`), ns).toBeNull()
+    }
+  })
+
+  it('peels every routing wrapper but not an unknown vendor inside one', () => {
+    setPriceOverrides({ 'zzz-router-probe': { input: 1, output: 2 } })
+
+    const routed = [
+      'omniroute:zzz-router-probe',
+      'omniroute:cp/cline-pass/zzz-router-probe',
+      'omniroute:cline-free/zzz-router-probe',
+      'omniroute:antigravity/zzz-router-probe',
+      'omniroute:cmd/zzz-router-probe',
+    ]
+    for (const id of routed) expect(getModelCosts(id), id).not.toBeNull()
+
+    expect(getModelCosts('omniroute:nosuchvendor/zzz-router-probe')).toBeNull()
+  })
+
+  it('lets a user price override for a bare id win over the routed catalog row', () => {
+    setPriceOverrides({ 'glm-5.3': { input: 99, output: 99 } })
+    expect(getModelCosts('cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(99 / 1_000_000)
+    expect(getModelCosts('omniroute:cp/cline-pass/glm-5.3')!.outputCostPerToken).toBe(99 / 1_000_000)
+  })
 })
 
 describe('getShortModelName', () => {
@@ -113,6 +175,13 @@ describe('getShortModelName', () => {
     expect(getShortModelName('GLM-5.2')).toBe('GLM-5.2')
     expect(getShortModelName('glm-5.2')).toBe('GLM-5.2')
     expect(getShortModelName('glm-5p1')).toBe('GLM-5.2')
+    expect(getShortModelName('glm-5.3')).toBe('GLM-5.3')
+    expect(getShortModelName('GLM-5.3')).toBe('GLM-5.3')
+    // Prices via the glm-5p2 sibling, but must not be LABELLED as GLM-5.2.
+    expect(getShortModelName('cmd/glm-5.3')).toBe('GLM-5.3')
+    expect(getShortModelName('z-ai/glm-5.3')).toBe('GLM-5.3')
+    expect(getShortModelName('xiaomi/glm-5.3')).toBe('GLM-5.3')
+    expect(getShortModelName('cp/cline-pass/glm-5.3')).toBe('GLM-5.3')
     // Grok Build prices via the grok-build-0.1 sibling.
     expect(getShortModelName('grok-build')).toBe('Grok Build')
     expect(getShortModelName('grok-build-0.1')).toBe('Grok Build')
