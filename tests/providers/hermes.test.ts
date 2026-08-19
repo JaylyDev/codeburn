@@ -49,6 +49,7 @@ function createHermesDb(homeDir: string): string {
       source TEXT,
       model TEXT,
       cwd TEXT,
+      git_repo_root TEXT,
       billing_provider TEXT,
       billing_base_url TEXT,
       billing_mode TEXT,
@@ -122,6 +123,7 @@ function insertSession(db: TestDb, values: {
   source?: string
   model?: string
   cwd?: string | null
+  gitRepoRoot?: string | null
   billingProvider?: string
   inputTokens: number
   outputTokens: number
@@ -137,15 +139,16 @@ function insertSession(db: TestDb, values: {
 }): void {
   db.prepare(
     `INSERT INTO sessions (
-      id, source, model, cwd, billing_provider, input_tokens, output_tokens,
+      id, source, model, cwd, git_repo_root, billing_provider, input_tokens, output_tokens,
       cache_read_tokens, cache_write_tokens, reasoning_tokens, estimated_cost_usd,
       actual_cost_usd, api_call_count, tool_call_count, started_at, title
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     values.id,
     values.source ?? 'cli',
     values.model ?? 'gpt-5.5',
     values.cwd ?? null,
+    values.gitRepoRoot ?? null,
     values.billingProvider ?? 'openai-codex',
     values.inputTokens,
     values.outputTokens,
@@ -609,6 +612,62 @@ skipUnlessSqlite('hermes provider', () => {
     expect(calls[0]?.project).toBe('hermes')
   })
 
+  it('does not treat a relative cwd as a workspace', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'rel-cwd',
+        source: 'desktop',
+        cwd: '.',
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('rel-cwd', 'user', 'hi', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=rel-cwd`)
+    expect(calls[0]?.project).toBe('hermes')
+    expect(calls[0]?.projectPath).toBeUndefined()
+  })
+
+  it('ignores fenced and unrelated-repo pull URLs when a git root is known', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'pr-filter',
+        gitRepoRoot: '/Users/a/Documents/Codeburn',
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run(
+          'pr-filter',
+          'assistant',
+          [
+            'Opened https://github.com/getagentseal/codeburn/pull/1037',
+            'Also see https://github.com/other/haystack/pull/1',
+            '```',
+            'https://github.com/getagentseal/codeburn/pull/677',
+            '```',
+          ].join('\n'),
+          1779549201,
+        )
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=pr-filter`)
+    expect(calls[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/1037'])
+    expect(calls[0]?.project).toBe('Codeburn')
+  })
+
   it('infers projects from Windows current working directory messages', async () => {
     const dbPath = createHermesDb(tmpDir)
     withTestDb(dbPath, (db) => {
@@ -626,10 +685,15 @@ skipUnlessSqlite('hermes provider', () => {
     })
 
     const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=windows-cwd-session`)
-    expect(calls[0]).toMatchObject({
-      project: 'C--AI_LAB-OPENCLAW',
-      projectPath: 'C:\\AI_LAB\\OPENCLAW',
-    })
+    if (process.platform === 'win32') {
+      expect(calls[0]).toMatchObject({
+        project: 'C--AI_LAB-OPENCLAW',
+        projectPath: 'C:\\AI_LAB\\OPENCLAW',
+      })
+    } else {
+      expect(calls[0]?.project).toBe('hermes')
+      expect(calls[0]?.projectPath).toBeUndefined()
+    }
   })
 
   it('groups by the sessions.cwd column when present, ahead of message scraping', async () => {

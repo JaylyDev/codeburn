@@ -92,17 +92,23 @@ function displayProjectForProfile(profile: string): string {
   return profile === 'default' ? 'hermes' : sanitizeProject(profile)
 }
 
-function extractGithubPullUrls(...texts: Array<string | null | undefined>): string[] {
+function extractGithubPullUrls(
+  texts: Array<string | null | undefined>,
+  repoName?: string,
+): string[] {
   const found = new Set<string>()
   const re = /https:\/\/github\.com\/[^/\s"'<>]+\/[^/\s"'<>]+\/pull\/\d+/gi
+  const wantedRepo = repoName?.trim().toLowerCase()
   for (const text of texts) {
     if (!text) continue
-    for (const match of text.matchAll(re)) {
+    const searchable = text.replace(/```[\s\S]*?```/g, ' ').replace(/`[^`]*`/g, ' ')
+    for (const match of searchable.matchAll(re)) {
       try {
-        const raw = match[0].replace(/[).,\]]:;]+$/g, '')
-        const url = new URL(raw)
+        const url = new URL(match[0])
         if (url.protocol !== 'https:') continue
-        if (!/^\/[^/]+\/[^/]+\/pull\/\d+$/.test(url.pathname)) continue
+        const pathMatch = url.pathname.match(/^\/[^/]+\/([^/]+)\/pull\/\d+$/)
+        if (!pathMatch) continue
+        if (wantedRepo && pathMatch[1].toLowerCase() !== wantedRepo) continue
         found.add(`${url.origin}${url.pathname}`)
       } catch {
         // skip malformed
@@ -275,7 +281,12 @@ function collectTools(messages: HermesMessageRow[]): { tools: string[]; toolSequ
 
 function isRealWorkspace(cwd: string | null | undefined): cwd is string {
   if (!cwd?.trim()) return false
-  const normalized = cwd.replace(/\\/g, '/').replace(/\/+$/, '')
+  const trimmed = cwd.trim()
+  const isAbsolute = process.platform === 'win32'
+    ? /^[a-zA-Z]:[\\/]/.test(trimmed)
+    : trimmed.startsWith('/')
+  if (!isAbsolute) return false
+  const normalized = trimmed.replace(/\\/g, '/').replace(/\/+$/, '')
   if (normalized === '/' || normalized === homedir() || normalized === homedir().replace(/\\/g, '/')) return false
   if (/\.app\/Contents\//.test(normalized)) return false
   return true
@@ -437,10 +448,12 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
         if (seenKeys.has(dedupKey)) return
         seenKeys.add(dedupKey)
 
+        const repoName = workspace.projectPath ? basename(workspace.projectPath) : undefined
         const prLinks = extractGithubPullUrls(
-          ...messages
+          messages
             .filter(msg => msg.role === 'assistant' || msg.role === 'user')
             .map(msg => msg.content),
+          repoName,
         )
 
         // Hermes bills reasoning tokens at the output rate (same as Gemini).

@@ -602,11 +602,31 @@ function resolveAlias(model: string): string {
   return model
 }
 function getCanonicalName(model: string): string {
+  return stripKnownFirstNamespace(
+    model
+      .replace(/@.*$/, '')
+      .replace(/-\d{8}$/, '')
+      .replace(/\[[^\]]*\]$/, ''),
+  )
+}
+
+// Only these first path segments are vendor/router identity. An unknown
+// `provider/model` must stay unpriced — do not treat `/` as authority.
+const KNOWN_NAMESPACES = new Set([
+  'anthropic', 'openai', 'azure', 'azure_ai', 'openrouter', 'google',
+  'gemini', 'vertex_ai', 'bedrock', 'xiaomi', 'deepseek', 'moonshot',
+  'minimax', 'mistral', 'meta-llama', 'meta', 'cohere', 'together_ai',
+  'groq', 'fireworks_ai', 'xai', 'databricks', 'snowflake', 'novita',
+  'nvidia', 'cerebras', 'kimi', 'alibaba', 'dashscope',
+  'cp', 'cline-pass', 'cline-free', 'cmd', 'antigravity',
+])
+
+function stripKnownFirstNamespace(model: string): string {
+  const idx = model.indexOf('/')
+  if (idx <= 0) return model
+  const head = model.slice(0, idx).toLowerCase()
+  if (KNOWN_NAMESPACES.has(head)) return model.slice(idx + 1)
   return model
-    .replace(/@.*$/, '')       // strip pin: claude-sonnet-4-6@20250929 -> claude-sonnet-4-6
-    .replace(/-\d{8}$/, '')   // strip date: claude-sonnet-4-20250514 -> claude-sonnet-4
-    .replace(/^[^/]+\//, '') // strip provider prefix: anthropic/foo -> foo
-    .replace(/\[[^\]]*\]$/, '') // strip context tag: Codex records Kimi as k3[1m], so kimi/k3[1m] -> k3
 }
 
 // Routing wrappers (OmniRoute, Cline Pass, cmd/, …) are not model ids.
@@ -643,8 +663,8 @@ function routedModelCandidates(model: string): string[] {
       }
     }
   }
-  // One house-style vendor strip (anthropic/foo → foo). Do not keep
-  // collapsing unknown provider/org/model trees onto a priced leaf.
+  // One known-vendor strip only (anthropic/foo → foo). Unknown
+  // provider/model trees stay intact and therefore unpriced.
   push(getCanonicalName(current))
   return ids
 }
