@@ -89,38 +89,46 @@ struct DataClientProcessTests {
 
     /// Concurrency + timeout smoke test: launch more hung subprocesses than
     /// there are cooperative threads, all at once, with a short timeout, and
-    /// assert every call returns once the timeout kills its sleep.
+    /// assert every call returns because the timeout killed its sleep.
     ///
     /// NOTE: this does NOT reproduce the production permanent deadlock (16/16
-    /// cooperative threads parked in waitUntilExit). In a short-lived unit-test
-    /// process libdispatch spins up replacement threads for blocked workers, so
-    /// even the old blocking-on-the-pool code completes here. The real deadlock
-    /// built up over ~2 days under the @MainActor refresh loop and is confirmed
-    /// by the live `sample`, not by this test. Kept as a guard that the
-    /// off-pool wait + timeout path stays correct under concurrency.
-    @Test("concurrent timed-out processes all complete")
-    func concurrentTimedOutProcessesAllComplete() {
+    /// cooperative threads parked in waitUntilExit). The real deadlock built up
+    /// over ~2 days under the @MainActor refresh loop and is confirmed by the
+    /// live `sample`, not by this test. Kept as a guard that the off-pool wait
+    /// + timeout path stays correct under concurrency.
+    ///
+    /// The body must stay `async` and await the group directly. It used to
+    /// block on a `DispatchSemaphore` with a 15s deadline, on the claim that a
+    /// test body runs on a real thread. It does not: Swift Testing invokes even
+    /// synchronous test bodies from a task on the cooperative pool, so the wait
+    /// parked one of the pool's `activeProcessorCount` workers on the very work
+    /// it was waiting for. A 16-core dev box has slack, a 3-core CI runner does
+    /// not, and the wait expired with the group making no progress at all.
+    /// Keeping it `async` also lets the compiler reject the blocking wait,
+    /// which is unavailable from asynchronous contexts.
+    @Test("concurrent timed-out processes all complete", .timeLimit(.minutes(1)))
+    func concurrentTimedOutProcessesAllComplete() async {
         let count = ProcessInfo.processInfo.activeProcessorCount * 2 + 4
-        let done = DispatchSemaphore(value: 0)
-
-        Task {
-            await withTaskGroup(of: Void.self) { group in
-                for _ in 0..<count {
-                    group.addTask {
-                        let process = Process()
-                        process.executableURL = URL(fileURLWithPath: "/bin/sleep")
-                        process.arguments = ["30"]
-                        _ = try? await DataClient.runProcess(process, timeoutSeconds: 1, label: "sleep 30")
-                    }
+        let codes = await withTaskGroup(of: Int32?.self) { group -> [Int32?] in
+            for _ in 0..<count {
+                group.addTask {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+                    process.arguments = ["30"]
+                    return try? await DataClient.runProcess(process, timeoutSeconds: 1, label: "sleep 30").exitCode
                 }
             }
-            done.signal()
+            var out: [Int32?] = []
+            for await code in group { out.append(code) }
+            return out
         }
 
-        // Wait on the test thread (a real thread, not the cooperative pool) so
-        // the deadlock is detectable even when the pool is fully starved.
-        let outcome = done.wait(timeout: .now() + 15)
-        #expect(outcome == .success, "runProcess deadlocked: \(count) concurrent CLIs starved the cooperative pool")
+        #expect(codes.count == count)
+        // A `sleep 30` cannot end within a 1s timeout on its own, so a signal
+        // status is proof the timeout fired and killed it rather than the child
+        // racing the deadline and exiting normally.
+        #expect(codes.allSatisfy { $0 == SIGTERM || $0 == SIGKILL },
+                "every hung process should be killed by its own timeout, got \(codes)")
     }
 
     /// A decode failure surfaces the CLI's actual stdout/stderr so a stray banner
