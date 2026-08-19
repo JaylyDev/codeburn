@@ -1108,4 +1108,38 @@ describe('unpricedModelHint', () => {
     expect(unpricedModelHint()).toContain('model-flat-rate')
     expect(unpricedModelHint()).not.toContain('Fix: codeburn model-alias')
   })
+
+  it('names both hatches for a concrete unknown SKU', () => {
+    const hint = unpricedModelHint('zz-new-subscription-pass-sku')
+    expect(hint).toContain('codeburn model-alias "zz-new-subscription-pass-sku"')
+    expect(hint).toContain('codeburn model-flat-rate "zz-new-subscription-pass-sku"')
+    expect(hint).toContain('If a model is billed per token')
+    expect(hint).toContain('If $0 is correct')
+  })
+})
+
+describe('calculateCost verbose unknown-model warning', () => {
+  it('does not present model-alias as the only fix for an unknown SKU', () => {
+    const previous = process.env['CODEBURN_VERBOSE']
+    process.env['CODEBURN_VERBOSE'] = '1'
+    const chunks: string[] = []
+    const originalWrite = process.stderr.write.bind(process.stderr)
+    process.stderr.write = ((chunk: string | Uint8Array, ...args: unknown[]) => {
+      chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString())
+      return (originalWrite as (chunk: string | Uint8Array, ...rest: unknown[]) => boolean)(chunk, ...args)
+    }) as typeof process.stderr.write
+    try {
+      expect(calculateCost('zz-new-subscription-pass-sku', 10, 10, 0, 0, 0)).toBe(0)
+    } finally {
+      process.stderr.write = originalWrite
+      if (previous === undefined) delete process.env['CODEBURN_VERBOSE']
+      else process.env['CODEBURN_VERBOSE'] = previous
+    }
+    const text = chunks.join('')
+    expect(text).toContain('zz-new-subscription-pass-sku')
+    expect(text).toContain('If a model is billed per token')
+    expect(text).toContain('model-flat-rate')
+    expect(text).toContain('model-alias')
+    expect(text).not.toMatch(/Map it with: codeburn model-alias/)
+  })
 })

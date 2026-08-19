@@ -584,9 +584,12 @@ export function isFlatRateModel(model: string): boolean {
 }
 
 /// Shared unpriced-warning copy. Never tell the user to alias unconditionally:
-/// mapping a subscription SKU onto a priced row invents spend.
-export function unpricedModelHint(): string {
-  return 'If a model is billed per token, map it with: codeburn model-alias "<model>" <known-model>. If $0 is correct (subscription / flat-rate): codeburn model-flat-rate "<model>".'
+/// mapping a subscription SKU onto a priced row invents spend. Optional `model`
+/// interpolates the sanitized id so the verbose calculateCost path names the
+/// same two hatches.
+export function unpricedModelHint(model = '<model>'): string {
+  const safe = model.replace(/[\x00-\x1F\x7F-\x9F]/g, '?').slice(0, 200)
+  return `If a model is billed per token, map it with: codeburn model-alias "${safe}" <known-model>. If $0 is correct (subscription / flat-rate): codeburn model-flat-rate "${safe}".`
 }
 
 /// Stable hash of the model-alias map, for the same staleness class as the
@@ -995,10 +998,9 @@ export function calculateCost(
       // payloads written by external tools, so a hostile or corrupt file
       // could embed terminal escape sequences here.
       const safeName = sanitizeModelForDisplay(model)
-      const aliasHint = `Map it with: codeburn model-alias "${safeName}" <known-model>, or track local-model savings with: codeburn model-savings "${safeName}" <baseline-model>`
       process.stderr.write(
         `codeburn: no pricing data for model "${safeName}" — costs for this model will show $0. ` +
-        `${aliasHint}, or update with: npx codeburn@latest.\n`
+        `${unpricedModelHint(safeName)} Or track local-model savings with: codeburn model-savings "${safeName}" <baseline-model>, or update with: npx codeburn@latest.\n`,
       )
     }
     return 0
