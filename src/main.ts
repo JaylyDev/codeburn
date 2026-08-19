@@ -2,8 +2,8 @@ import { isAbsolute } from 'path'
 import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
-import { findUnpricedModels, loadPricing, setModelAliases, setPriceOverrides, setLocalModelSavings, setProxyPaths, normalizeProxyPath } from './models.js'
-import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint } from './parser.js'
+import { findUnpricedModels, loadPricing, setModelAliases, setPriceOverrides, setLocalModelSavings, setProxyPaths, normalizeProxyPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
+import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint, isSessionHydrationComplete } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
 import { getProvider } from './providers/index.js'
 import { convertCost, formatCost } from './currency.js'
@@ -1153,6 +1153,23 @@ program
         label: periodInfo.label,
         ...queryScope,
         days: daysSelection ? [...daysSelection.days].sort() : undefined,
+        // Mirrors parser.ts's cacheKey: pricing-affecting config must
+        // invalidate this snapshot the same way it invalidates the
+        // parse-level memo, or an edited alias/override/savings config keeps
+        // serving costs priced under the old config until something
+        // unrelated moves the corpus fingerprint.
+        proxyPathsConfigHash: getProxyPathsConfigHash(),
+        modelAliasesConfigHash: getModelAliasesConfigHash(),
+        priceOverridesConfigHash: getPriceOverridesConfigHash(),
+        localModelSavingsConfigHash: getLocalModelSavingsConfigHash(),
+        // Same reasoning, different config: the rendered payload's costs are
+        // in the ACTIVE display currency (see `getCurrency`/`loadCurrency`,
+        // refreshed fresh from config.json by the `preAction` hook ahead of
+        // this handler), which the corpus fingerprint and the four hashes
+        // above never touch. Without this, switching currencies keeps
+        // serving the old currency's numbers until a session file happens to
+        // change too.
+        currency: getCurrency(),
       })
       const corpus = await computeCorpusFingerprint(pf)
       const snapshot = await loadStatusSnapshot(corpus.hash, corpus.newestMtimeMs, queryKey)
@@ -1160,7 +1177,13 @@ program
         ...queryScope,
         daysSelection,
       })) as Awaited<ReturnType<typeof buildMenubarPayloadForRange>>
-      if (!snapshot) await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, queryKey, payload)
+      // A read-only parse that had to serve stale/skip real files
+      // (isSessionHydrationComplete() === false) is a knowingly-degraded
+      // result. Persisting it under the CURRENT (already-advanced) corpus
+      // fingerprint would make that degraded answer look authoritative to
+      // every future poll that matches this fingerprint — never checkpoint a
+      // partial hydration as if it were a real, complete parse.
+      if (!snapshot && isSessionHydrationComplete()) await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, queryKey, payload)
       if (opts.scope === 'combined') {
         // Combined multi-device usage is best-effort enrichment on the menubar's
         // hot path. Never let pulling peers (or a corrupt remotes store) take

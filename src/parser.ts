@@ -35,7 +35,7 @@ import { acquireCacheRefreshLock, type RefreshLockHandle } from './cache-refresh
 import { decideParseWorkers, parseFilesInOrder, ParseWorkerPool, type ClaudeWorkerParse, type ParseJob } from './parse-workers.js'
 import type { CodexFullParse } from './providers/codex.js'
 import { dateKey } from './day-aggregator.js'
-import type { ParsedProviderCall, SessionSource } from './providers/types.js'
+import type { ParsedProviderCall, Provider, SessionSource } from './providers/types.js'
 import type {
   ApiUsageIteration,
   AssistantMessageContent,
@@ -3964,6 +3964,23 @@ export type CorpusFingerprint = {
   newestMtimeMs: number
 }
 
+// Generic counterpart to `collectJsonlInto`: every regular file under a
+// directory, any extension, recursively. Used to expand a directory-shaped
+// SessionSource for fingerprinting purposes only — not for parsing, which
+// stays with each provider's own (narrower, extension-aware) file layout
+// knowledge. Being over-inclusive here is safe: an extra file in the hash
+// can only cause an extra cache miss, never a missed update.
+async function collectFilesRecursive(dirPath: string): Promise<string[]> {
+  const entries = await readdir(dirPath, { withFileTypes: true }).catch(() => [])
+  const files: string[] = []
+  for (const entry of entries) {
+    const p = join(dirPath, entry.name)
+    if (entry.isDirectory()) files.push(...await collectFilesRecursive(p))
+    else files.push(p)
+  }
+  return files
+}
+
 // Cheap, content-free signature of "has anything in the discoverable session
 // corpus changed since the last check" — a stat-only pass (readdir + stat per
 // discovered source; no session-cache.json read/parse, no transcript content
@@ -3977,12 +3994,21 @@ export type CorpusFingerprint = {
 //
 // Claude `SessionSource.path` is a project DIRECTORY, not a leaf transcript
 // (see `scanProjectDirs`/`collectJsonlFiles` above) — every other provider's
-// path IS the leaf file/DB it parses. Fingerprinting the directory itself
-// would miss an in-place rewrite of an existing file inside it: a
-// directory's own mtime only moves when entries are added or removed, not
-// when one of its files' content changes. So Claude sources are expanded to
-// their actual `.jsonl` files first, exactly the way scanProjectDirs discovers
-// them, and each of those is fingerprinted individually.
+// path IS the leaf file/DB it parses, with two exceptions. Fingerprinting a
+// directory itself would miss an in-place rewrite of an existing file inside
+// it: a directory's own mtime only moves when entries are added or removed,
+// not when one of its files' content changes. So:
+// - Claude sources are expanded to their actual `.jsonl` files first, exactly
+//   the way scanProjectDirs discovers them, and each is fingerprinted
+//   individually.
+// - Any OTHER directory-shaped source (e.g. mistral-vibe, whose parser reads
+//   `join(source.path, 'messages.jsonl')`) gets the same treatment via a
+//   generic recursive file walk — this is deliberately NOT gated on provider
+//   name, so it also covers whatever directory-shaped provider shows up
+//   next instead of repeating the same blind spot one provider at a time.
+// - Network providers (e.g. Vercel AI Gateway) have no on-disk file at all —
+//   see the `provider.network` branch below, mirroring parseAllSessions'
+//   own treatment of the same sources in `parseProviderSources`.
 export async function computeCorpusFingerprint(providerFilter?: string): Promise<CorpusFingerprint> {
   const sources = await discoverAllSessions(providerFilter)
   const entries: string[] = []
@@ -3993,9 +4019,34 @@ export async function computeCorpusFingerprint(providerFilter?: string): Promise
     entries.push(`${path}|${fp.dev}|${fp.ino}|${fp.mtimeMs}|${fp.sizeBytes}`)
     if (fp.mtimeMs > newestMtimeMs) newestMtimeMs = fp.mtimeMs
   }
+  // Cache the provider lookup per name — sources routinely repeat a provider
+  // many times over (one per Claude project dir, one per mistral-vibe
+  // session dir, ...) and getProvider() can be a dynamic-import round-trip.
+  const providerByName = new Map<string, Provider | undefined>()
+  const resolveProvider = async (name: string): Promise<Provider | undefined> => {
+    if (!providerByName.has(name)) providerByName.set(name, await getProvider(name))
+    return providerByName.get(name)
+  }
   for (const source of sources) {
     if (source.provider === 'claude') {
       for (const filePath of await collectJsonlFiles(source.path)) await record(filePath)
+      continue
+    }
+    const provider = await resolveProvider(source.provider)
+    if (provider?.network) {
+      // No file to fingerprint. Force a miss (and advance newestMtimeMs)
+      // every call instead of silently contributing nothing to the hash —
+      // the parser re-fetches network sources unconditionally on every real
+      // parse, and a snapshot layer sitting in front of that must not be
+      // able to hide the run that would have done the fetching.
+      const now = Date.now()
+      entries.push(`${source.path}|network|${now}`)
+      if (now > newestMtimeMs) newestMtimeMs = now
+      continue
+    }
+    const info = await stat(source.path).catch(() => null)
+    if (info?.isDirectory()) {
+      for (const filePath of await collectFilesRecursive(source.path)) await record(filePath)
       continue
     }
     await record(source.path)

@@ -1631,6 +1631,11 @@ type StatusSnapshotRecord = {
   newestMtimeMs: number
   queryKey: string
   payload: unknown
+  // Wall-clock time (Date.now()) the FIRST mismatch against this record's
+  // corpusFingerprint was observed. Absent = not currently mismatched (a
+  // fresh save, or a record no load has mismatched against yet). This is
+  // what the settle-window decision anchors on — see `loadStatusSnapshot`.
+  mismatchFirstSeenAt?: number
 }
 
 function statusSnapshotPath(): string {
@@ -1653,31 +1658,19 @@ async function readStatusSnapshotRecord(): Promise<StatusSnapshotRecord | null> 
   }
 }
 
-/** Returns the previously-saved payload when the query still matches AND
- *  either the corpus fingerprint is an exact match (nothing changed) or the
- *  corpus's most recently touched file is still within the settle window
- *  (likely still being written — see `statusSnapshotSettleMs`). Null
- *  otherwise, so the caller recomputes for real and should persist a fresh
- *  snapshot with the new fingerprint. */
-export async function loadStatusSnapshot(corpusFingerprint: string, newestMtimeMs: number, queryKey: string): Promise<unknown | null> {
-  const stored = await readStatusSnapshotRecord()
-  if (!stored || stored.queryKey !== queryKey) return null
-  if (stored.corpusFingerprint === corpusFingerprint) return stored.payload ?? null
-  if (Date.now() - newestMtimeMs < statusSnapshotSettleMs()) return stored.payload ?? null
-  return null
-}
-
-/** Best-effort: a failed write just means the next poll recomputes instead
- *  of reusing. Only ever called by the caller when `loadStatusSnapshot`
- *  missed, so a settled recompute's result always supersedes whatever was
- *  there before. */
-export async function saveStatusSnapshot(corpusFingerprint: string, newestMtimeMs: number, queryKey: string, payload: unknown): Promise<void> {
+/** Shared best-effort atomic writer for both `saveStatusSnapshot` (a fresh,
+ *  settled recompute) and `loadStatusSnapshot`'s own bookkeeping write (a
+ *  first-observed-mismatch timestamp, so the settle clock survives across
+ *  the one-shot processes that call this — each CLI poll is a fresh process
+ *  with no in-memory state to carry it). A failed write just means the next
+ *  poll recomputes, or re-observes the mismatch as if it were first, instead
+ *  of reusing/deferring — never stale or corrupt data either way. */
+async function writeStatusSnapshotRecord(record: StatusSnapshotRecord): Promise<void> {
   try {
     const dir = getCodeburnCacheDir()
     if (!existsSync(dir)) await mkdir(dir, { recursive: true })
     const finalPath = statusSnapshotPath()
     const tempPath = `${finalPath}.${randomBytes(8).toString('hex')}.tmp`
-    const record: StatusSnapshotRecord = { version: STATUS_SNAPSHOT_VERSION, corpusFingerprint, newestMtimeMs, queryKey, payload }
     const handle = await open(tempPath, 'w', 0o600)
     try {
       await handle.writeFile(JSON.stringify(record), { encoding: 'utf-8' })
@@ -1686,4 +1679,44 @@ export async function saveStatusSnapshot(corpusFingerprint: string, newestMtimeM
     }
     await rename(tempPath, finalPath)
   } catch { /* best-effort; next poll just recomputes */ }
+}
+
+/** Returns the previously-saved payload when the query still matches AND
+ *  either the corpus fingerprint is an exact match (nothing changed) or this
+ *  mismatch was first observed less than `statusSnapshotSettleMs()` of
+ *  wall-clock time ago (likely still being written). Null otherwise, so the
+ *  caller recomputes for real and should persist a fresh snapshot with the
+ *  new fingerprint.
+ *
+ *  Deliberately does NOT use `newestMtimeMs` (the corpus-wide max mtime) to
+ *  decide how long a mismatch has been "recent": that value is the max
+ *  across every discovered source, so churn in a file the current query
+ *  never reads (a different project, or a network-provider source that
+ *  `computeCorpusFingerprint` deliberately re-stamps to "now" every call so
+ *  it never drops out of the hash) can keep it perpetually fresh, deferring
+ *  forever instead of "at most the window." Anchoring on the wall-clock time
+ *  THIS record's fingerprint first stopped matching makes the settle window
+ *  a true bound regardless of what else in the corpus is busy. */
+export async function loadStatusSnapshot(corpusFingerprint: string, newestMtimeMs: number, queryKey: string): Promise<unknown | null> {
+  const stored = await readStatusSnapshotRecord()
+  if (!stored || stored.queryKey !== queryKey) return null
+  if (stored.corpusFingerprint === corpusFingerprint) return stored.payload ?? null
+
+  const now = Date.now()
+  const firstSeenAt = stored.mismatchFirstSeenAt ?? now
+  if (now - firstSeenAt >= statusSnapshotSettleMs()) return null
+  if (stored.mismatchFirstSeenAt === undefined) {
+    await writeStatusSnapshotRecord({ ...stored, newestMtimeMs, mismatchFirstSeenAt: firstSeenAt })
+  }
+  return stored.payload ?? null
+}
+
+/** Best-effort: a failed write just means the next poll recomputes instead
+ *  of reusing. Only ever called by the caller when `loadStatusSnapshot`
+ *  missed, so a settled recompute's result always supersedes whatever was
+ *  there before. Always writes a fresh record with no `mismatchFirstSeenAt`,
+ *  which is exactly what clears the settle-window clock once a real
+ *  recompute lands. */
+export async function saveStatusSnapshot(corpusFingerprint: string, newestMtimeMs: number, queryKey: string, payload: unknown): Promise<void> {
+  await writeStatusSnapshotRecord({ version: STATUS_SNAPSHOT_VERSION, corpusFingerprint, newestMtimeMs, queryKey, payload })
 }

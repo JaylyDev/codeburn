@@ -2,17 +2,17 @@
 
 ## Problem
 
-`PERF-DEFECT-FINDINGS.md` reports `codeburn status` taking 25-90+ seconds per
+`codeburn status --format menubar-json` was measured taking 25-90+ seconds per
 call, with **no speedup on a repeat call against an unchanged, freshly-warmed
-cache** (finding "Test 5"). The findings doc's working hypothesis was a
-missing mtime/size gate ahead of per-file content hashing.
+cache**. The initial working hypothesis was a missing mtime/size gate ahead of
+per-file content hashing.
 
 Direct re-investigation on the reporter's own machine (live `sample`
 profiling of the installed `codeburn status --format menubar-json` binary
 against the real ~386MB `session-cache.v7.json`) found:
 
-- The per-source-file change-detection gate the findings doc hypothesized as
-  missing **already exists and is correct**: `reconcileFile`/`fingerprintFile`
+- The per-source-file change-detection gate hypothesized as missing
+  **already exists and is correct**: `reconcileFile`/`fingerprintFile`
   in `src/session-cache.ts` compare `dev/ino/mtimeMs/sizeBytes` and skip
   re-reading/re-hashing any unchanged source transcript. There is no
   content-hashing step anywhere in that gate.
@@ -172,9 +172,56 @@ needed to expire correctly:
 ## Secondary finding: dual kqueue watches on `/`
 
 Scoping call: **out of scope for this fix, filed as a separate follow-up.**
-The findings doc could not confirm this as a cause of the latency (flat FD
+This investigation could not confirm this as a cause of the latency (flat FD
 count over an 8s observation window) and it is orthogonal to the cache
 read/write path this fix touches — it would live in whichever file-watch
 setup code owns the fs-watcher init (not `session-cache.ts`), and needs its
 own `fs_usage`/`dtrace` reproduction under `sudo`, which wasn't available in
 this session either. No code change made for it here.
+
+## Reconciliation with the resident `serve --stdio` process
+
+This fix originally targeted a genuine gap: a fresh CLI spawn per menubar poll
+had no cross-process reuse story at all. That premise changed after this was
+opened — `src/serve.ts` now keeps a resident query server warm for the
+desktop app, with a request-level `outputMemo` (capped at 5 minutes, cleared
+on any config-fingerprint change) validated by root filesystem watchers
+(`startRootWatchers`/`classifyRootReuse`), and falls back to a fresh CLI spawn
+only when that in-process path is unavailable or refuses the command.
+
+Decision: **keep this disk snapshot**, scoped explicitly to that fallback
+spawn path (and any other one-shot invocation of `status --format
+menubar-json` outside the desktop app's `serve` connection), rather than drop
+it. Reasoning:
+
+- `serve`'s memo is in-process and per-server-lifetime; it buys nothing for an
+  actual CLI spawn, which is a brand-new process with no memo to hit. The
+  disk snapshot is the only thing standing between that spawn and paying the
+  full parse+aggregation cost — exactly the case `serve.ts`'s own module
+  comment documents as the fallback it exists to catch.
+- The concern that motivated re-examining this at all — "a second, weaker
+  cache whose invalidation rules lose to `serve`'s whenever it hits first" —
+  is addressed by the five correctness fixes in this revision (pricing-config
+  hash parity with `parser.ts`'s `cacheKey`, a synthetic fingerprint for
+  network providers, generic directory-shaped-source expansion, gating the
+  save on `isSessionHydrationComplete()`, and anchoring the settle-window
+  defer on wall-clock first-mismatch time instead of the corpus-wide newest
+  mtime). With those fixed, the snapshot's own freshness check
+  (`computeCorpusFingerprint`, an eager stat sweep over every discovered
+  source on every call) is not weaker than `serve`'s watcher-based heuristic
+  — if anything it is strictly more precise, since it re-runs discovery and
+  re-stats rather than trusting `fs.watch` coverage that has documented blind
+  spots (a root created after the watcher armed, a missed FSEvents
+  coalescence). `serve`'s 5-minute hard cap exists as defense-in-depth
+  against exactly those watcher blind spots; the disk snapshot doesn't need
+  an equivalent hard cap because it isn't exposed to that failure mode in the
+  first place.
+- No commits upstream of this branch's merge base touch the status-snapshot
+  code path (`loadStatusSnapshot`/`saveStatusSnapshot`/`statusSnapshotSettleMs`
+  in `src/session-cache.ts`, or the `status --format menubar-json` handler in
+  `src/main.ts`) — the two upstream cache commits in that range
+  (`fix(cache): stop republishing month shards a scoped run never read`,
+  `cache: CODEBURN_CACHE_SCOPE=all forces a full shard read`) are both scoped
+  to `saveCache`/`loadCache`'s month-shard mechanics, a different layer of
+  `session-cache.ts` entirely. No further rebase-driven reconciliation is
+  needed beyond the fixes above.
