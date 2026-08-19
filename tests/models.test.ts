@@ -776,6 +776,14 @@ describe('observed provider model aliases', () => {
     expect(getShortModelName('cline-pass/mimo-v2.5-pro')).toBe('MiMo v2.5 Pro')
   })
 
+  it('stays unary so Array.map cannot feed the index as cycle state', () => {
+    expect(['mimo-v2.5', 'gpt-4o', 'cline-pass/mimo-v2.5-pro'].map(getShortModelName)).toEqual([
+      'mimo-v2.5',
+      'GPT-4o',
+      'MiMo v2.5 Pro',
+    ])
+  })
+
   it('does not map dated Qwen3 Max to a reseller price without provider context', () => {
     expect(getModelCosts('qwen3-max-2026-01-23')).toBeNull()
     expect(calculateCost('qwen3-max-2026-01-23', 1_000_000, 1_000_000, 0, 0, 0)).toBe(0)

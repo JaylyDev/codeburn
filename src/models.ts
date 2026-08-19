@@ -994,7 +994,12 @@ function lookupShortName(id: string): string | undefined {
   return undefined
 }
 
-export function getShortModelName(model: string, seen: Set<string> = new Set()): string {
+// Public API stays unary so Array.map/forEach cannot feed index as cycle state.
+export function getShortModelName(model: string): string {
+  return shortModelName(model, new Set())
+}
+
+function shortModelName(model: string, seen: Set<string>): string {
   if (autoModelNames[model]) return autoModelNames[model]
   if (seen.has(model)) {
     const leaf = model.includes('/') ? model.slice(model.lastIndexOf('/') + 1) : model
@@ -1005,13 +1010,13 @@ export function getShortModelName(model: string, seen: Set<string> = new Set()):
   // User aliases win over built-in display names. A remap of gpt-4o must
   // show the target, not "GPT-4o".
   if (Object.hasOwn(userAliases, model)) {
-    return getShortModelName(userAliases[model]!, seen)
+    return shortModelName(userAliases[model]!, seen)
   }
 
   const stripped = getCanonicalName(model)
   if (stripped !== model) {
     if (Object.hasOwn(userAliases, stripped)) {
-      return getShortModelName(userAliases[stripped]!, seen)
+      return shortModelName(userAliases[stripped]!, seen)
     }
     const knownStripped = lookupShortName(stripped)
     if (knownStripped && !Object.hasOwn(BUILTIN_ALIASES, stripped) && !Object.hasOwn(BUILTIN_ALIASES, stripped.toLowerCase())) {
@@ -1028,7 +1033,7 @@ export function getShortModelName(model: string, seen: Set<string> = new Set()):
     if (!segment || seen.has(segment) || segment === stripped) {
       return lookupShortName(segment) ?? segment
     }
-    return getShortModelName(segment, seen)
+    return shortModelName(segment, seen)
   }
   return lookupShortName(canonical) ?? canonical
 }
