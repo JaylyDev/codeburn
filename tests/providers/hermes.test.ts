@@ -520,6 +520,26 @@ skipUnlessSqlite('hermes provider', () => {
     expect(calls[0]?.project).toBe('hermes')
   })
 
+  it('captures GitHub pull URLs that are wrapped in prose punctuation', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'pr-punct',
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('pr-punct', 'assistant', 'See (https://github.com/getagentseal/codeburn/pull/1037).', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=pr-punct`)
+    expect(calls[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/1037'])
+  })
+
   it('ignores GitHub pull URLs that only appear in tool dumps', async () => {
     const dbPath = createHermesDb(tmpDir)
     withTestDb(dbPath, (db) => {
@@ -542,7 +562,7 @@ skipUnlessSqlite('hermes provider', () => {
     expect(calls[0]?.prLinks).toBeUndefined()
   })
 
-  it('treats ACP sessions as the Buzz app, not a Hermes folder', async () => {
+  it('keeps ACP sessions on Hermes because source=acp is a transport, not Buzz', async () => {
     const dbPath = createHermesDb(tmpDir)
     withTestDb(dbPath, (db) => {
       insertSession(db, {
@@ -561,8 +581,8 @@ skipUnlessSqlite('hermes provider', () => {
 
     const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=acp-session`)
     expect(calls[0]).toMatchObject({
-      provider: 'buzz',
-      project: 'buzz',
+      provider: 'hermes',
+      project: 'hermes',
     })
   })
 

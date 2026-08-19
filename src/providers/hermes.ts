@@ -99,7 +99,8 @@ function extractGithubPullUrls(...texts: Array<string | null | undefined>): stri
     if (!text) continue
     for (const match of text.matchAll(re)) {
       try {
-        const url = new URL(match[0])
+        const raw = match[0].replace(/[).,\]]:;]+$/g, '')
+        const url = new URL(raw)
         if (url.protocol !== 'https:') continue
         if (!/^\/[^/]+\/[^/]+\/pull\/\d+$/.test(url.pathname)) continue
         found.add(`${url.origin}${url.pathname}`)
@@ -280,15 +281,11 @@ function isRealWorkspace(cwd: string | null | undefined): cwd is string {
   return true
 }
 
-function hermesSurfaceProvider(source: string | null | undefined): 'hermes' | 'buzz' {
-  return source === 'acp' ? 'buzz' : 'hermes'
-}
-
 function resolveHermesWorkspace(
   row: HermesSessionRow,
   messages: HermesMessageRow[],
-): { project: string; projectPath?: string; provider: 'hermes' | 'buzz' } {
-  const provider = hermesSurfaceProvider(row.source)
+): { project: string; projectPath?: string; provider: 'hermes' } {
+  const provider = 'hermes' as const
   const repo = row.git_repo_root?.trim()
   if (isRealWorkspace(repo)) {
     return { project: sanitizeProject(basename(repo)), projectPath: repo, provider }

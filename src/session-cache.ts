@@ -292,7 +292,7 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // replays (double-counted before), takes the model from the reporting
   // assistant/message, and keeps agent-injected context out of the preview.
   dsh: 'seed-aware-v1',
-  hermes: 'reasoning-output-accounting-v1-est-cost',
+  hermes: 'reasoning-output-accounting-v1-est-cost-routed-ids-workspace-pr-v2',
   'lingtai-tui': 'token-ledger-registry-activity-v3',
   'ibm-bob': 'worktree-project-grouping-v1',
   // project-path-v1: the parser now records the session's full working

@@ -630,8 +630,7 @@ function routedModelCandidates(model: string): string[] {
     ids.push(value)
   }
   push(model)
-  let current = getCanonicalName(model)
-  push(current)
+  let current = model
   let peeled = true
   while (peeled) {
     peeled = false
@@ -644,13 +643,9 @@ function routedModelCandidates(model: string): string[] {
       }
     }
   }
-  if (current.includes('/')) push(current.slice(current.lastIndexOf('/') + 1))
-  const leaf = current.includes('/') ? current.slice(current.lastIndexOf('/') + 1) : current
-  if (/^glm-5(?:\.\d+)?$/i.test(leaf)) {
-    push('glm-5p2')
-    push('glm-5p1')
-    push('glm-5')
-  }
+  // One house-style vendor strip (anthropic/foo → foo). Do not keep
+  // collapsing unknown provider/org/model trees onto a priced leaf.
+  push(getCanonicalName(current))
   return ids
 }
 
