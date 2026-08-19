@@ -770,15 +770,33 @@ describe('observed provider model aliases', () => {
   })
 
   it('does not recurse on vendor-requalified MiMo aliases', () => {
-    expect(getShortModelName('mimo-v2.5')).toBe('mimo-v2.5')
-    expect(getShortModelName('MiMo-v2.5')).toBe('mimo-v2.5')
-    expect(getShortModelName('cline-pass/mimo-v2.5')).toBe('mimo-v2.5')
+    expect(getShortModelName('mimo-v2.5')).toBe('MiMo v2.5')
+    expect(getShortModelName('MiMo-v2.5')).toBe('MiMo v2.5')
+    expect(getShortModelName('cline-pass/mimo-v2.5')).toBe('MiMo v2.5')
     expect(getShortModelName('cline-pass/mimo-v2.5-pro')).toBe('MiMo v2.5 Pro')
+  })
+
+  // The `mimo-v2-flash -> xiaomi/mimo-v2-flash` alias shipped before this
+  // change and already cycled: strip the namespace, alias it back, take the
+  // leaf, repeat. Every display surface (overview's model table included)
+  // threw RangeError on a real MiMo v2 Flash session. Pin the shipped ids.
+  it('resolves the already-shipped MiMo v2 Flash alias without blowing the stack', () => {
+    for (const id of ['mimo-v2-flash', 'MiMo-V2-Flash', 'cline-pass/mimo-v2-flash', 'mimo/mimo-v2-flash']) {
+      expect(() => getShortModelName(id)).not.toThrow()
+      expect(getShortModelName(id)).toBe('mimo-v2-flash')
+      expect(getModelCosts(id)).toEqual(getModelCosts('xiaomi/mimo-v2-flash'))
+    }
+  })
+
+  it('names the base MiMo 2.5 row without swallowing the Pro tier', () => {
+    expect(getShortModelName('mimo-v2.5')).toBe('MiMo v2.5')
+    expect(getShortModelName('mimo-v2.5-pro')).toBe('MiMo v2.5 Pro')
+    expect(getModelCosts('mimo-v2.5')).not.toEqual(getModelCosts('mimo-v2.5-pro'))
   })
 
   it('stays unary so Array.map cannot feed the index as cycle state', () => {
     expect(['mimo-v2.5', 'gpt-4o', 'cline-pass/mimo-v2.5-pro'].map(getShortModelName)).toEqual([
-      'mimo-v2.5',
+      'MiMo v2.5',
       'GPT-4o',
       'MiMo v2.5 Pro',
     ])
