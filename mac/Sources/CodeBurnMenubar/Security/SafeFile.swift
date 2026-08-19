@@ -147,6 +147,12 @@ enum SafeFile {
     /// Legacy credential migration path: open with `O_NOFOLLOW`, refuse non-regular /
     /// non-owned files, `fchmod(0600)` and verify mode, then read bounded bytes from
     /// the same descriptor. Permissions are repaired before any secret byte is read.
+    ///
+    /// The chmod deliberately precedes any content check: validating JSON first would
+    /// mean reading the secret while it is still world-readable, which is the exact
+    /// window this function exists to close. The cost is that a non-credential file
+    /// sitting at the caller's exact cache path also gets tightened to 0600 — bounded
+    /// to our own Application Support directory, and already symlink- and owner-checked.
     static func readAfterSecuringPermissions(
         from path: String,
         maxBytes: Int = defaultReadLimit,
