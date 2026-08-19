@@ -81,17 +81,31 @@ see the #927 ruling in `src/session-cache.ts`).
   source anyway: its parse defers on the busy shape, previously cached rows
   keep serving, and the pass reports incomplete hydration so the daily
   backfill holds its watermark.
-- **Durable cache.** Rides the same `durableSources` union as OTel, with one
-  scoped difference: the store declares `retainWhilePresent`, so its rows are
-  never evicted while the DB exists (crash-only rows have no rollup to fall
-  back to); every other copilot source keeps the standard durable schedule,
-  aging out at 90 days whether or not the file remains. A deleted store's rows
-  serve as orphans until the 90-day age-out. Reconciliation reads only cached
-  contents, so deleting or resetting the store never changes served totals.
+- **Read order.** The store is parsed AFTER every other copilot source in the
+  same pass, and a store served from cache that moves during the pass marks
+  the pass incomplete. Rows commit strictly before their leg's `session.shutdown`
+  line, so reading the store last makes the row set a superset of anything a
+  rollup we read can claim — a session that shuts down mid-pass can no longer
+  leave a leg reconciled against rows that had not landed. What is left is the
+  harmless direction: a row whose journal partner has not arrived yet serves
+  its own tokens and pairs on the next pass.
+- **Durable cache.** Rides the same `durableSources` union as OTel: still-
+  discovered sources are never aged out, and orphans age out at 90 days. A
+  deleted store's rows serve as orphans until then. Reconciliation reads only
+  cached contents, so deleting or resetting the store never changes served
+  totals. A parse-version bump carries every cached entry forward and re-reads
+  the live source into it, because a DB that still exists is not a DB that can
+  still re-derive its pruned rows.
 - **Billing metadata.** Each row's `total_nano_aiu` and `request_multiplier`
   are captured onto the cached call when the store's schema has them (older
   stores parse identically without). Nothing prices or displays them yet —
   billing-grade cost is upstream #890.
+- **Sync.** `codeburn sync push` holds a copilot session until it has been
+  quiet for 24 hours. The reconciliation output is mutable (a residual shrinks
+  as rows land, a rollup is dropped once rows cover its leg, a row's pairing
+  flips), and the sent-ledger is append-once, so a value sent mid-reconciliation
+  could never be corrected at the receiver (#988). Nothing is dropped; the next
+  push after the window sends it once, final.
 - **Requires Node 22+** (`node:sqlite`), same as the OTel source.
 
 ## JetBrains IDEs (IntelliJ, PyCharm, …)
