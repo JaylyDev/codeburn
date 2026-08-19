@@ -3,6 +3,8 @@ import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises'
 import { join, posix, win32 } from 'path'
 import { tmpdir } from 'os'
 import { createRequire } from 'node:module'
+import { dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { copilot, createCopilotProvider, getVSCodeGlobalStorageDirs, getVSCodeWorkspaceStorageDirs } from '../../src/providers/copilot.js'
 import { isSqliteAvailable, isSqliteBusyError } from '../../src/sqlite.js'
@@ -3182,5 +3184,80 @@ describe('copilot provider - JetBrains dedup key stability across store rewrites
     // turn is already cached and must not re-enter under a different key.
     expect(second).toHaveLength(1)
     expect(second[0]!.outputTokens).toBe(Math.ceil(newReply.length / 4))
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Dedup-key shapes are a CACHE contract, not an implementation detail
+// ═══════════════════════════════════════════════════════════════════════════
+// Copilot is durable: on a parse-version bump the cache is carried forward and
+// the re-parse is UNIONED into it by deduplicationKey (src/parser.ts,
+// getOrCreateProviderSection + the durable merge). A key that changes shape is
+// therefore a key the union cannot recognise, and every call behind it is
+// counted a second time — silently, permanently, on upgrade.
+//
+// So: changing, adding or removing any prefix below is a CACHE_VERSION bump,
+// not a PROVIDER_PARSE_VERSIONS bump. Deliberately a literal list rather than
+// a derived one — the point is that a diff to it is impossible to miss.
+describe('copilot deduplication key prefixes (durable-union contract)', () => {
+  it('pins every emitted key shape, read back out of the source', async () => {
+    const { readFile } = await import('node:fs/promises')
+    const here = dirname(fileURLToPath(import.meta.url))
+    const read = async (rel: string): Promise<string> => readFile(join(here, '..', '..', rel), 'utf8')
+
+    // Every dedup key this provider mints is a template literal starting with
+    // `copilot`. Collapse the interpolations so the test pins the SHAPE, not
+    // the variable names, and compare the whole set: a new key shape fails
+    // this just as loudly as a changed one.
+    const shapes = new Set<string>()
+    for (const src of [await read('src/providers/copilot.ts'), await read('src/parser.ts')]) {
+      for (const m of src.matchAll(/`(copilot[^`]*)`/g)) {
+        const raw = m[1]!
+        if (!raw.includes('${')) continue
+        const shape = raw.replace(/\$\{[^}]*\}/g, '$').replace(/\s+/g, '')
+        if (!shape.includes(':')) continue
+        shapes.add(shape)
+      }
+    }
+
+    expect([...shapes].sort()).toEqual([
+      // ── minted keys ────────────────────────────────────────────────────
+      'copilot-chatsession:$:$',            // VS Code core chatSessions
+      'copilot-otel:$',                     // agent-traces.db span
+      'copilot-store:$:$:${fnv1a64(',       // session-store row + content hash
+      'copilot:$:$',                        // CLI per-turn assistant.message
+      'copilot:$:shutdown-residual:$:$',    // synthesized in parser.ts
+      'copilot:$:shutdown:$:$',             // session.shutdown rollup leg
+      'copilot:jb:$:$:$',                   // JetBrains nitrite conversation
+      // ── discriminator prefixes, not keys ───────────────────────────────
+      // parseProviderSources tells the representations apart with these, and
+      // sync freezes on the same boundary. They belong in the pin: a rollup
+      // prefix that stopped excluding `shutdown-residual` would subtract a
+      // residual from itself.
+      'copilot:$:shutdown',
+      'copilot:$:shutdown:',
+    ].sort())
+  })
+
+  it('keeps the shapes the reconciliation discriminates on distinguishable', () => {
+    // parseProviderSources tells the three copilot representations apart by
+    // prefix alone. `:shutdown:` must not also match a residual, and a store
+    // row must not match either — otherwise a rollup is dropped as a row, or a
+    // residual is subtracted from itself.
+    const rollup = 'copilot:sess-1:shutdown:claude-sonnet-4-5:1'
+    const residual = 'copilot:sess-1:shutdown-residual:claude-sonnet-4-5:0'
+    const row = 'copilot-store:sess-1:7:abcdef0123456789'
+    const perTurn = 'copilot:sess-1:msg-1'
+
+    const shutdownPrefix = 'copilot:sess-1:shutdown:'
+    expect(rollup.startsWith(shutdownPrefix)).toBe(true)
+    expect(residual.startsWith(shutdownPrefix)).toBe(false)
+    expect(row.startsWith(shutdownPrefix)).toBe(false)
+    expect(perTurn.startsWith(shutdownPrefix)).toBe(false)
+    expect(row.startsWith('copilot-store:')).toBe(true)
+    expect(rollup.startsWith('copilot-store:')).toBe(false)
+    // And the sync freeze keys off the same boundary (src/sync/push.ts).
+    expect(rollup.indexOf(':shutdown:')).toBeGreaterThan(0)
+    expect(residual.indexOf(':shutdown:')).toBe(-1)
   })
 })

@@ -167,6 +167,57 @@ describe('collectUnsentCalls', () => {
     expect(later.unsent).toHaveLength(3)
   })
 
+  // The forward-only half of #988. This release moves copilot input/cache from
+  // one shutdown-rollup span per (session, model) to one span per request.
+  // Locally that is a replacement; at an append-once receiver it is an
+  // addition, and there is no retraction for a usage span. So a session whose
+  // rollup is already in the ledger is frozen at what was sent: the receiver
+  // keeps the old, lossier number rather than a permanently doubled one.
+  it('freezes the reconciliation output of a session already synced as a rollup', async () => {
+    const { collectUnsentCalls, RECONCILE_SETTLE_MS } = await import('../src/sync/push.js')
+    const { writeLedger } = await import('../src/sync/ledger.js')
+
+    const now = Date.parse('2026-07-10T12:00:00.000Z')
+    const settled = new Date(now - RECONCILE_SETTLE_MS * 2).toISOString()
+    const copilotCall = (key: string) => ({ ...makeCall(key), provider: 'copilot', timestamp: settled })
+
+    // Session S was synced by a previous version: its rollup span is out.
+    writeLedger([{ key: 'copilot:S:shutdown:claude-sonnet-4-5:1', ts: settled }])
+
+    const projects = [{
+      project: 'p',
+      sessions: [
+        {
+          sessionId: 'S',
+          turns: [{ assistantCalls: [
+            copilotCall('copilot-store:S:1:aa'),
+            copilotCall('copilot:S:shutdown-residual:claude-sonnet-4-5:0'),
+            // Per-turn output: never part of the rollup, never reconciled.
+            copilotCall('copilot:S:msg-1'),
+          ] }],
+        },
+        {
+          sessionId: 'T',
+          turns: [{ assistantCalls: [copilotCall('copilot-store:T:1:bb')] }],
+        },
+      ],
+    }] as unknown as ProjectSummary[]
+
+    const { unsent, held, frozen } = collectUnsentCalls(projects, now)
+
+    expect(frozen.map(f => f.call.deduplicationKey).sort())
+      .toEqual(['copilot-store:S:1:aa', 'copilot:S:shutdown-residual:claude-sonnet-4-5:0'])
+    // S's per-turn call still syncs — it carries output the rollup never held.
+    // T was never synced, so it takes the per-row path in full.
+    expect(unsent.map(u => u.call.deduplicationKey).sort())
+      .toEqual(['copilot-store:T:1:bb', 'copilot:S:msg-1'])
+    expect(held).toHaveLength(0)
+
+    // Frozen means frozen: no later push releases it.
+    const later = collectUnsentCalls(projects, now + RECONCILE_SETTLE_MS * 10)
+    expect(later.frozen).toHaveLength(2)
+  })
+
   it('never holds a provider whose served calls are immutable', async () => {
     const { collectUnsentCalls } = await import('../src/sync/push.js')
 

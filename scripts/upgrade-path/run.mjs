@@ -423,6 +423,19 @@ else {
 // whose file still exists it deletes exactly the history nothing can rebuild.
 // This build bumps PROVIDER_PARSE_VERSIONS.copilot, so it takes that path for
 // real. (#946 review.)
+//
+// Measured at the SESSION-CACHE layer, from export.json's per-call records.
+// The menubar/daily numbers are the wrong instrument here: on a version bump
+// adoptOlderDailyCaches carries the superseded daily file forward as the
+// baseline for days no source can re-derive, which is exactly the days this
+// scenario creates — a session-cache loss would be masked by the very
+// carry-forward that runs beside it. And the assertion is EQUALITY, not
+// "did not shrink": the failure mode on the other side of this fix is the
+// union counting a carried-forward call twice. (The loss direction is
+// demonstrated - reverting the carry-forward takes 80 calls to 40 here. The
+// double direction is asserted but not demonstrated: a faithful re-keying
+// simulation needs the parser to mint genuinely different keys, and a cheap
+// stand-in is collapsed by the serve-time dedup before it can be counted.)
 
 step('durable history across a bump on an extant, pruned source')
 const prunedCache = join(CACHES, 'pruned')
@@ -434,17 +447,33 @@ const copilotDb = process.platform === 'darwin'
     ? join(process.env['APPDATA'] ?? join(HOME, 'AppData', 'Roaming'), 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db')
     : join(HOME, '.config', 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db')
 
-// providerDetails carries the internal provider id; the `providers` map is
-// keyed by lowercased DISPLAY name, which is not stable to match on.
-const copilotOf = payload =>
-  (payload.menubar?.current?.providerDetails ?? []).find(d => d.id === 'copilot')
-const prunedBase = capture(oldBin, prunedCache, join(PAYLOADS, 'pruned-baseline'))
-const beforeSlice = copilotOf(prunedBase)
+// Per-call records for one provider, straight out of the parse. No daily-cache
+// layer in between, so a lost session-cache entry cannot be papered over.
+function copilotRecords(outDir) {
+  const exported = JSON.parse(readFileSync(join(outDir, 'export.json'), 'utf8'))
+  const acc = { calls: 0, cost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 }
+  for (const r of exported.records ?? []) {
+    if ((r.provider || '') !== 'copilot') continue
+    acc.calls++
+    acc.cost += r.cost ?? 0
+    acc.inputTokens += r.inputTokens ?? 0
+    acc.outputTokens += r.outputTokens ?? 0
+    acc.cacheReadTokens += r.cacheReadTokens ?? 0
+  }
+  return acc
+}
+const sameRecords = (a, b) =>
+  a.calls === b.calls && a.inputTokens === b.inputTokens && a.outputTokens === b.outputTokens
+  && a.cacheReadTokens === b.cacheReadTokens && Math.abs(a.cost - b.cost) < 1e-9
+const showRecords = r => `${r.calls} calls, $${r.cost.toFixed(6)}, ${r.inputTokens}/${r.outputTokens}/${r.cacheReadTokens} in/out/cacheRead`
 
-if (!beforeSlice || !(beforeSlice.cost > 0)) {
+capture(oldBin, prunedCache, join(PAYLOADS, 'pruned-baseline'))
+const beforeRecords = copilotRecords(join(PAYLOADS, 'pruned-baseline'))
+
+if (beforeRecords.calls === 0) {
   skip(`${OLD_VERSION} reported no copilot usage to prune (nothing to protect)`)
 } else {
-  ok(`baseline copilot: $${beforeSlice.cost.toFixed(6)}`)
+  ok(`baseline copilot: ${showRecords(beforeRecords)}`)
 
   // Prune HALF the conversations, leaving the DB present, valid and still
   // populated: the surviving rows are what the bump re-parses, the pruned ones
@@ -467,23 +496,25 @@ if (!beforeSlice || !(beforeSlice.cost > 0)) {
   }
 
   if (pruned > 0) {
-    const prunedUp = capture(newBin, prunedCache, join(PAYLOADS, 'pruned-upgraded'))
-    const afterSlice = copilotOf(prunedUp)
-    if (!afterSlice) {
-      fail(`the copilot slice is gone entirely after the bump; baseline had $${beforeSlice.cost.toFixed(6)}`)
-    } else {
-      // The bump may legitimately ADD (this build reads per-request rows the
-      // baseline never had). It must never subtract.
-      const costOk = afterSlice.cost >= beforeSlice.cost - 1e-9
-      const lost = costOk ? '' : ` — LOST $${(beforeSlice.cost - afterSlice.cost).toFixed(6)} (${(100 * (beforeSlice.cost - afterSlice.cost) / beforeSlice.cost).toFixed(1)}%)`
-      check(costOk, `copilot cost across the bump: $${beforeSlice.cost.toFixed(6)} -> $${afterSlice.cost.toFixed(6)}${lost}`)
+    // Remove the baseline daily cache so nothing but the session cache can
+    // answer. Without this the carry-forward would serve the pruned days from
+    // the v17 file and the check would pass with the session cache emptied.
+    rmSync(join(prunedCache, OLD_DAILY_CACHE), { force: true })
 
-      // And persisted, not merely served: a second run reads the cache the
-      // bump rewrote, so a carry-forward that only survived in memory fails.
-      const warm = copilotOf(capture(newBin, prunedCache, join(PAYLOADS, 'pruned-warm')))
-      check(!!warm && warm.cost >= beforeSlice.cost - 1e-9,
-        `and again from the rewritten cache: $${(warm?.cost ?? 0).toFixed(6)}`)
-    }
+    capture(newBin, prunedCache, join(PAYLOADS, 'pruned-upgraded'))
+    const afterRecords = copilotRecords(join(PAYLOADS, 'pruned-upgraded'))
+    const verdict = afterRecords.calls < beforeRecords.calls ? ' — LOST history'
+      : afterRecords.calls > beforeRecords.calls ? ' — DOUBLED'
+        : ''
+    check(sameRecords(beforeRecords, afterRecords),
+      `copilot across the bump: ${showRecords(beforeRecords)} -> ${showRecords(afterRecords)}${verdict}`)
+
+    // And persisted, not merely served: the second run reads the cache the
+    // bump rewrote, so a carry-forward that only survived in memory fails.
+    capture(newBin, prunedCache, join(PAYLOADS, 'pruned-warm'))
+    const warmRecords = copilotRecords(join(PAYLOADS, 'pruned-warm'))
+    check(sameRecords(beforeRecords, warmRecords),
+      `and again from the rewritten cache: ${showRecords(warmRecords)}`)
   }
 }
 

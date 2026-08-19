@@ -2949,6 +2949,19 @@ function getOrCreateProviderSection(cache: SessionCache, provider: string): Prov
   // source can still re-derive. Same event, same deduplicationKey, or the
   // union counts it twice. Changing a provider's key shape is therefore a
   // cache-version (CACHE_VERSION) change, not a parse-version change.
+  //
+  // The price of that contract, worth knowing before writing the next bump: a
+  // bump no longer RE-DERIVES a durable call it carried forward. The union
+  // appends only unseen keys, so a call already in the cache keeps the FIELDS
+  // the old parser gave it. A bump that changes what a call is worth in
+  // dollars still lands (cost is recomputed at serve time from the cached
+  // usage), but a bump that changes a call's metadata or its day attribution
+  // — this PR's own shutdown-timestamp fallback, capture-only fields like
+  // nanoAiu/compactedAt — reaches only calls the bump parses for the first
+  // time. Fixing those for existing caches needs CACHE_VERSION, which drops
+  // the cache outright, and that is exactly the history loss this block
+  // exists to prevent: the two cannot both be had for a source that has
+  // pruned its rows.
   if (existing && DURABLE_PROVIDER_NAMES.has(provider)) {
     if (existing.durable) section.durable = true
     for (const [path, file] of Object.entries(existing.files)) {
@@ -3395,9 +3408,14 @@ async function parseProviderSources(
             const existingKeys = new Set(
               existingEntry.turns.flatMap(t => t.calls.map(c => c.deduplicationKey))
             )
-            const newTurns = turns.filter(t =>
-              t.calls.every(c => !existingKeys.has(c.deduplicationKey))
-            )
+            // Call level, not turn level: a re-parse that returns a turn
+            // holding one already-cached call beside a genuinely new one is
+            // rare (durable providers emit one call per turn today) but
+            // dropping the whole turn on the first match would silently lose
+            // the new call, and nothing enforces the one-call assumption.
+            const newTurns = turns
+              .map(t => ({ ...t, calls: t.calls.filter(c => !existingKeys.has(c.deduplicationKey)) }))
+              .filter(t => t.calls.length > 0)
             existingEntry.turns = [...existingEntry.turns, ...newTurns]
             existingEntry.fingerprint = fp
           } else {
@@ -3465,9 +3483,25 @@ async function parseProviderSources(
   if (!readOnly && !deferredRetryableSource) {
     for (const { source } of unchangedSources) {
       if (!source.retainWhilePresent) continue
-      const now = await fingerprintFile(source.path)
       const used = section.files[source.path]?.fingerprint
-      if (!now || !used) continue
+      if (!used) continue
+      const now = await fingerprintFile(source.path)
+      if (!now) {
+        // Unreadable, not necessarily gone. The classification path already
+        // treats present-but-unfingerprintable as a deferral rather than a
+        // skip; do the same here, or a store that became unreadable mid-pass
+        // would be the one shape that seals silently. A genuinely deleted
+        // store has nothing left to reconcile against and stays a skip.
+        for (const candidate of sourcePathStatCandidates(source.path)) {
+          const code = await stat(candidate).then(
+            () => null,
+            (e: unknown) => (e as NodeJS.ErrnoException).code ?? 'UNKNOWN',
+          )
+          if (code !== 'ENOENT' && code !== 'ENOTDIR') { deferredRetryableSource = true; break }
+        }
+        if (deferredRetryableSource) break
+        continue
+      }
       if (now.mtimeMs !== used.mtimeMs || now.sizeBytes !== used.sizeBytes || now.ino !== used.ino) {
         deferredRetryableSource = true
         break

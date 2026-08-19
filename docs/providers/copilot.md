@@ -131,7 +131,12 @@ see the #927 ruling in `src/session-cache.ts`).
   as rows land, a rollup is dropped once rows cover its leg, a row's pairing
   flips), and the sent-ledger is append-once, so a value sent mid-reconciliation
   could never be corrected at the receiver (#988). Nothing is dropped; the next
-  push after the window sends it once, final.
+  push after the window sends it once, final. A session whose rollup was
+  already synced by an earlier version is frozen instead of held: its rows and
+  residuals never go out, because the receiver cannot be told to drop the
+  rollup it holds. That is a bounded under-count at the receiver in place of an
+  unbounded over-count; `codeburn sync reset --confirm` re-pushes everything
+  under the new breakdown for anyone who can clear the receiver too.
 - **Requires Node 22+** (`node:sqlite`), same as the OTel source.
 
 ## JetBrains IDEs (IntelliJ, PyCharm, …)
@@ -267,6 +272,31 @@ Copilot does not always tag the model on each message. The parser infers it from
 | `call_` | OpenAI |
 
 See `copilot.ts:176-213`.
+
+## Sharp edges
+
+- **A day sealed on a short store snapshot stays short.** Reconciliation
+  converges — the residual retires as rows land — but the daily cache seals a
+  finalized day once and only re-derives it on a version bump. The two
+  realizable ways to seal a short snapshot are both closed: a session that
+  shuts down mid-pass (the store is read after every journal, and a
+  cache-served store that moves mid-pass holds the watermark) and a compacted
+  leg (its interval now starts at the compaction). What remains is a store that
+  is behind its journal with no local signal at all — rows pruned, a restore,
+  a snapshot taken by something outside this process. There is no detector for
+  it: `rollup > rows-in-interval` is exactly the shape of legitimate partial
+  coverage (a store adopted mid-session has it permanently), so fencing on it
+  would hold the watermark forever. Stated plainly: that day is a permanent
+  under-report and the watermark advances past it. It is not a stall, and the
+  next parse's larger derivation cannot reach back to fix it.
+- **A compaction's own summarization call may serve twice.** See the interval
+  anchor above; bounded at one request per compaction, direction is over-serve.
+- **Pairing is ambiguous inside the 2-minute window.** A crash-only row within
+  two minutes of a request whose own row is missing can pair against it,
+  under-counting `apiCalls` by one. Tokens stay exact.
+- **A model string that cannot match its rollup's** (the empty-model `unknown`
+  key) is invisible to per-model reconciliation, so both representations serve:
+  over-serve, never lose.
 
 ## Quirks
 

@@ -55,12 +55,49 @@ export const RECONCILE_SETTLE_MS = 24 * 60 * 60 * 1000
 /** Providers whose SERVED calls can change value or role between passes. */
 const RECONCILING_PROVIDERS = new Set(['copilot'])
 
+/**
+ * Sessions whose copilot input/cache the receiver already holds as a
+ * session.shutdown ROLLUP span, sent by a version that had no store rows.
+ *
+ * This release moves the same tokens from one rollup span per (session, model)
+ * to one span per request. Locally that is a replacement; at the receiver it
+ * is an addition, because the ledger is append-once and there is no retraction
+ * for a usage span. Every session ever synced before this version would
+ * therefore be counted twice, permanently, on the first push after upgrade.
+ *
+ * So a session is frozen at whatever was already sent: once its rollup is in
+ * the ledger, its store rows and residuals never go out. The receiver keeps
+ * the old, lossier number instead of a doubled one — a bounded under-count in
+ * place of an unbounded over-count. Sessions with no rollup in the ledger are
+ * new to sync and take the per-row path in full.
+ *
+ * `codeburn sync reset --confirm` clears the local ledger and re-pushes
+ * everything under the new breakdown, but only helps if the receiver's own
+ * copy is cleared too — otherwise it produces exactly the doubling this
+ * avoids.
+ */
+function rolledUpSessions(sentKeys: ReadonlySet<string>): Set<string> {
+  const frozen = new Set<string>()
+  for (const key of sentKeys) {
+    if (!key.startsWith('copilot:')) continue
+    // `copilot:<sid>:shutdown:<model>:<n>`. The trailing colon is what keeps
+    // `:shutdown-residual:` out — a residual is this version's own output and
+    // freezes WITH its session rather than causing the freeze.
+    const marker = key.indexOf(':shutdown:')
+    if (marker < 0) continue
+    frozen.add(key.slice('copilot:'.length, marker))
+  }
+  return frozen
+}
+
 /** Flatten parsed projects into individual calls and filter out already-sent ones. */
 export function collectUnsentCalls(projects: ProjectSummary[], now: number = Date.now()): {
   allCalls: CallWithSession[]
   unsent: CallWithSession[]
   /** Not yet sent because their session is still reconciling. Retried later. */
   held: CallWithSession[]
+  /** Never sent: the receiver already holds this session as a rollup span. */
+  frozen: CallWithSession[]
 } {
   const allCalls: CallWithSession[] = []
   for (const project of projects) {
@@ -89,12 +126,25 @@ export function collectUnsentCalls(projects: ProjectSummary[], now: number = Dat
     if (isNaN(ts) || ts > settleCutoff) unsettled.add(`${c.project}\u0000${c.sessionId}`)
   }
 
+  const sent = ledgerKeySet()
+  const rolledUp = rolledUpSessions(sent)
+
+  // Only the reconciliation OUTPUT is frozen. The session's per-turn calls
+  // (`copilot:<sid>:<msgId>`) carry output tokens the rollup never held and
+  // reconciliation never touches, so they keep syncing normally.
+  const isFrozen = (c: CallWithSession): boolean =>
+    RECONCILING_PROVIDERS.has(c.call.provider)
+    && rolledUp.has(c.sessionId)
+    && (c.call.deduplicationKey.startsWith('copilot-store:')
+      || c.call.deduplicationKey.includes(':shutdown-residual:'))
+
   const isHeld = (c: CallWithSession): boolean =>
     RECONCILING_PROVIDERS.has(c.call.provider) && unsettled.has(`${c.project}\u0000${c.sessionId}`)
 
-  const sent = ledgerKeySet()
   const pending = allCalls.filter(c => !sent.has(c.call.deduplicationKey))
-  return { allCalls, unsent: pending.filter(c => !isHeld(c)), held: pending.filter(isHeld) }
+  const frozen = pending.filter(isFrozen)
+  const rest = pending.filter(c => !isFrozen(c))
+  return { allCalls, unsent: rest.filter(c => !isHeld(c)), held: rest.filter(isHeld), frozen }
 }
 
 export type PushOutcome = 'complete' | 'auth-rejected' | 'rate-limited' | 'server-error'

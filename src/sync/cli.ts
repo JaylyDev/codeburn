@@ -277,7 +277,7 @@ export function registerSyncCommands(program: Command): void {
         const projects = await parseAllSessions(range)
 
         // Flatten + filter against sent-ledger
-        const { allCalls, unsent, held } = collectUnsentCalls(projects)
+        const { allCalls, unsent, held, frozen } = collectUnsentCalls(projects)
 
         // Attribution records (opt-in): session→commit correlation computed
         // locally from the same parsed projects. Reuses the yield engine.
@@ -298,6 +298,9 @@ export function registerSyncCommands(program: Command): void {
           if (held.length > 0) {
             process.stderr.write(`[dry-run] ${held.length} calls held: their session is still reconciling and its values can still change (#988). They push once it settles.\n`)
           }
+          if (frozen.length > 0) {
+            process.stderr.write(`[dry-run] ${frozen.length} Copilot calls frozen: their sessions were already synced as shutdown rollups, which cannot be retracted. See docs/sync/README.md.\n`)
+          }
           process.stderr.write(`[dry-run] Would push ${toPushCount} calls ($${cost.toFixed(2)}) to ${config.baseUrl}${config.tracesPath}\n`)
           if (unsent.length > MAX_PER_PUSH) {
             process.stderr.write(`[dry-run] ${unsent.length - MAX_PER_PUSH} more calls exceed the ${MAX_PER_PUSH} safety limit — a second push would be needed\n`)
@@ -315,8 +318,12 @@ export function registerSyncCommands(program: Command): void {
         }
 
         if (unsent.length === 0 && attributionUnsent.length === 0) {
-          process.stderr.write(held.length > 0
-            ? `Nothing to push yet (${allCalls.length - held.length} calls already synced, ${held.length} held while their session is still reconciling).\n`
+          const pendingNote = [
+            held.length > 0 ? `${held.length} held while their session is still reconciling` : '',
+            frozen.length > 0 ? `${frozen.length} frozen behind an already-synced rollup` : '',
+          ].filter(Boolean).join(', ')
+          process.stderr.write(pendingNote
+            ? `Nothing to push yet (${allCalls.length - held.length - frozen.length} calls already synced, ${pendingNote}).\n`
             : `Nothing to push (${allCalls.length} calls already synced).\n`)
           updateLastSync()
           return
