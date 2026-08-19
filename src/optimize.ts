@@ -249,6 +249,70 @@ export type PasteDestination =
   | 'shell-config'     // append to ~/.zshrc / ~/.bashrc
   | 'manual'           // instructions the user carries out directly
 
+/// Provider-scoped remediation nouns. Cross-provider detectors and both
+/// render surfaces (CLI + TUI) share this so `--provider codex` cannot still
+/// tell the user to ask Claude or edit CLAUDE.md. Claude / unset / `all`
+/// keep the shipped CLAUDE.md copy. Only `codex` has a file CodeBurn already
+/// names (`AGENTS.md` in the Codex parser); every other provider stays on
+/// the generic "project instructions" rather than inventing a filename.
+export type OptimizeRemediationCopy = {
+  agent: string
+  instructionFile: string
+}
+
+const REMEDIATION_AGENT_NAMES: Record<string, string> = {
+  claude: 'Claude',
+  codex: 'Codex',
+  cursor: 'Cursor',
+  copilot: 'Copilot',
+  gemini: 'Gemini',
+  opencode: 'OpenCode',
+  antigravity: 'Antigravity',
+  windsurf: 'Windsurf',
+  cline: 'Cline',
+  hermes: 'Hermes',
+  kimi: 'Kimi',
+  kimicode: 'Kimi Code',
+  'ibm-bob': 'IBM Bob',
+  pi: 'Pi',
+}
+
+const REMEDIATION_INSTRUCTION_FILES: Record<string, string> = {
+  claude: 'CLAUDE.md',
+  codex: 'AGENTS.md',
+}
+
+function humanizeProviderId(id: string): string {
+  return id.split(/[-_]/).map(part => part ? part[0]!.toUpperCase() + part.slice(1) : part).join(' ')
+}
+
+export function optimizeRemediationCopy(provider?: string): OptimizeRemediationCopy {
+  const key = !provider || provider === 'all' ? 'claude' : provider.toLowerCase()
+  return {
+    agent: REMEDIATION_AGENT_NAMES[key] ?? humanizeProviderId(key),
+    instructionFile: REMEDIATION_INSTRUCTION_FILES[key] ?? 'project instructions',
+  }
+}
+
+export function sessionOpenerLabel(copy: OptimizeRemediationCopy): string {
+  return `Paste at the start of your NEXT expensive thread (one-time, do not add to ${copy.instructionFile}):`
+}
+
+export function askAgentLabel(copy: OptimizeRemediationCopy, rest: string): string {
+  return `Ask ${copy.agent} to ${rest}:`
+}
+
+export function optimizePasteHeader(destination: PasteDestination | undefined, copy: OptimizeRemediationCopy): string {
+  switch (destination) {
+    case 'claude-md':      return `Suggested ${copy.instructionFile} addition (permanent rule)`
+    case 'session-opener': return `One-time session opener (do NOT add to ${copy.instructionFile})`
+    case 'prompt':         return `Ask ${copy.agent} in the current session`
+    case 'shell-config':   return 'Add to your shell config'
+    case 'manual':         return 'Manual action'
+    default:               return 'Suggested action'
+  }
+}
+
 export type WasteAction =
   | { type: 'paste'; label: string; text: string; destination?: PasteDestination }
   | { type: 'command'; label: string; text: string }
@@ -1695,6 +1759,7 @@ function collectMcpProjectProfiles(
 export function detectMcpProfileAdvisor(
   projects: ProjectSummary[],
   coverage = aggregateMcpCoverage(projects),
+  provider?: string,
 ): WasteFinding | null {
   const candidates = collectMcpProjectProfiles(projects, coverage)
   if (candidates.length === 0) return null
@@ -1733,7 +1798,7 @@ export function detectMcpProfileAdvisor(
     fix: {
       type: 'paste',
       destination: 'prompt',
-      label: 'Ask Claude to turn this into a project-scoped MCP profile:',
+      label: askAgentLabel(optimizeRemediationCopy(provider), 'turn this into a project-scoped MCP profile'),
       text: [
         `Review these MCP profile recommendations before changing config (${preview.length} of ${candidates.length} shown):`,
         ...preview.map(candidate => {
@@ -1926,7 +1991,7 @@ function findCapabilityReliabilityCandidates(projects: ProjectSummary[]): Capabi
   return candidates
 }
 
-export function detectCapabilityReliability(projects: ProjectSummary[]): WasteFinding | null {
+export function detectCapabilityReliability(projects: ProjectSummary[], provider?: string): WasteFinding | null {
   projects = userStartedProjects(projects)
   const candidates = findCapabilityReliabilityCandidates(projects)
   if (candidates.length === 0) return null
@@ -1989,7 +2054,7 @@ export function detectCapabilityReliability(projects: ProjectSummary[]): WasteFi
     fix: {
       type: 'paste',
       destination: 'prompt',
-      label: 'Ask Claude to audit the retry-heavy capability before changing config:',
+      label: askAgentLabel(optimizeRemediationCopy(provider), 'audit the retry-heavy capability before changing config'),
       text: `Investigate these retry-correlated capabilities: ${names}. Compare edit turns with retries against one-shot edit turns, identify whether the MCP server or skill actually caused rework, then propose a scoped MCP config or skill-instruction change with session evidence. Do not remove a capability solely because it appears in this report.`,
     },
   }
@@ -3121,7 +3186,7 @@ export function findLowWorthCandidates(projects: ProjectSummary[]): LowWorthCand
   return candidates
 }
 
-export function detectLowWorthSessions(projects: ProjectSummary[]): WasteFinding | null {
+export function detectLowWorthSessions(projects: ProjectSummary[], provider?: string): WasteFinding | null {
   const candidates = findLowWorthCandidates(projects)
   if (candidates.length === 0) return null
 
@@ -3156,7 +3221,7 @@ export function detectLowWorthSessions(projects: ProjectSummary[]): WasteFinding
     fix: {
       type: 'paste',
       destination: 'session-opener',
-      label: 'Paste at the start of your NEXT expensive thread (one-time, do not add to CLAUDE.md):',
+      label: sessionOpenerLabel(optimizeRemediationCopy(provider)),
       text: LOW_WORTH_OPENER,
     },
   }
@@ -3231,7 +3296,7 @@ export function findContextBloatCandidates(projects: ProjectSummary[]): ContextB
   return candidates
 }
 
-export function detectContextBloat(projects: ProjectSummary[], excludedSessionIds?: ReadonlySet<string>): WasteFinding | null {
+export function detectContextBloat(projects: ProjectSummary[], excludedSessionIds?: ReadonlySet<string>, provider?: string): WasteFinding | null {
   const candidates = findContextBloatCandidates(projects)
     .filter(c => !excludedSessionIds?.has(c.sessionId))
   if (candidates.length === 0) return null
@@ -3272,13 +3337,13 @@ export function detectContextBloat(projects: ProjectSummary[], excludedSessionId
     fix: {
       type: 'paste',
       destination: 'session-opener',
-      label: 'Paste at the start of your NEXT expensive thread (one-time, do not add to CLAUDE.md):',
+      label: sessionOpenerLabel(optimizeRemediationCopy(provider)),
       text: CONTEXT_HEAVY_OPENER,
     },
   }
 }
 
-export function detectSessionOutliers(projects: ProjectSummary[], excludedSessionIds?: ReadonlySet<string>): WasteFinding | null {
+export function detectSessionOutliers(projects: ProjectSummary[], excludedSessionIds?: ReadonlySet<string>, provider?: string): WasteFinding | null {
   type Outlier = {
     project: string
     sessionId: string
@@ -3353,7 +3418,7 @@ export function detectSessionOutliers(projects: ProjectSummary[], excludedSessio
     fix: {
       type: 'paste',
       destination: 'session-opener',
-      label: 'Paste at the start of your NEXT expensive thread (one-time, do not add to CLAUDE.md):',
+      label: sessionOpenerLabel(optimizeRemediationCopy(provider)),
       text: 'Before making changes, summarize the smallest viable plan. Keep context narrow, avoid broad searches, and stop after the first working patch so I can review before continuing.',
     },
   }
@@ -3551,15 +3616,15 @@ export async function scanAndDetect(
     claudeOnly(() => detectDuplicateReads(toolCalls, dateRange)),
     claudeOnly(() => detectUnusedMcp(toolCalls, projects, projectCwds, mcpCoverage)),
     () => detectMcpToolCoverage(projects, mcpCoverage, localMcpServerNames(projectCwds)),
-    () => detectMcpProfileAdvisor(projects, mcpCoverage),
+    () => detectMcpProfileAdvisor(projects, mcpCoverage, provider),
     // mcp-deferral-gaps family (#614): detection only, no apply plans yet.
     claudeOnly(() => detectMcpDeferralOff(toolCalls, projects, projectCwds, apiCalls)),
     claudeOnly(() => detectMcpAlwaysLoadHygiene(projects, projectCwds, apiCalls, mcpCoverage)),
     claudeOnly(() => detectMcpDeferThreshold(projects, projectCwds)),
-    () => detectCapabilityReliability(behavioralProjects),
-    () => detectLowWorthSessions(behavioralProjects),
-    () => detectContextBloat(behavioralProjects, lowWorthSessionIds),
-    () => detectSessionOutliers(behavioralProjects, outlierExclusions),
+    () => detectCapabilityReliability(behavioralProjects, provider),
+    () => detectLowWorthSessions(behavioralProjects, provider),
+    () => detectContextBloat(behavioralProjects, lowWorthSessionIds, provider),
+    () => detectSessionOutliers(behavioralProjects, outlierExclusions, provider),
     claudeOnly(() => detectBloatedClaudeMd(projectCwds)),
     claudeOnly(() => detectBashBloat()),
     claudeOnly(() => detectRecurringContext(openers)),
@@ -3624,7 +3689,7 @@ function wrap(text: string, width: number, indent: string): string {
 /// destination. Issue #277: users were dropping one-time session openers
 /// into CLAUDE.md as permanent rules because the prompts had no labeled
 /// home in the output.
-function renderActionHeader(action: WasteAction): string {
+function renderActionHeader(action: WasteAction, copy: OptimizeRemediationCopy): string {
   const headerWidth = PANEL_WIDTH - 4
   const fillTo = (label: string): string => {
     const inner = ` ${label} `
@@ -3637,18 +3702,11 @@ function renderActionHeader(action: WasteAction): string {
     case 'command':
       return fillTo('Run this command')
     case 'paste':
-      switch (action.destination) {
-        case 'claude-md':       return fillTo('Suggested CLAUDE.md addition (permanent rule)')
-        case 'session-opener':  return fillTo('One-time session opener (do NOT add to CLAUDE.md)')
-        case 'prompt':          return fillTo('Ask Claude in the current session')
-        case 'shell-config':    return fillTo('Add to your shell config')
-        case 'manual':          return fillTo('Manual action')
-        default:                return fillTo('Suggested action')
-      }
+      return fillTo(optimizePasteHeader(action.destination, copy))
   }
 }
 
-function renderFinding(n: number, f: WasteFinding, costRate: number): string[] {
+function renderFinding(n: number, f: WasteFinding, costRate: number, copy: OptimizeRemediationCopy): string[] {
   const lines: string[] = []
   const costSaved = f.tokensSaved * costRate
   const impactLabel = f.impact.charAt(0).toUpperCase() + f.impact.slice(1)
@@ -3674,7 +3732,7 @@ function renderFinding(n: number, f: WasteFinding, costRate: number): string[] {
   // permanent rules and one-time prompts are no longer interchangeable in
   // the output.
   const a = f.fix
-  lines.push(chalk.hex(ORANGE)(`  ${renderActionHeader(a)}`))
+  lines.push(chalk.hex(ORANGE)(`  ${renderActionHeader(a, copy)}`))
   lines.push(chalk.hex(DIM)(`  ${a.label}`))
   if (a.type === 'file-content') {
     for (const line of a.content.split('\n')) lines.push(chalk.hex(CYAN)(`    ${line}`))
@@ -3743,7 +3801,9 @@ export function renderOptimize(
   previouslyApplied?: Record<string, string>,
   modelRecommendations?: ModelDefaultRecommendation[],
   appliedFixes: AppliedFix[] = [],
+  provider?: string,
 ): string {
+  const copy = optimizeRemediationCopy(provider)
   const lines: string[] = []
   lines.push('')
   lines.push(`  ${chalk.bold.hex(ORANGE)('CodeBurn config health')}${chalk.dim('  ' + periodLabel)}`)
@@ -3766,9 +3826,9 @@ export function renderOptimize(
   if (findings.length === 0) {
     lines.push(chalk.hex(GREEN)('  Nothing to fix. Your setup is lean.'))
     lines.push('')
-    lines.push(chalk.dim('  CodeBurn optimize scans your Claude Code sessions and config for'))
+    lines.push(chalk.dim(`  CodeBurn optimize scans your ${copy.agent} sessions and config for`))
     lines.push(chalk.dim('  token waste: junk directory reads, duplicate file reads, unused'))
-    lines.push(chalk.dim('  agents/skills/MCP servers, bloated CLAUDE.md, and more.'))
+    lines.push(chalk.dim(`  agents/skills/MCP servers, bloated ${copy.instructionFile}, and more.`))
     lines.push('')
     lines.push(...renderAppliedFixes(appliedFixes))
     lines.push(...renderWorkflowSection(reworkedFiles, coachingNotes))
@@ -3799,7 +3859,7 @@ export function renderOptimize(
     for (const f of group) {
       const appliedOn = previouslyApplied?.[f.id]
       const shown = appliedOn ? { ...f, title: `${f.title} (previously applied ${appliedOn}, re-flagged)` } : f
-      lines.push(...renderFinding(++n, shown, costRate))
+      lines.push(...renderFinding(++n, shown, costRate, copy))
     }
   }
 
@@ -3868,7 +3928,7 @@ export async function runOptimize(
   }
 
   const { topReworkedFiles, coachingNotes } = buildWorkflowReport(projects)
-  const output = renderOptimize(findings, costRate, periodLabel, periodCost, sessionCount, callCount, healthScore, healthGrade, topReworkedFiles, coachingNotes, opts.appliedHeader, opts.previouslyApplied, result.modelRecommendations, opts.appliedFixes)
+  const output = renderOptimize(findings, costRate, periodLabel, periodCost, sessionCount, callCount, healthScore, healthGrade, topReworkedFiles, coachingNotes, opts.appliedHeader, opts.previouslyApplied, result.modelRecommendations, opts.appliedFixes, opts.provider)
   console.log(output)
 }
 

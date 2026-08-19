@@ -28,6 +28,10 @@ import {
   buildOptimizeJsonReport,
   renderOptimize,
   findingBasis,
+  optimizeRemediationCopy,
+  optimizePasteHeader,
+  sessionOpenerLabel,
+  askAgentLabel,
   type FindingId,
   type ToolCall,
   type ApiCallMeta,
@@ -1441,5 +1445,104 @@ describe('renderOptimize applied-fixes section', () => {
     expect(render([fixture({})], [])).toContain('Applied fixes')
     expect(render([])).not.toContain('Applied fixes')
     expect(render([], [])).not.toContain('Applied fixes')
+  })
+})
+
+describe('provider-scoped remediation copy (#1044)', () => {
+  const strip = (s: string): string => s.replace(/\u001b\[[0-9;]*m/g, '')
+
+  function promptFinding(label: string): WasteFinding {
+    return {
+      id: 'retry-heavy-capabilities',
+      title: 'retry-heavy',
+      explanation: 'why',
+      impact: 'medium',
+      tokensSaved: 1000,
+      fix: { type: 'paste', destination: 'prompt', label, text: 'audit' },
+    }
+  }
+
+  function openerFinding(label: string): WasteFinding {
+    return {
+      id: 'low-worth-sessions',
+      title: 'low-worth',
+      explanation: 'why',
+      impact: 'low',
+      tokensSaved: 1000,
+      fix: { type: 'paste', destination: 'session-opener', label, text: 'open' },
+    }
+  }
+
+  it('keeps Claude / CLAUDE.md for unset, all, and claude', () => {
+    for (const provider of [undefined, 'all', 'claude'] as const) {
+      const copy = optimizeRemediationCopy(provider)
+      expect(copy).toEqual({ agent: 'Claude', instructionFile: 'CLAUDE.md' })
+      expect(optimizePasteHeader('prompt', copy)).toBe('Ask Claude in the current session')
+      expect(optimizePasteHeader('session-opener', copy)).toBe('One-time session opener (do NOT add to CLAUDE.md)')
+      expect(sessionOpenerLabel(copy)).toContain('CLAUDE.md')
+      expect(askAgentLabel(copy, 'audit the retry-heavy capability before changing config'))
+        .toBe('Ask Claude to audit the retry-heavy capability before changing config:')
+    }
+  })
+
+  it('uses Codex / AGENTS.md for --provider codex', () => {
+    const copy = optimizeRemediationCopy('codex')
+    expect(copy).toEqual({ agent: 'Codex', instructionFile: 'AGENTS.md' })
+    expect(optimizePasteHeader('prompt', copy)).toBe('Ask Codex in the current session')
+    expect(optimizePasteHeader('session-opener', copy)).toBe('One-time session opener (do NOT add to AGENTS.md)')
+    expect(sessionOpenerLabel(copy)).toContain('AGENTS.md')
+    expect(sessionOpenerLabel(copy)).not.toContain('CLAUDE.md')
+  })
+
+  it('does not invent a filename for providers CodeBurn has not named', () => {
+    const copy = optimizeRemediationCopy('cursor')
+    expect(copy.agent).toBe('Cursor')
+    expect(copy.instructionFile).toBe('project instructions')
+    expect(optimizePasteHeader('session-opener', copy)).toBe('One-time session opener (do NOT add to project instructions)')
+  })
+
+  it('scopes cross-provider detector labels, including JSON', () => {
+    const project = projectWithLowWorthSessions([
+      lowWorthSession(4, 0, { turns: [lowWorthTurn({ hasEdits: false })] }),
+    ])
+    const claude = detectLowWorthSessions([project])
+    const codex = detectLowWorthSessions([project], 'codex')
+    expect(claude!.fix.label).toContain('CLAUDE.md')
+    expect(codex!.fix.label).toContain('AGENTS.md')
+    expect(codex!.fix.label).not.toContain('CLAUDE.md')
+
+    const turns = Array.from({ length: 5 }, (_, i) => reliabilityTurn(i, {
+      retries: i < 3 ? 1 : 0,
+      call: { tools: ['Edit', 'Skill'], skills: ['reviewer'] },
+    }))
+    const retry = detectCapabilityReliability([projectWithReliabilityTurns(turns)], 'codex')
+    expect(retry!.fix.label).toBe('Ask Codex to audit the retry-heavy capability before changing config:')
+    expect(retry!.fix.label).not.toContain('Claude')
+
+    const json = buildOptimizeJsonReport(
+      [project],
+      'lifetime',
+      { findings: [codex!], costRate: 0.00001, healthScore: 80, healthGrade: 'B', modelRecommendations: [] },
+    )
+    expect(json.findings[0]!.fix.label).toContain('AGENTS.md')
+    expect(json.findings[0]!.fix.label).not.toContain('CLAUDE.md')
+  })
+
+  it('renders destination headers from the selected provider, not the finding text', () => {
+    const out = strip(renderOptimize(
+      [promptFinding('Ask Claude to audit the retry-heavy capability before changing config:')],
+      0.00001, 'lifetime', 10, 5, 100, 80, 'B', [], [],
+      undefined, undefined, undefined, [], 'codex',
+    ))
+    expect(out).toContain('Ask Codex in the current session')
+    expect(out).not.toContain('Ask Claude in the current session')
+
+    const opener = strip(renderOptimize(
+      [openerFinding('Paste at the start of your NEXT expensive thread (one-time, do not add to CLAUDE.md):')],
+      0.00001, 'lifetime', 10, 5, 100, 80, 'B', [], [],
+      undefined, undefined, undefined, [], 'codex',
+    ))
+    expect(opener).toContain('do NOT add to AGENTS.md')
+    expect(opener).not.toContain('do NOT add to CLAUDE.md')
   })
 })

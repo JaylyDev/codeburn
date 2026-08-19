@@ -10,7 +10,7 @@ import { findUnpricedModels, isExpectedFreeModel, loadPricing } from './models.j
 import { aggregateModelTotals } from './model-breakdown.js'
 import { buildDurablePeriod } from './usage-aggregator.js'
 import { getAllProviders } from './providers/index.js'
-import { classHeaderLine, classTotals, findingBasis, findingClass, scanAndDetect, type FindingClass, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
+import { classHeaderLine, classTotals, findingBasis, findingClass, optimizePasteHeader, optimizeRemediationCopy, scanAndDetect, type FindingClass, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
 import { appliedFixGlyph, formatAppliedFix, type AppliedFix } from './act/types.js'
 import { aggregateFileChurn, buildCoachingNotes, computePricingCoverage, medianTimeToFirstEditMs, scanUserCorrections, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 import { estimateContextBudget, type ContextBudget } from './context-budget.js'
@@ -1033,34 +1033,21 @@ function PeriodTabs({ active, providerName, showProvider }: { active: Period; pr
 /// permanent CLAUDE.md rule from a one-time session opener so they don't
 /// accidentally bake a single-run constraint into their project's permanent
 /// instructions. Issue #277.
-function actionDestinationHeader(action: WasteAction): string {
+function actionDestinationHeader(action: WasteAction, provider?: string): string {
   switch (action.type) {
     case 'file-content':
       return `── Suggested ${action.path} addition `.padEnd(64, '─')
     case 'command':
       return '── Run this command '.padEnd(64, '─')
     case 'paste': {
-      switch (action.destination) {
-        case 'claude-md':
-          return '── Suggested CLAUDE.md addition (permanent rule) '.padEnd(64, '─')
-        case 'session-opener':
-          return '── One-time session opener (do not add to CLAUDE.md) '.padEnd(64, '─')
-        case 'prompt':
-          return '── Ask Claude in the current session '.padEnd(64, '─')
-        case 'shell-config':
-          return '── Add to your shell config '.padEnd(64, '─')
-        case 'manual':
-          return '── Manual action '.padEnd(64, '─')
-        default:
-          return '── Suggested action '.padEnd(64, '─')
-      }
+      return `── ${optimizePasteHeader(action.destination, optimizeRemediationCopy(provider))} `.padEnd(64, '─')
     }
   }
 }
 
-function FindingAction({ action }: { action: WasteAction }) {
+function FindingAction({ action, provider }: { action: WasteAction; provider?: string }) {
   const lines = action.type === 'file-content' ? action.content.split('\n') : action.type === 'command' ? action.text.split('\n') : [action.text]
-  const header = actionDestinationHeader(action)
+  const header = actionDestinationHeader(action, provider)
   return (
     <>
       <Text color={ORANGE}>{header}</Text>
@@ -1070,7 +1057,7 @@ function FindingAction({ action }: { action: WasteAction }) {
   )
 }
 
-function FindingPanel({ index, finding, costRate, width }: { index: number; finding: WasteFinding; costRate: number; width: number }) {
+function FindingPanel({ index, finding, costRate, width, provider }: { index: number; finding: WasteFinding; costRate: number; width: number; provider?: string }) {
   const costSaved = finding.tokensSaved * costRate
   const color = IMPACT_PANEL_COLORS[finding.impact] ?? DIM
   const label = finding.impact.charAt(0).toUpperCase() + finding.impact.slice(1)
@@ -1086,7 +1073,7 @@ function FindingPanel({ index, finding, costRate, width }: { index: number; find
       <Text dimColor wrap="wrap">{finding.explanation}</Text>
       <Text color={GOLD}>Savings: ~{formatTokens(finding.tokensSaved)} tokens (~{formatCost(costSaved)})<Text dimColor>  {findingBasis(finding)}</Text></Text>
       <Text> </Text>
-      <FindingAction action={finding.fix} />
+      <FindingAction action={finding.fix} provider={provider} />
     </Box>
   )
 }
@@ -1106,7 +1093,7 @@ const APPLIED_FIX_COLORS: Record<AppliedFix['verdict'], string> = {
   pending: DIM,
 }
 
-function OptimizeView({ findings, costRate, projects, label, width, healthScore, healthGrade, cursor, appliedFixes = [] }: { findings: WasteFinding[]; costRate: number; projects: ProjectSummary[]; label: string; width: number; healthScore: number; healthGrade: string; cursor: number; appliedFixes?: AppliedFix[] }) {
+function OptimizeView({ findings, costRate, projects, label, width, healthScore, healthGrade, cursor, appliedFixes = [], provider }: { findings: WasteFinding[]; costRate: number; projects: ProjectSummary[]; label: string; width: number; healthScore: number; healthGrade: string; cursor: number; appliedFixes?: AppliedFix[]; provider?: string }) {
   const periodCost = projects.reduce((s, p) => s + p.totalCostUSD, 0)
   const totalTokens = findings.reduce((s, f) => s + f.tokensSaved, 0)
   const totalCost = totalTokens * costRate
@@ -1140,7 +1127,7 @@ function OptimizeView({ findings, costRate, projects, label, width, healthScore,
         return (
           <Fragment key={start + i}>
             {cls !== previous && <Box paddingX={1} width={width}><Text bold color={ORANGE} wrap="truncate-end">{classHeaderLine(cls, totals[cls], costRate)}</Text></Box>}
-            <FindingPanel index={start + i + 1} finding={f} costRate={costRate} width={width} />
+            <FindingPanel index={start + i + 1} finding={f} costRate={costRate} width={width} provider={provider} />
           </Fragment>
         )
       })}
@@ -1666,7 +1653,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
         {view === 'compare'
           ? <CompareView projects={projects} onBack={() => setView('dashboard')} />
           : view === 'optimize' && optimizeResult
-            ? <OptimizeView findings={optimizeResult.findings} costRate={optimizeResult.costRate} projects={projects} label={headerLabel} width={dashWidth} healthScore={optimizeResult.healthScore} healthGrade={optimizeResult.healthGrade} cursor={findingsCursor} appliedFixes={appliedFixes} />
+            ? <OptimizeView findings={optimizeResult.findings} costRate={optimizeResult.costRate} projects={projects} label={headerLabel} width={dashWidth} healthScore={optimizeResult.healthScore} healthGrade={optimizeResult.healthGrade} cursor={findingsCursor} appliedFixes={appliedFixes} provider={activeProvider} />
             : <DashboardContent projects={projects} period={period} columns={columns} maxContentWidth={maxContentWidth} activeProvider={activeProvider} budgets={projectBudgets} planUsages={planUsages} label={headerLabel} dayMode={isDayMode} dailyHistoryProjects={dailyHistoryProjects} dailyHistoryPageSize={dailyHistoryPageSize} scrollableDailyHistory={scrollableDailyHistory} dailyHistoryCursor={Math.min(dailyHistoryCursor, dailyHistoryMaxCursor)} durable={durable} />}
         {coachingNote && (
           <Box width={dashWidth} paddingX={1}>
