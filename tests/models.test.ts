@@ -783,7 +783,7 @@ describe('observed provider model aliases', () => {
   it('resolves the already-shipped MiMo v2 Flash alias without blowing the stack', () => {
     for (const id of ['mimo-v2-flash', 'MiMo-V2-Flash', 'cline-pass/mimo-v2-flash', 'mimo/mimo-v2-flash']) {
       expect(() => getShortModelName(id)).not.toThrow()
-      expect(getShortModelName(id)).toBe('mimo-v2-flash')
+      expect(getShortModelName(id)).toBe('MiMo v2 Flash')
       expect(getModelCosts(id)).toEqual(getModelCosts('xiaomi/mimo-v2-flash'))
     }
   })

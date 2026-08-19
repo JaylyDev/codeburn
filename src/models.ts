@@ -961,6 +961,7 @@ const SHORT_NAMES: Record<string, string> = {
   'qwen3.7-max': 'Qwen 3.7 Max',
   'mimo-v2.5-pro': 'MiMo v2.5 Pro',
   'mimo-v2.5': 'MiMo v2.5',
+  'mimo-v2-flash': 'MiMo v2 Flash',
   // Both spellings occur in the wild: OpenRouter gap-filled keys are lowercase
   // slugs while sessions report the capitalized name (see the case-insensitive
   // pricing index above). SHORT_NAMES matching is case-sensitive, so map both.
