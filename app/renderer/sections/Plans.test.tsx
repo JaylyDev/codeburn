@@ -119,7 +119,7 @@ describe('Plans', () => {
 
     expect(screen.getByRole('heading', { name: 'Budget plans' })).toBeInTheDocument()
     expect(screen.getByText('Cursor Pro')).toBeInTheDocument()
-    expect(screen.getByText('$20.00 / month · cursor')).toBeInTheDocument()
+    expect(screen.getByText('$20.00 / month budget · API-equivalent, not a live provider window · cursor')).toBeInTheDocument()
     expect(screen.getByText('$8.20 · 41%')).toBeInTheDocument()
     const cursorFill = container.querySelector('[data-testid="plan-track-cursor"] i')
     expect(cursorFill).toHaveStyle({ width: '41%' })
@@ -214,7 +214,7 @@ describe('Plans', () => {
 
     render(<Plans period="30days" />)
 
-    expect(await screen.findByText('€20.00 / month · cursor')).toBeInTheDocument()
+    expect(await screen.findByText('€20.00 / month budget · API-equivalent, not a live provider window · cursor')).toBeInTheDocument()
     expect(screen.getByText('€8.20 · 41%')).toBeInTheDocument()
   })
 
