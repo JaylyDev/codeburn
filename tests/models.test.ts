@@ -310,6 +310,13 @@ describe('user aliases via setModelAliases', () => {
     expect(getModelCosts('anthropic--claude-4.6-opus')).toEqual(getModelCosts('claude-sonnet-4-5'))
   })
 
+  it('user alias whose source already has a short name displays the target', () => {
+    setModelAliases({ 'gpt-4o': 'claude-opus-4-6' })
+    expect(getModelCosts('gpt-4o')).toEqual(getModelCosts('claude-opus-4-6'))
+    expect(getShortModelName('gpt-4o')).toBe('Opus 4.6')
+    setModelAliases({})
+  })
+
   it('resetting aliases restores builtins', () => {
     setModelAliases({ 'anthropic--claude-4.6-opus': 'claude-sonnet-4-5' })
     setModelAliases({})
@@ -739,6 +746,8 @@ describe('observed provider model aliases', () => {
     ['MiMo-V2-Flash', 'xiaomi/mimo-v2-flash'],
     ['mimo-v2.5-pro', 'xiaomi/mimo-v2.5-pro'],
     ['MiMo-v2.5-Pro', 'xiaomi/mimo-v2.5-pro'],
+    ['mimo-v2.5', 'xiaomi/mimo-v2.5'],
+    ['MiMo-v2.5', 'xiaomi/mimo-v2.5'],
     ['KAT-Coder-Pro-V1', 'kwaipilot/kat-coder-pro'],
     // Kimi Code wires report bare `k3` in llm.request.model; it must price
     // through the kimi-k3 table entry, not fall through to $0.
@@ -758,6 +767,13 @@ describe('observed provider model aliases', () => {
 
   it('k3 shows the Kimi K3 display name', () => {
     expect(getShortModelName('k3')).toBe('Kimi K3')
+  })
+
+  it('does not recurse on vendor-requalified MiMo aliases', () => {
+    expect(getShortModelName('mimo-v2.5')).toBe('mimo-v2.5')
+    expect(getShortModelName('MiMo-v2.5')).toBe('mimo-v2.5')
+    expect(getShortModelName('cline-pass/mimo-v2.5')).toBe('mimo-v2.5')
+    expect(getShortModelName('cline-pass/mimo-v2.5-pro')).toBe('MiMo v2.5 Pro')
   })
 
   it('does not map dated Qwen3 Max to a reseller price without provider context', () => {

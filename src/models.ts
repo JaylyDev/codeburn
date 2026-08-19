@@ -985,32 +985,52 @@ function deriveClaudeShortName(canonical: string): string | undefined {
   return `${CLAUDE_FAMILY[family]} ${major}${minor ? `.${minor}` : ''}`
 }
 
-export function getShortModelName(model: string): string {
-  if (autoModelNames[model]) return autoModelNames[model]
-  const stripped = getCanonicalName(model)
-  // Pricing aliases may re-namespace a leaf (mimo-v2.5-pro → xiaomi/…).
-  // Display names live on the leaf. Look that up before following the alias
-  // or we recurse forever: strip → alias → last-segment → strip.
-  for (const [key, name] of SORTED_SHORT_NAMES) {
-    if (stripped === key || stripped.startsWith(key + '-')) return name
-  }
-  const canonical = resolveAlias(stripped)
-  const claude = deriveClaudeShortName(canonical)
+function lookupShortName(id: string): string | undefined {
+  const claude = deriveClaudeShortName(id)
   if (claude) return claude
   for (const [key, name] of SORTED_SHORT_NAMES) {
-    if (canonical === key || canonical.startsWith(key + '-')) return name
+    if (id === key || id.startsWith(key + '-')) return name
   }
-  // getCanonicalName only strips the leading provider prefix, so a raw
-  // path-style id (e.g. accounts/fireworks/models/glm-5p2) still has slashes
-  // here. Take the last path segment and re-resolve it: the segment may itself
-  // be a known model slug (Fireworks fleet ids), earning a friendly name; a
-  // genuinely unmapped slug resolves to itself, preserving the raw-segment
-  // fallback for everything else.
+  return undefined
+}
+
+export function getShortModelName(model: string, seen: Set<string> = new Set()): string {
+  if (autoModelNames[model]) return autoModelNames[model]
+  if (seen.has(model)) {
+    const leaf = model.includes('/') ? model.slice(model.lastIndexOf('/') + 1) : model
+    return lookupShortName(leaf) ?? leaf
+  }
+  seen.add(model)
+
+  // User aliases win over built-in display names. A remap of gpt-4o must
+  // show the target, not "GPT-4o".
+  if (Object.hasOwn(userAliases, model)) {
+    return getShortModelName(userAliases[model]!, seen)
+  }
+
+  const stripped = getCanonicalName(model)
+  if (stripped !== model) {
+    if (Object.hasOwn(userAliases, stripped)) {
+      return getShortModelName(userAliases[stripped]!, seen)
+    }
+    const knownStripped = lookupShortName(stripped)
+    if (knownStripped && !Object.hasOwn(BUILTIN_ALIASES, stripped) && !Object.hasOwn(BUILTIN_ALIASES, stripped.toLowerCase())) {
+      return knownStripped
+    }
+  }
+
+  const canonical = resolveAlias(stripped)
+  const known = lookupShortName(canonical)
+  if (known) return known
+
   if (canonical.includes('/')) {
     const segment = canonical.slice(canonical.lastIndexOf('/') + 1)
-    return segment ? getShortModelName(segment) : canonical
+    if (!segment || seen.has(segment) || segment === stripped) {
+      return lookupShortName(segment) ?? segment
+    }
+    return getShortModelName(segment, seen)
   }
-  return canonical
+  return lookupShortName(canonical) ?? canonical
 }
 
 // Pricing is process-global state assembled at CLI startup from the cached
