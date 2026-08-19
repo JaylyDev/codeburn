@@ -131,12 +131,15 @@ see the #927 ruling in `src/session-cache.ts`).
   as rows land, a rollup is dropped once rows cover its leg, a row's pairing
   flips), and the sent-ledger is append-once, so a value sent mid-reconciliation
   could never be corrected at the receiver (#988). Nothing is dropped; the next
-  push after the window sends it once, final. A session whose rollup was
-  already synced by an earlier version is frozen instead of held: its rows and
-  residuals never go out, because the receiver cannot be told to drop the
-  rollup it holds. That is a bounded under-count at the receiver in place of an
-  unbounded over-count; `codeburn sync reset --confirm` re-pushes everything
-  under the new breakdown for anyone who can clear the receiver too.
+  push after the window sends it once, final. Separately, a session is frozen
+  into whichever of the two shapes it was FIRST synced in — the raw rollup, or
+  rows plus residuals — because the receiver cannot be told to drop what it
+  already holds. Both directions matter: a session synced by a pre-store
+  version never sends rows, and a session synced as rows never sends the
+  rollup that starts serving again once the 90-day age-out prunes them. That is
+  a bounded under-count at the receiver in place of an unbounded over-count;
+  `codeburn sync reset --confirm` re-pushes everything under the new breakdown
+  for anyone who can clear the receiver too.
 - **Requires Node 22+** (`node:sqlite`), same as the OTel source.
 
 ## JetBrains IDEs (IntelliJ, PyCharm, …)

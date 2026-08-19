@@ -640,6 +640,9 @@ describe.skipIf(!isSqliteAvailable())('(f2) durable history survives a bump on a
     clearSessionCache()
     const disk = await readCacheOnDisk()
     expect(disk.providers['copilot']).toBeDefined()
+    // Self-check: a sentinel equal to the real fingerprint would make the
+    // section MATCH and the test would pass while exercising nothing.
+    expect(disk.providers['copilot']!.envFingerprint).not.toBe('0000000000000000')
     disk.providers['copilot']!.envFingerprint = '0000000000000000'
     await writeCacheOnDisk(disk)
   }
@@ -1705,6 +1708,80 @@ describe.skipIf(!isSqliteAvailable())('(o) absence epoch: served totals are inde
 // rollup stands until rows actually land, partially-landed rows are topped
 // up by the residual to the rollup's own totals, and full coverage retires
 // the residual — counted once at every step and zero at none.
+// ═══════════════════════════════════════════════════════════════════════════
+// (c2) Residual dedup keys name the leg's INSTANT, never its position
+// ═══════════════════════════════════════════════════════════════════════════
+// A residual key used to carry the leg's index into the session's sorted leg
+// list. An index is only stable while nothing is ever inserted before it, and
+// legs are sorted across every cached file for the session — so an earlier leg
+// arriving later would renumber the residuals after it. The sync ledger has
+// already sent the old names, and a renamed key is a span the receiver takes a
+// second time (there is no retraction for a usage span).
+//
+// The leg's own timestamp cannot move: session files are append-only, and the
+// equal-timestamp coalescing above makes it unique per leg. Pinning that the
+// key is DERIVED from it is what forecloses the whole class, which is stronger
+// than pinning one insertion scenario — today a second file's leg collides on
+// the rollup's own dedup key before it can ever reach the residual sweep, so
+// the reachable repro would prove nothing about the next one. (Review B, B-4.)
+describe.skipIf(!isSqliteAvailable())('(c2) residual keys are derived from the leg timestamp', () => {
+  it('names each residual after its leg instant, not its index', async () => {
+    const dayN = Date.now() - 5 * 24 * 60 * 60 * 1000
+    const at = (offsetHours: number): string => new Date(dayN + offsetHours * 3600 * 1000).toISOString()
+    const sessionStateDir = join(tmpHome, 'reskey-state')
+    await mkdir(sessionStateDir, { recursive: true })
+    const dbPath = join(tmpHome, 'reskey-store.db')
+    vi.stubEnv('CODEBURN_COPILOT_SESSION_STATE_DIR', sessionStateDir)
+    vi.stubEnv('CODEBURN_COPILOT_SESSION_STORE_DB', dbPath)
+    vi.stubEnv('CODEBURN_COPILOT_DISABLE_OTEL', '1')
+    vi.stubEnv('CODEBURN_COPILOT_WS_STORAGE_DIR', join(tmpHome, 'no-ws'))
+    vi.stubEnv('CODEBURN_COPILOT_GLOBAL_STORAGE_DIR', join(tmpHome, 'no-global'))
+    vi.stubEnv('CODEBURN_COPILOT_JETBRAINS_DIR', join(tmpHome, 'no-jb'))
+
+    // Two legs, one partially-covering row: both legs mint a residual.
+    const dir = join(sessionStateDir, 'sess-reskey')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'workspace.yaml'), 'id: sess-reskey\ncwd: /home/user/testproj\n')
+    const rollup = (ts: string, cumulativeInput: number): string => JSON.stringify({
+      type: 'session.shutdown',
+      timestamp: ts,
+      data: {
+        shutdownType: 'routine',
+        modelMetrics: {
+          'claude-sonnet-4-5': {
+            requests: { count: 1, cost: 1 },
+            usage: { inputTokens: cumulativeInput, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 },
+          },
+        },
+      },
+    })
+    await writeFile(join(dir, 'events.jsonl'), [
+      JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: 'claude-sonnet-4-5' } }),
+      JSON.stringify({ type: 'assistant.message', timestamp: at(1), data: { messageId: 'msg-1', outputTokens: 10, toolRequests: [] } }),
+      rollup(at(2), 500),
+      rollup(at(26), 800),
+    ].join('\n') + '\n')
+
+    createStoreDb(dbPath)
+    insertStoreRow(dbPath, 'sess-reskey', 100, 0, 0, at(25))
+
+    const keys = (await parseAllSessions(undefined, 'copilot'))
+      .flatMap(p => p.sessions).flatMap(s => s.turns).flatMap(t => t.assistantCalls)
+      .map(c => c.deduplicationKey)
+      .filter(k => k.includes(':shutdown-residual:'))
+      .sort()
+
+    expect(keys).toEqual([
+      `copilot:sess-reskey:shutdown-residual:claude-sonnet-4-5:${Date.parse(at(2))}`,
+      `copilot:sess-reskey:shutdown-residual:claude-sonnet-4-5:${Date.parse(at(26))}`,
+    ].sort())
+
+    // The positional names must be gone: `:0` / `:1` are exactly what a leg
+    // insertion would have renumbered.
+    expect(keys.some(k => k.endsWith(':0') || k.endsWith(':1'))).toBe(false)
+  })
+})
+
 // ═══════════════════════════════════════════════════════════════════════════
 // (c1) In-session compaction anchors the leg's store-row interval
 // ═══════════════════════════════════════════════════════════════════════════

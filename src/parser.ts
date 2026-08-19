@@ -3964,7 +3964,14 @@ async function parseProviderSources(
           tools: [], mcpTools: [], skills: [], subagentTypes: [],
           hasAgentSpawn: false, hasPlanMode: false,
           speed: 'standard', timestamp: leg.rawTs, bashCommands: [],
-          deduplicationKey: `copilot:${sessionId}:shutdown-residual:${model}:${legIdx}`,
+          // Keyed by the leg's own INSTANT, never its position. A second
+          // journal file discovered later can contribute a leg that sorts
+          // BEFORE existing ones, which shifts every subsequent index — and an
+          // index that shifts renames a key the sync ledger has already sent,
+          // so the receiver takes the same residual twice under two names. The
+          // instant is immutable (session files are append-only) and unique
+          // per leg after the equal-timestamp coalescing above.
+          deduplicationKey: `copilot:${sessionId}:shutdown-residual:${model}:${leg.ts}`,
           supplementaryAccounting: true,
         })
         residualsBySession.set(sessionId, calls)

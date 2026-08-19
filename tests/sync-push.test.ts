@@ -218,6 +218,132 @@ describe('collectUnsentCalls', () => {
     expect(later.frozen).toHaveLength(2)
   })
 
+  // B-1: the freeze has to work in BOTH directions. Rows sync first; at the
+  // 90-day durable age-out the cached rows are pruned, the rollup stops being
+  // dropped and serves again under a key that was never sent. The session is
+  // long past settle, so without a symmetric freeze it pushes an aggregate on
+  // top of the per-request spans the receiver already has.
+  it('freezes the rollup of a session already synced as per-request rows', async () => {
+    const { collectUnsentCalls, RECONCILE_SETTLE_MS } = await import('../src/sync/push.js')
+    const { writeLedger } = await import('../src/sync/ledger.js')
+
+    const now = Date.parse('2026-07-10T12:00:00.000Z')
+    const old = new Date(now - RECONCILE_SETTLE_MS * 100).toISOString()
+    const copilotCall = (key: string) => ({ ...makeCall(key), provider: 'copilot', timestamp: old })
+
+    // Session S synced its rows. Then they aged out of the cache.
+    writeLedger([{ key: 'copilot-store:S:1:aa', ts: old }])
+
+    const projects = [{
+      project: 'p',
+      sessions: [{
+        sessionId: 'S',
+        turns: [{ assistantCalls: [
+          copilotCall('copilot:S:shutdown:claude-sonnet-4-5:1'),
+          copilotCall('copilot:S:shutdown-residual:claude-sonnet-4-5:1752000000000'),
+          copilotCall('copilot:S:msg-1'),          // per-turn output: neither shape
+          copilotCall('copilot-store:S:2:bb'),     // a row that survived: same shape, still sends
+        ] }],
+      }],
+    }] as unknown as ProjectSummary[]
+
+    const { unsent, held, frozen } = collectUnsentCalls(projects, now)
+
+    // Only the RAW rollup is frozen. The residual is reconciled output, the
+    // same shape as the rows that were sent, and rows+residual are disjoint by
+    // construction — so it is additive, not a second copy of anything.
+    expect(frozen.map(f => f.call.deduplicationKey))
+      .toEqual(['copilot:S:shutdown:claude-sonnet-4-5:1'])
+    expect(unsent.map(u => u.call.deduplicationKey).sort()).toEqual([
+      'copilot-store:S:2:bb',
+      'copilot:S:msg-1',
+      'copilot:S:shutdown-residual:claude-sonnet-4-5:1752000000000',
+    ])
+    expect(held).toHaveLength(0)
+
+    // Frozen means frozen.
+    expect(collectUnsentCalls(projects, now + RECONCILE_SETTLE_MS * 10).frozen).toHaveLength(1)
+  })
+
+  // B-2: an undatable session was held forever while the CLI promised it would
+  // "push once it settles". Nothing can ever settle it, so send it.
+  it('sends a session whose timestamps are all unparseable instead of holding it forever', async () => {
+    const { collectUnsentCalls } = await import('../src/sync/push.js')
+
+    const now = Date.parse('2026-07-10T12:00:00.000Z')
+    const broken = (key: string) => ({ ...makeCall(key), provider: 'copilot', timestamp: 'not-a-date' })
+
+    const projects = [{
+      project: 'p',
+      sessions: [{ sessionId: 'N', turns: [{ assistantCalls: [broken('copilot-store:N:1:aa')] }] }],
+    }] as unknown as ProjectSummary[]
+
+    const { unsent, held } = collectUnsentCalls(projects, now)
+    expect(held).toHaveLength(0)
+    expect(unsent.map(u => u.call.deduplicationKey)).toEqual(['copilot-store:N:1:aa'])
+  })
+
+  it('still holds a session where only SOME stamps are unparseable and the rest are recent', async () => {
+    const { collectUnsentCalls } = await import('../src/sync/push.js')
+
+    const now = Date.parse('2026-07-10T12:00:00.000Z')
+    const cp = (key: string, timestamp: string) => ({ ...makeCall(key), provider: 'copilot', timestamp })
+
+    const projects = [{
+      project: 'p',
+      sessions: [{
+        sessionId: 'M',
+        turns: [{ assistantCalls: [
+          cp('copilot-store:M:1:aa', 'not-a-date'),
+          cp('copilot-store:M:2:bb', new Date(now - 60_000).toISOString()),
+        ] }],
+      }],
+    }] as unknown as ProjectSummary[]
+
+    const { unsent, held } = collectUnsentCalls(projects, now)
+    expect(unsent).toHaveLength(0)
+    expect(held).toHaveLength(2)
+  })
+
+  // B-3: a stamp far in the future is broken data, not proof the session is
+  // live. One of them must not hold a month-old session hostage.
+  it('ignores an implausibly future stamp when deciding whether a session settled', async () => {
+    const { collectUnsentCalls } = await import('../src/sync/push.js')
+
+    const now = Date.parse('2026-07-10T12:00:00.000Z')
+    const cp = (key: string, timestamp: string) => ({ ...makeCall(key), provider: 'copilot', timestamp })
+    const thirtyDaysAgo = new Date(now - 30 * 24 * 3600 * 1000).toISOString()
+    const yearAhead = new Date(now + 365 * 24 * 3600 * 1000).toISOString()
+
+    const projects = [{
+      project: 'p',
+      sessions: [{
+        sessionId: 'F',
+        turns: [{ assistantCalls: [
+          cp('copilot-store:F:1:aa', thirtyDaysAgo),
+          cp('copilot-store:F:2:bb', yearAhead),
+        ] }],
+      }],
+    }] as unknown as ProjectSummary[]
+
+    const { unsent, held } = collectUnsentCalls(projects, now)
+    expect(held).toHaveLength(0)
+    expect(unsent).toHaveLength(2)
+
+    // But ordinary clock skew inside the grace window still counts as live.
+    const skewed = [{
+      project: 'p',
+      sessions: [{
+        sessionId: 'G',
+        turns: [{ assistantCalls: [
+          cp('copilot-store:G:1:aa', thirtyDaysAgo),
+          cp('copilot-store:G:2:bb', new Date(now + 60_000).toISOString()),
+        ] }],
+      }],
+    }] as unknown as ProjectSummary[]
+    expect(collectUnsentCalls(skewed, now).held).toHaveLength(2)
+  })
+
   it('never holds a provider whose served calls are immutable', async () => {
     const { collectUnsentCalls } = await import('../src/sync/push.js')
 

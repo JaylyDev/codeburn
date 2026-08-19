@@ -56,38 +56,101 @@ export const RECONCILE_SETTLE_MS = 24 * 60 * 60 * 1000
 const RECONCILING_PROVIDERS = new Set(['copilot'])
 
 /**
- * Sessions whose copilot input/cache the receiver already holds as a
- * session.shutdown ROLLUP span, sent by a version that had no store rows.
+ * A copilot session's input/cache can leave this machine in one of two shapes,
+ * and the receiver must never end up holding both.
  *
- * This release moves the same tokens from one rollup span per (session, model)
- * to one span per request. Locally that is a replacement; at the receiver it
- * is an addition, because the ledger is append-once and there is no retraction
- * for a usage span. Every session ever synced before this version would
- * therefore be counted twice, permanently, on the first push after upgrade.
+ *   rollup      `copilot:<sid>:shutdown:<model>:<n>`
+ *               one aggregate span per leg — what every pre-store version sent,
+ *               and what still serves for a session with no store rows.
+ *   reconciled  `copilot-store:<sid>:<rowId>:<hash>`  (one span per request)
+ *             + `copilot:<sid>:shutdown-residual:...` (the part rows don't cover)
+ *               the two together are exactly the rollup, re-expressed.
  *
- * So a session is frozen at whatever was already sent: once its rollup is in
- * the ledger, its store rows and residuals never go out. The receiver keeps
- * the old, lossier number instead of a doubled one — a bounded under-count in
- * place of an unbounded over-count. Sessions with no rollup in the ledger are
- * new to sync and take the per-row path in full.
+ * They describe the SAME tokens. Locally, reconciliation picks one per
+ * (session, model) on every pass and the answer can flip. Remotely there is no
+ * flipping: the ledger is append-once and a usage span has no retraction, so
+ * whatever was sent first is there forever and anything sent after it ADDS.
+ *
+ * Both directions are reachable:
+ *   - Rollup first: every session synced before this release went out that
+ *     way. The first push after upgrade would send rows and residuals on top.
+ *   - Reconciled first: rows sync, then at the 90-day durable age-out the
+ *     cached rows are pruned, the rollup stops being dropped and serves again
+ *     under a key that was never sent. Past settle, it pushes on top.
+ *
+ * So: whichever shape a session was first synced in, it stays in, and the
+ * other is frozen for that session permanently. Growth WITHIN the sent shape
+ * is unaffected — a resumed session's new rows and residuals still push if the
+ * reconciled shape was sent, a new leg's rollup still pushes if the rollup
+ * shape was — because same-shape output is additive, never substitutive.
  *
  * `codeburn sync reset --confirm` clears the local ledger and re-pushes
  * everything under the new breakdown, but only helps if the receiver's own
  * copy is cleared too — otherwise it produces exactly the doubling this
  * avoids.
  */
-function rolledUpSessions(sentKeys: ReadonlySet<string>): Set<string> {
-  const frozen = new Set<string>()
-  for (const key of sentKeys) {
-    if (!key.startsWith('copilot:')) continue
-    // `copilot:<sid>:shutdown:<model>:<n>`. The trailing colon is what keeps
-    // `:shutdown-residual:` out — a residual is this version's own output and
-    // freezes WITH its session rather than causing the freeze.
-    const marker = key.indexOf(':shutdown:')
-    if (marker < 0) continue
-    frozen.add(key.slice('copilot:'.length, marker))
+type CopilotShape = 'rollup' | 'reconciled'
+
+/** Which shape a key belongs to; null for anything reconciliation never rewrites. */
+function keyShape(key: string): CopilotShape | null {
+  if (key.startsWith('copilot-store:')) return 'reconciled'
+  if (!key.startsWith('copilot:')) return null
+  // Order matters: `:shutdown-residual:` is reconciled output, `:shutdown:` is
+  // the raw rollup it replaces. Everything else under `copilot:` is a per-turn
+  // call, which carries output the rollup never held and reconciliation never
+  // touches.
+  if (key.includes(':shutdown-residual:')) return 'reconciled'
+  if (key.includes(':shutdown:')) return 'rollup'
+  return null
+}
+
+/** Session id out of a copilot key, or null when the key has no session segment. */
+function keySessionId(key: string): string | null {
+  for (const prefix of ['copilot-store:', 'copilot:']) {
+    if (!key.startsWith(prefix)) continue
+    const rest = key.slice(prefix.length)
+    const end = rest.indexOf(':')
+    return end > 0 ? rest.slice(0, end) : null
   }
-  return frozen
+  return null
+}
+
+function syncedShapes(sentKeys: ReadonlySet<string>): Map<string, Set<CopilotShape>> {
+  const bySession = new Map<string, Set<CopilotShape>>()
+  for (const key of sentKeys) {
+    const shape = keyShape(key)
+    if (!shape) continue
+    const sid = keySessionId(key)
+    if (!sid) continue
+    const set = bySession.get(sid) ?? new Set<CopilotShape>()
+    set.add(shape)
+    bySession.set(sid, set)
+  }
+  return bySession
+}
+
+/**
+ * How far ahead of now a timestamp may sit and still count as evidence of when
+ * a session was active. Clock skew is absorbed in both directions; beyond it,
+ * a stamp is broken data rather than proof the session is live.
+ */
+const FUTURE_GRACE_MS = 60 * 60 * 1000
+
+/**
+ * Newest moment a session can be SHOWN to have been active, or null when
+ * nothing about it can be dated. Unparseable and implausibly-future stamps
+ * carry no information about recency and are ignored rather than treated as
+ * "recent" — otherwise one broken row would hold a year-old session forever,
+ * while the CLI promised a settlement that could never arrive.
+ */
+function newestDatableTs(timestamps: readonly string[], now: number): number | null {
+  let newest: number | null = null
+  for (const raw of timestamps) {
+    const ts = Date.parse(raw)
+    if (isNaN(ts) || ts > now + FUTURE_GRACE_MS) continue
+    if (newest === null || ts > newest) newest = ts
+  }
+  return newest
 }
 
 /** Flatten parsed projects into individual calls and filter out already-sent ones. */
@@ -96,7 +159,7 @@ export function collectUnsentCalls(projects: ProjectSummary[], now: number = Dat
   unsent: CallWithSession[]
   /** Not yet sent because their session is still reconciling. Retried later. */
   held: CallWithSession[]
-  /** Never sent: the receiver already holds this session as a rollup span. */
+  /** Never sent: the receiver already holds this session in the other shape. */
   frozen: CallWithSession[]
 } {
   const allCalls: CallWithSession[] = []
@@ -116,27 +179,36 @@ export function collectUnsentCalls(projects: ProjectSummary[], now: number = Dat
 
   // A session settles as a whole: holding only the residual would still let a
   // row that is about to change ITS value through, and holding only the rows
-  // would still ship a rollup that is about to be dropped.
+  // would still ship a rollup that is about to be dropped. So the decision is
+  // taken once per session, from the newest moment it can be SHOWN active.
   const settleCutoff = now - RECONCILE_SETTLE_MS
-  const unsettled = new Set<string>()
+  const stampsBySession = new Map<string, string[]>()
   for (const c of allCalls) {
     if (!RECONCILING_PROVIDERS.has(c.call.provider)) continue
-    const ts = Date.parse(c.call.timestamp)
-    // An unparseable stamp cannot be shown to be settled, so it is not.
-    if (isNaN(ts) || ts > settleCutoff) unsettled.add(`${c.project}\u0000${c.sessionId}`)
+    const key = `${c.project}\u0000${c.sessionId}`
+    const list = stampsBySession.get(key) ?? []
+    list.push(c.call.timestamp)
+    stampsBySession.set(key, list)
+  }
+  const unsettled = new Set<string>()
+  for (const [key, stamps] of stampsBySession) {
+    const newest = newestDatableTs(stamps, now)
+    if (newest !== null && newest > settleCutoff) unsettled.add(key)
   }
 
   const sent = ledgerKeySet()
-  const rolledUp = rolledUpSessions(sent)
+  const shapes = syncedShapes(sent)
 
-  // Only the reconciliation OUTPUT is frozen. The session's per-turn calls
-  // (`copilot:<sid>:<msgId>`) carry output tokens the rollup never held and
-  // reconciliation never touches, so they keep syncing normally.
-  const isFrozen = (c: CallWithSession): boolean =>
-    RECONCILING_PROVIDERS.has(c.call.provider)
-    && rolledUp.has(c.sessionId)
-    && (c.call.deduplicationKey.startsWith('copilot-store:')
-      || c.call.deduplicationKey.includes(':shutdown-residual:'))
+  // Only the reconciliation OUTPUT is frozen, and only into the shape the
+  // session was NOT first synced in. Per-turn calls (`copilot:<sid>:<msgId>`)
+  // belong to neither shape and always sync.
+  const isFrozen = (c: CallWithSession): boolean => {
+    if (!RECONCILING_PROVIDERS.has(c.call.provider)) return false
+    const shape = keyShape(c.call.deduplicationKey)
+    if (!shape) return false
+    const already = shapes.get(c.sessionId)
+    return already !== undefined && !already.has(shape)
+  }
 
   const isHeld = (c: CallWithSession): boolean =>
     RECONCILING_PROVIDERS.has(c.call.provider) && unsettled.has(`${c.project}\u0000${c.sessionId}`)

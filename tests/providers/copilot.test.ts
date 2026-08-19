@@ -3226,14 +3226,15 @@ describe('copilot deduplication key prefixes (durable-union contract)', () => {
       'copilot-otel:$',                     // agent-traces.db span
       'copilot-store:$:$:${fnv1a64(',       // session-store row + content hash
       'copilot:$:$',                        // CLI per-turn assistant.message
-      'copilot:$:shutdown-residual:$:$',    // synthesized in parser.ts
+      'copilot:$:shutdown-residual:$:$',    // parser.ts; <model>:<leg epoch ms>
       'copilot:$:shutdown:$:$',             // session.shutdown rollup leg
       'copilot:jb:$:$:$',                   // JetBrains nitrite conversation
       // ── discriminator prefixes, not keys ───────────────────────────────
       // parseProviderSources tells the representations apart with these, and
-      // sync freezes on the same boundary. They belong in the pin: a rollup
-      // prefix that stopped excluding `shutdown-residual` would subtract a
-      // residual from itself.
+      // sync's rollup-vs-reconciled shape split keys off the same boundary.
+      // They belong in the pin: a rollup prefix that stopped excluding
+      // `shutdown-residual` would subtract a residual from itself locally, and
+      // remotely would class reconciled output as the rollup it replaces.
       'copilot:$:shutdown',
       'copilot:$:shutdown:',
     ].sort())
@@ -3245,7 +3246,7 @@ describe('copilot deduplication key prefixes (durable-union contract)', () => {
     // row must not match either — otherwise a rollup is dropped as a row, or a
     // residual is subtracted from itself.
     const rollup = 'copilot:sess-1:shutdown:claude-sonnet-4-5:1'
-    const residual = 'copilot:sess-1:shutdown-residual:claude-sonnet-4-5:0'
+    const residual = 'copilot:sess-1:shutdown-residual:claude-sonnet-4-5:1752000000000'
     const row = 'copilot-store:sess-1:7:abcdef0123456789'
     const perTurn = 'copilot:sess-1:msg-1'
 
@@ -3256,8 +3257,14 @@ describe('copilot deduplication key prefixes (durable-union contract)', () => {
     expect(perTurn.startsWith(shutdownPrefix)).toBe(false)
     expect(row.startsWith('copilot-store:')).toBe(true)
     expect(rollup.startsWith('copilot-store:')).toBe(false)
-    // And the sync freeze keys off the same boundary (src/sync/push.ts).
+    // And sync's shape split keys off the same boundary (src/sync/push.ts):
+    // the raw rollup is one shape, rows + residuals together are the other.
     expect(rollup.indexOf(':shutdown:')).toBeGreaterThan(0)
     expect(residual.indexOf(':shutdown:')).toBe(-1)
+    expect(residual.includes(':shutdown-residual:')).toBe(true)
+    // The residual's last segment is the leg's epoch ms, not its index — a
+    // position renames under insertion, and a renamed key double-counts at a
+    // receiver that was already sent the old name.
+    expect(/:shutdown-residual:[^:]+:\d{13}$/.test(residual)).toBe(true)
   })
 })
