@@ -44,6 +44,7 @@ enum CodexCredentialStore {
         lastCacheDeleteResult = nil
         lastLegacyCleanupFailed = false
         unlinkLegacyOverride = nil
+        tightenLegacyOverride = nil
         lock.withLock { memoryCache = nil }
     }
 
@@ -134,7 +135,7 @@ enum CodexCredentialStore {
         lock.withLock { memoryCache = nil }
         let result = deleteOurCache()
         lastCacheDeleteResult = result
-        if result.keychainDeletedOrAbsent {
+        if result.isSuccess {
             isBootstrapCompleted = false
         }
         return result
@@ -149,6 +150,7 @@ enum CodexCredentialStore {
     nonisolated(unsafe) static var lastCacheDeleteResult: CacheDeleteResult?
     nonisolated(unsafe) static var lastLegacyCleanupFailed = false
     nonisolated(unsafe) static var unlinkLegacyOverride: ((URL) throws -> Void)?
+    nonisolated(unsafe) static var tightenLegacyOverride: ((URL) throws -> Void)?
 
 
     // MARK: - Public API
@@ -380,7 +382,15 @@ enum CodexCredentialStore {
             lastLegacyCleanupFailed = false
         } catch {
             lastLegacyCleanupFailed = true
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            do {
+                if let tightenLegacyOverride {
+                    try tightenLegacyOverride(url)
+                } else {
+                    try SafeFile.tightenToOwnerReadWrite(at: url.path)
+                }
+            } catch {
+                // Still leftover, and 0600 is unproven. Retry signal stays set.
+            }
         }
     }
 
@@ -397,7 +407,11 @@ enum CodexCredentialStore {
         let url = cacheFileURL()
         if FileManager.default.fileExists(atPath: url.path) {
             do {
-                try FileManager.default.removeItem(at: url)
+                if let unlinkLegacyOverride {
+                    try unlinkLegacyOverride(url)
+                } else {
+                    try FileManager.default.removeItem(at: url)
+                }
             } catch {
                 legacyOK = false
             }

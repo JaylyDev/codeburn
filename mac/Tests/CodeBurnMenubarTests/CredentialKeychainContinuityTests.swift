@@ -325,6 +325,52 @@ struct CredentialKeychainContinuityTests {
         }
     }
 
+    @Test("failed tighten after failed unlink keeps leftover and retry signal")
+    func failedTightenLeavesRetrySignal() throws {
+        try withHarness { _ in
+            let record = ClaudeCredentialStore.CredentialRecord(
+                accessToken: accessSentinel,
+                refreshToken: refreshSentinel,
+                expiresAt: Date(timeIntervalSince1970: 1_900_000_000),
+                rateLimitTier: "default"
+            )
+            try ClaudeCredentialStore.writeOurCache(record: record)
+            try writeLegacyClaude0644(record: record)
+            ClaudeCredentialStore.isBootstrapCompleted = true
+            ClaudeCredentialStore.unlinkLegacyOverride = { _ in throw POSIXError(.EPERM) }
+            ClaudeCredentialStore.tightenLegacyOverride = { _ in throw POSIXError(.EPERM) }
+            ClaudeCredentialStore.clearMemoryCacheForTesting()
+            _ = try ClaudeCredentialStore.currentRecord()
+            #expect(ClaudeCredentialStore.lastLegacyCleanupFailed == true)
+            #expect(FileManager.default.fileExists(atPath: ClaudeCredentialStore.cacheFileURL().path))
+        }
+    }
+
+    @Test("legacy-only disconnect failure keeps bootstrap so retry stays")
+    func legacyOnlyDisconnectKeepsBootstrap() throws {
+        try withHarness { _ in
+            try ClaudeCredentialStore.writeOurCache(record: .init(
+                accessToken: accessSentinel,
+                refreshToken: refreshSentinel,
+                expiresAt: nil,
+                rateLimitTier: nil
+            ))
+            try writeLegacyClaude0644(record: .init(
+                accessToken: accessSentinel,
+                refreshToken: refreshSentinel,
+                expiresAt: nil,
+                rateLimitTier: nil
+            ))
+            ClaudeCredentialStore.isBootstrapCompleted = true
+            ClaudeCredentialStore.unlinkLegacyOverride = { _ in throw POSIXError(.EPERM) }
+            let failed = ClaudeCredentialStore.resetBootstrap()
+            #expect(failed.keychainDeletedOrAbsent == true)
+            #expect(failed.legacyDeletedOrAbsent == false)
+            #expect(failed.isSuccess == false)
+            #expect(ClaudeCredentialStore.isBootstrapCompleted == true)
+        }
+    }
+
     @Test("reinstall with empty Keychain and no legacy clears bootstrap on read")
     func reinstallMissingCacheClearsBootstrap() throws {
         try withHarness { _ in

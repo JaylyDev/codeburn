@@ -21,6 +21,42 @@ enum SafeFile {
     /// from exhausting memory in the Swift process.
     static let defaultReadLimit = 8 * 1024 * 1024
 
+    /// Open the existing regular file with O_NOFOLLOW, fchmod 0600, and
+    /// fstat-verify the mode. Used when leftover credential JSON cannot be
+    /// unlinked after a verified Keychain write.
+    static func tightenToOwnerReadWrite(at path: String) throws {
+        var linkInfo = stat()
+        guard lstat(path, &linkInfo) == 0 else {
+            throw Error.readFailed(path, errno)
+        }
+        if (linkInfo.st_mode & S_IFMT) == S_IFLNK {
+            throw Error.symlinkDetected(path)
+        }
+        let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW)
+        guard fd >= 0 else {
+            throw Error.readFailed(path, errno)
+        }
+        defer { Darwin.close(fd) }
+        var opened = stat()
+        guard fstat(fd, &opened) == 0 else {
+            throw Error.readFailed(path, errno)
+        }
+        guard (opened.st_mode & S_IFMT) == S_IFREG else {
+            throw SecureReadError.notRegularFile(path)
+        }
+        if fchmod(fd, 0o600) != 0 {
+            throw SecureReadError.chmodFailed(path, errno)
+        }
+        var verified = stat()
+        guard fstat(fd, &verified) == 0 else {
+            throw Error.readFailed(path, errno)
+        }
+        let mode = verified.st_mode & 0o777
+        guard mode == 0o600 else {
+            throw SecureReadError.modeVerifyFailed(path, mode)
+        }
+    }
+
     /// Refuses to follow symlinks and writes atomically via a tmp file + rename. `mode` is the
     /// final file permission (0o600 by default so cache files stay user-private).
     static func write(_ data: Data, to path: String, mode: mode_t = 0o600) throws {
@@ -167,10 +203,11 @@ enum SafeFile {
         var data = Data()
         data.reserveCapacity(max(size, 0))
         var chunk = [UInt8](repeating: 0, count: 4096)
-        while data.count < maxBytes {
+        let limit = maxBytes + 1
+        while data.count < limit {
             let n = chunk.withUnsafeMutableBytes { buffer -> Int in
                 guard let base = buffer.baseAddress else { return 0 }
-                return Darwin.read(fd, base, buffer.count)
+                return Darwin.read(fd, base, min(buffer.count, limit - data.count))
             }
             guard n >= 0 else {
                 throw Error.readFailed(path, errno)

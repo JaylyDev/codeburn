@@ -57,6 +57,7 @@ enum ClaudeCredentialStore {
         lastCacheDeleteResult = nil
         lastLegacyCleanupFailed = false
         unlinkLegacyOverride = nil
+        tightenLegacyOverride = nil
         lock.withLock { memoryCache = nil }
     }
 
@@ -137,7 +138,7 @@ enum ClaudeCredentialStore {
         lastCacheDeleteResult = result
         // A failed Keychain delete must not pretend the provider is disconnected.
         // Clearing the flag hides Disconnect and orphans the remaining item.
-        if result.keychainDeletedOrAbsent {
+        if result.isSuccess {
             isBootstrapCompleted = false
         }
         return result
@@ -157,6 +158,7 @@ enum ClaudeCredentialStore {
     nonisolated(unsafe) static var lastLegacyCleanupFailed = false
     /// Test seam: force legacy unlink to throw so we can assert the 0600 repair.
     nonisolated(unsafe) static var unlinkLegacyOverride: ((URL) throws -> Void)?
+    nonisolated(unsafe) static var tightenLegacyOverride: ((URL) throws -> Void)?
 
 
     // MARK: - Public API
@@ -505,8 +507,15 @@ enum ClaudeCredentialStore {
             lastLegacyCleanupFailed = false
         } catch {
             lastLegacyCleanupFailed = true
-            // Verified Keychain item exists — leftover plaintext must not stay 0644.
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            do {
+                if let tightenLegacyOverride {
+                    try tightenLegacyOverride(url)
+                } else {
+                    try SafeFile.tightenToOwnerReadWrite(at: url.path)
+                }
+            } catch {
+                // Still leftover, and 0600 is unproven. Retry signal stays set.
+            }
         }
     }
 
@@ -523,7 +532,11 @@ enum ClaudeCredentialStore {
         let url = cacheFileURL()
         if FileManager.default.fileExists(atPath: url.path) {
             do {
-                try FileManager.default.removeItem(at: url)
+                if let unlinkLegacyOverride {
+                    try unlinkLegacyOverride(url)
+                } else {
+                    try FileManager.default.removeItem(at: url)
+                }
             } catch {
                 legacyOK = false
             }
