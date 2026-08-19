@@ -10,11 +10,11 @@ import {
   type DailyEntry,
 } from '../src/daily-cache.js'
 
-// The last SHIPPED daily-cache version before the Grok accounting change, so
-// this models the real 17 -> 19 upgrade path users hit. (v18 existed only as an
-// unreleased draft.) Anything below MIN_SUPPORTED_VERSION is untrusted, which
-// is what makes the re-derivation global rather than Grok-scoped.
-const PRE_FIX_DAILY_VERSION = 17
+// The last SHIPPED daily-cache version before the Codex session_meta model fix,
+// so this models the real 19 -> 20 upgrade path users hit. Anything below
+// MIN_SUPPORTED_VERSION is untrusted, which is what makes the re-derivation
+// global rather than scoped to the provider the bump exists for.
+const PRE_FIX_DAILY_VERSION = 19
 const cacheRoot = join(tmpdir(), `codeburn-daily-rederive-${process.pid}-${Date.now()}`)
 
 function day(date: string, cost: number): DailyEntry {
@@ -67,10 +67,9 @@ afterEach(async () => {
   await rm(cacheRoot, { recursive: true, force: true })
 })
 
-// Raising MIN_SUPPORTED_VERSION re-derives EVERY day from EVERY provider, not
-// only Grok - the daily cache has no per-provider invalidation. A Grok day is
-// used here because Grok is the provider whose totals the bump exists to
-// correct; the mechanism under test is version-wide.
+// Raising MIN_SUPPORTED_VERSION re-derives EVERY day from EVERY provider - the
+// daily cache has no per-provider invalidation. Which provider the seeded day
+// belongs to is incidental; the mechanism under test is version-wide.
 describe('daily-cache re-derivation on a DAILY_CACHE_VERSION bump', () => {
   it('re-derives a day from a below-minimum v17 cache while preserving the old file', async () => {
     const date = toDateString(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000))
