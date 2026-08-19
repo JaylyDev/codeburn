@@ -26,10 +26,41 @@ import type { SessionAttributionRecord } from '../yield.js'
  */
 export const MAX_PER_PUSH = 50_000
 
+/**
+ * How long a copilot session must be quiet before its calls may be synced.
+ *
+ * The ledger is append-once and the OTLP span id derives from the same
+ * deduplication key, so the whole pipeline assumes a served call is immutable:
+ * same key, same value, forever. Copilot's serve-time reconciliation is the
+ * first producer that breaks that (#988). Three ways, all within one session:
+ * a shutdown residual SHRINKS as the store rows that cover it land; a rollup
+ * is DROPPED once rows cover its leg; and an unpaired store row becomes
+ * supplementary once its journal call appears. Sent once at an intermediate
+ * state, the receiver keeps that state forever AND receives what supersedes
+ * it — a permanent over-count that no later push can correct. Local reports
+ * re-reconcile on every pass and are unaffected; this is only about what
+ * leaves the machine.
+ *
+ * Every input to that reconciliation is written DURING the session: rows as
+ * each request completes, the rollup at shutdown. So a session with no
+ * activity for a day cannot reconcile any further, and its first send is also
+ * its last word. A day is far longer than any session and absorbs clock skew,
+ * at the cost of copilot usage reaching a receiver up to a day late.
+ *
+ * This is a holdback, never a drop: the calls are simply not yet unsent-
+ * eligible, and the next push after the window picks them up.
+ */
+export const RECONCILE_SETTLE_MS = 24 * 60 * 60 * 1000
+
+/** Providers whose SERVED calls can change value or role between passes. */
+const RECONCILING_PROVIDERS = new Set(['copilot'])
+
 /** Flatten parsed projects into individual calls and filter out already-sent ones. */
-export function collectUnsentCalls(projects: ProjectSummary[]): {
+export function collectUnsentCalls(projects: ProjectSummary[], now: number = Date.now()): {
   allCalls: CallWithSession[]
   unsent: CallWithSession[]
+  /** Not yet sent because their session is still reconciling. Retried later. */
+  held: CallWithSession[]
 } {
   const allCalls: CallWithSession[] = []
   for (const project of projects) {
@@ -46,9 +77,24 @@ export function collectUnsentCalls(projects: ProjectSummary[]): {
     }
   }
 
+  // A session settles as a whole: holding only the residual would still let a
+  // row that is about to change ITS value through, and holding only the rows
+  // would still ship a rollup that is about to be dropped.
+  const settleCutoff = now - RECONCILE_SETTLE_MS
+  const unsettled = new Set<string>()
+  for (const c of allCalls) {
+    if (!RECONCILING_PROVIDERS.has(c.call.provider)) continue
+    const ts = Date.parse(c.call.timestamp)
+    // An unparseable stamp cannot be shown to be settled, so it is not.
+    if (isNaN(ts) || ts > settleCutoff) unsettled.add(`${c.project}\u0000${c.sessionId}`)
+  }
+
+  const isHeld = (c: CallWithSession): boolean =>
+    RECONCILING_PROVIDERS.has(c.call.provider) && unsettled.has(`${c.project}\u0000${c.sessionId}`)
+
   const sent = ledgerKeySet()
-  const unsent = allCalls.filter(c => !sent.has(c.call.deduplicationKey))
-  return { allCalls, unsent }
+  const pending = allCalls.filter(c => !sent.has(c.call.deduplicationKey))
+  return { allCalls, unsent: pending.filter(c => !isHeld(c)), held: pending.filter(isHeld) }
 }
 
 export type PushOutcome = 'complete' | 'auth-rejected' | 'rate-limited' | 'server-error'

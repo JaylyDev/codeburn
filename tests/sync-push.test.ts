@@ -123,6 +123,67 @@ describe('collectUnsentCalls', () => {
     expect(allCalls[0]!.sessionId).toBe('s1')
   })
 
+  // #988: copilot is the only producer whose SERVED calls change between
+  // passes — a residual shrinks as store rows land, a rollup is dropped once
+  // rows cover its leg, an unpaired row becomes supplementary when its journal
+  // call appears. The ledger is append-once and the span id derives from the
+  // same key, so a value sent at an intermediate state is a permanent
+  // receiver-side over-count. Hold the session until it can no longer change.
+  it('holds a copilot session whose reconciliation can still change', async () => {
+    const { collectUnsentCalls, RECONCILE_SETTLE_MS } = await import('../src/sync/push.js')
+
+    const now = Date.parse('2026-07-10T12:00:00.000Z')
+    const at = (msAgo: number) => new Date(now - msAgo).toISOString()
+    const copilotCall = (key: string, ts: string) => ({ ...makeCall(key), provider: 'copilot', timestamp: ts })
+
+    const projects = [{
+      project: 'p',
+      sessions: [
+        {
+          sessionId: 'fresh',
+          turns: [{ assistantCalls: [
+            copilotCall('copilot-store:fresh:1:aa', at(RECONCILE_SETTLE_MS * 2)),
+            copilotCall('copilot:fresh:shutdown-residual:m:1', at(60_000)),
+          ] }],
+        },
+        {
+          sessionId: 'settled',
+          turns: [{ assistantCalls: [copilotCall('copilot:settled:shutdown:m:1', at(RECONCILE_SETTLE_MS * 2))] }],
+        },
+      ],
+    }] as unknown as ProjectSummary[]
+
+    const { allCalls, unsent, held } = collectUnsentCalls(projects, now)
+    expect(allCalls).toHaveLength(3)
+    // The whole unsettled session is held, including its old row: holding only
+    // the residual would still ship a row whose PAIRING can still flip.
+    expect(held.map(h => h.call.deduplicationKey).sort())
+      .toEqual(['copilot-store:fresh:1:aa', 'copilot:fresh:shutdown-residual:m:1'])
+    expect(unsent.map(u => u.call.deduplicationKey)).toEqual(['copilot:settled:shutdown:m:1'])
+
+    // A holdback, not a drop: once the window passes it pushes normally.
+    const later = collectUnsentCalls(projects, now + RECONCILE_SETTLE_MS)
+    expect(later.held).toHaveLength(0)
+    expect(later.unsent).toHaveLength(3)
+  })
+
+  it('never holds a provider whose served calls are immutable', async () => {
+    const { collectUnsentCalls } = await import('../src/sync/push.js')
+
+    const now = Date.parse('2026-07-10T12:00:00.000Z')
+    const projects = [{
+      project: 'p',
+      sessions: [{
+        sessionId: 's1',
+        turns: [{ assistantCalls: [{ ...makeCall('k1'), timestamp: new Date(now - 1000).toISOString() }] }],
+      }],
+    }] as unknown as ProjectSummary[]
+
+    const { unsent, held } = collectUnsentCalls(projects, now)
+    expect(held).toHaveLength(0)
+    expect(unsent).toHaveLength(1)
+  })
+
   it('filters out calls already in the ledger', async () => {
     const { collectUnsentCalls } = await import('../src/sync/push.js')
     const { writeLedger } = await import('../src/sync/ledger.js')

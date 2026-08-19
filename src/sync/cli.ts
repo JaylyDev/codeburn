@@ -277,7 +277,7 @@ export function registerSyncCommands(program: Command): void {
         const projects = await parseAllSessions(range)
 
         // Flatten + filter against sent-ledger
-        const { allCalls, unsent } = collectUnsentCalls(projects)
+        const { allCalls, unsent, held } = collectUnsentCalls(projects)
 
         // Attribution records (opt-in): session→commit correlation computed
         // locally from the same parsed projects. Reuses the yield engine.
@@ -294,7 +294,10 @@ export function registerSyncCommands(program: Command): void {
         if (opts.dryRun) {
           const toPushCount = Math.min(unsent.length, MAX_PER_PUSH)
           const cost = unsent.slice(0, MAX_PER_PUSH).reduce((s, c) => s + c.call.costUSD, 0)
-          process.stderr.write(`[dry-run] Window: ${opts.since} — ${allCalls.length} calls total, ${allCalls.length - unsent.length} already synced\n`)
+          process.stderr.write(`[dry-run] Window: ${opts.since} — ${allCalls.length} calls total, ${allCalls.length - unsent.length - held.length} already synced\n`)
+          if (held.length > 0) {
+            process.stderr.write(`[dry-run] ${held.length} calls held: their session is still reconciling and its values can still change (#988). They push once it settles.\n`)
+          }
           process.stderr.write(`[dry-run] Would push ${toPushCount} calls ($${cost.toFixed(2)}) to ${config.baseUrl}${config.tracesPath}\n`)
           if (unsent.length > MAX_PER_PUSH) {
             process.stderr.write(`[dry-run] ${unsent.length - MAX_PER_PUSH} more calls exceed the ${MAX_PER_PUSH} safety limit — a second push would be needed\n`)
@@ -312,7 +315,9 @@ export function registerSyncCommands(program: Command): void {
         }
 
         if (unsent.length === 0 && attributionUnsent.length === 0) {
-          process.stderr.write(`Nothing to push (${allCalls.length} calls already synced).\n`)
+          process.stderr.write(held.length > 0
+            ? `Nothing to push yet (${allCalls.length - held.length} calls already synced, ${held.length} held while their session is still reconciling).\n`
+            : `Nothing to push (${allCalls.length} calls already synced).\n`)
           updateLastSync()
           return
         }

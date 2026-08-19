@@ -153,6 +153,9 @@ A: No. You run `codeburn sync push` when you want. A future version may offer op
 **Q: What if I push the same data twice?**
 A: Safe. A local sent-ledger tracks what's been sent. Re-pushing the same window doesn't create duplicates.
 
+**Q: Why is today's Copilot usage missing from my dashboard?**
+A: Copilot input/cache usage is reconciled locally between the per-request `session-store.db` rows and the `session.shutdown` rollups, and that reconciliation keeps changing while a session is live — a rollup residual shrinks as the rows covering it land, and a row that looked like a crash-only request becomes supplementary once its journal entry appears. The sent-ledger is append-once, so a value sent mid-reconciliation could never be corrected at the receiver. A Copilot session is therefore held back until it has been quiet for 24 hours, then pushed once, final. Nothing is dropped; `--dry-run` reports how many calls are held.
+
 **Q: What if I'm offline for a week?**
 A: Next push catches up. The default window is 7 days; use `--since 30d` or `--since all` (up to 6 months) for longer gaps. A push runs to completion regardless of size — server rate limits (429) are waited out automatically.
 
