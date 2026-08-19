@@ -188,6 +188,56 @@ describe('aggregateModels', () => {
     expect(rows[0]!.cacheReadTokens).toBe(4000) // not 8000
   })
 
+  it('falls back from a provider local table miss to the global short name', async () => {
+    const rows = await aggregateModels([makeProject([
+      makeTurn('feature', [makeCall({ provider: 'cursor-agent', model: 'gpt-5.6-sol', costUSD: 2.5 })]),
+    ])])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.modelDisplayName).toBe('GPT-5.6 Sol (est.)')
+    expect(rows[0]!.model).toBe('gpt-5.6-sol')
+  })
+
+  it('resolves Fireworks path-form ids through the global table', async () => {
+    const rows = await aggregateModels([makeProject([
+      makeTurn('feature', [makeCall({ provider: 'cline', model: 'accounts/fireworks/models/kimi-k2p6', costUSD: 1 })]),
+    ])])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.modelDisplayName).toBe('Kimi K2.6')
+    expect(rows[0]!.model).toBe('accounts/fireworks/models/kimi-k2p6')
+  })
+
+  it('merges two raw ids that resolve to the same provider + display name', async () => {
+    const rows = await aggregateModels([makeProject([
+      makeTurn('testing', [makeCall({
+        provider: 'cline-cli', model: 'accounts/fireworks/models/glm-5p2',
+        input: 800, output: 67, costUSD: 0.246,
+      })]),
+      makeTurn('conversation', [makeCall({
+        provider: 'cline-cli', model: 'GLM-5.2',
+        input: 15, output: 1, costUSD: 0.019,
+      })]),
+    ])])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.provider).toBe('cline-cli')
+    expect(rows[0]!.modelDisplayName).toBe('GLM-5.2')
+    expect(rows[0]!.inputTokens).toBe(815)
+    expect(rows[0]!.outputTokens).toBe(68)
+    expect(rows[0]!.costUSD).toBeCloseTo(0.265, 6)
+    expect(rows[0]!.calls).toBe(2)
+    expect(rows[0]!.topCategory).toBe('testing')
+    expect(rows[0]!.topCategoryShare).toBeCloseTo(0.246 / 0.265, 3)
+  })
+
+  it('does not merge the same display name across providers', async () => {
+    const rows = await aggregateModels([makeProject([
+      makeTurn('feature', [makeCall({ provider: 'cline-cli', model: 'glm-5p2', costUSD: 1 })]),
+      makeTurn('feature', [makeCall({ provider: 'hermes', model: 'glm-5p2', costUSD: 2 })]),
+    ])])
+    expect(rows).toHaveLength(2)
+    expect(new Set(rows.map(r => r.provider))).toEqual(new Set(['cline-cli', 'hermes']))
+    expect(rows.every(r => r.modelDisplayName === 'GLM-5.2')).toBe(true)
+  })
+
   it('reports the dominant task type with its cost share in default mode', async () => {
     const project = makeProject([
       makeTurn('feature', [makeCall({ provider: 'claude', model: 'claude-sonnet-4-6', costUSD: 6.0, input: 100, output: 20 })]),

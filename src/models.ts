@@ -1105,6 +1105,14 @@ export function getShortModelName(model: string): string {
   return shortModelName(model, new Set())
 }
 
+/// Provider-first display name. Local labels win (Cursor estimated suffixes,
+/// provider tables that intentionally override the global map). If the provider
+/// echoed the raw id, it missed — fall back to the global resolver instead of
+/// showing `gpt-5.6-sol` / `accounts/fireworks/models/kimi-k2p6`.
+export function fallbackRawModelDisplayName(localLabel: string, rawModel: string): string {
+  return localLabel === rawModel ? getShortModelName(rawModel) : localLabel
+}
+
 function shortModelName(model: string, seen: Set<string>): string {
   if (autoModelNames[model]) return autoModelNames[model]
   if (seen.has(model)) {

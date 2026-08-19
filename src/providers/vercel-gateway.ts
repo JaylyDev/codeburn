@@ -1,3 +1,4 @@
+import { getShortModelName } from '../models.js'
 import type { DateRange } from '../types.js'
 import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 import { fetchWithTimeout } from '../fetch-utils.js'
@@ -124,7 +125,7 @@ export const vercelGateway: Provider = {
 
   modelDisplayName(model: string): string {
     const slash = model.indexOf('/')
-    return slash >= 0 ? model.slice(slash + 1) : model
+    return getShortModelName(slash >= 0 ? model.slice(slash + 1) : model)
   },
 
   toolDisplayName(rawTool: string): string {

@@ -3,7 +3,7 @@ import stripAnsi from 'strip-ansi'
 
 import { codexCredits } from './codex-credits.js'
 import { formatCost, formatTokens } from './format.js'
-import { sanitizeModelForDisplay } from './models.js'
+import { fallbackRawModelDisplayName, getShortModelName, sanitizeModelForDisplay } from './models.js'
 import { getProvider } from './providers/index.js'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 
@@ -73,9 +73,10 @@ function bucketKey(provider: string, model: string, category: TaskCategory | nul
 }
 
 /// Walks every parsed turn, attributes each assistant call to a
-/// (provider, model, category, agent) bucket, and returns rows keyed by
-/// (provider, model) by default, (provider, model, category) under `byTask`, or
-/// (provider, model, agent) under `byAgent`.
+/// (provider, raw-model, category, agent) bucket, then merges buckets that
+/// resolve to the same provider + display name. Returned rows are keyed by
+/// (provider, display name) by default, plus category under `byTask` or agent
+/// under `byAgent`.
 ///
 /// Default view: rows sorted by cost descending.
 /// byTask / byAgent view: rows grouped by (provider, model) so the renderer can
@@ -155,74 +156,122 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
     const entry = {
       displayName: p?.displayName ?? name,
       formatModel: p
-        ? (m: string) => sanitizeModelForDisplay(p.modelDisplayName(m))
-        : sanitizeModelForDisplay,
+        ? (m: string) => sanitizeModelForDisplay(fallbackRawModelDisplayName(p.modelDisplayName(m), m))
+        : (m: string) => sanitizeModelForDisplay(getShortModelName(m)),
     }
     providerCache.set(name, entry)
     return entry
   }
 
-  const rows: ModelReportRow[] = []
+  const rowsByKey = new Map<string, ModelReportRow>()
+  const foldedCategoryCost = new Map<string, Map<CategoryKey, number>>()
+  const foldedTotalCost = new Map<string, number>()
+  const foldedRawSeen = new Set<string>()
+
   for (const bucket of buckets.values()) {
     const meta = await resolveProvider(bucket.provider)
+    const modelDisplayName = meta.formatModel(bucket.model)
+    const resolvedKey = bucketKey(bucket.provider, modelDisplayName, bucket.category, bucket.agentType)
+    const displayModelKey = `${bucket.provider} ${modelDisplayName}`
     const total = bucket.inputTokens + bucket.outputTokens + bucket.cacheWriteTokens + bucket.cacheReadTokens
-    const row: ModelReportRow = {
-      provider: bucket.provider,
-      providerDisplayName: meta.displayName,
-      model: bucket.model,
-      modelDisplayName: meta.formatModel(bucket.model),
-      category: bucket.category,
-      agentType: bucket.agentType,
-      inputTokens: bucket.inputTokens,
-      outputTokens: bucket.outputTokens,
-      cacheWriteTokens: bucket.cacheWriteTokens,
-      cacheReadTokens: bucket.cacheReadTokens,
-      totalTokens: total,
-      costUSD: bucket.costUSD,
-      savingsUSD: bucket.savingsUSD,
-      savingsBaselineModel: bucket.savingsBaselineModel,
-      calls: bucket.calls,
-      // outputTokens already includes reasoning (folded in above), and for Codex
-      // inputTokens is non-cached with cacheReadTokens holding cached input, which
-      // is exactly what the credit rates expect.
-      credits: bucket.provider === 'codex'
-        ? codexCredits(bucket.model, {
-            inputTokens: bucket.inputTokens,
-            cachedReadTokens: bucket.cacheReadTokens,
-            outputTokens: bucket.outputTokens,
-          })
-        : null,
+    // Credits are per raw id (aliases can have different rates). Sum only when
+    // every contributing bucket has a known rate; otherwise the merged row is null.
+    const bucketCredits = bucket.provider === 'codex'
+      ? codexCredits(bucket.model, {
+          inputTokens: bucket.inputTokens,
+          cachedReadTokens: bucket.cacheReadTokens,
+          outputTokens: bucket.outputTokens,
+        })
+      : null
+
+    const existing = rowsByKey.get(resolvedKey)
+    if (existing) {
+      existing.inputTokens += bucket.inputTokens
+      existing.outputTokens += bucket.outputTokens
+      existing.cacheWriteTokens += bucket.cacheWriteTokens
+      existing.cacheReadTokens += bucket.cacheReadTokens
+      existing.totalTokens += total
+      existing.costUSD += bucket.costUSD
+      existing.savingsUSD += bucket.savingsUSD
+      existing.calls += bucket.calls
+      if (bucket.model < existing.model) existing.model = bucket.model
+      if (existing.savingsBaselineModel && bucket.savingsBaselineModel
+        && existing.savingsBaselineModel !== bucket.savingsBaselineModel) {
+        existing.savingsBaselineModel = ''
+      } else if (!existing.savingsBaselineModel && bucket.savingsBaselineModel) {
+        existing.savingsBaselineModel = bucket.savingsBaselineModel
+      }
+      if (existing.credits === null || bucketCredits === null) existing.credits = null
+      else existing.credits += bucketCredits
+    } else {
+      rowsByKey.set(resolvedKey, {
+        provider: bucket.provider,
+        providerDisplayName: meta.displayName,
+        model: bucket.model,
+        modelDisplayName,
+        category: bucket.category,
+        agentType: bucket.agentType,
+        inputTokens: bucket.inputTokens,
+        outputTokens: bucket.outputTokens,
+        cacheWriteTokens: bucket.cacheWriteTokens,
+        cacheReadTokens: bucket.cacheReadTokens,
+        totalTokens: total,
+        costUSD: bucket.costUSD,
+        savingsUSD: bucket.savingsUSD,
+        savingsBaselineModel: bucket.savingsBaselineModel,
+        calls: bucket.calls,
+        credits: bucketCredits,
+      })
     }
 
-    if (!opts.byTask && !opts.byAgent) {
-      const perCat = perModelCategoryCost.get(`${bucket.provider} ${bucket.model}`)
-      if (perCat && perCat.size > 0) {
-        let topCat: TaskCategory = 'general'
-        let topCost = -1
-        let totalCost = 0
-        for (const [cat, cost] of perCat.entries()) {
-          totalCost += cost
-          if (cost > topCost) {
-            topCost = cost
-            topCat = cat
-          }
+    const rawKey = `${bucket.provider} ${bucket.model}`
+    if (!foldedRawSeen.has(rawKey)) {
+      foldedRawSeen.add(rawKey)
+      const rawCat = perModelCategoryCost.get(rawKey)
+      if (rawCat) {
+        let folded = foldedCategoryCost.get(displayModelKey)
+        if (!folded) {
+          folded = new Map()
+          foldedCategoryCost.set(displayModelKey, folded)
         }
-        row.topCategory = topCat
-        row.topCategoryCost = topCost
-        row.topCategoryShare = totalCost > 0 ? topCost / totalCost : 0
+        for (const [cat, cost] of rawCat) {
+          folded.set(cat, (folded.get(cat) ?? 0) + cost)
+        }
+      }
+      foldedTotalCost.set(
+        displayModelKey,
+        (foldedTotalCost.get(displayModelKey) ?? 0) + (perModelTotalCost.get(rawKey) ?? 0),
+      )
+    }
+  }
+
+  const rows = [...rowsByKey.values()]
+  for (const row of rows) {
+    if (opts.byTask || opts.byAgent) continue
+    const perCat = foldedCategoryCost.get(`${row.provider} ${row.modelDisplayName}`)
+    if (!perCat || perCat.size === 0) continue
+    let topCat: TaskCategory = 'general'
+    let topCost = -1
+    let totalCost = 0
+    for (const [cat, cost] of perCat.entries()) {
+      totalCost += cost
+      if (cost > topCost) {
+        topCost = cost
+        topCat = cat
       }
     }
-
-    rows.push(row)
+    row.topCategory = topCat
+    row.topCategoryCost = topCost
+    row.topCategoryShare = totalCost > 0 ? topCost / totalCost : 0
   }
 
   if (opts.byTask || opts.byAgent) {
     rows.sort((a, b) => {
-      const aTotal = perModelTotalCost.get(`${a.provider} ${a.model}`) ?? 0
-      const bTotal = perModelTotalCost.get(`${b.provider} ${b.model}`) ?? 0
+      const aTotal = foldedTotalCost.get(`${a.provider} ${a.modelDisplayName}`) ?? 0
+      const bTotal = foldedTotalCost.get(`${b.provider} ${b.modelDisplayName}`) ?? 0
       if (aTotal !== bTotal) return bTotal - aTotal
       if (a.provider !== b.provider) return a.provider.localeCompare(b.provider)
-      if (a.model !== b.model) return a.model.localeCompare(b.model)
+      if (a.modelDisplayName !== b.modelDisplayName) return a.modelDisplayName.localeCompare(b.modelDisplayName)
       return (b.costUSD + b.savingsUSD) - (a.costUSD + a.savingsUSD)
     })
   } else {
@@ -482,7 +531,7 @@ export function renderTable(
   const rowEntries: RowCells[] = []
   let prevProviderModel = ''
   for (const row of rows) {
-    const groupKey = `${row.provider} ${row.model}`
+    const groupKey = `${row.provider} ${row.modelDisplayName}`
     const isNewGroup = !grouped || groupKey !== prevProviderModel
     prevProviderModel = groupKey
     const allCells = defaultColumns(byTask, byAgent, showSaved).map(col => {

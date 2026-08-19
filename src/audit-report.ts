@@ -1,4 +1,4 @@
-import { getModelCosts, sanitizeModelForDisplay, type ModelCosts } from './models.js'
+import { fallbackRawModelDisplayName, getModelCosts, getShortModelName, sanitizeModelForDisplay, type ModelCosts } from './models.js'
 import { getProvider } from './providers/index.js'
 import { formatCost, formatTokens } from './format.js'
 import { renderTable, type TableColumn } from './text-table.js'
@@ -112,8 +112,8 @@ export async function aggregateAudit(projects: ProjectSummary[]): Promise<AuditR
     const entry = {
       displayName: p?.displayName ?? name,
       formatModel: p
-        ? (m: string) => sanitizeModelForDisplay(p.modelDisplayName(m))
-        : sanitizeModelForDisplay,
+        ? (m: string) => sanitizeModelForDisplay(fallbackRawModelDisplayName(p.modelDisplayName(m), m))
+        : (m: string) => sanitizeModelForDisplay(getShortModelName(m)),
     }
     providerCache.set(name, entry)
     return entry
