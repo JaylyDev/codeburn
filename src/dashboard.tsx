@@ -1,7 +1,8 @@
 import { homedir } from 'os'
+import { EventEmitter } from 'node:events'
 
 import React, { Fragment, useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
-import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, type DOMElement } from 'ink'
+import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, type DOMElement, type Instance, type RenderOptions } from 'ink'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost, formatTokens, markEstimated, carriedCostNote } from './format.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
@@ -31,6 +32,138 @@ export type DailyActivityRow = {
 
 export const DAILY_ACTIVITY_PAGE_SIZE = 10
 export const INTERACTIVE_RENDER_OPTIONS = { alternateScreen: true } as const
+export const RESIZE_DEBOUNCE_MS = 150
+
+export type TerminalSize = { columns: number; rows: number }
+export type DebouncedResizeStream = NodeJS.WriteStream & {
+  dispose(): void
+  onSettledResize(listener: (size: TerminalSize) => void): () => void
+}
+
+function normalizeTerminalDimension(value: number | undefined, fallback: number): number {
+  return Number.isFinite(value) && value! > 0 ? Math.floor(value!) : fallback
+}
+
+function terminalSizeOf(source: NodeJS.WriteStream): TerminalSize {
+  return {
+    columns: normalizeTerminalDimension(source.columns, 80),
+    rows: normalizeTerminalDimension(source.rows, 24),
+  }
+}
+
+const RESIZE_LISTENER_METHODS = new Set<PropertyKey>([
+  'addListener', 'on', 'once', 'prependListener', 'prependOnceListener', 'off', 'removeListener',
+])
+
+export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs: number): DebouncedResizeStream {
+  let resizeTimer: ReturnType<typeof setTimeout> | undefined
+  let disposed = false
+  let { columns, rows } = terminalSizeOf(source)
+  const resizeEvents = new EventEmitter()
+  const settledResizeListeners = new Set<(size: TerminalSize) => void>()
+
+  const resize = () => {
+    if (disposed) return
+    if (resizeTimer) clearTimeout(resizeTimer)
+    resizeTimer = setTimeout(() => {
+      resizeTimer = undefined
+      if (disposed) return
+      const next = terminalSizeOf(source)
+      const changed = next.columns !== columns || next.rows !== rows
+      columns = next.columns
+      rows = next.rows
+      if (!changed) return
+      // Rerender first so the settled view owns the first paint at the new
+      // size; then notify Ink/useWindowSize. Writes are never intercepted, so
+      // a mid-burst state update still reaches the terminal even when net
+      // size is unchanged.
+      for (const listener of [...settledResizeListeners]) listener(next)
+      resizeEvents.emit('resize')
+    }, delayMs)
+  }
+  source.on('resize', resize)
+
+  const dispose = () => {
+    if (disposed) return
+    disposed = true
+    source.off('resize', resize)
+    if (resizeTimer) clearTimeout(resizeTimer)
+    resizeTimer = undefined
+    resizeEvents.removeAllListeners()
+    settledResizeListeners.clear()
+  }
+
+  const stream = new Proxy(source as DebouncedResizeStream, {
+    get(target, property) {
+      if (property === 'dispose') return dispose
+      if (property === 'onSettledResize') {
+        return (listener: (size: TerminalSize) => void) => {
+          if (disposed) return () => {}
+          settledResizeListeners.add(listener)
+          return () => settledResizeListeners.delete(listener)
+        }
+      }
+      if (property === 'columns') return columns
+      if (property === 'rows') return rows
+      if (RESIZE_LISTENER_METHODS.has(property)) {
+        return (event: string | symbol, ...args: unknown[]) => {
+          if (event === 'resize') {
+            if (!disposed) {
+              Reflect.apply(Reflect.get(resizeEvents, property) as (...args: unknown[]) => unknown, resizeEvents, [event, ...args])
+            }
+            return stream
+          }
+          Reflect.apply(Reflect.get(target, property, target) as (...args: unknown[]) => unknown, target, [event, ...args])
+          return stream
+        }
+      }
+      const value = Reflect.get(target, property, target)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+  return stream
+}
+
+function DisposeOnUnmount({ dispose, children }: { dispose: () => void; children: React.ReactNode }) {
+  useLayoutEffect(() => dispose, [dispose])
+  return children
+}
+
+export type DebouncedInteractiveInstance = Instance & {
+  dispose(): void
+  stdout: DebouncedResizeStream
+}
+
+export function renderDebouncedInteractive(
+  source: NodeJS.WriteStream,
+  view: (size: TerminalSize) => React.ReactElement,
+  options: Omit<RenderOptions, 'stdout'> = INTERACTIVE_RENDER_OPTIONS,
+): DebouncedInteractiveInstance {
+  const stdout = createDebouncedResizeStream(source, RESIZE_DEBOUNCE_MS)
+  let size = { columns: stdout.columns, rows: stdout.rows }
+  let unsubscribe = () => {}
+  let disposed = false
+  const dispose = () => {
+    if (disposed) return
+    disposed = true
+    unsubscribe()
+    stdout.dispose()
+  }
+  const dashboard = () => <DisposeOnUnmount dispose={dispose}>{view(size)}</DisposeOnUnmount>
+  let app: Instance
+  try {
+    app = render(dashboard(), { ...options, stdout })
+  } catch (error) {
+    dispose()
+    throw error
+  }
+  unsubscribe = stdout.onSettledResize(nextSize => {
+    if (disposed) return
+    size = nextSize
+    app.rerender(dashboard())
+  })
+  return Object.assign(app, { dispose, stdout })
+}
 
 export function getDailyActivityPageSize(columnCount: 1 | 2 | 3, projectRows: number, activityRows: number, dayMode = false): number {
   if (dayMode) return 1
@@ -1749,23 +1882,13 @@ export async function renderDashboard(period: Period = 'week', provider: string 
   const label = initialDay ? formatDayRangeLabel(initialDay) : customRangeLabel
   patchStdoutForWindows()
   if (isTTY) {
-    let windowColumns = process.stdout.columns
-    const dashboard = () => (
-      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={period} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={windowColumns} />
-    )
-    const app = render(
-      dashboard(),
-      INTERACTIVE_RENDER_OPTIONS,
-    )
-    const resize = () => {
-      windowColumns = process.stdout.columns
-      app.rerender(dashboard())
-    }
-    process.stdout.prependListener('resize', resize)
+    const app = renderDebouncedInteractive(process.stdout, ({ columns }) => (
+      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={period} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={columns} />
+    ))
     try {
       await app.waitUntilExit()
     } finally {
-      process.stdout.off('resize', resize)
+      app.dispose()
     }
   } else {
     const { unmount } = render(<StaticDashboard projects={filteredProjects} period={period} activeProvider={provider} planUsages={planUsages} label={label} dayMode={initialDay != null} durable={initialDurable} />, { patchConsole: false })
