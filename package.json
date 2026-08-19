@@ -8,7 +8,8 @@
     "codeburn": "dist/cli.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "!dist/parse-worker.js.map"
   ],
   "scripts": {
     "bundle-litellm": "node scripts/bundle-litellm.mjs",
