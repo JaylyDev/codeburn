@@ -1,4 +1,5 @@
 import { readdir, stat } from 'fs/promises'
+import { existsSync, readFileSync, statSync } from 'fs'
 import { basename, dirname, join } from 'path'
 import { homedir } from 'os'
 
@@ -92,23 +93,72 @@ function displayProjectForProfile(profile: string): string {
   return profile === 'default' ? 'hermes' : sanitizeProject(profile)
 }
 
+function stripCodeRegions(text: string): string {
+  return text
+    .replace(/^[ \t]{4,}.*$/gm, ' ')
+    .replace(/(`{3,}|~{3,})[^\n]*\n[\s\S]*?\1/g, ' ')
+    .replace(/`[^`]*`/g, ' ')
+}
+
+function githubOwnerRepoFromRoot(repoRoot: string): { owner: string; repo: string } | null {
+  try {
+    let gitDir = join(repoRoot, '.git')
+    if (!existsSync(gitDir)) return null
+    const st = statSyncSafe(gitDir)
+    if (st === 'file') {
+      const body = readFileSync(gitDir, 'utf8')
+      const match = body.match(/^gitdir:\s*(.+?)\s*$/m)
+      if (!match?.[1]) return null
+      gitDir = match[1].startsWith('/') || /^[a-zA-Z]:[\\/]/.test(match[1])
+        ? match[1]
+        : join(repoRoot, match[1])
+    } else if (st !== 'dir') {
+      return null
+    }
+    const config = readFileSync(join(gitDir, 'config'), 'utf8')
+    const urlMatch = config.match(/url\s*=\s*(.+)/i)
+    if (!urlMatch?.[1]) return null
+    const url = urlMatch[1].trim()
+    const gh = url.match(/github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?$/i)
+    if (!gh) return null
+    return { owner: gh[1].toLowerCase(), repo: gh[2].replace(/\.git$/i, '').toLowerCase() }
+  } catch {
+    return null
+  }
+}
+
+function statSyncSafe(path: string): 'file' | 'dir' | null {
+  try {
+    const st = statSync(path)
+    if (st.isFile()) return 'file'
+    if (st.isDirectory()) return 'dir'
+    return null
+  } catch {
+    return null
+  }
+}
+
 function extractGithubPullUrls(
   texts: Array<string | null | undefined>,
-  repoName?: string,
+  identity?: { owner: string; repo: string } | 'none',
 ): string[] {
+  if (identity === 'none') return []
   const found = new Set<string>()
   const re = /https:\/\/github\.com\/[^/\s"'<>]+\/[^/\s"'<>]+\/pull\/\d+/gi
-  const wantedRepo = repoName?.trim().toLowerCase()
   for (const text of texts) {
     if (!text) continue
-    const searchable = text.replace(/```[\s\S]*?```/g, ' ').replace(/`[^`]*`/g, ' ')
+    const searchable = stripCodeRegions(text)
     for (const match of searchable.matchAll(re)) {
       try {
         const url = new URL(match[0])
         if (url.protocol !== 'https:') continue
-        const pathMatch = url.pathname.match(/^\/[^/]+\/([^/]+)\/pull\/\d+$/)
+        const pathMatch = url.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/\d+$/)
         if (!pathMatch) continue
-        if (wantedRepo && pathMatch[1].toLowerCase() !== wantedRepo) continue
+        if (identity) {
+          const owner = pathMatch[1].toLowerCase()
+          const repo = pathMatch[2].toLowerCase()
+          if (owner !== identity.owner || repo !== identity.repo) continue
+        }
         found.add(`${url.origin}${url.pathname}`)
       } catch {
         // skip malformed
@@ -283,8 +333,8 @@ function isRealWorkspace(cwd: string | null | undefined): cwd is string {
   if (!cwd?.trim()) return false
   const trimmed = cwd.trim()
   const isAbsolute = process.platform === 'win32'
-    ? /^[a-zA-Z]:[\\/]/.test(trimmed)
-    : trimmed.startsWith('/')
+    ? /^[a-zA-Z]:[\\/]/.test(trimmed) || /^\\\\[^\\/]+\\/.test(trimmed)
+    : trimmed.startsWith('/') && !trimmed.startsWith('//')
   if (!isAbsolute) return false
   const normalized = trimmed.replace(/\\/g, '/').replace(/\/+$/, '')
   if (normalized === '/' || normalized === homedir() || normalized === homedir().replace(/\\/g, '/')) return false
@@ -448,12 +498,14 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
         if (seenKeys.has(dedupKey)) return
         seenKeys.add(dedupKey)
 
-        const repoName = workspace.projectPath ? basename(workspace.projectPath) : undefined
+        const identity = workspace.projectPath
+          ? (githubOwnerRepoFromRoot(workspace.projectPath) ?? 'none')
+          : undefined
         const prLinks = extractGithubPullUrls(
           messages
             .filter(msg => msg.role === 'assistant' || msg.role === 'user')
             .map(msg => msg.content),
-          repoName,
+          identity,
         )
 
         // Hermes bills reasoning tokens at the output rate (same as Gemini).

@@ -617,7 +617,7 @@ const KNOWN_NAMESPACES = new Set([
   'gemini', 'vertex_ai', 'bedrock', 'xiaomi', 'deepseek', 'moonshot',
   'minimax', 'mistral', 'meta-llama', 'meta', 'cohere', 'together_ai',
   'groq', 'fireworks_ai', 'xai', 'databricks', 'snowflake', 'novita',
-  'nvidia', 'cerebras', 'kimi', 'alibaba', 'dashscope',
+  'nvidia', 'cerebras', 'kimi', 'alibaba', 'dashscope', 'z-ai',
   'cp', 'cline-pass', 'cline-free', 'cmd', 'antigravity',
 ])
 

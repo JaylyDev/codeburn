@@ -636,11 +636,14 @@ skipUnlessSqlite('hermes provider', () => {
   })
 
   it('ignores fenced and unrelated-repo pull URLs when a git root is known', async () => {
+    const repo = join(tmpDir, 'codeburn-src')
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await writeFile(join(repo, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/getagentseal/codeburn.git\n')
     const dbPath = createHermesDb(tmpDir)
     withTestDb(dbPath, (db) => {
       insertSession(db, {
         id: 'pr-filter',
-        gitRepoRoot: '/Users/a/Documents/Codeburn',
+        gitRepoRoot: repo,
         inputTokens: 10,
         outputTokens: 5,
         cacheReadTokens: 0,
@@ -654,10 +657,13 @@ skipUnlessSqlite('hermes provider', () => {
           'assistant',
           [
             'Opened https://github.com/getagentseal/codeburn/pull/1037',
-            'Also see https://github.com/other/haystack/pull/1',
+            'Also see https://github.com/evil/codeburn/pull/2',
             '```',
             'https://github.com/getagentseal/codeburn/pull/677',
             '```',
+            '~~~',
+            'https://github.com/getagentseal/codeburn/pull/4',
+            '~~~',
           ].join('\n'),
           1779549201,
         )
@@ -665,7 +671,30 @@ skipUnlessSqlite('hermes provider', () => {
 
     const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=pr-filter`)
     expect(calls[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/1037'])
-    expect(calls[0]?.project).toBe('Codeburn')
+    expect(calls[0]?.project).toBe('codeburn-src')
+  })
+
+  it('rejects a slash-UNC path as a workspace on POSIX', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'unc-cwd',
+        source: 'desktop',
+        cwd: '//server/share/repo',
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('unc-cwd', 'user', 'hi', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=unc-cwd`)
+    expect(calls[0]?.project).toBe('hermes')
+    expect(calls[0]?.projectPath).toBeUndefined()
   })
 
   it('infers projects from Windows current working directory messages', async () => {

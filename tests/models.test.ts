@@ -78,6 +78,8 @@ describe('getModelCosts', () => {
     expect(getModelCosts('cp/provider/glm-5.3')).toBeNull()
     expect(getModelCosts('omniroute:provider/glm-5.3')).toBeNull()
     expect(getModelCosts('unknown/deepseek-v4-flash')).toBeNull()
+    expect(getModelCosts('z-ai/glm-5.2')).not.toBeNull()
+    expect(getModelCosts('z-ai/glm-5.3')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
   })
 })
 
