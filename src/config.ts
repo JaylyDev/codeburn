@@ -44,6 +44,11 @@ export type CodeburnConfig = {
   // can show "saved $X by running locally". Distinct from modelAliases which
   // rewrites actual spend.
   localModelSavings?: Record<string, string>
+  // Model ids whose $0 cost is correct because they are billed as a
+  // subscription / flat-rate product, not missing LiteLLM rows. Distinct from
+  // modelAliases (which invent per-token spend) and localModelSavings
+  // (counterfactual local baseline). See `codeburn model-flat-rate`.
+  flatRateModels?: string[]
   // Spend budgets are stored in the configured display currency, not USD.
   budget?: {
     daily?: number

@@ -2,7 +2,7 @@ import { isAbsolute } from 'path'
 import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
-import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setProxyPaths, normalizeProxyPath } from './models.js'
+import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setProxyPaths, normalizeProxyPath, unpricedModelHint } from './models.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
 import { getProvider } from './providers/index.js'
@@ -465,6 +465,7 @@ program.hook('preAction', async (thisCommand) => {
   setModelAliases(config.modelAliases ?? {})
   setPriceOverrides(config.priceOverrides ?? {})
   setLocalModelSavings(config.localModelSavings ?? {})
+  setFlatRateModels(config.flatRateModels ?? [])
   setProxyPaths(config.proxyPaths ?? [])
   if (thisCommand.opts<{ verbose?: boolean }>().verbose) {
     process.env['CODEBURN_VERBOSE'] = '1'
@@ -1579,6 +1580,63 @@ program
   })
 
 program
+  .command('model-flat-rate [model]')
+  .description('Mark a model as subscription / flat-rate billed. $0 is the correct cost and the unpriced warning is silenced. Do not use model-alias for these — that maps them onto another model\'s per-token rate and invents spend (e.g. codeburn model-flat-rate auto-genius).')
+  .option('--remove <model>', 'Remove a flat-rate mark')
+  .option('--list', 'List configured flat-rate models')
+  .action(async (model?: string, opts?: { remove?: string; list?: boolean }) => {
+    const config = await readConfig()
+    const marked = [...(config.flatRateModels ?? [])]
+
+    if (opts?.list || (!model && !opts?.remove)) {
+      if (marked.length === 0) {
+        console.log('\n  No flat-rate models configured.')
+        console.log(`  Config: ${getConfigFilePath()}`)
+        console.log('  Add one with: codeburn model-flat-rate <model>\n')
+      } else {
+        console.log('\n  Flat-rate / subscription models:')
+        for (const name of marked) {
+          console.log(`    ${name}`)
+        }
+        console.log(`  Config: ${getConfigFilePath()}\n`)
+      }
+      return
+    }
+
+    if (opts?.remove) {
+      const idx = marked.indexOf(opts.remove)
+      if (idx < 0) {
+        console.error(`\n  No flat-rate mark found for: ${opts.remove}\n`)
+        process.exitCode = 1
+        return
+      }
+      marked.splice(idx, 1)
+      config.flatRateModels = marked.length > 0 ? marked : undefined
+      await saveConfig(config)
+      console.log(`\n  Removed flat-rate mark: ${opts.remove}\n`)
+      return
+    }
+
+    if (!model) {
+      console.error('\n  Usage: codeburn model-flat-rate <model>\n')
+      process.exitCode = 1
+      return
+    }
+
+    if (!marked.includes(model)) marked.push(model)
+    config.flatRateModels = marked
+    await saveConfig(config)
+
+    if (config.modelAliases && Object.hasOwn(config.modelAliases, model)) {
+      console.log(`\n  Note: ${model} is also in modelAliases (-> ${config.modelAliases[model]}).`)
+      console.log('  The alias still invents per-token spend. Remove it if $0 is the correct cost.')
+    }
+
+    console.log(`\n  Flat-rate mark saved: ${model}`)
+    console.log(`  Config: ${getConfigFilePath()}\n`)
+  })
+
+program
   .command('proxy-path [path]')
   .description('Mark a project directory as routed through a subscription-backed LLM proxy (e.g. Claude Code over GitHub Copilot). Sessions whose canonical path is under it keep their full API-rate cost as the "would-be" figure, but that amount is reported as subscription-covered so the report can show net out-of-pocket (e.g. codeburn proxy-path ~/work/copilot-repo). Actual API-key sessions elsewhere are untouched.')
   .option('--remove <path>', 'Remove a configured proxy path')
@@ -2163,7 +2221,7 @@ program
       process.stdout.write(renderTable(renderRows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent, showTotals: opts.totals !== false }) + '\n')
       // Never advise aliasing unconditionally: a subscription or flat-rate model
       // is correctly $0, and mapping it onto another model's rate invents spend.
-      if (opts.unpriced) process.stdout.write('If a model is billed per token, map it with: codeburn model-alias "<model>" <known-model>. Subscription or flat-rate models are correctly $0.\n')
+      if (opts.unpriced) process.stdout.write(unpricedModelHint() + '\n')
     } else {
       process.stderr.write(`codeburn: unknown --format "${opts.format}". Choose table, markdown, json, or csv.\n`)
       process.exit(1)

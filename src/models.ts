@@ -520,6 +520,75 @@ export function getLocalModelSavingsConfigHash(): string {
   return parts.join('\u0002')
 }
 
+// Subscription / flat-rate product SKUs. $0 is the correct cost; aliasing
+// them onto a per-token row fabricates spend (#968). Distinct from
+// model-savings (counterfactual local baseline) and from a zero-rate
+// price-override (user-declared free). Built-in families plus a user hatch.
+let userFlatRateModels = new Set<string>()
+let userFlatRateLeaves = new Set<string>()
+
+function flatRateLeaf(model: string): string {
+  const trimmed = model.trim().replace(/@.*$/, '').replace(/-\d{8}$/, '')
+  const leaf = trimmed.includes('/') ? trimmed.slice(trimmed.lastIndexOf('/') + 1) : trimmed
+  return leaf.toLowerCase()
+}
+
+export function setFlatRateModels(models: Iterable<string>): void {
+  userFlatRateModels = new Set()
+  userFlatRateLeaves = new Set()
+  for (const model of models) {
+    if (!model || typeof model !== 'string') continue
+    userFlatRateModels.add(model)
+    const leaf = flatRateLeaf(model)
+    if (leaf) userFlatRateLeaves.add(leaf)
+  }
+}
+
+export function getFlatRateModelsConfigHash(): string {
+  return [...userFlatRateModels].sort().join('\u0002')
+}
+
+export function getFlatRateModels(): string[] {
+  return [...userFlatRateModels]
+}
+
+function isUserFlatRateModel(model: string): boolean {
+  if (userFlatRateModels.has(model)) return true
+  const leaf = flatRateLeaf(model)
+  return leaf.length > 0 && userFlatRateLeaves.has(leaf)
+}
+
+/// Product SKUs billed as a subscription, not missing LiteLLM rows.
+/// Match raw ids, path-prefixed ids (`cline-pass/auto-genius`), and the
+/// display names aggregation keys by (parser.ts uses getShortModelName).
+function isBuiltInFlatRateModel(model: string): boolean {
+  const leaf = flatRateLeaf(model)
+  if (
+    leaf === 'warp'
+    || leaf === 'codex-auto-review'
+    || leaf === 'auto-genius'
+    || leaf === 'big-pickle'
+  ) return true
+  if (leaf.startsWith('grok-composer-')) return true
+  if (leaf.startsWith('warp-auto-')) return true
+  const display = model.trim()
+  if (/^codex auto review$/i.test(display)) return true
+  if (/^grok composer\b/i.test(display)) return true
+  if (/^warp auto\b/i.test(display)) return true
+  return false
+}
+
+export function isFlatRateModel(model: string): boolean {
+  if (!model) return false
+  return isUserFlatRateModel(model) || isBuiltInFlatRateModel(model)
+}
+
+/// Shared unpriced-warning copy. Never tell the user to alias unconditionally:
+/// mapping a subscription SKU onto a priced row invents spend.
+export function unpricedModelHint(): string {
+  return 'If a model is billed per token, map it with: codeburn model-alias "<model>" <known-model>. If $0 is correct (subscription / flat-rate): codeburn model-flat-rate "<model>".'
+}
+
 /// Stable hash of the model-alias map, for the same staleness class as the
 /// hashes below: a resident process (codeburn serve) must not serve memoized
 /// parse results priced under aliases the user has since changed.
@@ -848,14 +917,18 @@ function exactPriceOverrideFor(model: string): ModelCosts | null {
 // correct cost, as are zero-rate USER overrides (explicitly declared free).
 /// Models whose $0 cost is CORRECT rather than a pricing gap, mirroring the
 /// exclusions findUnpricedModels applies: local-looking models, models mapped
-/// to a local-savings baseline, and models an exact zero-rate user override
-/// declares free. Used to keep their calls out of the pricing-coverage
-/// denominator — otherwise a 95%-ollama user reads high coverage while every
-/// genuinely cost-bearing call is unpriced.
+/// to a local-savings baseline, subscription / flat-rate product SKUs, and
+/// models an exact zero-rate user override declares free. Used to keep their
+/// calls out of the pricing-coverage denominator — otherwise a 95%-ollama
+/// user reads high coverage while every genuinely cost-bearing call is unpriced.
 export function isExpectedFreeModel(model: string): boolean {
   if (looksLikeLocalModel(model)) return true
   if (getLocalSavingsBaseline(model)) return true
   const costs = getModelCosts(model)
+  // A builtin/user alias can still attach a billable rate to a subscription
+  // SKU (warp-auto-* today). Those calls are priced, so they stay in the
+  // coverage denominator. Only the $0 / no-rate case is expected-free.
+  if (isFlatRateModel(model) && (!costs || !hasBillableRate(costs))) return true
   if (costs && !hasBillableRate(costs) && exactPriceOverrideFor(model)) return true
   return false
 }
@@ -872,6 +945,7 @@ export function findUnpricedModels(
     if (row.cost > 0) continue
     if (looksLikeLocalModel(model)) continue
     if (getLocalSavingsBaseline(model)) continue
+    if (isFlatRateModel(model)) continue
     const costs = getModelCosts(model)
     if (costs && hasBillableRate(costs)) continue
     if (costs && exactPriceOverrideFor(model)) continue
@@ -888,7 +962,8 @@ function shouldWarnAboutUnknownModel(name: string): boolean {
   // actively misleading there. Users who need cost visibility for local
   // inference can still set an alias via `codeburn model-alias`.
   if (looksLikeLocalModel(name)) return false
-  // The warning fired on every CLI invocation (including the default
+  if (isFlatRateModel(name)) return false
+  // The warning fired on every CLI invocation (including the default)
   // dashboard) which made first launches look broken — three "no pricing
   // data" lines greet a user before the dashboard even draws. Now opt-in
   // via --verbose. The unknown model still costs $0 in reports; users who
@@ -1157,6 +1232,7 @@ export type PricingSnapshot = {
   aliases: Record<string, string>
   priceOverrides: Record<string, PriceOverrideRates>
   localModelSavings: Record<string, string>
+  flatRateModels?: string[]
 }
 
 export function snapshotPricingState(): PricingSnapshot {
@@ -1165,6 +1241,7 @@ export function snapshotPricingState(): PricingSnapshot {
     aliases: userAliases,
     priceOverrides: userPriceOverridesConfig,
     localModelSavings: userLocalModelSavings,
+    flatRateModels: getFlatRateModels(),
   }
 }
 
@@ -1176,4 +1253,5 @@ export function restorePricingState(snapshot: PricingSnapshot): void {
   setModelAliases(snapshot.aliases)
   setPriceOverrides(snapshot.priceOverrides)
   setLocalModelSavings(snapshot.localModelSavings)
+  setFlatRateModels(snapshot.flatRateModels ?? [])
 }

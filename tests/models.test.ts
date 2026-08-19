@@ -12,10 +12,15 @@ import {
   setModelAliases,
   setPriceOverrides,
   setLocalModelSavings,
+  setFlatRateModels,
+  isExpectedFreeModel,
+  isFlatRateModel,
   getLocalModelSavingsConfigHash,
   getPriceOverridesConfigHash,
   getModelAliasesConfigHash,
+  getFlatRateModelsConfigHash,
   parseLiteLLMEntry,
+  unpricedModelHint,
 } from '../src/models.js'
 import { getDailyCacheConfigHash } from '../src/usage-aggregator.js'
 
@@ -27,6 +32,7 @@ afterEach(() => {
   setModelAliases({})
   setPriceOverrides({})
   setLocalModelSavings({})
+  setFlatRateModels([])
 })
 
 describe('getModelCosts', () => {
@@ -485,6 +491,17 @@ describe('user price overrides', () => {
     expect(firstCombined).not.toBe(baseline)
     expect(secondCombined).not.toBe(baseline)
     expect(secondCombined).not.toBe(firstCombined)
+  })
+
+  it('includes flat-rate marks in the daily cache config hash', () => {
+    setLocalModelSavings({})
+    setPriceOverrides({})
+    setFlatRateModels([])
+    const baseline = getDailyCacheConfigHash()
+    setFlatRateModels(['zz-flat-hash'])
+    expect(getDailyCacheConfigHash()).not.toBe(baseline)
+    setFlatRateModels([])
+    expect(getDailyCacheConfigHash()).toBe(baseline)
   })
 })
 
@@ -980,6 +997,41 @@ describe('findUnpricedModels', () => {
     expect(findUnpricedModels([{ model, calls: 1, cost: 0, tokens: 10 }])).toEqual([])
   })
 
+  it('skips subscription / flat-rate product SKUs where $0 is correct', () => {
+    const rows = [
+      { model: 'auto-genius', calls: 898, cost: 0, tokens: 35_300_000 },
+      { model: 'cline-pass/big-pickle', calls: 4, cost: 0, tokens: 33_900 },
+      { model: 'warp', calls: 449, cost: 0, tokens: 17_700_000 },
+      { model: 'codex-auto-review', calls: 940, cost: 0, tokens: 7_200_000 },
+      { model: 'grok-composer-2.5-fast', calls: 10, cost: 0, tokens: 1_900_000 },
+      { model: 'Grok Composer 2.5 Fast', calls: 10, cost: 0, tokens: 1_900_000 },
+      { model: 'Codex Auto Review', calls: 2, cost: 0, tokens: 100 },
+      { model: 'zz-mystery-paid-model-999', calls: 3, cost: 0, tokens: 1200 },
+    ]
+    expect(findUnpricedModels(rows)).toEqual([
+      { model: 'zz-mystery-paid-model-999', calls: 3, tokens: 1200 },
+    ])
+  })
+
+  it('skips a user-declared flat-rate model, including path-prefixed siblings', () => {
+    const model = 'zz-my-pass-codename'
+    expect(findUnpricedModels([{ model, calls: 1, cost: 0, tokens: 10 }])).toHaveLength(1)
+    setFlatRateModels([model])
+    expect(findUnpricedModels([{ model, calls: 1, cost: 0, tokens: 10 }])).toEqual([])
+    expect(findUnpricedModels([{ model: `vendor/${model}`, calls: 1, cost: 0, tokens: 10 }])).toEqual([])
+    expect(findUnpricedModels([{ model: 'zz-other-unknown', calls: 1, cost: 0, tokens: 10 }])).toHaveLength(1)
+  })
+
+  it('does not treat a priced sibling as expected-free just because a family is flat-rate', () => {
+    // warp-auto-* is a subscription SKU, but main already aliases it onto a
+    // billable row. Coverage must still count those priced calls.
+    expect(isFlatRateModel('warp-auto-efficient')).toBe(true)
+    expect(getModelCosts('warp-auto-efficient')).not.toBeNull()
+    expect(isExpectedFreeModel('warp-auto-efficient')).toBe(false)
+    expect(isExpectedFreeModel('auto-genius')).toBe(true)
+    expect(isExpectedFreeModel('zz-mystery-paid-model-999')).toBe(false)
+  })
+
   it('sorts by tokens, then calls', () => {
     const unpriced = findUnpricedModels([
       { model: 'zz-small', calls: 9, cost: 0, tokens: 10 },
@@ -1017,5 +1069,43 @@ describe('getModelAliasesConfigHash', () => {
     setModelAliases({ 'my-model': 'claude-opus-4-6', 'b-model': 'gpt-5' })
     expect(getModelAliasesConfigHash()).toBe(two)
     setModelAliases({})
+  })
+})
+
+describe('getFlatRateModelsConfigHash', () => {
+  it('is empty for no marks, changes with content, ignores insertion order', () => {
+    setFlatRateModels([])
+    expect(getFlatRateModelsConfigHash()).toBe('')
+    setFlatRateModels(['auto-genius'])
+    const one = getFlatRateModelsConfigHash()
+    expect(one).not.toBe('')
+    setFlatRateModels(['warp', 'auto-genius'])
+    const two = getFlatRateModelsConfigHash()
+    expect(two).not.toBe(one)
+    setFlatRateModels(['auto-genius', 'warp'])
+    expect(getFlatRateModelsConfigHash()).toBe(two)
+    setFlatRateModels([])
+  })
+})
+
+describe('pricing snapshot carries flat-rate marks', () => {
+  it('restorePricingState reapplies user flat-rate marks', async () => {
+    const { snapshotPricingState, restorePricingState } = await import('../src/models.js')
+    setFlatRateModels(['zz-snapshot-flat'])
+    const snap = snapshotPricingState()
+    expect(snap.flatRateModels).toEqual(['zz-snapshot-flat'])
+    setFlatRateModels([])
+    expect(isFlatRateModel('zz-snapshot-flat')).toBe(false)
+    restorePricingState(snap)
+    expect(isFlatRateModel('zz-snapshot-flat')).toBe(true)
+    setFlatRateModels([])
+  })
+})
+
+describe('unpricedModelHint', () => {
+  it('never tells the user to alias unconditionally', () => {
+    expect(unpricedModelHint()).toContain('If a model is billed per token')
+    expect(unpricedModelHint()).toContain('model-flat-rate')
+    expect(unpricedModelHint()).not.toContain('Fix: codeburn model-alias')
   })
 })

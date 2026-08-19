@@ -516,7 +516,7 @@ Sync sends token counts, costs, models, and projects, never prompts or code. Thi
 | `codeburn models --by-task` | Break each model into per-task-type rows |
 | `codeburn models --by-agent` | Break each model into per-agent rows: which agent drove which model's spend (`(main)` covers non-agent sessions; `--min-cost 0` shows sub-cent agents) |
 | `codeburn models --top 10` | Only the 10 most expensive models |
-| `codeburn models --unpriced` | Only models with usage that currently price at $0 — the copyable form of the unpriced-models warning. Shows raw model IDs (not friendly names) so they can be pasted into `model-alias`; JSON keeps them exact |
+| `codeburn models --unpriced` | Only models with usage that currently price at $0 — the copyable form of the unpriced-models warning. Shows raw model IDs (not friendly names). Per-token gaps go to `model-alias`; subscription / flat-rate SKUs go to `model-flat-rate`. JSON keeps IDs exact |
 | `codeburn models --format markdown` | Emit a paste-friendly markdown table |
 | `codeburn models --task feature` | Filter to feature-development work |
 | `codeburn models --provider claude` | Filter to a single provider |
@@ -608,10 +608,11 @@ Aliases are stored in `~/.config/codeburn/config.json` and applied at runtime be
 ```bash
 codeburn price-override my-model --input 0.27 --output 1.10   # USD per 1M tokens
 codeburn model-savings "llama3.1:8b" gpt-4o                   # local model, counted as savings
+codeburn model-flat-rate auto-genius                          # subscription SKU, $0 is correct
 codeburn proxy-path ~/work/copilot-repo                       # subscription-covered project
 ```
 
-`price-override` sets exact rates for any model (input, output, cache read, cache creation), useful for private deployments or models LiteLLM prices wrong. `model-savings` maps a free local model to a paid baseline: the local calls stay $0, and the dashboard shows what the same tokens would have cost on the baseline. `proxy-path` marks a project routed through a subscription-backed proxy (e.g. Claude Code over GitHub Copilot), so its API-rate cost is reported as subscription-covered and your net out-of-pocket stays honest. All three support `--list` and `--remove`.
+`price-override` sets exact rates for any model (input, output, cache read, cache creation), useful for private deployments or models LiteLLM prices wrong. `model-savings` maps a free local model to a paid baseline: the local calls stay $0, and the dashboard shows what the same tokens would have cost on the baseline. `model-flat-rate` marks a subscription-billed product SKU so the unpriced warning stays quiet and `model-alias` is not suggested — aliasing those ids invents spend. `proxy-path` marks a project routed through a subscription-backed proxy (e.g. Claude Code over GitHub Copilot), so its API-rate cost is reported as subscription-covered and your net out-of-pocket stays honest. All four support `--list` and `--remove`.
 
 ### Filtering
 

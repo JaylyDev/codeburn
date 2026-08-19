@@ -25,6 +25,14 @@ describe('tables', () => {
     expect(t).toContain('Opus 4.8')
     expect(t).toContain('| Model | Cost | Calls |')
   })
+  it('unpriced warning names the flat-rate hatch instead of only alias', () => {
+    const p = payload()
+    p.current.unpricedModels = [{ model: 'zz-mystery-paid-model-999', calls: 3, tokens: 1200 }]
+    const t = renderSummaryTable(p)
+    expect(t).toContain('zz-mystery-paid-model-999')
+    expect(t).toContain('model-flat-rate')
+    expect(t).not.toContain('fix with `codeburn model-alias`')
+  })
   it('breakdown by provider lists providers', () => {
     expect(renderBreakdownTable(payload(), 'provider', 20)).toContain('claude code')
   })
