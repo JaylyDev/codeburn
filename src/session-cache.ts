@@ -285,7 +285,11 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // source-provenance-v1 (#944): CLI sessions were misread as VS Code
   // transcripts (both carry producer 'copilot-agent'), skipping the shutdown
   // input/cache rollup; this bump re-parses them so the missing tokens land.
-  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1',
+  // rollup-ts-v1 (#1051): shutdown rollup keys use the leg timestamp, not a
+  // per-file occurrence index. Present sources must re-parse so old `:n`
+  // keys are not union-merged next to the new timestamp keys (double count).
+  // Orphans whose source is gone stay via the fingerprint carry-forward.
+  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1-rollup-ts-v1',
   // authoritative-usage-v4: persist one Grok session call from top-level
   // authoritative totals, use modelUsage only for priced attribution, clamp
   // reasoning per record, and label mixed sessions estimated.

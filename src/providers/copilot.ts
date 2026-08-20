@@ -703,6 +703,14 @@ function inferTranscriptModel(lines: string[]): string {
 // token counts and no session.shutdown rollup)
 // ---------------------------------------------------------------------------
 
+// Shutdown rollup identity is (session, model, shutdown timestamp), not a
+// per-file occurrence index. Two journals for one session (resume into a
+// second events.jsonl) both started their local counter at 1, so `:1`
+// collided and the second file's first leg was dropped (#1051).
+function copilotShutdownDedupKey(sessionId: string, model: string, shutdownTimestamp: string): string {
+  return `copilot:${sessionId}:shutdown:${model}:${shutdownTimestamp || 'untimestamped'}`
+}
+
 /**
  * `isTranscript` comes from discovery (where the file lives), never from
  * content: the Copilot CLI writes the same session.start producer
@@ -758,11 +766,10 @@ function createJsonlParser(
       // A resumed session appends one session.shutdown PER LEG, each carrying
       // CUMULATIVE per-model totals. Emitting each rollup whole would need the
       // cache to update a prior call in place — the durable merge is
-      // append-only by dedup key — so we emit per-leg DELTAS keyed by
-      // occurrence instead: re-parses of a growing file append only the new
-      // leg, and each leg lands on its own timestamp.
+      // append-only by dedup key — so we emit per-leg DELTAS keyed by the
+      // shutdown timestamp: re-parses of a growing file append only the new
+      // leg, and two journals for one session cannot collide on `:1`.
       const prevShutdownUsage = new Map<string, ShutdownModelUsage>()
-      const shutdownCountByModel = new Map<string, number>()
 
       for (const line of lines) {
         let event: CopilotEvent
@@ -858,8 +865,6 @@ function createJsonlParser(
             }
             const prevRaw = prevShutdownUsage.get(model)
             prevShutdownUsage.set(model, cumulative)
-            const n = (shutdownCountByModel.get(model) ?? 0) + 1
-            shutdownCountByModel.set(model, n)
 
             // A cumulative total BELOW the previous rollup means the CLI reset
             // its counters (a fresh accounting epoch): delta from zero, else
@@ -891,7 +896,7 @@ function createJsonlParser(
             // to avoid an empty $0 row (output is intentionally excluded).
             if (inputTokens === 0 && cacheReadTokens === 0 && cacheWriteTokens === 0 && reasoningTokens === 0) continue
 
-            const dedupKey = `copilot:${sessionId}:shutdown:${model}:${n}`
+            const dedupKey = copilotShutdownDedupKey(sessionId, model, shutdownTimestamp)
             if (seenKeys.has(dedupKey)) continue
             seenKeys.add(dedupKey)
 
