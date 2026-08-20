@@ -14,7 +14,7 @@ import { createRequire } from 'node:module'
 
 import { isSqliteAvailable } from '../src/sqlite.js'
 import { clearSessionCache, parseAllSessions, setParseReuseValidator } from '../src/parser.js'
-import { loadCache, saveCache } from '../src/session-cache.js'
+import { computeEnvFingerprint, loadCache, PROVIDER_PARSE_VERSIONS, saveCache } from '../src/session-cache.js'
 import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 import type { SessionSource, SessionParser, ParsedProviderCall } from '../src/providers/types.js'
 
@@ -527,6 +527,78 @@ describe('(f) durable orphans survive a parse-version bump', () => {
     clearSessionCache()
     const again = totalOutput(await parseAllSessions(undefined, 'copilot'))
     expect(again).toBe(200)
+  })
+})
+
+describe('(f2) copilot shutdown-key migration does not bump the fingerprint', () => {
+  it('replaces cached :n shutdown keys on the JSONL file without moving the fingerprint', async () => {
+    expect(PROVIDER_PARSE_VERSIONS.copilot).toBe('cli-shutdown-cost-v1-skills-source-provenance-v1')
+
+    const sessionStateDir = join(tmpHome, 'session-state')
+    await mkdir(sessionStateDir, { recursive: true })
+    vi.stubEnv('CODEBURN_COPILOT_SESSION_STATE_DIR', sessionStateDir)
+    vi.stubEnv('CODEBURN_COPILOT_DISABLE_OTEL', '1')
+    vi.stubEnv('CODEBURN_COPILOT_WS_STORAGE_DIR', join(tmpHome, 'no-ws'))
+
+    const dir = join(sessionStateDir, 'sess-migrate')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'workspace.yaml'), 'id: sess-migrate\ncwd: /home/user/testproj\n')
+    const stamp = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString()
+    await writeFile(join(dir, 'events.jsonl'), [
+      JSON.stringify({ type: 'session.model_change', timestamp: stamp, data: { newModel: 'claude-sonnet-5' } }),
+      JSON.stringify({ type: 'assistant.message', timestamp: stamp, data: { messageId: 'msg-1', outputTokens: 10, interactionId: 'int-1', toolRequests: [] } }),
+      JSON.stringify({
+        type: 'session.shutdown',
+        timestamp: stamp,
+        data: {
+          shutdownType: 'routine',
+          modelMetrics: {
+            'claude-sonnet-5': {
+              requests: { count: 1, cost: 1 },
+              usage: { inputTokens: 3000, outputTokens: 10, cacheReadTokens: 1000, cacheWriteTokens: 500, reasoningTokens: 0 },
+            },
+          },
+        },
+      }),
+    ].join('\n') + '\n')
+
+    const first = await parseAllSessions(undefined, 'copilot')
+    const firstKeys = first.flatMap(p => p.sessions).flatMap(s => s.turns).flatMap(t => t.assistantCalls).map(c => c.deduplicationKey)
+    const journalKey = firstKeys.find(k => k.includes(':shutdown:'))
+    expect(journalKey).toMatch(/:events\.jsonl$/)
+    const firstInput = first.flatMap(p => p.sessions).flatMap(s => s.turns).flatMap(t => t.assistantCalls)
+      .filter(c => c.deduplicationKey.includes(':shutdown:'))
+      .reduce((s, c) => s + c.usage.inputTokens, 0)
+    expect(firstInput).toBe(1500)
+
+    const fingerprintBefore = computeEnvFingerprint('copilot')
+    const disk = await readCacheOnDisk()
+    expect(disk.providers['copilot']!.envFingerprint).toBe(fingerprintBefore)
+    const eventsPath = Object.keys(disk.providers['copilot']!.files).find(p => p.endsWith('events.jsonl'))
+    expect(eventsPath).toBeDefined()
+    for (const turn of disk.providers['copilot']!.files[eventsPath!]!.turns) {
+      for (const call of turn.calls) {
+        if (call.deduplicationKey.includes(':shutdown:')) {
+          call.deduplicationKey = 'copilot:sess-migrate:shutdown:claude-sonnet-5:1'
+        }
+      }
+    }
+    await writeCacheOnDisk(disk)
+    clearSessionCache()
+
+    const second = await parseAllSessions(undefined, 'copilot')
+    const secondCalls = second.flatMap(p => p.sessions).flatMap(s => s.turns).flatMap(t => t.assistantCalls)
+    const shutdownKeys = secondCalls.filter(c => c.deduplicationKey.includes(':shutdown:')).map(c => c.deduplicationKey)
+    expect(shutdownKeys).toEqual([journalKey])
+    expect(shutdownKeys.some(k => k.endsWith(':1'))).toBe(false)
+    const secondInput = secondCalls
+      .filter(c => c.deduplicationKey.includes(':shutdown:'))
+      .reduce((s, c) => s + c.usage.inputTokens, 0)
+    expect(secondInput).toBe(1500)
+
+    clearSessionCache()
+    const after = await readCacheOnDisk()
+    expect(after.providers['copilot']!.envFingerprint).toBe(fingerprintBefore)
   })
 })
 

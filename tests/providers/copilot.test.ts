@@ -615,7 +615,7 @@ describe('copilot provider - session.shutdown token/cost rollup', () => {
     // One per-turn assistant.message call + one supplementary shutdown call.
     expect(calls).toHaveLength(2)
 
-    const shutdown = calls.find(c => c.deduplicationKey === 'copilot:sess-shutdown:shutdown:claude-sonnet-4-5:2026-04-15T10:05:00Z')
+    const shutdown = calls.find(c => c.deduplicationKey === 'copilot:sess-shutdown:shutdown:claude-sonnet-4-5:2026-04-15T10:05:00Z:events.jsonl')
     expect(shutdown).toBeDefined()
     expect(shutdown!.model).toBe('claude-sonnet-4-5')
     expect(shutdown!.inputTokens).toBe(4)              // 71282 - 35495 - 35783
@@ -723,9 +723,9 @@ describe('copilot provider - session.shutdown token/cost rollup', () => {
 
     const shutdowns = calls.filter(c => c.deduplicationKey.includes(':shutdown:'))
     expect(shutdowns.map(c => c.deduplicationKey)).toEqual([
-      'copilot:sess-resumed:shutdown:claude-sonnet-5:2026-08-01T10:00:00Z',
-      'copilot:sess-resumed:shutdown:claude-sonnet-5:2026-08-02T10:00:00Z',
-      'copilot:sess-resumed:shutdown:claude-sonnet-5:2026-08-03T10:00:00Z',
+      'copilot:sess-resumed:shutdown:claude-sonnet-5:2026-08-01T10:00:00Z:events.jsonl',
+      'copilot:sess-resumed:shutdown:claude-sonnet-5:2026-08-02T10:00:00Z:events.jsonl',
+      'copilot:sess-resumed:shutdown:claude-sonnet-5:2026-08-03T10:00:00Z:events.jsonl',
     ])
     // Each leg lands on its own shutdown timestamp (a resumed session can
     // span days; whole-rollup emission would collapse them onto one).
@@ -806,8 +806,8 @@ describe('copilot provider - session.shutdown token/cost rollup', () => {
   it('keeps both first legs when one session has two journal files (#1051)', async () => {
     // The occurrence counter lived inside each file parse. Two journals for
     // the same sessionId both emitted `:1` and the shared seenKeys set
-    // dropped the second file's first shutdown. Keying by timestamp (and
-    // disambiguating a shared stamp against seenKeys) keeps both legs.
+    // dropped the second file's first shutdown. Keying by timestamp AND the
+    // journal basename keeps both legs, including when the stamps match.
     const sessionDir = join(tmpDir, 'sess-two-journals')
     await mkdir(sessionDir, { recursive: true })
     await writeFile(join(sessionDir, 'workspace.yaml'), 'id: sess-two-journals\ncwd: /home/user/myproject\n')
@@ -838,13 +838,52 @@ describe('copilot provider - session.shutdown token/cost rollup', () => {
     const second = await collectCalls({ path: path2, project: 'myproject', provider: 'copilot', sourceType: 'jsonl' }, seen)
     const shutdowns = [...first, ...second].filter(c => c.deduplicationKey.includes(':shutdown:'))
     expect(shutdowns.map(c => c.deduplicationKey)).toEqual([
-      'copilot:sess-two-journals:shutdown:claude-sonnet-5:2026-08-01T10:00:00Z',
-      'copilot:sess-two-journals:shutdown:claude-sonnet-5:2026-08-02T10:00:00Z',
+      'copilot:sess-two-journals:shutdown:claude-sonnet-5:2026-08-01T10:00:00Z:events.jsonl',
+      'copilot:sess-two-journals:shutdown:claude-sonnet-5:2026-08-02T10:00:00Z:events-2.jsonl',
     ])
     expect(shutdowns[0]!.inputTokens).toBe(1500) // 3000 − 1000 − 500
     expect(shutdowns[1]!.inputTokens).toBe(1300) // 4000 − 2000 − 700
     expect(shutdowns[0]!.cacheReadInputTokens).toBe(1000)
     expect(shutdowns[1]!.cacheReadInputTokens).toBe(2000)
+  })
+
+  it('keeps both first legs when two journals share a shutdown timestamp (#1051)', async () => {
+    const sessionDir = join(tmpDir, 'sess-shared-stamp')
+    await mkdir(sessionDir, { recursive: true })
+    await writeFile(join(sessionDir, 'workspace.yaml'), 'id: sess-shared-stamp\ncwd: /home/user/myproject\n')
+
+    const stamp = '2026-08-01T10:00:00Z'
+    const journal1 = [
+      modelChange('claude-sonnet-5'),
+      assistantMessage({ messageId: 'msg-a', outputTokens: 10 }),
+      shutdownEvent({
+        modelMetrics: { 'claude-sonnet-5': { inputTokens: 3000, outputTokens: 10, cacheReadTokens: 1000, cacheWriteTokens: 500 } },
+        timestamp: stamp,
+      }),
+    ]
+    const journal2 = [
+      modelChange('claude-sonnet-5'),
+      assistantMessage({ messageId: 'msg-b', outputTokens: 20 }),
+      shutdownEvent({
+        modelMetrics: { 'claude-sonnet-5': { inputTokens: 4000, outputTokens: 20, cacheReadTokens: 2000, cacheWriteTokens: 700 } },
+        timestamp: stamp,
+      }),
+    ]
+    const path1 = join(sessionDir, 'events.jsonl')
+    const path2 = join(sessionDir, 'events-2.jsonl')
+    await writeFile(path1, journal1.join('\n') + '\n')
+    await writeFile(path2, journal2.join('\n') + '\n')
+
+    const seen = new Set<string>()
+    const first = await collectCalls({ path: path1, project: 'myproject', provider: 'copilot', sourceType: 'jsonl' }, seen)
+    const second = await collectCalls({ path: path2, project: 'myproject', provider: 'copilot', sourceType: 'jsonl' }, seen)
+    const shutdowns = [...first, ...second].filter(c => c.deduplicationKey.includes(':shutdown:'))
+    expect(shutdowns.map(c => c.deduplicationKey)).toEqual([
+      'copilot:sess-shared-stamp:shutdown:claude-sonnet-5:2026-08-01T10:00:00Z:events.jsonl',
+      'copilot:sess-shared-stamp:shutdown:claude-sonnet-5:2026-08-01T10:00:00Z:events-2.jsonl',
+    ])
+    expect(shutdowns[0]!.inputTokens).toBe(1500)
+    expect(shutdowns[1]!.inputTokens).toBe(1300)
   })
 
   it('falls back to the last stamped event when shutdown carries no timestamp at all', async () => {
@@ -979,7 +1018,7 @@ describe('copilot provider - session.shutdown token/cost rollup', () => {
     expect(perTurn.every(c => c.model === 'claude-sonnet-5')).toBe(true)
 
     // The shutdown rollup lands: the tokens the misclassification dropped.
-    const shutdown = calls.find(c => c.deduplicationKey === 'copilot:sess-cli-producer:shutdown:claude-sonnet-5:2026-08-07T17:56:40.591Z')
+    const shutdown = calls.find(c => c.deduplicationKey === 'copilot:sess-cli-producer:shutdown:claude-sonnet-5:2026-08-07T17:56:40.591Z:events.jsonl')
     expect(shutdown).toBeDefined()
     expect(shutdown!.inputTokens).toBe(4) // 49473 − 24678 − 24791 (cache-inclusive)
     expect(shutdown!.cacheReadInputTokens).toBe(24678)
@@ -1043,7 +1082,7 @@ describe('copilot provider - session.shutdown token/cost rollup', () => {
       const calls: ParsedProviderCall[] = []
       for await (const call of provider.createSessionParser(sessions[0]!, new Set()).parse()) calls.push(call)
 
-      const shutdown = calls.find(c => c.deduplicationKey === 'copilot:sess-wire:shutdown:claude-sonnet-5:2026-04-15T10:05:00Z')
+      const shutdown = calls.find(c => c.deduplicationKey === 'copilot:sess-wire:shutdown:claude-sonnet-5:2026-04-15T10:05:00Z:events.jsonl')
       expect(shutdown).toBeDefined()
       expect(shutdown!.inputTokens).toBe(500) // 5000 − 3000 − 1500
       expect(shutdown!.cacheReadInputTokens).toBe(3000)

@@ -2822,6 +2822,24 @@ function getOrCreateProviderSection(cache: SessionCache, provider: string): Prov
   return section
 }
 
+function isLegacyCopilotShutdownKey(key: string, journalId: string): boolean {
+  return key.includes(':shutdown:') && !key.endsWith(`:${journalId}`)
+}
+
+// Drop occurrence-index / timestamp-only shutdown calls from one JSONL cache
+// entry so the durable union does not keep `:n` next to the new journal-keyed
+// calls (double count). OTel / JetBrains / transcript keys do not include
+// `:shutdown:` and are left alone.
+function stripLegacyCopilotShutdownCalls(entry: CachedFile, journalId: string): void {
+  const next: CachedTurn[] = []
+  for (const turn of entry.turns) {
+    const calls = turn.calls.filter(call => !isLegacyCopilotShutdownKey(call.deduplicationKey, journalId))
+    if (calls.length === 0) continue
+    next.push(calls.length === turn.calls.length ? turn : { ...turn, calls })
+  }
+  entry.turns = next
+}
+
 function cachedFileNeedsProviderReparse(providerName: string, sourcePath: string, cached: CachedFile): boolean {
   // Antigravity data comes from the live server, not from the conversation file.
   // A 0-turn cache entry may just mean the server was unavailable last run.
@@ -2831,6 +2849,16 @@ function cachedFileNeedsProviderReparse(providerName: string, sourcePath: string
   // only tracks the transcript JSON, so reparse to pick up DB-side project,
   // title, model, and timestamp changes.
   if (providerName === 'devin') return true
+
+  // #1051: migrate old Copilot CLI shutdown keys (`:n` or timestamp-only)
+  // without a provider-wide fingerprint bump. A bump would drop the present
+  // OTel DB source and erase conversations already pruned from that DB.
+  if (providerName === 'copilot') {
+    const journalId = basename(sourcePath)
+    return cached.turns.some(turn =>
+      turn.calls.some(call => isLegacyCopilotShutdownKey(call.deduplicationKey, journalId)),
+    )
+  }
 
   if (providerName !== 'gemini') return false
 
@@ -3208,6 +3236,9 @@ async function parseProviderSources(
         if (provider.durableSources) {
           const existingEntry = section.files[source.path]
           if (existingEntry) {
+            if (providerName === 'copilot') {
+              stripLegacyCopilotShutdownCalls(existingEntry, basename(source.path))
+            }
             const existingKeys = new Set(
               existingEntry.turns.flatMap(t => t.calls.map(c => c.deduplicationKey))
             )

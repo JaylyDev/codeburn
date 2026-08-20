@@ -703,12 +703,19 @@ function inferTranscriptModel(lines: string[]): string {
 // token counts and no session.shutdown rollup)
 // ---------------------------------------------------------------------------
 
-// Shutdown rollup identity is (session, model, shutdown timestamp), not a
-// per-file occurrence index. Two journals for one session (resume into a
-// second events.jsonl) both started their local counter at 1, so `:1`
-// collided and the second file's first leg was dropped (#1051).
-function copilotShutdownDedupKey(sessionId: string, model: string, shutdownTimestamp: string): string {
-  return `copilot:${sessionId}:shutdown:${model}:${shutdownTimestamp || 'untimestamped'}`
+// Shutdown rollup identity is (session, model, shutdown timestamp, journal
+// basename), not a per-file occurrence index. Two journals for one session
+// (resume into a second events.jsonl) both started their local counter at 1,
+// so `:1` collided and the second file's first leg was dropped (#1051).
+// Timestamp alone is not unique across journals: two files can share a stamp.
+// The journal basename is re-parse-stable; do not mint suffixes from seenKeys.
+function copilotShutdownDedupKey(
+  sessionId: string,
+  model: string,
+  shutdownTimestamp: string,
+  journalId: string,
+): string {
+  return `copilot:${sessionId}:shutdown:${model}:${shutdownTimestamp || 'untimestamped'}:${journalId}`
 }
 
 /**
@@ -767,8 +774,10 @@ function createJsonlParser(
       // CUMULATIVE per-model totals. Emitting each rollup whole would need the
       // cache to update a prior call in place — the durable merge is
       // append-only by dedup key — so we emit per-leg DELTAS keyed by the
-      // shutdown timestamp: re-parses of a growing file append only the new
-      // leg, and two journals for one session cannot collide on `:1`.
+      // shutdown timestamp plus this journal's basename: re-parses of a
+      // growing file append only the new leg, and two journals for one
+      // session cannot collide on `:1` or on a shared timestamp.
+      const journalId = basename(source.path)
       const prevShutdownUsage = new Map<string, ShutdownModelUsage>()
 
       for (const line of lines) {
@@ -896,7 +905,7 @@ function createJsonlParser(
             // to avoid an empty $0 row (output is intentionally excluded).
             if (inputTokens === 0 && cacheReadTokens === 0 && cacheWriteTokens === 0 && reasoningTokens === 0) continue
 
-            const dedupKey = copilotShutdownDedupKey(sessionId, model, shutdownTimestamp)
+            const dedupKey = copilotShutdownDedupKey(sessionId, model, shutdownTimestamp, journalId)
             if (seenKeys.has(dedupKey)) continue
             seenKeys.add(dedupKey)
 
