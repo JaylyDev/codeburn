@@ -14,6 +14,7 @@ import type { Provider, ProbeRoot, SessionSource, SessionParser, ParsedProviderC
 
 const modelDisplayNames: Record<string, string> = {
   'codex-auto-review': 'Codex Auto Review',
+  'codex-code-review': 'Codex Code Review',
   'gpt-5.5': 'GPT-5.5',
   'gpt-5.4-mini': 'GPT-5.4 Mini',
   'gpt-5.4': 'GPT-5.4',
