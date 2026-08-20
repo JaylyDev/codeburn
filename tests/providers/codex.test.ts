@@ -1,9 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises'
+import { mkdtemp, mkdir, writeFile, rm, stat } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
 import { createCodexProvider } from '../../src/providers/codex.js'
+import { clearCodexMemCaches } from '../../src/codex-cache.js'
+import { calculateCost } from '../../src/models.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
@@ -1154,5 +1156,76 @@ describe('codex provider - forked session dedupe', () => {
 
     const { tokens } = await aggregateTokens(tmpDir)
     expect(tokens).toBe(300)
+  })
+})
+
+describe('codex auto-review pricing (#1047)', () => {
+  it('parses auto-review as itself and prices it as GPT-5.4', async () => {
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-auto-review.jsonl', [
+      sessionMeta({ session_id: 'sess-auto', model: 'codex-auto-review' }),
+      userMessage('review the PR'),
+      tokenCount({
+        timestamp: '2026-04-14T10:01:00Z',
+        last: { input: 1_000_000, output: 1_000_000 },
+        total: { total: 2_000_000 },
+      }),
+    ])
+    const provider = createCodexProvider(tmpDir)
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser({ path: filePath, project: 'test', provider: 'codex' }, new Set()).parse()) {
+      calls.push(call)
+    }
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.model).toBe('codex-auto-review')
+    expect(calls[0]!.costUSD).toBe(calculateCost('gpt-5.4', 1_000_000, 1_000_000, 0, 0, 0))
+  })
+
+  it('discards a warm v9 $0 exact hit so unchanged rollouts reprice', async () => {
+    const cacheDir = join(tmpDir, 'cache')
+    await mkdir(cacheDir, { recursive: true })
+    const prev = process.env['CODEBURN_CACHE_DIR']
+    process.env['CODEBURN_CACHE_DIR'] = cacheDir
+    try {
+      const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-stale-auto.jsonl', [
+        sessionMeta({ session_id: 'sess-stale-auto', model: 'codex-auto-review' }),
+        userMessage('review the PR'),
+        tokenCount({
+          timestamp: '2026-04-14T10:01:00Z',
+          last: { input: 1_000_000, output: 1_000_000 },
+          total: { total: 2_000_000 },
+        }),
+      ])
+      const st = await stat(filePath)
+      await writeFile(join(cacheDir, 'codex-results.json'), JSON.stringify({
+        version: 9,
+        files: {
+          [filePath]: {
+            mtimeMs: st.mtimeMs,
+            sizeBytes: st.size,
+            project: 'test',
+            calls: [{
+              model: 'codex-auto-review',
+              costUSD: 0,
+              inputTokens: 1_000_000,
+              outputTokens: 1_000_000,
+              deduplicationKey: 'stale',
+            }],
+          },
+        },
+      }))
+      clearCodexMemCaches()
+      const provider = createCodexProvider(tmpDir)
+      const calls: ParsedProviderCall[] = []
+      for await (const call of provider.createSessionParser({ path: filePath, project: 'test', provider: 'codex' }, new Set()).parse()) {
+        calls.push(call)
+      }
+      expect(calls).toHaveLength(1)
+      expect(calls[0]!.costUSD).toBeGreaterThan(0)
+      expect(calls[0]!.costUSD).toBe(calculateCost('gpt-5.4', 1_000_000, 1_000_000, 0, 0, 0))
+    } finally {
+      clearCodexMemCaches()
+      if (prev === undefined) delete process.env['CODEBURN_CACHE_DIR']
+      else process.env['CODEBURN_CACHE_DIR'] = prev
+    }
   })
 })

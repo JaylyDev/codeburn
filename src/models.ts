@@ -275,13 +275,13 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'warp-auto-powerful':            'claude-opus-4-6',
   // Codex activity ids are product surfaces, not subscription SKUs and not
   // LiteLLM rows. Official rate card (help.openai.com/articles/20001106,
-  // updated 2026-08-20): "Auto review uses GPT-5.4." / "Code review uses
-  // GPT-5.3-Codex." Price as those models. Do not invent a rate. Do not
-  // treat them as honestly $0 — they consume the same credit pool as other
-  // Codex work. Display stays on autoModelNames so the activity label is
-  // preserved (same class as cursor-auto / copilot-openai-auto).
+  // 2026-08-20): "Auto review uses GPT-5.4." Price as that existing row.
+  // Do not invent a rate. Do not treat the id as honestly $0 — it consumes
+  // the same credit pool as other Codex work. Display stays on
+  // autoModelNames (same class as cursor-auto / copilot-openai-auto).
+  // Only alias ids observed in Codex source / real rollouts. Do not infer
+  // `codex-code-review` from the activity name "code review".
   'codex-auto-review':             'gpt-5.4',
-  'codex-code-review':             'gpt-5.3-codex',
   'grok-build':                    'grok-build-0.1',
   'GPT-5.3 Codex (low reasoning)': 'gpt-5.3-codex',
   'GPT-5.3 Codex (medium reasoning)': 'gpt-5.3-codex',
@@ -975,7 +975,6 @@ const autoModelNames: Record<string, string> = {
   'qwen-auto': 'Qwen (auto)',
   'kimi-auto': 'Kimi (auto)',
   'codex-auto-review': 'Codex Auto Review',
-  'codex-code-review': 'Codex Code Review',
 }
 
 const SHORT_NAMES: Record<string, string> = {

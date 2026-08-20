@@ -279,7 +279,9 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // lockstep so the pre-session-cache layer re-parses too.)
   // session-meta-model-v1: parse large session_meta records structurally so a
   // nested base_instructions provenance.model cannot overwrite turn_context.
-  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1',
+  // activity-price-v1: `codex-auto-review` now prices as gpt-5.4 (#1047).
+  // session-cache.json would otherwise keep the pre-alias $0 section.
+  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1-activity-price-v1',
   cursor: 'composer-anchored-crediting-v1-est-cost',
   'cursor-agent': 'workspaceless-transcript-v1',
   // source-provenance-v1 (#944): CLI sessions were misread as VS Code

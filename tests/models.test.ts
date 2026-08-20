@@ -609,9 +609,8 @@ describe('Cursor model variants resolve to pricing', () => {
     ['claude-4.6-haiku', 'claude-haiku-4-5'],
     // Cursor auto proxy
     ['cursor-auto', 'claude-sonnet-4-5'],
-    // Codex activity surfaces (official rate card, not invented rates)
+    // Codex activity surface (official rate card, observed raw id)
     ['codex-auto-review', 'gpt-5.4'],
-    ['codex-code-review', 'gpt-5.3-codex'],
     // OpenAI variants Cursor emits
     ['gpt-5', 'gpt-5'],
     ['gpt-5-fast', 'gpt-5'],
@@ -650,33 +649,23 @@ describe('Cursor model variants resolve to pricing', () => {
 describe('Codex activity ids (#1047)', () => {
   it('keeps the activity label instead of collapsing to the underlying model name', () => {
     expect(getShortModelName('codex-auto-review')).toBe('Codex Auto Review')
-    expect(getShortModelName('codex-code-review')).toBe('Codex Code Review')
   })
 
-  it('prices the same as the official underlying model, not an invented rate', () => {
+  it('prices as the exact bundled GPT-5.4 object, not an invented rate', () => {
+    expect(getModelCosts('codex-auto-review')).toBe(getModelCosts('gpt-5.4'))
     const auto = calculateCost('codex-auto-review', 1_000_000, 1_000_000, 0, 0, 0)
     const gpt54 = calculateCost('gpt-5.4', 1_000_000, 1_000_000, 0, 0, 0)
-    const review = calculateCost('codex-code-review', 1_000_000, 1_000_000, 0, 0, 0)
-    const gpt53 = calculateCost('gpt-5.3-codex', 1_000_000, 1_000_000, 0, 0, 0)
     expect(auto).toBeGreaterThan(0)
     expect(auto).toBe(gpt54)
-    expect(review).toBeGreaterThan(0)
-    expect(review).toBe(gpt53)
-    expect(auto).not.toBe(review)
   })
 
-  it('does not invent a family for unknown Codex activity ids', () => {
+  it('does not invent a family or an unobserved sibling id', () => {
+    expect(getModelCosts('codex-code-review')).toBeNull()
     expect(getModelCosts('codex-cloud-task')).toBeNull()
     expect(getModelCosts('codex-automation')).toBeNull()
-    expect(calculateCost('codex-cloud-task', 1_000_000, 1_000_000, 0, 0, 0)).toBe(0)
-  })
-
-  it('drops a priced auto-review row from the unpriced warning', () => {
-    const cost = calculateCost('codex-auto-review', 659_000_000, 0, 0, 0, 0)
-    expect(cost).toBeGreaterThan(0)
-    expect(findUnpricedModels([
-      { model: 'codex-auto-review', calls: 12, cost, tokens: 659_000_000 },
-    ])).toEqual([])
+    expect(getModelCosts('code-review')).toBeNull()
+    expect(getModelCosts('auto-review')).toBeNull()
+    expect(calculateCost('codex-code-review', 1_000_000, 1_000_000, 0, 0, 0)).toBe(0)
   })
 })
 

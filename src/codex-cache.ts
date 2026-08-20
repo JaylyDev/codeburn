@@ -21,7 +21,9 @@ import type { ParsedProviderCall } from './providers/types.js'
 // entry without them simply re-parses in full once and gains them.
 // v9: parse large session_meta records structurally so nested provenance.model
 // cannot overwrite the model selected by turn_context.
-const CODEX_CACHE_VERSION = 9
+// v10: builtin alias prices `codex-auto-review` as gpt-5.4 (#1047). Exact-hit
+// cache entries still hold the pre-alias $0; bump so unchanged rollouts reprice.
+const CODEX_CACHE_VERSION = 10
 const CACHE_FILE = 'codex-results.json'
 
 export type CodexFileFingerprint = { dev: number; ino: number; mtimeMs: number; sizeBytes: number }
