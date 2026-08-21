@@ -1,4 +1,4 @@
-import { createHash } from 'crypto'
+import { createHmac } from 'crypto'
 import type { DecodeContext } from '../../contracts.js'
 import type { RecordDiagnostic } from '../../diagnostics.js'
 import type {
@@ -1081,7 +1081,7 @@ function decodeChatSession(envelope: Extract<CopilotRecordEnvelope, { kind: 'cha
   }
 }
 
-function decodeJetBrains(envelope: Extract<CopilotRecordEnvelope, { kind: 'jetbrains' }>, seen: Set<string>, calls: CopilotDecodedCall[]): void {
+function decodeJetBrains(envelope: Extract<CopilotRecordEnvelope, { kind: 'jetbrains' }>, seen: Set<string>, calls: CopilotDecodedCall[], privacyKey: string): void {
   const raw = envelope.raw
   const sessionId = envelope.sessionId
   const mtime = envelope.mtime
@@ -1103,7 +1103,19 @@ function decodeJetBrains(envelope: Extract<CopilotRecordEnvelope, { kind: 'jetbr
     // One .db holds many chat tabs; group each turn under its own
     // conversation so the user sees one session per tab, not per file.
     const convId = turn.conversationId || sessionId
-    const contentHash = createHash('sha256').update(turn.replyText).digest('hex').slice(0, 12)
+    // The content digest is KEYED with the host's privacy key (D1), never a
+    // bare sha256: this dedup key is derived from assistant reply TEXT and
+    // crosses into the emitted envelope (observations.dedupKey) and the CLI
+    // ledger, so an unkeyed 12-hex digest of short replies ("OK", "Done.")
+    // would be dictionary-attackable. HMAC keeps the dedup key deterministic
+    // across re-parses (which is what the durable-store dedup needs) while
+    // binding it to the host's key.
+    //
+    // The CLI's bridged rich-decode path threads the real host privacy key
+    // (bridge.ts -> getHostPrivacyKey()), so the digest is keyed on every
+    // path; the key is per-install stable, so the dedup key stays stable
+    // across re-parses, which is what the durable copilot store needs.
+    const contentHash = createHmac('sha256', privacyKey).update(turn.replyText).digest('hex').slice(0, 12)
     const nth = (perContentIndex.get(`${convId}:${contentHash}`) ?? 0) + 1
     perContentIndex.set(`${convId}:${contentHash}`, nth)
     const dedupKey = `copilot:jb:${convId}:${contentHash}:${nth}`
@@ -1294,7 +1306,7 @@ export function decodeCopilot(input: CopilotDecodeInput): CopilotDecodeResult {
   switch (envelope.kind) {
     case 'jsonl':       decodeJsonl(envelope, seen, calls); break
     case 'chatsession': decodeChatSession(envelope, seen, calls); break
-    case 'jetbrains':   decodeJetBrains(envelope, seen, calls); break
+    case 'jetbrains':   decodeJetBrains(envelope, seen, calls, input.context.privacyKey); break
     case 'otel':        decodeOtel(envelope, seen, calls); break
   }
   return { calls, diagnostics: [] }
