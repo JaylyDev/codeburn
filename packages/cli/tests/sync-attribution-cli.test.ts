@@ -153,5 +153,7 @@ describe('sync push --attribution (CLI level)', () => {
     expect(names).toContain('codeburn.commit')                // commit span
     const wire = JSON.stringify(idp.tracesRequests)
     expect(wire).toContain('github.com/acme/cli-widget')
+    expect(wire).not.toContain(repoDir)
+    expect(wire).not.toContain('feat: recent')
   })
 })
