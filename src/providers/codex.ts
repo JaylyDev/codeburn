@@ -879,7 +879,10 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             const activeMs = durationMs - toolWaitMs
             if (activeMs <= 0) continue
             for (const call of pendingTaskCalls) {
-              const generated = call.outputTokens + call.reasoningTokens
+              // Reasoning is already inside output_tokens (#1075/#1078); the
+              // throughput numerator must agree with the cost numerator or
+              // Tok/s reads high for reasoning-heavy calls (#1079).
+              const generated = billableOutputTokens('codex', call.outputTokens, call.reasoningTokens)
               if (generated <= 0) continue
               call.activeGeneratedTokens = generated
               call.activeDurationMs = activeMs * (generated / taskGeneratedTokens)
@@ -1140,7 +1143,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             ...(pendingLocRemoved ? { locRemoved: pendingLocRemoved } : {}),
             ...(pendingEditFailed ? { editFailed: pendingEditFailed } : {}),
           })
-          taskGeneratedTokens += outputTokens + reasoningTokens
+          taskGeneratedTokens += billableOutputTokens('codex', outputTokens, reasoningTokens)
 
           pendingTools = []
           pendingToolSequence = []

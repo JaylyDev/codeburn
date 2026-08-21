@@ -722,7 +722,9 @@ describe('codex provider - JSONL parsing', () => {
       reasoningTokens: 20,
       tools: ['Bash'],
       activeDurationMs: 7000,
-      activeGeneratedTokens: 120,
+      // Reasoning (20) is a subset of output_tokens (100), not additive
+      // (#1075/#1078/#1079): the billable/throughput numerator is 100, not 120.
+      activeGeneratedTokens: 100,
       toolWaitMs: 3000,
     })
   })

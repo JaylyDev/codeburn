@@ -27,7 +27,14 @@ import type { ParsedProviderCall } from './providers/types.js'
 // output, and cache_write_input_tokens is carved out of the input bucket. This
 // file stores each call's costUSD and token buckets verbatim, so entries
 // written by v10 carry the old (overstated) cost and must be re-derived.
-export const CODEX_CACHE_VERSION = 11
+// v13: codex throughput fix (#1079) - activeGeneratedTokens was summing
+// output + reasoning, the same double-count Fix A removed from cost. This
+// file stores activeGeneratedTokens/activeDurationMs/toolWaitMs verbatim (not
+// re-derived on read), so v11 entries carry the overstated numerator and must
+// re-parse. Not 12: v12 is claimed by feat/core-extraction's own port of this
+// throughput feature (PR #1086), so reusing it would let two incompatible
+// schemas share a filename.
+export const CODEX_CACHE_VERSION = 13
 export const CODEX_LEGACY_CACHE_FILE = 'codex-results.json'
 export function codexCacheFileName(version = CODEX_CACHE_VERSION): string {
   return `codex-results.v${version}.json`

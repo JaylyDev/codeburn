@@ -286,7 +286,11 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // models with an explicit cache-write rate. The bucket move does NOT self-heal
   // on read (cached entries store the buckets, not the raw event), so cached
   // sessions must re-parse.
-  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1-session-meta-fields-v1-codex-pricing-v1',
+  // codex-tps-v1 (#1079): activeGeneratedTokens summed output + reasoning, the
+  // same double-count codex-pricing-v1 removed from cost. Cached entries store
+  // activeGeneratedTokens/activeDurationMs/toolWaitMs verbatim (cachedCallToApiCall
+  // passes them through without recomputing), so this does NOT self-heal either.
+  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1-session-meta-fields-v1-codex-pricing-v1-codex-tps-v1',
   cursor: 'composer-anchored-crediting-v1-est-cost',
   'cursor-agent': 'workspaceless-transcript-v1',
   // source-provenance-v1 (#944): CLI sessions were misread as VS Code

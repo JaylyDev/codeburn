@@ -1,6 +1,8 @@
 import { open, stat } from 'node:fs/promises'
 import { StringDecoder } from 'node:string_decoder'
 
+import { billableOutputTokens } from './models.js'
+
 export type CodexThroughputPoint = {
   timestamp: string
   model?: string
@@ -400,7 +402,9 @@ export class CodexThroughputReader {
       state.previousOutput = total?.output_tokens ?? state.previousOutput
       state.previousReasoning = total?.reasoning_output_tokens ?? state.previousReasoning
     }
-    const generatedTokens = outputTokens + reasoningTokens
+    // Reasoning is already inside output_tokens (#1075/#1078); same numerator
+    // as the cost path so live Tok/s can't drift from billed tokens (#1079).
+    const generatedTokens = billableOutputTokens('codex', outputTokens, reasoningTokens)
     if (generatedTokens <= 0) return
     const timestampMs = Date.parse(entry.timestamp)
     if (!Number.isFinite(timestampMs)) return
