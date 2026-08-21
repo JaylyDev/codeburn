@@ -4,7 +4,7 @@ import { randomBytes } from 'crypto'
 import { join, resolve } from 'path'
 import { AsyncLocalStorage } from 'node:async_hooks'
 
-import { getCodeburnCacheDir } from './cache-dir.js'
+import { getCodeburnCacheDir, readExistingTextFile } from './cache-dir.js'
 import type { ParsedProviderCall } from './providers/types.js'
 
 // v4: attribute MCP calls emitted as event_msg/mcp_tool_call_end (issue #478).
@@ -27,8 +27,11 @@ import type { ParsedProviderCall } from './providers/types.js'
 // output, and cache_write_input_tokens is carved out of the input bucket. This
 // file stores each call's costUSD and token buckets verbatim, so entries
 // written by v10 carry the old (overstated) cost and must be re-derived.
-const CODEX_CACHE_VERSION = 11
-const CACHE_FILE = 'codex-results.json'
+export const CODEX_CACHE_VERSION = 11
+export const CODEX_LEGACY_CACHE_FILE = 'codex-results.json'
+export function codexCacheFileName(version = CODEX_CACHE_VERSION): string {
+  return `codex-results.v${version}.json`
+}
 
 export type CodexFileFingerprint = { dev: number; ino: number; mtimeMs: number; sizeBytes: number }
 type FileFingerprint = CodexFileFingerprint
@@ -74,7 +77,15 @@ export function withCodexCacheDirectory<T>(cacheDir: string, operation: () => T)
 }
 
 function getCachePath(cacheDir: string): string {
-  return join(cacheDir, CACHE_FILE)
+  return join(cacheDir, codexCacheFileName())
+}
+
+function getLegacyCachePath(cacheDir: string): string {
+  return join(cacheDir, CODEX_LEGACY_CACHE_FILE)
+}
+
+function isCurrentCache(cache: ResultCache): boolean {
+  return cache.version === CODEX_CACHE_VERSION && !!cache.files && typeof cache.files === 'object'
 }
 
 // Embedded consumers can change CODEBURN_CACHE_DIR without reloading this
@@ -91,15 +102,33 @@ export function clearCodexMemCaches(): void {
 async function loadCache(cacheDir: string): Promise<ResultCache> {
   const inMemory = memCaches.get(cacheDir)
   if (inMemory) return inMemory
+  const empty = { version: CODEX_CACHE_VERSION, files: {} }
+  const versioned = await readExistingTextFile(getCachePath(cacheDir))
+  if (versioned.status === 'ok') {
+    try {
+      const cache = JSON.parse(versioned.text) as ResultCache
+      if (isCurrentCache(cache)) {
+        memCaches.set(cacheDir, cache)
+        return cache
+      }
+    } catch {}
+    memCaches.set(cacheDir, empty)
+    return empty
+  }
+  if (versioned.status === 'unreadable') {
+    memCaches.set(cacheDir, empty)
+    return empty
+  }
+  // Versioned file is absent (ENOENT). Adopt the unsuffixed file only when its
+  // version matches — old binaries still own that path; we never write or delete it.
   try {
-    const raw = await readFile(getCachePath(cacheDir), 'utf-8')
+    const raw = await readFile(getLegacyCachePath(cacheDir), 'utf-8')
     const cache = JSON.parse(raw) as ResultCache
-    if (cache.version === CODEX_CACHE_VERSION && cache.files && typeof cache.files === 'object') {
+    if (isCurrentCache(cache)) {
       memCaches.set(cacheDir, cache)
       return cache
     }
   } catch {}
-  const empty = { version: CODEX_CACHE_VERSION, files: {} }
   memCaches.set(cacheDir, empty)
   return empty
 }

@@ -7,12 +7,14 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import {
   clearCodexMemCaches,
+  codexCacheFileName,
   fingerprintFile,
   flushCodexCache,
   readCachedCodexResults,
   writeCachedCodexResults,
 } from '../src/codex-cache.js'
 import {
+  antigravityCacheFileName,
   clearAntigravityCacheStates,
   createAntigravityProvider,
   flushAntigravityCache,
@@ -53,7 +55,7 @@ async function seedAntigravityCache(
 ): Promise<void> {
   const sourceStat = await stat(sourcePath)
   await mkdir(cacheDir, { recursive: true })
-  await writeFile(join(cacheDir, 'antigravity-results.json'), JSON.stringify({
+  await writeFile(join(cacheDir, antigravityCacheFileName()), JSON.stringify({
     version: 5,
     cascades: {
       shared: {
@@ -107,7 +109,7 @@ describe('call-time CODEBURN_CACHE_DIR isolation', () => {
     await writeCachedCodexResults(sourcePath, 'project-b', [call('codex', 'from-b')], fingerprint!)
     await flushCodexCache()
 
-    const diskB = JSON.parse(await readFile(join(cacheB, 'codex-results.json'), 'utf8'))
+    const diskB = JSON.parse(await readFile(join(cacheB, codexCacheFileName()), 'utf8'))
     expect(diskB.files[sourcePath].calls.map((entry: ParsedProviderCall) => entry.model)).toEqual(['from-b'])
 
     process.env['CODEBURN_CACHE_DIR'] = cacheA
@@ -129,12 +131,12 @@ describe('call-time CODEBURN_CACHE_DIR isolation', () => {
     await writeCachedCodexResults(sourceB, 'project-b', [call('codex', 'dirty-b')], (await fingerprintFile(sourceB))!)
     await flushCodexCache()
 
-    const diskB = JSON.parse(await readFile(join(cacheB, 'codex-results.json'), 'utf8'))
+    const diskB = JSON.parse(await readFile(join(cacheB, codexCacheFileName()), 'utf8'))
     expect(Object.keys(diskB.files)).toEqual([sourceB])
 
     process.env['CODEBURN_CACHE_DIR'] = cacheA
     await flushCodexCache()
-    const diskA = JSON.parse(await readFile(join(cacheA, 'codex-results.json'), 'utf8'))
+    const diskA = JSON.parse(await readFile(join(cacheA, codexCacheFileName()), 'utf8'))
     expect(Object.keys(diskA.files)).toEqual([sourceA])
   })
 
@@ -200,9 +202,9 @@ describe('call-time CODEBURN_CACHE_DIR isolation', () => {
     expect(projects.some(project => project.sessions.some(session =>
       session.turns.some(turn => turn.assistantCalls.some(entry => entry.provider === 'codex'))
     ))).toBe(true)
-    expect(existsSync(join(cacheA, 'codex-results.json'))).toBe(true)
-    expect(existsSync(join(cacheB, 'codex-results.json'))).toBe(false)
-    const diskA = JSON.parse(await readFile(join(cacheA, 'codex-results.json'), 'utf8'))
+    expect(existsSync(join(cacheA, codexCacheFileName()))).toBe(true)
+    expect(existsSync(join(cacheB, codexCacheFileName()))).toBe(false)
+    const diskA = JSON.parse(await readFile(join(cacheA, codexCacheFileName()), 'utf8'))
     expect(diskA.files[sourcePath].calls).toHaveLength(1)
     clearSessionCache()
   })
@@ -238,10 +240,10 @@ describe('call-time CODEBURN_CACHE_DIR isolation', () => {
     process.env['CODEBURN_CACHE_DIR'] = cacheB
     await flushAntigravityCache(new Set(), cacheA)
 
-    expect(existsSync(join(cacheB, 'antigravity-results.json'))).toBe(true)
-    const diskB = JSON.parse(await readFile(join(cacheB, 'antigravity-results.json'), 'utf8'))
+    expect(existsSync(join(cacheB, antigravityCacheFileName()))).toBe(true)
+    const diskB = JSON.parse(await readFile(join(cacheB, antigravityCacheFileName()), 'utf8'))
     expect(diskB.cascades.shared.calls[0].model).toBe('from-b')
-    const diskA = JSON.parse(await readFile(join(cacheA, 'antigravity-results.json'), 'utf8'))
+    const diskA = JSON.parse(await readFile(join(cacheA, antigravityCacheFileName()), 'utf8'))
     expect(diskA.cascades).toEqual({})
   })
 
@@ -261,9 +263,9 @@ describe('call-time CODEBURN_CACHE_DIR isolation', () => {
     // Another process republishes both cache files. Without the clear, the
     // resident keeps serving its warm copies.
     await seedAntigravityCache(cacheDir, antigravitySource, 'after')
-    const codexDisk = JSON.parse(await readFile(join(cacheDir, 'codex-results.json'), 'utf8'))
+    const codexDisk = JSON.parse(await readFile(join(cacheDir, codexCacheFileName()), 'utf8'))
     codexDisk.files[codexSource].calls[0].model = 'after'
-    await writeFile(join(cacheDir, 'codex-results.json'), JSON.stringify(codexDisk))
+    await writeFile(join(cacheDir, codexCacheFileName()), JSON.stringify(codexDisk))
 
     expect((await readCachedCodexResults(codexSource))?.calls.map(entry => entry.model)).toEqual(['before'])
     expect(await readAntigravityModel(antigravitySource)).toBe('before')
