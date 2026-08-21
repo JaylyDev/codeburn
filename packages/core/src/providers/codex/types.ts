@@ -28,6 +28,11 @@ export type CodexEntry = {
     forked_from_id?: string
     model?: string
     name?: string
+    turn_id?: string
+    call_id?: string
+    started_at?: number
+    duration_ms?: number
+    duration?: { secs?: number; nanos?: number } | string
     content?: Array<{ type?: string; text?: string }>
     info?: {
       model?: string
@@ -75,6 +80,15 @@ export type CodexDecodedCall = {
   locRemoved?: number
   editFailed?: number
   costIsEstimated?: boolean
+  // Tool-excluded active timing, attributed from the enclosing task's
+  // task_started/task_complete window (see decode.ts). `activeDurationMs` is the
+  // task duration minus recorded tool-wait intervals, split across the task's
+  // calls proportionally to their generated tokens; `toolWaitMs` is the excluded
+  // wait share. Present only when the task recorded both timing and generated
+  // tokens.
+  activeDurationMs?: number
+  activeGeneratedTokens?: number
+  toolWaitMs?: number
 }
 
 /**
@@ -131,4 +145,13 @@ export type CodexDecodeState = {
   turnCounter: number
   currentTurnId: string
   seenKeys: string[]
+  // Tool-excluded active timing. These two are written ONLY into a state
+  // snapshotted at a `task_started` boundary (see CodexDecodeResult.checkpoint),
+  // where every per-task accumulator is provably empty: a pass resuming from
+  // such a state starts INSIDE that task having decoded none of its records, so
+  // it rebuilds the whole window itself. `taskOpen` is what tells it so; a state
+  // captured anywhere else leaves it false and a task_complete whose window this
+  // pass never saw attributes nothing rather than attributing a partial window.
+  taskOpen?: boolean
+  taskStartedAt?: number
 }

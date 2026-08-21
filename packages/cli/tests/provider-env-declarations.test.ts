@@ -28,6 +28,7 @@ import { getAllProviders } from '../src/providers/index.js'
 // the guard: add it, with the provider(s) the reads serve.
 const FILE_PROVIDERS: Record<string, string[]> = {
   'claude.ts': ['claude'],
+  'cline-cli.ts': ['cline-cli'],
   'codebuff.ts': ['codebuff'],
   'codewhale.ts': ['codewhale'],
   'codex.ts': ['codex'],

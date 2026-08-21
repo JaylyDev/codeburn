@@ -32,7 +32,17 @@ import type { ParsedProviderCall } from './providers/types.js'
 // re-parse of multi-GB rollout corpora over that is a bad trade — deliberately
 // NOT bumped. The daily-cache bump alone propagates the discovery widening:
 // newly-eligible files aren't in this cache yet and parse fresh regardless.
-const CODEX_CACHE_VERSION = 8
+//
+// v12: tool-excluded active timing. Every cached call can now carry
+// activeDurationMs / activeGeneratedTokens / toolWaitMs, the stored `state` can
+// carry the task-boundary window flag, and `callCount` marks how much of
+// `calls` a resumed decode may replay (the rest re-derives from the last
+// task_started). Cached entries have none of that, so bump once and let
+// unchanged sessions re-decode. This takes 12 rather than 9: main's own ladder
+// has since reached 11 (#1078), and a shared version number on two different
+// payload shapes would let a cache written by either line be read as current by
+// the other.
+const CODEX_CACHE_VERSION = 12
 const CACHE_FILE = 'codex-results.json'
 
 type FileFingerprint = { mtimeMs: number; sizeBytes: number }
@@ -41,8 +51,15 @@ type FileEntry = {
   mtimeMs: number
   sizeBytes: number
   project: string
+  // Resume point: the byte offset after the last `task_started` line this file
+  // decoded past, with `state` snapshotted there and `callCount` counting the
+  // calls emitted before it. An appended tail resumes from that boundary and
+  // re-derives the calls beyond it, so a task whose task_complete lands in the
+  // appended region gets its timing from a whole re-read window instead of a
+  // patch applied to calls already served.
   byteOffset: number
   state: CodexDecodeState
+  callCount: number
   calls: ParsedProviderCall[]
 }
 

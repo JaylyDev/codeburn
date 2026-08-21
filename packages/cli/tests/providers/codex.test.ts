@@ -874,4 +874,235 @@ describe('codex provider - token_count timestamps cannot poison the day aggregat
     expect(days.map(d => d.date)).toEqual(['2026-04-14'])
     expect(days[0]!.calls).toBe(1)
   })
+
+  it('does not treat a nested session_meta model as the active turn model', async () => {
+    const largeSessionMeta = JSON.stringify({
+      type: 'session_meta',
+      timestamp: '2026-04-14T10:00:00Z',
+      payload: {
+        cwd: '/Users/test/model-switch',
+        originator: 'codex-cli',
+        session_id: 'sess-model-switch',
+        base_instructions: {
+          provenance: { type: 'model', model: 'gpt-5.6-sol' },
+          text: 'x'.repeat(40_000),
+        },
+      },
+    })
+    const turnContext = JSON.stringify({
+      type: 'turn_context',
+      timestamp: '2026-04-14T10:00:01Z',
+      payload: { model: 'gpt-5.6-luna' },
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-model-switch.jsonl', [
+      largeSessionMeta,
+      turnContext,
+      tokenCount({ timestamp: '2026-04-14T10:00:02Z', last: { input: 100, output: 50 }, total: { total: 150 } }),
+      largeSessionMeta,
+      tokenCount({ timestamp: '2026-04-14T10:00:03Z', last: { input: 200, output: 100 }, total: { total: 450 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls.map(call => call.model)).toEqual(['gpt-5.6-luna', 'gpt-5.6-luna'])
+  })
+
+  it('reads session_meta cwd/session_id/originator at payload depth 1, not the first nested same-name key', async () => {
+    const largeSessionMeta = JSON.stringify({
+      type: 'session_meta',
+      timestamp: '2026-04-14T10:00:00Z',
+      payload: {
+        dynamic_tools: [{
+          name: 'shadow-tool',
+          cwd: '/shadow/cwd',
+          originator: 'shadow-originator',
+          session_id: 'shadow-session',
+          forked_from_id: 'shadow-fork',
+          model_provider: 'shadow-provider',
+        }],
+        base_instructions: { text: 'x'.repeat(40_000) },
+        cwd: '/Users/test/real-project',
+        originator: 'codex-cli',
+        session_id: 'sess-real',
+        model: 'gpt-5.6-luna',
+        model_provider: 'openai',
+        name: 'real-session-name',
+      },
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-nested-keys.jsonl', [
+      largeSessionMeta,
+      functionCall('exec_command'),
+      tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 100, output: 50 }, total: { total: 150 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.sessionId).toBe('sess-real')
+    expect(calls[0]!.workingDirectory).toBe('/Users/test/real-project')
+    expect(calls[0]!.projectPath).toBe('/Users/test/real-project')
+    expect(calls[0]!.model).toBe('gpt-5.6-luna')
+    expect(calls[0]!.tools).toEqual(['Bash'])
+  })
+
+  it('parses large rollout lines and computes active timing across a tool call', async () => {
+    // The oversized line under test is task_complete: it appends the final
+    // assistant message BEFORE its duration fields, so a head-only scan would
+    // lose the timing entirely.
+    const largeCompleteLine = JSON.stringify({
+      type: 'event_msg',
+      timestamp: '2026-04-14T10:01:11Z',
+      payload: { type: 'task_complete', last_agent_message: 'x'.repeat(40_000), duration_ms: 10_000 },
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-timing.jsonl', [
+      sessionMeta({ session_id: 'sess-timing', model: 'gpt-5.5' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started', turn_id: 'turn-1' } }),
+      userMessage('run the tool'),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:02Z', payload: { type: 'function_call', call_id: 'call-1', name: 'exec_command' } }),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:05Z', payload: { type: 'function_call_output', call_id: 'call-1', output: 'done' } }),
+      tokenCount({ timestamp: '2026-04-14T10:01:10Z', last: { input: 100, output: 100, reasoning: 20 }, total: { input: 100, output: 100, reasoning: 20, total: 220 } }),
+      largeCompleteLine,
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({
+      outputTokens: 100,
+      reasoningTokens: 20,
+      tools: ['Bash'],
+      activeDurationMs: 7000,
+      activeGeneratedTokens: 120,
+      toolWaitMs: 3000,
+    })
+  })
+
+  it('subtracts native MCP wait time from active timing', async () => {
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-mcp-timing.jsonl', [
+      sessionMeta({ session_id: 'sess-mcp-timing', model: 'gpt-5.5' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started' } }),
+      userMessage('look up the issue'),
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: '2026-04-14T10:00:05Z',
+        payload: {
+          type: 'mcp_tool_call_end',
+          call_id: 'mcp-1',
+          invocation: { server: 'github', tool: 'get_issue', arguments: {} },
+          duration: { secs: 3, nanos: 0 },
+        },
+      }),
+      tokenCount({
+        timestamp: '2026-04-14T10:00:08Z',
+        last: { input: 300, output: 100 },
+        total: { total: 400 },
+      }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:10Z', payload: { type: 'task_complete', duration_ms: 10_000 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ activeDurationMs: 7000, toolWaitMs: 3000 })
+  })
+
+  it('prefers payload-level duration over a nested duration_ms in large mcp_tool_call_end lines', async () => {
+    // Regression guard: a naive first-match regex would pick up the
+    // `duration_ms: 9999` inside invocation.arguments instead of the payload-level
+    // `duration: { secs: 3 }`. The depth-aware payload scan must win.
+    const largeMcpLine = JSON.stringify({
+      type: 'event_msg',
+      timestamp: '2026-04-14T10:00:05Z',
+      payload: {
+        type: 'mcp_tool_call_end',
+        call_id: 'mcp-duration-collision',
+        invocation: { server: 'github', tool: 'get_issue', arguments: { duration_ms: 9999, body: 'x'.repeat(40_000) } },
+        duration: { secs: 3, nanos: 0 },
+        result: { Ok: { content: [{ type: 'text', text: 'x'.repeat(40_000) }] } },
+      },
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-mcp-duration-collision.jsonl', [
+      sessionMeta({ session_id: 'sess-mcp-duration-collision', model: 'gpt-5.5' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started' } }),
+      userMessage('look up the issue'),
+      largeMcpLine,
+      tokenCount({ timestamp: '2026-04-14T10:00:08Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:10Z', payload: { type: 'task_complete', duration_ms: 10_000 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    // 3s of the 10s task is MCP wait: the payload-level `duration` won over the
+    // 9999 buried in invocation.arguments (which would have zeroed active time).
+    expect(calls[0]).toMatchObject({ activeDurationMs: 7000, toolWaitMs: 3000 })
+  })
+
+  it('attributes a task_complete over everything since the last task_started, even across a suppressed one', async () => {
+    // A mid-file session_meta carrying forked_from_id re-arms the fork-replay
+    // cutoff, which swallows the task_started right behind it while its
+    // task_complete lands past the cutoff. Attribution then has to span both
+    // turns, exactly as it did before calls were buffered per task.
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-suppressed-task-start.jsonl', [
+      sessionMeta({ session_id: 'sess-suppressed-start', model: 'gpt-5.5' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started' } }),
+      userMessage('first ask'),
+      tokenCount({ timestamp: '2026-04-14T10:00:05Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:10Z', payload: { type: 'task_complete', duration_ms: 10_000 } }),
+      sessionMeta({ timestamp: '2026-04-14T10:00:11Z', session_id: 'sess-suppressed-start', model: 'gpt-5.5', forked_from_id: 'sess-parent' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:12Z', payload: { type: 'task_started' } }),
+      userMessage('second ask', '2026-04-14T10:00:18Z'),
+      tokenCount({ timestamp: '2026-04-14T10:00:20Z', last: { input: 300, output: 300 }, total: { total: 1000 } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:25Z', payload: { type: 'task_complete', duration_ms: 5_000 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(2)
+    // The second task_complete re-attributes the first turn too, so the 5s
+    // window is split across both by generated tokens rather than leaving the
+    // first turn pinned to its own 10s window.
+    expect(calls[0]!.activeDurationMs).toBeCloseTo(1250, 6)
+    expect(calls[1]!.activeDurationMs).toBeCloseTo(3750, 6)
+    expect(calls[0]!.activeDurationMs! + calls[1]!.activeDurationMs!).toBeCloseTo(5000, 6)
+  })
+
+  it('omits active timing when recorded tool wait consumes the task duration', async () => {
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-degenerate-timing.jsonl', [
+      sessionMeta({ session_id: 'sess-degenerate-timing', model: 'gpt-5.5' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started' } }),
+      userMessage('wait for the tool'),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'function_call', call_id: 'call-1', name: 'exec_command' } }),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:10Z', payload: { type: 'function_call_output', call_id: 'call-1', output: 'done' } }),
+      tokenCount({ timestamp: '2026-04-14T10:00:12Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:13Z', payload: { type: 'task_complete', duration_ms: 10_000 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.activeDurationMs).toBeUndefined()
+    expect(calls[0]!.toolWaitMs).toBeUndefined()
+  })
 })

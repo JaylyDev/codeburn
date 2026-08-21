@@ -353,3 +353,68 @@ describe('codex decoder — untrusted fields from structurally-valid rollouts', 
     expect(calls[0]!.deduplicationKey).not.toContain('object')
   })
 })
+
+// Tool-excluded active timing resumes ONLY from a task_started boundary: that is
+// the one point where every per-task accumulator is empty, so a later pass can
+// rebuild the whole window instead of patching calls it already emitted.
+const TASK_CORPUS: string[] = [
+  sessionMeta({ session_id: 'sess-task', timestamp: '2026-04-14T10:00:00Z' }),
+  // Task 1: 10s wall, 3s of it tool wait.
+  JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started' } }),
+  userMessage('run the tool', '2026-04-14T10:00:01Z'),
+  JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:02Z', payload: { type: 'function_call', call_id: 'c1', name: 'exec_command' } }),
+  JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:05Z', payload: { type: 'function_call_output', call_id: 'c1', output: 'ok' } }),
+  tokenCount({ timestamp: '2026-04-14T10:00:08Z', last: { input: 300, output: 100 }, total: { input: 300, output: 100, total: 400 } }),
+  JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:10Z', payload: { type: 'task_complete', duration_ms: 10_000 } }),
+  // Task 2: 5s wall, no tool wait.
+  JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:11Z', payload: { type: 'task_started' } }),
+  userMessage('now the tests', '2026-04-14T10:00:12Z'),
+  tokenCount({ timestamp: '2026-04-14T10:00:14Z', last: { input: 200, output: 200 }, total: { input: 500, output: 300, total: 900 } }),
+  JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:16Z', payload: { type: 'task_complete', duration_ms: 5_000 } }),
+]
+const TASK2_STARTED_INDEX = 7
+const MID_TASK2_INDEX = 9 // task 2's token_count; its task_complete is the next record
+
+describe('codex decoder — task-timing checkpoint', () => {
+  it('attributes each task its own tool-excluded active window', () => {
+    const cold = decodeCold(TASK_CORPUS)
+    expect(cold).toHaveLength(2)
+    expect(cold[0]).toMatchObject({ activeDurationMs: 7000, activeGeneratedTokens: 100, toolWaitMs: 3000 })
+    expect(cold[1]).toMatchObject({ activeDurationMs: 5000, activeGeneratedTokens: 200, toolWaitMs: 0 })
+  })
+
+  it('reports the last task_started as the resume checkpoint, with the calls before it', () => {
+    const { checkpoint } = decodeCodex({ records: TASK_CORPUS, context })
+    expect(checkpoint?.recordIndex).toBe(TASK2_STARTED_INDEX)
+    // Task 1's call is complete and replayable; task 2's is not, because a
+    // later pass re-derives it from this very boundary.
+    expect(checkpoint?.callCount).toBe(1)
+    expect(checkpoint?.state.taskOpen).toBe(true)
+  })
+
+  it('resuming at the checkpoint deep-equals a cold decode, timing included', () => {
+    const first = decodeCodex({ records: TASK_CORPUS.slice(0, MID_TASK2_INDEX + 1), context })
+    const checkpoint = first.checkpoint!
+    // What the host persists: the calls before the boundary, and the boundary
+    // state as plain JSON.
+    const replayed = first.calls.slice(0, checkpoint.callCount)
+    const serialized: CodexDecodeState = JSON.parse(JSON.stringify(checkpoint.state))
+    const second = decodeCodex({ records: TASK_CORPUS.slice(checkpoint.recordIndex + 1), context, state: serialized })
+    expect([...replayed, ...second.calls]).toEqual(decodeCold(TASK_CORPUS))
+  })
+
+  it('a mid-task split that resumes from end-of-file attributes no timing rather than a partial window', () => {
+    // The end-of-input state deliberately declares no open task, so a
+    // task_complete whose window this pass never saw stamps nothing. Wrong
+    // timing (a whole task's active time spread over part of its tokens) would
+    // be worse than none.
+    const first = decodeCodex({ records: TASK_CORPUS.slice(0, MID_TASK2_INDEX + 1), context })
+    const serialized: CodexDecodeState = JSON.parse(JSON.stringify(first.state))
+    expect(serialized.taskOpen).toBe(false)
+    const second = decodeCodex({ records: TASK_CORPUS.slice(MID_TASK2_INDEX + 1), context, state: serialized })
+    const calls = [...first.calls, ...second.calls]
+    expect(calls).toHaveLength(2)
+    expect(calls[1]!.activeDurationMs).toBeUndefined()
+    expect(calls[1]!.toolWaitMs).toBeUndefined()
+  })
+})
