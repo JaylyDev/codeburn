@@ -1082,6 +1082,11 @@ function decodeChatSession(envelope: Extract<CopilotRecordEnvelope, { kind: 'cha
 }
 
 function decodeJetBrains(envelope: Extract<CopilotRecordEnvelope, { kind: 'jetbrains' }>, seen: Set<string>, calls: CopilotDecodedCall[], privacyKey: string): void {
+  // Same throw-on-empty discipline as fingerprint.ts and sanitizeDetail: a
+  // keyed digest must never silently degrade to an effectively unkeyed one.
+  // createHmac accepts '' happily, which would hand back a digest anyone can
+  // recompute from the reply text — the very weakness the HMAC replaced.
+  if (!privacyKey) throw new Error('privacyKey is required')
   const raw = envelope.raw
   const sessionId = envelope.sessionId
   const mtime = envelope.mtime

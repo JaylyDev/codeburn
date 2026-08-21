@@ -201,6 +201,8 @@ describe('decodeCopilot — jetbrains arm', () => {
       return calls[0]!.deduplicationKey
     }
 
+    expect(() => keyFor('')).toThrow(/privacyKey is required/) // never a degenerate key
+
     const keyA = keyFor('privacy-key-A')
     const keyB = keyFor('privacy-key-B')
 
