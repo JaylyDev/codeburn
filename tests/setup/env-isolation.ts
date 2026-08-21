@@ -1,12 +1,13 @@
 // Vitest setup file: isolates every test from the developer's shell environment.
 //
 // codeburn discovers sessions through a long list of provider-specific env
-// vars (CLAUDE_CONFIG_DIR, CODEX_HOME, CRUSH_GLOBAL_DATA, …) and via HOME /
-// XDG_* / APPDATA / LOCALAPPDATA. Without this file, any value set in the
-// developer's shell (e.g. CLAUDE_CONFIG_DIRS=/Users/me/.claude:…) bleeds into
+// vars (CLAUDE_CONFIG_DIR, CODEX_HOME, HERMES_HOME, CRUSH_GLOBAL_DATA, …) and
+// via HOME / XDG_* / APPDATA / LOCALAPPDATA. Without this file, any value set
+// in the developer's shell (e.g. HERMES_HOME=/Users/me/.hermes) bleeds into
 // fixture-based tests: the parser reads the developer's REAL sessions instead
 // of the temp-dir fixture, producing nonsense totals and false failures that
-// pass on a clean CI runner.
+// pass on a clean CI runner. tests/env-isolation-declarations.test.ts fails
+// closed if PROVIDER_ENV_VARS grows a data-dir override that is not listed.
 //
 // What this file does:
 //   1. Mints an empty sandbox temp dir once per worker.
@@ -56,26 +57,36 @@ const CLEARED = [
   'CODEWHALE_HOME',
   'CRUSH_GLOBAL_DATA',
   'CODEBUFF_DATA_DIR',
+  'DSH_HOME',
   'FACTORY_DIR',
   'GOOSE_PATH_ROOT',
   'GROK_HOME',
+  'HERMES_HOME',
   'KIRO_HOME',
+  'KIMI_CODE_HOME',
   'KIMI_SHARE_DIR',
+  'LINGTAI_HOME',
+  'LINGTAI_TUI_GLOBAL_DIR',
+  'LINGTAI_TUI_HOME',
   'MUX_ROOT',
   'OPENCODE_DATA_DIR',
   'OPENCODE_DB_PREFIX',
+  'QUICKWORK_HOME',
   'QWEN_DATA_DIR',
   'VIBE_HOME',
   'WARP_DB_PATH',
   'ZS_DATA_DIR',
   // codeburn override dirs / paths
   'CODEBURN_CACHE_DIR',
+  'CODEBURN_COPILOT_GLOBAL_STORAGE_DIR',
   'CODEBURN_COPILOT_JETBRAINS_DIR',
   'CODEBURN_COPILOT_OTEL_DB',
   'CODEBURN_COPILOT_SESSION_STATE_DIR',
   'CODEBURN_COPILOT_WS_STORAGE_DIR',
   'CODEBURN_DESKTOP_SESSIONS_DIR',
   'CODEBURN_MUX_DIR',
+  'CODEBURN_OPEN_DESIGN_DIR',
+  'CODEBURN_OPENCLAUDE_DIR',
   'CODEBURN_ANTIGRAVITY_SETTINGS_PATH',
   // codeburn behavior toggles (set by the dev to tweak local runs)
   'CODEBURN_COPILOT_DISABLE_OTEL',
