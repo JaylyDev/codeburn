@@ -21,9 +21,12 @@ import type { ParsedProviderCall } from './providers/types.js'
 // entry without them simply re-parses in full once and gains them.
 // v9: parse large session_meta records structurally so nested provenance.model
 // cannot overwrite the model selected by turn_context.
-// v10: builtin alias prices `codex-auto-review` as gpt-5.4 (#1047). Exact-hit
-// cache entries still hold the pre-alias $0; bump so unchanged rollouts reprice.
-const CODEX_CACHE_VERSION = 10
+// v10: same depth-1 window for the rest of session_meta's raw string fields
+// (cwd/name/originator/session_id/forked_from_id/model_provider). (#1055)
+// v11: builtin alias prices `codex-auto-review` (#1047). Exact-hit cache
+// entries still hold the pre-alias $0; bump so unchanged rollouts reprice.
+// Must be max(#1055, this)+1 — both claimed v10 independently.
+const CODEX_CACHE_VERSION = 11
 const CACHE_FILE = 'codex-results.json'
 
 export type CodexFileFingerprint = { dev: number; ino: number; mtimeMs: number; sizeBytes: number }
