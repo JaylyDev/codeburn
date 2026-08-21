@@ -7,6 +7,7 @@ import { createHash } from 'crypto'
 import type { Provider, ProbeRoot, SessionSource, SessionParser } from './types.js'
 import { getShortModelName } from '../models.js'
 import { readConfig } from '../config.js'
+import { wslHomes } from '../wsl.js'
 
 export type ClaudeConfigSource = {
   id: string
@@ -39,6 +40,10 @@ function claudeConfigSourceId(path: string): string {
 function baseClaudeConfigLabel(path: string): string {
   const normalized = resolve(path)
   if (normalized === resolve(join(homedir(), '.claude'))) return 'Default Claude'
+  // Every WSL root basenames to ".claude", so name them by distro instead of
+  // letting makeUniqueLabels number them "claude 1", "claude 2" (#1059).
+  const wsl = /^\\\\wsl(?:\$|\.localhost)\\([^\\]+)\\/i.exec(path)
+  if (wsl) return `${wsl[1]} (WSL)`
   const name = basename(normalized).replace(/^\./, '').trim()
   return name || normalized
 }
@@ -67,6 +72,14 @@ function makeUniqueLabels(sources: ClaudeConfigSource[]): ClaudeConfigSource[] {
 /// ProjectSummary per project name in `src/parser.ts:scanProjectDirs`, so two
 /// dirs holding the same sanitized project slug naturally aggregate (#208).
 export async function getClaudeConfigDirs(): Promise<string[]> {
+  // WSL homes are additive, not an override: a Windows user who points
+  // CLAUDE_CONFIG_DIRS at a second Windows account still wants the sessions
+  // Claude Code wrote inside their distro (#1059). Off-win32 this is empty.
+  const wsl = wslHomes().map(home => join(home, '.claude'))
+  return dedupeResolved([...await configuredClaudeConfigDirs(), ...wsl])
+}
+
+async function configuredClaudeConfigDirs(): Promise<string[]> {
   const multi = process.env['CLAUDE_CONFIG_DIRS']
   if (multi !== undefined && multi !== '') {
     const dirs = multi
