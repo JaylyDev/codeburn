@@ -752,35 +752,6 @@ describe('codex provider - JSONL parsing', () => {
     expect(calls[0]).toMatchObject({ activeGeneratedTokens: 100, activeDurationMs: 13_000, toolWaitMs: 0 })
   })
 
-  it('REGRESSION (#1088 BUG-2): a partially fork-deduped task rate matches the undeduped rate', async () => {
-    // Two checkpoints generate 50 tokens each over a 10s task with no tool
-    // calls; the first is pre-marked as already-seen (as a fork replay would
-    // collide it) so only the second reaches pendingTaskCalls. The task's
-    // real active time (10s) still spans both checkpoints' work, so the
-    // survivor must be credited with only its proportional share (5s), not
-    // the full 10s -- giving 50 tokens / 5s = 10 tok/s, the same rate as if
-    // neither checkpoint had been deduped (100 tokens / 10s). If this ever
-    // reverts to crediting the full window, it reads 50 tokens / 10s = 5 tok/s.
-    const dedupedKey = 'codex:sess-dedup:50:0:0:50:0'
-    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-partial-dedup.jsonl', [
-      sessionMeta({ session_id: 'sess-dedup', model: 'gpt-5.5' }),
-      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started' } }),
-      userMessage('run the tool', '2026-04-14T10:00:00Z'),
-      tokenCount({ timestamp: '2026-04-14T10:00:04Z', last: { output: 50 }, total: { output: 50, total: 50 } }),
-      tokenCount({ timestamp: '2026-04-14T10:00:08Z', last: { output: 50 }, total: { output: 100, total: 100 } }),
-      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:10Z', payload: { type: 'task_complete', duration_ms: 10_000 } }),
-    ])
-
-    const provider = createCodexProvider(tmpDir)
-    const source = { path: filePath, project: 'test', provider: 'codex' }
-    const seenKeys = new Set<string>([dedupedKey])
-    const calls: ParsedProviderCall[] = []
-    for await (const call of provider.createSessionParser(source, seenKeys).parse()) calls.push(call)
-
-    expect(calls).toHaveLength(1)
-    expect(calls[0]).toMatchObject({ outputTokens: 50, activeGeneratedTokens: 50, activeDurationMs: 5_000 })
-  })
-
   it('#1088 BUG-8: reads a task_complete duration reported as {secs,nanos}, not only a plain number', async () => {
     // mcp_tool_call_end already tolerates {secs,nanos} and string durations
     // (durationValueMs); task_complete only read the plain-number duration_ms

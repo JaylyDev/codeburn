@@ -725,10 +725,6 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
       // Bounded by one task's calls; flushed at the next task_started and at EOF.
       let pendingTaskCalls: ParsedProviderCall[] = []
       let taskGeneratedTokens = 0
-      // #1088 BUG-2: tokens from token_count events dropped by fork-replay
-      // dedup within the current (not-yet-completed) task. See the dedup site
-      // below for why this must offset the active-time window at task_complete.
-      let taskDedupedTokens = 0
       let taskToolIntervals: Array<[number, number]> = []
       let taskStartedAt: number | undefined = resume?.state.taskStartedAt
       let taskActiveStartedAt: number | undefined = resume?.state.taskActiveStartedAt
@@ -814,7 +810,6 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           results.push(...pendingTaskCalls)
           pendingTaskCalls = []
           taskGeneratedTokens = 0
-          taskDedupedTokens = 0
           taskToolIntervals = []
           const startedAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
           taskStartedAt = Number.isFinite(startedAt) ? startedAt : undefined
@@ -911,13 +906,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             // #1088 BUG-8: shared with codex-throughput.ts's live estimate
             // instead of a second inline copy of the same clip/merge/cap.
             const toolWaitMs = mergeToolIntervals(taskToolIntervals, effectiveDurationMs, activeWindowStart, Number.isFinite(completedAt) ? completedAt : undefined)
-            // #1088 BUG-2: a partially fork-deduped task's active window still
-            // spans the dropped events' real time even though their tokens
-            // never reached taskGeneratedTokens (see the dedup site above).
-            // Shrink the window by the dropped fraction so surviving calls
-            // aren't credited with time that covers discarded work.
-            const totalTaskTokens = taskGeneratedTokens + taskDedupedTokens
-            const activeMs = (effectiveDurationMs - toolWaitMs) * (taskGeneratedTokens / totalTaskTokens)
+            const activeMs = effectiveDurationMs - toolWaitMs
             if (activeMs <= 0) continue
             for (const call of pendingTaskCalls) {
               // Reasoning is already inside output_tokens (#1075/#1078); the
@@ -1143,15 +1132,11 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           // key would spuriously diverge on a replay and double-count it.
           const dedupKey = `codex:${forkedFromId || sessionId}:${cumulativeTotal}:${total?.input_tokens ?? 0}:${total?.cached_input_tokens ?? 0}:${total?.output_tokens ?? 0}:${total?.reasoning_output_tokens ?? 0}`
 
-          if (seenKeys.has(dedupKey)) {
-            // #1088 BUG-2: this event's tokens are dropped from the numerator,
-            // but task_complete's duration_ms is real wall-clock time that
-            // still spans them -- track what was dropped so the active window
-            // can be scaled down to match, instead of crediting the surviving
-            // calls with time that covers work whose tokens were discarded.
-            taskDedupedTokens += billableOutputTokens('codex', outputTokens, reasoningTokens)
-            continue
-          }
+          // A drop here can only be a byte-identical replay: the
+          // prevCumulativeTotal guard above already discards a repeated
+          // running total, so nothing reaching this point ever loses real
+          // tokens -- no active-time rescaling needed (#1088 investigation).
+          if (seenKeys.has(dedupKey)) continue
           seenKeys.add(dedupKey)
 
           // Reasoning tokens are already inside output_tokens, so they are NOT
