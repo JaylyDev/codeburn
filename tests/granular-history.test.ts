@@ -120,7 +120,7 @@ describe('granular history', () => {
     ])], { start, end }, end)
 
     expect(history.sessionSeries.map(series => series.label)).toEqual([
-      'sessio…3456 (claude) · Refactor billing module',
+      'Refactor billing module (claude)',
       'sessio…3457 (claude) · repos/demo',
       'sessio…3458 (claude) · repos/demo',
       'sessio…3459 (claude) · repos/demo',
@@ -175,7 +175,7 @@ describe('granular history', () => {
       calls: [apiCall({ timestamp, cost: 1 })],
     }])], { start, end }, end)
 
-    expect(history.sessionSeries[0]?.label).toBe('sessio…3456 (claude) · Refactor billing module')
+    expect(history.sessionSeries[0]?.label).toBe('Refactor billing module (claude)')
     expect(history.sessionSeries[0]?.label).not.toContain('\x1b')
     expect(history.sessionSeries[0]?.label).not.toContain('\x00')
   })
@@ -190,7 +190,7 @@ describe('granular history', () => {
       calls: [apiCall({ timestamp, cost: 1 })],
     }])], { start, end }, end)
 
-    expect(history.sessionSeries[0]?.label).toBe('sessio…3456 (claude) · ' + 'x'.repeat(80))
+    expect(history.sessionSeries[0]?.label).toBe('x'.repeat(80) + ' (claude)')
   })
 
   it('caps session titles by code point without splitting an emoji', () => {
@@ -205,9 +205,8 @@ describe('granular history', () => {
     }])], { start, end }, end)
 
     const label = history.sessionSeries[0]?.label ?? ''
-    const titlePart = label.slice(label.indexOf(' · ') + 3)
-    expect(titlePart).toBe('x'.repeat(79) + '😀')
-    expect([...titlePart]).toEqual([...('x'.repeat(79) + '😀')])
+    expect(label).toBe('x'.repeat(79) + '😀' + ' (claude)')
+    expect([...label]).toEqual([...'x'.repeat(79), '😀', ' ', '(', 'c', 'l', 'a', 'u', 'd', 'e', ')'])
   })
 
   it('prefers a title from any duplicate session summary sharing a key', () => {
@@ -230,7 +229,7 @@ describe('granular history', () => {
     ])], { start, end }, end)
 
     expect(history.sessionSeries).toHaveLength(1)
-    expect(history.sessionSeries[0]?.label).toBe('sessio…3456 (claude) · Z recovered session title')
+    expect(history.sessionSeries[0]?.label).toBe('Z recovered session title (claude)')
   })
 
   it('fills idle buckets and keeps separate model and session lines from real call timestamps', () => {
