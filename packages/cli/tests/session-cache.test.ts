@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { createHash } from 'crypto'
 import { readFile, rm, writeFile, mkdir } from 'fs/promises'
 import { existsSync } from 'fs'
 import { tmpdir } from 'os'
@@ -279,6 +280,21 @@ describe('computeEnvFingerprint', () => {
     expect(computeEnvFingerprint('copilot')).not.toBe(computeEnvFingerprint('unknown-provider'))
     expect(computeEnvFingerprint('kiro')).not.toBe(computeEnvFingerprint('unknown-provider'))
     expect(computeEnvFingerprint('warp')).not.toBe(computeEnvFingerprint('unknown-provider'))
+  })
+
+  // opencode/kilo-code session-model-v1 (#930): bumped PROVIDER_PARSE_VERSIONS
+  // so already-cached files reparse once and pick up the fix. Reproduces the
+  // pre-bump fingerprint and asserts it now differs, i.e. a cached file keyed
+  // under the old fingerprint is treated as stale and reparsed.
+  const preBumpFingerprint = (provider: string, oldParserVersion?: string): string => {
+    const parts = (PROVIDER_ENV_VARS[provider] ?? []).map(v => `${v}=${process.env[v] ?? ''}`)
+    if (oldParserVersion) parts.push(`parser=${oldParserVersion}`)
+    return createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 16)
+  }
+
+  it('bumped opencode/kilo-code parser versions invalidate a pre-bump cached fingerprint', () => {
+    expect(computeEnvFingerprint('opencode')).not.toBe(preBumpFingerprint('opencode'))
+    expect(computeEnvFingerprint('kilo-code')).not.toBe(preBumpFingerprint('kilo-code', 'worktree-project-grouping-v1'))
   })
 })
 

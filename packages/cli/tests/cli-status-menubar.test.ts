@@ -3,7 +3,12 @@ import { tmpdir } from 'node:os'
 import { delimiter as pathDelimiter, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+
+// Every case here spawns the real CLI and does genuine multi-provider parse
+// work; the 5s default is fine on a dev laptop and not on a shared 2-core
+// runner, where individual cases have been observed needing 6-8s.
+vi.setConfig({ testTimeout: 30_000 })
 
 function runCli(args: string[], home: string, extraEnv: Record<string, string | undefined> = {}) {
   return spawnSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', ...args], {
