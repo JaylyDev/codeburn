@@ -29,9 +29,10 @@
 // keyed dedup key below is a constant rather than a per-run random.
 import './setup/fixed-privacy-key.js'
 
-import { describe, it, expect, beforeEach, afterAll } from 'vitest'
+import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest'
 import { mkdir, readFile, rm, writeFile } from 'fs/promises'
 import { createHash, createHmac } from 'crypto'
+import { homedir } from 'os'
 import { join } from 'path'
 
 import { clearSessionCache, parseAllSessions } from '../src/parser.js'
@@ -52,6 +53,9 @@ const JB_ROOT = join(TEST_ROOT, 'jetbrains')
 // derived from EXACTLY this string, so the seeded old-shape key and the
 // expected new-shape key are both computed from it.
 const REPLY_TEXT = 'Hello! How can I help you today?'
+// A second turn, appended after the key rotation below. Distinct text so it
+// gets its own digest rather than colliding into the per-content counter.
+const REPLY_TEXT_2 = 'Sure - here is the second answer.'
 const STORE_ID = 'conv-1'
 
 // What computeEnvFingerprint('copilot') returned under the PRE-BUMP parse
@@ -102,11 +106,11 @@ function jbDbContent(blobs: string[]): string {
   )
 }
 
-async function createJetBrainsDb(): Promise<string> {
+async function createJetBrainsDb(replies: string[] = [REPLY_TEXT]): Promise<string> {
   const dir = join(JB_ROOT, 'iu', 'chat-agent-sessions', STORE_ID)
   await mkdir(dir, { recursive: true })
   const dbPath = join(dir, 'copilot-agent-sessions-nitrite.db')
-  await writeFile(dbPath, jbDbContent([jbAssistantBlob(REPLY_TEXT)]))
+  await writeFile(dbPath, jbDbContent(replies.map(jbAssistantBlob)))
   return dbPath
 }
 
@@ -243,5 +247,92 @@ describe('copilot session cache invalidation', () => {
     expect(envFingerprint).toBe(computeEnvFingerprint('copilot'))
     expect(keys).toEqual([newShapeKey()])
     expect(keys).not.toContain(oldShapeKey())
+  })
+})
+
+// ── privacy-key rotation, end to end ───────────────────────────────────
+
+// The bump above is only half the guarantee. Copilot's dedup key is
+// createHmac(privacyKey, replyText), so its VALUE also moves whenever the host
+// privacy key moves — and the privacy key is not a released artifact: it is a
+// random per-install file that can be rotated, lost, restored from another
+// machine's backup, or (when it is corrupt/unreadable) replaced by a FRESH
+// ephemeral key in every single process. No parse-version bump can see any of
+// that.
+//
+// computeEnvFingerprint folds a digest of the key in for KEY_DERIVED_PROVIDERS
+// so the section rebuilds. The selector for that fold was originally sniffed
+// out of the parse-version string ('source-ref-fingerprint-v1'), which copilot's
+// version does not contain — right value, wrong selector, so copilot silently
+// fell out. The unit tests for the fold both stub the fingerprint, so neither
+// notices; only a real parse does. This is that parse.
+describe('copilot privacy-key rotation (end to end)', () => {
+  const KEY_1 = '11'.repeat(32)
+  const KEY_2 = '22'.repeat(32)
+
+  /** The dedup key the JetBrains decoder writes for `reply` under `key`. */
+  function keyUnder(key: string, reply: string): string {
+    const digest = createHmac('sha256', key).update(reply).digest('hex').slice(0, 12)
+    return `copilot:jb:${STORE_ID}:${digest}:1`
+  }
+
+  async function writeHostPrivacyKey(key: string): Promise<void> {
+    const dir = join(homedir(), '.config', 'codeburn')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'privacy-key'), key + '\n', { mode: 0o600 })
+  }
+
+  // A fresh module registry per parse, so privacy-key.ts re-reads the file
+  // instead of serving the key it memoized — which is exactly what the next
+  // `codeburn` process does.
+  async function parseInFreshProcess(): Promise<string[]> {
+    vi.resetModules()
+    const parser = await import('../src/parser.js')
+    parser.clearSessionCache()
+    const projects = await parser.parseAllSessions(undefined, 'copilot')
+    return projects
+      .flatMap(p => p.sessions)
+      .flatMap(s => s.turns)
+      .flatMap(t => t.assistantCalls)
+      .map(c => c.deduplicationKey)
+  }
+
+  afterAll(async () => {
+    // Leave the pinned key on disk for any test that runs after this one.
+    await writeHostPrivacyKey(FIXED_PRIVACY_KEY)
+  })
+
+  it('rotating the key rebuilds the section instead of double-counting every turn', async () => {
+    const dbPath = await createJetBrainsDb()
+
+    // Run 1 — warm the cache under K1. One turn in the .db, one call out.
+    await writeHostPrivacyKey(KEY_1)
+    expect(await parseInFreshProcess()).toEqual([keyUnder(KEY_1, REPLY_TEXT)])
+    expect((await cachedCopilotKeys()).keys).toEqual([keyUnder(KEY_1, REPLY_TEXT)])
+
+    // Rotate the key, and have the user hold one more conversation turn.
+    await writeHostPrivacyKey(KEY_2)
+    await createJetBrainsDb([REPLY_TEXT, REPLY_TEXT_2])
+
+    // Run 2 — two turns in the .db, so two calls out. Not three.
+    //
+    // With the fold missing, the env fingerprint holds still, the section is
+    // MERGED rather than rebuilt, and copilot is the sole durable provider:
+    // its union-merge never deletes, it appends any turn whose key is not
+    // already cached. The K1 copy of turn 1 therefore survives alongside the
+    // K2 copy of the same turn — 2 real turns reported as 3 calls, and the
+    // inflation repeats on every rotation (and on every RUN when the key file
+    // is corrupt, since each process then mints a fresh ephemeral key).
+    const afterRotation = await parseInFreshProcess()
+    expect(afterRotation).toHaveLength(2)
+    expect([...afterRotation].sort()).toEqual(
+      [keyUnder(KEY_2, REPLY_TEXT), keyUnder(KEY_2, REPLY_TEXT_2)].sort(),
+    )
+    expect(afterRotation).not.toContain(keyUnder(KEY_1, REPLY_TEXT))
+
+    // And the K1-era key is gone from disk, not merely absent from this read.
+    const { keys } = await cachedCopilotKeys()
+    expect(keys).toHaveLength(2)
+    expect(keys).not.toContain(keyUnder(KEY_1, REPLY_TEXT))
   })
 })

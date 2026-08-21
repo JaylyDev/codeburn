@@ -16,9 +16,9 @@
 // accept an externally supplied privacy key, and adding that knob would be a
 // far worse hole than the goldens are worth.
 import { createHmac } from 'node:crypto'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, join, sep } from 'node:path'
 
 import { normalizePath } from '@codeburn/core'
 
@@ -34,7 +34,22 @@ export const FIXED_PRIVACY_KEY = 'c0de6b12'.repeat(8)
 // mkdtemp dir under tmpdir() named `codeburn-test-env-*`. Run outside vitest —
 // tsx, a stray node -e, a REPL — and this throws instead of eating the key.
 const home = homedir()
-if (!home.startsWith(tmpdir()) || !basename(home).startsWith('codeburn-test-env-')) {
+
+// Resolve both sides before comparing. Without this the check is a string
+// prefix test on an UNRESOLVED path, so a symlink at a sandbox-shaped location
+// (HOME=/tmp/codeburn-test-env-x -> /Users/me) passes it and the write lands in
+// the real home anyway. It also makes the honest case work on macOS, where
+// tmpdir() is /var/folders/... and the mkdtemp dir resolves under /private/var.
+// A path that cannot be resolved falls through as-is and gets refused below.
+const resolve = (path: string): string => {
+  try {
+    return realpathSync(path)
+  } catch {
+    return path
+  }
+}
+const realHome = resolve(home)
+if (!realHome.startsWith(resolve(tmpdir()) + sep) || !basename(realHome).startsWith('codeburn-test-env-')) {
   throw new Error(
     `fixed-privacy-key.ts refuses to write into HOME=${home}: it overwrites ` +
     `<home>/.config/codeburn/privacy-key, and that is only safe against the ` +
