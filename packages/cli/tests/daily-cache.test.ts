@@ -467,7 +467,7 @@ describe('ensureCacheHydrated: timezone invalidation', () => {
   })
 })
 
-// Codex discovery went structural in v16 (#873/#626), admitting rollouts from
+// Codex discovery went structural in v23 (#873/#626), admitting rollouts from
 // third-party frontends that v15 rollups never counted. Every historical day is
 // served from this cache (usage-aggregator only recomputes today) and retention
 // is ten years, so without a schema bump an upgrading user keeps the pre-fix

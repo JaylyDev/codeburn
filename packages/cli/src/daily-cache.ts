@@ -5,15 +5,22 @@ import { homedir } from 'os'
 import { join } from 'path'
 import type { DateRange, ProjectSummary } from './types.js'
 
-// Bumped to 16: Codex discovery is structural instead of originator-gated
+// Bumped to 23: Codex discovery is structural instead of originator-gated
 // (#873/#626), so rollouts written by third-party frontends driving
 // `codex app-server` ("t3code_desktop", "JetBrains.IntelliJ IDEA", ...) now
-// contribute usage that v15 rollups never contained. Those files were rejected
-// before they were ever parsed, so nothing downstream can notice on its own:
-// `usage-aggregator` serves every day before today from this cache, and
-// retention is ten years, so an upgrading user with a warm cache would keep the
-// pre-fix history forever while today's numbers silently disagreed with it.
-// Raising MIN_SUPPORTED_VERSION forces the one-time re-derivation.
+// contribute usage that older rollups never contained. Those files were
+// rejected before they were ever parsed, so nothing downstream can notice on
+// its own: `usage-aggregator` serves every day before today from this cache,
+// and retention is ten years, so an upgrading user with a warm cache would
+// keep the pre-fix history forever while today's numbers silently disagreed
+// with it. Raising MIN_SUPPORTED_VERSION forces the one-time re-derivation.
+// This branch was authored against v15/16, but main shipped 17 in v0.9.20 and
+// has since moved to 20, with 21 (#946) and 22 (#1056) claimed on the
+// main-side pipeline; this bump takes 23 so no real user's cache file — built
+// by any binary on either line of history — can be adopted as current without
+// the widened-discovery re-derivation firing. A lower number would let a
+// main-built cache pass isMigratableCache() unchanged and the fix would never
+// take effect for that user.
 //
 // v15: per-project daily rollups. Days and provider slices now carry
 // a `projects` breakdown (cost/calls/savings/sessions per project) so project
@@ -67,8 +74,8 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 16
-const MIN_SUPPORTED_VERSION = 16
+export const DAILY_CACHE_VERSION = 23
+const MIN_SUPPORTED_VERSION = 23
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including
