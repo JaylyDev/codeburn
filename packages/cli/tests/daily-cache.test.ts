@@ -467,8 +467,8 @@ describe('ensureCacheHydrated: timezone invalidation', () => {
   })
 })
 
-// A complete v15 cache is trusted as-is (unchanged savings hash, matching tz,
-// complete marker set) — so without the v17 bump, an upgrading user keeps the
+// A complete v25 cache is trusted as-is (unchanged savings hash, matching tz,
+// complete marker set) — so without the v26 bump, an upgrading user keeps the
 // pre-fix kiro day totals forever while freshly reparsed sessions disagree
 // with them. The bump mints a fresh filename, adoption marks the result
 // incomplete, and the next hydration re-derives the window; the corrected kiro
@@ -498,24 +498,25 @@ describe('ensureCacheHydrated: schema version invalidation (#909)', () => {
     }
   }
 
-  it('re-derives a warm complete v15 cache instead of serving its pre-fix kiro totals', async () => {
+  it('re-derives a warm complete v25 cache instead of serving its pre-fix kiro totals', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-06-12T12:00:00.000Z'))
 
     const { writeFile, mkdir } = await import('fs/promises')
     await mkdir(TMP_CACHE_ROOT, { recursive: true })
     // A cache exactly as a pre-fix release left it: current schema at the
-    // time, finalized off a complete parse, watermark at yesterday, matching
-    // tz and savings hash. Nothing but the version bump can invalidate it.
-    const v15 = {
-      version: 15,
+    // time (v25, the version immediately before this fix's bump), finalized
+    // off a complete parse, watermark at yesterday, matching tz and savings
+    // hash. Nothing but the version bump can invalidate it.
+    const v25 = {
+      version: 25,
       savingsConfigHash: '',
       tzKey: currentTzKey(),
       lastComputedDate: '2026-06-11',
       days: [kiroDay('2026-06-11', 4.55, 1, 500)],
       complete: true,
     }
-    await writeFile(join(TMP_CACHE_ROOT, 'daily-cache.v15.json'), JSON.stringify(v15), 'utf-8')
+    await writeFile(join(TMP_CACHE_ROOT, 'daily-cache.v25.json'), JSON.stringify(v25), 'utf-8')
 
     let parseCalls = 0
     const hydrated = await ensureCacheHydrated(
@@ -530,7 +531,7 @@ describe('ensureCacheHydrated: schema version invalidation (#909)', () => {
 
     // The whole point: the window is re-parsed rather than served frozen.
     expect(parseCalls).toBe(1)
-    // ...and the fresh derivation wins over the stale v15 day, at the
+    // ...and the fresh derivation wins over the stale v25 day, at the
     // provider-slice level where the pre-fix kiro cost actually lived.
     const day = hydrated.days.find(d => d.date === '2026-06-11')
     expect(day?.cost).toBe(18.2)
@@ -538,7 +539,83 @@ describe('ensureCacheHydrated: schema version invalidation (#909)', () => {
     expect(day?.providers['kiro']?.inputTokens).toBe(750)
     expect(hydrated.version).toBe(DAILY_CACHE_VERSION)
     expect(hydrated.complete).toBe(true)
+    // The v25 file is never rewritten or deleted — old binaries still own it.
+    expect(JSON.parse(await readFile(join(TMP_CACHE_ROOT, 'daily-cache.v25.json'), 'utf-8')).version).toBe(25)
+  })
+})
+
+// Codex discovery went structural in v23 (#873/#626), admitting rollouts from
+// third-party frontends that v15 rollups never counted. Every historical day is
+// served from this cache (usage-aggregator only recomputes today) and retention
+// is ten years, so without a schema bump an upgrading user keeps the pre-fix
+// numbers forever: the session COUNT moves because discovery reruns, while
+// cost/calls stay frozen — a self-contradicting report that reads as "fixed".
+describe('ensureCacheHydrated: schema version invalidation (#873)', () => {
+  it('re-derives a warm v15 cache instead of serving its pre-fix rollups', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-06-12T12:00:00.000Z'))
+
+    const { writeFile, mkdir } = await import('fs/promises')
+    await mkdir(TMP_CACHE_ROOT, { recursive: true })
+    // A cache exactly as a pre-fix release left it: current schema at the time,
+    // finalized off a complete parse, watermark at yesterday, matching tz.
+    // Nothing but the version bump can invalidate it.
+    const v15 = {
+      version: 15,
+      savingsConfigHash: '',
+      tzKey: currentTzKey(),
+      lastComputedDate: '2026-06-11',
+      days: [emptyDay('2026-06-11', 4.55, 1)],
+      complete: true,
+      watermarkTrusted: true,
+    }
+    await writeFile(join(TMP_CACHE_ROOT, 'daily-cache.v15.json'), JSON.stringify(v15), 'utf-8')
+
+    let parseCalls = 0
+    const hydrated = await ensureCacheHydrated(
+      async () => {
+        parseCalls += 1
+        return []
+      },
+      () => [emptyDay('2026-06-11', 18.2, 2)],
+    )
+
+    // The whole point: the window is re-parsed rather than served frozen.
+    expect(parseCalls).toBe(1)
+    // ...and the fresh derivation wins over the stale v15 day.
+    expect(hydrated.days.find(d => d.date === '2026-06-11')?.cost).toBe(18.2)
+    expect(hydrated.days.find(d => d.date === '2026-06-11')?.calls).toBe(2)
+    expect(hydrated.version).toBe(DAILY_CACHE_VERSION)
     // The v15 file is never rewritten or deleted — old binaries still own it.
     expect(JSON.parse(await readFile(join(TMP_CACHE_ROOT, 'daily-cache.v15.json'), 'utf-8')).version).toBe(15)
+  })
+
+  it('carries a v15 day forward when its sources can no longer re-derive it', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-06-12T12:00:00.000Z'))
+
+    const { writeFile, mkdir } = await import('fs/promises')
+    await mkdir(TMP_CACHE_ROOT, { recursive: true })
+    const v15 = {
+      version: 15,
+      savingsConfigHash: '',
+      tzKey: currentTzKey(),
+      lastComputedDate: '2026-06-11',
+      days: [emptyDay('2026-04-02', 7, 3), emptyDay('2026-06-11', 4.55, 1)],
+      complete: true,
+      watermarkTrusted: true,
+    }
+    await writeFile(join(TMP_CACHE_ROOT, 'daily-cache.v15.json'), JSON.stringify(v15), 'utf-8')
+
+    // The parse can only still see the recent day; April's sources are gone.
+    const hydrated = await ensureCacheHydrated(
+      async () => [],
+      () => [emptyDay('2026-06-11', 18.2, 2)],
+    )
+
+    // NEVER-LOSE (v14) still holds across this bump: the sourceless day keeps
+    // its old accounting rather than being dropped or zeroed.
+    expect(hydrated.days.find(d => d.date === '2026-04-02')?.cost).toBe(7)
+    expect(hydrated.days.find(d => d.date === '2026-06-11')?.cost).toBe(18.2)
   })
 })

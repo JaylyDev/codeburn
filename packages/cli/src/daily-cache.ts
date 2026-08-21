@@ -5,21 +5,48 @@ import { homedir } from 'os'
 import { join } from 'path'
 import type { DateRange, ProjectSummary } from './types.js'
 
-// Bumped to 17 — 16 is skipped on purpose: main already spent it on the codex
-// structural-discovery fix (eece4cf), so a v16 cache in the wild is a
-// main-owned cache meaning the codex fix, not this one. Claiming 16 here too
-// would let a user who has ever run a main build load its v16 cache as
-// CURRENT and COMPLETE, and this invalidation would never fire. 17 is the
-// first version that also means the kiro chat-file fix.
-//
-// kiro chat-file input tokens are now estimated from every human turn's full
-// text instead of the last 500 chars (#909, this PR), so a v15 rollup
-// finalized by the pre-fix binary carries kiro costs off by up to
+// Bumped to 26: kiro chat-file input tokens are now estimated from every
+// human turn's full text instead of the last 500 chars (#909), so a v25
+// rollup finalized by the pre-fix binary carries kiro costs off by up to
 // severalfold. Nothing downstream can notice on its own: `usage-aggregator`
 // serves every day before today from this cache, and retention is ten years,
 // so an upgrading user with a warm complete cache would keep the stale
 // pre-fix kiro day totals forever while freshly reparsed sessions disagreed
 // with them. Raising MIN_SUPPORTED_VERSION forces the one-time re-derivation.
+// This takes 26 — the next free number after #930's 25 — rather than riding
+// on that version.
+//
+// Bumped to 25: pi/omp, cline and opencode/kilo-code session discovery was
+// restored (#930). Older rollups missed OMP sessions written after a
+// `type: "title"` slot line, Cline sessions under the Insiders / VSCodium /
+// home-data roots, and opencode/kilo-code interrupted or user-only sessions
+// whose session-level fallback queried a `model_id` column neither schema
+// has. Those files were skipped before they were ever parsed, so nothing
+// downstream can notice on its own; raising MIN_SUPPORTED_VERSION forces the
+// one-time re-derivation.
+//
+// Bumped to 24: Codex discovery is structural instead of originator-gated
+// (#873/#626), so rollouts written by third-party frontends driving
+// `codex app-server` ("t3code_desktop", "JetBrains.IntelliJ IDEA", ...) now
+// contribute usage that older rollups never contained. Those files were
+// rejected before they were ever parsed, so nothing downstream can notice on
+// its own: `usage-aggregator` serves every day before today from this cache,
+// and retention is ten years, so an upgrading user with a warm cache would
+// keep the pre-fix history forever while today's numbers silently disagreed
+// with it. Raising MIN_SUPPORTED_VERSION forces the one-time re-derivation.
+// This branch was authored against v15/16, but main shipped 17 in v0.9.20 and
+// has since moved to 20, with 21 (#946) and 22 (#1056) claimed on the
+// main-side pipeline; this bump takes 24 so no real user's cache file — built
+// by any binary on either line of history — can be adopted as current without
+// the widened-discovery re-derivation firing. A lower number would let a
+// main-built cache pass isMigratableCache() unchanged and the fix would never
+// take effect for that user.
+// This branch also carries the midnight-straddle fix (#852): range and day
+// filters now slice a straddling turn per call instead of keeping it whole on
+// its anchor day, so a historical day already finalized by any earlier binary
+// holds calls that now belong to the next day. That is a second reason the
+// rollups must be re-derived once, and it is why this bump takes 24 — the next
+// free number after #926's 23 — rather than riding on that version.
 //
 // v15: per-project daily rollups. Days and provider slices now carry
 // a `projects` breakdown (cost/calls/savings/sessions per project) so project
@@ -73,8 +100,8 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 17
-const MIN_SUPPORTED_VERSION = 17
+export const DAILY_CACHE_VERSION = 26
+const MIN_SUPPORTED_VERSION = 26
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including
@@ -707,10 +734,17 @@ export async function ensureCacheHydrated(
     const tzChanged = c.tzKey !== undefined && c.tzKey !== tzKey
     if (c.savingsConfigHash !== savingsConfigHash || c.complete !== true || tzChanged) {
       const baseline = c.days
-      const backfillStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - BACKFILL_DAYS)
+      // Re-derive the WHOLE retention window, not just the 365-day product
+      // backfill (BACKFILL_DAYS): these triggers invalidate ALL cached days, and
+      // a day older than the backfill whose sources still survive must be
+      // corrected too — otherwise the v17 straddle double-count (or a stale
+      // savings/tz bucketing) lingers on it for the rest of retention. The cost
+      // is bounded by the surviving session files, and the path only runs on
+      // the rare invalidations, never on the daily gap parse.
+      const rederiveStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - DAILY_CACHE_RETENTION_DAYS)
       let freshDays: DailyEntry[] = []
-      if (backfillStart.getTime() <= yesterdayEnd.getTime()) {
-        freshDays = aggregateDays(await parseSessions({ start: backfillStart, end: yesterdayEnd }))
+      if (rederiveStart.getTime() <= yesterdayEnd.getTime()) {
+        freshDays = aggregateDays(await parseSessions({ start: rederiveStart, end: yesterdayEnd }))
       }
       const parseWasComplete = sessionComplete()
       // A PARTIAL parse must not overwrite finalized baseline days with
