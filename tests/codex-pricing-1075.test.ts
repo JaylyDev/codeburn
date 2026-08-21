@@ -112,17 +112,18 @@ describe('#1075 A - reasoning is not billed on top of output', () => {
     const codex = makeApiCall('codex', 'gpt-5.5', { outputTokens: 1000, reasoningTokens: 400 })
     // A provider that really does report reasoning as a separate bucket keeps
     // the additive behaviour, so this is a codex carve-out and not a blanket
-    // change to every display sum.
-    const additive = makeApiCall('hermes', 'gpt-5.5', { outputTokens: 1000, reasoningTokens: 400 })
+    // change to every display sum. Gemini documents "thoughts" as genuinely
+    // separate from output (src/providers/gemini.ts), unlike codex/claude.
+    const additive = makeApiCall('gemini', 'gemini-2.5-pro', { outputTokens: 1000, reasoningTokens: 400 })
     const projects = [makeProject([codex, additive])]
 
     const auditRows = await aggregateAudit(projects)
     expect(auditRows.find(r => r.provider === 'codex')!.displayed.outputTokens).toBe(1000)
-    expect(auditRows.find(r => r.provider === 'hermes')!.displayed.outputTokens).toBe(1400)
+    expect(auditRows.find(r => r.provider === 'gemini')!.displayed.outputTokens).toBe(1400)
 
     const modelRows = await aggregateModels(projects)
     expect(modelRows.find(r => r.provider === 'codex')!.outputTokens).toBe(1000)
-    expect(modelRows.find(r => r.provider === 'hermes')!.outputTokens).toBe(1400)
+    expect(modelRows.find(r => r.provider === 'gemini')!.outputTokens).toBe(1400)
   })
 })
 

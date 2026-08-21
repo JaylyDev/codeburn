@@ -244,8 +244,8 @@ describe('aggregateModels', () => {
     const project = makeProject([
       makeTurn('feature', [
         {
-          provider: 'hermes',
-          model: 'gpt-5',
+          provider: 'gemini',
+          model: 'gemini-2.5-pro',
           usage: { ...emptyTokens(), inputTokens: 100, outputTokens: 50, reasoningTokens: 200 },
           costUSD: 1.0,
           tools: [],

@@ -25,15 +25,23 @@
 //   codex   PRICING changed by design in #1075: reasoning tokens are billed
 //       inside output rather than on top of it, and cache writes are carved out
 //       of the input bucket. Nothing about what was PARSED moved, so codex keeps
-//       the full exact treatment for the call count and every token field; only
-//       the cost tolerance is lifted, and the delta is reported instead. Drop it
-//       from this list once a published CLI carries the fix.
+//       the full exact treatment for the call count and every token field; the
+//       cost tolerance is instead replaced with REPRICE_TOLERANCE — the
+//       upgraded cost must be strictly lower than the baseline and within 25%
+//       of it, since #1075 only ever removes a double-count and never raises
+//       cost — and the delta is reported instead. Drop it from this list once a
+//       published CLI carries the fix.
 const EXACT = ['claude', 'codex', 'gemini', 'kiro', 'cursor']
 const CHANGED_BY_DESIGN = ['grok']
 const COST_CHANGED_BY_DESIGN = ['codex']
 const NEW_IN_THIS_RELEASE = ['dsh']
 
 const COST_TOLERANCE = 0.005 // 0.5% relative
+// #1075 only ever LOWERS codex cost (double-counted reasoning removed, cache
+// writes carved out of the input bucket) and by a bounded amount on any real
+// corpus; a rise, or a drop past this bound, means something beyond the known
+// repricing changed.
+const REPRICE_TOLERANCE = 0.25 // 25% relative
 
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -102,8 +110,14 @@ for (const name of providers) {
     if (b.calls !== u.calls) diffs.push(`calls ${b.calls} != ${u.calls}`)
     for (const f of TOKEN_FIELDS) if (b[f] !== u[f]) diffs.push(`${f} ${b[f]} != ${u[f]}`)
     const costDrift = relDiff(b.cost, u.cost)
+    let repriced = false
     if (COST_CHANGED_BY_DESIGN.includes(name)) {
-      notes.push(`${name}: cost ${fmt(b.cost)} -> ${fmt(u.cost)} (${(costDrift * 100).toFixed(3)}%) — repricing expected (#1075); tokens and calls still asserted exactly`)
+      if (u.cost > b.cost) diffs.push(`cost ${fmt(b.cost)} -> ${fmt(u.cost)} rose; #1075 should only lower codex cost`)
+      else if (costDrift > REPRICE_TOLERANCE) diffs.push(`cost ${fmt(b.cost)} -> ${fmt(u.cost)} (${(costDrift * 100).toFixed(3)}% > ${(REPRICE_TOLERANCE * 100).toFixed(0)}% expected bound for #1075)`)
+      else {
+        repriced = true
+        notes.push(`${name}: cost ${fmt(b.cost)} -> ${fmt(u.cost)} (${(costDrift * 100).toFixed(3)}%) — repricing expected (#1075); tokens and calls still asserted exactly`)
+      }
     } else if (costDrift > COST_TOLERANCE) {
       diffs.push(`cost ${fmt(b.cost)} != ${fmt(u.cost)} (${(costDrift * 100).toFixed(3)}% > ${(COST_TOLERANCE * 100).toFixed(1)}%)`)
     }
@@ -113,6 +127,8 @@ for (const name of providers) {
     } else if (diffs.length) {
       failures.push(`${name}: ${diffs.join(', ')}`)
       verdict = 'DIFFERS'
+    } else if (repriced) {
+      verdict = `repriced (cost ${(costDrift * 100).toFixed(3)}% drift)`
     } else {
       verdict = costDrift === 0 ? 'identical' : `identical (cost ${(costDrift * 100).toFixed(3)}% drift)`
     }
