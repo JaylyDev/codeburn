@@ -380,6 +380,7 @@ export function freshCodexState(): CodexDecodeState {
     prevCumulativeTotal: null,
     prevInput: 0,
     prevCached: 0,
+    prevCacheWrite: 0,
     prevOutput: 0,
     prevReasoning: 0,
     pendingTools: [],
@@ -728,6 +729,7 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
           cacheCreationInputTokens: 0,
           cacheReadInputTokens: 0,
           cachedInputTokens: 0,
+          cacheWriteCandidateTokens: 0,
           reasoningTokens: 0,
           webSearchRequests: 0,
           costIsEstimated: true,
@@ -757,6 +759,7 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
       const last = info.last_token_usage
       let inputTokens = 0
       let cachedInputTokens = 0
+      let cacheWriteTokens = 0
       let outputTokens = 0
       let reasoningTokens = 0
 
@@ -769,6 +772,7 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
         // siblings are never thrown away and NaN can never form.
         inputTokens = firstFiniteNumber(last.input_tokens) ?? 0
         cachedInputTokens = firstFiniteNumber(last.cached_input_tokens) ?? 0
+        cacheWriteTokens = firstFiniteNumber(last.cache_write_input_tokens) ?? 0
         outputTokens = firstFiniteNumber(last.output_tokens) ?? 0
         reasoningTokens = firstFiniteNumber(last.reasoning_output_tokens) ?? 0
       } else if (cumulativeTotal > 0) {
@@ -776,6 +780,7 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
         if (!total) continue
         inputTokens = (firstFiniteNumber(total.input_tokens) ?? 0) - s.prevInput
         cachedInputTokens = (firstFiniteNumber(total.cached_input_tokens) ?? 0) - s.prevCached
+        cacheWriteTokens = (firstFiniteNumber(total.cache_write_input_tokens) ?? 0) - s.prevCacheWrite
         outputTokens = (firstFiniteNumber(total.output_tokens) ?? 0) - s.prevOutput
         reasoningTokens = (firstFiniteNumber(total.reasoning_output_tokens) ?? 0) - s.prevReasoning
       }
@@ -786,6 +791,7 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
       if (total) {
         s.prevInput = firstFiniteNumber(total.input_tokens) ?? 0
         s.prevCached = firstFiniteNumber(total.cached_input_tokens) ?? 0
+        s.prevCacheWrite = firstFiniteNumber(total.cache_write_input_tokens) ?? 0
         s.prevOutput = firstFiniteNumber(total.output_tokens) ?? 0
         s.prevReasoning = firstFiniteNumber(total.reasoning_output_tokens) ?? 0
       }
@@ -796,6 +802,12 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
       // OpenAI includes cached tokens inside input_tokens; normalize to Anthropic
       // semantics: inputTokens = non-cached only.
       const uncachedInputTokens = Math.max(0, inputTokens - cachedInputTokens)
+
+      // Cache writes are carved out of the uncached input, never added to it:
+      // clamp so a malformed or lagging count can never drive the plain input
+      // bucket negative. Which bucket they end up billed in is the host's call
+      // (see toPricedProviderCall in the CLI's providers/codex.ts).
+      const cacheWriteCandidateTokens = Math.max(0, Math.min(cacheWriteTokens, uncachedInputTokens))
 
       const model = resolveModel(entry.payload, s.sessionModel)
       // Fork replays copy the parent's token_count history verbatim, so key on
@@ -814,6 +826,7 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
         cacheCreationInputTokens: 0,
         cacheReadInputTokens: cachedInputTokens,
         cachedInputTokens,
+        cacheWriteCandidateTokens,
         reasoningTokens,
         webSearchRequests: 0,
         tools: s.pendingTools,

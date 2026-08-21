@@ -8,6 +8,7 @@ import { decodeCodex, codexToolNameMap, countUnifiedDiffLoc } from '@codeburn/co
 import type { CodexDecodedCall, CodexDecodeState, CodexEntry } from '@codeburn/core/providers/codex'
 
 import { readSessionLines } from '../fs-utils.js'
+import { getModelCosts } from '../models.js'
 import { priceProviderCall } from '../pricing-pass.js'
 import {
   readCodexCacheEntry,
@@ -185,12 +186,22 @@ async function discoverSessionsInDir(codexDir: string): Promise<SessionSource[]>
 // marks the call so the pricing pass fills `costUSD` from the token buckets,
 // byte-identical to the two in-decoder pricing calls this retires (issue #809).
 function toPricedProviderCall(rich: CodexDecodedCall): ParsedProviderCall {
+  // Only move the decoder's cache-write candidate into the cache-write bucket
+  // when the pricing source publishes a real cache-write rate for this model
+  // (gpt-5.6+ charges 1.25x input; everything before it charges nothing extra).
+  // Otherwise buildCosts' fabricated 1.25x default would invent a surcharge
+  // OpenAI never billed, so the tokens stay where they already were - in plain
+  // input, priced exactly as before (#1075). The rate table is host-side, which
+  // is why this split lives here and not in the decoder.
+  const cacheWriteTokens = rich.cacheWriteCandidateTokens > 0 && getModelCosts(rich.model)?.cacheWriteCostIsExplicit
+    ? rich.cacheWriteCandidateTokens
+    : 0
   const call: ParsedProviderCall = {
     provider: 'codex',
     model: rich.model,
-    inputTokens: rich.inputTokens,
+    inputTokens: rich.inputTokens - cacheWriteTokens,
     outputTokens: rich.outputTokens,
-    cacheCreationInputTokens: rich.cacheCreationInputTokens,
+    cacheCreationInputTokens: rich.cacheCreationInputTokens + cacheWriteTokens,
     cacheReadInputTokens: rich.cacheReadInputTokens,
     cachedInputTokens: rich.cachedInputTokens,
     reasoningTokens: rich.reasoningTokens,

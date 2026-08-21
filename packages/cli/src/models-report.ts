@@ -3,6 +3,7 @@ import stripAnsi from 'strip-ansi'
 
 import { codexCredits } from './codex-credits.js'
 import { formatCost, formatTokens } from './format.js'
+import { billableOutputTokens } from './models.js'
 import { getProvider } from './providers/index.js'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 
@@ -119,7 +120,7 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
             buckets.set(key, bucket)
           }
           bucket.inputTokens += call.usage.inputTokens
-          bucket.outputTokens += call.usage.outputTokens + call.usage.reasoningTokens
+          bucket.outputTokens += billableOutputTokens(provider, call.usage.outputTokens, call.usage.reasoningTokens)
           bucket.cacheWriteTokens += call.usage.cacheCreationInputTokens
           // cacheReadInputTokens (Anthropic vocab) and cachedInputTokens (OpenAI vocab)
           // are two names for the same thing. Providers populate one or set both to the
@@ -179,9 +180,10 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
       savingsUSD: bucket.savingsUSD,
       savingsBaselineModel: bucket.savingsBaselineModel,
       calls: bucket.calls,
-      // outputTokens already includes reasoning (folded in above), and for Codex
-      // inputTokens is non-cached with cacheReadTokens holding cached input, which
-      // is exactly what the credit rates expect.
+      // outputTokens is the billable output (for Codex that already contains
+      // reasoning, so nothing is added on top), and inputTokens is non-cached
+      // with cacheReadTokens holding cached input - exactly what the credit
+      // rates expect.
       credits: bucket.provider === 'codex'
         ? codexCredits(bucket.model, {
             inputTokens: bucket.inputTokens,

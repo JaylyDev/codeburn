@@ -5,6 +5,16 @@ import { homedir } from 'os'
 import { join } from 'path'
 import type { DateRange, ProjectSummary } from './types.js'
 
+// Bumped to 28: the #1075/#1078 codex pricing fix, ported to this branch
+// (#1083). Reasoning tokens were billed on top of output (they are a subset of
+// it) and cache_write_input_tokens was ignored, so days finalized at v27 carry
+// codex costs overstated by ~3.5% and codex output tokens overstated by ~34.6%.
+// `usage-aggregator` serves every day before today from this cache and
+// retention is ten years, so nothing downstream would ever notice; raising
+// MIN_SUPPORTED_VERSION forces the one-time re-derivation. (main's own ladder
+// took 23 for the same fix; this branch reconciles at its final merge by
+// keeping the max.)
+//
 // Bumped to 27: the Cline CLI (npm `cline`, 3.x) is a NEW provider, so every
 // historical session under ~/.cline/data/sessions contributes usage that no
 // older rollup ever contained. Those files were never scanned before they were
@@ -109,8 +119,8 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 27
-const MIN_SUPPORTED_VERSION = 27
+export const DAILY_CACHE_VERSION = 28
+const MIN_SUPPORTED_VERSION = 28
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including

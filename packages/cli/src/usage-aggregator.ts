@@ -451,9 +451,9 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   }
   claudeConfigs = claudeConfigs ?? await claudeConfigSelector(scanProjects, null)
 
-  // Codex credits for the period. Reuses the models aggregation (folds reasoning
-  // into output, keeps non-cached input + cached-read separate) so the figure
-  // matches the official credit rates.
+  // Codex credits for the period. Reuses the models aggregation (billable output
+  // already includes reasoning for codex, keeps non-cached input + cached-read
+  // separate) so the figure matches the official credit rates.
   const modelRows = await aggregateModels(scanProjects)
   currentData.codexCredits = modelRows.reduce(
     (sum, r) => sum + (r.provider === 'codex' && r.credits != null ? r.credits : 0),

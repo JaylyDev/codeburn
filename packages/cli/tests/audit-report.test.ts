@@ -86,8 +86,11 @@ describe('aggregateAudit', () => {
     expect(r.raw.reasoningTokens).toBe(10)
     expect(r.raw.cacheReadInputTokens).toBe(200)
     expect(r.raw.cachedInputTokens).toBe(300)
-    // reasoning folds into output for pricing
-    expect(r.displayed.outputTokens).toBe(110)
+    // Reasoning does NOT fold into output for claude or codex: both bill it
+    // as part of output_tokens already, so adding it would double-count
+    // (#1075/#1083). Providers that report reasoning as a separate bucket
+    // still get the additive treatment - see codex-pricing-1083.test.ts.
+    expect(r.displayed.outputTokens).toBe(100)
     // cache read is the SUM of per-call max(anthropic, openai), not max of sums
     expect(r.displayed.cacheReadTokens).toBe(500)
     // attributed cost is preserved exactly
