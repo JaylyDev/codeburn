@@ -26,6 +26,12 @@ import type { ParsedProviderCall } from './providers/types.js'
 //     decodes only the new bytes instead of re-streaming the whole file.
 // This is lossless: Codex rollout files are durable (never auto-deleted), so the
 // one-time re-derive on first run under v8 rebuilds byte-identical data.
+//
+// #926's structural-validation guards change decode behavior only for record
+// shapes measured at 0 occurrences across 136k real events, so forcing a full
+// re-parse of multi-GB rollout corpora over that is a bad trade — deliberately
+// NOT bumped. The daily-cache bump alone propagates the discovery widening:
+// newly-eligible files aren't in this cache yet and parse fresh regardless.
 const CODEX_CACHE_VERSION = 8
 const CACHE_FILE = 'codex-results.json'
 

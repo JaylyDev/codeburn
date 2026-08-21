@@ -5,26 +5,31 @@ import { homedir } from 'os'
 import { join } from 'path'
 import type { DateRange, ProjectSummary } from './types.js'
 
-// Bumped to 17: pi/omp, cline and opencode/kilo-code session discovery
-// was restored (#845, this PR). v15/v16 rollups missed OMP sessions
-// written after a `type: "title"` slot line, Cline sessions under the
-// Insiders / VSCodium / home-data roots, and opencode/kilo-code
-// interrupted or user-only sessions whose session-level fallback queried
-// a `model_id` column neither schema has. Those files were skipped before
-// they were ever parsed, so nothing downstream can notice on its own: the
-// daily cache serves every day before today, retention is ten years, and
-// an upgrading user with a warm complete cache would keep the pre-fix
-// zeroes forever while today's numbers silently disagreed with them.
-// Raising MIN_SUPPORTED_VERSION forces the one-time re-derivation.
+// Bumped to 24: pi/omp, cline and opencode/kilo-code session discovery was
+// restored (#930). Older rollups missed OMP sessions written after a
+// `type: "title"` slot line, Cline sessions under the Insiders / VSCodium /
+// home-data roots, and opencode/kilo-code interrupted or user-only sessions
+// whose session-level fallback queried a `model_id` column neither schema
+// has. Those files were skipped before they were ever parsed, so nothing
+// downstream can notice on its own; raising MIN_SUPPORTED_VERSION forces the
+// one-time re-derivation.
 //
-// v16 is skipped on purpose: main already spent it on the codex
-// structural-discovery fix (eece4cf). The cache filename and the accepted
-// version window ([MIN_SUPPORTED_VERSION, DAILY_CACHE_VERSION]) are
-// shared across trees, so claiming 16 here would load a main-built v16
-// cache — which carries only the codex fix, none of this PR's — as
-// current and complete, and the invalidation would never fire. 17 is the
-// first version that contains both the codex fix and this PR's discovery
-// fixes; the next bump must check what main has already claimed.
+// Bumped to 23: Codex discovery is structural instead of originator-gated
+// (#873/#626), so rollouts written by third-party frontends driving
+// `codex app-server` ("t3code_desktop", "JetBrains.IntelliJ IDEA", ...) now
+// contribute usage that older rollups never contained. Those files were
+// rejected before they were ever parsed, so nothing downstream can notice on
+// its own: `usage-aggregator` serves every day before today from this cache,
+// and retention is ten years, so an upgrading user with a warm cache would
+// keep the pre-fix history forever while today's numbers silently disagreed
+// with it. Raising MIN_SUPPORTED_VERSION forces the one-time re-derivation.
+// This branch was authored against v15/16, but main shipped 17 in v0.9.20 and
+// has since moved to 20, with 21 (#946) and 22 (#1056) claimed on the
+// main-side pipeline; this bump takes 23 so no real user's cache file — built
+// by any binary on either line of history — can be adopted as current without
+// the widened-discovery re-derivation firing. A lower number would let a
+// main-built cache pass isMigratableCache() unchanged and the fix would never
+// take effect for that user.
 //
 // v15: per-project daily rollups. Days and provider slices now carry
 // a `projects` breakdown (cost/calls/savings/sessions per project) so project
@@ -78,8 +83,8 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 17
-const MIN_SUPPORTED_VERSION = 17
+export const DAILY_CACHE_VERSION = 24
+const MIN_SUPPORTED_VERSION = 24
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including
