@@ -621,3 +621,59 @@ describe('ensureCacheHydrated: schema version invalidation (#873)', () => {
     expect(hydrated.days.find(d => d.date === '2026-06-11')?.cost).toBe(18.2)
   })
 })
+
+// The Cline CLI is a NEW provider: every historical session under
+// ~/.cline/data/sessions contributes usage no v26 rollup ever contained.
+// usage-aggregator serves every day before today from this cache and retention
+// is ten years, so without the bump an upgrading user keeps cline-cli-less
+// history forever while today's numbers silently include it.
+describe('ensureCacheHydrated: schema version invalidation (cline-cli)', () => {
+  function clineCliDay(date: string, cost: number, calls: number): DailyEntry {
+    return {
+      ...emptyDay(date, cost, calls),
+      sessions: 1,
+      providers: { 'cline-cli': { cost, calls, savingsUSD: 0, sessions: 1, inputTokens: 500, outputTokens: 200 } },
+    }
+  }
+
+  it('re-derives a warm complete v26 cache instead of serving its cline-cli-less totals', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-06-12T12:00:00.000Z'))
+
+    const { writeFile, mkdir } = await import('fs/promises')
+    await mkdir(TMP_CACHE_ROOT, { recursive: true })
+    // A cache exactly as the pre-bump release left it: the schema current at
+    // the time (v26), finalized off a complete parse, watermark at yesterday,
+    // matching tz and savings hash. Nothing but the version bump can
+    // invalidate it: revert DAILY_CACHE_VERSION to 26 and this file becomes the
+    // active one again, served complete and frozen (parseCalls stays 0).
+    const v26 = {
+      version: 26,
+      savingsConfigHash: '',
+      tzKey: currentTzKey(),
+      lastComputedDate: '2026-06-11',
+      days: [emptyDay('2026-06-11', 4.55, 1)],
+      complete: true,
+      watermarkTrusted: true,
+    }
+    await writeFile(join(TMP_CACHE_ROOT, 'daily-cache.v26.json'), JSON.stringify(v26), 'utf-8')
+
+    let parseCalls = 0
+    const hydrated = await ensureCacheHydrated(
+      async () => {
+        parseCalls += 1
+        return []
+      },
+      () => [clineCliDay('2026-06-11', 9.1, 3)],
+    )
+
+    expect(parseCalls).toBe(1)
+    const day = hydrated.days.find(d => d.date === '2026-06-11')
+    expect(day?.cost).toBe(9.1)
+    expect(day?.providers['cline-cli']?.cost).toBe(9.1)
+    expect(hydrated.version).toBe(DAILY_CACHE_VERSION)
+    expect(hydrated.complete).toBe(true)
+    // The v26 file is never rewritten or deleted — old binaries still own it.
+    expect(JSON.parse(await readFile(join(TMP_CACHE_ROOT, 'daily-cache.v26.json'), 'utf-8')).version).toBe(26)
+  })
+})
