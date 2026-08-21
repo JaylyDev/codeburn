@@ -1,4 +1,4 @@
-import { getModelCosts, sanitizeModelForDisplay, type ModelCosts } from './models.js'
+import { billableOutputTokens, getModelCosts, sanitizeModelForDisplay, type ModelCosts } from './models.js'
 import { getProvider } from './providers/index.js'
 import { formatCost, formatTokens } from './format.js'
 import { renderTable, type TableColumn } from './text-table.js'
@@ -124,7 +124,7 @@ export async function aggregateAudit(projects: ProjectSummary[]): Promise<AuditR
     const meta = await resolveProvider(bucket.provider)
     const displayed = {
       inputTokens: bucket.raw.inputTokens,
-      outputTokens: bucket.raw.outputTokens + bucket.raw.reasoningTokens,
+      outputTokens: billableOutputTokens(bucket.provider, bucket.raw.outputTokens, bucket.raw.reasoningTokens),
       cacheWriteTokens: bucket.raw.cacheCreationInputTokens,
       cacheReadTokens: bucket.cacheReadDisplayed,
     }
