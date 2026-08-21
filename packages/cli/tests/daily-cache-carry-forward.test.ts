@@ -701,6 +701,7 @@ describe('adoption union across older cache files', () => {
       lastComputedDate: daysAgoStr(1),
       days: [rich],
       complete: true,
+      watermarkTrusted: true,
     }
     await saveDailyCache(cache)
     const loaded = await loadDailyCache()
