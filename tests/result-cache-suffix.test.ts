@@ -250,4 +250,68 @@ describe('unsuffixed result caches coexist with mixed-version binaries', () => {
     }))
     expect(await readAntigravityModel(sourcePath)).toBeUndefined()
   })
+
+  it('never serves matching legacy when a versioned file is present but invalid', async () => {
+    const sourcePath = join(root, 'rollout.jsonl')
+    const dbPath = join(root, 'state.vscdb')
+    const pbPath = join(root, 'shared.pb')
+    await writeFile(sourcePath, '{}\n')
+    await writeFile(dbPath, 'cursor-db')
+    await writeFile(pbPath, 'fixture')
+    const fingerprint = await fingerprintFile(sourcePath)
+    const { stat } = await import('fs/promises')
+    const dbStat = await stat(dbPath)
+    const pbStat = await stat(pbPath)
+    const floor = '2026-01-01T00:00:00.000Z'
+    expect(fingerprint).not.toBeNull()
+
+    await writeFile(join(root, CODEX_LEGACY_CACHE_FILE), JSON.stringify({
+      version: CODEX_CACHE_VERSION,
+      files: {
+        [sourcePath]: {
+          dev: fingerprint!.dev,
+          ino: fingerprint!.ino,
+          mtimeMs: fingerprint!.mtimeMs,
+          sizeBytes: fingerprint!.sizeBytes,
+          project: 'legacy',
+          calls: [call('codex', 'legacy-served')],
+        },
+      },
+    }))
+    await writeFile(join(root, CURSOR_LEGACY_CACHE_FILE), JSON.stringify({
+      version: CURSOR_CACHE_VERSION,
+      dbMtimeMs: dbStat.mtimeMs,
+      dbSizeBytes: dbStat.size,
+      lookbackFloor: floor,
+      calls: [call('cursor', 'legacy-served')],
+    }))
+    await writeFile(join(root, ANTIGRAVITY_LEGACY_CACHE_FILE), JSON.stringify({
+      version: ANTIGRAVITY_CACHE_VERSION,
+      cascades: {
+        shared: { mtimeMs: pbStat.mtimeMs, sizeBytes: pbStat.size, calls: [call('antigravity', 'legacy-served')] },
+      },
+    }))
+
+    await writeFile(join(root, codexCacheFileName()), '{not-json')
+    await writeFile(join(root, cursorCacheFileName()), '{not-json')
+    await writeFile(join(root, antigravityCacheFileName()), '{not-json')
+    expect(await readCachedCodexResults(sourcePath)).toBeNull()
+    expect(await readCachedResults(dbPath, floor)).toBeNull()
+    expect(await readAntigravityModel(pbPath)).toBeUndefined()
+
+    clearCodexMemCaches()
+    clearAntigravityCacheStates()
+    await writeFile(join(root, codexCacheFileName()), JSON.stringify({ version: CODEX_CACHE_VERSION - 1, files: {} }))
+    await writeFile(join(root, cursorCacheFileName()), JSON.stringify({
+      version: CURSOR_CACHE_VERSION - 1,
+      dbMtimeMs: dbStat.mtimeMs,
+      dbSizeBytes: dbStat.size,
+      lookbackFloor: floor,
+      calls: [call('cursor', 'wrong-version')],
+    }))
+    await writeFile(join(root, antigravityCacheFileName()), JSON.stringify({ version: ANTIGRAVITY_CACHE_VERSION - 1, cascades: {} }))
+    expect(await readCachedCodexResults(sourcePath)).toBeNull()
+    expect(await readCachedResults(dbPath, floor)).toBeNull()
+    expect(await readAntigravityModel(pbPath)).toBeUndefined()
+  })
 })

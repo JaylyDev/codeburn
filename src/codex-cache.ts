@@ -4,7 +4,7 @@ import { randomBytes } from 'crypto'
 import { join, resolve } from 'path'
 import { AsyncLocalStorage } from 'node:async_hooks'
 
-import { getCodeburnCacheDir } from './cache-dir.js'
+import { getCodeburnCacheDir, readExistingTextFile } from './cache-dir.js'
 import type { ParsedProviderCall } from './providers/types.js'
 
 // v4: attribute MCP calls emitted as event_msg/mcp_tool_call_end (issue #478).
@@ -102,15 +102,24 @@ export function clearCodexMemCaches(): void {
 async function loadCache(cacheDir: string): Promise<ResultCache> {
   const inMemory = memCaches.get(cacheDir)
   if (inMemory) return inMemory
-  try {
-    const raw = await readFile(getCachePath(cacheDir), 'utf-8')
-    const cache = JSON.parse(raw) as ResultCache
-    if (isCurrentCache(cache)) {
-      memCaches.set(cacheDir, cache)
-      return cache
-    }
-  } catch {}
-  // Versioned file missing/unreadable. Adopt the unsuffixed file only when its
+  const empty = { version: CODEX_CACHE_VERSION, files: {} }
+  const versioned = await readExistingTextFile(getCachePath(cacheDir))
+  if (versioned.status === 'ok') {
+    try {
+      const cache = JSON.parse(versioned.text) as ResultCache
+      if (isCurrentCache(cache)) {
+        memCaches.set(cacheDir, cache)
+        return cache
+      }
+    } catch {}
+    memCaches.set(cacheDir, empty)
+    return empty
+  }
+  if (versioned.status === 'unreadable') {
+    memCaches.set(cacheDir, empty)
+    return empty
+  }
+  // Versioned file is absent (ENOENT). Adopt the unsuffixed file only when its
   // version matches — old binaries still own that path; we never write or delete it.
   try {
     const raw = await readFile(getLegacyCachePath(cacheDir), 'utf-8')
@@ -120,7 +129,6 @@ async function loadCache(cacheDir: string): Promise<ResultCache> {
       return cache
     }
   } catch {}
-  const empty = { version: CODEX_CACHE_VERSION, files: {} }
   memCaches.set(cacheDir, empty)
   return empty
 }

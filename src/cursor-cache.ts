@@ -2,7 +2,7 @@ import { readFile, writeFile, mkdir, rename, stat, unlink } from 'fs/promises'
 import { join } from 'path'
 import { randomBytes } from 'crypto'
 
-import { getCodeburnCacheDir } from './cache-dir.js'
+import { getCodeburnCacheDir, readExistingTextFile } from './cache-dir.js'
 import type { ParsedProviderCall } from './providers/types.js'
 
 // Bumped to 3 for the workspace-aware breakdown change: the cursor parser
@@ -76,12 +76,18 @@ export async function readCachedResults(
     const fp = await getDbFingerprint(dbPath)
     if (!fp) return null
 
-    const versioned = await readCacheFile(getCachePath())
-    if (versioned && isCurrentHit(versioned, fp, requestedFloor)) return versioned.calls
-    if (versioned) return null
+    const versioned = await readExistingTextFile(getCachePath())
+    if (versioned.status === 'ok') {
+      try {
+        const cache = JSON.parse(versioned.text) as ResultCache
+        if (cache && typeof cache === 'object' && isCurrentHit(cache, fp, requestedFloor)) return cache.calls
+      } catch {}
+      return null
+    }
+    if (versioned.status === 'unreadable') return null
 
-    // Versioned file missing. Adopt the unsuffixed file only when its version
-    // and fingerprint match — old binaries still own that path.
+    // Versioned file is absent (ENOENT). Adopt the unsuffixed file only when its
+    // version and fingerprint match — old binaries still own that path.
     const legacy = await readCacheFile(getLegacyCachePath())
     if (legacy && isCurrentHit(legacy, fp, requestedFloor)) return legacy.calls
     return null

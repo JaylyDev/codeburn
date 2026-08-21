@@ -6,7 +6,7 @@ import { homedir } from 'os'
 import { fileURLToPath } from 'url'
 import https from 'https'
 
-import { getCodeburnCacheDir } from '../cache-dir.js'
+import { getCodeburnCacheDir, readExistingTextFile } from '../cache-dir.js'
 import { calculateCost } from '../models.js'
 import { isSqliteAvailable, isSqliteBusyError, openDatabase } from '../sqlite.js'
 import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
@@ -349,16 +349,32 @@ export function extractAntigravityGeneratorMetadata(resp: unknown): GeneratorMet
 async function loadCache(cacheDir: string): Promise<AntigravityCacheState> {
   const inMemory = cacheStates.get(cacheDir)
   if (inMemory) return inMemory
-  try {
-    const raw = await readFile(getCachePath(cacheDir), 'utf-8')
-    const cache = JSON.parse(raw) as AntigravityCache
-    if (isCurrentCache(cache)) {
-      const state = { cache, dirty: false }
-      cacheStates.set(cacheDir, state)
-      return state
+  const versioned = await readExistingTextFile(getCachePath(cacheDir))
+  if (versioned.status === 'ok') {
+    try {
+      const cache = JSON.parse(versioned.text) as AntigravityCache
+      if (isCurrentCache(cache)) {
+        const state = { cache, dirty: false }
+        cacheStates.set(cacheDir, state)
+        return state
+      }
+    } catch { /* present but invalid */ }
+    const invalid: AntigravityCacheState = {
+      cache: { version: CACHE_VERSION, cascades: {} },
+      dirty: false,
     }
-  } catch { /* no cache or invalid */ }
-  // Versioned file missing/unreadable. Adopt the unsuffixed file only when its
+    cacheStates.set(cacheDir, invalid)
+    return invalid
+  }
+  if (versioned.status === 'unreadable') {
+    const invalid: AntigravityCacheState = {
+      cache: { version: CACHE_VERSION, cascades: {} },
+      dirty: false,
+    }
+    cacheStates.set(cacheDir, invalid)
+    return invalid
+  }
+  // Versioned file is absent (ENOENT). Adopt the unsuffixed file only when its
   // version matches — old binaries still own that path; we never write or delete it.
   try {
     const raw = await readFile(getLegacyCachePath(cacheDir), 'utf-8')
