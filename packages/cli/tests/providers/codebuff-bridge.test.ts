@@ -1,3 +1,7 @@
+// FIRST import: pins the host privacy key before anything reads it, so the
+// dedup-key fingerprint below is a constant rather than a per-run random.
+import '../setup/fixed-privacy-key.js'
+
 import { dirname, join, resolve } from 'path'
 import { fileURLToPath } from 'url'
 
@@ -5,19 +9,24 @@ import { describe, it, expect } from 'vitest'
 
 import { createCodebuffProvider } from '../../src/providers/codebuff.js'
 import { priceProviderCall } from '../../src/pricing-pass.js'
+import { expectedSourceRef } from '../setup/fixed-privacy-key.js'
 import type { ParsedProviderCall, SessionSource } from '../../src/providers/types.js'
 
 // Byte-identical parity gate for the codebuff bridge migration. The GOLDEN below
 // was captured from the legacy in-CLI decode before the migration; the bridged
 // provider (discovery + I/O CLI-side, pure decode in @codeburn/core/providers/codebuff)
-// must reproduce it exactly. Dedup keys contain absolute source paths, so they are
-// computed from the discovered source at runtime rather than hard-coded.
+// must reproduce it exactly, EXCEPT the dedup key, which deliberately changed:
+// it used to embed the absolute chat-dir path (dedupKey ships on the observation
+// envelope, so that was a raw host path riding a payload) and now embeds a keyed
+// fingerprint of it. The expected fingerprint is re-derived longhand from a
+// pinned key (expectedSourceRef) rather than by calling the production helper,
+// so this golden pins the encoding instead of agreeing with itself.
 
 const here = dirname(fileURLToPath(import.meta.url))
 const FIXTURE_DIR = resolve(here, '../fixtures/codebuff-parity/manicode')
 
 function expectedGolden(sourcePath: string): ParsedProviderCall[] {
-  const chatDir = sourcePath
+  const chatRef = expectedSourceRef(sourcePath)
   return [
     {
       provider: 'codebuff',
@@ -35,7 +44,7 @@ function expectedGolden(sourcePath: string): ParsedProviderCall[] {
       bashCommands: ['npm', 'npm'],
       timestamp: '2026-04-14T10:00:30.000Z',
       speed: 'standard',
-      deduplicationKey: `codebuff:${chatDir}:a1`,
+      deduplicationKey: `codebuff:${chatRef}:a1`,
       userMessage: 'implement the feature',
       sessionId: 'manicode/2026-04-14T10-00-00.000Z',
     },
@@ -55,7 +64,7 @@ function expectedGolden(sourcePath: string): ParsedProviderCall[] {
       bashCommands: [],
       timestamp: '2026-04-14T10:01:30.000Z',
       speed: 'standard',
-      deduplicationKey: `codebuff:${chatDir}:a2`,
+      deduplicationKey: `codebuff:${chatRef}:a2`,
       userMessage: 'fix the bug',
       sessionId: 'manicode/2026-04-14T10-00-00.000Z',
     },
@@ -75,7 +84,7 @@ function expectedGolden(sourcePath: string): ParsedProviderCall[] {
       bashCommands: [],
       timestamp: '2026-04-14T10:02:00.000Z',
       speed: 'standard',
-      deduplicationKey: `codebuff:${chatDir}:a3`,
+      deduplicationKey: `codebuff:${chatRef}:a3`,
       userMessage: '',
       sessionId: 'manicode/2026-04-14T10-00-00.000Z',
     },
@@ -99,6 +108,16 @@ describe('codebuff bridge — fixture parity', () => {
   it('the bridged provider reproduces the pre-migration decode byte-for-byte', async () => {
     const { calls, sourcePath } = await collect()
     expect(calls).toEqual(expectedGolden(sourcePath))
+  })
+
+  it('the dedup key is an opaque fingerprint, never the chat-dir path', async () => {
+    const { calls, sourcePath } = await collect()
+    expect(calls.length).toBeGreaterThan(0) // non-vacuous
+    for (const call of calls) {
+      expect(call.deduplicationKey).toMatch(/^codebuff:[0-9a-f]{16}:a[0-9]+$/)
+      expect(call.deduplicationKey).not.toContain(sourcePath)
+      expect(call.deduplicationKey).not.toContain('codebuff-parity')
+    }
   })
 
   it('the priced output survives the pricing pass; credit fallback is used when table price is zero', async () => {

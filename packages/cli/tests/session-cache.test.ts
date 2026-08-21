@@ -1,6 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createHash } from 'crypto'
-import { readFile, rm, writeFile, mkdir } from 'fs/promises'
+import { mkdtemp, readFile, rm, writeFile, mkdir } from 'fs/promises'
 import { existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { basename, join } from 'path'
@@ -295,6 +295,64 @@ describe('computeEnvFingerprint', () => {
   it('bumped opencode/kilo-code parser versions invalidate a pre-bump cached fingerprint', () => {
     expect(computeEnvFingerprint('opencode')).not.toBe(preBumpFingerprint('opencode'))
     expect(computeEnvFingerprint('kilo-code')).not.toBe(preBumpFingerprint('kilo-code', 'worktree-project-grouping-v1'))
+  })
+
+  it('every dedup-key-hygiene provider carries a parse version so cached old-shape keys re-derive', () => {
+    // The six sourceRef providers changed their dedup key shape (raw source
+    // path -> keyed fingerprint) and copilot's JetBrains digest changed value
+    // (sha256 -> HMAC). Without an entry here the env fingerprint would not
+    // change, a warm session cache would keep serving the old keys, and those
+    // keys seed the dedup sets — re-ingesting the same records under the new
+    // shape. The comparison baseline is a provider with no entry and no env
+    // vars, whose fingerprint omits the `parser=` component entirely.
+    for (const provider of ['codebuff', 'zerostack', 'pi', 'omp', 'grok', 'lingtai-tui', 'copilot']) {
+      expect(computeEnvFingerprint(provider), provider).not.toBe(computeEnvFingerprint('unknown-provider'))
+    }
+  })
+})
+
+// ── computeEnvFingerprint: privacy-key binding ─────────────────────────
+
+// The six sourceRef providers derive their dedup keys from the per-install
+// privacy key. A parse version cannot see that key change — a lost, rotated, or
+// (unwritable config dir) ephemeral key would silently produce keys that never
+// match the cached ones, so every record re-ingests as new. computeEnvFingerprint
+// therefore folds a digest of the key in for exactly those providers.
+describe('computeEnvFingerprint — privacy-key binding', () => {
+  async function fingerprintUnderKey(key: string, providers: string[]): Promise<string[]> {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-envfp-'))
+    await mkdir(join(home, '.config', 'codeburn'), { recursive: true })
+    await writeFile(join(home, '.config', 'codeburn', 'privacy-key'), key + '\n')
+    process.env.HOME = home
+    // Fresh module registry so privacy-key.ts re-reads the file instead of
+    // serving its memoized key — this is what a new process would do.
+    vi.resetModules()
+    const mod = await import('../src/session-cache.js')
+    const out = providers.map(p => mod.computeEnvFingerprint(p))
+    await rm(home, { recursive: true, force: true })
+    return out
+  }
+
+  const KEY_A = 'a1'.repeat(32)
+  const KEY_B = 'b2'.repeat(32)
+
+  it('changes the fingerprint of a sourceRef provider and leaves other providers alone', async () => {
+    const providers = ['codebuff', 'claude']
+    const underA = await fingerprintUnderKey(KEY_A, providers)
+    const underB = await fingerprintUnderKey(KEY_B, providers)
+
+    // codebuff: key-derived dedup keys, so a different key must re-parse.
+    expect(underB[0]).not.toBe(underA[0])
+    // claude: dedup keys owe nothing to the privacy key, so a rotation must NOT
+    // churn its cache. Without this half the test would pass on a fingerprint
+    // that folded the key in for everyone.
+    expect(underB[1]).toBe(underA[1])
+  })
+
+  it('is stable when the key is unchanged', async () => {
+    const first = await fingerprintUnderKey(KEY_A, ['codebuff'])
+    const again = await fingerprintUnderKey(KEY_A, ['codebuff'])
+    expect(again[0]).toBe(first[0])
   })
 })
 

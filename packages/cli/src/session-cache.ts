@@ -4,6 +4,7 @@ import { createHash, randomBytes } from 'crypto'
 import { join } from 'path'
 import { homedir } from 'os'
 
+import { getHostPrivacyKey } from './privacy-key.js'
 import type { ToolCall } from './types.js'
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -234,6 +235,22 @@ export const DURABLE_PROVIDER_NAMES: ReadonlySet<string> = new Set(['copilot'])
 // needs no suffix: the cli-shutdown-cost-v1 bump below already forces its one
 // re-parse, which lands the flag too, and durable orphans now survive
 // fingerprint changes (the carry-forward in getOrCreateProviderSection).
+// Dedup-key hygiene (#933/#935): six providers now thread a FINGERPRINT of the
+// source path into their dedup keys instead of the raw path, and copilot's
+// JetBrains per-turn digest went from an unkeyed sha256 to a keyed HMAC. The
+// session cache seeds its dedup sets from the CACHED keys, so a pre-fix cache
+// keeps the old-shape keys and the same records re-ingest under the new shape
+// (double-count; and for the six, the raw path stays on disk forever). Each
+// entry/suffix below changes the provider's env fingerprint, which forces the
+// one-time re-parse that drops the old-shape keys.
+//
+// SOURCE_REF_KEYED_PARSE_VERSION is the marker token for the six: their keys
+// are derived from the per-install privacy key, which the parse version alone
+// cannot see. computeEnvFingerprint folds a digest of that key in for exactly
+// these providers, so a lost or rotated key forces a clean re-parse instead of
+// silently accumulating duplicates in a warm cache.
+export const SOURCE_REF_KEYED_PARSE_VERSION = 'source-ref-fingerprint-v1'
+
 export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // rich-session-capture-v1: parse-time capture of per-turn gitBranch, per-call
   // LOC deltas / interruptions / userModified / toolErrors, and session-level
@@ -252,10 +269,14 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   codex: 'mcp-attribution-v2-est-cost-rich-capture-v1-cross-provider-pr-v1',
   cursor: 'composer-anchored-crediting-v1-est-cost',
   'cursor-agent': 'workspaceless-transcript-v1',
-  copilot: 'cli-shutdown-cost-v1-skills',
-  grok: 'estimated-cost-v1',
+  copilot: 'cli-shutdown-cost-v1-skills-dedup-key-hmac-v1',
+  codebuff: 'source-ref-fingerprint-v1',
+  zerostack: 'source-ref-fingerprint-v1',
+  pi: 'source-ref-fingerprint-v1',
+  omp: 'source-ref-fingerprint-v1',
+  grok: 'estimated-cost-v1-source-ref-fingerprint-v1',
   hermes: 'reasoning-output-accounting-v1-est-cost',
-  'lingtai-tui': 'token-ledger-registry-activity-v3',
+  'lingtai-tui': 'token-ledger-registry-activity-v3-source-ref-fingerprint-v1',
   'ibm-bob': 'worktree-project-grouping-v1',
   kiro: 'ide-parsing-v1-est-cost',
   opencode: 'session-model-v1',
@@ -292,7 +313,19 @@ export function computeEnvFingerprint(provider: string): string {
   const vars = PROVIDER_ENV_VARS[provider] ?? []
   const parts = vars.map(v => `${v}=${process.env[v] ?? ''}`)
   const parseVersion = PROVIDER_PARSE_VERSIONS[provider]
-  if (parseVersion) parts.push(`parser=${parseVersion}`)
+  if (parseVersion) {
+    parts.push(`parser=${parseVersion}`)
+    // Providers whose dedup keys are HMAC-derived from the per-install privacy
+    // key must re-parse when that key changes. The key file can be lost,
+    // rotated, or fall back to a per-process ephemeral key (unwritable config
+    // dir) with no parse-version change to notice it — and the cached keys
+    // would then never match the freshly derived ones, so every record would
+    // re-ingest as new. A digest of the key (never the key itself) rides the
+    // fingerprint for exactly those providers.
+    if (parseVersion.includes(SOURCE_REF_KEYED_PARSE_VERSION)) {
+      parts.push(`privacy-key=${createHash('sha256').update(getHostPrivacyKey()).digest('hex').slice(0, 16)}`)
+    }
+  }
   return createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 16)
 }
 
