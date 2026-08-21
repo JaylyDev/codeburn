@@ -225,21 +225,30 @@ function mergeSnapshotFallbacks(pricing: Map<string, ModelCosts>): Map<string, M
   return applyBuiltinPriceOverrides(pricing)
 }
 
+function setPricingCache(pricing: Map<string, ModelCosts>): void {
+  pricingCache = pricing
+  sortedPricingKeys = null
+  lowercasePricingIndex = null
+  knownNamespaces = null
+}
+
 export async function loadPricing(): Promise<void> {
   const cached = await loadCachedPricing()
   if (cached) {
-    pricingCache = mergeSnapshotFallbacks(cached)
-    sortedPricingKeys = null
-    lowercasePricingIndex = null
-    knownNamespaces = null
+    setPricingCache(mergeSnapshotFallbacks(cached))
+    return
+  }
+
+  // Test-only escape hatch, set for the whole suite in
+  // tests/setup/env-isolation.ts: skip the live LiteLLM fetch and price purely
+  // off the bundled snapshot, so an upstream reprice can't turn tests red.
+  if (process.env['CODEBURN_PRICING_SNAPSHOT_ONLY']) {
+    setPricingCache(mergeSnapshotFallbacks(new Map()))
     return
   }
 
   try {
-    pricingCache = mergeSnapshotFallbacks(await fetchAndCachePricing())
-    sortedPricingKeys = null
-    lowercasePricingIndex = null
-    knownNamespaces = null
+    setPricingCache(mergeSnapshotFallbacks(await fetchAndCachePricing()))
   } catch {
     // snapshot already loaded at init; nothing more to do
   }
