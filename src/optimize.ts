@@ -321,10 +321,13 @@ export function optimizeEmptyScanLines(provider?: string): [string, string, stri
     ]
   }
   const copy = optimizeRemediationCopy(provider)
+  // scanSessions is Claude-only. Naming the provider's instruction file here
+  // would claim a scan that did not run (Health A / 100 under --provider
+  // codex with every listed detector claudeOnly-disabled).
   return [
-    `CodeBurn optimize scans your ${copy.agent} sessions and config for`,
-    'token waste: junk directory reads, duplicate file reads, unused',
-    `agents/skills/MCP servers, bloated ${copy.instructionFile}, and more.`,
+    `Session-scan detectors do not cover ${copy.agent} yet.`,
+    'junk directory reads, duplicate file reads, unused agents/skills/MCP,',
+    'and bloated instruction files currently scan Claude Code only.',
   ]
 }
 
