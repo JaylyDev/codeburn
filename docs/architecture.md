@@ -198,6 +198,19 @@ type Provider = {
 
 Both lists hit the same `getAllProviders()` aggregator. A failed lazy import is silent and excludes that provider from the run.
 
+### WSL roots (Windows)
+
+`src/wsl.ts` is inert off Windows: `wslHomes()` returns `[]` and nothing is spawned. On Windows it runs `%SystemRoot%\System32\wsl.exe --list --quiet --running` (3 s timeout, absolute path so nothing dropped next to the CLI can impersonate it), decodes its UTF-16LE output, drops container-runtime distros, and enumerates `\\wsl$\<distro>\home\*` plus `\\wsl$\<distro>\root`. The result is memoized per process.
+
+`claude` (via `getClaudeConfigDirs`) and `codex` (via `createCodexProvider`) append `<wslHome>/.claude` and `<wslHome>/.codex` to their root lists, so the existing multi-root discovery, `probeRoots()` and `codeburn doctor` cover them with no other changes. Roots are additive — they do not replace `CLAUDE_CONFIG_DIRS`/`CODEX_HOME`.
+
+Two knock-on rules:
+
+- **Running distros only** by default. Touching `\\wsl$\<distro>` boots a stopped distro, which is intrusive and slow. `CODEBURN_WSL=all` opts into every installed distro; `CODEBURN_WSL=off` disables discovery. It is a read policy, never part of a cache fingerprint (see `PROVIDER_ENV_VARS` in `src/session-cache.ts`).
+- **Fingerprints drop `dev`/`ino` for `\\wsl$` paths** (`fingerprintFile` in `src/session-cache.ts` and `src/codex-cache.ts`). The 9P share synthesizes them per mount, so keying on them would re-parse every WSL session on every run; mtime+size alone still detects both a modification and an append.
+
+Session `cwd` values recorded inside WSL are Linux paths (`/home/me/proj`) that name nothing on the Windows filesystem. `resolveCanonicalProjectPath` (`src/parser.ts`) already refuses to walk a path that is not absolute *on the current platform*, so those are attributed to the recorded `cwd` verbatim instead of being walked or canonicalized.
+
 `src/providers/vscode-cline-parser.ts` is a shared helper consumed by `cline`, `ibm-bob`, `kilo-code`, and `roo-code`. It is not registered as a provider on its own.
 
 For the per-provider data location, storage format, parser quirks, and test coverage, see `docs/providers/`.
