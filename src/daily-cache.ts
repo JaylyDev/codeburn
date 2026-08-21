@@ -119,8 +119,20 @@ import type { DateRange, ProjectSummary } from './types.js'
 // PR #1056, so those numbers are spoken for and reusing one would let two
 // incompatible schemas share a filename. (feat/core-extraction sits at 26 and
 // reconciles at its final merge by keeping the max.)
-export const DAILY_CACHE_VERSION = 23
-const MIN_SUPPORTED_VERSION = 23
+//
+// v24: gpt-5.6-codex / gpt-5.6-codex-max pricing (#1077) - added as explicit
+// litellm-snapshot.json rows. getModelCosts already resolved both ids to the
+// correct rate via the `gpt-5.6` prefix fallback before this landed, so a day
+// finalized on any binary that had a `gpt-5.6` snapshot row already carries
+// the right cost; this bump only matters for a day finalized before THAT (a
+// window where neither existed). The daily cache has no per-provider
+// invalidation, so there is no way to tell those days apart from here -
+// raising MIN_SUPPORTED_VERSION forces the one-time re-derivation for
+// everyone, which is a lossless no-op for days already correct. #1056 also
+// claims 24 on its own branch (unmerged as of this writing); whichever lands
+// second takes the next number instead of reusing this one.
+export const DAILY_CACHE_VERSION = 24
+const MIN_SUPPORTED_VERSION = 24
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including
