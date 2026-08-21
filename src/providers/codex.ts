@@ -7,6 +7,7 @@ import { homedir } from 'os'
 import { readSessionLines } from '../fs-utils.js'
 import { billableOutputTokens, calculateCost, getModelCosts } from '../models.js'
 import { readCachedCodexResults, writeCachedCodexResults, getCachedCodexProject, fingerprintFile, type CodexFileFingerprint } from '../codex-cache.js'
+import { mergeToolIntervals } from '../codex-throughput.js'
 import { normalizeContentBlocks } from '../content-utils.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ToolCall } from '../types.js'
@@ -612,6 +613,12 @@ type CodexResumeState = {
   turnCounter: number
   currentTurnId: string
   taskStartedAt?: number
+  // #1088 BUG-1: timestamp of the first request-context event (turn_context,
+  // world_state, event_msg/user_message, or response_item/message) seen since
+  // the last task_started. Codex fires task_started before it assembles the
+  // request, so the gap up to this event is CLI/harness startup, not model
+  // wait -- the active window for Tok/s starts here, not at task_started.
+  taskActiveStartedAt?: number
 }
 
 // The state comes back off our own JSON cache; a truncated or hand-edited file
@@ -718,8 +725,13 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
       // Bounded by one task's calls; flushed at the next task_started and at EOF.
       let pendingTaskCalls: ParsedProviderCall[] = []
       let taskGeneratedTokens = 0
+      // #1088 BUG-2: tokens from token_count events dropped by fork-replay
+      // dedup within the current (not-yet-completed) task. See the dedup site
+      // below for why this must offset the active-time window at task_complete.
+      let taskDedupedTokens = 0
       let taskToolIntervals: Array<[number, number]> = []
       let taskStartedAt: number | undefined = resume?.state.taskStartedAt
+      let taskActiveStartedAt: number | undefined = resume?.state.taskActiveStartedAt
       const openToolStarts = new Map<string, number>()
 
       // Resume point for the NEXT run, refreshed at every task boundary.
@@ -763,6 +775,22 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           continue
         }
 
+        // #1088 BUG-1: the first request-context event since task_started marks
+        // where model-request assembly actually began. Checked before any of
+        // these types `continue` below, and unconditionally (like turn_context's
+        // model capture above) so a forked replay's own request-context events
+        // still mark it -- matching how those events are already read regardless
+        // of isForkReplay, which only filters task boundaries and tool events.
+        if (taskActiveStartedAt === undefined && (
+          entry.type === 'turn_context'
+          || entry.type === 'world_state'
+          || (entry.type === 'event_msg' && entry.payload?.type === 'user_message')
+          || (entry.type === 'response_item' && entry.payload?.type === 'message')
+        )) {
+          const ctxAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+          if (Number.isFinite(ctxAt)) taskActiveStartedAt = ctxAt
+        }
+
         if (entry.type === 'turn_context' && typeof entry.payload?.model === 'string') {
           sessionModel = entry.payload.model
           continue
@@ -786,9 +814,11 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           results.push(...pendingTaskCalls)
           pendingTaskCalls = []
           taskGeneratedTokens = 0
+          taskDedupedTokens = 0
           taskToolIntervals = []
           const startedAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
           taskStartedAt = Number.isFinite(startedAt) ? startedAt : undefined
+          taskActiveStartedAt = undefined
           openToolStarts.clear()
           // Everything decoded so far is now in `results` and the per-task
           // accumulators are empty: a clean restart point for an appended tail.
@@ -817,6 +847,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             turnCounter,
             currentTurnId,
             ...(taskStartedAt !== undefined ? { taskStartedAt } : {}),
+            ...(taskActiveStartedAt !== undefined ? { taskActiveStartedAt } : {}),
           }
           continue
         }
@@ -860,23 +891,33 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
         }
 
         if (entry.type === 'event_msg' && entry.payload?.type === 'task_complete') {
-          const durationMs = entry.payload.duration_ms
+          // #1088 BUG-8: task_complete's duration can arrive as {secs,nanos} or
+          // a string too (mcp_tool_call_end already tolerates both, below, via
+          // this same durationValueMs helper); read it the same permissive way
+          // instead of only the plain-number `duration_ms` field.
+          const durationMs = durationValueMs(entry.payload.duration_ms) ?? durationValueMs(entry.payload.duration)
           if (typeof durationMs === 'number' && durationMs > 0 && taskGeneratedTokens > 0 && pendingTaskCalls.length > 0) {
             const completedAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
-            const windowStart = taskStartedAt ?? (Number.isFinite(completedAt) ? completedAt - durationMs : undefined)
-            const windowEnd = windowStart !== undefined ? windowStart + durationMs : undefined
-            const clipped = taskToolIntervals.map(([start, end]) => [
-              windowStart !== undefined ? Math.max(start, windowStart) : start,
-              windowEnd !== undefined ? Math.min(end, windowEnd) : end,
-            ] as [number, number]).filter(([start, end]) => end > start)
-            const merged = clipped.sort((a, b) => a[0] - b[0]).reduce<Array<[number, number]>>((acc, interval) => {
-              const previous = acc.at(-1)
-              if (previous && interval[0] <= previous[1]) previous[1] = Math.max(previous[1], interval[1])
-              else acc.push([...interval])
-              return acc
-            }, [])
-            const toolWaitMs = Math.min(durationMs, merged.reduce((sum, interval) => sum + interval[1] - interval[0], 0))
-            const activeMs = durationMs - toolWaitMs
+            // #1088 BUG-1: Codex fires task_started before it assembles the
+            // request, so the gap up to the first request-context event is
+            // CLI/harness startup, not model wait. The active window starts
+            // there instead of at task_started; task completion (windowEnd,
+            // inside mergeToolIntervals) is unchanged.
+            const activeWindowStart = taskActiveStartedAt ?? taskStartedAt
+            const startupGapMs = activeWindowStart !== undefined && taskStartedAt !== undefined
+              ? activeWindowStart - taskStartedAt
+              : 0
+            const effectiveDurationMs = Math.max(0, durationMs - startupGapMs)
+            // #1088 BUG-8: shared with codex-throughput.ts's live estimate
+            // instead of a second inline copy of the same clip/merge/cap.
+            const toolWaitMs = mergeToolIntervals(taskToolIntervals, effectiveDurationMs, activeWindowStart, Number.isFinite(completedAt) ? completedAt : undefined)
+            // #1088 BUG-2: a partially fork-deduped task's active window still
+            // spans the dropped events' real time even though their tokens
+            // never reached taskGeneratedTokens (see the dedup site above).
+            // Shrink the window by the dropped fraction so surviving calls
+            // aren't credited with time that covers discarded work.
+            const totalTaskTokens = taskGeneratedTokens + taskDedupedTokens
+            const activeMs = (effectiveDurationMs - toolWaitMs) * (taskGeneratedTokens / totalTaskTokens)
             if (activeMs <= 0) continue
             for (const call of pendingTaskCalls) {
               // Reasoning is already inside output_tokens (#1075/#1078); the
@@ -1102,7 +1143,15 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           // key would spuriously diverge on a replay and double-count it.
           const dedupKey = `codex:${forkedFromId || sessionId}:${cumulativeTotal}:${total?.input_tokens ?? 0}:${total?.cached_input_tokens ?? 0}:${total?.output_tokens ?? 0}:${total?.reasoning_output_tokens ?? 0}`
 
-          if (seenKeys.has(dedupKey)) continue
+          if (seenKeys.has(dedupKey)) {
+            // #1088 BUG-2: this event's tokens are dropped from the numerator,
+            // but task_complete's duration_ms is real wall-clock time that
+            // still spans them -- track what was dropped so the active window
+            // can be scaled down to match, instead of crediting the surviving
+            // calls with time that covers work whose tokens were discarded.
+            taskDedupedTokens += billableOutputTokens('codex', outputTokens, reasoningTokens)
+            continue
+          }
           seenKeys.add(dedupKey)
 
           // Reasoning tokens are already inside output_tokens, so they are NOT

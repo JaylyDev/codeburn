@@ -107,7 +107,12 @@ function durationMs(payload: RolloutLine['payload']): number | undefined {
   return undefined
 }
 
-function mergeToolIntervals(intervals: Array<[number, number]>, durationMs: number, taskStartedAt?: number, taskCompletedAt?: number): number {
+// Shared with src/providers/codex.ts (#1088 BUG-8): both clip a task's tool
+// intervals to its [taskStartedAt, taskStartedAt + durationMs] window, merge
+// overlaps, and cap the sum at durationMs. Was copy-pasted inline in
+// providers/codex.ts and had already drifted (duration parsing there accepted
+// only a plain `duration_ms` number); one copy now, called from both.
+export function mergeToolIntervals(intervals: Array<[number, number]>, durationMs: number, taskStartedAt?: number, taskCompletedAt?: number): number {
   const windowStart = taskStartedAt ?? (taskCompletedAt !== undefined ? taskCompletedAt - durationMs : undefined)
   const windowEnd = windowStart !== undefined ? windowStart + durationMs : undefined
   const clipped = intervals.map(([start, end]) => [
