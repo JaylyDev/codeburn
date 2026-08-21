@@ -292,6 +292,11 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // source-provenance-v1 (#944): CLI sessions were misread as VS Code
   // transcripts (both carry producer 'copilot-agent'), skipping the shutdown
   // input/cache rollup; this bump re-parses them so the missing tokens land.
+  // #1051 does NOT bump this again. A fingerprint change drops every present
+  // Copilot source (parser.ts getOrCreateProviderSection) and would erase
+  // conversations already pruned from a still-present OTel DB. Old `:n`
+  // shutdown keys migrate via cachedFileNeedsProviderReparse + a durable
+  // strip of legacy shutdown calls on that JSONL file only.
   copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1',
   // authoritative-usage-v4: persist one Grok session call from top-level
   // authoritative totals, use modelUsage only for priced attribution, clamp
