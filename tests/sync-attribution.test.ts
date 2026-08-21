@@ -572,6 +572,17 @@ describe('buildAttributionOtlpPayload', () => {
     expect(commitAttrs['git.repo']).toEqual({ stringValue: 'github.com/acme/widget' })
   })
 
+  it('keeps session identity off the wire; join is the shared traceId', () => {
+    const items = flattenAttributionRecords([makeRecord()])
+    const payload = buildAttributionOtlpPayload(items)
+    const spans = payload.resourceSpans[0]!.scopeSpans[0]!.spans
+    expect(spans.length).toBeGreaterThan(0)
+    for (const span of spans) {
+      expect(attrMap(span.attributes)['ai.session_id']).toBeUndefined()
+      expect(span.traceId).toBe(deriveTraceId('sess-1'))
+    }
+  })
+
   it('omits git.repo when null and pr_links when empty', () => {
     const items = flattenAttributionRecords([makeRecord({ repo: null, prLinks: [], commits: [] })])
     const payload = buildAttributionOtlpPayload(items)

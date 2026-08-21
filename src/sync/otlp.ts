@@ -154,7 +154,7 @@ export const COMMIT_ATTRIBUTION_SPAN_NAME = 'codeburn.commit'
  * encodes the mutable state (inMain/wasReverted for commits; repo, PR links,
  * and commit set for sessions), so a state TRANSITION mints a new key and the
  * updated fact is re-sent on the next push — the receiver upserts by
- * (repo, sha) / (session). Identical states dedupe via the sent-ledger.
+ * (repo, sha) / traceId. Identical states dedupe via the sent-ledger.
  */
 export type AttributionItem = {
   kind: 'session' | 'commit'
