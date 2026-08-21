@@ -616,6 +616,19 @@ function getCanonicalName(model: string): string {
   )
 }
 
+/// Alias-resolved identity for report merge. Display names stay cosmetic —
+/// prefix matches in SHORT_NAMES must not fold distinct SKUs into one row.
+/// Path-form ids (`accounts/fireworks/models/<slug>`, `cline-pass/<slug>`)
+/// peel to the leaf so they share a bucket with the bare slug.
+export function resolveCanonicalModelId(model: string): string {
+  const viaUser = Object.hasOwn(userAliases, model) ? userAliases[model]! : model
+  const aliased = resolveAlias(getCanonicalName(viaUser))
+  if (!aliased.includes('/')) return aliased
+  const leaf = aliased.slice(aliased.lastIndexOf('/') + 1)
+  if (!leaf) return aliased
+  return resolveAlias(getCanonicalName(leaf))
+}
+
 // Namespaces the pricing catalog itself uses, plus the ones below. An unknown
 // `provider/model` must stay unpriced — do not treat `/` as authority. Derived
 // rather than hand-listed so a vendor LiteLLM already knows (`x-ai/`, `qwen/`,
