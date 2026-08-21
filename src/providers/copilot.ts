@@ -2007,13 +2007,32 @@ const SESSION_STORE_USAGE_FROM = `
   LEFT JOIN sessions s ON s.id = e.session_id`
 const SESSION_STORE_USAGE_SELECT = `SELECT ${SESSION_STORE_USAGE_COLUMNS}${SESSION_STORE_USAGE_FROM}`
 
-// OPTIONAL enrichment: the billing-metadata columns, tried first at parse
-// time and never probed at discovery — older CLI stores predate them, and
-// requiring them would classify a perfectly readable store as absent. A
-// `no such column` failure falls back to the base select above, so an old
-// store parses identically, just without the metadata.
-const SESSION_STORE_USAGE_SELECT_BILLING = `SELECT ${SESSION_STORE_USAGE_COLUMNS},
-       e.total_nano_aiu, e.request_multiplier${SESSION_STORE_USAGE_FROM}`
+// OPTIONAL enrichment: the billing-metadata columns plus `initiator`, tried
+// first at parse time and never probed at discovery — older CLI stores predate
+// them, and requiring them would classify a perfectly readable store as
+// absent. A `no such column` failure falls back to the base select above, so
+// an old store parses identically, just without the enrichment.
+//
+// `initiator` names what caused the request. The one value that changes
+// accounting is 'compaction': that row is the CLI summarizing its own context,
+// not a user turn, so it has no assistant.message to pair with and it belongs
+// to the compaction that resets the shutdown rollup. It is optional in the
+// strongest sense — on a real 2,509-row store 1,504 rows carried NULL here
+// (the column exists, the CLI just did not always populate it), so every rule
+// below prefers the label when present and falls back to the timestamp
+// geometry when it is not.
+// Widest first, then narrower, then the discovery-validated base. Each step
+// drops the newest optional column, so a store that has the billing columns
+// but not `initiator` keeps its billing metadata instead of falling all the
+// way back — the columns arrived in different CLI releases and a single
+// all-or-nothing enrichment would lose the older one.
+const SESSION_STORE_USAGE_SELECTS = [
+  `SELECT ${SESSION_STORE_USAGE_COLUMNS},
+       e.total_nano_aiu, e.request_multiplier, e.initiator${SESSION_STORE_USAGE_FROM}`,
+  `SELECT ${SESSION_STORE_USAGE_COLUMNS},
+       e.total_nano_aiu, e.request_multiplier${SESSION_STORE_USAGE_FROM}`,
+  SESSION_STORE_USAGE_SELECT,
+]
 
 // Type alias, not interface: db.query's Row constraint needs the implicit
 // index signature only anonymous object types carry.
@@ -2032,6 +2051,7 @@ type SessionStoreUsageRow = {
   // Present only when the billing select succeeded (schema has the columns).
   total_nano_aiu?: number | null
   request_multiplier?: number | null
+  initiator?: string | null
 }
 
 // FNV-1a 64-bit over the row's identifying content, base36. Collisions only
@@ -2075,18 +2095,22 @@ function createSessionStoreParser(
         )
       }
       try {
-        let rows: SessionStoreUsageRow[]
+        let rows: SessionStoreUsageRow[] | undefined
         try {
-          try {
-            rows = db.query<SessionStoreUsageRow>(`${SESSION_STORE_USAGE_SELECT_BILLING} ORDER BY e.id ASC`)
-          } catch (billingErr) {
-            // Only the optional billing columns may be missing (older store
-            // schema): fall back to the discovery-validated base select.
-            // Anything else re-throws into the defer classification below.
-            const msg = billingErr instanceof Error ? billingErr.message : String(billingErr)
-            if (!/no such column/i.test(msg)) throw billingErr
-            rows = db.query<SessionStoreUsageRow>(`${SESSION_STORE_USAGE_SELECT} ORDER BY e.id ASC`)
+          for (const select of SESSION_STORE_USAGE_SELECTS) {
+            try {
+              rows = db.query<SessionStoreUsageRow>(`${select} ORDER BY e.id ASC`)
+              break
+            } catch (selectErr) {
+              // Only an OPTIONAL column may be missing (older store schema):
+              // step down to the next narrower select. The last entry is the
+              // discovery-validated base, so a `no such column` there is a
+              // real shape change and re-throws with everything else.
+              const msg = selectErr instanceof Error ? selectErr.message : String(selectErr)
+              if (!/no such column/i.test(msg) || select === SESSION_STORE_USAGE_SELECT) throw selectErr
+            }
           }
+          if (!rows) throw new Error('copilot session-store.db: no usable select')
         } catch (err) {
           // Discovery prepare-validated this exact query moments ago, so any
           // failure here means the store became unreadable or changed shape
@@ -2228,6 +2252,7 @@ function createSessionStoreParser(
             // the request). Omitted when the schema predates the columns.
             ...(typeof row.total_nano_aiu === 'number' ? { nanoAiu: row.total_nano_aiu } : {}),
             ...(typeof row.request_multiplier === 'number' ? { requestMultiplier: row.request_multiplier } : {}),
+            ...(row.initiator ? { initiator: row.initiator } : {}),
           }
         }
       } finally {

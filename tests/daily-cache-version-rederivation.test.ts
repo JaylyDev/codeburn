@@ -10,10 +10,10 @@ import {
   type DailyEntry,
 } from '../src/daily-cache.js'
 
-// One below the current version, so this pins the ADJACENT-version case: 18
-// and 20 exist only as unreleased draft heads (#946's earlier public head, and
-// #1040), and a draft's days must not be adopted as finalized under a number
-// that now means different accounting. Anything below MIN_SUPPORTED_VERSION is
+// One below the current version, so this pins the ADJACENT-version case: v20
+// is the SHIPPED predecessor (#1040, codex model attribution), and its days
+// must be re-derived rather than adopted as finalized under a number that now
+// means different accounting. Anything below MIN_SUPPORTED_VERSION is
 // untrusted, which is what makes the re-derivation global rather than
 // provider-scoped.
 const PRE_FIX_DAILY_VERSION = 20
@@ -69,10 +69,9 @@ afterEach(async () => {
   await rm(cacheRoot, { recursive: true, force: true })
 })
 
-// Raising MIN_SUPPORTED_VERSION re-derives EVERY day from EVERY provider, not
-// only Grok - the daily cache has no per-provider invalidation. A Grok day is
-// used here because Grok is the provider whose totals the bump exists to
-// correct; the mechanism under test is version-wide.
+// Raising MIN_SUPPORTED_VERSION re-derives EVERY day from EVERY provider - the
+// daily cache has no per-provider invalidation. Which provider the seeded day
+// belongs to is incidental; the mechanism under test is version-wide.
 describe('daily-cache re-derivation on a DAILY_CACHE_VERSION bump', () => {
   it('re-derives a day from a below-minimum v20 cache while preserving the old file', async () => {
     const date = toDateString(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000))

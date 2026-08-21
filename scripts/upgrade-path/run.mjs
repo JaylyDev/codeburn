@@ -359,6 +359,25 @@ capture(oldBin, agingCache, join(PAYLOADS, 'aging-baseline'))
 const baseDaily = JSON.parse(readFileSync(join(agingCache, OLD_DAILY_CACHE), 'utf8'))
 const sliceOf = (cache, date) => cache.days.find(d => d.date === date)?.providers?.claude
 
+// A day KEY is not the unit of never-lose; the tokens are. A parse change that
+// re-dates a call to its true day legitimately empties one day and fills its
+// neighbour, token for token - reported from a real cache where 2026-08-08's
+// single call moved to 2026-08-07 with input/cacheRead/cacheWrite landing
+// there exactly. So every comparison below reads a WINDOW around the day
+// rather than the day alone, and only a window that shrinks is a loss.
+const windowOf = (cache, date) => {
+  const day = new Date(`${date}T00:00:00Z`).getTime()
+  const iso = ms => new Date(ms).toISOString().slice(0, 10)
+  const acc = { cost: 0, calls: 0 }
+  for (const offset of [-1, 0, 1]) {
+    const slice = sliceOf(cache, iso(day + offset * 86400000))
+    if (!slice) continue
+    acc.cost += slice.cost ?? 0
+    acc.calls += slice.calls ?? 0
+  }
+  return acc
+}
+
 // Group transcripts by the day their turns land on. Sidechain files are left out:
 // deleting a parent's subagent transcript entangles this with spawn-link
 // carry-forward, which is a different contract.
@@ -398,19 +417,19 @@ else {
   const usd = n => `$${n.toFixed(6)}`
 
   for (const a of aged) {
-    const b = sliceOf(baseDaily, a.date)
-    const u = sliceOf(upDaily, a.date)
-    if (!u) { fail(`${a.date} (${a.kind}): the claude slice is gone entirely; baseline had ${usd(b.cost)} over ${b.calls} calls`); continue }
-    // A fully sourceless day has nothing to re-derive, so it must come back
-    // EXACTLY. A partially sourceless one may legitimately grow (a re-parse
-    // under new accounting), but must never shrink.
+    const b = windowOf(baseDaily, a.date)
+    const u = windowOf(upDaily, a.date)
+    // A fully sourceless day has nothing to re-derive, so its window must come
+    // back EXACTLY. A partially sourceless one may legitimately grow (a
+    // re-parse under new accounting), but must never shrink.
     const exact = a.kind === 'fully sourceless'
     const costOk = exact ? Math.abs(u.cost - b.cost) < 1e-9 : u.cost >= b.cost - 1e-9
     const callsOk = exact ? u.calls === b.calls : u.calls >= b.calls
     const loss = costOk && callsOk ? '' :
-      ` — LOST ${usd(b.cost - u.cost)} (${(100 * (b.cost - u.cost) / b.cost).toFixed(1)}%) and ${b.calls - u.calls} calls`
+      ` — LOST ${usd(b.cost - u.cost)} (${b.cost > 0 ? (100 * (b.cost - u.cost) / b.cost).toFixed(1) : '0.0'}%) and ${b.calls - u.calls} calls`
+    const moved = sliceOf(upDaily, a.date) ? '' : ' (day key empty; window intact)'
     check(costOk && callsOk,
-      `${a.date} (${a.kind}): cost ${usd(b.cost)} -> ${usd(u.cost)}, calls ${b.calls} -> ${u.calls}${loss}`)
+      `${a.date} +/-1d (${a.kind}): cost ${usd(b.cost)} -> ${usd(u.cost)}, calls ${b.calls} -> ${u.calls}${loss}${moved}`)
   }
 }
 

@@ -1709,6 +1709,330 @@ describe.skipIf(!isSqliteAvailable())('(o) absence epoch: served totals are inde
 // up by the residual to the rollup's own totals, and full coverage retires
 // the residual — counted once at every step and zero at none.
 // ═══════════════════════════════════════════════════════════════════════════
+// (c5) initiator = 'compaction' identifies the summarization request
+// ═══════════════════════════════════════════════════════════════════════════
+// The CLI's context-summarization call writes its own assistant_usage_events
+// row, labelled `initiator = 'compaction'` where the store carries that
+// column. Two consequences, both of which need the label: it has no
+// assistant.message, so it must not compete for a per-turn pairing partner,
+// and it commits just BEFORE the compaction stamp that anchors the leg's
+// interval, so without the label the anchor pushes it outside the subtraction
+// while the post-reset rollup still counts it - the documented one-request
+// over-serve. The column is optional twice over (absent on older stores, NULL
+// on many rows of newer ones), so the unlabelled path must be unchanged.
+describe.skipIf(!isSqliteAvailable())('(c5) compaction-initiated store rows', () => {
+  const createStoreDbWithInitiator = (dbPath: string): void => {
+    const { DatabaseSync } = requireForTest('node:sqlite') as { DatabaseSync: new (p: string) => TestDb }
+    const db = new DatabaseSync(dbPath)
+    db.exec(`
+      CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, repository TEXT, created_at TEXT);
+      CREATE TABLE assistant_usage_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL, model TEXT NOT NULL,
+        input_tokens INTEGER, output_tokens INTEGER,
+        cache_read_tokens INTEGER, cache_write_tokens INTEGER,
+        reasoning_tokens INTEGER, created_at TEXT,
+        total_nano_aiu INTEGER, request_multiplier REAL, initiator TEXT);
+    `)
+    db.close()
+  }
+  const insertLabelled = (dbPath: string, sid: string, input: number, at: string, initiator: string | null): void => {
+    const { DatabaseSync } = requireForTest('node:sqlite') as { DatabaseSync: new (p: string) => TestDb }
+    const db = new DatabaseSync(dbPath)
+    db.prepare('INSERT OR IGNORE INTO sessions (id, cwd) VALUES (?, ?)').run(sid, '/home/user/testproj')
+    db.prepare(`INSERT INTO assistant_usage_events
+      (session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+       reasoning_tokens, created_at, total_nano_aiu, request_multiplier, initiator)
+      VALUES (?, 'claude-sonnet-4-5', ?, 0, 0, 0, 0, ?, 1000, 1, ?)`).run(sid, input, at, initiator)
+    db.close()
+  }
+
+  const setup = async (name: string) => {
+    const sessionStateDir = join(tmpHome, `cmpinit-state-${name}`)
+    await mkdir(sessionStateDir, { recursive: true })
+    const dbPath = join(tmpHome, `cmpinit-store-${name}.db`)
+    vi.stubEnv('CODEBURN_COPILOT_SESSION_STATE_DIR', sessionStateDir)
+    vi.stubEnv('CODEBURN_COPILOT_SESSION_STORE_DB', dbPath)
+    vi.stubEnv('CODEBURN_COPILOT_DISABLE_OTEL', '1')
+    vi.stubEnv('CODEBURN_COPILOT_WS_STORAGE_DIR', join(tmpHome, 'no-ws'))
+    vi.stubEnv('CODEBURN_COPILOT_GLOBAL_STORAGE_DIR', join(tmpHome, 'no-global'))
+    vi.stubEnv('CODEBURN_COPILOT_JETBRAINS_DIR', join(tmpHome, 'no-jb'))
+    const base = Date.now() - 3 * 24 * 3600 * 1000
+    const at = (sec: number): string => new Date(base + sec * 1000).toISOString()
+    createStoreDbWithInitiator(dbPath)
+    return { sessionStateDir, dbPath, at }
+  }
+
+  // Row A (user request, 100) - compaction row C (50) - compaction stamp -
+  // rollup claiming 200 for the post-compaction request whose row is missing.
+  const writeSession = async (sessionStateDir: string, at: (s: number) => string): Promise<void> => {
+    const dir = join(sessionStateDir, 'sess-ci')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'workspace.yaml'), 'id: sess-ci\ncwd: /home/user/testproj\n')
+    await writeFile(join(dir, 'events.jsonl'), [
+      JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: 'claude-sonnet-4-5' } }),
+      JSON.stringify({ type: 'session.compaction_complete', timestamp: at(10), data: { success: true, kind: 'background' } }),
+      JSON.stringify({ type: 'session.shutdown', timestamp: at(20), data: {
+        shutdownType: 'routine',
+        modelMetrics: { 'claude-sonnet-4-5': { requests: { count: 1, cost: 1 },
+          usage: { inputTokens: 250, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } },
+      } }),
+    ].join('\n') + '\n')
+  }
+
+  const totalInput = (projects: Awaited<ReturnType<typeof parseAllSessions>>): number =>
+    projects.flatMap(p => p.sessions).flatMap(s => s.turns).flatMap(t => t.assistantCalls)
+      .reduce((sum, c) => sum + c.usage.inputTokens, 0)
+
+  it('subtracts a labelled compaction row from the leg it belongs to', async () => {
+    const { sessionStateDir, dbPath, at } = await setup('labelled')
+    await writeSession(sessionStateDir, at)
+    insertLabelled(dbPath, 'sess-ci', 100, at(5), null)          // user request, pre-compaction
+    insertLabelled(dbPath, 'sess-ci', 50, at(9), 'compaction')   // the summarization call
+
+    // The rollup resets at the compaction and then counts the summarization
+    // call (250 = 50 + a 200 request whose row has not landed). Row A is
+    // excluded by the anchor; the compaction row is subtracted by its label.
+    // Served: 100 + 50 + residual 200 = 350. Without the label the compaction
+    // row would fall outside the interval and serve twice (400).
+    expect(totalInput(await parseAllSessions(undefined, 'copilot'))).toBe(350)
+  })
+
+  it('leaves an UNLABELLED store on its previous behaviour', async () => {
+    const { sessionStateDir, dbPath, at } = await setup('unlabelled')
+    await writeSession(sessionStateDir, at)
+    insertLabelled(dbPath, 'sess-ci', 100, at(5), null)
+    insertLabelled(dbPath, 'sess-ci', 50, at(9), null)  // same row, no label
+
+    // Indistinguishable from a user request: the anchor excludes it, so its
+    // 50 is served once as a row and again inside the residual. Over-serve,
+    // never lose - the documented bound, one request per compaction.
+    expect(totalInput(await parseAllSessions(undefined, 'copilot'))).toBe(400)
+  })
+
+  it('keeps a compaction row out of per-turn pairing', async () => {
+    const { sessionStateDir, dbPath, at } = await setup('pairing')
+    const dir = join(sessionStateDir, 'sess-ci')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'workspace.yaml'), 'id: sess-ci\ncwd: /home/user/testproj\n')
+    // One real request with its assistant.message, and a compaction row a few
+    // seconds later - inside the 2-minute pairing window.
+    await writeFile(join(dir, 'events.jsonl'), [
+      JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: 'claude-sonnet-4-5' } }),
+      JSON.stringify({ type: 'assistant.message', timestamp: at(10), data: { messageId: 'm1', outputTokens: 25, toolRequests: [] } }),
+    ].join('\n') + '\n')
+    insertLabelled(dbPath, 'sess-ci', 100, at(11), null)
+    insertLabelled(dbPath, 'sess-ci', 50, at(13), 'compaction')
+
+    const projects = await parseAllSessions(undefined, 'copilot')
+    const calls = projects.flatMap(p => p.sessions).flatMap(s => s.turns).flatMap(t => t.assistantCalls)
+    const supp = (k: string) => calls.find(c => c.deduplicationKey.includes(k))?.supplementaryAccounting ?? false
+    // The user request's row pairs with m1 and goes supplementary. The
+    // compaction row never enters the pairing pass, so it cannot steal that
+    // partner and keeps its own weight as the real request it is.
+    const storeCalls = calls.filter(c => c.deduplicationKey.startsWith('copilot-store:'))
+    expect(storeCalls).toHaveLength(2)
+    expect(storeCalls.filter(c => c.supplementaryAccounting)).toHaveLength(1)
+    expect(supp('copilot:sess-ci:m1')).toBe(false)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// (c4) Attributed cost equals cost recomputed from the served tokens
+// ═══════════════════════════════════════════════════════════════════════════
+// `codeburn audit` reports both, and a gap between them means some call is
+// carrying dollars its tokens do not justify - the shape of a double-served
+// request. It is the cheapest end-to-end check there is on copilot's
+// reconciliation, so it runs over every combination of the three
+// representations a session can be written in.
+//
+// Magnitudes are a real reported day (2026-08-18, gpt-5.6-terra: 146 store
+// rows, net input 17,792 / cache write 501,395 / cache read 12,097,364 /
+// output 63,344 / reasoning 24,831, billed $4.47 by GitHub), collapsed to two
+// requests. $4.4687 is what those tokens price at, and what the store billed.
+describe.skipIf(!isSqliteAvailable())('(c4) attributed cost tracks recomputed cost', () => {
+  const MODEL = 'gpt-5.6-terra'
+  const BILLED_USD = 4.4687
+
+  const build = async (name: string, opts: { messages: boolean; rollup: boolean; rows: boolean }) => {
+    const sessionStateDir = join(tmpHome, `att-state-${name}`)
+    await mkdir(sessionStateDir, { recursive: true })
+    const dbPath = join(tmpHome, `att-store-${name}.db`)
+    vi.stubEnv('CODEBURN_COPILOT_SESSION_STATE_DIR', sessionStateDir)
+    vi.stubEnv('CODEBURN_COPILOT_SESSION_STORE_DB', dbPath)
+    vi.stubEnv('CODEBURN_COPILOT_DISABLE_OTEL', '1')
+    vi.stubEnv('CODEBURN_COPILOT_WS_STORAGE_DIR', join(tmpHome, 'no-ws'))
+    vi.stubEnv('CODEBURN_COPILOT_GLOBAL_STORAGE_DIR', join(tmpHome, 'no-global'))
+    vi.stubEnv('CODEBURN_COPILOT_JETBRAINS_DIR', join(tmpHome, 'no-jb'))
+
+    const base = Date.now() - 3 * 24 * 3600 * 1000
+    const at = (sec: number): string => new Date(base + sec * 1000).toISOString()
+    createStoreDb(dbPath)
+
+    const dir = join(sessionStateDir, 'sess-att')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'workspace.yaml'), 'id: sess-att\ncwd: /home/user/testproj\n')
+    const lines = [JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: MODEL } })]
+    if (opts.messages) {
+      lines.push(JSON.stringify({ type: 'assistant.message', timestamp: at(10), data: { messageId: 'm1', outputTokens: 31672, toolRequests: [] } }))
+      lines.push(JSON.stringify({ type: 'assistant.message', timestamp: at(20), data: { messageId: 'm2', outputTokens: 31672, toolRequests: [] } }))
+    }
+    if (opts.rollup) {
+      lines.push(JSON.stringify({
+        type: 'session.shutdown', timestamp: at(30), data: {
+          shutdownType: 'routine',
+          modelMetrics: { [MODEL]: { requests: { count: 2, cost: 1 }, usage: {
+            // cache-inclusive, as the CLI writes it
+            inputTokens: 17792 + 12097364 + 501395, outputTokens: 63344,
+            cacheReadTokens: 12097364, cacheWriteTokens: 501395, reasoningTokens: 24831 } } },
+        },
+      }))
+    }
+    await writeFile(join(dir, 'events.jsonl'), lines.join('\n') + '\n')
+
+    if (opts.rows) {
+      insertStoreRow(dbPath, 'sess-att', 8896 + 6048682 + 250697, 6048682, 250697, at(11), 12415)
+      insertStoreRow(dbPath, 'sess-att', 8896 + 6048682 + 250698, 6048682, 250698, at(21), 12416)
+    }
+  }
+
+  const audit = async () => {
+    const { aggregateAudit } = await import('../src/audit-report.js')
+    const rows = await aggregateAudit(await parseAllSessions(undefined, 'copilot'))
+    const row = rows.find(r => r.provider === 'copilot' && r.model === MODEL)
+    expect(row).toBeDefined()
+    return row!
+  }
+
+  for (const shape of [
+    { name: 'rows+messages+rollup', messages: true, rollup: true, rows: true },
+    { name: 'rows+messages', messages: true, rollup: false, rows: true },
+    { name: 'rows+rollup', messages: false, rollup: true, rows: true },
+    { name: 'messages+rollup', messages: true, rollup: true, rows: false },
+  ]) {
+    it(`never attributes more than the served tokens price at: ${shape.name}`, async () => {
+      await build(shape.name.replace(/\+/g, '-'), shape)
+      const row = await audit()
+      expect(row.attributedCostUSD).toBeCloseTo(row.cost.recomputedTotalUSD, 6)
+    })
+  }
+
+  it('lands on the billed amount when the store covers the session', async () => {
+    await build('billed', { messages: true, rollup: true, rows: true })
+    const row = await audit()
+    // Attributed == recomputed == what GitHub billed for these requests.
+    expect(row.cost.recomputedTotalUSD).toBeCloseTo(BILLED_USD, 3)
+    expect(row.attributedCostUSD).toBeCloseTo(BILLED_USD, 3)
+    // Reasoning is inside output and must not be re-priced on top of it:
+    // the pre-fix reading showed 63,344 + 24,831 = 88,175.
+    expect(row.displayed.outputTokens).toBe(63344)
+    expect(row.raw.reasoningTokens).toBe(24831)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// (c3) session.shutdown counters are CUMULATIVE across resume legs
+// ═══════════════════════════════════════════════════════════════════════════
+// Measured on a real 3-leg session (CLI 1.0.80): every counter in a leg,
+// billing and tokens alike, includes the legs before it, and the LAST leg of a
+// complete session equals the session's store-row total exactly. The parser
+// already converts cumulative to per-leg deltas at emission, so the interval
+// arithmetic downstream sees per-leg claims - these pin that end to end,
+// because reading the raw journal makes it look like the opposite.
+describe.skipIf(!isSqliteAvailable())('(c3) cumulative shutdown counters across resume legs', () => {
+  const setup = async (name: string) => {
+    const sessionStateDir = join(tmpHome, `cum-state-${name}`)
+    await mkdir(sessionStateDir, { recursive: true })
+    const dbPath = join(tmpHome, `cum-store-${name}.db`)
+    vi.stubEnv('CODEBURN_COPILOT_SESSION_STATE_DIR', sessionStateDir)
+    vi.stubEnv('CODEBURN_COPILOT_SESSION_STORE_DB', dbPath)
+    vi.stubEnv('CODEBURN_COPILOT_DISABLE_OTEL', '1')
+    vi.stubEnv('CODEBURN_COPILOT_WS_STORAGE_DIR', join(tmpHome, 'no-ws'))
+    vi.stubEnv('CODEBURN_COPILOT_GLOBAL_STORAGE_DIR', join(tmpHome, 'no-global'))
+    vi.stubEnv('CODEBURN_COPILOT_JETBRAINS_DIR', join(tmpHome, 'no-jb'))
+    const base = Date.now() - 4 * 24 * 3600 * 1000
+    const at = (sec: number): string => new Date(base + sec * 1000).toISOString()
+    createStoreDb(dbPath)
+    return { sessionStateDir, dbPath, at }
+  }
+
+  const rollup = (ts: string, cumulativeInput: number): string => JSON.stringify({
+    type: 'session.shutdown',
+    timestamp: ts,
+    data: {
+      shutdownType: 'routine',
+      modelMetrics: {
+        'claude-sonnet-4-5': {
+          requests: { count: 1, cost: 1 },
+          usage: { inputTokens: cumulativeInput, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 },
+        },
+      },
+    },
+  })
+
+  const totalInput = (projects: Awaited<ReturnType<typeof parseAllSessions>>): number =>
+    projects.flatMap(p => p.sessions).flatMap(s => s.turns).flatMap(t => t.assistantCalls)
+      .reduce((sum, c) => sum + c.usage.inputTokens, 0)
+
+  it('serves a complete 3-leg session at exactly its store total, not the sum of its legs', async () => {
+    const { sessionStateDir, dbPath, at } = await setup('complete')
+    const dir = join(sessionStateDir, 'sess-cum')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'workspace.yaml'), 'id: sess-cum\ncwd: /home/user/testproj\n')
+    // Cumulative legs 100 / 400 / 900. Summing them naively gives 1,400; the
+    // truth is 900, which the last leg states and the rows confirm.
+    await writeFile(join(dir, 'events.jsonl'), [
+      JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: 'claude-sonnet-4-5' } }),
+      rollup(at(10), 100), rollup(at(20), 400), rollup(at(30), 900),
+    ].join('\n') + '\n')
+
+    // Rows covering the session completely, summing to the last leg exactly -
+    // the invariant observed on real multi-leg sessions.
+    insertStoreRow(dbPath, 'sess-cum', 100, 0, 0, at(5))
+    insertStoreRow(dbPath, 'sess-cum', 300, 0, 0, at(15))
+    insertStoreRow(dbPath, 'sess-cum', 500, 0, 0, at(25))
+
+    // Complete coverage: every residual retires and the session serves its
+    // rows once. A per-leg reading of the journal would serve 1,400.
+    expect(totalInput(await parseAllSessions(undefined, 'copilot'))).toBe(900)
+  })
+
+  it('serves an uncovered cumulative session once, at its last leg', async () => {
+    const { sessionStateDir, dbPath, at } = await setup('uncovered')
+    const dir = join(sessionStateDir, 'sess-cum2')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'workspace.yaml'), 'id: sess-cum2\ncwd: /home/user/testproj\n')
+    await writeFile(join(dir, 'events.jsonl'), [
+      JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: 'claude-sonnet-4-5' } }),
+      rollup(at(10), 100), rollup(at(20), 400), rollup(at(30), 900),
+    ].join('\n') + '\n')
+    // One row, far too small to cover anything: the rest serves as residuals.
+    insertStoreRow(dbPath, 'sess-cum2', 50, 0, 0, at(5))
+
+    // 50 (row) + 50 (leg 1 residual) + 300 (leg 2 delta) + 500 (leg 3 delta).
+    expect(totalInput(await parseAllSessions(undefined, 'copilot'))).toBe(900)
+  })
+
+  it('treats a leg SMALLER than its predecessor as a fresh epoch, not a negative delta', async () => {
+    const { sessionStateDir, dbPath, at } = await setup('reset')
+    const dir = join(sessionStateDir, 'sess-reset')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'workspace.yaml'), 'id: sess-reset\ncwd: /home/user/testproj\n')
+    // Leg 2 reports LESS than leg 1. Either an older per-leg CLI or a
+    // mid-session counter reset; both mean leg 2 stands on its own. Clamping
+    // the delta to 0 would silently drop it.
+    await writeFile(join(dir, 'events.jsonl'), [
+      JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: 'claude-sonnet-4-5' } }),
+      rollup(at(10), 900), rollup(at(20), 200),
+    ].join('\n') + '\n')
+    insertStoreRow(dbPath, 'sess-reset', 10, 0, 0, at(5))
+
+    // 10 (row) + 890 (leg 1 residual) + 200 (leg 2 in full).
+    expect(totalInput(await parseAllSessions(undefined, 'copilot'))).toBe(1100)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
 // (c2) Residual dedup keys name the leg's INSTANT, never its position
 // ═══════════════════════════════════════════════════════════════════════════
 // A residual key used to carry the leg's index into the session's sorted leg

@@ -70,6 +70,17 @@ see the #927 ruling in `src/session-cache.ts`).
   dropped and each rollup leg's usage beyond the rows in its own interval
   serves once as a synthesized residual call at that leg's timestamp. Sessions
   with no rows (pre-store CLI builds) keep the rollup path unchanged.
+- **The rollup's counters are CUMULATIVE across resume legs, and the parser
+  emits per-leg deltas.** Measured on a real 3-leg session (CLI 1.0.80): every
+  counter in a leg, billing and tokens alike, includes the legs before it, and
+  the LAST leg of a complete session equals the session's store-row total
+  exactly. So reading the journal directly makes it look as though summing legs
+  would count a resumed session several times over - what is CACHED is already
+  `cumulative - previous cumulative` per model, which is what the interval
+  arithmetic below consumes. A leg reporting LESS than its predecessor is a
+  fresh accounting epoch (an older per-leg CLI, or a counter reset) and is
+  taken at face value rather than clamped to a negative delta, so its usage is
+  never silently dropped.
 - **A leg's interval starts at its last successful compaction, not at the
   previous leg.** In-session compaction resets the CLI's rollup counters, so a
   leg containing one describes only its post-compaction requests. Running the
@@ -84,18 +95,23 @@ see the #927 ruling in `src/session-cache.ts`).
   or absent compaction falls back to the previous-leg interval. Multiple
   compactions in one leg: the last wins. The stamp rides on the cached rollup
   call as `compactedAt`.
-  *Accepted, bounded over-serve:* the summarization call has its own usage
-  (`compactionTokensUsed`, charged through the CLI's ordinary `recordUsage`).
-  If it also writes an `assistant_usage_events` row — likely, since it carries
-  the same `copilotUsage.totalNanoAiu` envelope every request does, but the
-  writer is native and not verifiable from the JS bundle — that row sits just
-  before the compaction stamp and so falls outside the interval, while the
-  post-reset rollup counts it. One summarization request per compaction can
-  therefore serve twice. Deliberately not subtracted from the payload: the
-  triggering request completes immediately before the compaction too, so any
-  grace window wide enough to catch the summarization row also catches a real
-  request and turns an over-serve into a loss. Resolvable by anyone with a real
-  store: check whether a row exists at the compaction stamp.
+  *The summarization call, and what the `initiator` label buys.* The
+  compaction's own summarization request DOES write an
+  `assistant_usage_events` row — confirmed on a real store — and where the
+  schema has an `initiator` column that row is labelled `'compaction'`. The
+  label is read (schema-adaptively, alongside the billing columns) and used for
+  exactly two things: the row is subtracted from the leg it belongs to even
+  though it commits before the compaction stamp, and it is kept out of per-turn
+  pairing, since there is no `assistant.message` for it to pair with.
+  *Bounded over-serve where the label is absent:* the column is missing on
+  older stores and NULL on many rows of newer ones (1,504 of 2,509 on one real
+  store), and an unlabelled compaction row is indistinguishable from a user
+  request — it falls outside the anchored interval while the post-reset rollup
+  counts it, so one request per compaction serves twice. A timestamp heuristic
+  cannot close that: the request that TRIGGERED the compaction completes
+  immediately before it too, so any grace window wide enough to catch the
+  summarization row also catches a real request and turns an over-serve into a
+  loss.
 - **Behavioral weight.** Rollups and residuals are aggregate accounting: tokens
   and cost count, but never api-call / model-call / turn weight. A store row
   pairs with its per-turn call by timestamp adjacency (2-minute window,
@@ -131,7 +147,10 @@ see the #927 ruling in `src/session-cache.ts`).
   as rows land, a rollup is dropped once rows cover its leg, a row's pairing
   flips), and the sent-ledger is append-once, so a value sent mid-reconciliation
   could never be corrected at the receiver (#988). Nothing is dropped; the next
-  push after the window sends it once, final. Separately, a session is frozen
+  push after the window sends it once, final. A day is conservative: on one
+  real store no row ever landed after its session's shutdown (91 sessions,
+  median -0.1s), so this can likely be seconds once a second machine agrees.
+  Separately, a session is frozen
   into whichever of the two shapes it was FIRST synced in — the raw rollup, or
   rows plus residuals — because the receiver cannot be told to drop what it
   already holds. Both directions matter: a session synced by a pre-store

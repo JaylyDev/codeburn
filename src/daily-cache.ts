@@ -15,12 +15,29 @@ import type { DateRange, ProjectSummary } from './types.js'
 // costs all move, so days finalized under an earlier version would disagree
 // with the live parse.
 //
-// 20 is NOT free: an unmerged head of #1040 (codex model attribution) claims
-// it, and 18 was burned by an earlier public head of THIS change under
-// different accounting (whole-session rollup suppression, no supplementary
-// weight). isMigratableCache/adoptOlderDailyCaches carry a same-or-newer
-// version forward as FINALIZED without re-deriving it, so a number can never
-// mean two accountings. 21 is the first number no other head claims.
+// 20 is taken by #1040 (codex model attribution, now on main) and 18 was
+// burned by an earlier public head of THIS change under different accounting
+// (whole-session rollup suppression, no supplementary weight).
+// isMigratableCache/adoptOlderDailyCaches carry a same-or-newer version
+// forward as FINALIZED without re-deriving it, so a number can never mean two
+// accountings. 21 is the first free number.
+// Bumped to 20: the Codex fast-path read a nested
+// `base_instructions.provenance.model` out of `session_meta` as if it were
+// `payload.model` (#1040), so every call a rollout attributed from session
+// metadata - the ones before its first `turn_context`, and every one after a
+// mid-file `session_meta` - was credited to the wrong model. The codex parse
+// version and CODEX_CACHE_VERSION move with it, but the daily cache has no
+// per-provider invalidation, so days already finalized keep the wrong model
+// rows forever unless MIN_SUPPORTED_VERSION moves too. This pass re-derives
+// ALL days for EVERY provider off the warm session cache, so it costs seconds
+// rather than a full re-parse, and it is lossless: adoptOlderDailyCaches keeps
+// the superseded v19 file as the baseline, and the partial-survival guard from
+// #1033 holds any day whose sources have only partly aged out. On a real
+// 110-day cache the 19 -> 20 pass moved ZERO days down and lost none: 100 days
+// came back byte-identical and 9 grok days rose by $19.80 in total, clearing
+// rollups the grok parse change had left stale, while every codex model row
+// stayed identical (that corpus predates the `provenance` field, so the fix it
+// carries has nothing to correct there).
 //
 // Bumped to 19: Grok authoritative usage now keeps one session-level rollup
 // from top-level totals, clamps reasoning to reported output, and labels mixed

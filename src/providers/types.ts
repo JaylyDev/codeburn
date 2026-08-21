@@ -54,6 +54,13 @@ export type ParsedProviderCall = {
   locAdded?: number
   locRemoved?: number
   editFailed?: number
+  // Copilot session-store rows only: the store's `initiator` column, when the
+  // schema has it AND the CLI populated it. Only 'compaction' changes
+  // accounting - that row is the CLI summarizing its own context, so it has no
+  // assistant.message to pair with and its usage belongs to the compaction
+  // that reset the rollup. Absent on older stores and on many rows of newer
+  // ones, so nothing may depend on it being there.
+  initiator?: string
   // Copilot shutdown rollups only: the stamp of the last SUCCESSFUL in-session
   // compaction before this leg. A compaction resets the CLI's rollup counters,
   // so the leg describes only the requests after it; serve-time reconciliation

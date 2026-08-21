@@ -431,7 +431,12 @@ function parseCodexLine(line: string | Buffer): CodexEntry | null {
     ? getRawDurationMs(getRawPayloadFieldWindow(line, 'duration') ?? '')
     : undefined
   const timingDuration = payloadDuration ?? getRawDurationMs(pHead) ?? getRawDurationMs(timingTail)
-  const compactModel = getRawJsonStringField(pHead, 'model')
+  // session_meta can contain base_instructions.provenance.model. Only inspect
+  // direct payload fields there, or a nested provenance model would overwrite
+  // the model selected by the latest turn_context.
+  const compactModel = type === 'session_meta'
+    ? getRawJsonStringField(getRawPayloadFieldWindow(line, 'model') ?? '', 'model')
+    : getRawJsonStringField(pHead, 'model')
   const compactModelName = getRawJsonStringField(pHead, 'model_name')
   const compactLastUsage = getRawTokenUsage(pHead, 'last_token_usage')
   const compactTotalUsage = getRawTokenUsage(pHead, 'total_token_usage')
@@ -451,7 +456,7 @@ function parseCodexLine(line: string | Buffer): CodexEntry | null {
       originator: getRawJsonStringField(pHead, 'originator'),
       session_id: getRawJsonStringField(pHead, 'session_id'),
       forked_from_id: getRawJsonStringField(pHead, 'forked_from_id'),
-      model: getRawJsonStringField(pHead, 'model'),
+      model: compactModel,
       name: getRawJsonStringField(pHead, 'name'),
       invocation,
       call_id: getRawJsonStringField(pHead, 'call_id'),

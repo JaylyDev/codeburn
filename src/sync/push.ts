@@ -49,6 +49,13 @@ export const MAX_PER_PUSH = 50_000
  *
  * This is a holdback, never a drop: the calls are simply not yet unsent-
  * eligible, and the next push after the window picks them up.
+ *
+ * A day is deliberately conservative. The one measurement available says it
+ * could be far shorter: across 91 sessions on a real macOS store, ZERO rows
+ * landed after their session's shutdown - median delta -0.1s, maximum -0.0s,
+ * i.e. the store was already complete when shutdown was written. That is one
+ * machine and one CLI version (1.0.80), so this stays at a day until a second
+ * machine agrees; the number to beat is seconds, not hours.
  */
 export const RECONCILE_SETTLE_MS = 24 * 60 * 60 * 1000
 

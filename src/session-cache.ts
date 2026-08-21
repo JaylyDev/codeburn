@@ -62,6 +62,9 @@ export type CachedCall = {
   // Copilot shutdown rollups only: stamp of the last successful in-session
   // compaction before this leg. See ParsedProviderCall.compactedAt.
   compactedAt?: string
+  // Copilot session-store rows only: the store's `initiator` label when
+  // present. See ParsedProviderCall.initiator.
+  initiator?: string
 }
 
 export type CachedTurn = {
@@ -294,7 +297,9 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // rich-session-capture-v1: per-call LOC deltas + editFailed from
   // patch_apply_end. (The codex-results.json CODEX_CACHE_VERSION is bumped in
   // lockstep so the pre-session-cache layer re-parses too.)
-  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1',
+  // session-meta-model-v1: parse large session_meta records structurally so a
+  // nested base_instructions provenance.model cannot overwrite turn_context.
+  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1',
   cursor: 'composer-anchored-crediting-v1-est-cost',
   'cursor-agent': 'workspaceless-transcript-v1',
   // source-provenance-v1 (#944): CLI sessions were misread as VS Code
@@ -566,6 +571,7 @@ function validateCall(c: unknown): c is CachedCall {
     && isOptionalNum(o['nanoAiu'])
     && isOptionalNum(o['requestMultiplier'])
     && isOptionalString(o['compactedAt'])
+    && isOptionalString(o['initiator'])
     && isStringArray(o['tools'])
     && isStringArray(o['bashCommands'])
     && isStringArray(o['skills'])

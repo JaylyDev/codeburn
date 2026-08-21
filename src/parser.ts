@@ -2523,6 +2523,7 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
     ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
     ...(call.requestMultiplier != null ? { requestMultiplier: call.requestMultiplier } : {}),
     ...(call.compactedAt ? { compactedAt: call.compactedAt } : {}),
+    ...(call.initiator ? { initiator: call.initiator } : {}),
     activeDurationMs: call.activeDurationMs,
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
@@ -3586,7 +3587,7 @@ async function parseProviderSources(
   //   rows' own label — so neither a store row cached before events.jsonl
   //   existed nor an events.jsonl orphaned after a prune can split the
   //   session across two grouping keys.
-  type CopilotStamped = { ts: number; input: number; cacheRead: number; cacheWrite: number; reasoning: number }
+  type CopilotStamped = { ts: number; input: number; cacheRead: number; cacheWrite: number; reasoning: number; isCompaction?: boolean }
   let copilotRecon: {
     storeKeys: Set<string>
     storeCalls: Map<string, CopilotStamped[]>
@@ -3666,11 +3667,21 @@ async function parseProviderSources(
           if (isStore) {
             storeKeys.add(aggKey)
             const list = storeCalls.get(aggKey) ?? []
-            list.push(stamped)
+            // The CLI's own context-summarization request. It has no
+            // assistant.message, so it must not compete for a per-turn partner
+            // in the pairing pass below, and its usage belongs to the
+            // compaction that reset the rollup rather than to the interval
+            // after it. Labelled only where the store carries `initiator`;
+            // where it does not, this row is indistinguishable from a user
+            // request and keeps the pre-label behaviour.
+            const isCompaction = c.initiator === 'compaction'
+            list.push(isCompaction ? { ...stamped, isCompaction: true } : stamped)
             storeCalls.set(aggKey, list)
-            const ids = storeRowIds.get(aggKey) ?? []
-            ids.push({ ts, dedupKey: c.deduplicationKey })
-            storeRowIds.set(aggKey, ids)
+            if (!isCompaction) {
+              const ids = storeRowIds.get(aggKey) ?? []
+              ids.push({ ts, dedupKey: c.deduplicationKey })
+              storeRowIds.set(aggKey, ids)
+            }
             if (c.project && !storeProject.has(turn.sessionId)) storeProject.set(turn.sessionId, c.project)
           } else {
             const legs = rollupLegs.get(aggKey) ?? []
@@ -3940,7 +3951,14 @@ async function parseProviderSources(
         const intervalStart = Math.max(prevLegTs, leg.compactedAtMs)
         while (rowIdx < rows.length && rows[rowIdx]!.ts <= leg.ts) {
           const row = rows[rowIdx]!
-          if (row.ts > intervalStart) {
+          // A labelled compaction row is the summarization request itself. It
+          // commits just BEFORE the compaction stamp, so the anchor would push
+          // it outside the interval while the post-reset rollup still counts
+          // it — serving it twice. The label lets it be subtracted exactly
+          // instead. Without the label (older stores, and many rows of newer
+          // ones) the row is invisible here and the documented one-request
+          // over-serve per compaction stands.
+          if (row.ts > intervalStart || (row.isCompaction && row.ts > prevLegTs)) {
             covered.input += row.input
             covered.cacheRead += row.cacheRead
             covered.cacheWrite += row.cacheWrite
