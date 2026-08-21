@@ -93,11 +93,19 @@ export function createBridgedProvider<TRich>(spec: BridgedProviderSpec<TRich>): 
           // digest, so the bridge has to supply the real one.
           // getHostPrivacyKey() is per-install stable (persisted, like the
           // optimize detectors use), so dedup keys stay stable across runs and
-          // the session-cache dedup semantics are unchanged; it falls back to a
-          // per-process key only when the config dir is unwritable, in which
-          // case the session cache cannot persist either. A lost or rotated key
-          // is caught by computeEnvFingerprint, which folds a digest of the key
-          // into the env fingerprint for the affected providers.
+          // the session-cache dedup semantics are unchanged.
+          //
+          // It degrades to a FRESH per-process key whenever the config dir
+          // (~/.config/codeburn) is unwritable OR the key file exists but is
+          // corrupt/unreadable — and that says nothing about whether the cache
+          // can persist: the cache lives in ~/.cache/codeburn (or
+          // CODEBURN_CACHE_DIR), a different directory, separately overridable.
+          // A writable cache plus an unreadable key file therefore means a new
+          // key every process. computeEnvFingerprint is what stops that from
+          // inflating totals: it folds a digest of the key into the fingerprint
+          // for every provider in KEY_DERIVED_PROVIDERS, so a rotated, lost, or
+          // per-process key rebuilds the section instead of re-ingesting the
+          // same records under keys the cache has never seen.
           const context: DecodeContext = { privacyKey: getHostPrivacyKey(), providerId: spec.name, sourceRef: source.path }
           const { calls } = spec.decode({ records, context, seenKeys })
           for (const rich of calls) {

@@ -15,6 +15,9 @@ import {
   type SessionCache,
   cleanupOrphanedTempFiles,
   computeEnvFingerprint,
+  DURABLE_PROVIDER_NAMES,
+  KEY_DERIVED_PROVIDERS,
+  PROVIDER_PARSE_VERSIONS,
   emptyCache,
   fingerprintFile,
   loadCache,
@@ -313,11 +316,12 @@ describe('computeEnvFingerprint', () => {
 
 // ── computeEnvFingerprint: privacy-key binding ─────────────────────────
 
-// The six sourceRef providers derive their dedup keys from the per-install
-// privacy key. A parse version cannot see that key change — a lost, rotated, or
-// (unwritable config dir) ephemeral key would silently produce keys that never
-// match the cached ones, so every record re-ingests as new. computeEnvFingerprint
-// therefore folds a digest of the key in for exactly those providers.
+// Seven providers derive their dedup keys from the per-install privacy key: the
+// six sourceRef ones, plus copilot (its JetBrains per-turn digest is an HMAC
+// under that key). A parse version cannot see the key change — a lost, rotated,
+// or ephemeral key silently produces keys that never match the cached ones, so
+// every record re-ingests as new. computeEnvFingerprint therefore folds a digest
+// of the key in for exactly KEY_DERIVED_PROVIDERS.
 describe('computeEnvFingerprint — privacy-key binding', () => {
   async function fingerprintUnderKey(key: string, providers: string[]): Promise<string[]> {
     const home = await mkdtemp(join(tmpdir(), 'codeburn-envfp-'))
@@ -336,17 +340,46 @@ describe('computeEnvFingerprint — privacy-key binding', () => {
   const KEY_A = 'a1'.repeat(32)
   const KEY_B = 'b2'.repeat(32)
 
-  it('changes the fingerprint of a sourceRef provider and leaves other providers alone', async () => {
-    const providers = ['codebuff', 'claude']
+  it('rotating the key moves every key-derived provider and no other', async () => {
+    // Both halves matter. Without the "moves" half a fingerprint that ignored
+    // the key would pass; without the "does not move" half a fingerprint that
+    // folded the key in for EVERY provider would pass, churning caches that owe
+    // the key nothing.
+    const KEY_DERIVED = ['codebuff', 'zerostack', 'pi', 'omp', 'grok', 'lingtai-tui', 'copilot']
+    const UNAFFECTED = ['claude', 'codex', 'cursor', 'warp', 'unknown-provider']
+    const providers = [...KEY_DERIVED, ...UNAFFECTED]
+
     const underA = await fingerprintUnderKey(KEY_A, providers)
     const underB = await fingerprintUnderKey(KEY_B, providers)
 
-    // codebuff: key-derived dedup keys, so a different key must re-parse.
-    expect(underB[0]).not.toBe(underA[0])
-    // claude: dedup keys owe nothing to the privacy key, so a rotation must NOT
-    // churn its cache. Without this half the test would pass on a fingerprint
-    // that folded the key in for everyone.
-    expect(underB[1]).toBe(underA[1])
+    KEY_DERIVED.forEach((name, i) => {
+      expect(underB[i], `${name} must re-parse when the privacy key rotates`).not.toBe(underA[i])
+    })
+    UNAFFECTED.forEach((name, i) => {
+      const at = KEY_DERIVED.length + i
+      expect(underB[at], `${name} must NOT churn when the privacy key rotates`).toBe(underA[at])
+    })
+  })
+
+  it('copilot moves on rotation even though its parse version says nothing about source refs', async () => {
+    // The regression this pins: the fold set used to be sniffed out of the
+    // parse-version string (`includes('source-ref-fingerprint-v1')`). Copilot's
+    // dedup keys are just as key-derived — createHmac(privacyKey) over the
+    // JetBrains reply text — but its parse version reads
+    // `…-dedup-key-hmac-v1`, so the sniff missed it and its fingerprint held
+    // still across a rotation. Copilot is the sole DURABLE provider: its
+    // union-merge never deletes cached turns, it appends any turn whose key is
+    // not already cached. A held-still fingerprint therefore does not merely
+    // re-parse — it keeps the K1 keys forever AND appends the K2 ones for the
+    // same turns, inflating totals on every rotation, and on every single run
+    // when the key file is corrupt (each process mints a fresh ephemeral key).
+    expect(PROVIDER_PARSE_VERSIONS['copilot']).not.toContain('source-ref-fingerprint-v1')
+    expect(DURABLE_PROVIDER_NAMES.has('copilot')).toBe(true)
+    expect(KEY_DERIVED_PROVIDERS.has('copilot')).toBe(true)
+
+    const [underA] = await fingerprintUnderKey(KEY_A, ['copilot'])
+    const [underB] = await fingerprintUnderKey(KEY_B, ['copilot'])
+    expect(underB).not.toBe(underA)
   })
 
   it('is stable when the key is unchanged', async () => {

@@ -244,12 +244,31 @@ export const DURABLE_PROVIDER_NAMES: ReadonlySet<string> = new Set(['copilot'])
 // entry/suffix below changes the provider's env fingerprint, which forces the
 // one-time re-parse that drops the old-shape keys.
 //
-// SOURCE_REF_KEYED_PARSE_VERSION is the marker token for the six: their keys
-// are derived from the per-install privacy key, which the parse version alone
-// cannot see. computeEnvFingerprint folds a digest of that key in for exactly
-// these providers, so a lost or rotated key forces a clean re-parse instead of
-// silently accumulating duplicates in a warm cache.
-export const SOURCE_REF_KEYED_PARSE_VERSION = 'source-ref-fingerprint-v1'
+// A parse version cannot see the OTHER input those keys depend on: the random
+// per-install privacy key. Rotate it, lose the file, or land on the ephemeral
+// fallback and the freshly derived keys stop matching the cached ones, so every
+// record re-ingests as new — silently, and for copilot (the sole durable
+// provider, whose union-merge never deletes) permanently. Every provider whose
+// dedup keys are derived from that key is listed HERE, explicitly, and
+// computeEnvFingerprint folds a digest of the key in for exactly this set.
+//
+// Listed explicitly rather than sniffed out of the parse-version string: the
+// first version of this used `parseVersion.includes('source-ref-fingerprint-v1')`
+// and silently missed copilot, whose keys are just as key-derived but whose
+// parse version says `dedup-key-hmac-v1`. A provider is in this set because of
+// what its decoder DOES, which no substring of a version label can know.
+// Add a provider here whenever its dedup key starts depending on the privacy
+// key — the rotation test in session-cache.test.ts covers one member of each
+// kind (source-ref and durable/copilot).
+export const KEY_DERIVED_PROVIDERS: ReadonlySet<string> = new Set([
+  'codebuff',
+  'zerostack',
+  'pi',
+  'omp',
+  'grok',
+  'lingtai-tui',
+  'copilot',
+])
 
 export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // rich-session-capture-v1: parse-time capture of per-turn gitBranch, per-call
@@ -313,18 +332,15 @@ export function computeEnvFingerprint(provider: string): string {
   const vars = PROVIDER_ENV_VARS[provider] ?? []
   const parts = vars.map(v => `${v}=${process.env[v] ?? ''}`)
   const parseVersion = PROVIDER_PARSE_VERSIONS[provider]
-  if (parseVersion) {
-    parts.push(`parser=${parseVersion}`)
-    // Providers whose dedup keys are HMAC-derived from the per-install privacy
-    // key must re-parse when that key changes. The key file can be lost,
-    // rotated, or fall back to a per-process ephemeral key (unwritable config
-    // dir) with no parse-version change to notice it — and the cached keys
-    // would then never match the freshly derived ones, so every record would
-    // re-ingest as new. A digest of the key (never the key itself) rides the
-    // fingerprint for exactly those providers.
-    if (parseVersion.includes(SOURCE_REF_KEYED_PARSE_VERSION)) {
-      parts.push(`privacy-key=${createHash('sha256').update(getHostPrivacyKey()).digest('hex').slice(0, 16)}`)
-    }
+  if (parseVersion) parts.push(`parser=${parseVersion}`)
+  // Providers whose dedup keys are HMAC-derived from the per-install privacy
+  // key must re-parse when that key changes; a digest of the key (never the key
+  // itself) rides the fingerprint for exactly those. Deliberately NOT nested
+  // under `if (parseVersion)`: the key dependency comes from the decoder, not
+  // from having a parse-version entry, and a key-derived provider that ever
+  // loses its entry must still re-parse on rotation.
+  if (KEY_DERIVED_PROVIDERS.has(provider)) {
+    parts.push(`privacy-key=${createHash('sha256').update(getHostPrivacyKey()).digest('hex').slice(0, 16)}`)
   }
   return createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 16)
 }
