@@ -281,47 +281,42 @@ describe('provider turn range filtering', () => {
     }
   })
 
-  it('re-anchors a turn whose calls ALL survive but whose anchor sits before the range', async () => {
-    // The removal-path test above exercises a turn whose pre-range call is
-    // dropped. This is the mirror case the first fix missed: a turn whose user
-    // message predates the range but whose calls ALL land inside it. The early
-    // return ("all calls survived") kept the pre-range anchor, so turn-anchored
-    // stats (category, editTurns, session day) bucketed to the OLD day while
-    // calls/cost landed on the new one. The slice must re-anchor to the first
-    // in-range call whenever the anchor is wrong, not only when calls were cut.
-    const codexHome = join(home, 'codex')
-    const sessionDir = join(codexHome, 'sessions', '2026', '05', '15')
-    await mkdir(sessionDir, { recursive: true })
+  it('re-anchors a claude turn whose calls ALL survive but whose anchor sits before the range', async () => {
+    // The test above exercises a turn whose pre-range call is dropped. This is
+    // the mirror case the first fix missed: a turn whose calls ALL land inside
+    // the range but whose ANCHOR does not. It has to run on the CLAUDE path:
+    // there `turn.timestamp` is the user-message time, which can precede the
+    // first assistant call, while codex derives the anchor from the first call
+    // so the case cannot exist. The old early return ("all calls survived")
+    // kept the pre-range anchor, so turn-anchored stats (category, editTurns,
+    // session day) bucketed to the day BEFORE the window while calls/cost
+    // landed inside it.
+    const projectDir = join(home, '.claude', 'projects', 'project-a')
+    await mkdir(projectDir, { recursive: true })
+    process.env['CLAUDE_CONFIG_DIR'] = join(home, '.claude')
     const lines = [
-      JSON.stringify({ type: 'session_meta', timestamp: '2026-05-15T23:55:00Z', payload: { session_id: 'sess-anchor', model: 'gpt-5.5', cwd: '/Users/test/project-a', originator: 'codex_cli_rs' } }),
-      JSON.stringify({ type: 'response_item', timestamp: '2026-05-15T23:57:00Z', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'run the long task' }] } }),
-      JSON.stringify({ type: 'response_item', timestamp: '2026-05-16T00:10:00Z', payload: { type: 'function_call', name: 'exec_command', arguments: JSON.stringify({ command: 'npm test' }) } }),
-      JSON.stringify({ type: 'event_msg', timestamp: '2026-05-16T00:15:00Z', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 30 }, total_token_usage: { total_tokens: 130 } } } }),
-      JSON.stringify({ type: 'response_item', timestamp: '2026-05-16T00:20:00Z', payload: { type: 'function_call', name: 'exec_command', arguments: JSON.stringify({ command: 'npm run build' }) } }),
-      JSON.stringify({ type: 'event_msg', timestamp: '2026-05-16T00:25:00Z', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 80, output_tokens: 20 }, total_token_usage: { total_tokens: 230 } } } }),
+      // User message at 23:57 the PREVIOUS day — the turn's anchor, outside the range.
+      JSON.stringify({ type: 'user', sessionId: 'sess-claude-anchor', timestamp: '2026-05-15T23:57:00Z', cwd: '/Users/test/project-a', message: { role: 'user', content: 'run the long task' } }),
+      JSON.stringify({ type: 'assistant', sessionId: 'sess-claude-anchor', timestamp: '2026-05-16T00:15:00Z', cwd: '/Users/test/project-a', message: { id: 'm1', type: 'message', role: 'assistant', model: 'claude-sonnet-4-5', content: [{ type: 'text', text: 'working' }], usage: { input_tokens: 100, output_tokens: 30 } } }),
+      JSON.stringify({ type: 'assistant', sessionId: 'sess-claude-anchor', timestamp: '2026-05-16T00:25:00Z', cwd: '/Users/test/project-a', message: { id: 'm2', type: 'message', role: 'assistant', model: 'claude-sonnet-4-5', content: [{ type: 'text', text: 'done' }], usage: { input_tokens: 80, output_tokens: 20 } } }),
     ]
-    await writeFile(join(sessionDir, 'rollout-anchor.jsonl'), lines.join('\n') + '\n')
+    await writeFile(join(projectDir, 'sess-claude-anchor.jsonl'), lines.join('\n') + '\n')
 
-    process.env['CODEX_HOME'] = codexHome
-    try {
-      const parseAllSessions = await loadParser()
-      const projects = await parseAllSessions(dayRange(), 'codex')
-      const session = projects[0]!.sessions[0]!
-      const turn = session.turns[0]!
+    const parseAllSessions = await loadParser()
+    const projects = await parseAllSessions(dayRange(), 'claude')
+    const session = projects[0]!.sessions[0]!
+    const turn = session.turns[0]!
 
-      // BOTH calls are inside the range — nothing was removed.
-      expect(turn.assistantCalls.map(call => new Date(call.timestamp).toISOString())).toEqual([
-        '2026-05-16T00:15:00.000Z',
-        '2026-05-16T00:25:00.000Z',
-      ])
-      // Yet the anchor (user-message time, 2026-05-15T23:57Z) must re-anchor to
-      // the first in-range call, or turn-anchored bucketing would land the
-      // turn's stats on the day BEFORE the window while its calls land inside.
-      expect(new Date(turn.timestamp).toISOString()).toBe('2026-05-16T00:15:00.000Z')
-      expect(session.totalInputTokens).toBe(180)
-      expect(session.totalOutputTokens).toBe(50)
-    } finally {
-      delete process.env['CODEX_HOME']
-    }
+    // BOTH calls are inside the range — nothing was removed.
+    expect(turn.assistantCalls.map(call => new Date(call.timestamp).toISOString())).toEqual([
+      '2026-05-16T00:15:00.000Z',
+      '2026-05-16T00:25:00.000Z',
+    ])
+    // Yet the anchor (user-message time, 2026-05-15T23:57Z) must re-anchor to
+    // the first in-range call, or turn-anchored bucketing would land the
+    // turn's stats on the day BEFORE the window while its calls land inside.
+    expect(new Date(turn.timestamp).toISOString()).toBe('2026-05-16T00:15:00.000Z')
+    expect(session.totalInputTokens).toBe(180)
+    expect(session.totalOutputTokens).toBe(50)
   })
 })
