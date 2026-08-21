@@ -5,6 +5,9 @@
 ### Added (CLI)
 - `codeburn sync push --attribution` (opt-in): sends git attribution spans — the session→commit correlation from `codeburn yield` (`codeburn.session.attribution` and `codeburn.commit` span types with normalized repo remote, commit SHAs, merged/reverted state, and PR links). Nothing new is sent without the flag; local-only repos and Windows filesystem paths are never emitted as repo identities, and sessions whose project path no longer resolves never inherit the push-time working directory's repo. See docs/sync/README.md "Git attribution".
 
+### Changed (CLI)
+- **`codeburn sync` re-keys device, span, and trace identity.** Device, span, and trace ids are now domain-separated HMAC digests under the per-install privacy key rather than bare hashes. This is a one-time identity re-key: a sync backend sees a new device identity after upgrade, and spans pushed before the upgrade won't correlate with spans pushed after it. `sync push` also now hard-aborts — instead of degrading to an ephemeral, unstable key — when the config dir is unwritable or the on-disk privacy-key file is corrupt.
+
 ### Fixed
 - Claude Desktop and Cowork sessions are discovered for Windows Microsoft Store (MSIX) installs. (#611)
 - Sessions that were silently invisible now appear: Pi and Oh My Pi transcripts with an OMP title slot, Cline sessions under Code - Insiders or VSCodium roots, and OpenCode/kilo-code usage that silently read as zero now reports. (#930)
