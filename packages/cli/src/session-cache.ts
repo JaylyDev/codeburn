@@ -52,6 +52,10 @@ export type CachedCall = {
   toolErrors?: number
   // Codex: count of this call's patch applications with success === false.
   editFailed?: number
+  // Tool-excluded active throughput (Codex only), attributed per call.
+  activeDurationMs?: number
+  activeGeneratedTokens?: number
+  toolWaitMs?: number
 }
 
 export type CachedTurn = {
@@ -290,7 +294,12 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // rich-session-capture-v1: per-call LOC deltas + editFailed from
   // patch_apply_end. (The codex-results.json CODEX_CACHE_VERSION is bumped in
   // lockstep so the pre-session-cache layer re-parses too.)
-  codex: 'mcp-attribution-v2-est-cost-rich-capture-v1-cross-provider-pr-v1',
+  // active-timing-v1: calls now carry activeDurationMs / activeGeneratedTokens
+  // / toolWaitMs, and the codex-results resume point moved to the last
+  // task_started boundary (see codex-cache.ts v12). Cached turns hold neither,
+  // so bump in lockstep with that cache or session-cache.json keeps serving
+  // timing-less turns without ever invoking the parser.
+  codex: 'mcp-attribution-v2-est-cost-rich-capture-v1-cross-provider-pr-v1-active-timing-v1',
   cursor: 'composer-anchored-crediting-v1-est-cost',
   'cursor-agent': 'workspaceless-transcript-v1',
   copilot: 'cli-shutdown-cost-v1-skills-dedup-key-hmac-v1',
@@ -432,6 +441,9 @@ function validateCall(c: unknown): c is CachedCall {
     && (o['speed'] === 'standard' || o['speed'] === 'fast')
     && isOptionalNum(o['costUSD'])
     && isOptionalBool(o['isEstimated'])
+    && isOptionalNum(o['activeDurationMs'])
+    && isOptionalNum(o['activeGeneratedTokens'])
+    && isOptionalNum(o['toolWaitMs'])
     && isStringArray(o['tools'])
     && isStringArray(o['bashCommands'])
     && isStringArray(o['skills'])

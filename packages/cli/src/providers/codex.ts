@@ -211,6 +211,9 @@ function toPricedProviderCall(rich: CodexDecodedCall): ParsedProviderCall {
     ...(rich.locRemoved !== undefined ? { locRemoved: rich.locRemoved } : {}),
     ...(rich.editFailed !== undefined ? { editFailed: rich.editFailed } : {}),
     ...(rich.costIsEstimated ? { costIsEstimated: rich.costIsEstimated } : {}),
+    ...(rich.activeDurationMs !== undefined ? { activeDurationMs: rich.activeDurationMs } : {}),
+    ...(rich.activeGeneratedTokens !== undefined ? { activeGeneratedTokens: rich.activeGeneratedTokens } : {}),
+    ...(rich.toolWaitMs !== undefined ? { toolWaitMs: rich.toolWaitMs } : {}),
   }
   return priceProviderCall(call)
 }
@@ -245,13 +248,21 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       if (resume && cached) {
         startByteOffset = cached.byteOffset
         initialState = cached.state
-        priorCalls = cached.calls
+        // Only the calls emitted BEFORE the cached task boundary are replayed.
+        // The rest belong to the task that was still open there and re-derive
+        // from this pass, which reads that task's records from its task_started
+        // and can therefore stamp its active timing.
+        priorCalls = cached.calls.slice(0, cached.callCount)
         for (const c of priorCalls) seenKeys.add(c.deduplicationKey)
       }
 
       // Stream raw lines (only the appended tail when resuming). Buffers for huge
       // lines pass straight into the decoder without a full string conversion.
       const records: (string | Buffer)[] = []
+      // Byte offset AFTER each streamed record, parallel to `records`. The
+      // decoder reports its resume checkpoint as a record index (core never sees
+      // bytes); this is what turns it back into a file offset.
+      const offsetAfter: number[] = []
       const tracker = { lastCompleteLineOffset: startByteOffset }
       let sawAnyLine = false
       for await (const rawLine of readSessionLines(source.path, undefined, {
@@ -261,6 +272,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       })) {
         sawAnyLine = true
         records.push(rawLine)
+        offsetAfter.push(tracker.lastCompleteLineOffset)
       }
 
       // A cold decode that streamed nothing means the file was unreadable,
@@ -268,7 +280,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       // pin an empty result set (mirrors the pre-phase-4 sawAnyLine guard).
       if (!sawAnyLine && !resume) return
 
-      const { calls: richCalls, diagnostics, state: newState } = decodeCodex({
+      const { calls: richCalls, diagnostics, state: newState, checkpoint } = decodeCodex({
         records,
         context: { privacyKey: '', providerId: 'codex', sourceRef: source.path },
         state: initialState,
@@ -290,16 +302,29 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       const newPriced = richCalls.map(toPricedProviderCall)
       const allCalls = resume ? [...priorCalls, ...newPriced] : newPriced
 
-      // Persist the state blob + host-priced calls + resume offset. seenKeys is
+      // Persist the state blob + host-priced calls + resume point. seenKeys is
       // stripped from the stored state (cross-file dedup is reconstructed each
       // run from the session cache, as the pre-phase-4 shared set was).
-      const storedState: CodexDecodeState = { ...newState, seenKeys: [] }
+      //
+      // The resume point is the decoder's last `task_started` checkpoint, the
+      // only offset where the per-task timing accumulators are provably empty.
+      // A pass that crossed no task boundary leaves the previous entry's
+      // boundary standing (nothing better exists) and, on a cold decode of a
+      // file with no task_started at all, falls back to end-of-file — a state
+      // that declares no open window, so nothing is attributed a partial one.
+      const resumePoint = checkpoint
+        ? { byteOffset: offsetAfter[checkpoint.recordIndex]!, state: checkpoint.state, callCount: priorCalls.length + checkpoint.callCount }
+        : resume && cached
+          ? { byteOffset: cached.byteOffset, state: cached.state, callCount: cached.callCount }
+          : { byteOffset: tracker.lastCompleteLineOffset, state: newState, callCount: allCalls.length }
+      const storedState: CodexDecodeState = { ...resumePoint.state, seenKeys: [] }
       await writeCodexCacheEntry(source.path, {
         mtimeMs: currentFp.mtimeMs,
         sizeBytes: currentFp.sizeBytes,
         project: source.project,
-        byteOffset: tracker.lastCompleteLineOffset,
+        byteOffset: resumePoint.byteOffset,
         state: storedState,
+        callCount: resumePoint.callCount,
         calls: allCalls,
       })
 

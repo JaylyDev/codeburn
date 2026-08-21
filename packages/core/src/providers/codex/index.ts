@@ -16,6 +16,7 @@ export {
   codexToolNameMap,
   type CodexDecodeInput,
   type CodexDecodeResult,
+  type CodexResumeCheckpoint,
 } from './decode.js'
 
 export {

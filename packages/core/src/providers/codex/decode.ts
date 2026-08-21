@@ -100,6 +100,106 @@ function payloadHead(head: string): string {
   return idx === -1 ? head : head.slice(idx)
 }
 
+function getRawJsonNumberField(head: string, field: string): number | undefined {
+  const match = new RegExp(`"${field}"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)`).exec(head)
+  if (!match) return undefined
+  const value = Number(match[1])
+  return Number.isFinite(value) ? value : undefined
+}
+
+// Return a small window of `source` starting at the DEPTH-1 payload key `field`,
+// i.e. the payload's own key rather than the first same-named key anywhere
+// inside it. A compact head scan takes the first match it sees, which on a
+// nested object (session_meta embeds base_instructions / dynamic_tools; an MCP
+// record embeds invocation.arguments) is the wrong one.
+function getRawPayloadFieldWindow(source: Buffer, field: string, windowBytes = 4096): string | undefined {
+  const payloadKey = Buffer.from('"payload"')
+  const payloadIndex = source.indexOf(payloadKey)
+  if (payloadIndex < 0) return undefined
+  const payloadStart = source.indexOf(0x7b, payloadIndex + payloadKey.length) // {
+  if (payloadStart < 0) return undefined
+
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = payloadStart; i < source.length; i++) {
+    const byte = source[i]!
+    if (inString) {
+      if (escaped) escaped = false
+      else if (byte === 0x5c) escaped = true // backslash
+      else if (byte === 0x22) inString = false // "
+      continue
+    }
+    if (byte === 0x22) {
+      const keyStart = i + 1
+      let keyEnd = keyStart
+      let keyEscaped = false
+      for (; keyEnd < source.length; keyEnd++) {
+        const keyByte = source[keyEnd]!
+        if (keyEscaped) { keyEscaped = false; continue }
+        if (keyByte === 0x5c) { keyEscaped = true; continue }
+        if (keyByte === 0x22) break
+      }
+      if (depth === 1 && keyEnd < source.length) {
+        const key = source.subarray(keyStart, keyEnd).toString('utf-8')
+        let valueStart = keyEnd + 1
+        while (valueStart < source.length && (source[valueStart] === 0x20 || source[valueStart] === 0x09 || source[valueStart] === 0x0a || source[valueStart] === 0x0d)) valueStart++
+        if (source[valueStart] === 0x3a && key === field) {
+          return source.subarray(i, Math.min(source.length, i + windowBytes)).toString('utf-8')
+        }
+      }
+      i = keyEnd
+      inString = false
+      continue
+    }
+    if (byte === 0x22) inString = true
+    else if (byte === 0x7b || byte === 0x5b) depth++ // { or [
+    else if (byte === 0x7d || byte === 0x5d) depth-- // } or ]
+    if (depth < 0) break
+  }
+  return undefined
+}
+
+function getRawDurationMs(head: string): number | undefined {
+  const objectMatch = /"duration"\s*:\s*\{\s*"secs"\s*:\s*(-?\d+(?:\.\d+)?)\s*,\s*"nanos"\s*:\s*(-?\d+(?:\.\d+)?)\s*\}/.exec(head)
+  if (objectMatch) {
+    const seconds = Number(objectMatch[1])
+    const nanos = Number(objectMatch[2])
+    if (Number.isFinite(seconds) && Number.isFinite(nanos)) return seconds * 1000 + nanos / 1e6
+  }
+  const text = getRawJsonStringField(head, 'duration')
+  if (text) {
+    const match = /^(\d+(?:\.\d+)?)(ms|s)?$/.exec(text.trim())
+    if (match) {
+      const value = Number(match[1])
+      if (Number.isFinite(value)) return value * (match[2] === 's' ? 1000 : 1)
+    }
+  }
+  return undefined
+}
+
+// The parsed (small-line) form of the same field: `duration` is a number of ms,
+// a Rust Duration object, or a "1500ms"/"1.5s" string depending on the writer.
+function durationValueMs(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'object' && value) {
+    const record = value as Record<string, unknown>
+    const seconds = record['secs']
+    const nanos = record['nanos']
+    if (typeof seconds === 'number' && typeof nanos === 'number' && Number.isFinite(seconds) && Number.isFinite(nanos)) {
+      return seconds * 1000 + nanos / 1e6
+    }
+  }
+  if (typeof value === 'string') {
+    const match = /^(\d+(?:\.\d+)?)(ms|s)?$/.exec(value.trim())
+    if (match) {
+      const parsed = Number(match[1])
+      if (Number.isFinite(parsed)) return parsed * (match[2] === 's' ? 1000 : 1)
+    }
+  }
+  return undefined
+}
+
 function countJsonStringBytes(source: Buffer, valueStart: number): number {
   let count = 0
   for (let i = valueStart; i < source.length; i++) {
@@ -172,6 +272,32 @@ export function parseCodexLine(line: string | Buffer): CodexEntry | null {
   const pHead = payloadHead(head)
   const payloadType = getRawJsonStringField(pHead, 'type')
   const role = getRawJsonStringField(pHead, 'role')
+  // task_complete appends the potentially huge final assistant message before
+  // its duration fields. Fall back to the full Buffer only for this event so
+  // timing metadata is not lost when the compact head stops early.
+  const needsTimingTail = type === 'event_msg' && (payloadType === 'task_complete' || payloadType === 'mcp_tool_call_end')
+  const timingTail = needsTimingTail && line.length > RAW_HEAD_BYTES
+    ? line.subarray(Math.max(0, line.length - 16 * 1024)).toString('utf-8')
+    : pHead
+  const timingNumber = (field: string): number | undefined =>
+    getRawJsonNumberField(pHead, field) ?? getRawJsonNumberField(timingTail, field)
+  // MCP records can place a large invocation.arguments object before duration
+  // and a large result after it. Searching a small window around the field
+  // avoids materializing the middle of the Buffer while still preserving wait
+  // timing for those records.
+  const payloadDuration = payloadType === 'mcp_tool_call_end'
+    ? getRawDurationMs(getRawPayloadFieldWindow(line, 'duration') ?? '')
+    : undefined
+  const timingDuration = payloadDuration ?? getRawDurationMs(pHead) ?? getRawDurationMs(timingTail)
+  // session_meta can embed same-name keys under base_instructions /
+  // dynamic_tools (including provenance.model). A depth-agnostic scan of the
+  // compact head steals the first nested hit and can overwrite turn_context.
+  // Restrict every session_meta string field to payload depth 1. Other event
+  // types keep the cheap first-match scan.
+  const payloadString = (field: string): string | undefined =>
+    type === 'session_meta'
+      ? getRawJsonStringField(getRawPayloadFieldWindow(line, field) ?? '', field)
+      : getRawJsonStringField(pHead, field)
 
   const entry: CodexEntry = {
     type,
@@ -179,13 +305,21 @@ export function parseCodexLine(line: string | Buffer): CodexEntry | null {
     payload: {
       type: payloadType,
       role,
-      cwd: getRawJsonStringField(pHead, 'cwd'),
-      model_provider: getRawJsonStringField(pHead, 'model_provider'),
-      originator: getRawJsonStringField(pHead, 'originator'),
-      session_id: getRawJsonStringField(pHead, 'session_id'),
-      forked_from_id: getRawJsonStringField(pHead, 'forked_from_id'),
-      model: getRawJsonStringField(pHead, 'model'),
-      name: getRawJsonStringField(pHead, 'name'),
+      cwd: payloadString('cwd'),
+      model_provider: payloadString('model_provider'),
+      originator: payloadString('originator'),
+      session_id: payloadString('session_id'),
+      forked_from_id: payloadString('forked_from_id'),
+      model: payloadString('model'),
+      name: payloadString('name'),
+      call_id: getRawJsonStringField(pHead, 'call_id'),
+      turn_id: getRawJsonStringField(pHead, 'turn_id'),
+      // On mcp_tool_call_end a coincidental `duration_ms` inside the large
+      // invocation.arguments object can shadow the payload-level duration, so the
+      // depth-aware value wins. The naive scan stays as the fallback for
+      // task_complete, which records duration_ms at the payload level directly.
+      duration_ms: timingDuration ?? timingNumber('duration_ms'),
+      started_at: timingNumber('started_at'),
     },
   }
 
@@ -297,10 +431,26 @@ export type CodexDecodeInput = {
   sessionIdFallback?: string
 }
 
+/**
+ * The last `task_started` boundary this pass crossed: the only point where a
+ * later pass may restart and still rebuild a whole task-timing window, because
+ * every per-task accumulator is empty there. `recordIndex` is the index of the
+ * task_started record (the host maps it to the byte offset AFTER that line);
+ * `callCount` is how many calls had been emitted at that point, so the host can
+ * replay exactly those and let the rest re-decode. Absent when the pass saw no
+ * task_started at all.
+ */
+export type CodexResumeCheckpoint = {
+  recordIndex: number
+  callCount: number
+  state: CodexDecodeState
+}
+
 export type CodexDecodeResult = {
   calls: CodexDecodedCall[]
   diagnostics: RecordDiagnostic[]
   state: CodexDecodeState
+  checkpoint?: CodexResumeCheckpoint
 }
 
 /**
@@ -318,9 +468,55 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
   const calls: CodexDecodedCall[] = []
   const diagnostics: RecordDiagnostic[] = []
 
+  // Tool-excluded active timing. Calls decoded since the last task_started are
+  // held back here so task_complete can stamp them BEFORE they are appended to
+  // `calls`: emitting a task only once its timing is known keeps single-pass and
+  // resumed decodes in agreement instead of back-patching a call already handed
+  // to the host. Bounded by one task's calls; flushed at the next task_started
+  // and at end of input.
+  let pendingTaskCalls: CodexDecodedCall[] = []
+  let taskGeneratedTokens = 0
+  let taskToolIntervals: Array<[number, number]> = []
+  // `taskOpen` is true only when THIS pass owns the whole current task window:
+  // either it saw the task_started, or it resumed from a state snapshotted at
+  // one. A task_complete without it attributes nothing, because a partial window
+  // would spread the task's active time over only part of its tokens.
+  let taskOpen = prevState?.taskOpen === true
+  let taskStartedAt: number | undefined = prevState?.taskStartedAt
+  const openToolStarts = new Map<string, number>()
+  let checkpoint: CodexResumeCheckpoint | undefined
+
   for (const [index, rawLine] of records.entries()) {
     const entry = parseCodexLine(rawLine as string | Buffer)
     if (!entry) continue
+
+    // Forked sessions replay the parent's event history clustered at the fork
+    // creation time. The token_count path has always skipped those replays; the
+    // timing branches must too, or a replayed task_started would reset a live
+    // window. Deliberately scoped to the timing branches: every other record
+    // type keeps the attribution this decoder already produces.
+    const isForkReplay = Boolean(s.forkCutoff && entry.timestamp && entry.timestamp < s.forkCutoff)
+
+    if (entry.type === 'event_msg' && entry.payload?.type === 'task_started') {
+      if (isForkReplay) continue
+      // Emit the previous task. If it never reached task_complete its timing
+      // fields simply stay unset, matching the un-buffered behaviour.
+      calls.push(...pendingTaskCalls)
+      pendingTaskCalls = []
+      taskGeneratedTokens = 0
+      taskToolIntervals = []
+      const startedAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+      taskStartedAt = Number.isFinite(startedAt) ? startedAt : undefined
+      taskOpen = true
+      openToolStarts.clear()
+      // Everything decoded so far is in `calls` and every per-task accumulator
+      // is empty: the clean restart point for an appended tail.
+      const snapshot = cloneState(s)
+      snapshot.taskOpen = true
+      snapshot.taskStartedAt = taskStartedAt
+      checkpoint = { recordIndex: index, callCount: calls.length, state: snapshot }
+      continue
+    }
 
     if (entry.type === 'session_meta') {
       // Update in place — do NOT reset the running counters. A single rollout
@@ -376,7 +572,23 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
           s.pendingToolSequence.push([{ tool: mcpTool }])
         }
       }
+      const callId = entry.payload.call_id
+      const started = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+      if (!isForkReplay && callId && Number.isFinite(started)) openToolStarts.set(callId, started)
       s.pendingToolSequence.push([call])
+      continue
+    }
+
+    // Closes a tool-wait interval opened by the matching function_call. Tool
+    // names and files were already collected there, so this branch is timing
+    // only.
+    if (entry.type === 'response_item' && entry.payload?.type === 'function_call_output') {
+      if (isForkReplay) continue
+      const callId = entry.payload.call_id
+      const ended = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+      const started = callId ? openToolStarts.get(callId) : undefined
+      if (started !== undefined && Number.isFinite(ended) && ended > started) taskToolIntervals.push([started, ended])
+      if (callId) openToolStarts.delete(callId)
       continue
     }
 
@@ -402,6 +614,13 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
     }
 
     if (entry.type === 'event_msg' && entry.payload?.type === 'mcp_tool_call_end') {
+      // An MCP call records no start event, only its own duration on the end
+      // event, so the interval is reconstructed backwards from the end.
+      const endedAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+      const mcpDurationMs = entry.payload.duration_ms ?? durationValueMs(entry.payload.duration)
+      if (!isForkReplay && typeof mcpDurationMs === 'number' && mcpDurationMs > 0 && Number.isFinite(endedAt)) {
+        taskToolIntervals.push([endedAt - mcpDurationMs, endedAt])
+      }
       const inv = (entry.payload as Record<string, unknown>)['invocation'] as Record<string, unknown> | undefined
       const server = typeof inv?.['server'] === 'string' ? inv['server'] as string : ''
       const tool = typeof inv?.['tool'] === 'string' ? inv['tool'] as string : ''
@@ -409,6 +628,37 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
         const name = `mcp__${server}__${tool}`
         s.pendingTools.push(name)
         s.pendingToolSequence.push([{ tool: name }])
+      }
+      continue
+    }
+
+    if (entry.type === 'event_msg' && entry.payload?.type === 'task_complete') {
+      if (isForkReplay) continue
+      const durationMs = entry.payload.duration_ms
+      if (taskOpen && typeof durationMs === 'number' && durationMs > 0 && taskGeneratedTokens > 0 && pendingTaskCalls.length > 0) {
+        const completedAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+        const windowStart = taskStartedAt ?? (Number.isFinite(completedAt) ? completedAt - durationMs : undefined)
+        const windowEnd = windowStart !== undefined ? windowStart + durationMs : undefined
+        const clipped = taskToolIntervals.map(([start, end]) => [
+          windowStart !== undefined ? Math.max(start, windowStart) : start,
+          windowEnd !== undefined ? Math.min(end, windowEnd) : end,
+        ] as [number, number]).filter(([start, end]) => end > start)
+        const merged = clipped.sort((a, b) => a[0] - b[0]).reduce<Array<[number, number]>>((acc, interval) => {
+          const previous = acc.at(-1)
+          if (previous && interval[0] <= previous[1]) previous[1] = Math.max(previous[1], interval[1])
+          else acc.push([...interval])
+          return acc
+        }, [])
+        const toolWaitMs = Math.min(durationMs, merged.reduce((sum, interval) => sum + interval[1] - interval[0], 0))
+        const activeMs = durationMs - toolWaitMs
+        if (activeMs <= 0) continue
+        for (const call of pendingTaskCalls) {
+          const generated = call.outputTokens + call.reasoningTokens
+          if (generated <= 0) continue
+          call.activeGeneratedTokens = generated
+          call.activeDurationMs = activeMs * (generated / taskGeneratedTokens)
+          call.toolWaitMs = toolWaitMs * (generated / taskGeneratedTokens)
+        }
       }
       continue
     }
@@ -461,7 +711,7 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
         if (seen.has(dedupKey)) { clearPending(s); continue }
         seen.add(dedupKey)
 
-        calls.push({
+        pendingTaskCalls.push({
           provider: 'codex',
           model,
           inputTokens: estInput,
@@ -486,6 +736,7 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
           ...(s.pendingEditFailed ? { editFailed: s.pendingEditFailed } : {}),
         })
 
+        taskGeneratedTokens += estOutput
         clearPending(s)
         continue
       }
@@ -546,7 +797,7 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
       if (seen.has(dedupKey)) continue
       seen.add(dedupKey)
 
-      calls.push({
+      pendingTaskCalls.push({
         provider: 'codex',
         model,
         inputTokens: uncachedInputTokens,
@@ -570,10 +821,23 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
         ...(s.pendingEditFailed ? { editFailed: s.pendingEditFailed } : {}),
       })
 
+      taskGeneratedTokens += outputTokens + reasoningTokens
       clearPending(s)
     }
   }
 
+  // Flush the final task, which has no following task_started to trigger it. A
+  // task still open here keeps its timing fields unset; the host resumes from
+  // `checkpoint` (the task's own task_started) so the next pass rebuilds the
+  // whole window and emits these same calls WITH timing, rather than patching
+  // calls it has already handed out.
+  calls.push(...pendingTaskCalls)
+
+  // The end-of-input state is only ever used as a resume point when this pass
+  // crossed no task boundary at all, so it must never claim an open window.
+  s.taskOpen = false
+  s.taskStartedAt = undefined
+
   s.seenKeys = liveSeen ? [] : [...seen]
-  return { calls, diagnostics, state: s }
+  return { calls, diagnostics, state: s, ...(checkpoint ? { checkpoint } : {}) }
 }

@@ -116,4 +116,52 @@ describe('codex append-resume through the CLI cache', () => {
 
     expect(v2.map(c => c.model)).toContain('SENTINEL-MODEL')
   })
+
+  it('attributes active timing across the append boundary (mid-task cut then task_complete)', async () => {
+    // The live-session cut: run 1 parses a rollout that ends mid-task
+    // (token_count emitted, task_complete not yet written), so its call has no
+    // timing. Run 2 appends the task_complete. The resume point is the task's
+    // own task_started, so run 2 re-reads the whole window and emits the call
+    // WITH timing — no already-emitted call is ever patched.
+    const TIMING_PREFIX = [
+      JSON.stringify({ type: 'session_meta', timestamp: '2026-04-14T10:00:00Z', payload: { session_id: 'sess-timing', model: 'gpt-5.5', cwd: '/Users/t/p', originator: 'codex-cli' } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started', turn_id: 'turn-1' } }),
+      userMessage('run the tool', '2026-04-14T10:00:01Z'),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:02Z', payload: { type: 'function_call', call_id: 'call-1', name: 'exec_command' } }),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:05Z', payload: { type: 'function_call_output', call_id: 'call-1', output: 'done' } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:01:10Z', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 100, reasoning_output_tokens: 20, total_tokens: 220 }, total_token_usage: { total_tokens: 220 } } } }),
+    ]
+    const TIMING_COMPLETE = [
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:01:11Z', payload: { type: 'task_complete', duration_ms: 10_000 } }),
+    ]
+
+    const filePath = await writeAt(tmpDir, 'rollout-timing-grow.jsonl', TIMING_PREFIX)
+
+    // Run 1: cold decode, ends mid-task — no timing yet.
+    const v1 = await parseFile(filePath)
+    expect(v1).toHaveLength(1)
+    expect(v1[0]!.activeDurationMs).toBeUndefined()
+
+    // The resume point rewound to the task_started rather than end-of-file:
+    // none of the open task's calls may be replayed, or run 2 would have to
+    // patch a call it already served. Revert the checkpoint to the end-of-file
+    // offset and callCount becomes 1 and the timing below never arrives.
+    const midEntry = await readCodexCacheEntry(filePath)
+    expect(midEntry!.callCount).toBe(0)
+    expect(midEntry!.state.taskOpen).toBe(true)
+    expect(midEntry!.calls).toHaveLength(1)
+
+    // Run 2: the file grows by the task_complete; the codex-results cache
+    // resumes from the persisted task boundary.
+    await appendFile(filePath, TIMING_COMPLETE.join('\n') + '\n')
+    const v2 = await parseFile(filePath)
+
+    // Cold decode of the full grown file: the resumed output must equal it.
+    const coldPath = await writeAt(tmpDir, 'rollout-timing-cold.jsonl', [...TIMING_PREFIX, ...TIMING_COMPLETE])
+    const cold = await parseFile(coldPath)
+    expect(cold).toHaveLength(1)
+    expect(cold[0]).toMatchObject({ activeDurationMs: 7000, activeGeneratedTokens: 120, toolWaitMs: 3000 })
+
+    expect(v2).toEqual(cold)
+  })
 })
