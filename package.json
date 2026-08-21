@@ -1,6 +1,6 @@
 {
   "name": "codeburn-monorepo",
-  "version": "0.10.0",
+  "version": "0.9.20",
   "description": "CodeBurn monorepo — CLI (packages/cli) + @codeburn/core (packages/core)",
   "private": true,
   "type": "module",

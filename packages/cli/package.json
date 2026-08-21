@@ -1,6 +1,6 @@
 {
   "name": "codeburn",
-  "version": "0.10.0",
+  "version": "0.9.20",
   "description": "See where your AI spend goes - by task, tool, model, and project",
   "type": "module",
   "main": "./dist/cli.js",
@@ -51,7 +51,7 @@
   },
   "homepage": "https://github.com/getagentseal/codeburn#readme",
   "dependencies": {
-    "@codeburn/core": "0.10.0",
+    "@codeburn/core": "0.9.20",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "bonjour-service": "^1.4.1",
     "chalk": "^5.4.1",
