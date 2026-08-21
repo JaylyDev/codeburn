@@ -114,6 +114,11 @@ async function getExchangeRate(code: string): Promise<number> {
   const cached = await loadCachedRate(code)
   if (cached) return cached
 
+  // Test-only escape hatch, set for the whole suite in
+  // tests/setup/env-isolation.ts: skip the live Frankfurter fetch so a real FX
+  // move can't shift assertions. Same fallback an unreachable network gets.
+  if (process.env['CODEBURN_FX_NO_FETCH']) return 1
+
   let rate: number
   try {
     rate = await fetchRate(code)
