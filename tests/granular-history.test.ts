@@ -157,12 +157,31 @@ describe('granular history', () => {
     // 160px at the chart's 10px font fits roughly 31-32 lowercase glyphs;
     // compare a conservative prefix that must be visible in that budget.
     const visibleCharacterBudget = 24
-    const visiblePrefixes = history.sessionSeries.map(series => series.label.slice(0, visibleCharacterBudget))
+    const visiblePrefixes = history.sessionSeries.map(series => Array.from(series.label).slice(0, visibleCharacterBudget).join(''))
     expect(new Set(visiblePrefixes).size).toBe(2)
     expect(history.sessionSeries.map(series => series.label)).toEqual(expect.arrayContaining([
       expect.stringMatching(/^a1b2c3…7f01 \(claude\) · /),
       expect.stringMatching(/^d4e5f6…8a02 \(claude\) · /),
     ]))
+  })
+
+  it('counts the visible title-lead window in code points, not UTF-16 units', () => {
+    const timestamp = '2026-07-15T12:05:00.000Z'
+    const start = new Date('2026-07-15T00:00:00.000Z')
+    const end = new Date('2026-07-15T23:59:59.999Z')
+    const emojiPrefix = '😀'.repeat(12)
+    const history = buildGranularHistory([project([
+      { id: 'emoji-alpha-aaaaaa', title: `${emojiPrefix} alpha work`, calls: [apiCall({ timestamp, cost: 1 })] },
+      { id: 'emoji-beta-bbbbbb', title: `${emojiPrefix} beta work`, calls: [apiCall({ timestamp, cost: 2 })] },
+    ])], { start, end }, end)
+
+    // 12 emoji = 12 glyphs / 24 UTF-16 units. A unit slice collides both
+    // titles on the emoji run and would id-first; a code-point window still
+    // sees " alpha" vs " beta" and can title-lead.
+    expect(history.sessionSeries.map(series => series.label).sort()).toEqual([
+      `${emojiPrefix} alpha work (claude)`,
+      `${emojiPrefix} beta work (claude)`,
+    ].sort())
   })
 
   it('sanitises control characters and ANSI escapes in session titles', () => {

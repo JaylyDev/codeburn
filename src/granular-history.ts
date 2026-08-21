@@ -177,8 +177,13 @@ function preferredSessionTitle(titleCandidates: Map<string, SessionTitleCandidat
 
 // Chart legend is `max-w-40` at 10px ≈ 24–32 glyphs. A title that is unique in
 // that window can lead; otherwise the short id must stay in the prefix or
-// truncated series look identical (the #997 class).
+// truncated series look identical (the #997 class). Count code points, matching
+// the title cap — a UTF-16 slice can split an emoji and collide two titles.
 const VISIBLE_LEGEND_PREFIX = 24
+
+function visibleLegendPrefix(label: string): string {
+  return Array.from(label).slice(0, VISIBLE_LEGEND_PREFIX).join('')
+}
 
 function buildSessionLabels(inputs: Map<string, SessionLabelInfo>): Map<string, string> {
   // Stable raw-key order makes the residual used-label guard independent of
@@ -197,11 +202,11 @@ function buildSessionLabels(inputs: Map<string, SessionLabelInfo>): Map<string, 
 
   const titlePrefixCounts = new Map<string, number>()
   for (const entry of draft) {
-    const prefix = entry.baseLabel.slice(0, VISIBLE_LEGEND_PREFIX)
+    const prefix = visibleLegendPrefix(entry.baseLabel)
     titlePrefixCounts.set(prefix, (titlePrefixCounts.get(prefix) ?? 0) + 1)
   }
   const entries: SessionLabelEntry[] = draft.map(entry => {
-    const prefix = entry.baseLabel.slice(0, VISIBLE_LEGEND_PREFIX)
+    const prefix = visibleLegendPrefix(entry.baseLabel)
     const titleLeads = (titlePrefixCounts.get(prefix) ?? 0) === 1
     return { ...entry, baseLabel: titleLeads ? entry.baseLabel : entry.idFirst }
   })
