@@ -553,7 +553,7 @@ describe('buildAttributionOtlpPayload', () => {
     expect(sessionSpan.spanId).not.toBe(commitSpan.spanId)
 
     const sessionAttrs = attrMap(sessionSpan.attributes)
-    expect(sessionAttrs['ai.session_id']).toEqual({ stringValue: 'sess-1' })
+    expect(sessionAttrs['ai.session_id']).toBeUndefined()
     expect(sessionAttrs['ai.project']).toEqual({ stringValue: 'app' })
     expect(sessionAttrs['git.repo']).toEqual({ stringValue: 'github.com/acme/widget' })
     expect(sessionAttrs['git.commit_count']).toEqual({ intValue: '1' })
@@ -565,6 +565,7 @@ describe('buildAttributionOtlpPayload', () => {
     expect(sessionSpan.endTimeUnixNano).toBe((BigInt(new Date('2026-01-01T11:00:00.000Z').getTime()) * 1_000_000n).toString())
 
     const commitAttrs = attrMap(commitSpan.attributes)
+    expect(commitAttrs['ai.session_id']).toBeUndefined()
     expect(commitAttrs['git.sha']).toEqual({ stringValue: 'a'.repeat(40) })
     expect(commitAttrs['git.in_main']).toEqual({ boolValue: true })
     expect(commitAttrs['git.was_reverted']).toEqual({ boolValue: false })

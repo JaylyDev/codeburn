@@ -256,7 +256,6 @@ export function buildAttributionOtlpPayload(items: AttributionItem[]): OtlpPaylo
     const endNano = (rawEndNano > minEndNano ? rawEndNano : minEndNano).toString()
 
     const attributes: OtlpAttribute[] = [
-      { key: 'ai.session_id', value: { stringValue: item.sessionId } },
       { key: 'ai.project', value: { stringValue: item.project } },
     ]
     if (item.repo) {
