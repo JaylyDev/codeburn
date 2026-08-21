@@ -418,3 +418,52 @@ describe('codex decoder — task-timing checkpoint', () => {
     expect(calls[1]!.toolWaitMs).toBeUndefined()
   })
 })
+
+// One task carrying TWO token_counts, so a pass that resumes INSIDE it holds
+// only part of the task's generated tokens.
+const SPLIT_TASK_CORPUS: string[] = [
+  sessionMeta({ session_id: 'sess-split', timestamp: '2026-04-14T10:00:00Z' }),
+  JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started' } }),
+  userMessage('two checkpoints', '2026-04-14T10:00:01Z'),
+  tokenCount({ timestamp: '2026-04-14T10:00:02Z', last: { input: 100, output: 100 }, total: { input: 100, output: 100, total: 200 } }),
+  tokenCount({ timestamp: '2026-04-14T10:00:04Z', last: { input: 100, output: 100 }, total: { input: 200, output: 200, total: 400 } }),
+  JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:06Z', payload: { type: 'task_complete', duration_ms: 6_000 } }),
+]
+
+describe('codex decoder — timing never lands on a partial task window', () => {
+  it('attributes the whole window across both calls in one pass', () => {
+    const cold = decodeCold(SPLIT_TASK_CORPUS)
+    expect(cold).toHaveLength(2)
+    expect(cold[0]!.activeDurationMs).toBe(3000)
+    expect(cold[1]!.activeDurationMs).toBe(3000)
+  })
+
+  it('attributes nothing when the pass holding task_complete never opened the window', () => {
+    // Resume from an end-of-file state (taskOpen false) with the tail carrying
+    // the task's SECOND token_count and its task_complete. Without the gate the
+    // tail would take the full 6s window for the one call it happens to hold —
+    // double its real share, and the first call would stay unattributed.
+    const first = decodeCodex({ records: SPLIT_TASK_CORPUS.slice(0, 4), context })
+    const serialized: CodexDecodeState = JSON.parse(JSON.stringify(first.state))
+    expect(serialized.taskOpen).toBe(false)
+    const second = decodeCodex({ records: SPLIT_TASK_CORPUS.slice(4), context, state: serialized })
+    expect(second.calls).toHaveLength(1)
+    expect(second.calls[0]!.activeDurationMs).toBeUndefined()
+    expect(second.calls[0]!.toolWaitMs).toBeUndefined()
+  })
+
+  it('excludes custom-tool wait from active time, like a function_call pair', () => {
+    const records = [
+      sessionMeta({ session_id: 'sess-custom', timestamp: '2026-04-14T10:00:00Z' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started' } }),
+      userMessage('run the tool', '2026-04-14T10:00:01Z'),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:02Z', payload: { type: 'custom_tool_call', call_id: 'c1', name: 'exec' } }),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:05Z', payload: { type: 'custom_tool_call_output', call_id: 'c1', output: 'ok' } }),
+      tokenCount({ timestamp: '2026-04-14T10:00:08Z', last: { input: 300, output: 100 }, total: { input: 300, output: 100, total: 400 } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:10Z', payload: { type: 'task_complete', duration_ms: 10_000 } }),
+    ]
+    const calls = decodeCold(records)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ activeDurationMs: 7000, toolWaitMs: 3000 })
+  })
+})
