@@ -464,7 +464,7 @@ describe('buildPeriodDataFromDays', () => {
 
 describe('daily-cache ↔ report daily-bucket parity', () => {
   // The daily cache (history.daily + provider breakdown) and JSON-report
-  // headlines (durable.days from buildDurablePeriod) must bucket days by the
+  // daily[] rows (durable.days from buildDurablePeriod) must bucket days by the
   // SAME rule, or their per-day totals drift and their period sums diverge from
   // current.cost at window boundaries — the V1 audit's constant -$3.45/-81-calls
   // finding. Both are now PER-CALL for cost/savings/calls (issue #852) with
