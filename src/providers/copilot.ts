@@ -703,21 +703,6 @@ function inferTranscriptModel(lines: string[]): string {
 // token counts and no session.shutdown rollup)
 // ---------------------------------------------------------------------------
 
-// Shutdown rollup identity is (session, model, shutdown timestamp, journal
-// basename), not a per-file occurrence index. Two journals for one session
-// (resume into a second events.jsonl) both started their local counter at 1,
-// so `:1` collided and the second file's first leg was dropped (#1051).
-// Timestamp alone is not unique across journals: two files can share a stamp.
-// The journal basename is re-parse-stable; do not mint suffixes from seenKeys.
-function copilotShutdownDedupKey(
-  sessionId: string,
-  model: string,
-  shutdownTimestamp: string,
-  journalId: string,
-): string {
-  return `copilot:${sessionId}:shutdown:${model}:${shutdownTimestamp || 'untimestamped'}:${journalId}`
-}
-
 /**
  * `isTranscript` comes from discovery (where the file lives), never from
  * content: the Copilot CLI writes the same session.start producer
@@ -773,12 +758,12 @@ function createJsonlParser(
       // A resumed session appends one session.shutdown PER LEG, each carrying
       // CUMULATIVE per-model totals. Emitting each rollup whole would need the
       // cache to update a prior call in place — the durable merge is
-      // append-only by dedup key — so we emit per-leg DELTAS keyed by the
-      // shutdown timestamp plus this journal's basename: re-parses of a
-      // growing file append only the new leg, and two journals for one
-      // session cannot collide on `:1` or on a shared timestamp.
-      const journalId = basename(source.path)
+      // append-only by dedup key — so we emit per-leg DELTAS keyed by
+      // occurrence (`:n`): re-parses of a growing file append only the new
+      // leg, and each leg lands on its own timestamp. Discovery only yields
+      // `<sid>/events.jsonl`, so two journals cannot share a session id.
       const prevShutdownUsage = new Map<string, ShutdownModelUsage>()
+      const shutdownCountByModel = new Map<string, number>()
 
       for (const line of lines) {
         let event: CopilotEvent
@@ -857,8 +842,14 @@ function createJsonlParser(
           const modelMetrics = shutdownData.modelMetrics
           if (!isRecord(modelMetrics)) continue
 
+          // Prefer lastEventTimestamp over sessionStartTime. sessionStartTime
+          // is identical for every stampless leg of a resumed session, so
+          // using it for the call timestamp (or, previously, the key) collapsed
+          // those legs onto one date. lastEventTimestamp is the last stamped
+          // event in this journal — distinct per leg when intervening events
+          // are stamped, and still a real time when they are not.
           const shutdownTimestamp =
-            (event.timestamp ?? '') || timestampToISO(shutdownData.sessionStartTime) || lastEventTimestamp
+            (event.timestamp ?? '') || lastEventTimestamp || timestampToISO(shutdownData.sessionStartTime)
 
           for (const [model, metrics] of Object.entries(modelMetrics)) {
             if (!model || !isRecord(metrics)) continue
@@ -874,6 +865,8 @@ function createJsonlParser(
             }
             const prevRaw = prevShutdownUsage.get(model)
             prevShutdownUsage.set(model, cumulative)
+            const n = (shutdownCountByModel.get(model) ?? 0) + 1
+            shutdownCountByModel.set(model, n)
 
             // A cumulative total BELOW the previous rollup means the CLI reset
             // its counters (a fresh accounting epoch): delta from zero, else
@@ -905,7 +898,7 @@ function createJsonlParser(
             // to avoid an empty $0 row (output is intentionally excluded).
             if (inputTokens === 0 && cacheReadTokens === 0 && cacheWriteTokens === 0 && reasoningTokens === 0) continue
 
-            const dedupKey = copilotShutdownDedupKey(sessionId, model, shutdownTimestamp, journalId)
+            const dedupKey = `copilot:${sessionId}:shutdown:${model}:${n}`
             if (seenKeys.has(dedupKey)) continue
             seenKeys.add(dedupKey)
 
