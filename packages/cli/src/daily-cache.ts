@@ -5,6 +5,15 @@ import { homedir } from 'os'
 import { join } from 'path'
 import type { DateRange, ProjectSummary } from './types.js'
 
+// Bumped to 25: pi/omp, cline and opencode/kilo-code session discovery was
+// restored (#930). Older rollups missed OMP sessions written after a
+// `type: "title"` slot line, Cline sessions under the Insiders / VSCodium /
+// home-data roots, and opencode/kilo-code interrupted or user-only sessions
+// whose session-level fallback queried a `model_id` column neither schema
+// has. Those files were skipped before they were ever parsed, so nothing
+// downstream can notice on its own; raising MIN_SUPPORTED_VERSION forces the
+// one-time re-derivation.
+//
 // Bumped to 24: Codex discovery is structural instead of originator-gated
 // (#873/#626), so rollouts written by third-party frontends driving
 // `codex app-server` ("t3code_desktop", "JetBrains.IntelliJ IDEA", ...) now
@@ -80,8 +89,8 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 24
-const MIN_SUPPORTED_VERSION = 24
+export const DAILY_CACHE_VERSION = 25
+const MIN_SUPPORTED_VERSION = 25
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including
