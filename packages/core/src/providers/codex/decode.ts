@@ -579,10 +579,19 @@ export function decodeCodex({ records, state: prevState, seenKeys: liveSeen, ses
       continue
     }
 
-    // Closes a tool-wait interval opened by the matching function_call. Tool
-    // names and files were already collected there, so this branch is timing
-    // only.
-    if (entry.type === 'response_item' && entry.payload?.type === 'function_call_output') {
+    // Opens a tool-wait interval for Codex Desktop's custom-tool transport,
+    // which the branch's tool-name collection above does not speak yet. Timing
+    // only, exactly as codex-throughput.ts counts it.
+    if (entry.type === 'response_item' && entry.payload?.type === 'custom_tool_call') {
+      const callId = entry.payload.call_id
+      const started = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+      if (!isForkReplay && callId && Number.isFinite(started)) openToolStarts.set(callId, started)
+      continue
+    }
+
+    // Closes a tool-wait interval opened by the matching call. Tool names and
+    // files were already collected there, so this branch is timing only.
+    if (entry.type === 'response_item' && (entry.payload?.type === 'function_call_output' || entry.payload?.type === 'custom_tool_call_output')) {
       if (isForkReplay) continue
       const callId = entry.payload.call_id
       const ended = entry.timestamp ? Date.parse(entry.timestamp) : NaN
