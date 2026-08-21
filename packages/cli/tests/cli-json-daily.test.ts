@@ -235,6 +235,59 @@ describe('codeburn report --format json daily[] one-shot fields (issue #279)', (
     }
   })
 
+  it('splits a midnight-straddling turn across both days in daily[] (#852)', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-cli-json-straddle-'))
+
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'app')
+      await mkdir(projectDir, { recursive: true })
+
+      // ONE turn (single user line) whose two assistant calls fall on either
+      // side of local midnight. runCli pins TZ=UTC, so 23:59 and 00:01 are
+      // different calendar days for the report's day bucketing.
+      await writeFile(
+        join(projectDir, 'straddle.jsonl'),
+        [
+          userLine('s-straddle', '2026-04-10T23:59:00Z'),
+          assistantEditLine('s-straddle', '2026-04-10T23:59:30Z', 'm-before-midnight'),
+          assistantNoEditLine('s-straddle', '2026-04-11T00:01:00Z', 'm-after-midnight'),
+        ].join('\n'),
+      )
+
+      const result = runCli([
+        '--format', 'json',
+        '--from', '2026-04-10',
+        '--to', '2026-04-11',
+        '--provider', 'claude',
+      ], home)
+
+      expect(result.status).toBe(0)
+      const report = JSON.parse(result.stdout) as {
+        overview: { calls: number; cost: number }
+        daily: Array<{ date: string; cost: number; calls: number; turns: number }>
+      }
+
+      // Before #852 the whole turn was kept on its anchor day, so 2026-04-11
+      // had no row at all and both calls landed on 2026-04-10.
+      expect(report.daily.map(d => d.date)).toEqual(['2026-04-10', '2026-04-11'])
+      const dayA = report.daily.find(d => d.date === '2026-04-10')!
+      const dayB = report.daily.find(d => d.date === '2026-04-11')!
+      expect(dayA.calls).toBe(1)
+      expect(dayB.calls).toBe(1)
+      // Turn-level stats stay anchored on the turn's own day; only call-derived
+      // values split.
+      expect(dayA.turns).toBe(1)
+      expect(dayB.turns).toBe(0)
+      expect(dayA.cost).toBeGreaterThan(0)
+      expect(dayB.cost).toBeGreaterThan(0)
+      // Conservation: the split re-buckets spend, it never creates or loses it.
+      expect(report.overview.calls).toBe(2)
+      expect(dayA.cost + dayB.cost).toBeCloseTo(report.overview.cost, 6)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
   it('includes older sessions under --period lifetime but not under --period all', async () => {
     const home = await mkdtemp(join(tmpdir(), 'codeburn-cli-json-lifetime-'))
 
