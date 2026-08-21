@@ -73,11 +73,7 @@ function toProviderCall(rich: ClineCliDecodedCall): ParsedProviderCall {
     cacheReadInputTokens: rich.cacheReadInputTokens,
     cachedInputTokens: rich.cachedInputTokens,
     reasoningTokens: rich.reasoningTokens,
-    // Upstream prices the estimated path with a hardcoded 0 web-search requests,
-    // so the decoded count must not reach the pricing pass (which bills
-    // $0.01 each). A metered call carries the CLI's own dollar figure, so its
-    // real count rides along without touching cost.
-    webSearchRequests: measured ? rich.webSearchRequests : 0,
+    webSearchRequests: rich.webSearchRequests,
     ...(measured
       ? { costUSD: rich.reportedCost, costBasis: 'measured' as const }
       : { costBasis: 'estimated' as const }),
