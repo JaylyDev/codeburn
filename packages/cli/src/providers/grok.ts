@@ -143,6 +143,7 @@ export function createGrokProvider(sessionsDir?: string): Provider {
     },
 
     decode: decodeGrok,
+    legacyDeduplicationSourceRef: source => dirname(source.path),
     toProviderCall,
   })
 }

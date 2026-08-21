@@ -315,11 +315,12 @@ describe('copilot provider - JSONL parsing', () => {
     expect(calls2).toHaveLength(0)
   })
 
-  it('returns empty for missing file', async () => {
+  it('surfaces a missing durable file as a retryable parse failure', async () => {
     const source = { path: '/nonexistent/events.jsonl', project: 'test', provider: 'copilot' }
-    const calls: ParsedProviderCall[] = []
-    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
-    expect(calls).toHaveLength(0)
+    const consume = async () => {
+      for await (const _call of copilot.createSessionParser(source, new Set()).parse()) { /* consume */ }
+    }
+    await expect(consume()).rejects.toThrow(/Copilot JSONL source was unreadable/)
   })
 
   it('skips assistant messages before the first model_change event', async () => {
@@ -2017,9 +2018,9 @@ describe('copilot provider - JetBrains dedup key stability across store rewrites
   }
 
   it('a compaction that moves a new blob ahead of an old one must not re-bill the old turn', async () => {
-    // copilot is a durable provider: cached turns are never deleted, and a
-    // re-parse appends any dedup key it has not seen. MVStore compaction can
-    // rewrite the file with blobs in a different byte order. If dedup keys were
+    // Copilot is durable: the host reconciles present rows by identity while
+    // retaining cached-only rows that disappeared from the DB. MVStore
+    // compaction can rewrite the file with blobs in a different byte order. If dedup keys were
     // positional (conversation + scan index), a rewrite that puts a NEW turn
     // before an OLD one would hand the new turn the old turn's key (skipped as
     // already-seen) and re-emit the old turn under a fresh index — billing it

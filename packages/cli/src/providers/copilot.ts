@@ -782,24 +782,27 @@ async function discoverTranscriptSessions(
 
 async function readJsonlRecords(source: SessionSource): Promise<unknown[] | null> {
   const content = await readSessionFile(source.path)
-  if (!content) return null
+  if (content === null) throw new Error('Copilot JSONL source was unreadable')
   return [{ kind: 'jsonl', sessionId: basename(dirname(source.path)),
             lines: content.split('\n').filter((l) => l.trim()) }]
 }
 
 async function readChatSessionRecords(source: SessionSource): Promise<unknown[] | null> {
   const content = await readSessionFile(source.path)
-  if (!content) return null
+  if (content === null) throw new Error('Copilot chat session source was unreadable')
   return [{ kind: 'chatsession', content, project: source.project,
             fallbackSessionId: basename(source.path, '.jsonl') }]
 }
 
 async function readJetBrainsRecords(source: SessionSource): Promise<unknown[] | null> {
   const jbSource = source as JetBrainsSessionSource
-  if (!jbSource.dbPath) return null
-  let raw: string | null = null
-  try { raw = await readSessionFile(jbSource.dbPath, 'latin1') } catch { raw = null }
-  if (!raw) return null
+  if (!jbSource.dbPath) throw new Error('Copilot JetBrains source has no DB path')
+  const raw = await readSessionFile(jbSource.dbPath, 'latin1')
+  // readSessionFile deliberately returns null for stat/read/size failures. A
+  // durable source must surface that as a failed parse, not a successful empty
+  // decode: success would stamp the new fingerprint and clear needsReparse,
+  // permanently hiding rows added while the DB was unreadable.
+  if (!raw) throw new Error('Copilot JetBrains DB was unreadable or empty')
   // FS probe stays host-side: resolve every candidate dir the decoder could ask for.
   const memo = new Map<string, string | undefined>()
   const repoRootByDir = new Map<string, string>()
@@ -934,6 +937,8 @@ function toProviderCall(rich: CopilotDecodedCall): ParsedProviderCall {
     timestamp: rich.timestamp,
     speed: rich.speed,
     deduplicationKey: rich.deduplicationKey,
+    ...(rich.cacheIdentityKey !== undefined ? { cacheIdentityKey: rich.cacheIdentityKey } : {}),
+    ...(rich.deduplicationAliases !== undefined ? { deduplicationAliases: rich.deduplicationAliases } : {}),
     userMessage: rich.userMessage,
   }
 

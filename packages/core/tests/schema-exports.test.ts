@@ -23,13 +23,13 @@ const pkgRoot = resolve(here, '..')
 const childScript = resolve(here, 'harness/schema-resolve-child.mjs')
 
 describe('schemas exports map', () => {
-  it('resolves a concrete published schema through the exports map and loads it', () => {
+  it.each(['0.2.0', '0.3.0'])('resolves observation-%s through the exports map', (version) => {
     const result = spawnSync(
       process.execPath,
-      [childScript, '@codeburn/core/schemas/observation-0.2.0.json'],
+      [childScript, `@codeburn/core/schemas/observation-${version}.json`],
       { cwd: pkgRoot, encoding: 'utf8' },
     )
     expect(result.status, `status ${result.status}\nstderr:\n${result.stderr}`).toBe(0)
-    expect(result.stdout).toContain('SCHEMA_EXPORT_OK 0.2.0')
+    expect(result.stdout).toContain(`SCHEMA_EXPORT_OK ${version}`)
   })
 })

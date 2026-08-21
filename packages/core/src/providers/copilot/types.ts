@@ -145,5 +145,14 @@ export interface CopilotDecodedCall {
   timestamp: string
   speed: 'standard'
   deduplicationKey: string
+  /**
+   * Stable local identity for durable-cache reconciliation. This may contain an
+   * unkeyed content digest, so hosts may persist it only in their local cache;
+   * it must never be copied into an observation or sync envelope.
+   */
+  cacheIdentityKey?: string
+  /** Prior public key shapes accepted only for local migration/ledger matching.
+   * Hosts may persist them locally, but must never emit them. */
+  deduplicationAliases?: string[]
   userMessage: string
 }

@@ -7,7 +7,7 @@ import { parseAllSessions, clearSessionCache } from '../src/parser.js'
 import { aggregateByPr } from '../src/sessions-report.js'
 import { loadPricing } from '../src/models.js'
 
-// Finding 1: the 5 -> 6 session-cache bump must not make PR-linked sessions whose
+// A session-cache bump must not make PR-linked sessions whose
 // transcript has since expired VANISH. loadCache adopts such expired-source
 // entries from session-cache.v5.json, and the claude scan preserves + surfaces
 // them so the by-PR legacy even-split path is actually reachable.
@@ -49,7 +49,7 @@ function cachedCall(dedup: string, cost: number): Record<string, unknown> {
   }
 }
 
-describe('v5 -> v6 cache adoption of expired PR sessions', () => {
+describe('prior-cache adoption of expired PR sessions', () => {
   it('keeps a PR-linked session whose transcript is gone, as a legacy approx split', async () => {
     await loadPricing()
     // A v5 cache whose one entry points at a transcript that no longer exists.
@@ -193,22 +193,22 @@ function expiredPrEntry(cwd: string, name: string, prUrl: string): Record<string
   }
 }
 
-// The immediately-preceding versioned cache (v6) must also be adopted on the v7
+// The immediately-preceding versioned cache (v7) must also be adopted on the v8
 // bump, or the last build's expired-PR history vanishes (the same bug class that
 // dropped v5 on the 5->6 bump).
-describe('newest-prior cache adoption (v6 then v5)', () => {
-  it('adopts an expired PR entry from a v6-only file into v7 as legacy attribution', async () => {
+describe('newest-prior cache adoption (v7, v6, then v5)', () => {
+  it('adopts an expired PR entry from a v7-only file into v8 as legacy attribution', async () => {
     await loadPricing()
-    const gonePath = join(configDir, 'projects', 'gone6', 'gone6.jsonl')
-    const v6 = {
-      version: 6, complete: true,
-      providers: { claude: { envFingerprint: 'stale-v6', files: { [gonePath]: expiredPrEntry('/gone6', 'gone6', 'https://github.com/o/r/pull/6') } } },
+    const gonePath = join(configDir, 'projects', 'gone7', 'gone7.jsonl')
+    const v7 = {
+      version: 7, complete: true,
+      providers: { claude: { envFingerprint: 'stale-v7', files: { [gonePath]: expiredPrEntry('/gone7', 'gone7', 'https://github.com/o/r/pull/7') } } },
     }
-    await writeFile(join(cacheDir, 'session-cache.v6.json'), JSON.stringify(v6))
+    await writeFile(join(cacheDir, 'session-cache.v7.json'), JSON.stringify(v7))
 
     const range = { start: new Date('2026-07-20T00:00:00Z'), end: new Date('2026-07-20T23:59:59Z') }
     const rows = aggregateByPr(await parseAllSessions(range, 'claude'))
-    const row = rows.find(r => r.url === 'https://github.com/o/r/pull/6')
+    const row = rows.find(r => r.url === 'https://github.com/o/r/pull/7')
     expect(row).toBeDefined()
     expect(row!.approx).toBe(true)
     expect(row!.cost).toBeCloseTo(40, 6)

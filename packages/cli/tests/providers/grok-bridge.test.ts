@@ -81,6 +81,10 @@ describe('grok bridge — fixture parity', () => {
       expect(call.deduplicationKey).toMatch(/^grok:[0-9a-f]{16}:/)
       expect(call.deduplicationKey).not.toContain(SESSION_DIR)
       expect(call.deduplicationKey).not.toContain('grok-parity')
+      expect(call.deduplicationAliases).toEqual([
+        call.deduplicationKey.replace(expectedSourceRef(SESSION_DIR), SESSION_DIR),
+      ])
+      expect(JSON.stringify(call)).not.toContain(SESSION_DIR)
     }
   })
 

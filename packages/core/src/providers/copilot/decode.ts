@@ -1,4 +1,4 @@
-import { createHmac } from 'crypto'
+import { createHash, createHmac } from 'crypto'
 import type { DecodeContext } from '../../contracts.js'
 import type { RecordDiagnostic } from '../../diagnostics.js'
 import type {
@@ -60,6 +60,34 @@ export const copilotToolNameMap: Record<string, string> = {
   deleteFile: 'Delete',
   renameOrMoveFile: 'Edit',
   fetchWebpage: 'Web',
+}
+
+const JETBRAINS_CACHE_IDENTITY_RE = /^(copilot:jb:.+):([0-9a-f]{12}):([1-9]\d*)$/
+
+/**
+ * Local-only identity for a JetBrains turn. It intentionally retains the
+ * legacy unkeyed digest because that value already exists in pre-HMAC caches
+ * and lets a host re-key a DB-pruned turn without having its reply text.
+ */
+export function copilotJetBrainsCacheIdentityKey(
+  conversationId: string,
+  replyText: string,
+  occurrence: number,
+): string {
+  const contentDigest = createHash('sha256').update(replyText).digest('hex').slice(0, 12)
+  return `copilot:jb:${conversationId}:${contentDigest}:${occurrence}`
+}
+
+/** Derive the public, privacy-key-bound key from a local cache identity. */
+export function copilotJetBrainsDeduplicationKey(
+  cacheIdentityKey: string,
+  privacyKey: string,
+): string {
+  if (!privacyKey) throw new Error('privacyKey is required')
+  const match = JETBRAINS_CACHE_IDENTITY_RE.exec(cacheIdentityKey)
+  if (!match) throw new Error('invalid Copilot JetBrains cache identity')
+  const keyedDigest = createHmac('sha256', privacyKey).update(match[2]!).digest('hex').slice(0, 12)
+  return `${match[1]}:${keyedDigest}:${match[3]}`
 }
 
 /**
@@ -1094,38 +1122,44 @@ function decodeJetBrains(envelope: Extract<CopilotRecordEnvelope, { kind: 'jetbr
 
   const storeModel = inferJetBrainsModel(raw)
   const turns = extractJetBrainsDbTurns(raw, envelope.repoRootByDir)
-  // Dedup keys derive from the reply CONTENT, not the scan position:
-  // copilot is a durable provider (cached turns are never deleted and a
-  // re-parse appends any key it hasn't seen), while MVStore compaction
-  // can rewrite the file with blobs in a different byte order. With
-  // positional keys, a rewrite that puts a new blob ahead of an old one
-  // hands the new turn the old turn's key (skipped as seen) and re-emits
-  // the old turn under a fresh index — double-billing it. The per-hash
-  // counter keeps genuinely repeated replies and errored turns (which
-  // share replyText '') distinct within a conversation.
+  // Identities derive from reply CONTENT, not scan position. MVStore compaction
+  // can rewrite blobs in a different byte order; positional keys would then
+  // hand a new turn an old identity and move the old turn to a fresh one. The
+  // durable host reconciles matching identities/aliases, replaces current
+  // records, and retains DB-pruned records. The per-content counter keeps
+  // genuinely repeated replies and errored turns (replyText '') distinct within
+  // one conversation.
   const perContentIndex = new Map<string, number>()
   for (const turn of turns) {
     // One .db holds many chat tabs; group each turn under its own
     // conversation so the user sees one session per tab, not per file.
     const convId = turn.conversationId || sessionId
-    // The content digest is KEYED with the host's privacy key (D1), never a
-    // bare sha256: this dedup key is derived from assistant reply TEXT and
-    // crosses into the emitted envelope (observations.dedupKey) and the CLI
-    // ledger, so an unkeyed 12-hex digest of short replies ("OK", "Done.")
-    // would be dictionary-attackable. HMAC keeps the dedup key deterministic
-    // across re-parses (which is what the durable-store dedup needs) while
-    // binding it to the host's key.
+    // Keep two identities with deliberately different trust boundaries:
+    //
+    //  - cacheIdentityKey is the legacy content-derived key. It stays local and
+    //    lets the durable cache recognize/re-key a turn after its DB row has
+    //    been pruned (the reply text is then no longer available).
+    //  - dedupKey HMACs that stable digest with the host privacy key. Only this
+    //    key crosses into observations and sync, so short replies are not
+    //    dictionary-attackable outside the host.
     //
     // The CLI's bridged rich-decode path threads the real host privacy key
     // (bridge.ts -> getHostPrivacyKey()), so the digest is keyed on every
     // path; the key is per-install stable, so the dedup key stays stable
     // across re-parses, which is what the durable copilot store needs.
-    const contentHash = createHmac('sha256', privacyKey).update(turn.replyText).digest('hex').slice(0, 12)
-    const nth = (perContentIndex.get(`${convId}:${contentHash}`) ?? 0) + 1
-    perContentIndex.set(`${convId}:${contentHash}`, nth)
-    const dedupKey = `copilot:jb:${convId}:${contentHash}:${nth}`
+    const contentDigest = createHash('sha256').update(turn.replyText).digest('hex').slice(0, 12)
+    const nth = (perContentIndex.get(`${convId}:${contentDigest}`) ?? 0) + 1
+    perContentIndex.set(`${convId}:${contentDigest}`, nth)
+    const cacheIdentityKey = copilotJetBrainsCacheIdentityKey(convId, turn.replyText, nth)
+    const dedupKey = copilotJetBrainsDeduplicationKey(cacheIdentityKey, privacyKey)
     if (seen.has(dedupKey)) continue
     seen.add(dedupKey)
+
+    // #1074 briefly shipped HMAC(replyText) on the integration branch. Expose
+    // that shape as a local-only alias so the CLI can replace a present cached
+    // record in place and preserve sent-ledger continuity.
+    const v1ContentHash = createHmac('sha256', privacyKey).update(turn.replyText).digest('hex').slice(0, 12)
+    const v1DedupKey = `copilot:jb:${convId}:${v1ContentHash}:${nth}`
 
     // Prefer the per-turn model, else the store default, else a generic
     // Copilot bucket so a real reply is never mis-priced as free.
@@ -1159,6 +1193,8 @@ function decodeJetBrains(envelope: Extract<CopilotRecordEnvelope, { kind: 'jetbr
       timestamp: mtime,
       speed: 'standard',
       deduplicationKey: dedupKey,
+      cacheIdentityKey,
+      deduplicationAliases: [cacheIdentityKey, v1DedupKey],
       // Surface the chat-thread name here (it is the session's label, not
       // a project) so it remains visible in session-level views.
       userMessage: turn.conversationTitle,

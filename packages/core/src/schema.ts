@@ -4,25 +4,13 @@ import { z } from 'zod'
  * ObservationEnvelope schema version. 0.x per decision D8: the observation
  * contract is pre-stability, so consumers must treat minor bumps as breaking.
  *
- * 0.2.0 adds the optional per-call `resourceReads` / `resourceEdits` arrays
- * (ResourceRef). Strictness rules are unchanged: every added field is either a
- * fingerprint or a coarse enum, so the anti-smuggling property still holds.
- *
- * MIGRATION NOTE (in-place hardening, not a version bump): during 0.2.0's
- * lifetime the `model` / `pricingModel` validation was tightened in place from
- * `minLength: 1` to the ModelIdentifier bound (maxLength 128 + identifier
- * charset), and the published schemas/observation-0.2.0.json changed in lock-
- * step. The envelope shape is unchanged — producers always normalize through
- * `normalizeModelIdentifier` now, so no newly produced envelope can be
- * rejected. The one hazard is ARCHIVED envelopes: a pre-hardening 0.2.0
- * envelope whose model held a display name (e.g. "Gemini 3.5 Flash (High)")
- * now fails validation against the same version string. Such archives must be
- * re-normalized (collapse the model to 'unknown' or an identifier) before
- * re-validating. A version bump was considered and rejected: 0.x is already
- * breaking-by-default, no field changed shape, and a new version would force
- * consumers to carry a second schema for a validation tightening alone.
+ * 0.2.0 added the optional per-call `resourceReads` / `resourceEdits` arrays.
+ * 0.3.0 bounds `model` / `pricingModel` to the ModelIdentifier charset and 128
+ * characters. That validation tightening is intentionally a new wire version:
+ * the published 0.2.0 artifact remains frozen, so archived 0.2.0 envelopes keep
+ * validating against the exact contract under which they were emitted.
  */
-export const OBSERVATION_SCHEMA_VERSION = '0.2.0'
+export const OBSERVATION_SCHEMA_VERSION = '0.3.0'
 
 /**
  * A privacy-preserving fingerprint: the first 16 hex chars of an HMAC-SHA256.

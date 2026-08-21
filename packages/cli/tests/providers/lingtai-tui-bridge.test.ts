@@ -143,6 +143,10 @@ describe('lingtai-tui bridge — fixture parity', () => {
       expect(call.deduplicationKey).toMatch(/^lingtai-tui:[0-9a-f]{16}:/)
       expect(call.deduplicationKey).not.toContain(source.path)
       expect(call.deduplicationKey).not.toContain('lingtai-parity')
+      expect(call.deduplicationAliases).toEqual([
+        call.deduplicationKey.replace(expectedSourceRef(source.path), source.path),
+      ])
+      expect(JSON.stringify(call)).not.toContain(source.path)
     }
   })
 

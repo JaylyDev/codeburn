@@ -1,4 +1,4 @@
-import type { DecodeContext } from '@codeburn/core'
+import { sourceRefFingerprint, type DecodeContext } from '@codeburn/core'
 
 import { getHostPrivacyKey } from '../privacy-key.js'
 import type { Provider, ProbeRoot, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
@@ -45,8 +45,9 @@ export interface BridgedProviderSpec<TRich> {
 
   // I/O adapter (CLI-side): read one discovered source into the raw records the
   // core decoder consumes (e.g. the JSONL lines of a file). Return `null` to
-  // skip the source entirely (unreadable / oversized / empty) so a transient
-  // read failure yields nothing rather than an empty-but-cached result.
+  // skip the source entirely (unreadable / oversized / empty) so a provider can
+  // decide whether that is a legitimate absent arm. A durable provider that
+  // must retry read failures should throw in its own adapter (Copilot does).
   readRecords: (source: SessionSource) => Promise<unknown[] | null>
 
   // Pure core decode: records -> rich cost-free calls, threading the host's
@@ -57,6 +58,15 @@ export interface BridgedProviderSpec<TRich> {
   // where cost re-enters (via `costBasis: 'estimated'` + the parser.ts pricing
   // pass) and where CLI-only concerns (bash base-name extraction) are applied.
   toProviderCall: (rich: TRich) => ParsedProviderCall
+
+  // #1074 replaced a raw source path inside several public dedup keys with its
+  // keyed fingerprint. The sync ledger still contains the old public keys for
+  // up to seven days, so those calls need a host-only compatibility alias or
+  // they are uploaded again under the new key. Set this only for providers
+  // whose key has one `:<sourceRefFingerprint>:` component. The bridge derives
+  // the exact legacy key locally and keeps it non-enumerable; parser caching
+  // persists it deliberately, but observations and OTLP payloads never do.
+  legacyDeduplicationSourceRef?: (source: SessionSource) => string
 }
 
 /**
@@ -101,15 +111,37 @@ export function createBridgedProvider<TRich>(spec: BridgedProviderSpec<TRich>): 
           // can persist: the cache lives in ~/.cache/codeburn (or
           // CODEBURN_CACHE_DIR), a different directory, separately overridable.
           // A writable cache plus an unreadable key file therefore means a new
-          // key every process. computeEnvFingerprint is what stops that from
-          // inflating totals: it folds a digest of the key into the fingerprint
-          // for every provider in KEY_DERIVED_PROVIDERS, so a rotated, lost, or
-          // per-process key rebuilds the section instead of re-ingesting the
-          // same records under keys the cache has never seen.
+          // key every process. computeEnvFingerprint folds a digest of the key
+          // into every KEY_DERIVED_PROVIDERS fingerprint. Ordinary providers
+          // reparse cleanly; durable Copilot calls are re-keyed from a local
+          // stable identity and reconciled so cached-only history survives.
           const context: DecodeContext = { privacyKey: getHostPrivacyKey(), providerId: spec.name, sourceRef: source.path }
           const { calls } = spec.decode({ records, context, seenKeys })
           for (const rich of calls) {
-            yield spec.toProviderCall(rich)
+            const call = spec.toProviderCall(rich)
+            const legacySourceRef = spec.legacyDeduplicationSourceRef?.(source)
+            if (legacySourceRef !== undefined) {
+              const currentSourceRef = sourceRefFingerprint(context.privacyKey, legacySourceRef)
+              const marker = `:${currentSourceRef}:`
+              const markerIndex = call.deduplicationKey.indexOf(marker)
+              if (markerIndex < 0) {
+                throw new Error(`${spec.name} dedup key does not contain its configured source fingerprint`)
+              }
+              const legacyKey = [
+                call.deduplicationKey.slice(0, markerIndex + 1),
+                legacySourceRef,
+                call.deduplicationKey.slice(markerIndex + marker.length - 1),
+              ].join('')
+              const aliases = new Set(call.deduplicationAliases ?? [])
+              aliases.add(legacyKey)
+              Object.defineProperty(call, 'deduplicationAliases', {
+                value: [...aliases],
+                configurable: true,
+                writable: true,
+                enumerable: false,
+              })
+            }
+            yield call
           }
         },
       }

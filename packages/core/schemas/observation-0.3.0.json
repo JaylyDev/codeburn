@@ -6,7 +6,7 @@
       "properties": {
         "schemaVersion": {
           "type": "string",
-          "const": "0.2.0"
+          "const": "0.3.0"
         },
         "generator": {
           "type": "object",
@@ -69,11 +69,15 @@
                     },
                     "model": {
                       "type": "string",
-                      "minLength": 1
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[A-Za-z0-9._:/@-]+$"
                     },
                     "pricingModel": {
                       "type": "string",
-                      "minLength": 1
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[A-Za-z0-9._:/@-]+$"
                     },
                     "tokens": {
                       "type": "object",

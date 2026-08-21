@@ -60,7 +60,7 @@ function session(label: string, calls: CallObservation[]): SessionObservation {
 
 function envelope(sessions: SessionObservation[]): ObservationEnvelope {
   return {
-    schemaVersion: '0.2.0',
+    schemaVersion: '0.3.0',
     generator: { name: '@codeburn/core', version: '0.0.0-test' },
     sessions,
   }

@@ -4,6 +4,8 @@ import { createHash, randomBytes } from 'crypto'
 import { join } from 'path'
 import { homedir } from 'os'
 
+import { copilotJetBrainsDeduplicationKey } from '@codeburn/core/providers/copilot'
+
 import { getHostPrivacyKey } from './privacy-key.js'
 import type { ToolCall } from './types.js'
 
@@ -35,6 +37,12 @@ export type CachedCall = {
   skills: string[]
   subagentTypes: string[]
   deduplicationKey: string
+  // Local-only stable identity for a durable record whose public dedup key can
+  // rotate. It is never surfaced by cachedCallToApiCall or sync.
+  cacheIdentityKey?: string
+  // Former public key shapes retained locally so sync's sent-ledger recognizes
+  // a call after cache migration. Never emitted in OTLP or report JSON.
+  deduplicationAliases?: string[]
   project?: string
   projectPath?: string
   workingDirectory?: string
@@ -98,6 +106,9 @@ export type CachedFile = {
   // is re-parsed only when the file changes (fingerprint differs). Carries no
   // turns, so it contributes no usage. (issue #441 follow-up)
   failed?: boolean
+  // A durable entry survived a failed forced re-parse. Its turns remain valid,
+  // but the source must be retried even when the file fingerprint is unchanged.
+  needsReparse?: boolean
   // Rich-session-capture, Claude session-level (capture-only; no report yet).
   // `title` is the LAST `ai-title` entry's text; `prLinks` accumulates every
   // `pr-link` entry's URL. `isSidechain` is true when any entry is a sidechain:
@@ -152,10 +163,13 @@ export type SessionCache = {
 // v7: sidechain->parent linkage - per-turn `spawnToolUseIds`, per-file
 // `parentSessionId` / `agentSpawnLinks` - so subagent spend folds into the parent
 // turn's PR set. v6 never shipped, so users cross v5->v7 in a single combined bump.
+// v8: durable Copilot calls gain a local cache identity that can be re-keyed
+// without reply text. A distinct file prevents a released v0.9.20 process (v7)
+// from accepting and then rewriting the new cache without that identity.
 // INVARIANT: a version bump must extend `PRIOR_CACHE_VERSIONS` (the adoption path
 // below) to EVERY prior version that can still exist on disk, or expired-PR
 // history from the immediately preceding build silently vanishes.
-export const CACHE_VERSION = 7
+export const CACHE_VERSION = 8
 
 // The cache filename is version-suffixed so different binaries (e.g. an old
 // launchd menubar on a prior release and a newer desktop app) each own a
@@ -177,16 +191,12 @@ const TEMP_FILE_MAX_AGE_MS = 5 * 60 * 1000
 // (opencode.ts:151, kilo-code.ts:94) only changes logging verbosity, never
 // parsed output.
 //
-// Copilot is deliberately NOT declared here. Declaring any CODEBURN_COPILOT_*
-// var would change its fingerprint, and on a fingerprint change
-// getOrCreateProviderSection (src/parser.ts:1270) keeps only the cached
-// entries whose source path no longer exists — but copilot's OTel discovery
-// returns one source per DB file ({ path: dbPath }, src/providers/copilot.ts:431)
-// and that DB keeps existing, so its cached entry would be dropped and
-// re-parsed, destroying conversations Copilot has since pruned from the DB
-// that only the cache still holds (see DURABLE_PROVIDER_NAMES below). Do not
-// "complete" the map for copilot until the durable carry-forward learns to
-// merge instead of drop.
+// Copilot is deliberately NOT declared here. Its sources are durable, so a
+// discovery-root switch cannot use the generic "invalidate and union" rule:
+// that would combine the old root/account history with the new one. It needs a
+// provider-specific source-namespace decision before those overrides can move
+// the fingerprint. Parse-version and privacy-key changes are safe because the
+// durable migration below preserves and reconciles the same source namespace.
 export const PROVIDER_ENV_VARS: Record<string, string[]> = {
   claude: ['CLAUDE_CONFIG_DIRS', 'CLAUDE_CONFIG_DIR', 'CODEBURN_DESKTOP_SESSIONS_DIR', 'APPDATA', 'LOCALAPPDATA'],
   codebuff: ['CODEBUFF_DATA_DIR'],
@@ -233,24 +243,23 @@ export const DURABLE_PROVIDER_NAMES: ReadonlySet<string> = new Set(['copilot'])
 // `-est-cost` suffix (or a new entry) so their already-cached sessions reparse
 // once and the flag lands, instead of silently reading as measured. Copilot
 // needs no suffix: the cli-shutdown-cost-v1 bump below already forces its one
-// re-parse, which lands the flag too, and durable orphans now survive
-// fingerprint changes (the carry-forward in getOrCreateProviderSection).
+// re-parse, which lands the flag too.
 // Dedup-key hygiene (#933/#935): six providers now thread a FINGERPRINT of the
 // source path into their dedup keys instead of the raw path, and copilot's
 // JetBrains per-turn digest went from an unkeyed sha256 to a keyed HMAC. The
 // session cache seeds its dedup sets from the CACHED keys, so a pre-fix cache
 // keeps the old-shape keys and the same records re-ingest under the new shape
 // (double-count; and for the six, the raw path stays on disk forever). Each
-// entry/suffix below changes the provider's env fingerprint, which forces the
-// one-time re-parse that drops the old-shape keys.
+// entry/suffix below changes the provider's env fingerprint and forces a
+// one-time re-parse. Copilot is special: its durable cache is migrated in place
+// so DB-pruned history survives while present records reconcile under new keys.
 //
 // A parse version cannot see the OTHER input those keys depend on: the random
 // per-install privacy key. Rotate it, lose the file, or land on the ephemeral
-// fallback and the freshly derived keys stop matching the cached ones, so every
-// record re-ingests as new — silently, and for copilot (the sole durable
-// provider, whose union-merge never deletes) permanently. Every provider whose
-// dedup keys are derived from that key is listed HERE, explicitly, and
-// computeEnvFingerprint folds a digest of the key in for exactly this set.
+// fallback and freshly derived keys stop matching cached public keys. Every
+// provider whose dedup keys are derived from that key is listed HERE so the
+// transition cannot pass unnoticed: ordinary providers re-parse cleanly, while
+// Copilot re-keys and reconciles its durable history in place.
 //
 // Listed explicitly rather than sniffed out of the parse-version string: the
 // first version of this used `parseVersion.includes('source-ref-fingerprint-v1')`
@@ -288,14 +297,17 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   codex: 'mcp-attribution-v2-est-cost-rich-capture-v1-cross-provider-pr-v1',
   cursor: 'composer-anchored-crediting-v1-est-cost',
   'cursor-agent': 'workspaceless-transcript-v1',
-  copilot: 'cli-shutdown-cost-v1-skills-dedup-key-hmac-v1',
-  codebuff: 'source-ref-fingerprint-v1',
-  zerostack: 'source-ref-fingerprint-v1',
-  pi: 'source-ref-fingerprint-v1',
-  omp: 'source-ref-fingerprint-v1',
-  grok: 'estimated-cost-v1-source-ref-fingerprint-v1',
+  copilot: 'cli-shutdown-cost-v1-skills-dedup-key-hmac-v2',
+  // ledger-alias-v1 forces one follow-up parse for caches already written by
+  // #1074: their public keys are correct, but they predate the local legacy-key
+  // alias needed to keep sync's sent ledger idempotent across the transition.
+  codebuff: 'source-ref-fingerprint-v1-ledger-alias-v1',
+  zerostack: 'source-ref-fingerprint-v1-ledger-alias-v1',
+  pi: 'source-ref-fingerprint-v1-ledger-alias-v1',
+  omp: 'source-ref-fingerprint-v1-ledger-alias-v1',
+  grok: 'estimated-cost-v1-source-ref-fingerprint-v1-ledger-alias-v1',
   hermes: 'reasoning-output-accounting-v1-est-cost',
-  'lingtai-tui': 'token-ledger-registry-activity-v3-source-ref-fingerprint-v1',
+  'lingtai-tui': 'token-ledger-registry-activity-v3-source-ref-fingerprint-v1-ledger-alias-v1',
   'ibm-bob': 'worktree-project-grouping-v1',
   // v2: chat-file input tokens now estimate from the FULL prompt (sum of every
   // human turn), not the last 500-char slice — so costUSD changed for chat-arm
@@ -347,6 +359,53 @@ export function computeEnvFingerprint(provider: string): string {
     parts.push(`privacy-key=${createHash('sha256').update(getHostPrivacyKey()).digest('hex').slice(0, 16)}`)
   }
   return createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 16)
+}
+
+const COPILOT_JETBRAINS_KEY_RE = /^copilot:jb:.+:[0-9a-f]{12}:[1-9]\d*$/
+const COPILOT_INTERIM_HMAC_V1_PARSE_VERSION = 'cli-shutdown-cost-v1-skills-dedup-key-hmac-v1'
+
+function copilotInterimHmacV1Fingerprint(): string {
+  const keyDigest = createHash('sha256').update(getHostPrivacyKey()).digest('hex').slice(0, 16)
+  return createHash('sha256')
+    .update(`parser=${COPILOT_INTERIM_HMAC_V1_PARSE_VERSION}\0privacy-key=${keyDigest}`)
+    .digest('hex')
+    .slice(0, 16)
+}
+
+/**
+ * Re-key every durable JetBrains cache record from its stable local identity.
+ *
+ * Caches written before this field existed used the legacy SHA-based public key
+ * as that identity, so absence of cacheIdentityKey is the format marker. This
+ * deliberately does not inspect envFingerprint: released builds used more than
+ * one pre-HMAC parse version, while #1074's short-lived integration build used
+ * the same key syntax with an HMAC. Present #1074 records are corrected through
+ * decoder aliases during the re-parse; already-pruned ones remain consistently
+ * re-keyable from the locally preserved value.
+ */
+export function rekeyCopilotDurableCache(files: Record<string, CachedFile>): void {
+  const privacyKey = getHostPrivacyKey()
+  for (const file of Object.values(files)) {
+    for (const turn of file.turns) {
+      for (const call of turn.calls) {
+        if (call.provider !== 'copilot' || !COPILOT_JETBRAINS_KEY_RE.test(call.deduplicationKey)) continue
+        const cacheIdentityKey = call.cacheIdentityKey ?? call.deduplicationKey
+        try {
+          const deduplicationKey = copilotJetBrainsDeduplicationKey(cacheIdentityKey, privacyKey)
+          const aliases = new Set(call.deduplicationAliases ?? [])
+          aliases.add(call.deduplicationKey)
+          aliases.delete(deduplicationKey)
+          call.cacheIdentityKey = cacheIdentityKey
+          call.deduplicationKey = deduplicationKey
+          call.deduplicationAliases = [...aliases]
+        } catch {
+          // A malformed optional identity must not invalidate the whole durable
+          // cache. Keep its existing public key and let a present source repair
+          // the record through the normal parse/alias reconciliation path.
+        }
+      }
+    }
+  }
 }
 
 // ── Load / Save ────────────────────────────────────────────────────────
@@ -423,6 +482,8 @@ function validateCall(c: unknown): c is CachedCall {
   return typeof o['provider'] === 'string'
     && typeof o['model'] === 'string'
     && typeof o['deduplicationKey'] === 'string'
+    && isOptionalString(o['cacheIdentityKey'])
+    && (o['deduplicationAliases'] === undefined || isStringArray(o['deduplicationAliases']))
     && typeof o['timestamp'] === 'string'
     && (o['speed'] === 'standard' || o['speed'] === 'fast')
     && isOptionalNum(o['costUSD'])
@@ -471,6 +532,7 @@ function validateCachedFile(f: unknown): f is CachedFile {
     && isOptionalBool(o['isSidechain'])
     && isOptionalString(o['agentType'])
     && isOptionalBool(o['failed'])
+    && isOptionalBool(o['needsReparse'])
     && isOptionalString(o['parentSessionId'])
     && isOptionalStringRecord(o['agentSpawnLinks'])
     && (o['ambiguousSpawnAgentIds'] === undefined || isStringArray(o['ambiguousSpawnAgentIds']))
@@ -494,15 +556,13 @@ function validateCache(raw: unknown): raw is SessionCache {
   return Object.values(o['providers'] as Record<string, unknown>).every(validateProviderSection)
 }
 
-// Every prior versioned cache file that can still exist on disk from a shipped or
-// dev build, NEWEST first. On a bump we adopt the newest one present: its
-// expired-source PR orphans (transcripts since deleted) hold attributable spend
-// that can never be re-parsed, and each newer version already carried the older
-// versions' orphans forward, so the newest is a superset. INVARIANT: a
-// CACHE_VERSION bump MUST extend this list to every prior version that can still
-// exist on disk, or that history silently vanishes. (v5 was missed on the 5->6
-// bump; v6 on the 6->7 bump; both are listed here.)
-const PRIOR_CACHE_VERSIONS = [6, 5] as const
+// Every prior versioned cache file that can still exist on disk from a shipped
+// or dev build, NEWEST first. Adoption reads all of them oldest-to-newest: a
+// newer partial cache is not guaranteed to contain older-only orphans or DB rows
+// that were later pruned. INVARIANT: a CACHE_VERSION bump MUST extend this list
+// to every prior version that can still exist on disk, or that history silently
+// vanishes. (v5 was missed on the 5->6 bump; v6 on the 6->7 bump.)
+const PRIOR_CACHE_VERSIONS = [7, 6, 5] as const
 
 function priorCacheFile(version: number): string {
   return `session-cache.v${version}.json`
@@ -518,14 +578,12 @@ function isCacheEnvelope(raw: unknown, version: number): raw is { version: numbe
     && !!o['providers'] && typeof o['providers'] === 'object' && !Array.isArray(o['providers'])
 }
 
-// One-time migration on a version bump: carry forward exactly the prior-version
-// entries whose source no longer exists AND that carry prLinks (they can never
-// re-parse, but they hold attributable PR spend); present sources are dropped so
-// they re-parse fresh under the new version and gain the new fields. Each file is
-// validated individually, so a single corrupt entry is skipped rather than
-// discarding the whole cache. Each carried section takes the CURRENT
-// envFingerprint so the scan reuses it and appends the freshly-parsed present
-// sources. The daily cache (durable cost history) is not touched.
+// Adopt a specific prior-version cache. Ordinary providers carry only expired
+// PR-linked sources, because those are irreplaceable while present sources can
+// re-parse under the new schema. Copilot is different: a still-existing DB may
+// already have pruned individual rows, so every valid durable file is carried
+// and reconciled. Each file is validated independently, so one corrupt entry
+// cannot invalidate its siblings. The daily cache is not touched.
 async function adoptPriorCache(version: number): Promise<SessionCache | null> {
   try {
     const raw = await readFile(join(getCacheDir(), priorCacheFile(version)), 'utf-8')
@@ -536,16 +594,26 @@ async function adoptPriorCache(version: number): Promise<SessionCache | null> {
       if (!section || typeof section !== 'object') continue
       const rawFiles = (section as Record<string, unknown>)['files']
       const files: Record<string, CachedFile> = {}
+      const durableCopilot = provider === 'copilot'
       if (rawFiles && typeof rawFiles === 'object' && !Array.isArray(rawFiles)) {
         for (const [path, file] of Object.entries(rawFiles as Record<string, unknown>)) {
           if (!validateCachedFile(file)) continue
-          if (!existsSync(path) && file.prLinks?.length) files[path] = file
+          // Copilot's DB path can still exist after individual conversations
+          // have been pruned. Its v7 entry is then the only remaining copy, so
+          // unlike ordinary version adoption every valid durable file must move
+          // into v8 and be reconciled on the first parse.
+          if (durableCopilot || (!existsSync(path) && file.prLinks?.length)) files[path] = file
         }
       }
+      const previousEnvFingerprint = (section as Record<string, unknown>)['envFingerprint']
       migrated.providers[provider] = {
-        envFingerprint: computeEnvFingerprint(provider),
+        // Preserve Copilot's old fingerprint so getOrCreateProviderSection sees
+        // a transition, re-keys the adopted calls, and force-reparses present DBs.
+        envFingerprint: durableCopilot
+          ? (typeof previousEnvFingerprint === 'string' ? previousEnvFingerprint : `adopted-v${version}`)
+          : computeEnvFingerprint(provider),
         files,
-        ...((section as Record<string, unknown>)['durable'] ? { durable: true } : {}),
+        ...(durableCopilot || (section as Record<string, unknown>)['durable'] ? { durable: true } : {}),
       }
     }
     return migrated
@@ -554,12 +622,19 @@ async function adoptPriorCache(version: number): Promise<SessionCache | null> {
   }
 }
 
-// Adopt EVERY prior versioned cache present on disk, migrating OLDEST first and
-// merging per source path so a newer version wins per entry. Returning the newest
-// alone would be wrong: a sparse or partial newer file (e.g. v6 holding only some
-// orphans) would mask older-only orphans that still hold attributable spend. Newer
-// entries overwrite older ones for the same path; entries unique to an older
-// version survive.
+function mergeAdoptedCopilotFile(older: CachedFile, newer: CachedFile): CachedFile {
+  const newerKeys = new Set(newer.turns.flatMap(turn => turn.calls.map(call => call.deduplicationKey)))
+  const olderOnlyTurns = older.turns.filter(turn =>
+    turn.calls.every(call => !newerKeys.has(call.deduplicationKey)),
+  )
+  return { ...newer, turns: [...newer.turns, ...olderOnlyTurns] }
+}
+
+// Adopt EVERY prior versioned cache present on disk, migrating OLDEST first.
+// Returning the newest alone would be wrong: a sparse or partial newer file can
+// mask older-only history. Ordinary providers let the newer entry win per path;
+// durable Copilot instead unions calls at the same DB path because pruning can
+// make the newer entry a strict subset of the older one.
 async function adoptNewestPriorCache(): Promise<SessionCache | null> {
   const oldestFirst = [...PRIOR_CACHE_VERSIONS].sort((a, b) => a - b)
   let merged: SessionCache | null = null
@@ -570,8 +645,33 @@ async function adoptNewestPriorCache(): Promise<SessionCache | null> {
     for (const [provider, section] of Object.entries(adopted.providers)) {
       const existing = merged.providers[provider]
       if (!existing) { merged.providers[provider] = section; continue }
-      // Newer version's entries overwrite older ones for the same source path.
-      Object.assign(existing.files, section.files)
+      if (provider === 'copilot') {
+        const interimHmacV1 = section.envFingerprint === copilotInterimHmacV1Fingerprint()
+        // A newer released cache can be sparse at the same still-existing DB
+        // path after older rows were pruned, so it is normally unioned with the
+        // older durable entry. The unreleased HMAC-v1 exception below instead
+        // keeps the released entry for an overlapping path because its cached-
+        // only rows are cryptographically uncorrelatable across the two formats.
+        for (const [path, newerFile] of Object.entries(section.files)) {
+          const olderFile = existing.files[path]
+          if (!olderFile) {
+            existing.files[path] = newerFile
+          } else if (!interimHmacV1) {
+            existing.files[path] = mergeAdoptedCopilotFile(olderFile, newerFile)
+          }
+          // #1074's unreleased v7 HMAC(replyText) keys cannot be correlated with
+          // the same cached-only v5 SHA(replyText) records after the reply leaves
+          // the DB. For an overlapping path under that exact same-key dev
+          // fingerprint, keep the released cache authoritative and force-parse
+          // the current DB. This avoids deterministic double-counting; v7-only
+          // paths still survive. A key-rotated interim cache is intentionally not
+          // guessed from an opaque fingerprint.
+        }
+        existing.envFingerprint = section.envFingerprint
+      } else {
+        // Newer version's entries overwrite older ones for the same source path.
+        Object.assign(existing.files, section.files)
+      }
       if (section.durable) existing.durable = true
     }
   }
@@ -589,10 +689,9 @@ export async function loadCache(): Promise<SessionCache> {
   }
 }
 
-// The current versioned file is absent/unreadable. Prefer adopting the newest
-// prior versioned file's expired-source PR orphans (v6 before v5); failing that,
-// fall back to the legacy unversioned file. Either way the versioned file is
-// minted on the next save.
+// The current versioned file is absent/unreadable. Union every supported prior
+// cache oldest-to-newest (v5, v6, v7), then fall back to the legacy unversioned
+// file if none exists. The v8 file is minted on the next save.
 async function afterMissingVersionedCache(): Promise<SessionCache> {
   const prior = await adoptNewestPriorCache()
   if (prior) return prior

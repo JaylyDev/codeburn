@@ -177,12 +177,11 @@ describe('decodeCopilot — jetbrains arm', () => {
   })
 
   it('keys the per-turn content digest with the privacy key: same input, different keys => different dedup key', () => {
-    // The JetBrains dedup key embeds a digest of the assistant REPLY TEXT and
-    // ships on the observation envelope. An unkeyed sha256 of a short reply
-    // ("OK", "Done.") is dictionary-attackable, so the digest is an HMAC under
-    // the host privacy key. This test is the mutation gate: swap createHmac
-    // back to createHash in decode.ts and the two keys below become equal (and
-    // equal to the bare sha256 pinned at the end), so it fails.
+    // The public JetBrains key HMACs a stable local digest of the assistant
+    // reply and ships on the observation envelope. The unkeyed local digest is
+    // dictionary-attackable for short replies, so it must never be the emitted
+    // value. This test pins both halves: stable local identity across rotations,
+    // different public keys under different host keys.
     const raw = jetBrainsRaw('Ask reply', 'Hello World')
     const envelope = (): CopilotRecordEnvelope => ({
       kind: 'jetbrains',
@@ -191,28 +190,32 @@ describe('decodeCopilot — jetbrains arm', () => {
       raw,
       repoRootByDir: new Map(),
     })
-    const keyFor = (privacyKey: string): string => {
+    const callFor = (privacyKey: string) => {
       const { calls } = decodeCopilot({
         records: [envelope()],
         context: { privacyKey, providerId: 'copilot', sourceRef: 'ref' },
         seenKeys: new Set<string>(),
       })
       expect(calls).toHaveLength(1) // non-vacuous: a decode that emits nothing proves nothing
-      return calls[0]!.deduplicationKey
+      return calls[0]!
     }
 
-    expect(() => keyFor('')).toThrow(/privacyKey is required/) // never a degenerate key
+    expect(() => callFor('')).toThrow(/privacyKey is required/) // never a degenerate key
 
-    const keyA = keyFor('privacy-key-A')
-    const keyB = keyFor('privacy-key-B')
+    const callA = callFor('privacy-key-A')
+    const callB = callFor('privacy-key-B')
+    const keyA = callA.deduplicationKey
+    const keyB = callB.deduplicationKey
 
     expect(keyA).not.toBe(keyB)
-    expect(keyA).toBe(keyFor('privacy-key-A')) // deterministic under one key
+    expect(keyA).toBe(callFor('privacy-key-A').deduplicationKey) // deterministic under one key
     expect(keyA).toMatch(/^copilot:jb:[^:]+:[0-9a-f]{12}:1$/)
 
-    // Direct anti-createHash pin: the digest component must NOT be the unkeyed
-    // sha256 of the reply text.
+    // The cache identity is stable across rotations and exactly preserves the
+    // released SHA-based key locally, while the public key never exposes it.
     const unkeyed = createHash('sha256').update('Ask reply').digest('hex').slice(0, 12)
+    expect(callA.cacheIdentityKey).toBe(`copilot:jb:11111111-1111-1111-1111-111111111111:${unkeyed}:1`)
+    expect(callB.cacheIdentityKey).toBe(callA.cacheIdentityKey)
     expect(keyA).not.toContain(unkeyed)
     expect(keyB).not.toContain(unkeyed)
   })

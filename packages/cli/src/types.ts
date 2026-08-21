@@ -50,6 +50,9 @@ export type ParsedApiCall = {
   timestamp: string
   bashCommands: string[]
   deduplicationKey: string
+  /// Local, non-enumerable prior public keys used only to preserve sync-ledger
+  /// idempotency across a dedup-key migration. Never serialized or sent.
+  localDeduplicationAliases?: string[]
   cacheCreationOneHourTokens?: number
   toolSequence?: ToolCall[][]
   /// Claude Code: `tool_use` ids of the `Agent`/`Task` subagent-spawn blocks in

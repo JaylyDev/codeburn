@@ -312,6 +312,7 @@ export function createLingTaiTuiProvider(options?: string | LingTaiProviderOptio
     },
 
     decode,
+    legacyDeduplicationSourceRef: source => source.path,
     toProviderCall,
   })
 }
