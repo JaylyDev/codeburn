@@ -17,15 +17,34 @@
 // far worse hole than the goldens are worth.
 import { createHmac } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
+import { basename, join } from 'node:path'
 
 import { normalizePath } from '@codeburn/core'
 
 /** The pinned key every digest literal in the goldens is derived under. */
 export const FIXED_PRIVACY_KEY = 'c0de6b12'.repeat(8)
 
-const configDir = join(homedir(), '.config', 'codeburn')
+// This module OVERWRITES <home>/.config/codeburn/privacy-key. That is harmless
+// against the throwaway sandbox env-isolation.ts mints, and destructive against
+// a real one: silently replacing a developer's key re-keys every resource
+// fingerprint and orphans everything already synced — the exact failure
+// privacy-key.ts refuses to cause on its own (it never overwrites a key file).
+// So refuse unless HOME really is that sandbox. Its shape is the check: a
+// mkdtemp dir under tmpdir() named `codeburn-test-env-*`. Run outside vitest —
+// tsx, a stray node -e, a REPL — and this throws instead of eating the key.
+const home = homedir()
+if (!home.startsWith(tmpdir()) || !basename(home).startsWith('codeburn-test-env-')) {
+  throw new Error(
+    `fixed-privacy-key.ts refuses to write into HOME=${home}: it overwrites ` +
+    `<home>/.config/codeburn/privacy-key, and that is only safe against the ` +
+    `throwaway sandbox tests/setup/env-isolation.ts mints (a ` +
+    `codeburn-test-env-* dir under ${tmpdir()}). Import it only from a vitest ` +
+    `test run under that setup file.`,
+  )
+}
+
+const configDir = join(home, '.config', 'codeburn')
 mkdirSync(configDir, { recursive: true })
 writeFileSync(join(configDir, 'privacy-key'), FIXED_PRIVACY_KEY + '\n', { mode: 0o600 })
 
