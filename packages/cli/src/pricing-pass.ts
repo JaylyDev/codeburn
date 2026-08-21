@@ -34,7 +34,11 @@ export function priceProviderCall(call: ParsedProviderCall): ParsedProviderCall 
     outputForCost,
     call.cacheCreationInputTokens,
     call.cacheReadInputTokens,
-    call.webSearchRequests,
+    // cline-cli's `webSearchRequests` counts `fetch_web_content` page fetches,
+    // not billable provider-side searches: upstream reports the count on the
+    // call but passes a hardcoded 0 to the price table. Billing it here would
+    // add $0.01 per fetch on top of tokens.
+    call.provider === 'cline-cli' ? 0 : call.webSearchRequests,
     call.speed,
   )
   // Seam extension: some decoders prefer the table price but fall back to a
