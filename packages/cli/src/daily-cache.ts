@@ -5,7 +5,7 @@ import { homedir } from 'os'
 import { join } from 'path'
 import type { DateRange, ProjectSummary } from './types.js'
 
-// Bumped to 24: pi/omp, cline and opencode/kilo-code session discovery was
+// Bumped to 25: pi/omp, cline and opencode/kilo-code session discovery was
 // restored (#930). Older rollups missed OMP sessions written after a
 // `type: "title"` slot line, Cline sessions under the Insiders / VSCodium /
 // home-data roots, and opencode/kilo-code interrupted or user-only sessions
@@ -14,7 +14,7 @@ import type { DateRange, ProjectSummary } from './types.js'
 // downstream can notice on its own; raising MIN_SUPPORTED_VERSION forces the
 // one-time re-derivation.
 //
-// Bumped to 23: Codex discovery is structural instead of originator-gated
+// Bumped to 24: Codex discovery is structural instead of originator-gated
 // (#873/#626), so rollouts written by third-party frontends driving
 // `codex app-server` ("t3code_desktop", "JetBrains.IntelliJ IDEA", ...) now
 // contribute usage that older rollups never contained. Those files were
@@ -25,11 +25,17 @@ import type { DateRange, ProjectSummary } from './types.js'
 // with it. Raising MIN_SUPPORTED_VERSION forces the one-time re-derivation.
 // This branch was authored against v15/16, but main shipped 17 in v0.9.20 and
 // has since moved to 20, with 21 (#946) and 22 (#1056) claimed on the
-// main-side pipeline; this bump takes 23 so no real user's cache file — built
+// main-side pipeline; this bump takes 24 so no real user's cache file — built
 // by any binary on either line of history — can be adopted as current without
 // the widened-discovery re-derivation firing. A lower number would let a
 // main-built cache pass isMigratableCache() unchanged and the fix would never
 // take effect for that user.
+// This branch also carries the midnight-straddle fix (#852): range and day
+// filters now slice a straddling turn per call instead of keeping it whole on
+// its anchor day, so a historical day already finalized by any earlier binary
+// holds calls that now belong to the next day. That is a second reason the
+// rollups must be re-derived once, and it is why this bump takes 24 — the next
+// free number after #926's 23 — rather than riding on that version.
 //
 // v15: per-project daily rollups. Days and provider slices now carry
 // a `projects` breakdown (cost/calls/savings/sessions per project) so project
@@ -83,8 +89,8 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 24
-const MIN_SUPPORTED_VERSION = 24
+export const DAILY_CACHE_VERSION = 25
+const MIN_SUPPORTED_VERSION = 25
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including
@@ -717,10 +723,17 @@ export async function ensureCacheHydrated(
     const tzChanged = c.tzKey !== undefined && c.tzKey !== tzKey
     if (c.savingsConfigHash !== savingsConfigHash || c.complete !== true || tzChanged) {
       const baseline = c.days
-      const backfillStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - BACKFILL_DAYS)
+      // Re-derive the WHOLE retention window, not just the 365-day product
+      // backfill (BACKFILL_DAYS): these triggers invalidate ALL cached days, and
+      // a day older than the backfill whose sources still survive must be
+      // corrected too — otherwise the v17 straddle double-count (or a stale
+      // savings/tz bucketing) lingers on it for the rest of retention. The cost
+      // is bounded by the surviving session files, and the path only runs on
+      // the rare invalidations, never on the daily gap parse.
+      const rederiveStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - DAILY_CACHE_RETENTION_DAYS)
       let freshDays: DailyEntry[] = []
-      if (backfillStart.getTime() <= yesterdayEnd.getTime()) {
-        freshDays = aggregateDays(await parseSessions({ start: backfillStart, end: yesterdayEnd }))
+      if (rederiveStart.getTime() <= yesterdayEnd.getTime()) {
+        freshDays = aggregateDays(await parseSessions({ start: rederiveStart, end: yesterdayEnd }))
       }
       const parseWasComplete = sessionComplete()
       // A PARTIAL parse must not overwrite finalized baseline days with

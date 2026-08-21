@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtemp, mkdir, writeFile, appendFile, readFile, rm, stat, unlink } from 'fs/promises'
+import { mkdtemp, mkdir, writeFile, appendFile, readFile, rename, rm, stat } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
@@ -286,14 +286,20 @@ describe('incremental append parsing', () => {
     await parseWith(warmCache)
     const inoBefore = (await stat(sessionPath)).ino
 
-    // Replace the file (new inode) with different, LARGER content.
-    await unlink(sessionPath)
+    // Replace the file (new inode) with different, LARGER content. Write the
+    // replacement to a sibling path FIRST, while the original still exists and
+    // its inode is still allocated, then rename over it: unlink-then-recreate
+    // lets ext4 hand the freed inode straight back (seen on CI runners), which
+    // turns this into a same-inode append case instead of a replacement.
     const replaced = [
       ...baseLines(),
       userLine('2026-05-01T12:00:00.000Z', 'brand new task'),
       asstLine('msg-z', '2026-05-01T12:00:02.000Z', { input_tokens: 500, output_tokens: 120 }, [readBlock('/z.ts')]),
     ].join('\n') + '\n'
-    await writeFile(sessionPath, replaced)
+    const replacementPath = sessionPath + '.replacement'
+    await writeFile(replacementPath, replaced)
+    expect((await stat(replacementPath)).ino).not.toBe(inoBefore)
+    await rename(replacementPath, sessionPath)
     expect((await stat(sessionPath)).ino).not.toBe(inoBefore)
 
     readLineCalls.length = 0
