@@ -106,7 +106,16 @@ export const ModelIdentifier = z
  * envelope.
  */
 export function normalizeModelIdentifier(raw: string): string {
-  const trimmed = raw.trim()
+  // Not typed `unknown`, but reached with non-strings anyway. Two decoders
+  // resolve their model through a plain-object lookup — warp's
+  // `modelAliases[model]`, antigravity's `modelMap[usage.model]` — so a session
+  // naming its model '__proto__', 'constructor' or 'toString' gets an object or
+  // a function back off the prototype chain, and `.trim()` on that throws. The
+  // base this replaced took `z.string()`, which REJECTED a non-string
+  // gracefully; throwing here would be a regression that kills the whole parse
+  // over one hostile record. Anything that is not a string is simply not an
+  // identifier: it collapses to 'unknown' like every other non-conforming value.
+  const trimmed = typeof raw === 'string' ? raw.trim() : ''
   if (trimmed.length === 0 || trimmed.length > 128) return 'unknown'
   return MODEL_IDENTIFIER_PATTERN.test(trimmed) ? trimmed : 'unknown'
 }
