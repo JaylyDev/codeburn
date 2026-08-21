@@ -312,6 +312,21 @@ describe('computeEnvFingerprint', () => {
       expect(computeEnvFingerprint(provider), provider).not.toBe(computeEnvFingerprint('unknown-provider'))
     }
   })
+
+  it('reparses #1074 source-key caches once so local sent-ledger aliases land', () => {
+    const interim: Record<string, string> = {
+      codebuff: 'source-ref-fingerprint-v1',
+      zerostack: 'source-ref-fingerprint-v1',
+      pi: 'source-ref-fingerprint-v1',
+      omp: 'source-ref-fingerprint-v1',
+      grok: 'estimated-cost-v1-source-ref-fingerprint-v1',
+      'lingtai-tui': 'token-ledger-registry-activity-v3-source-ref-fingerprint-v1',
+    }
+    for (const [provider, parseVersion] of Object.entries(interim)) {
+      expect(PROVIDER_PARSE_VERSIONS[provider], provider).not.toBe(parseVersion)
+      expect(PROVIDER_PARSE_VERSIONS[provider], provider).toContain('ledger-alias-v1')
+    }
+  })
 })
 
 // ── computeEnvFingerprint: privacy-key binding ─────────────────────────
@@ -319,9 +334,9 @@ describe('computeEnvFingerprint', () => {
 // Seven providers derive their dedup keys from the per-install privacy key: the
 // six sourceRef ones, plus copilot (its JetBrains per-turn digest is an HMAC
 // under that key). A parse version cannot see the key change — a lost, rotated,
-// or ephemeral key silently produces keys that never match the cached ones, so
-// every record re-ingests as new. computeEnvFingerprint therefore folds a digest
-// of the key in for exactly KEY_DERIVED_PROVIDERS.
+// or ephemeral key produces different public keys. computeEnvFingerprint folds
+// a digest of the key in for exactly KEY_DERIVED_PROVIDERS so ordinary caches
+// re-parse and Copilot's durable cache enters its explicit re-key migration.
 describe('computeEnvFingerprint — privacy-key binding', () => {
   async function fingerprintUnderKey(key: string, providers: string[]): Promise<string[]> {
     const home = await mkdtemp(join(tmpdir(), 'codeburn-envfp-'))
@@ -364,15 +379,11 @@ describe('computeEnvFingerprint — privacy-key binding', () => {
   it('copilot moves on rotation even though its parse version says nothing about source refs', async () => {
     // The regression this pins: the fold set used to be sniffed out of the
     // parse-version string (`includes('source-ref-fingerprint-v1')`). Copilot's
-    // dedup keys are just as key-derived — createHmac(privacyKey) over the
-    // JetBrains reply text — but its parse version reads
-    // `…-dedup-key-hmac-v1`, so the sniff missed it and its fingerprint held
-    // still across a rotation. Copilot is the sole DURABLE provider: its
-    // union-merge never deletes cached turns, it appends any turn whose key is
-    // not already cached. A held-still fingerprint therefore does not merely
-    // re-parse — it keeps the K1 keys forever AND appends the K2 ones for the
-    // same turns, inflating totals on every rotation, and on every single run
-    // when the key file is corrupt (each process mints a fresh ephemeral key).
+    // public keys are just as key-derived — an HMAC over the stable local
+    // JetBrains identity — but their parse version reads `…-dedup-key-hmac-v2`.
+    // The explicit set ensures a rotation is detected; the durable migration
+    // then re-keys cached-only records and reconciles DB-present records without
+    // either retaining stale public keys or appending a second copy.
     expect(PROVIDER_PARSE_VERSIONS['copilot']).not.toContain('source-ref-fingerprint-v1')
     expect(DURABLE_PROVIDER_NAMES.has('copilot')).toBe(true)
     expect(KEY_DERIVED_PROVIDERS.has('copilot')).toBe(true)
@@ -463,17 +474,11 @@ describe('provider env overrides invalidate the fingerprint (#920)', () => {
   })
 
   // Copilot is deliberately NOT declared in PROVIDER_ENV_VARS (Ruling 1 of
-  // lane 04): its OTel discovery returns one source per DB file
-  // ({ path: dbPath }, src/providers/copilot.ts:431), and the durable
-  // carry-forward in getOrCreateProviderSection (src/parser.ts:1270) drops
-  // every cached entry whose source still exists on a fingerprint change — so
-  // declaring any CODEBURN_COPILOT_* var would force a re-parse that destroys
-  // conversations Copilot has since pruned from the DB, which only the cache
-  // still holds. The fingerprint must therefore NOT move when one is set.
-  // This reads as intent, not as an oversight — and the assertions below pin
-  // the WHOLE invariant (no entry at all, plus every one of the nine deferred
-  // reads), so a future "completing" edit fails a test instead of silently
-  // re-opening the durable history-loss path.
+  // lane 04). The durable migration now makes parse-version/key changes safe,
+  // but a discovery-root or account switch has different semantics: blindly
+  // carrying the old durable section would combine two source namespaces.
+  // Keep these overrides out of the generic fingerprint until Copilot has an
+  // explicit namespace migration. The assertions pin that intentional deferral.
   describe('copilot is deliberately undeclared in PROVIDER_ENV_VARS', () => {
     it('has no PROVIDER_ENV_VARS entry at all', () => {
       expect(PROVIDER_ENV_VARS['copilot']).toBeUndefined()
@@ -481,7 +486,7 @@ describe('provider env overrides invalidate the fingerprint (#920)', () => {
 
     // The nine reads copilot.ts performs whose declaration is deferred (each
     // is allowlisted in tests/provider-env-declarations.test.ts): setting any
-    // of them must leave the copilot fingerprint untouched.
+    // of them must leave the Copilot fingerprint untouched.
     const DEFERRED_COPILOT_VARS = [
       'CODEBURN_COPILOT_SESSION_STATE_DIR',
       'CODEBURN_COPILOT_OTEL_DB',

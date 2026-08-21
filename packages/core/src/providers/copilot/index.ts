@@ -9,6 +9,8 @@
 
 export {
   collectJetBrainsRepoDirCandidates,
+  copilotJetBrainsCacheIdentityKey,
+  copilotJetBrainsDeduplicationKey,
   copilotToolNameMap,
   decodeCopilot,
   normalizeCopilotTool,

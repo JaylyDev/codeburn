@@ -97,9 +97,14 @@ describe('zerostack bridge — fixture parity', () => {
     const calls = await collect()
     expect(calls.length).toBeGreaterThan(0) // non-vacuous
     for (const call of calls) {
+      const sourcePath = join(FIXTURE_DIR, `${call.sessionId}.json`)
       expect(call.deduplicationKey).toMatch(/^zerostack:[0-9a-f]{16}:/)
       expect(call.deduplicationKey).not.toContain(FIXTURE_DIR)
       expect(call.deduplicationKey).not.toContain('zerostack-parity')
+      expect(call.deduplicationAliases).toEqual([
+        call.deduplicationKey.replace(expectedSourceRef(sourcePath), sourcePath),
+      ])
+      expect(JSON.stringify(call)).not.toContain(sourcePath)
     }
   })
 

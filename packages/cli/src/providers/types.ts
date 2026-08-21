@@ -60,6 +60,13 @@ export type ParsedProviderCall = {
   timestamp: string
   speed: 'standard' | 'fast'
   deduplicationKey: string
+  // Stable, local-only identity used to reconcile durable cache entries when a
+  // privacy-key or parse-version change rotates the public deduplication key.
+  // Never copied into ParsedApiCall, observations, the daily cache, or sync.
+  cacheIdentityKey?: string
+  // Prior public key shapes used only for local cache reconciliation and sent-
+  // ledger continuity. They must never enter observations or OTLP payloads.
+  deduplicationAliases?: string[]
   // Lines added/removed by this call's edits, counted from the provider's diff
   // records (Codex: `patch_apply_end.changes[*].unified_diff`). Numbers only;
   // omitted when zero. `editFailed` counts patches with `success === false`.

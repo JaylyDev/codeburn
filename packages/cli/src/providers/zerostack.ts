@@ -115,6 +115,7 @@ export function createZerostackProvider(sessionsDir?: string): Provider {
     },
 
     decode,
+    legacyDeduplicationSourceRef: source => source.path,
     toProviderCall,
   })
 }

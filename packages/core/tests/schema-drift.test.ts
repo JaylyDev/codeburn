@@ -24,14 +24,24 @@ describe('JSON Schema drift', () => {
     })
   }
 
-  // The superseded 0.1.0 observation schema is kept as a FROZEN historical
-  // artifact: it is no longer emitted from the current zod (which is 0.2.0), so
-  // it has no fresh counterpart. Assert it stays pinned at its own version so a
-  // careless re-emit can never overwrite it with 0.2.0 content.
-  it('observation-0.1.0.json remains frozen at schemaVersion 0.1.0', () => {
-    const onDisk = JSON.parse(readFileSync(resolve(schemasDir, 'observation-0.1.0.json'), 'utf8'))
-    const root = onDisk?.definitions?.ObservationEnvelope ?? onDisk
-    expect(root?.properties?.schemaVersion?.const).toBe('0.1.0')
-    expect(Object.keys(fresh)).not.toContain('observation-0.1.0')
+  // Superseded observation schemas remain FROZEN historical artifacts. They
+  // are no longer emitted from the current zod, so a careless re-emit must not
+  // overwrite a versioned contract that external archives still reference.
+  for (const version of ['0.1.0', '0.2.0']) {
+    it(`observation-${version}.json remains frozen at schemaVersion ${version}`, () => {
+      const name = `observation-${version}`
+      const onDisk = JSON.parse(readFileSync(resolve(schemasDir, `${name}.json`), 'utf8'))
+      const root = onDisk?.definitions?.ObservationEnvelope ?? onDisk
+      expect(root?.properties?.schemaVersion?.const).toBe(version)
+      expect(Object.keys(fresh)).not.toContain(name)
+    })
+  }
+
+  it('keeps the 0.2.0 model fields at their published minLength-only contract', () => {
+    const onDisk = JSON.parse(readFileSync(resolve(schemasDir, 'observation-0.2.0.json'), 'utf8'))
+    const call = onDisk.definitions.ObservationEnvelope.properties.sessions.items
+      .properties.calls.items.properties
+    expect(call.model).toEqual({ type: 'string', minLength: 1 })
+    expect(call.pricingModel).toEqual({ type: 'string', minLength: 1 })
   })
 })

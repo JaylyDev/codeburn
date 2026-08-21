@@ -180,6 +180,7 @@ export function createPiProvider(sessionsDir?: string): Provider {
     // Pi vs OMP is disambiguated inside the decoder via context.providerId, which
     // the bridge sets from spec.name ('pi' here) — no wrapper needed.
     decode: decodePi,
+    legacyDeduplicationSourceRef: source => source.path,
     toProviderCall,
   })
 }
@@ -238,6 +239,7 @@ export function createOmpProvider(sessionsDir?: string): Provider {
     // context.providerId is 'omp' here (from spec.name), so the shared decoder
     // stamps provider: 'omp' and the omp dedup-key prefix.
     decode: decodePi,
+    legacyDeduplicationSourceRef: source => source.path,
     toProviderCall,
   })
 }

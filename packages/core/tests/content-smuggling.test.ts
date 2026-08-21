@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import zlib from 'node:zlib'
@@ -1067,6 +1068,13 @@ describe('content-smuggling guardrail: real copilot decode -> toObservations is 
     for (const secret of ALL_SECRETS) {
       expect(serialized).not.toContain(secret)
     }
+  })
+
+  it('never emits the local JetBrains cache identity', () => {
+    const serialized = JSON.stringify(decodeAndMinimize())
+    const reply = `${SECRETS.apiKey} ${SECRETS.fileContent}`
+    const localDigest = createHash('sha256').update(reply).digest('hex').slice(0, 12)
+    expect(serialized).not.toContain(localDigest)
   })
 
   it('keeps canonical tool names (Bash) and drops the argument-carrying name', () => {

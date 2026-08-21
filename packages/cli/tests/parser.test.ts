@@ -14,7 +14,9 @@ import { createRequire } from 'node:module'
 
 import { isSqliteAvailable } from '../src/sqlite.js'
 import { clearSessionCache, parseAllSessions } from '../src/parser.js'
-import { loadCache, saveCache, sessionCachePath } from '../src/session-cache.js'
+import { DURABLE_PROVIDER_NAMES, loadCache, saveCache, sessionCachePath } from '../src/session-cache.js'
+import { collectUnsentCalls } from '../src/sync/push.js'
+import { writeLedger } from '../src/sync/ledger.js'
 import type { DateRange } from '../src/types.js'
 import type { SessionSource, SessionParser, ParsedProviderCall } from '../src/providers/types.js'
 
@@ -24,6 +26,7 @@ import type { SessionSource, SessionParser, ParsedProviderCall } from '../src/pr
 let _synthSources: SessionSource[] = []
 let _synthDurable = false
 let _synthYields: ParsedProviderCall[] = []
+let _synthError: Error | undefined
 
 vi.mock('../src/providers/index.js', async (importOriginal) => {
   type Mod = typeof import('../src/providers/index.js')
@@ -53,6 +56,7 @@ vi.mock('../src/providers/index.js', async (importOriginal) => {
           createSessionParser(_s: SessionSource, _k: Set<string>): SessionParser {
             return {
               async *parse(): AsyncGenerator<ParsedProviderCall> {
+                if (_synthError) throw _synthError
                 for (const call of _synthYields) {
                   // Respect seenKeys so that when multiple sources share the same
                   // dedup key, only the first source yields it (mirrors real parsers).
@@ -202,6 +206,7 @@ beforeEach(async () => {
   _synthSources = []
   _synthDurable = false
   _synthYields  = []
+  _synthError = undefined
 })
 
 afterEach(async () => {
@@ -209,6 +214,7 @@ afterEach(async () => {
   vi.unstubAllEnvs()
 
   _synthSources = []
+  _synthError = undefined
 
   await rm(tmpHome,  { recursive: true, force: true })
   await rm(tmpCache, { recursive: true, force: true })
@@ -311,6 +317,119 @@ describe.skipIf(!isSqliteAvailable())(
     })
   }
 )
+
+// ═══════════════════════════════════════════════════════════════════════════
+// (c2) A forced durable re-parse that throws must retain history and retry.
+// ═══════════════════════════════════════════════════════════════════════════
+describe('(c2) durable parse failure preserves history', () => {
+  it('keeps cached turns and retries at the same file fingerprint', async () => {
+    const sourcePath = join(tmpHome, 'durable-retry.db')
+    await writeFile(sourcePath, 'unchanged durable source')
+    _synthDurable = true
+    _synthSources = [{ path: sourcePath, project: 'test', provider: 'test-synthetic' }]
+
+    const call = (key: string, outputTokens: number): ParsedProviderCall => ({
+      provider: 'test-synthetic', model: 'gpt-4o',
+      inputTokens: 0, outputTokens,
+      cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0,
+      costUSD: 0, tools: [], bashCommands: [],
+      timestamp: new Date().toISOString(), speed: 'standard',
+      deduplicationKey: key, userMessage: '', sessionId: 'durable-retry',
+    })
+    const firstCall = call('durable-retry-a', 5)
+    const secondCall = call('durable-retry-b', 7)
+    _synthYields = [firstCall]
+    expect(totalOutput(await parseAllSessions(undefined, 'test-synthetic'))).toBe(5)
+
+    // Simulate a provider migration: the source fingerprint is unchanged, the
+    // provider fingerprint is stale, and no retry marker exists yet.
+    const scheduled = await loadCache()
+    scheduled.providers['test-synthetic']!.envFingerprint = 'pre-migration-fingerprint'
+    expect(scheduled.providers['test-synthetic']!.files[sourcePath]!.needsReparse).toBeUndefined()
+    await saveCache(scheduled)
+
+    // getOrCreateProviderSection uses this static set to identify the durable
+    // sections it must carry across the mismatch. The synthetic provider is
+    // durable at runtime too; register it only for this migration-path test.
+    const durableNames = DURABLE_PROVIDER_NAMES as Set<string>
+    durableNames.add('test-synthetic')
+    try {
+      clearSessionCache()
+      _synthError = new Error('transient durable parse failure')
+      expect(totalOutput(await parseAllSessions(undefined, 'test-synthetic'))).toBe(5)
+      const afterFailure = await loadCache()
+      expect(afterFailure.providers['test-synthetic']!.files[sourcePath]!.turns).toHaveLength(1)
+      expect(afterFailure.providers['test-synthetic']!.files[sourcePath]!.needsReparse).toBe(true)
+      // A merged prior cache can also carry a legacy failed marker. The new
+      // retry obligation must take precedence over it.
+      afterFailure.providers['test-synthetic']!.files[sourcePath]!.failed = true
+      await saveCache(afterFailure)
+
+      // Same source fingerprint, but the marker created by the failed forced
+      // parse makes the next run retry and converge.
+      clearSessionCache()
+      _synthError = undefined
+      _synthYields = [firstCall, secondCall]
+      expect(totalOutput(await parseAllSessions(undefined, 'test-synthetic'))).toBe(12)
+      const healed = await loadCache()
+      expect(healed.providers['test-synthetic']!.files[sourcePath]!.needsReparse).toBeUndefined()
+      expect(healed.providers['test-synthetic']!.files[sourcePath]!.failed).toBeUndefined()
+    } finally {
+      durableNames.delete('test-synthetic')
+    }
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// (c3) A host-only legacy key must survive pricing + cache round-trips.
+// ═══════════════════════════════════════════════════════════════════════════
+describe('(c3) dedup migration aliases preserve sync idempotency', () => {
+  it('keeps a non-enumerable legacy key through pricing, canonicalization, and the disk cache', async () => {
+    const sourcePath = join(tmpHome, 'source-ref-alias.jsonl')
+    await writeFile(sourcePath, 'synthetic source')
+    vi.stubEnv('XDG_CACHE_HOME', tmpCache)
+    _synthSources = [{ path: sourcePath, project: 'test', provider: 'test-synthetic' }]
+
+    const legacyKey = `test-synthetic:${sourcePath}:call-1`
+    const currentKey = 'test-synthetic:0123456789abcdef:call-1'
+    const call: ParsedProviderCall = {
+      provider: 'test-synthetic', model: 'gpt-4o',
+      inputTokens: 10, outputTokens: 5,
+      cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+      cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0,
+      costBasis: 'estimated', tools: [], bashCommands: [],
+      timestamp: new Date().toISOString(), speed: 'standard',
+      deduplicationKey: currentKey, userMessage: '', sessionId: 'source-ref-alias',
+      // Forces canonicalizeProviderCallProject through its cloning path too.
+      projectPath: tmpHome,
+    }
+    Object.defineProperty(call, 'deduplicationAliases', {
+      value: [legacyKey],
+      enumerable: false,
+    })
+    _synthYields = [call]
+
+    writeLedger([{ key: legacyKey, ts: call.timestamp }])
+    const first = await parseAllSessions(undefined, 'test-synthetic')
+    const firstCall = first.flatMap(project => project.sessions)
+      .flatMap(session => session.turns)
+      .flatMap(turn => turn.assistantCalls)[0]!
+    expect(firstCall.localDeduplicationAliases).toEqual([legacyKey])
+    expect(JSON.stringify(firstCall)).not.toContain(sourcePath)
+    expect(collectUnsentCalls(first).unsent).toHaveLength(0)
+
+    // Prove the alias was intentionally persisted, not merely kept in memory.
+    clearSessionCache()
+    const reloaded = await parseAllSessions(undefined, 'test-synthetic')
+    const reloadedCall = reloaded.flatMap(project => project.sessions)
+      .flatMap(session => session.turns)
+      .flatMap(turn => turn.assistantCalls)[0]!
+    expect(reloadedCall.localDeduplicationAliases).toEqual([legacyKey])
+    expect(JSON.stringify(reloadedCall)).not.toContain(sourcePath)
+    expect(collectUnsentCalls(reloaded).unsent).toHaveLength(0)
+  })
+})
 
 // ═══════════════════════════════════════════════════════════════════════════
 // (d) Non-durable evicts: deleted source for non-durable provider is removed

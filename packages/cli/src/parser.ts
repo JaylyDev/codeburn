@@ -1,4 +1,3 @@
-import { existsSync } from 'fs'
 import { lstat, readFile, readdir, stat } from 'fs/promises'
 import { basename, dirname, join, resolve, sep } from 'path'
 import { readSessionLines } from './fs-utils.js'
@@ -46,6 +45,8 @@ import {
   fingerprintFile,
   isCacheComplete,
   loadCache,
+  mergeCallByDedupKey,
+  rekeyCopilotDurableCache,
   reconcileFile,
   saveCache,
 } from './session-cache.js'
@@ -1038,6 +1039,8 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
     skills: call.skills ?? [],
     subagentTypes: call.subagentTypes ?? [],
     deduplicationKey: call.deduplicationKey,
+    ...(call.cacheIdentityKey !== undefined ? { cacheIdentityKey: call.cacheIdentityKey } : {}),
+    ...(call.deduplicationAliases?.length ? { deduplicationAliases: call.deduplicationAliases } : {}),
     project: call.project,
     projectPath: call.projectPath,
     workingDirectory: call.workingDirectory,
@@ -1157,6 +1160,95 @@ function providerCallsToCachedTurns(calls: ParsedProviderCall[]): CachedTurn[] {
   return turns
 }
 
+type CachedCallSlot = { turn: CachedTurn; callIndex: number; call: CachedCall }
+
+function mergeDurableCachedTurns(
+  existingTurns: CachedTurn[],
+  incomingTurns: CachedTurn[],
+  aliasesByDedupKey: ReadonlyMap<string, readonly string[]>,
+): void {
+  for (const incomingTurn of incomingTurns) {
+    // Keep every slot per identity, not just one. During the short-lived #1074
+    // integration build the same DB-present record can exist in an adopted v5
+    // cache under its legacy SHA key and in v7 under HMAC(replyText). The fresh
+    // decode knows both aliases, so reconciliation must collapse BOTH cached
+    // copies rather than replacing one and leaving the other double-counted.
+    const slotsByIdentity = new Map<string, CachedCallSlot[]>()
+    const register = (key: string, slot: CachedCallSlot): void => {
+      const slots = slotsByIdentity.get(key)
+      if (slots) slots.push(slot)
+      else slotsByIdentity.set(key, [slot])
+    }
+    for (const turn of existingTurns) {
+      turn.calls.forEach((call, callIndex) => {
+        const slot = { turn, callIndex, call }
+        register(call.deduplicationKey, slot)
+        if (call.cacheIdentityKey) register(call.cacheIdentityKey, slot)
+      })
+    }
+
+    const matches = incomingTurn.calls.map(call => {
+      const candidates: CachedCallSlot[] = []
+      const seenCalls = new Set<CachedCall>()
+      const add = (slots: CachedCallSlot[] | undefined): void => {
+        for (const slot of slots ?? []) {
+          if (seenCalls.has(slot.call)) continue
+          seenCalls.add(slot.call)
+          candidates.push(slot)
+        }
+      }
+      // Exact current public-key matches come first and become the canonical
+      // slot; legacy and interim formats follow through transient aliases.
+      add(slotsByIdentity.get(call.deduplicationKey))
+      for (const alias of aliasesByDedupKey.get(call.deduplicationKey) ?? []) {
+        add(slotsByIdentity.get(alias))
+      }
+      return candidates
+    })
+
+    if (matches.every(slots => slots.length > 0)) {
+      // A key rotation or key-format migration found the same durable calls
+      // under their local identity / prior public key. Replace them in place so
+      // cached-only siblings survive and current records do not append twice.
+      const duplicateCalls = new Set<CachedCall>()
+      matches.forEach((slots, index) => {
+        const slot = slots[0]!
+        const incoming = incomingTurn.calls[index]!
+        const existing = slot.turn.calls[slot.callIndex]!
+        const merged = mergeCallByDedupKey(existing, incoming)
+        const aliases = new Set([
+          ...(existing.deduplicationAliases ?? []),
+          existing.deduplicationKey,
+          ...(incoming.deduplicationAliases ?? []),
+        ])
+        for (const duplicate of slots.slice(1)) {
+          aliases.add(duplicate.call.deduplicationKey)
+          for (const alias of duplicate.call.deduplicationAliases ?? []) aliases.add(alias)
+        }
+        aliases.delete(merged.deduplicationKey)
+        if (aliases.size > 0) merged.deduplicationAliases = [...aliases]
+        slot.turn.calls[slot.callIndex] = merged
+        for (const duplicate of slots.slice(1)) duplicateCalls.add(duplicate.call)
+      })
+      if (duplicateCalls.size > 0) {
+        for (let turnIndex = existingTurns.length - 1; turnIndex >= 0; turnIndex--) {
+          const turn = existingTurns[turnIndex]!
+          turn.calls = turn.calls.filter(call => !duplicateCalls.has(call))
+          if (turn.calls.length === 0) existingTurns.splice(turnIndex, 1)
+        }
+      }
+      continue
+    }
+
+    // Preserve the existing all-or-nothing turn rule: a partially duplicated
+    // multi-call turn is not appended. Current durable providers emit one call
+    // per cached turn, but this guards future grouped formats from half-counts.
+    if (matches.every(slots => slots.length === 0)) {
+      existingTurns.push(incomingTurn)
+    }
+  }
+}
+
 function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
   const u = call.usage
   const outputForCost = call.provider === 'claude'
@@ -1167,7 +1259,7 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
     u.cacheCreationInputTokens, u.cacheReadInputTokens,
     u.webSearchRequests, call.speed, u.cacheCreationOneHourTokens,
   )
-  return applyLocalModelSavings({
+  const apiCall = applyLocalModelSavings({
     provider: call.provider,
     model: call.model,
     usage: {
@@ -1194,6 +1286,16 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
     cacheCreationOneHourTokens: u.cacheCreationOneHourTokens || undefined,
     toolSequence: call.toolSequence,
   })
+  if (call.deduplicationAliases?.length) {
+    // Sync needs prior public keys for ledger continuity, but this migration
+    // metadata is deliberately non-enumerable so report/dashboard JSON cannot
+    // expose the local legacy identity.
+    Object.defineProperty(apiCall, 'localDeduplicationAliases', {
+      value: [...call.deduplicationAliases],
+      enumerable: false,
+    })
+  }
+  return apiCall
 }
 
 // `resolvedBranch` restores the turn's git branch after the cache's per-turn
@@ -1284,23 +1386,31 @@ function getOrCreateProviderSection(cache: SessionCache, provider: string): Prov
   const existing = cache.providers[provider]
   if (existing && existing.envFingerprint === envFp) return existing
   const section: ProviderSection = { envFingerprint: envFp, files: {} }
-  // A fingerprint change (env override or parse-version bump) must re-parse
-  // every present source, but for durable providers the cache is the ONLY
-  // remaining record of usage whose source rows were already pruned (OTel
-  // orphans). Discarding those with the section would permanently erase
-  // month-to-date history that cannot be re-derived, so carry forward exactly
-  // the entries whose source no longer exists; everything present on disk is
-  // dropped and re-parsed under the new fingerprint.
+  // A fingerprint change must re-parse every present source. For durable
+  // providers, however, a still-existing DB can already have pruned rows whose
+  // only copy lives inside that same cached file entry. Carry the entire section
+  // forward; parseProviderSources forces present paths through the parser and
+  // its durable merge reconciles current records without deleting cached-only
+  // history.
   if (existing && DURABLE_PROVIDER_NAMES.has(provider)) {
-    for (const [path, file] of Object.entries(existing.files)) {
-      if (!existsSync(path)) section.files[path] = file
-    }
+    Object.assign(section.files, existing.files)
+    if (existing.durable) section.durable = true
+    if (provider === 'copilot') rekeyCopilotDurableCache(section.files)
+    // The section fingerprint is about to advance even when a present source is
+    // temporarily unreadable, outside the requested date range, or absent from
+    // this discovery pass. Persist a per-file obligation so the first later
+    // appearance is still force-parsed under the new provider generation.
+    for (const file of Object.values(section.files)) file.needsReparse = true
   }
   cache.providers[provider] = section
+  ;(cache as { _dirty?: boolean })._dirty = true
   return section
 }
 
 function cachedFileNeedsProviderReparse(providerName: string, sourcePath: string, cached: CachedFile): boolean {
+  if (cached.needsReparse) return true
+  if (cached.failed) return false
+
   // Antigravity data comes from the live server, not from the conversation file.
   // A 0-turn cache entry may just mean the server was unavailable last run.
   if (providerName === 'antigravity') return shouldReparseAntigravitySource(sourcePath, cached.turns.length)
@@ -1544,6 +1654,9 @@ async function parseProviderSources(
   const provider = await getProvider(providerName)
   if (!provider) return []
 
+  const previousEnvFingerprint = diskCache.providers[providerName]?.envFingerprint
+  const providerFingerprintChanged = previousEnvFingerprint !== undefined
+    && previousEnvFingerprint !== computeEnvFingerprint(providerName)
   const section = getOrCreateProviderSection(diskCache, providerName)
   const allDiscoveredFiles = new Set<string>()
   const servedSources = [...sources]
@@ -1586,8 +1699,8 @@ async function parseProviderSources(
     // A cached parse failure at this same fingerprint stays skipped — don't
     // re-read a file that already threw and hasn't changed. It re-parses only
     // when the file changes (then `reconcileFile` reports non-'unchanged').
-    if (cached && (readOnly || (action.action === 'unchanged' && (cached.failed || !cachedFileNeedsProviderReparse(providerName, source.path, cached))))) {
-      if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
+    if (cached && (readOnly || (!providerFingerprintChanged && action.action === 'unchanged' && !cachedFileNeedsProviderReparse(providerName, source.path, cached)))) {
+      if (readOnly && (providerFingerprintChanged || action.action !== 'unchanged')) readOnlyServedStale = true
       unchangedSources.push({ source, cached })
     } else if (!readOnly) {
       changedSources.push({ source, fp })
@@ -1650,28 +1763,45 @@ async function parseProviderSources(
         for await (const call of parser.parse()) {
           providerCalls.push(call)
         }
+        // Some migrations attach prior public keys as non-enumerable metadata
+        // so raw legacy source refs cannot leak through a generic object spread.
+        // Pricing and project canonicalization intentionally clone calls, so
+        // capture the aliases before either pass and re-attach them afterward.
+        const aliasesByDedupKey = new Map(
+          providerCalls
+            .filter(call => call.deduplicationAliases?.length)
+            .map(call => [call.deduplicationKey, call.deduplicationAliases!] as const),
+        )
         // Host-side pricing pass: fill costUSD for converted decoders (which
         // emit tokens + costBasis) before anything is cached or aggregated.
         const pricedCalls = providerCalls.map(priceProviderCall)
         const canonicalCalls = await Promise.all(pricedCalls.map(canonicalizeProviderCallProject))
+        for (const call of canonicalCalls) {
+          const aliases = aliasesByDedupKey.get(call.deduplicationKey)
+          if (!aliases?.length) continue
+          Object.defineProperty(call, 'deduplicationAliases', {
+            value: [...aliases],
+            configurable: true,
+            writable: true,
+            enumerable: false,
+          })
+        }
         const turns = providerCallsToCachedTurns(canonicalCalls)
 
         // Store/merge parsed turns into the cache.
-        // Durable providers use a union-by-deduplicationKey merge: existing turns
-        // are NEVER deleted (preserves data for spans pruned from the DB), and
-        // only turns whose dedup keys are not already cached are appended.
+        // Durable providers reconcile by public key, stable local identity, and
+        // transient prior-key aliases. Matching current records replace their
+        // cached copy, cached-only records survive, and genuinely new records
+        // append. That avoids both history loss and double-counting across a
+        // privacy-key or key-format transition.
         // Non-durable providers keep the original overwrite-or-append behaviour.
         if (provider.durableSources) {
           const existingEntry = section.files[source.path]
           if (existingEntry) {
-            const existingKeys = new Set(
-              existingEntry.turns.flatMap(t => t.calls.map(c => c.deduplicationKey))
-            )
-            const newTurns = turns.filter(t =>
-              t.calls.every(c => !existingKeys.has(c.deduplicationKey))
-            )
-            existingEntry.turns = [...existingEntry.turns, ...newTurns]
+            mergeDurableCachedTurns(existingEntry.turns, turns, aliasesByDedupKey)
             existingEntry.fingerprint = fp
+            delete existingEntry.needsReparse
+            delete existingEntry.failed
           } else {
             section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns }
           }
@@ -1691,16 +1821,29 @@ async function parseProviderSources(
         ;(diskCache as { _dirty?: boolean })._dirty = true
       } catch (err) {
         if (isSqliteBusyError(err)) {
+          const durableEntry = provider.durableSources ? section.files[source.path] : undefined
+          if (durableEntry) {
+            durableEntry.needsReparse = true
+            ;(diskCache as { _dirty?: boolean })._dirty = true
+          }
           warnProviderReadFailureOnce(providerName, err)
           continue
         }
         // A single malformed session file must not abort the entire run — that
         // would silently empty the daily-cache backfill and wipe the trend /
         // history (issue #441). Record a negative-result marker keyed by the
-        // current fingerprint so we don't re-read + re-throw this unchanged file
-        // on every refresh; it re-parses only if it changes. Empty turns => no
-        // usage contributed.
-        section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns: [], failed: true }
+        // current fingerprint so we don't re-read + re-throw a new empty file on
+        // every refresh. An existing durable entry instead keeps its turns and
+        // a retry marker: its history must never be exchanged for an empty marker.
+        const durableEntry = provider.durableSources ? section.files[source.path] : undefined
+        if (durableEntry) {
+          // Never replace durable history with an empty failure marker. Keep the
+          // old turns and force another parse next run, even if the DB's file
+          // fingerprint itself has not changed.
+          durableEntry.needsReparse = true
+        } else {
+          section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns: [], failed: true }
+        }
         ;(diskCache as { _dirty?: boolean })._dirty = true
         warnProviderParseFailure(providerName, source.path, err)
         continue

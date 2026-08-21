@@ -17,7 +17,8 @@ function readJson(rel: string): unknown {
 
 const goldenEnvelope = readJson('tests/fixtures/golden-envelope.json')
 const goldenFinding = readJson('tests/fixtures/golden-finding.json')
-const observationSchema = readJson('schemas/observation-0.2.0.json') as object
+const observationSchema = readJson('schemas/observation-0.3.0.json') as object
+const legacyObservationSchema = readJson('schemas/observation-0.2.0.json') as object
 const findingSchema = readJson('schemas/finding-0.1.0.json') as object
 
 // strict:false so unknown string formats (date-time) are ignored rather than
@@ -28,6 +29,7 @@ const ajv = new Ajv({ strict: false, allErrors: true })
 // runtime, so we register it as always-valid to keep ajv from warning.
 ajv.addFormat('date-time', true)
 const validateEnvelope = ajv.compile(observationSchema)
+const validateLegacyEnvelope = ajv.compile(legacyObservationSchema)
 const validateFinding = ajv.compile(findingSchema)
 
 /**
@@ -68,6 +70,17 @@ describe('three-way agreement: golden finding', () => {
 })
 
 describe('strictness / structural minimization', () => {
+  it('keeps the published 0.2.0 model contract valid for archived envelopes', () => {
+    const archived = structuredClone(goldenEnvelope) as {
+      schemaVersion: string
+      sessions: { calls: Array<Record<string, unknown>> }[]
+    }
+    archived.schemaVersion = '0.2.0'
+    archived.sessions[0].calls[0].model = 'Gemini 3.5 Flash (High)'
+    expect(validateLegacyEnvelope(archived), JSON.stringify(validateLegacyEnvelope.errors)).toBe(true)
+    expect(validateEnvelope(archived)).toBe(false)
+  })
+
   it('zod rejects an unknown top-level field', () => {
     expect(ObservationEnvelope.safeParse({ ...(goldenEnvelope as object), title: 'x' }).success).toBe(false)
   })

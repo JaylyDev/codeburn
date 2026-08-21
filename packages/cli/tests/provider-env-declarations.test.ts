@@ -69,16 +69,13 @@ const FILE_PROVIDERS: Record<string, string[]> = {
 // against the declarations (see the header comment). If you add an entry here,
 // the guard goes silent for that var in that file — the reason must say
 // exactly why a change to it cannot make a cached section stale.
-// Reason shared by every copilot.ts entry (Ruling 1 of lane 04): copilot is
-// deliberately undeclared in PROVIDER_ENV_VARS. Declaring any of its reads
-// would change the copilot fingerprint, and on a fingerprint change
-// getOrCreateProviderSection (src/parser.ts:1270) keeps only cached entries
-// whose source path no longer exists — but OTel discovery returns one source
-// per DB file ({ path: dbPath }, copilot.ts:431) and that DB keeps existing,
-// so the cached entry is dropped and re-parsed, destroying conversations
-// Copilot has since pruned from the DB that only the cache still holds.
-// Deferred until the durable carry-forward learns to merge instead of drop.
-const COPILOT_DEFERRED = 'deferred (Ruling 1): declaring it would force the durable re-parse that loses pruned OTel history'
+// Reason shared by every copilot.ts entry (Ruling 1 of lane 04): Copilot is
+// deliberately undeclared in PROVIDER_ENV_VARS. Its durable migration safely
+// handles parse-version and privacy-key changes within one source namespace,
+// but blindly carrying the durable section across a root/account override would
+// combine the old and new namespaces. Defer until that transition has explicit
+// provider-specific semantics.
+const COPILOT_DEFERRED = 'deferred (Ruling 1): a root/account switch needs explicit durable source-namespace semantics'
 const ALLOWLIST: Record<string, string> = {
   'opencode.ts:CODEBURN_VERBOSE': 'opencode.ts:151 — logging verbosity only; changes no discovered path and no parsed value',
   'kilo-code.ts:CODEBURN_VERBOSE': 'kilo-code.ts:94 — logging verbosity only; changes no discovered path and no parsed value',

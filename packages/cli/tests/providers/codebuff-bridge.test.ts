@@ -117,6 +117,10 @@ describe('codebuff bridge — fixture parity', () => {
       expect(call.deduplicationKey).toMatch(/^codebuff:[0-9a-f]{16}:a[0-9]+$/)
       expect(call.deduplicationKey).not.toContain(sourcePath)
       expect(call.deduplicationKey).not.toContain('codebuff-parity')
+      expect(call.deduplicationAliases).toEqual([
+        call.deduplicationKey.replace(expectedSourceRef(sourcePath), sourcePath),
+      ])
+      expect(JSON.stringify(call)).not.toContain(sourcePath)
     }
   })
 

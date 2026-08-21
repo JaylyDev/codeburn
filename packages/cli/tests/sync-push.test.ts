@@ -142,6 +142,23 @@ describe('collectUnsentCalls', () => {
     expect(unsent).toHaveLength(1)
     expect(unsent[0]!.call.deduplicationKey).toBe('k2')
   })
+
+  it('does not resend a migrated call when a prior public key is ledgered', async () => {
+    const { collectUnsentCalls } = await import('../src/sync/push.js')
+    const { writeLedger } = await import('../src/sync/ledger.js')
+
+    writeLedger([{ key: 'copilot:jb:store:old-key:1', ts: '2026-07-10T00:00:00Z' }])
+    const migrated = makeCall('copilot:jb:store:new-key:1')
+    migrated.localDeduplicationAliases = ['copilot:jb:store:old-key:1']
+    const projects = [{
+      project: 'p',
+      sessions: [{ sessionId: 's1', turns: [{ assistantCalls: [migrated] }] }],
+    }] as unknown as ProjectSummary[]
+
+    const { allCalls, unsent } = collectUnsentCalls(projects)
+    expect(allCalls).toHaveLength(1)
+    expect(unsent).toHaveLength(0)
+  })
 })
 
 // ── sendBatches: success path ─────────────────────────────────────────

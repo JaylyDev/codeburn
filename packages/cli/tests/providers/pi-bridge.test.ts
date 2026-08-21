@@ -124,6 +124,10 @@ describe('pi/omp bridge — fixture parity', () => {
         expect(call.deduplicationKey).toMatch(shape)
         expect(call.deduplicationKey).not.toContain(rawPath)
         expect(call.deduplicationKey).not.toContain('pi-parity')
+        expect(call.deduplicationAliases).toEqual([
+          call.deduplicationKey.replace(expectedSourceRef(rawPath), rawPath),
+        ])
+        expect(JSON.stringify(call)).not.toContain(rawPath)
       }
     })
   })

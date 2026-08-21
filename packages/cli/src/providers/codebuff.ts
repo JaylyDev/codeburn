@@ -167,6 +167,7 @@ export function createCodebuffProvider(baseDir?: string): Provider {
     },
 
     decode: decodeCodebuff,
+    legacyDeduplicationSourceRef: source => source.path,
     toProviderCall,
   })
 }

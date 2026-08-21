@@ -47,7 +47,10 @@ export function collectUnsentCalls(projects: ProjectSummary[]): {
   }
 
   const sent = ledgerKeySet()
-  const unsent = allCalls.filter(c => !sent.has(c.call.deduplicationKey))
+  const unsent = allCalls.filter(({ call }) =>
+    !sent.has(call.deduplicationKey)
+      && !(call.localDeduplicationAliases ?? []).some(alias => sent.has(alias)),
+  )
   return { allCalls, unsent }
 }
 
