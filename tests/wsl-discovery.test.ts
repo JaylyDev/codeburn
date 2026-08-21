@@ -52,6 +52,23 @@ describe('wsl.exe distro listing', () => {
     expect(parseWslDistros(raw)).toEqual(['Ubuntu'])
   })
 
+  it('yields no names from the "no installed distributions" message', () => {
+    // Every line of this would otherwise be probed as a distro over UNC.
+    expect(parseWslDistros(wslOutput([
+      'Windows Subsystem for Linux has no installed distributions.',
+      "Use 'wsl.exe --list --online' to list available distributions",
+      "and 'wsl.exe --install <Distro>' to install.",
+      '',
+      'Distributions can also be installed by visiting the Microsoft Store:',
+      'https://aka.ms/wslstore',
+    ]))).toEqual([])
+  })
+
+  it('keeps the punctuation real distro names actually use', () => {
+    expect(parseWslDistros(wslOutput(['Ubuntu-24.04', 'openSUSE-Leap-15.6', 'kali-linux', 'FedoraLinux-42'])))
+      .toEqual(['Ubuntu-24.04', 'openSUSE-Leap-15.6', 'kali-linux', 'FedoraLinux-42'])
+  })
+
   it('falls back to UTF-8 when the output carries no NULs', () => {
     expect(parseWslDistros(Buffer.from('Ubuntu\nArch\n', 'utf8'))).toEqual(['Ubuntu', 'Arch'])
   })
@@ -132,6 +149,24 @@ describe('WSL homes as extra provider roots', () => {
 
     const labels = (await discoverClaudeConfigSources()).map(s => s.label)
     expect(labels).toEqual(expect.arrayContaining(['Ubuntu (WSL)', 'Debian (WSL)']))
+  })
+
+  it('names the user too when one distro contributes several homes', async () => {
+    process.env['CLAUDE_CONFIG_DIR'] = join(tmpDir, 'win', '.claude')
+    setWslHomes([
+      '\\\\wsl$\\Ubuntu\\home\\alice',
+      '\\\\wsl$\\Ubuntu\\home\\bob',
+      '\\\\wsl$\\Ubuntu\\root',
+      '\\\\wsl$\\Debian\\home\\carol',
+    ])
+
+    const labels = (await discoverClaudeConfigSources()).map(s => s.label)
+    // Debian has a single home, so it keeps the plain distro label.
+    expect(labels).toEqual(expect.arrayContaining([
+      'Ubuntu (WSL, alice)', 'Ubuntu (WSL, bob)', 'Ubuntu (WSL, root)', 'Debian (WSL)',
+    ]))
+    // No WSL label was left for makeUniqueLabels to number.
+    expect(labels.filter(l => l.includes('(WSL')).some(l => / \d$/.test(l))).toBe(false)
   })
 
   it('reports each WSL root in probeRoots so doctor can show a missing one', async () => {

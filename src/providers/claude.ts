@@ -37,13 +37,23 @@ function claudeConfigSourceId(path: string): string {
   return 'claude-config:' + createHash('sha256').update(path).digest('hex').slice(0, 16)
 }
 
-function baseClaudeConfigLabel(path: string): string {
+// `\\wsl$\<distro>\home\<user>\.claude` -> distro, and the home's own name
+// (`<user>`, or `root`). Either separator after the prefix: the join that
+// builds these follows the host platform, which is `/` under test.
+const WSL_CONFIG_DIR = /^\\\\wsl(?:\$|\.localhost)\\([^\\/]+)[\\/](?:home[\\/])?([^\\/]+)[\\/]/i
+
+function baseClaudeConfigLabel(path: string, siblings: string[]): string {
   const normalized = resolve(path)
   if (normalized === resolve(join(homedir(), '.claude'))) return 'Default Claude'
   // Every WSL root basenames to ".claude", so name them by distro instead of
-  // letting makeUniqueLabels number them "claude 1", "claude 2" (#1059).
-  const wsl = /^\\\\wsl(?:\$|\.localhost)\\([^\\]+)\\/i.exec(path)
-  if (wsl) return `${wsl[1]} (WSL)`
+  // letting makeUniqueLabels number them "claude 1", "claude 2" (#1059). Two
+  // homes in the same distro would collide on the distro alone, so those also
+  // carry the user name.
+  const wsl = WSL_CONFIG_DIR.exec(path)
+  if (wsl) {
+    const shared = siblings.filter(p => WSL_CONFIG_DIR.exec(p)?.[1]?.toLowerCase() === wsl[1]!.toLowerCase())
+    return shared.length > 1 ? `${wsl[1]} (WSL, ${wsl[2]})` : `${wsl[1]} (WSL)`
+  }
   const name = basename(normalized).replace(/^\./, '').trim()
   return name || normalized
 }
@@ -110,7 +120,7 @@ export async function discoverClaudeConfigSources(): Promise<ClaudeConfigSource[
   const dirs = await getClaudeConfigDirs()
   return makeUniqueLabels(dirs.map(path => ({
     id: claudeConfigSourceId(path),
-    label: baseClaudeConfigLabel(path),
+    label: baseClaudeConfigLabel(path, dirs),
     path,
   })))
 }

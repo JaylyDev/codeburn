@@ -173,7 +173,7 @@ export async function getCachedCodexProject(
   try {
     const s = await stat(filePath)
     const cache = await loadCache(currentCacheDir())
-    const entry = getEntry(cache, filePath, { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, sizeBytes: s.size })
+    const entry = getEntry(cache, filePath, fingerprintFromStat(filePath, s))
     return entry?.project ?? null
   } catch {}
   return null

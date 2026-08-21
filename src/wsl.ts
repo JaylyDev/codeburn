@@ -34,17 +34,34 @@ const UTILITY_DISTROS = /^(docker-desktop|podman-machine|rancher-desktop)/
 /// `wsl.exe --list --quiet` writes UTF-16LE (no BOM on some builds) with CRLF
 /// line ends; piping it through a UTF-8 decode yields NUL-separated garbage.
 /// Detect the encoding from the interleaved NULs rather than trusting either.
+///
+/// With nothing installed, wsl.exe prints prose ("Windows Subsystem for Linux
+/// has no installed distributions.", plus install hints) on stdout, and every
+/// one of those lines would otherwise be probed as a distro name over UNC.
+/// A name must therefore be a single token with none of the characters Windows
+/// bans from a path component and no trailing period \u2014 true of every real
+/// distro name, false of every line of that message, in any UI language.
+// ponytail: a distro imported under a name containing a space is skipped.
+// Widen to a wording-based filter only if someone actually reports one.
+const DISTRO_NAME = /^[^\s\\/:*?"<>|]+$/
+
 export function parseWslDistros(raw: Buffer): string[] {
   const text = raw.includes(0) ? raw.toString('utf16le') : raw.toString('utf8')
   return text
-    .replace(/^\uFEFF/, '')
     .split(/\r?\n/)
-    .map(line => line.replace(/\0/g, '').trim())
-    .filter(name => name.length > 0 && !UTILITY_DISTROS.test(name))
+    .map(line => line.replace(/[\0\uFEFF]/g, '').trim())
+    .filter(name => DISTRO_NAME.test(name) && !name.endsWith('.') && !UTILITY_DISTROS.test(name))
 }
 
-const UNC_PREFIXES = ['\\\\wsl.localhost\\', '\\\\wsl$\\']
+// `\\wsl$\` first: it works on every WSL build, while `wsl.localhost` only
+// exists on newer ones. Probing the newer spelling first would send builds
+// without it through MUP -> SMB -> DNS resolution for a host named
+// "wsl.localhost" \u2014 multiple seconds of stall per distro, every process.
+const UNC_PREFIXES = ['\\\\wsl$\\', '\\\\wsl.localhost\\']
 
+/// Only the backslash spellings are matched: these paths are produced by
+/// UNC_PREFIXES above and never normalized to forward slashes, and Windows
+/// itself accepts `//wsl$/` only through APIs we do not use.
 export function isWslUncPath(path: string): boolean {
   return /^\\\\wsl(\$|\.localhost)\\/i.test(path)
 }
@@ -108,4 +125,14 @@ export function wslHomes(): string[] {
 /// which exists on CI. Pass `undefined` to restore real discovery.
 export function setWslHomes(homes: string[] | undefined): void {
   cached = homes
+}
+
+/// One line for `codeburn doctor` when Windows probed no WSL roots, so an
+/// opt-out or a missing wsl.exe reads as a reason rather than a silent zero.
+export function wslDoctorNote(platform: NodeJS.Platform = process.platform): string | undefined {
+  if (platform !== 'win32') return undefined
+  if (wslMode() === 'off') return 'WSL scan disabled by CODEBURN_WSL=off; no \\\\wsl$ roots were probed.'
+  if (wslHomes().length > 0) return undefined
+  return 'No WSL roots probed: no running distro was found, or wsl.exe is unavailable. ' +
+    'Set CODEBURN_WSL=all to include stopped distros (accessing one starts it).'
 }
