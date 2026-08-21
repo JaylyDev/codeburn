@@ -1,12 +1,13 @@
 // Vitest setup file: isolates every test from the developer's shell environment.
 //
 // codeburn discovers sessions through a long list of provider-specific env
-// vars (CLAUDE_CONFIG_DIR, CODEX_HOME, CRUSH_GLOBAL_DATA, …) and via HOME /
-// XDG_* / APPDATA / LOCALAPPDATA. Without this file, any value set in the
-// developer's shell (e.g. CLAUDE_CONFIG_DIRS=/Users/me/.claude:…) bleeds into
+// vars (CLAUDE_CONFIG_DIR, CODEX_HOME, HERMES_HOME, CRUSH_GLOBAL_DATA, …) and
+// via HOME / XDG_* / APPDATA / LOCALAPPDATA. Without this file, any value set
+// in the developer's shell (e.g. HERMES_HOME=/Users/me/.hermes) bleeds into
 // fixture-based tests: the parser reads the developer's REAL sessions instead
 // of the temp-dir fixture, producing nonsense totals and false failures that
-// pass on a clean CI runner.
+// pass on a clean CI runner. tests/env-isolation-declarations.test.ts fails
+// closed if PROVIDER_ENV_VARS grows a data-dir override that is not listed.
 //
 // What this file does:
 //   1. Mints an empty sandbox temp dir once per worker.
@@ -33,68 +34,10 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { beforeEach } from 'vitest'
 
+import { CLEARED, PRESERVED, REDIRECTED } from './env-isolation-vars.js'
+
 const sandbox = mkdtempSync(join(tmpdir(), 'codeburn-test-env-'))
 
-const REDIRECTED = [
-  'HOME',
-  'XDG_CONFIG_HOME',
-  'XDG_DATA_HOME',
-  'XDG_CACHE_HOME',
-  'XDG_STATE_HOME',
-  'APPDATA',
-  'LOCALAPPDATA',
-] as const
-
-const CLEARED = [
-  // Provider session-discovery dirs
-  'CLAUDE_CONFIG_DIR',
-  'CLAUDE_CONFIG_DIRS',
-  'CLINE_DIR',
-  'CLINE_DATA_DIR',
-  'CLINE_SESSION_DATA_DIR',
-  'CODEX_HOME',
-  'CODEWHALE_HOME',
-  'CRUSH_GLOBAL_DATA',
-  'CODEBUFF_DATA_DIR',
-  'FACTORY_DIR',
-  'GOOSE_PATH_ROOT',
-  'GROK_HOME',
-  'KIRO_HOME',
-  'KIMI_SHARE_DIR',
-  'MUX_ROOT',
-  'OPENCODE_DATA_DIR',
-  'OPENCODE_DB_PREFIX',
-  'QWEN_DATA_DIR',
-  'VIBE_HOME',
-  'WARP_DB_PATH',
-  'ZS_DATA_DIR',
-  // codeburn override dirs / paths
-  'CODEBURN_CACHE_DIR',
-  'CODEBURN_COPILOT_JETBRAINS_DIR',
-  'CODEBURN_COPILOT_OTEL_DB',
-  'CODEBURN_COPILOT_SESSION_STATE_DIR',
-  'CODEBURN_COPILOT_WS_STORAGE_DIR',
-  'CODEBURN_DESKTOP_SESSIONS_DIR',
-  'CODEBURN_MUX_DIR',
-  'CODEBURN_ANTIGRAVITY_SETTINGS_PATH',
-  // codeburn behavior toggles (set by the dev to tweak local runs)
-  'CODEBURN_COPILOT_DISABLE_OTEL',
-  'CODEBURN_TZ',
-  'CODEBURN_VERBOSE',
-  'CODEBURN_CURSOR_MAX_BUBBLES',
-  'CODEBURN_FORCE_MACOS_MAJOR',
-  // Provider model/credential overrides
-  'KIMI_MODEL_NAME',
-  'AI_GATEWAY_API_KEY',
-  'VERCEL_OIDC_TOKEN',
-  // Read by detectBashBloat - a dev's real shell limit must not bleed in
-  'BASH_MAX_OUTPUT_LENGTH',
-] as const
-
-// Snapshotted from the dev's shell and restored every test. These can't be
-// wiped (Node needs PATH for spawn / module resolution, dashboard/table layout
-// reads COLUMNS) but a test that mutates them shouldn't leak.
-const PRESERVED = ['PATH', 'COLUMNS'] as const
 const preservedSnapshot = new Map<string, string | undefined>()
 for (const key of PRESERVED) preservedSnapshot.set(key, process.env[key])
 
