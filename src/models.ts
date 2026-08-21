@@ -59,6 +59,11 @@ type SnapshotEntry = [number, number, number | null, number | null, (number | nu
 
 const LITELLM_URL = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json'
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000
+// Bump whenever a ModelCosts field changes pricing behavior (cacheWriteCostIsExplicit,
+// added in #1075/#1078). A cache written under an older/missing version is treated as a
+// miss instead of read verbatim, so a stale on-disk file can't reintroduce a killed bug
+// for up to CACHE_TTL_MS after an upgrade.
+const CACHE_SCHEMA_VERSION = 2
 const WEB_SEARCH_COST = 0.01
 const ONE_HOUR_CACHE_WRITE_MULTIPLIER_FROM_FIVE_MINUTE_RATE = 1.6
 
@@ -223,6 +228,7 @@ async function fetchAndCachePricing(): Promise<Map<string, ModelCosts>> {
 
   await mkdir(getCodeburnCacheDir(), { recursive: true })
   await writeFile(getCachePath(), JSON.stringify({
+    version: CACHE_SCHEMA_VERSION,
     timestamp: Date.now(),
     data: Object.fromEntries(pricing),
   }))
@@ -233,7 +239,8 @@ async function fetchAndCachePricing(): Promise<Map<string, ModelCosts>> {
 async function loadCachedPricing(): Promise<Map<string, ModelCosts> | null> {
   try {
     const raw = await readFile(getCachePath(), 'utf-8')
-    const cached = JSON.parse(raw) as { timestamp: number; data: Record<string, ModelCosts> }
+    const cached = JSON.parse(raw) as { version?: number; timestamp: number; data: Record<string, ModelCosts> }
+    if (cached.version !== CACHE_SCHEMA_VERSION) return null
     if (Date.now() - cached.timestamp > CACHE_TTL_MS) return null
     return new Map(Object.entries(cached.data))
   } catch {

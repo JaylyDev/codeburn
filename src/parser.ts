@@ -1768,7 +1768,7 @@ function buildSessionSummary(
       modelBreakdown[modelKey].tokens.reasoningTokens += call.usage.reasoningTokens
       if (call.activeDurationMs !== undefined) {
         modelBreakdown[modelKey].activeDurationMs = (modelBreakdown[modelKey].activeDurationMs ?? 0) + call.activeDurationMs
-        modelBreakdown[modelKey].activeGeneratedTokens = (modelBreakdown[modelKey].activeGeneratedTokens ?? 0) + (call.activeGeneratedTokens ?? billableOutputTokens(call.provider, call.usage.outputTokens, call.usage.reasoningTokens))
+        modelBreakdown[modelKey].activeGeneratedTokens = (modelBreakdown[modelKey].activeGeneratedTokens ?? 0) + (call.activeGeneratedTokens ?? call.usage.outputTokens + call.usage.reasoningTokens)
         modelBreakdown[modelKey].toolWaitMs = (modelBreakdown[modelKey].toolWaitMs ?? 0) + (call.toolWaitMs ?? 0)
       }
 
