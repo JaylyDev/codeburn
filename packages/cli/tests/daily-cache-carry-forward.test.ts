@@ -305,17 +305,12 @@ describe('never-lose invariant: invalidations with vanished sources', () => {
   })
 
   it('a version bump forces a re-derive that recovers usage the old cache never had', async () => {
-    // The pre-fix binary shipped daily-cache v16 (main's codex discovery
-    // fix spent 16; this PR's fixes land at 17). THIS LITERAL IS THE POINT:
-    // it must stay pinned to the version the pre-fix binary wrote, so a warm
-    // cache from that binary sits at daily-cache.v16.json, complete: true,
-    // with no opencode usage (the session-level fallback and pi/omp discovery
-    // fixes landed after). Only the MIN_SUPPORTED_VERSION bump decides
-    // whether that file loads as the trusted CURRENT cache — freezing the
-    // pre-fix zeroes forever — or as an old-version file that forces the
-    // one-time re-derive. When the next bump lands, move this literal to the
-    // version the current binary shipped.
-    const PRE_FIX_CACHE_VERSION = 16
+    // Pinned to 23, the base's DAILY_CACHE_VERSION immediately before this
+    // PR's bump to 24 — NOT computed as `DAILY_CACHE_VERSION - 1`, which
+    // would silently track any future bump and stop discriminating whether
+    // *this* bump actually happened. When the next bump lands, move this
+    // literal up to whatever DAILY_CACHE_VERSION was before that bump.
+    const PRE_FIX_CACHE_VERSION = 23
     const preFixCache: DailyCache = {
       version: PRE_FIX_CACHE_VERSION,
       savingsConfigHash: 'cfg-A',
