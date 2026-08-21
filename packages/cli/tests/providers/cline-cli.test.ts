@@ -509,30 +509,41 @@ describe('cline-cli provider - rollup fallback', () => {
     expect(calls[0]?.costUSD).toBeGreaterThan(0)
   })
 
-  it('keeps web-search requests out of the estimated-cost path', async () => {
+  it('reports web-search requests but never bills them, on either cost path', async () => {
     const fetchTool = { name: 'fetch_web_content', input: { url: 'https://example.com' } }
+    const metrics = { inputTokens: 1000, outputTokens: 100 }
     await writeSession(tmpDir, 'sess-a', {
       messages: [
         { role: 'user', text: 'go' },
-        { role: 'assistant', text: 'ok', metrics: { inputTokens: 1000, outputTokens: 100 }, toolUse: fetchTool },
+        { role: 'assistant', text: 'ok', metrics, toolUse: fetchTool },
       ],
     })
+    // Same tokens, no fetch: the estimated cost must not move between the two.
     await writeSession(tmpDir, 'sess-b', {
       messages: [
         { role: 'user', text: 'go' },
-        { role: 'assistant', text: 'ok', metrics: { inputTokens: 1000, outputTokens: 100, cost: 0.02 }, toolUse: fetchTool },
+        { role: 'assistant', text: 'ok', metrics },
+      ],
+    })
+    await writeSession(tmpDir, 'sess-c', {
+      messages: [
+        { role: 'user', text: 'go' },
+        { role: 'assistant', text: 'ok', metrics: { ...metrics, cost: 0.02 }, toolUse: fetchTool },
       ],
     })
 
     const calls = await collect(tmpDir)
-    const estimated = calls.find(c => c.costIsEstimated)
-    const metered = calls.find(c => !c.costIsEstimated)
+    const [withFetch, withoutFetch, metered] = calls
 
-    expect(estimated?.tools).toContain('WebFetch')
-    // Upstream prices this path with a hardcoded 0 requests; routing the real
-    // count into the pricing pass would bill $0.01 per fetch on top of tokens.
-    expect(estimated?.webSearchRequests).toBe(0)
+    // Upstream reports the count on every per-message call (it is an analytics
+    // field, not a billing input).
+    expect(withFetch?.tools).toContain('WebFetch')
+    expect(withFetch?.webSearchRequests).toBe(1)
     expect(metered?.webSearchRequests).toBe(1)
+    // ...and prices it with a hardcoded 0 requests: routing the count into the
+    // pricing pass would add $0.01 per fetch on top of the token cost.
+    expect(withFetch?.costUSD).toBe(withoutFetch?.costUSD)
+    expect(metered?.costUSD).toBe(0.02)
   })
 
   it('emits nothing for a session with neither message metrics nor a rollup', async () => {
