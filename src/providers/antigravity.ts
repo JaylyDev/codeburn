@@ -50,6 +50,11 @@ function conversationRoots(): readonly AntigravityConversationRoot[] {
   ]
 }
 const CACHE_VERSION = 5
+export const ANTIGRAVITY_CACHE_VERSION = CACHE_VERSION
+export const ANTIGRAVITY_LEGACY_CACHE_FILE = 'antigravity-results.json'
+export function antigravityCacheFileName(version = CACHE_VERSION): string {
+  return `antigravity-results.v${version}.json`
+}
 
 const RPC_TIMEOUT_MS = 5000
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -190,7 +195,15 @@ function currentCacheDir(): string {
 }
 
 function getCachePath(cacheDir: string): string {
-  return join(cacheDir, 'antigravity-results.json')
+  return join(cacheDir, antigravityCacheFileName())
+}
+
+function getLegacyCachePath(cacheDir: string): string {
+  return join(cacheDir, ANTIGRAVITY_LEGACY_CACHE_FILE)
+}
+
+function isCurrentCache(cache: AntigravityCache): boolean {
+  return cache.version === CACHE_VERSION && !!cache.cascades && typeof cache.cascades === 'object'
 }
 
 export function getAntigravityStatusLineEventsPath(): string {
@@ -339,12 +352,23 @@ async function loadCache(cacheDir: string): Promise<AntigravityCacheState> {
   try {
     const raw = await readFile(getCachePath(cacheDir), 'utf-8')
     const cache = JSON.parse(raw) as AntigravityCache
-    if (cache.version === CACHE_VERSION && cache.cascades && typeof cache.cascades === 'object') {
+    if (isCurrentCache(cache)) {
       const state = { cache, dirty: false }
       cacheStates.set(cacheDir, state)
       return state
     }
   } catch { /* no cache or invalid */ }
+  // Versioned file missing/unreadable. Adopt the unsuffixed file only when its
+  // version matches — old binaries still own that path; we never write or delete it.
+  try {
+    const raw = await readFile(getLegacyCachePath(cacheDir), 'utf-8')
+    const cache = JSON.parse(raw) as AntigravityCache
+    if (isCurrentCache(cache)) {
+      const state = { cache, dirty: false }
+      cacheStates.set(cacheDir, state)
+      return state
+    }
+  } catch { /* no legacy cache or invalid */ }
   const state: AntigravityCacheState = {
     cache: { version: CACHE_VERSION, cascades: {} },
     dirty: false,

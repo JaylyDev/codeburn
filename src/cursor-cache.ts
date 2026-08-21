@@ -19,7 +19,11 @@ import type { ParsedProviderCall } from './providers/types.js'
 // (cursor:composer-input:<id>) with per-conversation source selection, the
 // agent stream regained tool/system context and stream-only sessions, and
 // tool names are canonicalized. v5 results mix crediting regimes.
-const CURSOR_CACHE_VERSION = 6
+export const CURSOR_CACHE_VERSION = 6
+export const CURSOR_LEGACY_CACHE_FILE = 'cursor-results.json'
+export function cursorCacheFileName(version = CURSOR_CACHE_VERSION): string {
+  return `cursor-results.v${version}.json`
+}
 
 type ResultCache = {
   version?: number
@@ -29,10 +33,30 @@ type ResultCache = {
   calls: ParsedProviderCall[]
 }
 
-const CACHE_FILE = 'cursor-results.json'
-
 function getCachePath(): string {
-  return join(getCodeburnCacheDir(), CACHE_FILE)
+  return join(getCodeburnCacheDir(), cursorCacheFileName())
+}
+
+function getLegacyCachePath(): string {
+  return join(getCodeburnCacheDir(), CURSOR_LEGACY_CACHE_FILE)
+}
+
+function isCurrentHit(cache: ResultCache, fp: { mtimeMs: number; size: number }, requestedFloor: string): boolean {
+  return (
+    cache.version === CURSOR_CACHE_VERSION
+    && cache.dbMtimeMs === fp.mtimeMs
+    && cache.dbSizeBytes === fp.size
+    && typeof cache.lookbackFloor === 'string'
+    && cache.lookbackFloor <= requestedFloor
+  )
+}
+
+async function readCacheFile(path: string): Promise<ResultCache | null> {
+  try {
+    const cache = JSON.parse(await readFile(path, 'utf-8')) as ResultCache
+    if (cache && typeof cache === 'object') return cache
+  } catch {}
+  return null
 }
 
 async function getDbFingerprint(dbPath: string): Promise<{ mtimeMs: number; size: number } | null> {
@@ -52,18 +76,14 @@ export async function readCachedResults(
     const fp = await getDbFingerprint(dbPath)
     if (!fp) return null
 
-    const raw = await readFile(getCachePath(), 'utf-8')
-    const cache = JSON.parse(raw) as ResultCache
+    const versioned = await readCacheFile(getCachePath())
+    if (versioned && isCurrentHit(versioned, fp, requestedFloor)) return versioned.calls
+    if (versioned) return null
 
-    if (
-      cache.version === CURSOR_CACHE_VERSION &&
-      cache.dbMtimeMs === fp.mtimeMs &&
-      cache.dbSizeBytes === fp.size &&
-      typeof cache.lookbackFloor === 'string' &&
-      cache.lookbackFloor <= requestedFloor
-    ) {
-      return cache.calls
-    }
+    // Versioned file missing. Adopt the unsuffixed file only when its version
+    // and fingerprint match — old binaries still own that path.
+    const legacy = await readCacheFile(getLegacyCachePath())
+    if (legacy && isCurrentHit(legacy, fp, requestedFloor)) return legacy.calls
     return null
   } catch {
     return null
