@@ -22,8 +22,15 @@
 //       which is the part the corpus can honestly establish.
 //   dsh     did not exist in the published CLI. Reported; required to be absent
 //       in the baseline and present after the upgrade.
+//   codex   PRICING changed by design in #1075: reasoning tokens are billed
+//       inside output rather than on top of it, and cache writes are carved out
+//       of the input bucket. Nothing about what was PARSED moved, so codex keeps
+//       the full exact treatment for the call count and every token field; only
+//       the cost tolerance is lifted, and the delta is reported instead. Drop it
+//       from this list once a published CLI carries the fix.
 const EXACT = ['claude', 'codex', 'gemini', 'kiro', 'cursor']
 const CHANGED_BY_DESIGN = ['grok']
+const COST_CHANGED_BY_DESIGN = ['codex']
 const NEW_IN_THIS_RELEASE = ['dsh']
 
 const COST_TOLERANCE = 0.005 // 0.5% relative
@@ -95,7 +102,11 @@ for (const name of providers) {
     if (b.calls !== u.calls) diffs.push(`calls ${b.calls} != ${u.calls}`)
     for (const f of TOKEN_FIELDS) if (b[f] !== u[f]) diffs.push(`${f} ${b[f]} != ${u[f]}`)
     const costDrift = relDiff(b.cost, u.cost)
-    if (costDrift > COST_TOLERANCE) diffs.push(`cost ${fmt(b.cost)} != ${fmt(u.cost)} (${(costDrift * 100).toFixed(3)}% > ${(COST_TOLERANCE * 100).toFixed(1)}%)`)
+    if (COST_CHANGED_BY_DESIGN.includes(name)) {
+      notes.push(`${name}: cost ${fmt(b.cost)} -> ${fmt(u.cost)} (${(costDrift * 100).toFixed(3)}%) — repricing expected (#1075); tokens and calls still asserted exactly`)
+    } else if (costDrift > COST_TOLERANCE) {
+      diffs.push(`cost ${fmt(b.cost)} != ${fmt(u.cost)} (${(costDrift * 100).toFixed(3)}% > ${(COST_TOLERANCE * 100).toFixed(1)}%)`)
+    }
     if (!EXACT.includes(name)) {
       notes.push(`${name}: no expectation declared in compare.mjs; ${diffs.length ? diffs.join(', ') : 'identical'}`)
       verdict = diffs.length ? 'differs (unclassified)' : 'identical'

@@ -110,8 +110,17 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 20
-const MIN_SUPPORTED_VERSION = 20
+// v23: codex pricing fix (#1075) - reasoning tokens were billed on top of
+// output (they are a subset of it) and cache_write_input_tokens was ignored, so
+// days finalized at v20 carry codex costs overstated by ~3.5% and codex output
+// tokens overstated by ~34.6%. Raising MIN_SUPPORTED_VERSION forces the
+// one-time re-derivation.
+// It takes 23, not 21: v21 is claimed by the #946 landing branch and v22 by
+// PR #1056, so those numbers are spoken for and reusing one would let two
+// incompatible schemas share a filename. (feat/core-extraction sits at 26 and
+// reconciles at its final merge by keeping the max.)
+export const DAILY_CACHE_VERSION = 23
+const MIN_SUPPORTED_VERSION = 23
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including

@@ -13,6 +13,28 @@ export type ModelCosts = {
   cacheReadCostPerToken: number
   webSearchCostPerRequest: number
   fastMultiplier: number
+  /// True only when the pricing source carried a real cache-write rate. When
+  /// absent/false, `cacheWriteCostPerToken` is the fabricated `1.25 x input`
+  /// default, which is right for Anthropic-style pricing but would invent a
+  /// surcharge on providers that charge nothing extra to write cache. Callers
+  /// that decide WHICH bucket to put tokens in (rather than what to multiply
+  /// them by) must consult this before routing tokens to the cache-write
+  /// bucket. Optional so an incomplete literal defaults to the safe answer.
+  cacheWriteCostIsExplicit?: boolean
+}
+
+/// Providers whose reported `reasoningTokens` are a SUBSET of `outputTokens`
+/// rather than a separate bucket to add on top. OpenAI bills reasoning as part
+/// of output (every codex `token_count` event satisfies input + output ==
+/// total), and Anthropic folds thinking into output the same way, so summing
+/// the two double-counts both the cost and the displayed output tokens.
+const REASONING_INCLUDED_IN_OUTPUT = new Set(['claude', 'codex'])
+
+/// Output tokens to bill and display for one call. Single source of truth so
+/// the pricing sites and the display sums can never disagree about whether a
+/// provider's reasoning tokens are already inside its output count (#1075).
+export function billableOutputTokens(provider: string, outputTokens: number, reasoningTokens: number): number {
+  return REASONING_INCLUDED_IN_OUTPUT.has(provider) ? outputTokens : outputTokens + reasoningTokens
 }
 
 type PriceOverrideRates = {
@@ -71,6 +93,7 @@ function buildCosts(
     cacheReadCostPerToken: cacheRead ?? input * 0.1,
     webSearchCostPerRequest: WEB_SEARCH_COST,
     fastMultiplier: fast ?? 1,
+    cacheWriteCostIsExplicit: cacheWrite !== null && cacheWrite !== undefined,
   }
 }
 
