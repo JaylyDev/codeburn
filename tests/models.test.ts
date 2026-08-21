@@ -18,6 +18,7 @@ import {
   parseLiteLLMEntry,
 } from '../src/models.js'
 import { getDailyCacheConfigHash } from '../src/usage-aggregator.js'
+import snapshotData from '../src/data/litellm-snapshot.json' with { type: 'json' }
 
 beforeAll(async () => {
   await loadPricing()
@@ -79,6 +80,32 @@ describe('getModelCosts', () => {
     expect(getModelCosts('unknown/deepseek-v4-flash')).toBeNull()
     expect(getModelCosts('z-ai/glm-5.2')).not.toBeNull()
     expect(getModelCosts('z-ai/glm-5.3')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
+  })
+
+  it('prices gpt-5.6-codex and gpt-5.6-codex-max, sourced directly from the snapshot (#1077)', () => {
+    // Directly checks the bundled snapshot data (not just the resolved lookup),
+    // so this fails if the litellm-snapshot.json entries are ever reverted even
+    // though getModelCosts would still resolve both ids via the `gpt-5.6` prefix
+    // fallback - explicit rows are still correct and match every other Codex
+    // generation LiteLLM ships (gpt-5-codex, gpt-5.1-codex, gpt-5.1-codex-max,
+    // gpt-5.2-codex, gpt-5.3-codex all carry their base model's exact rate).
+    const snapshot = snapshotData as Record<string, unknown>
+    expect(snapshot['gpt-5.6-codex']).toEqual(snapshot['gpt-5.6'])
+    expect(snapshot['gpt-5.6-codex-max']).toEqual(snapshot['gpt-5.6'])
+
+    const codex = getModelCosts('gpt-5.6-codex')
+    const codexMax = getModelCosts('gpt-5.6-codex-max')
+    expect(codex).not.toBeNull()
+    expect(codexMax).not.toBeNull()
+    expect(codex!.inputCostPerToken).toBe(5e-6)
+    expect(codex!.outputCostPerToken).toBe(3e-5)
+    expect(codex!.cacheWriteCostPerToken).toBe(6.25e-6)
+    expect(codex!.cacheReadCostPerToken).toBe(5e-7)
+    expect(codex!.cacheWriteCostIsExplicit).toBe(true)
+    expect(codexMax).toEqual(codex)
+
+    expect(calculateCost('gpt-5.6-codex', 1_000_000, 1_000_000, 0, 0, 0)).toBeGreaterThan(0)
+    expect(calculateCost('gpt-5.6-codex-max', 1_000_000, 1_000_000, 0, 0, 0)).toBeGreaterThan(0)
   })
 
   // A price override on a synthetic bare id can only be reached if the leading

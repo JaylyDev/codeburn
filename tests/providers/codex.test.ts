@@ -724,9 +724,56 @@ describe('codex provider - JSONL parsing', () => {
       reasoningTokens: 20,
       tools: ['Bash'],
       activeDurationMs: 7000,
-      activeGeneratedTokens: 120,
+      // Reasoning (20) is a subset of output_tokens (100), not additive
+      // (#1075/#1078/#1079): the billable/throughput numerator is 100, not 120.
+      activeGeneratedTokens: 100,
       toolWaitMs: 3000,
     })
+  })
+
+  it('REGRESSION (#1088 BUG-1): excludes the task_started -> first request-context gap from active time', async () => {
+    // Codex fires task_started before it assembles the request; the 7s gap to
+    // the first request-context event (here, the user message) is CLI/harness
+    // startup, not model wait, and must not count toward active time. If this
+    // ever reverts to windowStart = taskStartedAt, activeDurationMs becomes
+    // 20000 (the full duration_ms) instead of 13000 (20000 - the 7s gap).
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-startup-gap.jsonl', [
+      sessionMeta({ session_id: 'sess-startup-gap', model: 'gpt-5.5' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started' } }),
+      userMessage('run the tool', '2026-04-14T10:00:07Z'),
+      tokenCount({ timestamp: '2026-04-14T10:00:20Z', last: { output: 100 }, total: { output: 100, total: 100 } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:20Z', payload: { type: 'task_complete', duration_ms: 20_000 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ activeGeneratedTokens: 100, activeDurationMs: 13_000, toolWaitMs: 0 })
+  })
+
+  it('#1088 BUG-8: reads a task_complete duration reported as {secs,nanos}, not only a plain number', async () => {
+    // mcp_tool_call_end already tolerates {secs,nanos} and string durations
+    // (durationValueMs); task_complete only read the plain-number duration_ms
+    // field, so a task_complete reported the object form was silently dropped
+    // (no active timing at all) instead of parsed.
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-object-duration.jsonl', [
+      sessionMeta({ session_id: 'sess-object-duration', model: 'gpt-5.5' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started' } }),
+      userMessage('run the tool', '2026-04-14T10:00:00Z'),
+      tokenCount({ timestamp: '2026-04-14T10:00:10Z', last: { output: 100 }, total: { output: 100, total: 100 } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:10Z', payload: { type: 'task_complete', duration: { secs: 10, nanos: 0 } } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ activeGeneratedTokens: 100, activeDurationMs: 10_000 })
   })
 
   it('keeps estimated output parsing for large token lines without usage info', async () => {

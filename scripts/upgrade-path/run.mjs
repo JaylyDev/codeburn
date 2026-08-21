@@ -33,7 +33,7 @@ const WORK = process.env['UPGRADE_PATH_WORK'] || join(tmpdir(), 'codeburn upgrad
 const OLD_SESSION_CACHE = 'session-cache.v7.json'
 const OLD_DAILY_CACHE = 'daily-cache.v17.json'
 const NEW_SESSION_CACHE_DIR = 'session-cache.v9'
-const NEW_DAILY_CACHE = 'daily-cache.v24.json'
+const NEW_DAILY_CACHE = 'daily-cache.v25.json'
 
 const HOME = join(WORK, 'user home')
 const PAYLOADS = join(WORK, 'payloads')
