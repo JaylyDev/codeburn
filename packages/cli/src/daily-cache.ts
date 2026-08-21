@@ -5,29 +5,28 @@ import { homedir } from 'os'
 import { join } from 'path'
 import type { DateRange, ProjectSummary } from './types.js'
 
-// Bumped to 17: range and day filters now slice a midnight-straddling turn
-// instead of filtering it as a unit (issue #852), so call-derived values
-// (cost, calls, savings, tokens) bucket under each call's own local day. A
-// v15 rollup finalized by the pre-fix binary holds the WHOLE turn on its
-// start day, and the new slicing then also puts the post-midnight half on
-// the next day — the same cost twice. Nothing downstream can notice on its
-// own: `usage-aggregator` serves every day before today from this cache, and
-// retention is ten years, so an upgrading user would keep the stale
-// whole-turn day N forever while day N+1 grew the sliced half. Raising
-// MIN_SUPPORTED_VERSION forces the one-time re-derivation: the new version
-// mints a fresh filename, adoption marks the result incomplete, and the next
-// hydration rebuilds every day within the retention window whose sources
-// survive under per-call bucketing — the re-derive parses the FULL retention
-// window, not the 365-day product backfill, so an old-but-still-sourced day
-// gets corrected too (days whose sources are gone are carried forward).
-//
-// v16 is SKIPPED: main already spent it on the codex structural-discovery
-// fix (eece4cf, #873/#626), which raised these same two constants to 16 with
-// a DIFFERENT meaning. Claiming 16 here too would make this binary load a
-// main-built v16 cache — which holds only the codex fix — as current and
-// complete, so the straddle re-derivation would never fire for anyone who
-// ever ran a main build. The next bump must take the next free number, not
-// the last one main used.
+// Bumped to 24: Codex discovery is structural instead of originator-gated
+// (#873/#626), so rollouts written by third-party frontends driving
+// `codex app-server` ("t3code_desktop", "JetBrains.IntelliJ IDEA", ...) now
+// contribute usage that older rollups never contained. Those files were
+// rejected before they were ever parsed, so nothing downstream can notice on
+// its own: `usage-aggregator` serves every day before today from this cache,
+// and retention is ten years, so an upgrading user with a warm cache would
+// keep the pre-fix history forever while today's numbers silently disagreed
+// with it. Raising MIN_SUPPORTED_VERSION forces the one-time re-derivation.
+// This branch was authored against v15/16, but main shipped 17 in v0.9.20 and
+// has since moved to 20, with 21 (#946) and 22 (#1056) claimed on the
+// main-side pipeline; this bump takes 24 so no real user's cache file — built
+// by any binary on either line of history — can be adopted as current without
+// the widened-discovery re-derivation firing. A lower number would let a
+// main-built cache pass isMigratableCache() unchanged and the fix would never
+// take effect for that user.
+// This branch also carries the midnight-straddle fix (#852): range and day
+// filters now slice a straddling turn per call instead of keeping it whole on
+// its anchor day, so a historical day already finalized by any earlier binary
+// holds calls that now belong to the next day. That is a second reason the
+// rollups must be re-derived once, and it is why this bump takes 24 — the next
+// free number after #926's 23 — rather than riding on that version.
 //
 // v15: per-project daily rollups. Days and provider slices now carry
 // a `projects` breakdown (cost/calls/savings/sessions per project) so project
@@ -81,8 +80,8 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 17
-const MIN_SUPPORTED_VERSION = 17
+export const DAILY_CACHE_VERSION = 24
+const MIN_SUPPORTED_VERSION = 24
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including
