@@ -6,6 +6,24 @@ import { join } from 'path'
 import { getCodeburnCacheDir } from './cache-dir.js'
 import type { DateRange, ProjectSummary } from './types.js'
 
+// Bumped to 20: the Codex fast-path read a nested
+// `base_instructions.provenance.model` out of `session_meta` as if it were
+// `payload.model` (#1040), so every call a rollout attributed from session
+// metadata - the ones before its first `turn_context`, and every one after a
+// mid-file `session_meta` - was credited to the wrong model. The codex parse
+// version and CODEX_CACHE_VERSION move with it, but the daily cache has no
+// per-provider invalidation, so days already finalized keep the wrong model
+// rows forever unless MIN_SUPPORTED_VERSION moves too. This pass re-derives
+// ALL days for EVERY provider off the warm session cache, so it costs seconds
+// rather than a full re-parse, and it is lossless: adoptOlderDailyCaches keeps
+// the superseded v19 file as the baseline, and the partial-survival guard from
+// #1033 holds any day whose sources have only partly aged out. On a real
+// 110-day cache the 19 -> 20 pass moved ZERO days down and lost none: 100 days
+// came back byte-identical and 9 grok days rose by $19.80 in total, clearing
+// rollups the grok parse change had left stale, while every codex model row
+// stayed identical (that corpus predates the `provenance` field, so the fix it
+// carries has nothing to correct there).
+//
 // Bumped to 19: Grok authoritative usage now keeps one session-level rollup
 // from top-level totals, clamps reasoning to reported output, and labels mixed
 // authoritative/heuristic coverage. Every day finalized under the previous
@@ -92,8 +110,8 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 19
-const MIN_SUPPORTED_VERSION = 19
+export const DAILY_CACHE_VERSION = 20
+const MIN_SUPPORTED_VERSION = 20
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including

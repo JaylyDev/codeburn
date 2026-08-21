@@ -19,7 +19,11 @@ import type { ParsedProviderCall } from './providers/types.js'
 // resumeState): they are additive and absence-safe in both directions, so a
 // bump would only throw away a warm multi-hundred-MB cache to gain nothing. An
 // entry without them simply re-parses in full once and gains them.
-const CODEX_CACHE_VERSION = 8
+// v9: parse large session_meta records structurally so nested provenance.model
+// cannot overwrite the model selected by turn_context.
+// v10: same depth-1 window for the rest of session_meta's raw string fields
+// (cwd/name/originator/session_id/forked_from_id/model_provider).
+const CODEX_CACHE_VERSION = 10
 const CACHE_FILE = 'codex-results.json'
 
 export type CodexFileFingerprint = { dev: number; ino: number; mtimeMs: number; sizeBytes: number }

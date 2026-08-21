@@ -570,6 +570,82 @@ describe('codex provider - session discovery', () => {
 })
 
 describe('codex provider - JSONL parsing', () => {
+  it('does not treat a nested session_meta model as the active turn model', async () => {
+    const largeSessionMeta = JSON.stringify({
+      type: 'session_meta',
+      timestamp: '2026-04-14T10:00:00Z',
+      payload: {
+        cwd: '/Users/test/model-switch',
+        originator: 'codex-cli',
+        session_id: 'sess-model-switch',
+        base_instructions: {
+          provenance: { type: 'model', model: 'gpt-5.6-sol' },
+          text: 'x'.repeat(40_000),
+        },
+      },
+    })
+    const turnContext = JSON.stringify({
+      type: 'turn_context',
+      timestamp: '2026-04-14T10:00:01Z',
+      payload: { model: 'gpt-5.6-luna' },
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-model-switch.jsonl', [
+      largeSessionMeta,
+      turnContext,
+      tokenCount({ timestamp: '2026-04-14T10:00:02Z', last: { input: 100, output: 50 }, total: { total: 150 } }),
+      largeSessionMeta,
+      tokenCount({ timestamp: '2026-04-14T10:00:03Z', last: { input: 200, output: 100 }, total: { total: 450 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls.map(call => call.model)).toEqual(['gpt-5.6-luna', 'gpt-5.6-luna'])
+  })
+
+  it('reads session_meta cwd/session_id/originator at payload depth 1, not the first nested same-name key', async () => {
+    const largeSessionMeta = JSON.stringify({
+      type: 'session_meta',
+      timestamp: '2026-04-14T10:00:00Z',
+      payload: {
+        dynamic_tools: [{
+          name: 'shadow-tool',
+          cwd: '/shadow/cwd',
+          originator: 'shadow-originator',
+          session_id: 'shadow-session',
+          forked_from_id: 'shadow-fork',
+          model_provider: 'shadow-provider',
+        }],
+        base_instructions: { text: 'x'.repeat(40_000) },
+        cwd: '/Users/test/real-project',
+        originator: 'codex-cli',
+        session_id: 'sess-real',
+        model: 'gpt-5.6-luna',
+        model_provider: 'openai',
+        name: 'real-session-name',
+      },
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-nested-keys.jsonl', [
+      largeSessionMeta,
+      functionCall('exec_command'),
+      tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 100, output: 50 }, total: { total: 150 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.sessionId).toBe('sess-real')
+    expect(calls[0]!.workingDirectory).toBe('/Users/test/real-project')
+    expect(calls[0]!.projectPath).toBe('/Users/test/real-project')
+    expect(calls[0]!.model).toBe('gpt-5.6-luna')
+    expect(calls[0]!.tools).toEqual(['Bash'])
+  })
+
   it('extracts token usage from last_token_usage', async () => {
     const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-parse.jsonl', [
       sessionMeta({ session_id: 'sess-parse', model: 'gpt-5.3-codex' }),

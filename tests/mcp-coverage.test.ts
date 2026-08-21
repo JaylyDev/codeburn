@@ -769,6 +769,29 @@ describe('detectMcpProfileAdvisor', () => {
     }
   })
 
+  it('scopes the remediation label to --provider codex', () => {
+    const hotTurns = [makeTurn([
+      makeCall({ tools: ['mcp__github__t0'], cacheCreation: 10_000 }),
+      makeCall({ tools: ['mcp__github__t1'], cacheCreation: 10_000 }),
+    ])]
+    const coldTurns = [makeTurn([makeCall({ cacheCreation: 10_000 })])]
+    const projects = [
+      projectNamed('api', [
+        makeSession({ inventory: smallInventory, turns: hotTurns, mcpBreakdown: { github: { calls: 2 } } }),
+      ]),
+      projectNamed('web', [
+        makeSession({ inventory: smallInventory, turns: coldTurns, mcpBreakdown: { github: { calls: 0 } } }),
+      ]),
+      projectNamed('docs', [
+        makeSession({ inventory: smallInventory, turns: coldTurns, mcpBreakdown: { github: { calls: 0 } } }),
+      ]),
+    ]
+    const finding = detectMcpProfileAdvisor(projects, undefined, 'codex')
+    expect(finding!.fix.label).toBe('Ask Codex to turn this into a project-scoped MCP profile:')
+    expect(finding!.fix.label).not.toContain('Claude')
+    expect(finding!.fix.label).not.toContain('CLAUDE.md')
+  })
+
   it('does not flag servers used evenly across loaded projects', () => {
     const projects = ['api', 'web', 'docs'].map(name => projectNamed(name, [
       makeSession({

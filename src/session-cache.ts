@@ -277,7 +277,11 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // rich-session-capture-v1: per-call LOC deltas + editFailed from
   // patch_apply_end. (The codex-results.json CODEX_CACHE_VERSION is bumped in
   // lockstep so the pre-session-cache layer re-parses too.)
-  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1',
+  // session-meta-model-v1: parse large session_meta records structurally so a
+  // nested base_instructions provenance.model cannot overwrite turn_context.
+  // session-meta-fields-v1: the same depth-1 window for cwd/name/originator/
+  // session_id/forked_from_id/model_provider, not just model.
+  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1-session-meta-fields-v1',
   cursor: 'composer-anchored-crediting-v1-est-cost',
   'cursor-agent': 'workspaceless-transcript-v1',
   // source-provenance-v1 (#944): CLI sessions were misread as VS Code
