@@ -308,7 +308,12 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // task_started boundary (see codex-cache.ts v12). Cached turns hold neither,
   // so bump in lockstep with that cache or session-cache.json keeps serving
   // timing-less turns without ever invoking the parser.
-  codex: 'mcp-attribution-v2-est-cost-rich-capture-v1-cross-provider-pr-v1-active-timing-v1',
+  // codex-pricing-v1 (#1075, ported in #1083): reasoning tokens are no longer
+  // added on top of output, and cache_write_input_tokens moves out of the plain
+  // input bucket on models with an explicit cache-write rate. The bucket move
+  // does NOT self-heal on read (cached entries store the buckets, not the raw
+  // event), so cached sessions must re-parse.
+  codex: 'mcp-attribution-v2-est-cost-rich-capture-v1-cross-provider-pr-v1-active-timing-v1-codex-pricing-v1',
   cursor: 'composer-anchored-crediting-v1-est-cost',
   'cursor-agent': 'workspaceless-transcript-v1',
   copilot: 'cli-shutdown-cost-v1-skills-dedup-key-hmac-v2',

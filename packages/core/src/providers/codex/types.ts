@@ -10,6 +10,10 @@
 export type CodexTokenUsage = {
   input_tokens?: number
   cached_input_tokens?: number
+  /// Portion of `input_tokens` that was WRITTEN to the prompt cache this call
+  /// (codex PR #33454). Like `cached_input_tokens`, it is carved out of
+  /// `input_tokens`, not added on top.
+  cache_write_input_tokens?: number
   output_tokens?: number
   reasoning_output_tokens?: number
   total_tokens?: number
@@ -64,6 +68,12 @@ export type CodexDecodedCall = {
   cacheCreationInputTokens: number
   cacheReadInputTokens: number
   cachedInputTokens: number
+  /// Cache-write tokens observed on this call, already clamped into
+  /// `inputTokens` (never larger than it) but NOT yet carved out of it: whether
+  /// they move into `cacheCreationInputTokens` depends on whether the pricing
+  /// source publishes a real cache-write rate for the model, which only the
+  /// host knows. The host's codex adapter does that split (#1075).
+  cacheWriteCandidateTokens: number
   reasoningTokens: number
   webSearchRequests: number
   tools: string[]
@@ -132,6 +142,7 @@ export type CodexDecodeState = {
   prevCumulativeTotal: number | null
   prevInput: number
   prevCached: number
+  prevCacheWrite: number
   prevOutput: number
   prevReasoning: number
   pendingTools: string[]

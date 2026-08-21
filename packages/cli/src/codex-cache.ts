@@ -42,7 +42,13 @@ import type { ParsedProviderCall } from './providers/types.js'
 // has since reached 11 (#1078), and a shared version number on two different
 // payload shapes would let a cache written by either line be read as current by
 // the other.
-const CODEX_CACHE_VERSION = 12
+//
+// v13: the #1075/#1078 codex pricing fix, ported here (#1083). Every cached
+// call carries `costUSD` verbatim and its token buckets, so v12 entries hold
+// costs with reasoning double-counted and cache writes never carved out of
+// input; the stored `state` also lacks `prevCacheWrite`. Bump once and let
+// unchanged sessions re-decode.
+const CODEX_CACHE_VERSION = 13
 const CACHE_FILE = 'codex-results.json'
 
 type FileFingerprint = { mtimeMs: number; sizeBytes: number }

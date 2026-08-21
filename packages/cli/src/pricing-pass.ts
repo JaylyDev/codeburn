@@ -1,4 +1,4 @@
-import { calculateCost } from './models.js'
+import { billableOutputTokens, calculateCost } from './models.js'
 import type { ParsedProviderCall } from './providers/types.js'
 
 // Host-side pricing pass (Phase 0 of the @codeburn/core extraction).
@@ -20,10 +20,14 @@ import type { ParsedProviderCall } from './providers/types.js'
 export function priceProviderCall(call: ParsedProviderCall): ParsedProviderCall {
   if (call.costBasis !== 'estimated') return call
 
-  // Mirror cachedCallToApiCall's non-claude branch: reasoning tokens are billed
-  // at the output rate. Provider calls never carry 1-hour cache tokens (the
-  // cache write path hardcodes them to 0), so the default 0 is correct here.
-  const outputForCost = call.outputTokens + call.reasoningTokens
+  // Mirror cachedCallToApiCall: reasoning tokens are billed at the output rate,
+  // except for the providers that already report reasoning INSIDE output
+  // (billableOutputTokens in models.ts), where adding it double-counts (#1075).
+  // Both sites go through that helper so a fresh parse and a cache-rehydrated
+  // read can never price the same call differently. Provider calls never carry
+  // 1-hour cache tokens (the cache write path hardcodes them to 0), so the
+  // default 0 is correct here.
+  const outputForCost = billableOutputTokens(call.provider, call.outputTokens, call.reasoningTokens)
   // Seam extension: price `pricingModel` when the decoder supplied one (its
   // display `model` differs from the model the price table is keyed by, e.g.
   // antigravity's suffix-stripped / aliased id). Falls back to `model` for
