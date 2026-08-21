@@ -283,14 +283,15 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'warp-auto-efficient':           'gpt-5.3-codex',
   'warp-auto-powerful':            'claude-opus-4-6',
   // Codex activity ids are product surfaces, not subscription SKUs and not
-  // LiteLLM rows. Official rate card (help.openai.com/articles/20001106,
-  // 2026-08-20): "Auto review uses GPT-5.4." Price as that existing row.
-  // Do not invent a rate. Do not treat the id as honestly $0 — it consumes
-  // the same credit pool as other Codex work. Display stays on
-  // autoModelNames (same class as cursor-auto / copilot-openai-auto).
+  // LiteLLM rows. OpenAI's tracker (openai/codex#32224) says auto review
+  // consumes normal model usage. Public evidence: review_model defaults to
+  // the session model; GPT-5.5 is the currently recommended review model.
+  // Price as that existing bundled row. Do not invent a rate. Do not treat
+  // the id as honestly $0 — it draws from the same credit pool. Display
+  // stays on autoModelNames (same class as cursor-auto / copilot-openai-auto).
   // Only alias ids observed in Codex source / real rollouts. Do not infer
   // `codex-code-review` from the activity name "code review".
-  'codex-auto-review':             'gpt-5.4',
+  'codex-auto-review':             'gpt-5.5',
   'grok-build':                    'grok-build-0.1',
   'GPT-5.3 Codex (low reasoning)': 'gpt-5.3-codex',
   'GPT-5.3 Codex (medium reasoning)': 'gpt-5.3-codex',

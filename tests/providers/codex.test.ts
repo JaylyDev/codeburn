@@ -1201,7 +1201,7 @@ describe('codex provider - forked session dedupe', () => {
 })
 
 describe('codex auto-review pricing (#1047)', () => {
-  it('parses auto-review as itself and prices it as GPT-5.4', async () => {
+  it('parses auto-review as itself and prices it as GPT-5.5', async () => {
     const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-auto-review.jsonl', [
       sessionMeta({ session_id: 'sess-auto', model: 'codex-auto-review' }),
       userMessage('review the PR'),
@@ -1218,7 +1218,7 @@ describe('codex auto-review pricing (#1047)', () => {
     }
     expect(calls).toHaveLength(1)
     expect(calls[0]!.model).toBe('codex-auto-review')
-    expect(calls[0]!.costUSD).toBe(calculateCost('gpt-5.4', 1_000_000, 1_000_000, 0, 0, 0))
+    expect(calls[0]!.costUSD).toBe(calculateCost('gpt-5.5', 1_000_000, 1_000_000, 0, 0, 0))
   })
 
   it('discards a warm v9 $0 exact hit so unchanged rollouts reprice', async () => {
@@ -1262,7 +1262,7 @@ describe('codex auto-review pricing (#1047)', () => {
       }
       expect(calls).toHaveLength(1)
       expect(calls[0]!.costUSD).toBeGreaterThan(0)
-      expect(calls[0]!.costUSD).toBe(calculateCost('gpt-5.4', 1_000_000, 1_000_000, 0, 0, 0))
+      expect(calls[0]!.costUSD).toBe(calculateCost('gpt-5.5', 1_000_000, 1_000_000, 0, 0, 0))
     } finally {
       clearCodexMemCaches()
       if (prev === undefined) delete process.env['CODEBURN_CACHE_DIR']

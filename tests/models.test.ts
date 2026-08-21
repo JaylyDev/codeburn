@@ -610,7 +610,7 @@ describe('Cursor model variants resolve to pricing', () => {
     // Cursor auto proxy
     ['cursor-auto', 'claude-sonnet-4-5'],
     // Codex activity surface (official rate card, observed raw id)
-    ['codex-auto-review', 'gpt-5.4'],
+    ['codex-auto-review', 'gpt-5.5'],
     // OpenAI variants Cursor emits
     ['gpt-5', 'gpt-5'],
     ['gpt-5-fast', 'gpt-5'],
@@ -651,12 +651,12 @@ describe('Codex activity ids (#1047)', () => {
     expect(getShortModelName('codex-auto-review')).toBe('Codex Auto Review')
   })
 
-  it('prices as the exact bundled GPT-5.4 object, not an invented rate', () => {
-    expect(getModelCosts('codex-auto-review')).toBe(getModelCosts('gpt-5.4'))
+  it('prices as the exact bundled GPT-5.5 object, not an invented rate', () => {
+    expect(getModelCosts('codex-auto-review')).toBe(getModelCosts('gpt-5.5'))
     const auto = calculateCost('codex-auto-review', 1_000_000, 1_000_000, 0, 0, 0)
-    const gpt54 = calculateCost('gpt-5.4', 1_000_000, 1_000_000, 0, 0, 0)
+    const gpt55 = calculateCost('gpt-5.5', 1_000_000, 1_000_000, 0, 0, 0)
     expect(auto).toBeGreaterThan(0)
-    expect(auto).toBe(gpt54)
+    expect(auto).toBe(gpt55)
   })
 
   it('does not invent a family or an unobserved sibling id', () => {

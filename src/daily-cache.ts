@@ -6,13 +6,17 @@ import { join } from 'path'
 import { getCodeburnCacheDir } from './cache-dir.js'
 import type { DateRange, ProjectSummary } from './types.js'
 
-// Bumped to 21: `codex-auto-review` now prices as the official GPT-5.4 row
-// (#1047). Days already finalized under v20 keep that id at $0 forever unless
-// MIN_SUPPORTED_VERSION moves: the daily cache has no per-provider
-// invalidation. The Codex parse version and CODEX_CACHE_VERSION move with
-// this so the lower caches reprice first; this pass then re-derives ALL days
-// from the warm session cache (seconds, not a full re-parse). adoptOlderDailyCaches
-// keeps the superseded v20 file as the baseline.
+// Bumped to 22: `codex-auto-review` now prices as the recommended GPT-5.5
+// row (#1047). Days already finalized under v20/v21 keep that id at $0
+// forever unless MIN_SUPPORTED_VERSION moves: the daily cache has no
+// per-provider invalidation. The Codex parse version and CODEX_CACHE_VERSION
+// move with this so the lower caches reprice first; this pass then re-derives
+// ALL days from the warm session cache (seconds, not a full re-parse).
+// adoptOlderDailyCaches keeps the superseded file as the baseline. v22 not
+// v21: #946 (in landing) already claims 21.
+//
+// Bumped to 21: unreleased on this branch; skipped so we do not collide
+// with #946's daily-cache.v21.json.
 //
 // Bumped to 20: the Codex fast-path read a nested
 // `base_instructions.provenance.model` out of `session_meta` as if it were
@@ -118,8 +122,8 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 21
-const MIN_SUPPORTED_VERSION = 21
+export const DAILY_CACHE_VERSION = 22
+const MIN_SUPPORTED_VERSION = 22
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including

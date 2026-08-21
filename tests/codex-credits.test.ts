@@ -17,6 +17,12 @@ describe('codexCreditRate', () => {
     expect(codexCreditRate('gpt-4o')).toBeNull()
     expect(codexCreditRate('claude-opus-4-8')).toBeNull()
   })
+
+  it('resolves the auto-review activity id to the same rate as GPT-5.5', () => {
+    expect(codexCreditRate('codex-auto-review')).toEqual(codexCreditRate('gpt-5.5'))
+    expect(codexCreditRate('codex-auto-review')).not.toBeNull()
+    expect(codexCreditRate('CODEX-AUTO-REVIEW')).toEqual(codexCreditRate('gpt-5.5'))
+  })
 })
 
 describe('codexCredits', () => {
@@ -49,5 +55,9 @@ describe('codexCredits', () => {
 
   it('returns null for an unknown model', () => {
     expect(codexCredits('gpt-4o', { inputTokens: 1_000_000, cachedReadTokens: 0, outputTokens: 0 })).toBeNull()
+  })
+
+  it('charges auto-review at the GPT-5.5 credit rate, not null', () => {
+    expect(codexCredits('codex-auto-review', { inputTokens: 1_000_000, cachedReadTokens: 0, outputTokens: 0 })).toBe(125)
   })
 })
