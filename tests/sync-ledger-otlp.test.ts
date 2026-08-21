@@ -156,6 +156,7 @@ describe('buildOtlpPayload', () => {
     expect(attrMap['ai.cost_usd']).toEqual({ doubleValue: 0.05 })
     expect(attrMap['ai.project']).toEqual({ stringValue: 'my-project' })
     expect(attrMap['ai.speed']).toEqual({ stringValue: 'standard' })
+    expect(attrMap['ai.session_id']).toBeUndefined()
   })
 
   it('includes tools as array attribute', () => {

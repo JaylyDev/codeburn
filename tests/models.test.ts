@@ -778,6 +778,7 @@ describe('DeepSeek v4 models resolve to pricing', () => {
       process.env['CODEBURN_CACHE_DIR'] = cacheRoot
       await mkdir(cacheRoot, { recursive: true })
       await writeFile(join(cacheRoot, 'litellm-pricing.json'), JSON.stringify({
+        version: 2, // must match models.ts's CACHE_SCHEMA_VERSION or the cache is treated as a miss
         timestamp: Date.now(),
         data: {
           'gpt-4o-mini': {
@@ -796,6 +797,42 @@ describe('DeepSeek v4 models resolve to pricing', () => {
       expect(getModelCosts('gpt-4o-mini')!.inputCostPerToken).toBe(9e-7)
       expect(getModelCosts('deepseek-v4-pro')!.inputCostPerToken).toBe(4.35e-7)
       expect(getModelCosts('deepseek-v4-flash')!.inputCostPerToken).toBe(1.4e-7)
+    } finally {
+      await rm(cacheRoot, { recursive: true, force: true })
+      await loadPricing()
+    }
+  })
+})
+
+describe('pricing cache schema version (#1075/#1078 follow-up)', () => {
+  it('discards a cache written by a pre-#1078 binary instead of reading its missing cacheWriteCostIsExplicit as false', async () => {
+    const cacheRoot = await mkdtemp(join(tmpdir(), 'codeburn-pricing-cache-'))
+    try {
+      process.env['CODEBURN_CACHE_DIR'] = cacheRoot
+      await mkdir(cacheRoot, { recursive: true })
+      // Shape of a cache file written before #1078 added `version` and
+      // `cacheWriteCostIsExplicit`: no version field, and entries missing the
+      // key despite carrying a real (non-default) cache-write rate.
+      await writeFile(join(cacheRoot, 'litellm-pricing.json'), JSON.stringify({
+        timestamp: Date.now(),
+        data: {
+          'gpt-5.6': {
+            inputCostPerToken: 5e-6,
+            outputCostPerToken: 3e-5,
+            cacheWriteCostPerToken: 6.25e-6,
+            cacheReadCostPerToken: 5e-7,
+            webSearchCostPerRequest: 0.01,
+            fastMultiplier: 1,
+          },
+        },
+      }), 'utf-8')
+
+      await loadPricing()
+
+      // Pre-fix, loadCachedPricing had no version check: it would read this
+      // cache verbatim, and gpt-5.6's missing key would resolve to undefined
+      // (falsy) here instead of the true its LiteLLM entry actually carries.
+      expect(getModelCosts('gpt-5.6')!.cacheWriteCostIsExplicit).toBe(true)
     } finally {
       await rm(cacheRoot, { recursive: true, force: true })
       await loadPricing()
@@ -940,6 +977,7 @@ describe('findUnpricedModels', () => {
     try {
       process.env['CODEBURN_CACHE_DIR'] = cacheRoot
       await writeFile(join(cacheRoot, 'litellm-pricing.json'), JSON.stringify({
+        version: 2, // must match models.ts's CACHE_SCHEMA_VERSION or the cache is treated as a miss
         timestamp: Date.now(),
         data: {
           'zz-zero-stub-model': {

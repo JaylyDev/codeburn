@@ -6,17 +6,14 @@ import { join } from 'path'
 import { getCodeburnCacheDir } from './cache-dir.js'
 import type { DateRange, ProjectSummary } from './types.js'
 
-// Bumped to 22: `codex-auto-review` now prices as the recommended GPT-5.5
-// row (#1047). Days already finalized under v20/v21 keep that id at $0
+// Bumped to 24: `codex-auto-review` now prices as the recommended GPT-5.5
+// row (#1047). Days already finalized under v23 keep that id at $0
 // forever unless MIN_SUPPORTED_VERSION moves: the daily cache has no
 // per-provider invalidation. The Codex parse version and CODEX_CACHE_VERSION
 // move with this so the lower caches reprice first; this pass then re-derives
 // ALL days from the warm session cache (seconds, not a full re-parse).
-// adoptOlderDailyCaches keeps the superseded file as the baseline. v22 not
-// v21: #946 (in landing) already claims 21.
-//
-// Bumped to 21: unreleased on this branch; skipped so we do not collide
-// with #946's daily-cache.v21.json.
+// adoptOlderDailyCaches keeps the superseded file as the baseline. v21 is
+// #946, v22 was this PR's previous claim, v23 is #1075 on main.
 //
 // Bumped to 20: the Codex fast-path read a nested
 // `base_instructions.provenance.model` out of `session_meta` as if it were
@@ -122,8 +119,18 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 22
-const MIN_SUPPORTED_VERSION = 22
+// v23: codex pricing fix (#1075) - reasoning tokens were billed on top of
+// output (they are a subset of it) and cache_write_input_tokens was ignored, so
+// days finalized at v20 carry codex costs overstated by ~3.5% and codex output
+// tokens overstated by ~34.6%. Raising MIN_SUPPORTED_VERSION forces the
+// one-time re-derivation.
+// It takes 23, not 21: v21 is claimed by the #946 landing branch and v22 by
+// PR #1056, so those numbers are spoken for and reusing one would let two
+// incompatible schemas share a filename. (feat/core-extraction sits at 26 and
+// reconciles at its final merge by keeping the max.)
+// v24: #1047 activity-id pricing. v23 on main already shipped #1075.
+export const DAILY_CACHE_VERSION = 24
+const MIN_SUPPORTED_VERSION = 24
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including

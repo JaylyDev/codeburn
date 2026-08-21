@@ -2,7 +2,7 @@ import { existsSync } from 'fs'
 import { lstat, readFile, readdir, stat } from 'fs/promises'
 import { basename, dirname, join, resolve, sep } from 'path'
 import { readSessionLines } from './fs-utils.js'
-import { calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
+import { billableOutputTokens, calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
 import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
 import { normalizeContentBlocks, flatSlice, flatString } from './content-utils.js'
 import { discoverAllSessions, getProvider } from './providers/index.js'
@@ -2629,9 +2629,11 @@ function providerCallsToCachedTurns(calls: ParsedProviderCall[]): CachedTurn[] {
 
 function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
   const u = call.usage
-  const outputForCost = call.provider === 'claude'
-    ? u.outputTokens
-    : u.outputTokens + u.reasoningTokens
+  // Cache-rehydration twin of the fresh-parse pricing in
+  // src/providers/codex.ts (and every other provider's parser): both go
+  // through billableOutputTokens so a cached read and a cold parse can never
+  // disagree about whether reasoning is already inside output (#1075).
+  const outputForCost = billableOutputTokens(call.provider, u.outputTokens, u.reasoningTokens)
   const costUSD = calculateCost(
     call.model, u.inputTokens, outputForCost,
     u.cacheCreationInputTokens, u.cacheReadInputTokens,

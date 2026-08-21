@@ -38,11 +38,6 @@ describe('codexCredits', () => {
     expect(codexCredits('gpt-5.5', { inputTokens: 0, cachedReadTokens: 1_000_000, outputTokens: 0 })).toBe(12.5)
   })
 
-  it('folds reasoning tokens into the output rate', () => {
-    // 500k output + 500k reasoning = 1M output-billed => 750 credits.
-    expect(codexCredits('gpt-5.5', { inputTokens: 0, cachedReadTokens: 0, outputTokens: 500_000, reasoningTokens: 500_000 })).toBe(750)
-  })
-
   it('sums a mixed record (gpt-5.4)', () => {
     // 2M input (125) + 1M cached (6.25) + 0.5M output (187.5) = 318.75
     const credits = codexCredits('gpt-5.4', { inputTokens: 2_000_000, cachedReadTokens: 1_000_000, outputTokens: 500_000 })

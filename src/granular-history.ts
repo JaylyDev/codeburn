@@ -64,6 +64,7 @@ type SessionLabelEntry = {
   key: string
   info: SessionLabelInfo
   baseLabel: string
+  idFirst: string
 }
 
 function nonNegative(value: number): number {
@@ -174,19 +175,41 @@ function preferredSessionTitle(titleCandidates: Map<string, SessionTitleCandidat
   return cleaned[0]?.title
 }
 
+// Chart legend is `max-w-40` at 10px ≈ 24–32 glyphs. A title that is unique in
+// that window can lead; otherwise the short id must stay in the prefix or
+// truncated series look identical (the #997 class). Count code points, matching
+// the title cap — a UTF-16 slice can split an emoji and collide two titles.
+const VISIBLE_LEGEND_PREFIX = 24
+
+function visibleLegendPrefix(label: string): string {
+  return Array.from(label).slice(0, VISIBLE_LEGEND_PREFIX).join('')
+}
+
 function buildSessionLabels(inputs: Map<string, SessionLabelInfo>): Map<string, string> {
   // Stable raw-key order makes the residual used-label guard independent of
   // project/session discovery order when a title happens to match another
   // label shape.
-  const entries: SessionLabelEntry[] = [...inputs.entries()].map(([key, info]) => {
-    const sessionLabel = preferredSessionTitle(info.titleCandidates)
-      ?? shortProjectLabel(info.projectPath, preferredProjectName(info.projectNames))
-    return {
-      key,
-      info,
-      baseLabel: `${shortSessionId(info.sessionId)} (${info.provider}) · ${sessionLabel}`,
-    }
+  const draft: SessionLabelEntry[] = [...inputs.entries()].map(([key, info]) => {
+    const title = preferredSessionTitle(info.titleCandidates)
+    const project = shortProjectLabel(info.projectPath, preferredProjectName(info.projectNames))
+    const shortId = shortSessionId(info.sessionId)
+    const idFirst = title
+      ? `${shortId} (${info.provider}) · ${title}`
+      : `${shortId} (${info.provider}) · ${project}`
+    const titleFirst = title ? `${title} (${info.provider})` : idFirst
+    return { key, info, baseLabel: titleFirst, idFirst }
   }).sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0)
+
+  const titlePrefixCounts = new Map<string, number>()
+  for (const entry of draft) {
+    const prefix = visibleLegendPrefix(entry.baseLabel)
+    titlePrefixCounts.set(prefix, (titlePrefixCounts.get(prefix) ?? 0) + 1)
+  }
+  const entries: SessionLabelEntry[] = draft.map(entry => {
+    const prefix = visibleLegendPrefix(entry.baseLabel)
+    const titleLeads = (titlePrefixCounts.get(prefix) ?? 0) === 1
+    return { ...entry, baseLabel: titleLeads ? entry.baseLabel : entry.idFirst }
+  })
   const byBaseLabel = new Map<string, SessionLabelEntry[]>()
   for (const entry of entries) {
     const group = byBaseLabel.get(entry.baseLabel) ?? []

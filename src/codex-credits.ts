@@ -45,9 +45,9 @@ export type CodexCreditTokens = {
   inputTokens: number
   /// Cache-read (cached input) tokens, billed at the cheaper cached rate.
   cachedReadTokens: number
+  /// Billable output tokens: reasoning is already included (billableOutputTokens
+  /// in models.ts), so callers must not add it on top here.
   outputTokens: number
-  /// Reasoning tokens are billed as output, matching CodeBurn's cost model.
-  reasoningTokens?: number
 }
 
 /// Credits consumed for one Codex usage record. Returns null when the model has
@@ -57,10 +57,9 @@ export function codexCredits(model: string, tokens: CodexCreditTokens): number |
   if (!rate) return null
   const safe = (n: number) => (Number.isFinite(n) && n > 0 ? n : 0)
   const PER_MILLION = 1_000_000
-  const output = safe(tokens.outputTokens) + safe(tokens.reasoningTokens ?? 0)
   return (
     (safe(tokens.inputTokens) / PER_MILLION) * rate.input +
     (safe(tokens.cachedReadTokens) / PER_MILLION) * rate.cachedInput +
-    (output / PER_MILLION) * rate.output
+    (safe(tokens.outputTokens) / PER_MILLION) * rate.output
   )
 }

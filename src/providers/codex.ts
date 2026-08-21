@@ -5,7 +5,7 @@ import { basename, join } from 'path'
 import { homedir } from 'os'
 
 import { readSessionLines } from '../fs-utils.js'
-import { calculateCost } from '../models.js'
+import { billableOutputTokens, calculateCost, getModelCosts } from '../models.js'
 import { readCachedCodexResults, writeCachedCodexResults, getCachedCodexProject, fingerprintFile, type CodexFileFingerprint } from '../codex-cache.js'
 import { normalizeContentBlocks } from '../content-utils.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
@@ -126,6 +126,10 @@ type CodexEntry = {
 type CodexTokenUsage = {
   input_tokens?: number
   cached_input_tokens?: number
+  /// Portion of `input_tokens` that was WRITTEN to the prompt cache this call
+  /// (codex PR #33454). Like `cached_input_tokens`, it is carved out of
+  /// `input_tokens`, not added on top.
+  cache_write_input_tokens?: number
   output_tokens?: number
   reasoning_output_tokens?: number
   total_tokens?: number
@@ -323,6 +327,7 @@ function getRawTokenUsage(head: string, field: 'last_token_usage' | 'total_token
   return {
     input_tokens: getRawJsonNumberField(body, 'input_tokens'),
     cached_input_tokens: getRawJsonNumberField(body, 'cached_input_tokens'),
+    cache_write_input_tokens: getRawJsonNumberField(body, 'cache_write_input_tokens'),
     output_tokens: getRawJsonNumberField(body, 'output_tokens'),
     reasoning_output_tokens: getRawJsonNumberField(body, 'reasoning_output_tokens'),
     total_tokens: getRawJsonNumberField(body, 'total_tokens'),
@@ -593,6 +598,7 @@ type CodexResumeState = {
   prevCumulativeTotal: number | null
   prevInput: number
   prevCached: number
+  prevCacheWrite: number
   prevOutput: number
   prevReasoning: number
   pendingTools: string[]
@@ -619,6 +625,7 @@ function isResumeState(value: unknown): value is CodexResumeState {
     && (v['prevCumulativeTotal'] === null || typeof v['prevCumulativeTotal'] === 'number')
     && typeof v['prevInput'] === 'number'
     && typeof v['prevCached'] === 'number'
+    && typeof v['prevCacheWrite'] === 'number'
     && typeof v['prevOutput'] === 'number'
     && typeof v['prevReasoning'] === 'number'
     && Array.isArray(v['pendingTools'])
@@ -678,6 +685,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
       let prevCumulativeTotal: number | null = resume?.state.prevCumulativeTotal ?? null
       let prevInput = resume?.state.prevInput ?? 0
       let prevCached = resume?.state.prevCached ?? 0
+      let prevCacheWrite = resume?.state.prevCacheWrite ?? 0
       let prevOutput = resume?.state.prevOutput ?? 0
       let prevReasoning = resume?.state.prevReasoning ?? 0
       let pendingTools: string[] = resume ? [...resume.state.pendingTools] : []
@@ -795,6 +803,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             prevCumulativeTotal,
             prevInput,
             prevCached,
+            prevCacheWrite,
             prevOutput,
             prevReasoning,
             pendingTools: [...pendingTools],
@@ -1014,12 +1023,14 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           const last = info.last_token_usage
           let inputTokens = 0
           let cachedInputTokens = 0
+          let cacheWriteTokens = 0
           let outputTokens = 0
           let reasoningTokens = 0
 
           if (last) {
             inputTokens = last.input_tokens ?? 0
             cachedInputTokens = last.cached_input_tokens ?? 0
+            cacheWriteTokens = last.cache_write_input_tokens ?? 0
             outputTokens = last.output_tokens ?? 0
             reasoningTokens = last.reasoning_output_tokens ?? 0
           } else if (cumulativeTotal > 0) {
@@ -1027,6 +1038,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             if (!total) continue
             inputTokens = (total.input_tokens ?? 0) - prevInput
             cachedInputTokens = (total.cached_input_tokens ?? 0) - prevCached
+            cacheWriteTokens = (total.cache_write_input_tokens ?? 0) - prevCacheWrite
             outputTokens = (total.output_tokens ?? 0) - prevOutput
             reasoningTokens = (total.reasoning_output_tokens ?? 0) - prevReasoning
           }
@@ -1042,6 +1054,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           if (total) {
             prevInput = total.input_tokens ?? 0
             prevCached = total.cached_input_tokens ?? 0
+            prevCacheWrite = total.cache_write_input_tokens ?? 0
             prevOutput = total.output_tokens ?? 0
             prevReasoning = total.reasoning_output_tokens ?? 0
           }
@@ -1053,7 +1066,22 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           // Normalize to Anthropic semantics: inputTokens = non-cached only.
           const uncachedInputTokens = Math.max(0, inputTokens - cachedInputTokens)
 
+          // Cache writes are carved out of the uncached input, never added to
+          // it: clamp so a malformed or lagging count can never drive the plain
+          // input bucket negative.
+          const cacheWriteInputTokens = Math.max(0, Math.min(cacheWriteTokens, uncachedInputTokens))
+
           const model = resolveModel(entry.payload, sessionModel)
+          // Only move tokens into the cache-write bucket when the pricing
+          // source publishes a real cache-write rate for this model (gpt-5.6+
+          // charges 1.25x input; everything before it charges nothing extra).
+          // Otherwise buildCosts' fabricated 1.25x default would invent a
+          // surcharge that OpenAI never billed, so the tokens stay where they
+          // already were -- in plain input, priced exactly as before.
+          const billedCacheWriteTokens = cacheWriteInputTokens > 0 && getModelCosts(model)?.cacheWriteCostIsExplicit
+            ? cacheWriteInputTokens
+            : 0
+          const billedInputTokens = uncachedInputTokens - billedCacheWriteTokens
           const timestamp = entry.timestamp ?? ''
           // Forked sessions copy the parent's entire token_count history
           // (re-timestamped), so replays must collide with the parent's events
@@ -1074,11 +1102,15 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           if (seenKeys.has(dedupKey)) continue
           seenKeys.add(dedupKey)
 
+          // Reasoning tokens are already inside output_tokens, so they are NOT
+          // added here. The cache-rehydration twin of this line lives in
+          // src/parser.ts (cachedCallToApiCall); both call billableOutputTokens
+          // so a fresh parse and a cache read can never price differently.
           const costUSD = calculateCost(
             model,
-            uncachedInputTokens,
-            outputTokens + reasoningTokens,
-            0,
+            billedInputTokens,
+            billableOutputTokens('codex', outputTokens, reasoningTokens),
+            billedCacheWriteTokens,
             cachedInputTokens,
             0,
           )
@@ -1086,9 +1118,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           pendingTaskCalls.push({
             provider: 'codex',
             model,
-            inputTokens: uncachedInputTokens,
+            inputTokens: billedInputTokens,
             outputTokens,
-            cacheCreationInputTokens: 0,
+            cacheCreationInputTokens: billedCacheWriteTokens,
             cacheReadInputTokens: cachedInputTokens,
             cachedInputTokens,
             reasoningTokens,

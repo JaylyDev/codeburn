@@ -8,6 +8,32 @@ const quota = (provider: 'claude' | 'codex'): QuotaProvider => ({
 })
 
 describe('QuotaService', () => {
+  // The snap declares no Codex credential path, because the live gauge would
+  // need write access to the Codex CLI's own auth.json to rotate the token.
+  // Under $SNAP the Codex fetch must not run at all; Claude is unaffected.
+  it('skips the Codex live gauge under snap confinement', async () => {
+    const previous = process.env['SNAP']
+    process.env['SNAP'] = '/snap/codeburn/current'
+    try {
+      const claude = vi.fn(async () => ({ quota: quota('claude') }))
+      const codex = vi.fn(async () => ({ quota: quota('codex') }))
+      const service = new QuotaService({
+        claude, codex, now: () => Date.parse('2026-08-14T00:00:00Z'),
+        readFile: vi.fn(async () => null),
+        writeFile: vi.fn(async () => {}),
+        statePath: '/mock/backoff.json',
+      })
+      const [claudeQuota, codexQuota] = await service.getQuota({ force: true })
+      expect(codex).not.toHaveBeenCalled()
+      expect(claude).toHaveBeenCalledTimes(1)
+      expect(codexQuota?.connection).toBe('disconnected')
+      expect(claudeQuota?.connection).toBe('connected')
+    } finally {
+      if (previous === undefined) delete process.env['SNAP']
+      else process.env['SNAP'] = previous
+    }
+  })
+
   it('persists provider 429 blocked-until and gates the next forced fetch', async () => {
     const writes: string[] = []
     const claude = vi.fn(async () => ({ quota: quota('claude'), retryAfterSeconds: 60 }))

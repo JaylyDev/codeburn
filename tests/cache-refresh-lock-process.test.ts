@@ -79,7 +79,12 @@ describe('warm refresh child-process regression', () => {
     const loserOutcome = await waitForAny(barriers, [
       `${loser}.timed-out`, `${loser}.parsed`, `${loser}.completed-by-other`, `${loser}.unavailable`,
     ])
-    expect(loserOutcome, (await readdir(barriers)).join(',')).toBe(`${loser}.timed-out`)
+    // Exactly one owner publishes. The loser of a stale-lock contest is not
+    // the owner: `timed-out` is the usual wait-out, but missing+missing during
+    // the winner's unlink-guard/create-successor gap is honestly
+    // `completed-by-other` (#904). Do not require timed-out.
+    expect(loserOutcome, (await readdir(barriers)).join(',')).not.toBe(`${loser}.parsed`)
+    expect([`${loser}.timed-out`, `${loser}.completed-by-other`, `${loser}.unavailable`]).toContain(loserOutcome)
     await writeFile(join(barriers, `${winner}.save`), '')
     await Promise.all([waitForExit(a), waitForExit(b)])
     await expect(stat(join(cacheDir, 'session-refresh.lock.takeover'))).rejects.toMatchObject({ code: 'ENOENT' })
@@ -113,7 +118,12 @@ describe('warm refresh child-process regression', () => {
     const loserOutcome = await waitForAny(barriers, [
       `${loser}.timed-out`, `${loser}.parsed`, `${loser}.completed-by-other`, `${loser}.unavailable`,
     ])
-    expect(loserOutcome, (await readdir(barriers)).join(',')).toBe(`${loser}.timed-out`)
+    // Exactly one owner publishes. The loser of a stale-lock contest is not
+    // the owner: `timed-out` is the usual wait-out, but missing+missing during
+    // the winner's unlink-guard/create-successor gap is honestly
+    // `completed-by-other` (#904). Do not require timed-out.
+    expect(loserOutcome, (await readdir(barriers)).join(',')).not.toBe(`${loser}.parsed`)
+    expect([`${loser}.timed-out`, `${loser}.completed-by-other`, `${loser}.unavailable`]).toContain(loserOutcome)
     await writeFile(join(barriers, `${winner}.save`), '')
     await Promise.all([waitForExit(a), waitForExit(b)])
     await expect(stat(join(cacheDir, 'session-refresh.lock.takeover'))).rejects.toMatchObject({ code: 'ENOENT' })

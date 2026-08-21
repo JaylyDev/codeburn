@@ -4,7 +4,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 
 import { createCodexProvider } from '../../src/providers/codex.js'
-import { clearCodexMemCaches } from '../../src/codex-cache.js'
+import { clearCodexMemCaches, CODEX_CACHE_VERSION, codexCacheFileName } from '../../src/codex-cache.js'
 import { calculateCost } from '../../src/models.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
@@ -1221,7 +1221,7 @@ describe('codex auto-review pricing (#1047)', () => {
     expect(calls[0]!.costUSD).toBe(calculateCost('gpt-5.5', 1_000_000, 1_000_000, 0, 0, 0))
   })
 
-  it('discards a warm v9 $0 exact hit so unchanged rollouts reprice', async () => {
+  it('discards a warm v11 versioned $0 exact hit so unchanged rollouts reprice', async () => {
     const cacheDir = join(tmpDir, 'cache')
     await mkdir(cacheDir, { recursive: true })
     const prev = process.env['CODEBURN_CACHE_DIR']
@@ -1237,8 +1237,11 @@ describe('codex auto-review pricing (#1047)', () => {
         }),
       ])
       const st = await stat(filePath)
-      await writeFile(join(cacheDir, 'codex-results.json'), JSON.stringify({
-        version: 9,
+      // Main's #1075 already owns v11. A colliding v11 $0 file must not be
+      // treated as current after this PR takes v12.
+      expect(CODEX_CACHE_VERSION).toBeGreaterThan(11)
+      await writeFile(join(cacheDir, codexCacheFileName(11)), JSON.stringify({
+        version: 11,
         files: {
           [filePath]: {
             mtimeMs: st.mtimeMs,
