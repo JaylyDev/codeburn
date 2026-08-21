@@ -1,3 +1,8 @@
+// FIRST import: pins the host privacy key before anything can read it. The
+// JetBrains dedup keys below embed an HMAC keyed with it, so without the pin
+// every `copilot:jb:...` literal here would be a random per-run value.
+import '../setup/fixed-privacy-key.js'
+
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises'
 import { join, basename, dirname } from 'path'
@@ -724,7 +729,7 @@ const G5_GOLDEN: ParsedProviderCall[] = [
     "bashCommands": [],
     "timestamp": "2026-07-03T12:00:00.000Z",
     "speed": "standard",
-    "deduplicationKey": "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:29c75429dae1:1",
+    "deduplicationKey": "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:9907719707c3:1",
     "userMessage": "Conversation B"
   },
   {
@@ -745,7 +750,7 @@ const G5_GOLDEN: ParsedProviderCall[] = [
     "bashCommands": [],
     "timestamp": "2026-07-03T12:00:00.000Z",
     "speed": "standard",
-    "deduplicationKey": "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:55e5aea23f97:1",
+    "deduplicationKey": "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:6b4d59c0e74e:1",
     "userMessage": "Conversation B"
   },
   {
@@ -766,7 +771,7 @@ const G5_GOLDEN: ParsedProviderCall[] = [
     "bashCommands": [],
     "timestamp": "2026-07-03T12:00:00.000Z",
     "speed": "standard",
-    "deduplicationKey": "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:e3b0c44298fc:1",
+    "deduplicationKey": "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:01e02c77fe38:1",
     "userMessage": "Conversation B"
   },
   {
@@ -787,16 +792,16 @@ const G5_GOLDEN: ParsedProviderCall[] = [
     "bashCommands": [],
     "timestamp": "2026-07-03T12:00:00.000Z",
     "speed": "standard",
-    "deduplicationKey": "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:eff208336025:1",
+    "deduplicationKey": "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:ada6313a0808:1",
     "userMessage": "Conversation B"
   }
 ]
 
 const G5_KEYS = [
-  "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:29c75429dae1:1",
-  "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:55e5aea23f97:1",
-  "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:e3b0c44298fc:1",
-  "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:eff208336025:1"
+  "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:01e02c77fe38:1",
+  "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:6b4d59c0e74e:1",
+  "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:9907719707c3:1",
+  "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:ada6313a0808:1"
 ]
 
 const G6_GOLDEN: ParsedProviderCall[] = [
@@ -818,13 +823,13 @@ const G6_GOLDEN: ParsedProviderCall[] = [
     "bashCommands": [],
     "timestamp": "2026-07-03T12:00:00.000Z",
     "speed": "standard",
-    "deduplicationKey": "copilot:jb:17a5d71b-27f7-4937-8803-7fc2cbb705cb:a4d4d9a6916b:1",
+    "deduplicationKey": "copilot:jb:17a5d71b-27f7-4937-8803-7fc2cbb705cb:31950016be99:1",
     "userMessage": "Understanding HBase Architecture"
   }
 ]
 
 const G6_KEYS = [
-  "copilot:jb:17a5d71b-27f7-4937-8803-7fc2cbb705cb:a4d4d9a6916b:1"
+  "copilot:jb:17a5d71b-27f7-4937-8803-7fc2cbb705cb:31950016be99:1"
 ]
 
 const G7_GOLDEN: ParsedProviderCall[] = [
@@ -1167,7 +1172,7 @@ const G13_GOLDEN: ParsedProviderCall[] = [
     "bashCommands": [],
     "timestamp": "2026-07-03T12:00:00.000Z",
     "speed": "standard",
-    "deduplicationKey": "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:eff208336025:1",
+    "deduplicationKey": "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:ada6313a0808:1",
     "userMessage": "Conversation X7"
   },
   {
@@ -1188,14 +1193,14 @@ const G13_GOLDEN: ParsedProviderCall[] = [
     "bashCommands": [],
     "timestamp": "2026-07-03T12:00:00.000Z",
     "speed": "standard",
-    "deduplicationKey": "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:e0110dcd5a4e:1",
+    "deduplicationKey": "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:a08d65507059:1",
     "userMessage": "Conversation X7"
   }
 ]
 
 const G13_KEYS = [
-  "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:e0110dcd5a4e:1",
-  "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:eff208336025:1"
+  "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:a08d65507059:1",
+  "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:ada6313a0808:1"
 ]
 
 const G14_GOLDEN: ParsedProviderCall[] = [
@@ -1217,13 +1222,13 @@ const G14_GOLDEN: ParsedProviderCall[] = [
     "bashCommands": [],
     "timestamp": "2026-07-03T12:00:00.000Z",
     "speed": "standard",
-    "deduplicationKey": "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:03e1bde7d7c0:1",
+    "deduplicationKey": "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:5c217b7ca104:1",
     "userMessage": "Conversation X8"
   }
 ]
 
 const G14_KEYS = [
-  "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:03e1bde7d7c0:1"
+  "copilot:jb:485825c0-3331-46a7-acb2-c71875ad6640:5c217b7ca104:1"
 ]
 
 const G15_GOLDEN: ParsedProviderCall[] = [
@@ -1245,7 +1250,7 @@ const G15_GOLDEN: ParsedProviderCall[] = [
     "bashCommands": [],
     "timestamp": "2026-07-03T12:00:00.000Z",
     "speed": "standard",
-    "deduplicationKey": "copilot:jb:x17-store:9829e901954d:1",
+    "deduplicationKey": "copilot:jb:x17-store:4db98cac6d89:1",
     "userMessage": ""
   },
   {
@@ -1266,14 +1271,14 @@ const G15_GOLDEN: ParsedProviderCall[] = [
     "bashCommands": [],
     "timestamp": "2026-07-03T12:00:00.000Z",
     "speed": "standard",
-    "deduplicationKey": "copilot:jb:x17-store:95b22f4dffb0:1",
+    "deduplicationKey": "copilot:jb:x17-store:95250cfdeede:1",
     "userMessage": ""
   }
 ]
 
 const G15_KEYS = [
-  "copilot:jb:x17-store:95b22f4dffb0:1",
-  "copilot:jb:x17-store:9829e901954d:1"
+  "copilot:jb:x17-store:4db98cac6d89:1",
+  "copilot:jb:x17-store:95250cfdeede:1"
 ]
 
 const G16_GOLDEN: ParsedProviderCall[] = [

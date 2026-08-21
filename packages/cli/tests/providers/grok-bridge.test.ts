@@ -1,3 +1,7 @@
+// FIRST import: pins the host privacy key before anything reads it, so the
+// dedup-key fingerprint below is a constant rather than a per-run random.
+import '../setup/fixed-privacy-key.js'
+
 import { dirname, resolve } from 'path'
 import { fileURLToPath } from 'url'
 
@@ -5,6 +9,7 @@ import { describe, it, expect } from 'vitest'
 
 import { createGrokProvider } from '../../src/providers/grok.js'
 import { priceProviderCall } from '../../src/pricing-pass.js'
+import { expectedSourceRef } from '../setup/fixed-privacy-key.js'
 import type { ParsedProviderCall, SessionSource } from '../../src/providers/types.js'
 
 // Byte-identical parity gate for the grok bridge migration (phase 8). The
@@ -12,6 +17,13 @@ import type { ParsedProviderCall, SessionSource } from '../../src/providers/type
 
 const here = dirname(fileURLToPath(import.meta.url))
 const FIXTURE_DIR = resolve(here, '../fixtures/grok-parity')
+// The dedup key used to embed the session dir's ABSOLUTE PATH; dedupKey ships on
+// the observation envelope, so that was a raw host path riding a payload. It now
+// embeds a keyed fingerprint of that path, re-derived here longhand from a
+// pinned key (expectedSourceRef) instead of by calling the production helper, so
+// the golden pins the encoding rather than agreeing with itself.
+const SESSION_DIR = resolve(FIXTURE_DIR, '%2FUsers%2Ftest/019edf9c-0000-7000-8000-000000000001')
+const SESSION_REF = expectedSourceRef(SESSION_DIR)
 
 const GOLDEN: ParsedProviderCall[] = [
   {
@@ -35,7 +47,7 @@ const GOLDEN: ParsedProviderCall[] = [
     speed: 'standard',
     // The key embeds the session dir's absolute path — compute it from
     // FIXTURE_DIR so the golden is portable across checkouts.
-    deduplicationKey: `grok:${resolve(FIXTURE_DIR, '%2FUsers%2Ftest/019edf9c-0000-7000-8000-000000000001')}:2026-06-19T11:31:12.282793Z:019edf9c-0000-7000-8000-000000000001`,
+    deduplicationKey: `grok:${SESSION_REF}:2026-06-19T11:31:12.282793Z:019edf9c-0000-7000-8000-000000000001`,
     userMessage: 'User asks about the repo',
     sessionId: '019edf9c-0000-7000-8000-000000000001',
     project: 'myproject',
@@ -60,6 +72,16 @@ async function collect(): Promise<ParsedProviderCall[]> {
 describe('grok bridge — fixture parity', () => {
   it('the bridged provider reproduces the pre-migration decode byte-for-byte', async () => {
     expect(await collect()).toEqual(GOLDEN)
+  })
+
+  it('the dedup key is an opaque fingerprint, never the session-dir path', async () => {
+    const calls = await collect()
+    expect(calls.length).toBeGreaterThan(0) // non-vacuous
+    for (const call of calls) {
+      expect(call.deduplicationKey).toMatch(/^grok:[0-9a-f]{16}:/)
+      expect(call.deduplicationKey).not.toContain(SESSION_DIR)
+      expect(call.deduplicationKey).not.toContain('grok-parity')
+    }
   })
 
   it('the priced output survives the pricing pass with only costUSD added', async () => {

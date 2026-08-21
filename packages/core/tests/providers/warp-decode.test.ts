@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { decodeWarp, toObservations } from '../../src/providers/warp/index.js'
 import { ObservationEnvelope } from '../../src/observations.js'
-import { OBSERVATION_SCHEMA_VERSION } from '../../src/schema.js'
+import { OBSERVATION_SCHEMA_VERSION, normalizeModelIdentifier } from '../../src/schema.js'
 import type { DecodeContext } from '../../src/contracts.js'
 import type { WarpBlockRow, WarpConversationRow, WarpQueryRow } from '../../src/providers/warp/types.js'
 
@@ -170,6 +170,29 @@ describe('warp rich decode (moved to @codeburn/core)', () => {
     expect(calls[0]!.model).toBe('gpt-5.3-codex')
   })
 
+  it('acceptance: a display-name model the alias map does not cover is normalized at the observation boundary', () => {
+    // Warp's alias map is closed, so any NEW model id arrives verbatim (spaces
+    // and all) — e.g. "GPT-5.4 Codex (medium reasoning)" or "Claude Sonnet
+    // 4.7". The decode passes it through; the observation boundary must
+    // normalize it to 'unknown' instead of rejecting the whole envelope.
+    const exchanges: WarpQueryRow[] = [makeExchange('ex-1', { model_id: 'GPT-5.4 Codex (medium reasoning)' })]
+    const { calls } = decodeWarp({ records: [makeComposite('conv-a', BASE_CONVERSATION, exchanges)], context })
+    expect(calls[0]!.model).toBe('GPT-5.4 Codex (medium reasoning)')
+
+    const { sessions } = toObservations(
+      { sessionId: 'conv-a', projectPath: '/Users/me/projects/codeburn', calls },
+      { privacyKey: 'test-privacy-key', provider: 'warp' },
+    )
+    const envelope = {
+      schemaVersion: OBSERVATION_SCHEMA_VERSION,
+      generator: { name: '@codeburn/core', version: '0.0.0-test' },
+      sessions,
+    }
+    expect(ObservationEnvelope.safeParse(envelope).success).toBe(true)
+    expect(sessions[0]!.calls[0]!.model).toBe('unknown')
+    expect(JSON.stringify(envelope)).not.toContain('GPT-5.4 Codex')
+  })
+
   it('uses the fallback token budget when conversation usage is absent', () => {
     const conversation: WarpConversationRow = {
       ...BASE_CONVERSATION,
@@ -178,6 +201,58 @@ describe('warp rich decode (moved to @codeburn/core)', () => {
     const exchanges: WarpQueryRow[] = [makeExchange('ex-1')]
     const { calls } = decodeWarp({ records: [makeComposite('conv-a', conversation, exchanges)], context })
     expect(calls[0]!.inputTokens).toBeGreaterThan(0)
+  })
+
+  // The model name reaches the boundary through `modelAliases[model]` — a plain
+  // object, so a session whose model_id names a prototype member gets an object
+  // or a function back, not a string. normalizeModelIdentifier used to call
+  // .trim() on it and throw, taking the whole parse down with one hostile
+  // record; the base it replaced (z.string()) rejected gracefully. These are
+  // the reachable non-string inputs, end to end through the real decoder.
+  it.each(['__proto__', 'constructor', 'toString', 'valueOf'])(
+    'a model_id naming the prototype member %s yields unknown instead of throwing',
+    (hostile) => {
+      const conversation: WarpConversationRow = {
+        ...BASE_CONVERSATION,
+        conversation_data: JSON.stringify({
+          conversation_usage_metadata: {
+            token_usage: [{
+              model_id: hostile,
+              warp_tokens: 300,
+              byok_tokens: 0,
+              warp_token_usage_by_category: { primary_agent: 300 },
+              byok_token_usage_by_category: {},
+            }],
+          },
+        }),
+      }
+      const exchanges: WarpQueryRow[] = [makeExchange('ex-1')]
+      const { calls } = decodeWarp({
+        records: [makeComposite('conv-a', conversation, exchanges)],
+        context,
+      })
+      expect(calls.length).toBeGreaterThan(0) // non-vacuous: a dropped record proves nothing
+
+      const { sessions } = toObservations(
+        { sessionId: 'conv-a', projectPath: '/Users/me/projects/codeburn', calls },
+        { privacyKey: 'test-privacy-key', provider: 'warp' },
+      )
+      const envelope = {
+        schemaVersion: OBSERVATION_SCHEMA_VERSION,
+        generator: { name: '@codeburn/core', version: '0.0.0-test' },
+        sessions,
+      }
+      expect(ObservationEnvelope.safeParse(envelope).success).toBe(true)
+      expect(sessions[0]!.calls[0]!.model).toBe('unknown')
+    },
+  )
+
+  it('normalizeModelIdentifier collapses a non-string to unknown rather than throwing', () => {
+    // The unit-level statement of the same contract, for the inputs a lookup can
+    // return: no caller may be able to crash the boundary with a bad type.
+    for (const hostile of [{}, [], () => {}, 42, null, undefined, Object.prototype]) {
+      expect(normalizeModelIdentifier(hostile as unknown as string)).toBe('unknown')
+    }
   })
 
   it('toObservations produces a schema-valid, content-free envelope', () => {

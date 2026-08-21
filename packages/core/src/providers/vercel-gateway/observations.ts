@@ -3,10 +3,16 @@
 //
 // Vercel Gateway reports contain no free-text user content. The only string
 // fields that cross into the envelope are machine identifiers:
-//   - `provider` and `model` are emitted by design under the identifier-exemption
+//   - `provider` is emitted by design under the identifier-exemption
 //     convention (see architecture-gate.test.ts MACHINE_ID_ALLOWLIST).
+//   - `model` is externally supplied (the fetched report) and is normalized at
+//     this boundary: values inside the ModelIdentifier charset cross unchanged,
+//     anything else (a hostile prompt, a display name) collapses to 'unknown',
+//     so a bad model can never reject the whole envelope.
 //   - `day` is an API-supplied calendar date. It IS emitted, verbatim, inside the
-//     synthesized timestamp and the dedup key. The envelope's `format: date-time`
+//     synthesized timestamp and the dedup key. (The dedup key also carries the
+//     RAW model — normalization is a boundary concern only, and the key's
+//     free-text surface is the schema-wide dedup-key hashing follow-up.) The envelope's `format: date-time`
 //     constraint on every timestamp is what bounds it: a `day` that is not a real
 //     date fails envelope validation, so a hostile value cannot ship.
 // No host-held user prompt, tools, bashCommands, file paths, or command lines
@@ -16,6 +22,7 @@ import { projectRef, sessionRef } from '../../fingerprint.js'
 import type { RecordDiagnostic } from '../../diagnostics.js'
 import type { CallObservation, SessionObservation } from '../../observations.js'
 import type { VercelGatewayDecodedCall } from './types.js'
+import { normalizeModelIdentifier } from '../../schema.js'
 
 /** One Vercel Gateway report's rich decode, as the host holds it before minimization. */
 export interface RichVercelGatewaySessionDecode {
@@ -36,7 +43,7 @@ export interface VercelGatewayToObservationsContext {
 function toCallObservation(call: VercelGatewayDecodedCall, turnIndex: number): CallObservation {
   return {
     provider: call.provider,
-    model: call.model,
+    model: normalizeModelIdentifier(call.model),
     tokens: {
       input: call.inputTokens,
       output: call.outputTokens,

@@ -1,5 +1,6 @@
 import type { DecodeContext } from '@codeburn/core'
 
+import { getHostPrivacyKey } from '../privacy-key.js'
 import type { Provider, ProbeRoot, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 // ── The dual-registry bridge ────────────────────────────────────────────────
@@ -81,10 +82,31 @@ export function createBridgedProvider<TRich>(spec: BridgedProviderSpec<TRich>): 
         async *parse(): AsyncGenerator<ParsedProviderCall> {
           const records = await spec.readRecords(source)
           if (records === null) return
-          // The CLI holds the rich decode only; minimization / fingerprinting
-          // happens on the sync path, so an empty privacy key is correct here
-          // (the rich decoder never consumes it), matching claude/codex.
-          const context: DecodeContext = { privacyKey: '', providerId: spec.name, sourceRef: source.path }
+          // The host privacy key, threaded into the rich decode (D1). An empty
+          // key was correct when the bridge was written — minimization and
+          // fingerprinting happened later, on the sync path, so the rich
+          // decoder never consumed it. That is no longer true: the rich
+          // decoders now derive dedup keys (sourceRefFingerprint, copilot's
+          // JetBrains per-turn HMAC) and diagnostic details from the key, and
+          // dedupKey ships on the observation envelope. core's keyed
+          // primitives THROW on an empty key rather than degrade to an unkeyed
+          // digest, so the bridge has to supply the real one.
+          // getHostPrivacyKey() is per-install stable (persisted, like the
+          // optimize detectors use), so dedup keys stay stable across runs and
+          // the session-cache dedup semantics are unchanged.
+          //
+          // It degrades to a FRESH per-process key whenever the config dir
+          // (~/.config/codeburn) is unwritable OR the key file exists but is
+          // corrupt/unreadable — and that says nothing about whether the cache
+          // can persist: the cache lives in ~/.cache/codeburn (or
+          // CODEBURN_CACHE_DIR), a different directory, separately overridable.
+          // A writable cache plus an unreadable key file therefore means a new
+          // key every process. computeEnvFingerprint is what stops that from
+          // inflating totals: it folds a digest of the key into the fingerprint
+          // for every provider in KEY_DERIVED_PROVIDERS, so a rotated, lost, or
+          // per-process key rebuilds the section instead of re-ingesting the
+          // same records under keys the cache has never seen.
+          const context: DecodeContext = { privacyKey: getHostPrivacyKey(), providerId: spec.name, sourceRef: source.path }
           const { calls } = spec.decode({ records, context, seenKeys })
           for (const rich of calls) {
             yield spec.toProviderCall(rich)

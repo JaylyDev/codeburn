@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 import { describe, it, expect } from 'vitest'
 import { collectJetBrainsRepoDirCandidates, decodeCopilot } from '../../src/providers/copilot/decode.js'
 import type { CopilotRecordEnvelope } from '../../src/providers/copilot/types.js'
@@ -142,18 +144,23 @@ describe('decodeCopilot — chatsession arm', () => {
   })
 })
 
+/** One JetBrains nitrite page holding a single ask-mode turn. */
+function jetBrainsRaw(replyText: string, userMessage: string): string {
+  const convGuid = '11111111-1111-1111-1111-111111111111'
+  const convRecord = `$${convGuid}t\x00\x04namesq\x00\x01?@\x00\x00w\x00\x00t\x00value t\x00${userMessage}t\x00\x06sourcet\x00copilotx`
+  const innerMd = { type: 'Markdown', data: JSON.stringify({ text: replyText, annotations: [] }) }
+  const valueMap: Record<string, unknown> = {
+    'a1b2c3d4-0000-0000-0000-000000000001': { type: 'Value', value: JSON.stringify(innerMd) },
+  }
+  const blob = JSON.stringify({ __first__: { type: 'Subgraph', value: JSON.stringify(valueMap) } })
+  return 'H:2,block:9,blockSize:1000,format:3\n' +
+    'com.github.copilot.agent.session.persistence.nitrite.entity.NtAgentTurn\n' +
+    convRecord + '\n' + blob + '\n' + blob + '\n'
+}
+
 describe('decodeCopilot — jetbrains arm', () => {
   it('extracts an ask-mode turn and dedups by content hash', () => {
-    const convGuid = '11111111-1111-1111-1111-111111111111'
-    const convRecord = `$${convGuid}t\x00\x04namesq\x00\x01?@\x00\x00w\x00\x00t\x00value t\x00Hello Worldt\x00\x06sourcet\x00copilotx`
-    const innerMd = { type: 'Markdown', data: JSON.stringify({ text: 'Ask reply', annotations: [] }) }
-    const valueMap: Record<string, unknown> = {
-      'a1b2c3d4-0000-0000-0000-000000000001': { type: 'Value', value: JSON.stringify(innerMd) },
-    }
-    const blob = JSON.stringify({ __first__: { type: 'Subgraph', value: JSON.stringify(valueMap) } })
-    const raw = 'H:2,block:9,blockSize:1000,format:3\n' +
-      'com.github.copilot.agent.session.persistence.nitrite.entity.NtAgentTurn\n' +
-      convRecord + '\n' + blob + '\n' + blob + '\n'
+    const raw = jetBrainsRaw('Ask reply', 'Hello World')
     const envelope: CopilotRecordEnvelope = {
       kind: 'jetbrains',
       sessionId: 'jb1',
@@ -167,6 +174,47 @@ describe('decodeCopilot — jetbrains arm', () => {
     expect(calls[0]?.arm).toBe('jetbrains')
     expect(calls[0]?.outputTokens).toBe(3) // ceil("Ask reply".length / 4) = 3
     expect(calls[0]?.userMessage).toBe('Hello World')
+  })
+
+  it('keys the per-turn content digest with the privacy key: same input, different keys => different dedup key', () => {
+    // The JetBrains dedup key embeds a digest of the assistant REPLY TEXT and
+    // ships on the observation envelope. An unkeyed sha256 of a short reply
+    // ("OK", "Done.") is dictionary-attackable, so the digest is an HMAC under
+    // the host privacy key. This test is the mutation gate: swap createHmac
+    // back to createHash in decode.ts and the two keys below become equal (and
+    // equal to the bare sha256 pinned at the end), so it fails.
+    const raw = jetBrainsRaw('Ask reply', 'Hello World')
+    const envelope = (): CopilotRecordEnvelope => ({
+      kind: 'jetbrains',
+      sessionId: 'jb1',
+      mtime: '2026-07-17T10:00:00.000Z',
+      raw,
+      repoRootByDir: new Map(),
+    })
+    const keyFor = (privacyKey: string): string => {
+      const { calls } = decodeCopilot({
+        records: [envelope()],
+        context: { privacyKey, providerId: 'copilot', sourceRef: 'ref' },
+        seenKeys: new Set<string>(),
+      })
+      expect(calls).toHaveLength(1) // non-vacuous: a decode that emits nothing proves nothing
+      return calls[0]!.deduplicationKey
+    }
+
+    expect(() => keyFor('')).toThrow(/privacyKey is required/) // never a degenerate key
+
+    const keyA = keyFor('privacy-key-A')
+    const keyB = keyFor('privacy-key-B')
+
+    expect(keyA).not.toBe(keyB)
+    expect(keyA).toBe(keyFor('privacy-key-A')) // deterministic under one key
+    expect(keyA).toMatch(/^copilot:jb:[^:]+:[0-9a-f]{12}:1$/)
+
+    // Direct anti-createHash pin: the digest component must NOT be the unkeyed
+    // sha256 of the reply text.
+    const unkeyed = createHash('sha256').update('Ask reply').digest('hex').slice(0, 12)
+    expect(keyA).not.toContain(unkeyed)
+    expect(keyB).not.toContain(unkeyed)
   })
 })
 

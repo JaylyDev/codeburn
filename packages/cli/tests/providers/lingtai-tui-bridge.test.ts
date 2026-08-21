@@ -1,9 +1,14 @@
+// FIRST import: pins the host privacy key before anything reads it, so the
+// dedup-key fingerprint below is a constant rather than a per-run random.
+import '../setup/fixed-privacy-key.js'
+
 import { dirname, resolve } from 'path'
 import { fileURLToPath } from 'url'
 import { describe, it, expect } from 'vitest'
 
 import { createLingTaiTuiProvider } from '../../src/providers/lingtai-tui.js'
 import { priceProviderCall } from '../../src/pricing-pass.js'
+import { expectedSourceRef } from '../setup/fixed-privacy-key.js'
 import type { ParsedProviderCall, SessionSource } from '../../src/providers/types.js'
 
 // Byte-identical parity gate for the lingtai-tui bridge migration (phase 8).
@@ -14,7 +19,11 @@ import type { ParsedProviderCall, SessionSource } from '../../src/providers/type
 // per-source-label activity synthesis (main / tc_wake / daemon => userMessage +
 // tools + subagentTypes), model/endpoint fallback from the manifest when a
 // ledger row omits them, run_id vs `${agentId}:${label}` session ids, the
-// composite dedup key threaded on the SOURCE PATH (not the agent dir), turnId,
+// composite dedup key threaded on a keyed FINGERPRINT of the source path (not
+// the agent dir; the raw path used to ride the key, and dedupKey ships on the
+// observation envelope). The expected fingerprint is re-derived longhand from a
+// pinned key (expectedSourceRef) rather than by calling the production helper,
+// so the golden pins the encoding instead of agreeing with itself. Also: turnId,
 // and the manifest-derived project / projectPath carried onto the call.
 const here = dirname(fileURLToPath(import.meta.url))
 const FIXTURE_DIR = resolve(here, '../fixtures/lingtai-parity')
@@ -33,7 +42,7 @@ function dedup(
   thinking: number,
   cached: number,
 ): string {
-  return ['lingtai-tui', sourcePath, lineNo, ts, model, endpoint, label, emId, runId, input, output, thinking, cached].join(':')
+  return ['lingtai-tui', expectedSourceRef(sourcePath), lineNo, ts, model, endpoint, label, emId, runId, input, output, thinking, cached].join(':')
 }
 
 function golden(sourcePath: string, agentDir: string): ParsedProviderCall[] {
@@ -125,6 +134,16 @@ describe('lingtai-tui bridge — fixture parity', () => {
     const { source, calls } = await sourceAndCalls()
     const agentDir = dirname(dirname(source.path))
     expect(calls).toEqual(golden(source.path, agentDir))
+  })
+
+  it('the dedup key is an opaque fingerprint, never the ledger path', async () => {
+    const { source, calls } = await sourceAndCalls()
+    expect(calls.length).toBeGreaterThan(0) // non-vacuous
+    for (const call of calls) {
+      expect(call.deduplicationKey).toMatch(/^lingtai-tui:[0-9a-f]{16}:/)
+      expect(call.deduplicationKey).not.toContain(source.path)
+      expect(call.deduplicationKey).not.toContain('lingtai-parity')
+    }
   })
 
   it('the priced output survives the pricing pass with only costUSD added', async () => {

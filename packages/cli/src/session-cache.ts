@@ -4,6 +4,7 @@ import { createHash, randomBytes } from 'crypto'
 import { join } from 'path'
 import { homedir } from 'os'
 
+import { getHostPrivacyKey } from './privacy-key.js'
 import type { ToolCall } from './types.js'
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -234,6 +235,41 @@ export const DURABLE_PROVIDER_NAMES: ReadonlySet<string> = new Set(['copilot'])
 // needs no suffix: the cli-shutdown-cost-v1 bump below already forces its one
 // re-parse, which lands the flag too, and durable orphans now survive
 // fingerprint changes (the carry-forward in getOrCreateProviderSection).
+// Dedup-key hygiene (#933/#935): six providers now thread a FINGERPRINT of the
+// source path into their dedup keys instead of the raw path, and copilot's
+// JetBrains per-turn digest went from an unkeyed sha256 to a keyed HMAC. The
+// session cache seeds its dedup sets from the CACHED keys, so a pre-fix cache
+// keeps the old-shape keys and the same records re-ingest under the new shape
+// (double-count; and for the six, the raw path stays on disk forever). Each
+// entry/suffix below changes the provider's env fingerprint, which forces the
+// one-time re-parse that drops the old-shape keys.
+//
+// A parse version cannot see the OTHER input those keys depend on: the random
+// per-install privacy key. Rotate it, lose the file, or land on the ephemeral
+// fallback and the freshly derived keys stop matching the cached ones, so every
+// record re-ingests as new — silently, and for copilot (the sole durable
+// provider, whose union-merge never deletes) permanently. Every provider whose
+// dedup keys are derived from that key is listed HERE, explicitly, and
+// computeEnvFingerprint folds a digest of the key in for exactly this set.
+//
+// Listed explicitly rather than sniffed out of the parse-version string: the
+// first version of this used `parseVersion.includes('source-ref-fingerprint-v1')`
+// and silently missed copilot, whose keys are just as key-derived but whose
+// parse version says `dedup-key-hmac-v1`. A provider is in this set because of
+// what its decoder DOES, which no substring of a version label can know.
+// Add a provider here whenever its dedup key starts depending on the privacy
+// key — the rotation test in session-cache.test.ts covers one member of each
+// kind (source-ref and durable/copilot).
+export const KEY_DERIVED_PROVIDERS: ReadonlySet<string> = new Set([
+  'codebuff',
+  'zerostack',
+  'pi',
+  'omp',
+  'grok',
+  'lingtai-tui',
+  'copilot',
+])
+
 export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // rich-session-capture-v1: parse-time capture of per-turn gitBranch, per-call
   // LOC deltas / interruptions / userModified / toolErrors, and session-level
@@ -252,10 +288,14 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   codex: 'mcp-attribution-v2-est-cost-rich-capture-v1-cross-provider-pr-v1',
   cursor: 'composer-anchored-crediting-v1-est-cost',
   'cursor-agent': 'workspaceless-transcript-v1',
-  copilot: 'cli-shutdown-cost-v1-skills',
-  grok: 'estimated-cost-v1',
+  copilot: 'cli-shutdown-cost-v1-skills-dedup-key-hmac-v1',
+  codebuff: 'source-ref-fingerprint-v1',
+  zerostack: 'source-ref-fingerprint-v1',
+  pi: 'source-ref-fingerprint-v1',
+  omp: 'source-ref-fingerprint-v1',
+  grok: 'estimated-cost-v1-source-ref-fingerprint-v1',
   hermes: 'reasoning-output-accounting-v1-est-cost',
-  'lingtai-tui': 'token-ledger-registry-activity-v3',
+  'lingtai-tui': 'token-ledger-registry-activity-v3-source-ref-fingerprint-v1',
   'ibm-bob': 'worktree-project-grouping-v1',
   // v2: chat-file input tokens now estimate from the FULL prompt (sum of every
   // human turn), not the last 500-char slice — so costUSD changed for chat-arm
@@ -297,6 +337,15 @@ export function computeEnvFingerprint(provider: string): string {
   const parts = vars.map(v => `${v}=${process.env[v] ?? ''}`)
   const parseVersion = PROVIDER_PARSE_VERSIONS[provider]
   if (parseVersion) parts.push(`parser=${parseVersion}`)
+  // Providers whose dedup keys are HMAC-derived from the per-install privacy
+  // key must re-parse when that key changes; a digest of the key (never the key
+  // itself) rides the fingerprint for exactly those. Deliberately NOT nested
+  // under `if (parseVersion)`: the key dependency comes from the decoder, not
+  // from having a parse-version entry, and a key-derived provider that ever
+  // loses its entry must still re-parse on rotation.
+  if (KEY_DERIVED_PROVIDERS.has(provider)) {
+    parts.push(`privacy-key=${createHash('sha256').update(getHostPrivacyKey()).digest('hex').slice(0, 16)}`)
+  }
   return createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 16)
 }
 
