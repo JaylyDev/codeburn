@@ -234,6 +234,16 @@ export async function loadPricing(): Promise<void> {
     return
   }
 
+  // Test-only escape hatch, set for the whole suite in
+  // tests/setup/env-isolation.ts: skip the live LiteLLM fetch and price purely
+  // off the bundled snapshot, so an upstream reprice can't turn tests red.
+  if (process.env['CODEBURN_PRICING_SNAPSHOT_ONLY']) {
+    pricingCache = mergeSnapshotFallbacks(new Map())
+    sortedPricingKeys = null
+    lowercasePricingIndex = null
+    return
+  }
+
   try {
     pricingCache = mergeSnapshotFallbacks(await fetchAndCachePricing())
     sortedPricingKeys = null
