@@ -5,6 +5,17 @@ import { homedir } from 'os'
 import { join } from 'path'
 import type { DateRange, ProjectSummary } from './types.js'
 
+// Bumped to 26: kiro chat-file input tokens are now estimated from every
+// human turn's full text instead of the last 500 chars (#909), so a v25
+// rollup finalized by the pre-fix binary carries kiro costs off by up to
+// severalfold. Nothing downstream can notice on its own: `usage-aggregator`
+// serves every day before today from this cache, and retention is ten years,
+// so an upgrading user with a warm complete cache would keep the stale
+// pre-fix kiro day totals forever while freshly reparsed sessions disagreed
+// with them. Raising MIN_SUPPORTED_VERSION forces the one-time re-derivation.
+// This takes 26 — the next free number after #930's 25 — rather than riding
+// on that version.
+//
 // Bumped to 25: pi/omp, cline and opencode/kilo-code session discovery was
 // restored (#930). Older rollups missed OMP sessions written after a
 // `type: "title"` slot line, Cline sessions under the Insiders / VSCodium /
@@ -89,8 +100,8 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 25
-const MIN_SUPPORTED_VERSION = 25
+export const DAILY_CACHE_VERSION = 26
+const MIN_SUPPORTED_VERSION = 26
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including
