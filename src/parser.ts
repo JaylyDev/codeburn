@@ -3504,6 +3504,9 @@ function cacheKey(dateRange: DateRange | undefined, providerFilter: string | und
   // Pricing-affecting config participates so a memoized parse (exact-key or
   // burst-reused in a resident serve process) can never present costs priced
   // under aliases/overrides/savings the user has since changed.
+  // Flat-rate marks do not change parse-time cost (still $0 without a LiteLLM
+  // row); findUnpricedModels / coverage apply them at render time, so they
+  // stay out of this serve-memo key on purpose.
   return `${s}:${providerFilter ?? 'all'}:${claudeRoots}:${getProxyPathsConfigHash()}:${getModelAliasesConfigHash()}:${getPriceOverridesConfigHash()}:${getLocalModelSavingsConfigHash()}`
 }
 

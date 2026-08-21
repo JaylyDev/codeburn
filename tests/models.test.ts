@@ -13,6 +13,7 @@ import {
   setPriceOverrides,
   setLocalModelSavings,
   setFlatRateModels,
+  setFlatRateRemoved,
   isExpectedFreeModel,
   isFlatRateModel,
   getLocalModelSavingsConfigHash,
@@ -33,6 +34,7 @@ afterEach(() => {
   setPriceOverrides({})
   setLocalModelSavings({})
   setFlatRateModels([])
+  setFlatRateRemoved([])
 })
 
 describe('getModelCosts', () => {
@@ -1000,16 +1002,25 @@ describe('findUnpricedModels', () => {
   it('skips subscription / flat-rate product SKUs where $0 is correct', () => {
     const rows = [
       { model: 'auto-genius', calls: 898, cost: 0, tokens: 35_300_000 },
-      { model: 'cline-pass/big-pickle', calls: 4, cost: 0, tokens: 33_900 },
-      { model: 'warp', calls: 449, cost: 0, tokens: 17_700_000 },
-      { model: 'codex-auto-review', calls: 940, cost: 0, tokens: 7_200_000 },
+      { model: 'cline-pass/auto-genius', calls: 4, cost: 0, tokens: 33_900 },
+      { model: 'auto', calls: 449, cost: 0, tokens: 17_700_000 },
+      { model: 'kimi-for-coding-highspeed', calls: 12, cost: 0, tokens: 3_400_000 },
+      { model: 'moonshot/kimi-for-coding-highspeed', calls: 2, cost: 0, tokens: 80_000 },
       { model: 'grok-composer-2.5-fast', calls: 10, cost: 0, tokens: 1_900_000 },
       { model: 'Grok Composer 2.5 Fast', calls: 10, cost: 0, tokens: 1_900_000 },
+      { model: 'Warp Auto (efficient)', calls: 3, cost: 0, tokens: 50_000 },
+      { model: 'warp', calls: 449, cost: 0, tokens: 17_700_000 },
+      { model: 'codex-auto-review', calls: 940, cost: 0, tokens: 7_200_000 },
       { model: 'Codex Auto Review', calls: 2, cost: 0, tokens: 100 },
+      { model: 'big-pickle', calls: 4, cost: 0, tokens: 33_900 },
       { model: 'zz-mystery-paid-model-999', calls: 3, cost: 0, tokens: 1200 },
     ]
     expect(findUnpricedModels(rows)).toEqual([
+      { model: 'warp', calls: 449, tokens: 17_700_000 },
+      { model: 'codex-auto-review', calls: 940, tokens: 7_200_000 },
+      { model: 'big-pickle', calls: 4, tokens: 33_900 },
       { model: 'zz-mystery-paid-model-999', calls: 3, tokens: 1200 },
+      { model: 'Codex Auto Review', calls: 2, tokens: 100 },
     ])
   })
 
@@ -1029,7 +1040,24 @@ describe('findUnpricedModels', () => {
     expect(getModelCosts('warp-auto-efficient')).not.toBeNull()
     expect(isExpectedFreeModel('warp-auto-efficient')).toBe(false)
     expect(isExpectedFreeModel('auto-genius')).toBe(true)
+    expect(isExpectedFreeModel('auto')).toBe(true)
+    expect(isExpectedFreeModel('kimi-for-coding-highspeed')).toBe(true)
+    expect(isExpectedFreeModel('warp')).toBe(false)
+    expect(isExpectedFreeModel('codex-auto-review')).toBe(false)
     expect(isExpectedFreeModel('zz-mystery-paid-model-999')).toBe(false)
+  })
+
+  it('lets --remove opt out of a built-in so a false positive can warn again', () => {
+    expect(findUnpricedModels([{ model: 'auto-genius', calls: 1, cost: 0, tokens: 10 }])).toEqual([])
+    setFlatRateRemoved(['auto-genius'])
+    expect(isFlatRateModel('auto-genius')).toBe(false)
+    expect(findUnpricedModels([{ model: 'auto-genius', calls: 1, cost: 0, tokens: 10 }])).toEqual([
+      { model: 'auto-genius', calls: 1, tokens: 10 },
+    ])
+    expect(findUnpricedModels([{ model: 'cline-pass/auto-genius', calls: 1, cost: 0, tokens: 10 }])).toEqual([
+      { model: 'cline-pass/auto-genius', calls: 1, tokens: 10 },
+    ])
+    expect(isFlatRateModel('auto')).toBe(true)
   })
 
   it('sorts by tokens, then calls', () => {
@@ -1086,6 +1114,16 @@ describe('getFlatRateModelsConfigHash', () => {
     expect(getFlatRateModelsConfigHash()).toBe(two)
     setFlatRateModels([])
   })
+
+  it('changes when a built-in is opted out', () => {
+    setFlatRateModels([])
+    setFlatRateRemoved([])
+    const baseline = getFlatRateModelsConfigHash()
+    setFlatRateRemoved(['auto-genius'])
+    expect(getFlatRateModelsConfigHash()).not.toBe(baseline)
+    setFlatRateRemoved([])
+    expect(getFlatRateModelsConfigHash()).toBe(baseline)
+  })
 })
 
 describe('pricing snapshot carries flat-rate marks', () => {
@@ -1099,6 +1137,18 @@ describe('pricing snapshot carries flat-rate marks', () => {
     restorePricingState(snap)
     expect(isFlatRateModel('zz-snapshot-flat')).toBe(true)
     setFlatRateModels([])
+  })
+
+  it('restorePricingState reapplies built-in opt-outs', async () => {
+    const { snapshotPricingState, restorePricingState } = await import('../src/models.js')
+    setFlatRateRemoved(['auto-genius'])
+    const snap = snapshotPricingState()
+    expect(snap.flatRateModelsRemoved).toEqual(['auto-genius'])
+    setFlatRateRemoved([])
+    expect(isFlatRateModel('auto-genius')).toBe(true)
+    restorePricingState(snap)
+    expect(isFlatRateModel('auto-genius')).toBe(false)
+    setFlatRateRemoved([])
   })
 })
 

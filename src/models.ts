@@ -526,6 +526,8 @@ export function getLocalModelSavingsConfigHash(): string {
 // price-override (user-declared free). Built-in families plus a user hatch.
 let userFlatRateModels = new Set<string>()
 let userFlatRateLeaves = new Set<string>()
+let userFlatRateRemoved = new Set<string>()
+let userFlatRateRemovedLeaves = new Set<string>()
 
 function flatRateLeaf(model: string): string {
   const trimmed = model.trim().replace(/@.*$/, '').replace(/-\d{8}$/, '')
@@ -533,23 +535,52 @@ function flatRateLeaf(model: string): string {
   return leaf.toLowerCase()
 }
 
-export function setFlatRateModels(models: Iterable<string>): void {
-  userFlatRateModels = new Set()
-  userFlatRateLeaves = new Set()
+function fillFlatRateSet(
+  models: Iterable<string>,
+): { ids: Set<string>; leaves: Set<string> } {
+  const ids = new Set<string>()
+  const leaves = new Set<string>()
   for (const model of models) {
     if (!model || typeof model !== 'string') continue
-    userFlatRateModels.add(model)
+    ids.add(model)
     const leaf = flatRateLeaf(model)
-    if (leaf) userFlatRateLeaves.add(leaf)
+    if (leaf) leaves.add(leaf)
   }
+  return { ids, leaves }
+}
+
+export function setFlatRateModels(models: Iterable<string>): void {
+  const filled = fillFlatRateSet(models)
+  userFlatRateModels = filled.ids
+  userFlatRateLeaves = filled.leaves
+}
+
+export function setFlatRateRemoved(models: Iterable<string>): void {
+  const filled = fillFlatRateSet(models)
+  userFlatRateRemoved = filled.ids
+  userFlatRateRemovedLeaves = filled.leaves
 }
 
 export function getFlatRateModelsConfigHash(): string {
-  return [...userFlatRateModels].sort().join('\u0002')
+  const added = [...userFlatRateModels].sort().join('\u0002')
+  const removed = [...userFlatRateRemoved].sort().join('\u0002')
+  if (!removed) return added
+  return `${added}\u0003${removed}`
 }
 
 export function getFlatRateModels(): string[] {
   return [...userFlatRateModels]
+}
+
+export function getFlatRateRemoved(): string[] {
+  return [...userFlatRateRemoved]
+}
+
+export function isSameFlatRateModel(a: string, b: string): boolean {
+  if (!a || !b) return false
+  if (a === b) return true
+  const leaf = flatRateLeaf(a)
+  return leaf.length > 0 && leaf === flatRateLeaf(b)
 }
 
 function isUserFlatRateModel(model: string): boolean {
@@ -558,21 +589,28 @@ function isUserFlatRateModel(model: string): boolean {
   return leaf.length > 0 && userFlatRateLeaves.has(leaf)
 }
 
-/// Product SKUs billed as a subscription, not missing LiteLLM rows.
-/// Match raw ids, path-prefixed ids (`cline-pass/auto-genius`), and the
-/// display names aggregation keys by (parser.ts uses getShortModelName).
-function isBuiltInFlatRateModel(model: string): boolean {
+function isFlatRateRemoved(model: string): boolean {
+  if (userFlatRateRemoved.has(model)) return true
   const leaf = flatRateLeaf(model)
+  return leaf.length > 0 && userFlatRateRemovedLeaves.has(leaf)
+}
+
+/// Product SKUs billed as a subscription, not missing LiteLLM rows.
+/// Match raw ids and path-prefixed ids (`cline-pass/auto-genius`). Display
+/// names from getShortModelName are matched only when the aggregation key
+/// is not the raw leaf (Warp Auto *, Grok Composer *).
+export function isBuiltInFlatRateModel(model: string): boolean {
+  const leaf = flatRateLeaf(model)
+  // Warp's product SKU is the bare id `auto`. Kiro rewrites its own `auto`
+  // to `kiro-auto` before pricing, so this leaf does not swallow Kiro.
   if (
-    leaf === 'warp'
-    || leaf === 'codex-auto-review'
+    leaf === 'auto'
     || leaf === 'auto-genius'
-    || leaf === 'big-pickle'
+    || leaf === 'kimi-for-coding-highspeed'
   ) return true
   if (leaf.startsWith('grok-composer-')) return true
   if (leaf.startsWith('warp-auto-')) return true
   const display = model.trim()
-  if (/^codex auto review$/i.test(display)) return true
   if (/^grok composer\b/i.test(display)) return true
   if (/^warp auto\b/i.test(display)) return true
   return false
@@ -580,6 +618,7 @@ function isBuiltInFlatRateModel(model: string): boolean {
 
 export function isFlatRateModel(model: string): boolean {
   if (!model) return false
+  if (isFlatRateRemoved(model)) return false
   return isUserFlatRateModel(model) || isBuiltInFlatRateModel(model)
 }
 
@@ -966,7 +1005,7 @@ function shouldWarnAboutUnknownModel(name: string): boolean {
   // inference can still set an alias via `codeburn model-alias`.
   if (looksLikeLocalModel(name)) return false
   if (isFlatRateModel(name)) return false
-  // The warning fired on every CLI invocation (including the default)
+  // The warning fired on every CLI invocation (including the default
   // dashboard) which made first launches look broken — three "no pricing
   // data" lines greet a user before the dashboard even draws. Now opt-in
   // via --verbose. The unknown model still costs $0 in reports; users who
@@ -1235,6 +1274,7 @@ export type PricingSnapshot = {
   priceOverrides: Record<string, PriceOverrideRates>
   localModelSavings: Record<string, string>
   flatRateModels?: string[]
+  flatRateModelsRemoved?: string[]
 }
 
 export function snapshotPricingState(): PricingSnapshot {
@@ -1244,6 +1284,7 @@ export function snapshotPricingState(): PricingSnapshot {
     priceOverrides: userPriceOverridesConfig,
     localModelSavings: userLocalModelSavings,
     flatRateModels: getFlatRateModels(),
+    flatRateModelsRemoved: getFlatRateRemoved(),
   }
 }
 
@@ -1256,4 +1297,5 @@ export function restorePricingState(snapshot: PricingSnapshot): void {
   setPriceOverrides(snapshot.priceOverrides)
   setLocalModelSavings(snapshot.localModelSavings)
   setFlatRateModels(snapshot.flatRateModels ?? [])
+  setFlatRateRemoved(snapshot.flatRateModelsRemoved ?? [])
 }

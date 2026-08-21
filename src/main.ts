@@ -2,7 +2,7 @@ import { isAbsolute } from 'path'
 import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
-import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setProxyPaths, normalizeProxyPath, unpricedModelHint } from './models.js'
+import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel } from './models.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
 import { getProvider } from './providers/index.js'
@@ -466,6 +466,7 @@ program.hook('preAction', async (thisCommand) => {
   setPriceOverrides(config.priceOverrides ?? {})
   setLocalModelSavings(config.localModelSavings ?? {})
   setFlatRateModels(config.flatRateModels ?? [])
+  setFlatRateRemoved(config.flatRateModelsRemoved ?? [])
   setProxyPaths(config.proxyPaths ?? [])
   if (thisCommand.opts<{ verbose?: boolean }>().verbose) {
     process.env['CODEBURN_VERBOSE'] = '1'
@@ -1582,21 +1583,30 @@ program
 program
   .command('model-flat-rate [model]')
   .description('Mark a model as subscription / flat-rate billed. $0 is the correct cost and the unpriced warning is silenced. Do not use model-alias for these — that maps them onto another model\'s per-token rate and invents spend (e.g. codeburn model-flat-rate auto-genius).')
-  .option('--remove <model>', 'Remove a flat-rate mark')
-  .option('--list', 'List configured flat-rate models')
+  .option('--remove <model>', 'Remove a flat-rate mark, including a built-in SKU')
+  .option('--list', 'List configured flat-rate models and built-in opt-outs')
   .action(async (model?: string, opts?: { remove?: string; list?: boolean }) => {
     const config = await readConfig()
     const marked = [...(config.flatRateModels ?? [])]
+    const removed = [...(config.flatRateModelsRemoved ?? [])]
 
     if (opts?.list || (!model && !opts?.remove)) {
-      if (marked.length === 0) {
+      if (marked.length === 0 && removed.length === 0) {
         console.log('\n  No flat-rate models configured.')
         console.log(`  Config: ${getConfigFilePath()}`)
         console.log('  Add one with: codeburn model-flat-rate <model>\n')
       } else {
-        console.log('\n  Flat-rate / subscription models:')
-        for (const name of marked) {
-          console.log(`    ${name}`)
+        if (marked.length > 0) {
+          console.log('\n  Flat-rate / subscription models:')
+          for (const name of marked) {
+            console.log(`    ${name}`)
+          }
+        }
+        if (removed.length > 0) {
+          console.log('\n  Built-in flat-rate opt-outs (unpriced warning fires again):')
+          for (const name of removed) {
+            console.log(`    ${name}`)
+          }
         }
         console.log(`  Config: ${getConfigFilePath()}\n`)
       }
@@ -1604,16 +1614,29 @@ program
     }
 
     if (opts?.remove) {
-      const idx = marked.indexOf(opts.remove)
-      if (idx < 0) {
-        console.error(`\n  No flat-rate mark found for: ${opts.remove}\n`)
+      const target = opts.remove
+      const idx = marked.indexOf(target)
+      const builtIn = isBuiltInFlatRateModel(target)
+      const alreadyOptedOut = removed.some(id => isSameFlatRateModel(id, target))
+      if (idx < 0 && (!builtIn || alreadyOptedOut)) {
+        console.error(`\n  No flat-rate mark found for: ${target}\n`)
         process.exitCode = 1
         return
       }
-      marked.splice(idx, 1)
-      config.flatRateModels = marked.length > 0 ? marked : undefined
+      if (idx >= 0) {
+        marked.splice(idx, 1)
+        config.flatRateModels = marked.length > 0 ? marked : undefined
+      }
+      if (builtIn && !alreadyOptedOut) {
+        removed.push(target)
+        config.flatRateModelsRemoved = removed
+      }
       await saveConfig(config)
-      console.log(`\n  Removed flat-rate mark: ${opts.remove}\n`)
+      console.log(`\n  Removed flat-rate mark: ${target}`)
+      if (builtIn) {
+        console.log('  Built-in SKU opted out; the unpriced warning will fire again until you re-add it.')
+      }
+      console.log()
       return
     }
 
@@ -1625,6 +1648,8 @@ program
 
     if (!marked.includes(model)) marked.push(model)
     config.flatRateModels = marked
+    const remainingOptOuts = removed.filter(id => !isSameFlatRateModel(id, model))
+    config.flatRateModelsRemoved = remainingOptOuts.length > 0 ? remainingOptOuts : undefined
     await saveConfig(config)
 
     if (config.modelAliases && Object.hasOwn(config.modelAliases, model)) {

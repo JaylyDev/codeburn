@@ -612,7 +612,7 @@ codeburn model-flat-rate auto-genius                          # subscription SKU
 codeburn proxy-path ~/work/copilot-repo                       # subscription-covered project
 ```
 
-`price-override` sets exact rates for any model (input, output, cache read, cache creation), useful for private deployments or models LiteLLM prices wrong. `model-savings` maps a free local model to a paid baseline: the local calls stay $0, and the dashboard shows what the same tokens would have cost on the baseline. `model-flat-rate` marks a subscription-billed product SKU so the unpriced warning stays quiet and `model-alias` is not suggested — aliasing those ids invents spend. `proxy-path` marks a project routed through a subscription-backed proxy (e.g. Claude Code over GitHub Copilot), so its API-rate cost is reported as subscription-covered and your net out-of-pocket stays honest. All four support `--list` and `--remove`.
+`price-override` sets exact rates for any model (input, output, cache read, cache creation), useful for private deployments or models LiteLLM prices wrong. `model-savings` maps a free local model to a paid baseline: the local calls stay $0, and the dashboard shows what the same tokens would have cost on the baseline. `model-flat-rate` marks a subscription-billed product SKU so the unpriced warning stays quiet and `model-alias` is not suggested — aliasing those ids invents spend. `--remove` also opts out of a built-in SKU. `proxy-path` marks a project routed through a subscription-backed proxy (e.g. Claude Code over GitHub Copilot), so its API-rate cost is reported as subscription-covered and your net out-of-pocket stays honest. All four support `--list` and `--remove`.
 
 ### Filtering
 
