@@ -7,17 +7,25 @@ import {
   findUnpricedModels,
   getModelCosts,
   getShortModelName,
+  resolveCanonicalModelId,
   calculateCost,
   loadPricing,
   setModelAliases,
   setPriceOverrides,
   setLocalModelSavings,
+  setFlatRateModels,
+  setFlatRateRemoved,
+  isExpectedFreeModel,
+  isFlatRateModel,
   getLocalModelSavingsConfigHash,
   getPriceOverridesConfigHash,
   getModelAliasesConfigHash,
+  getFlatRateModelsConfigHash,
   parseLiteLLMEntry,
+  unpricedModelHint,
 } from '../src/models.js'
 import { getDailyCacheConfigHash } from '../src/usage-aggregator.js'
+import snapshotData from '../src/data/litellm-snapshot.json' with { type: 'json' }
 
 beforeAll(async () => {
   await loadPricing()
@@ -27,6 +35,8 @@ afterEach(() => {
   setModelAliases({})
   setPriceOverrides({})
   setLocalModelSavings({})
+  setFlatRateModels([])
+  setFlatRateRemoved([])
 })
 
 describe('getModelCosts', () => {
@@ -81,6 +91,32 @@ describe('getModelCosts', () => {
     expect(getModelCosts('z-ai/glm-5.3')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
   })
 
+  it('prices gpt-5.6-codex and gpt-5.6-codex-max, sourced directly from the snapshot (#1077)', () => {
+    // Directly checks the bundled snapshot data (not just the resolved lookup),
+    // so this fails if the litellm-snapshot.json entries are ever reverted even
+    // though getModelCosts would still resolve both ids via the `gpt-5.6` prefix
+    // fallback - explicit rows are still correct and match every other Codex
+    // generation LiteLLM ships (gpt-5-codex, gpt-5.1-codex, gpt-5.1-codex-max,
+    // gpt-5.2-codex, gpt-5.3-codex all carry their base model's exact rate).
+    const snapshot = snapshotData as Record<string, unknown>
+    expect(snapshot['gpt-5.6-codex']).toEqual(snapshot['gpt-5.6'])
+    expect(snapshot['gpt-5.6-codex-max']).toEqual(snapshot['gpt-5.6'])
+
+    const codex = getModelCosts('gpt-5.6-codex')
+    const codexMax = getModelCosts('gpt-5.6-codex-max')
+    expect(codex).not.toBeNull()
+    expect(codexMax).not.toBeNull()
+    expect(codex!.inputCostPerToken).toBe(5e-6)
+    expect(codex!.outputCostPerToken).toBe(3e-5)
+    expect(codex!.cacheWriteCostPerToken).toBe(6.25e-6)
+    expect(codex!.cacheReadCostPerToken).toBe(5e-7)
+    expect(codex!.cacheWriteCostIsExplicit).toBe(true)
+    expect(codexMax).toEqual(codex)
+
+    expect(calculateCost('gpt-5.6-codex', 1_000_000, 1_000_000, 0, 0, 0)).toBeGreaterThan(0)
+    expect(calculateCost('gpt-5.6-codex-max', 1_000_000, 1_000_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
   // A price override on a synthetic bare id can only be reached if the leading
   // segment was stripped, so these assert the namespace allowlist itself without
   // pinning to any real model's presence in (or absence from) the snapshot.
@@ -120,6 +156,22 @@ describe('getModelCosts', () => {
     setPriceOverrides({ 'glm-5.3': { input: 99, output: 99 } })
     expect(getModelCosts('cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(99 / 1_000_000)
     expect(getModelCosts('omniroute:cp/cline-pass/glm-5.3')!.outputCostPerToken).toBe(99 / 1_000_000)
+  })
+})
+
+describe('resolveCanonicalModelId', () => {
+  it('aliases, peels path-form ids, and leaves display-only collisions distinct', () => {
+    expect(resolveCanonicalModelId('k3')).toBe('kimi-k3')
+    expect(resolveCanonicalModelId('k3-agent')).toBe('kimi-k3')
+    expect(resolveCanonicalModelId('kimi-k3')).toBe('kimi-k3')
+    expect(resolveCanonicalModelId('accounts/fireworks/models/glm-5p2')).toBe('glm-5p2')
+    expect(resolveCanonicalModelId('glm-5p2')).toBe('glm-5p2')
+    expect(resolveCanonicalModelId('GLM-5.2')).toBe('glm-5p1')
+    expect(resolveCanonicalModelId('gpt-5-fast')).toBe('gpt-5')
+    expect(resolveCanonicalModelId('gpt-5-untracked-xyz')).toBe('gpt-5-untracked-xyz')
+    expect(resolveCanonicalModelId('claude-opus-4.6')).toBe('claude-opus-4-6')
+    expect(resolveCanonicalModelId('kimi-code')).toBe('kimi-k2-thinking')
+    expect(resolveCanonicalModelId('cline-pass/kimi-k3')).toBe('kimi-k3')
   })
 })
 
@@ -486,6 +538,17 @@ describe('user price overrides', () => {
     expect(secondCombined).not.toBe(baseline)
     expect(secondCombined).not.toBe(firstCombined)
   })
+
+  it('includes flat-rate marks in the daily cache config hash', () => {
+    setLocalModelSavings({})
+    setPriceOverrides({})
+    setFlatRateModels([])
+    const baseline = getDailyCacheConfigHash()
+    setFlatRateModels(['zz-flat-hash'])
+    expect(getDailyCacheConfigHash()).not.toBe(baseline)
+    setFlatRateModels([])
+    expect(getDailyCacheConfigHash()).toBe(baseline)
+  })
 })
 
 describe('calculateCost - OMP names produce non-zero cost', () => {
@@ -609,6 +672,8 @@ describe('Cursor model variants resolve to pricing', () => {
     ['claude-4.6-haiku', 'claude-haiku-4-5'],
     // Cursor auto proxy
     ['cursor-auto', 'claude-sonnet-4-5'],
+    // Codex activity surface (official rate card, observed raw id)
+    ['codex-auto-review', 'gpt-5.5'],
     // OpenAI variants Cursor emits
     ['gpt-5', 'gpt-5'],
     ['gpt-5-fast', 'gpt-5'],
@@ -641,6 +706,29 @@ describe('Cursor model variants resolve to pricing', () => {
   // independently of today's pricing coincidence.
   it('keeps claude-4-sonnet-thinking in the Sonnet 4 model family', () => {
     expect(getShortModelName('claude-4-sonnet-thinking')).toBe('Sonnet 4')
+  })
+})
+
+describe('Codex activity ids (#1047)', () => {
+  it('keeps the activity label instead of collapsing to the underlying model name', () => {
+    expect(getShortModelName('codex-auto-review')).toBe('Codex Auto Review')
+  })
+
+  it('prices as the exact bundled GPT-5.5 object, not an invented rate', () => {
+    expect(getModelCosts('codex-auto-review')).toBe(getModelCosts('gpt-5.5'))
+    const auto = calculateCost('codex-auto-review', 1_000_000, 1_000_000, 0, 0, 0)
+    const gpt55 = calculateCost('gpt-5.5', 1_000_000, 1_000_000, 0, 0, 0)
+    expect(auto).toBeGreaterThan(0)
+    expect(auto).toBe(gpt55)
+  })
+
+  it('does not invent a family or an unobserved sibling id', () => {
+    expect(getModelCosts('codex-code-review')).toBeNull()
+    expect(getModelCosts('codex-cloud-task')).toBeNull()
+    expect(getModelCosts('codex-automation')).toBeNull()
+    expect(getModelCosts('code-review')).toBeNull()
+    expect(getModelCosts('auto-review')).toBeNull()
+    expect(calculateCost('codex-code-review', 1_000_000, 1_000_000, 0, 0, 0)).toBe(0)
   })
 })
 
@@ -753,6 +841,7 @@ describe('DeepSeek v4 models resolve to pricing', () => {
       process.env['CODEBURN_CACHE_DIR'] = cacheRoot
       await mkdir(cacheRoot, { recursive: true })
       await writeFile(join(cacheRoot, 'litellm-pricing.json'), JSON.stringify({
+        version: 2, // must match models.ts's CACHE_SCHEMA_VERSION or the cache is treated as a miss
         timestamp: Date.now(),
         data: {
           'gpt-4o-mini': {
@@ -771,6 +860,42 @@ describe('DeepSeek v4 models resolve to pricing', () => {
       expect(getModelCosts('gpt-4o-mini')!.inputCostPerToken).toBe(9e-7)
       expect(getModelCosts('deepseek-v4-pro')!.inputCostPerToken).toBe(4.35e-7)
       expect(getModelCosts('deepseek-v4-flash')!.inputCostPerToken).toBe(1.4e-7)
+    } finally {
+      await rm(cacheRoot, { recursive: true, force: true })
+      await loadPricing()
+    }
+  })
+})
+
+describe('pricing cache schema version (#1075/#1078 follow-up)', () => {
+  it('discards a cache written by a pre-#1078 binary instead of reading its missing cacheWriteCostIsExplicit as false', async () => {
+    const cacheRoot = await mkdtemp(join(tmpdir(), 'codeburn-pricing-cache-'))
+    try {
+      process.env['CODEBURN_CACHE_DIR'] = cacheRoot
+      await mkdir(cacheRoot, { recursive: true })
+      // Shape of a cache file written before #1078 added `version` and
+      // `cacheWriteCostIsExplicit`: no version field, and entries missing the
+      // key despite carrying a real (non-default) cache-write rate.
+      await writeFile(join(cacheRoot, 'litellm-pricing.json'), JSON.stringify({
+        timestamp: Date.now(),
+        data: {
+          'gpt-5.6': {
+            inputCostPerToken: 5e-6,
+            outputCostPerToken: 3e-5,
+            cacheWriteCostPerToken: 6.25e-6,
+            cacheReadCostPerToken: 5e-7,
+            webSearchCostPerRequest: 0.01,
+            fastMultiplier: 1,
+          },
+        },
+      }), 'utf-8')
+
+      await loadPricing()
+
+      // Pre-fix, loadCachedPricing had no version check: it would read this
+      // cache verbatim, and gpt-5.6's missing key would resolve to undefined
+      // (falsy) here instead of the true its LiteLLM entry actually carries.
+      expect(getModelCosts('gpt-5.6')!.cacheWriteCostIsExplicit).toBe(true)
     } finally {
       await rm(cacheRoot, { recursive: true, force: true })
       await loadPricing()
@@ -915,6 +1040,7 @@ describe('findUnpricedModels', () => {
     try {
       process.env['CODEBURN_CACHE_DIR'] = cacheRoot
       await writeFile(join(cacheRoot, 'litellm-pricing.json'), JSON.stringify({
+        version: 2, // must match models.ts's CACHE_SCHEMA_VERSION or the cache is treated as a miss
         timestamp: Date.now(),
         data: {
           'zz-zero-stub-model': {
@@ -980,6 +1106,71 @@ describe('findUnpricedModels', () => {
     expect(findUnpricedModels([{ model, calls: 1, cost: 0, tokens: 10 }])).toEqual([])
   })
 
+  it('skips subscription / flat-rate product SKUs where $0 is correct', () => {
+    const rows = [
+      { model: 'auto-genius', calls: 898, cost: 0, tokens: 35_300_000 },
+      { model: 'cline-pass/auto-genius', calls: 4, cost: 0, tokens: 33_900 },
+      { model: 'auto', calls: 449, cost: 0, tokens: 17_700_000 },
+      { model: 'kimi-for-coding-highspeed', calls: 12, cost: 0, tokens: 3_400_000 },
+      { model: 'moonshot/kimi-for-coding-highspeed', calls: 2, cost: 0, tokens: 80_000 },
+      { model: 'grok-composer-2.5-fast', calls: 10, cost: 0, tokens: 1_900_000 },
+      { model: 'Grok Composer 2.5 Fast', calls: 10, cost: 0, tokens: 1_900_000 },
+      { model: 'Warp Auto (efficient)', calls: 3, cost: 0, tokens: 50_000 },
+      { model: 'warp', calls: 449, cost: 0, tokens: 17_700_000 },
+      { model: 'codex-auto-review', calls: 940, cost: 0, tokens: 7_200_000 },
+      { model: 'Codex Auto Review', calls: 2, cost: 0, tokens: 100 },
+      { model: 'big-pickle', calls: 4, cost: 0, tokens: 33_900 },
+      { model: 'zz-mystery-paid-model-999', calls: 3, cost: 0, tokens: 1200 },
+    ]
+    expect(findUnpricedModels(rows)).toEqual([
+      { model: 'warp', calls: 449, tokens: 17_700_000 },
+      // Note: NOT 'codex-auto-review' — #1056 aliases it to gpt-5.5, so it
+      // now resolves a billable rate and is filtered out here (a $0 row for
+      // it is stale data, not evidence of missing pricing). It still left
+      // the flat-rate list, verified separately in the "Codex activity ids
+      // (#1047)" describe block below.
+      { model: 'big-pickle', calls: 4, tokens: 33_900 },
+      { model: 'zz-mystery-paid-model-999', calls: 3, tokens: 1200 },
+      { model: 'Codex Auto Review', calls: 2, tokens: 100 },
+    ])
+  })
+
+  it('skips a user-declared flat-rate model, including path-prefixed siblings', () => {
+    const model = 'zz-my-pass-codename'
+    expect(findUnpricedModels([{ model, calls: 1, cost: 0, tokens: 10 }])).toHaveLength(1)
+    setFlatRateModels([model])
+    expect(findUnpricedModels([{ model, calls: 1, cost: 0, tokens: 10 }])).toEqual([])
+    expect(findUnpricedModels([{ model: `vendor/${model}`, calls: 1, cost: 0, tokens: 10 }])).toEqual([])
+    expect(findUnpricedModels([{ model: 'zz-other-unknown', calls: 1, cost: 0, tokens: 10 }])).toHaveLength(1)
+  })
+
+  it('does not treat a priced sibling as expected-free just because a family is flat-rate', () => {
+    // warp-auto-* is a subscription SKU, but main already aliases it onto a
+    // billable row. Coverage must still count those priced calls.
+    expect(isFlatRateModel('warp-auto-efficient')).toBe(true)
+    expect(getModelCosts('warp-auto-efficient')).not.toBeNull()
+    expect(isExpectedFreeModel('warp-auto-efficient')).toBe(false)
+    expect(isExpectedFreeModel('auto-genius')).toBe(true)
+    expect(isExpectedFreeModel('auto')).toBe(true)
+    expect(isExpectedFreeModel('kimi-for-coding-highspeed')).toBe(true)
+    expect(isExpectedFreeModel('warp')).toBe(false)
+    expect(isExpectedFreeModel('codex-auto-review')).toBe(false)
+    expect(isExpectedFreeModel('zz-mystery-paid-model-999')).toBe(false)
+  })
+
+  it('lets --remove opt out of a built-in so a false positive can warn again', () => {
+    expect(findUnpricedModels([{ model: 'auto-genius', calls: 1, cost: 0, tokens: 10 }])).toEqual([])
+    setFlatRateRemoved(['auto-genius'])
+    expect(isFlatRateModel('auto-genius')).toBe(false)
+    expect(findUnpricedModels([{ model: 'auto-genius', calls: 1, cost: 0, tokens: 10 }])).toEqual([
+      { model: 'auto-genius', calls: 1, tokens: 10 },
+    ])
+    expect(findUnpricedModels([{ model: 'cline-pass/auto-genius', calls: 1, cost: 0, tokens: 10 }])).toEqual([
+      { model: 'cline-pass/auto-genius', calls: 1, tokens: 10 },
+    ])
+    expect(isFlatRateModel('auto')).toBe(true)
+  })
+
   it('sorts by tokens, then calls', () => {
     const unpriced = findUnpricedModels([
       { model: 'zz-small', calls: 9, cost: 0, tokens: 10 },
@@ -1017,5 +1208,99 @@ describe('getModelAliasesConfigHash', () => {
     setModelAliases({ 'my-model': 'claude-opus-4-6', 'b-model': 'gpt-5' })
     expect(getModelAliasesConfigHash()).toBe(two)
     setModelAliases({})
+  })
+})
+
+describe('getFlatRateModelsConfigHash', () => {
+  it('is empty for no marks, changes with content, ignores insertion order', () => {
+    setFlatRateModels([])
+    expect(getFlatRateModelsConfigHash()).toBe('')
+    setFlatRateModels(['auto-genius'])
+    const one = getFlatRateModelsConfigHash()
+    expect(one).not.toBe('')
+    setFlatRateModels(['warp', 'auto-genius'])
+    const two = getFlatRateModelsConfigHash()
+    expect(two).not.toBe(one)
+    setFlatRateModels(['auto-genius', 'warp'])
+    expect(getFlatRateModelsConfigHash()).toBe(two)
+    setFlatRateModels([])
+  })
+
+  it('changes when a built-in is opted out', () => {
+    setFlatRateModels([])
+    setFlatRateRemoved([])
+    const baseline = getFlatRateModelsConfigHash()
+    setFlatRateRemoved(['auto-genius'])
+    expect(getFlatRateModelsConfigHash()).not.toBe(baseline)
+    setFlatRateRemoved([])
+    expect(getFlatRateModelsConfigHash()).toBe(baseline)
+  })
+})
+
+describe('pricing snapshot carries flat-rate marks', () => {
+  it('restorePricingState reapplies user flat-rate marks', async () => {
+    const { snapshotPricingState, restorePricingState } = await import('../src/models.js')
+    setFlatRateModels(['zz-snapshot-flat'])
+    const snap = snapshotPricingState()
+    expect(snap.flatRateModels).toEqual(['zz-snapshot-flat'])
+    setFlatRateModels([])
+    expect(isFlatRateModel('zz-snapshot-flat')).toBe(false)
+    restorePricingState(snap)
+    expect(isFlatRateModel('zz-snapshot-flat')).toBe(true)
+    setFlatRateModels([])
+  })
+
+  it('restorePricingState reapplies built-in opt-outs', async () => {
+    const { snapshotPricingState, restorePricingState } = await import('../src/models.js')
+    setFlatRateRemoved(['auto-genius'])
+    const snap = snapshotPricingState()
+    expect(snap.flatRateModelsRemoved).toEqual(['auto-genius'])
+    setFlatRateRemoved([])
+    expect(isFlatRateModel('auto-genius')).toBe(true)
+    restorePricingState(snap)
+    expect(isFlatRateModel('auto-genius')).toBe(false)
+    setFlatRateRemoved([])
+  })
+})
+
+describe('unpricedModelHint', () => {
+  it('never tells the user to alias unconditionally', () => {
+    expect(unpricedModelHint()).toContain('If a model is billed per token')
+    expect(unpricedModelHint()).toContain('model-flat-rate')
+    expect(unpricedModelHint()).not.toContain('Fix: codeburn model-alias')
+  })
+
+  it('names both hatches for a concrete unknown SKU', () => {
+    const hint = unpricedModelHint('zz-new-subscription-pass-sku')
+    expect(hint).toContain('codeburn model-alias "zz-new-subscription-pass-sku"')
+    expect(hint).toContain('codeburn model-flat-rate "zz-new-subscription-pass-sku"')
+    expect(hint).toContain('If a model is billed per token')
+    expect(hint).toContain('If $0 is correct')
+  })
+})
+
+describe('calculateCost verbose unknown-model warning', () => {
+  it('does not present model-alias as the only fix for an unknown SKU', () => {
+    const previous = process.env['CODEBURN_VERBOSE']
+    process.env['CODEBURN_VERBOSE'] = '1'
+    const chunks: string[] = []
+    const originalWrite = process.stderr.write.bind(process.stderr)
+    process.stderr.write = ((chunk: string | Uint8Array, ...args: unknown[]) => {
+      chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString())
+      return (originalWrite as (chunk: string | Uint8Array, ...rest: unknown[]) => boolean)(chunk, ...args)
+    }) as typeof process.stderr.write
+    try {
+      expect(calculateCost('zz-new-subscription-pass-sku', 10, 10, 0, 0, 0)).toBe(0)
+    } finally {
+      process.stderr.write = originalWrite
+      if (previous === undefined) delete process.env['CODEBURN_VERBOSE']
+      else process.env['CODEBURN_VERBOSE'] = previous
+    }
+    const text = chunks.join('')
+    expect(text).toContain('zz-new-subscription-pass-sku')
+    expect(text).toContain('If a model is billed per token')
+    expect(text).toContain('model-flat-rate')
+    expect(text).toContain('model-alias')
+    expect(text).not.toMatch(/Map it with: codeburn model-alias/)
   })
 })

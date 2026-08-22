@@ -350,6 +350,7 @@ describe('review-findings regressions', () => {
     expect(isExpectedFreeModel('qwen3.6:35b-a3b-bf16')).toBe(true)
     expect(isExpectedFreeModel('llama-3-8b-q4')).toBe(true)
     expect(isExpectedFreeModel('claude-opus-4-8')).toBe(false)
+    expect(isExpectedFreeModel('auto-genius')).toBe(true)
     // 95 local calls + 5 unpriced cloud calls: coverage must be 0, not 0.95.
     expect(computePricingCoverage(5, 5)).toBe(0)
   })

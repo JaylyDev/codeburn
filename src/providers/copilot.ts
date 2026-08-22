@@ -783,8 +783,9 @@ function createJsonlParser(
       // CUMULATIVE per-model totals. Emitting each rollup whole would need the
       // cache to update a prior call in place — the durable merge is
       // append-only by dedup key — so we emit per-leg DELTAS keyed by
-      // occurrence instead: re-parses of a growing file append only the new
-      // leg, and each leg lands on its own timestamp.
+      // occurrence (`:n`): re-parses of a growing file append only the new
+      // leg, and each leg lands on its own timestamp. Discovery only yields
+      // `<sid>/events.jsonl`, so two journals cannot share a session id.
       const prevShutdownUsage = new Map<string, ShutdownModelUsage>()
       const shutdownCountByModel = new Map<string, number>()
 
@@ -897,6 +898,13 @@ function createJsonlParser(
           const modelMetrics = shutdownData.modelMetrics
           if (!isRecord(modelMetrics)) continue
 
+          // Prefer lastEventTimestamp over sessionStartTime. sessionStartTime
+          // is identical for every stampless leg of a resumed session, so
+          // using it for the call timestamp (or, previously, the key) collapsed
+          // those legs onto one date. lastEventTimestamp is the last stamped
+          // event in this journal — distinct per leg when intervening events
+          // are stamped, and still a real time when they are not.
+          //
           // Fallback order matters for accounting, not just display: this
           // stamp anchors the leg's interval in the serve-time reconciliation,
           // which subtracts the store rows written up to it. A shutdown

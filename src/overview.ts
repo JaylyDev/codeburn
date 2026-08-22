@@ -4,7 +4,7 @@ import { homedir } from 'os'
 
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost as baseCost, getCurrency } from './currency.js'
-import { findUnpricedModels, getShortModelName } from './models.js'
+import { findUnpricedModels, getShortModelName, unpricedModelHint } from './models.js'
 import { markEstimated } from './format.js'
 import { dateKey } from './day-aggregator.js'
 import type { DailyEntry } from './daily-cache.js'
@@ -224,7 +224,7 @@ export function renderOverview(
       .join(', ')
     const more = unpriced.length > 3 ? ` +${unpriced.length - 3} more` : ''
     out.push(kv('Unpriced', c.yellow(`${unpriced.length} model${unpriced.length === 1 ? '' : 's'} at $0: `) + shown + more))
-    out.push(kv('', c.dim('Fix: codeburn model-alias "<model>" <known-model>')))
+    out.push(kv('', c.dim(unpricedModelHint())))
   }
   if (opts.budget) {
     const label = opts.budget.tier === 'daily'

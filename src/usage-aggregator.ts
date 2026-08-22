@@ -3,7 +3,7 @@ import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory, type DateRange
 import { isBehavioralCall } from './behavioral-weight.js'
 import { type PeriodData, type ProviderCost, type BreakdownArrays, type MenubarPayload, type ClaudeConfigSelector, buildMenubarPayload } from './menubar-json.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, isSessionHydrationComplete } from './parser.js'
-import { findUnpricedModels, getLocalModelSavingsConfigHash, getPriceOverridesConfigHash, getShortModelName, isExpectedFreeModel } from './models.js'
+import { findUnpricedModels, getFlatRateModelsConfigHash, getLocalModelSavingsConfigHash, getPriceOverridesConfigHash, getShortModelName, isExpectedFreeModel } from './models.js'
 import { getAllProviders, safeDiscoverSessions } from './providers/index.js'
 import { claude, getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { stat } from 'node:fs/promises'
@@ -83,8 +83,8 @@ export function buildPeriodData(label: string, projects: ProjectSummary[]): Peri
 export function getDailyCacheConfigHash(): string {
   const savingsHash = getLocalModelSavingsConfigHash()
   const overridesHash = getPriceOverridesConfigHash()
-  if (!overridesHash) return savingsHash
-  return `localModelSavings=${savingsHash}\u0002priceOverrides=${overridesHash}`
+  const flatRateHash = getFlatRateModelsConfigHash()
+  return `localModelSavings=${savingsHash}\u0002priceOverrides=${overridesHash}\u0002flatRateModels=${flatRateHash}`
 }
 
 async function hydrateCache(): Promise<DailyCache> {
@@ -610,9 +610,9 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   }
   claudeConfigs = claudeConfigs ?? await claudeConfigSelector(scanProjects, null)
 
-  // Codex credits for the period. Reuses the models aggregation (folds reasoning
-  // into output, keeps non-cached input + cached-read separate) so the figure
-  // matches the official credit rates.
+  // Codex credits for the period. Reuses the models aggregation (billable output
+  // already includes reasoning for codex, keeps non-cached input + cached-read
+  // separate) so the figure matches the official credit rates.
   const modelRows = await aggregateModels(scanProjects)
   currentData.codexCredits = modelRows.reduce(
     (sum, r) => sum + (r.provider === 'codex' && r.credits != null ? r.credits : 0),

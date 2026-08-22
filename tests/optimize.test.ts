@@ -28,6 +28,12 @@ import {
   buildOptimizeJsonReport,
   renderOptimize,
   findingBasis,
+  optimizeRemediationCopy,
+  optimizePasteHeader,
+  optimizeTuiPasteHeader,
+  optimizeEmptyScanLines,
+  sessionOpenerLabel,
+  askAgentLabel,
   type FindingId,
   type ToolCall,
   type ApiCallMeta,
@@ -1441,5 +1447,139 @@ describe('renderOptimize applied-fixes section', () => {
     expect(render([fixture({})], [])).toContain('Applied fixes')
     expect(render([])).not.toContain('Applied fixes')
     expect(render([], [])).not.toContain('Applied fixes')
+  })
+})
+
+describe('provider-scoped remediation copy (#1044)', () => {
+  const strip = (s: string): string => s.replace(/\u001b\[[0-9;]*m/g, '')
+
+  function promptFinding(label: string): WasteFinding {
+    return {
+      id: 'retry-heavy-capabilities',
+      title: 'retry-heavy',
+      explanation: 'why',
+      impact: 'medium',
+      tokensSaved: 1000,
+      fix: { type: 'paste', destination: 'prompt', label, text: 'audit' },
+    }
+  }
+
+  function openerFinding(label: string): WasteFinding {
+    return {
+      id: 'low-worth-sessions',
+      title: 'low-worth',
+      explanation: 'why',
+      impact: 'low',
+      tokensSaved: 1000,
+      fix: { type: 'paste', destination: 'session-opener', label, text: 'open' },
+    }
+  }
+
+  it('keeps the exact shipped Claude / CLAUDE.md strings', () => {
+    for (const provider of [undefined, 'all', 'claude'] as const) {
+      const copy = optimizeRemediationCopy(provider)
+      expect(copy).toEqual({ agent: 'Claude', instructionFile: 'CLAUDE.md' })
+      expect(optimizePasteHeader('prompt', copy)).toBe('Ask Claude in the current session')
+      expect(optimizePasteHeader('session-opener', copy)).toBe('One-time session opener (do NOT add to CLAUDE.md)')
+      expect(sessionOpenerLabel(copy)).toBe('Paste at the start of your NEXT expensive thread (one-time, do not add to CLAUDE.md):')
+      expect(askAgentLabel(copy, 'audit the retry-heavy capability before changing config'))
+        .toBe('Ask Claude to audit the retry-heavy capability before changing config:')
+      expect(optimizeEmptyScanLines(provider)).toEqual([
+        'CodeBurn optimize scans your Claude Code sessions and config for',
+        'token waste: junk directory reads, duplicate file reads, unused',
+        'agents/skills/MCP servers, bloated CLAUDE.md, and more.',
+      ])
+      expect(optimizeTuiPasteHeader('session-opener', provider))
+        .toBe('── One-time session opener (do not add to CLAUDE.md) '.padEnd(64, '─'))
+      expect(optimizeTuiPasteHeader('prompt', provider))
+        .toBe('── Ask Claude in the current session '.padEnd(64, '─'))
+    }
+    const empty = strip(renderOptimize([], 0, 'lifetime', 0, 0, 0, 100, 'A', [], []))
+    expect(empty).toContain('CodeBurn optimize scans your Claude Code sessions and config for')
+    expect(empty).toContain('bloated CLAUDE.md')
+    expect(empty).not.toContain('Claude sessions')
+  })
+
+  it('uses Codex / AGENTS.md for --provider codex', () => {
+    const copy = optimizeRemediationCopy('codex')
+    expect(copy).toEqual({ agent: 'Codex', instructionFile: 'AGENTS.md' })
+    expect(optimizePasteHeader('prompt', copy)).toBe('Ask Codex in the current session')
+    expect(optimizePasteHeader('session-opener', copy)).toBe('One-time session opener (do NOT add to AGENTS.md)')
+    expect(sessionOpenerLabel(copy)).toContain('AGENTS.md')
+    expect(sessionOpenerLabel(copy)).not.toContain('CLAUDE.md')
+    expect(optimizeEmptyScanLines('codex')[0]).toBe('Session-scan detectors do not cover Codex yet.')
+    expect(optimizeEmptyScanLines('codex')[2]).toContain('currently scan Claude Code only')
+    expect(optimizeEmptyScanLines('codex').join(' ')).not.toContain('scans your Codex')
+    expect(optimizeEmptyScanLines('codex').join(' ')).not.toContain('bloated AGENTS.md')
+    expect(optimizeTuiPasteHeader('prompt', 'codex')).toContain('Ask Codex in the current session')
+    expect(optimizeTuiPasteHeader('session-opener', 'codex')).toContain('do NOT add to AGENTS.md')
+    expect(optimizeTuiPasteHeader('session-opener', 'codex')).not.toContain('CLAUDE.md')
+  })
+
+  it('uses the canonical Provider.displayName, not a title-cased id', () => {
+    expect(optimizeRemediationCopy('hermes').agent).toBe('Hermes Agent')
+    expect(optimizeRemediationCopy('cursor').agent).toBe('Cursor')
+    expect(optimizeRemediationCopy('cursor').instructionFile).toBe('project instructions')
+    expect(optimizePasteHeader('session-opener', optimizeRemediationCopy('cursor')))
+      .toBe('One-time session opener (do NOT add to project instructions)')
+  })
+
+  it('scopes every cross-provider detector label, including JSON', () => {
+    const lowWorth = detectLowWorthSessions([
+      projectWithLowWorthSessions([lowWorthSession(4, 0, { turns: [lowWorthTurn({ hasEdits: false })] })]),
+    ], 'codex')
+    const context = detectContextBloat([
+      projectWithContextSessions([contextSession(0, {
+        totalInputTokens: 90_000,
+        totalCacheReadTokens: 30_000,
+        totalOutputTokens: 2_000,
+      })]),
+    ], undefined, 'codex')
+    const outliers = detectSessionOutliers([projectWithSessions([1, 1, 1, 10])], undefined, 'codex')
+    const turns = Array.from({ length: 5 }, (_, i) => reliabilityTurn(i, {
+      retries: i < 3 ? 1 : 0,
+      call: { tools: ['Edit', 'Skill'], skills: ['reviewer'] },
+    }))
+    const retry = detectCapabilityReliability([projectWithReliabilityTurns(turns)], 'codex')
+
+    const findings = [lowWorth, context, outliers, retry]
+    expect(findings.every(Boolean)).toBe(true)
+    for (const finding of findings) {
+      expect(finding!.fix.label).not.toContain('Claude')
+      expect(finding!.fix.label).not.toContain('CLAUDE.md')
+    }
+    expect(lowWorth!.fix.label).toContain('AGENTS.md')
+    expect(context!.fix.label).toContain('AGENTS.md')
+    expect(outliers!.fix.label).toContain('AGENTS.md')
+    expect(retry!.fix.label).toBe('Ask Codex to audit the retry-heavy capability before changing config:')
+
+    const json = buildOptimizeJsonReport(
+      [projectWithSessions([1])],
+      'lifetime',
+      { findings: findings as WasteFinding[], costRate: 0.00001, healthScore: 80, healthGrade: 'B', modelRecommendations: [] },
+    )
+    expect(json.findings).toHaveLength(4)
+    for (const row of json.findings) {
+      expect(row.fix.label).not.toContain('Claude')
+      expect(row.fix.label).not.toContain('CLAUDE.md')
+    }
+  })
+
+  it('renders destination headers from the selected provider, not the finding text', () => {
+    const out = strip(renderOptimize(
+      [promptFinding('Ask Claude to audit the retry-heavy capability before changing config:')],
+      0.00001, 'lifetime', 10, 5, 100, 80, 'B', [], [],
+      undefined, undefined, undefined, [], 'codex',
+    ))
+    expect(out).toContain('Ask Codex in the current session')
+    expect(out).not.toContain('Ask Claude in the current session')
+
+    const opener = strip(renderOptimize(
+      [openerFinding('Paste at the start of your NEXT expensive thread (one-time, do not add to CLAUDE.md):')],
+      0.00001, 'lifetime', 10, 5, 100, 80, 'B', [], [],
+      undefined, undefined, undefined, [], 'codex',
+    ))
+    expect(opener).toContain('do NOT add to AGENTS.md')
+    expect(opener).not.toContain('do NOT add to CLAUDE.md')
   })
 })

@@ -44,6 +44,16 @@ const MANUAL_ENTRIES = {
   'deepseek-v4-pro':        [4.35e-7, 8.7e-7, 0, 3.625e-9],
   // Mythos 5 launch pricing; not yet in LiteLLM or the models.dev/OpenRouter gap-fill (Fable is).
   'claude-mythos-5':        [10e-6, 50e-6, 12.5e-6, 1e-6],
+  // gpt-5.6-codex / gpt-5.6-codex-max (#1077): not yet in LiteLLM. Every prior
+  // Codex-suffixed id LiteLLM DOES carry bills identically to its bare-model
+  // sibling of the same generation - gpt-5-codex == gpt-5, gpt-5.1-codex ==
+  // gpt-5.1-codex-max == gpt-5.1, gpt-5.2-codex == gpt-5.2, gpt-5.3-codex ==
+  // gpt-5.3 (all four input/output/cache-write/cache-read rates identical,
+  // verified against the live model_prices_and_context_window.json). Mirroring
+  // that pattern onto gpt-5.6 rather than inventing a number: both ids get the
+  // exact gpt-5.6 tuple (Sol-tier: $5/$30 per million, 1.25x cache-write).
+  'gpt-5.6-codex':          [5e-6, 3e-5, 6.25e-6, 5e-7],
+  'gpt-5.6-codex-max':      [5e-6, 3e-5, 6.25e-6, 5e-7],
 }
 
 const snapshot = {}

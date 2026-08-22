@@ -747,6 +747,11 @@ function ModelBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: 
   const anyEstimated = Object.values(modelTotals).some(d => d.estimatedCostUSD > 0)
   const sorted = Object.entries(modelTotals).sort(([, a], [, b]) => b.costUSD - a.costUSD)
   const costLabels = sorted.map(([, data]) => markEstimated(formatCost(data.costUSD), data.estimatedCostUSD > 0))
+  // #1088: this column has zero width slack left at the standard 3-column
+  // breakpoint (verified: widening the header even one character clips
+  // 'cache'/'1-shot' and drops the value column entirely), so the header stays
+  // "Tok/s" -- the legend below carries the "Effective Tok/s" framing and the
+  // caveat that it is not a vendor decode-speed figure.
   const headers = ['cost', 'cache', 'calls', '1-shot', 'Tok/s']
   const values = sorted.map(([model, data], index) => {
     const totalInput = data.freshInput + data.cacheRead + data.cacheWrite
@@ -807,7 +812,7 @@ function ModelBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: 
       {anyEstimated && (
         <Text dimColor wrap="truncate-end">~ estimated cost (priced from estimated tokens)</Text>
       )}
-      <Text dimColor wrap="truncate-end">~ Tok/s: generated tokens / active time; tool wait excluded</Text>
+      <Text dimColor wrap="truncate-end">~ Effective Tok/s: generated tokens ÷ time the agent spent waiting on the model, tool execution excluded. Includes prefill, request assembly and reasoning. Not comparable to vendor decode-speed figures.</Text>
     </Panel>
   )
 }

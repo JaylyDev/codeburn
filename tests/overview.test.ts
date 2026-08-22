@@ -240,6 +240,23 @@ describe('renderOverview unpriced models', () => {
     expect(out).toContain('1 model at $0')
     expect(out).toContain('zz-mystery-paid-model-999')
     expect(out).toContain('codeburn model-alias')
+    expect(out).toContain('model-flat-rate')
+    expect(out).not.toContain('Fix: codeburn model-alias')
+  })
+
+  it('stays silent for subscription SKUs whose $0 is correct', () => {
+    const out = renderOverview([makeProject({
+      project: 'pass',
+      projectPath: '/Users/test/pass',
+      cost: 0,
+      calls: 4,
+      model: 'auto-genius',
+      provider: 'cline-cli',
+      tokens: { input: 1000, output: 200, cacheR: 0, cacheW: 0 },
+    })], { label: 'June 2026', color: false })
+
+    expect(out).not.toContain('Unpriced')
+    expect(out).not.toContain('model-alias')
   })
 
   it('stays silent when every model is priced', () => {

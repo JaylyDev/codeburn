@@ -721,9 +721,9 @@ describe('copilot provider - session.shutdown token/cost rollup', () => {
   it('emits per-leg deltas for a resumed session with cumulative shutdown rollups', async () => {
     // Numbers from a real resumed CLI 1.0.78 session (3 legs via --resume):
     // each leg appends a session.shutdown whose modelMetrics are CUMULATIVE.
-    // Emitting deltas keyed by occurrence keeps a growing file append-only
-    // under the durable union-by-key cache merge — re-parsing after each
-    // resume adds only the new leg, never double-counting earlier ones.
+    // Emitting deltas keyed by shutdown timestamp keeps a growing file
+    // append-only under the durable union-by-key cache merge — re-parsing
+    // after each resume adds only the new leg, never double-counting earlier ones.
     const legs = [
       { inputTokens: 24672, outputTokens: 17, cacheReadTokens: 0, cacheWriteTokens: 24670 },
       { inputTokens: 74463, outputTokens: 149, cacheReadTokens: 49489, cacheWriteTokens: 24968 },
@@ -816,6 +816,54 @@ describe('copilot provider - session.shutdown token/cost rollup', () => {
     // Durable provider: re-parsing with the same seenKeys re-emits nothing.
     const second = await collectCalls(source, seen)
     expect(second).toHaveLength(0)
+  })
+
+  it('keeps three stampless shutdown legs as :n keys with lastEventTimestamp, not sessionStartTime', async () => {
+    // sessionStartTime is identical on every leg. Putting it in the key (or
+    // preferring it over lastEventTimestamp for the call timestamp) collapses
+    // a 3-leg journal onto one row. Discovery only yields events.jsonl, so
+    // two-journal fixtures are unreachable; this is the reachable class.
+    const lastEvent = '2026-08-01T10:00:15Z'
+    const sessionStartTime = 1784102040274
+    const stamplessShutdown = (usage: {
+      inputTokens: number
+      outputTokens: number
+      cacheReadTokens: number
+      cacheWriteTokens: number
+    }) => JSON.stringify({
+      type: 'session.shutdown',
+      data: {
+        shutdownType: 'routine',
+        sessionStartTime,
+        modelMetrics: {
+          'claude-sonnet-5': {
+            requests: { count: 1, cost: 1 },
+            usage: { ...usage, reasoningTokens: 0 },
+          },
+        },
+      },
+    })
+    const eventsPath = await createSessionDir('sess-stampless', [
+      modelChange('claude-sonnet-5'),
+      assistantMessage({ messageId: 'msg-1', outputTokens: 10, timestamp: lastEvent }),
+      stamplessShutdown({ inputTokens: 3000, outputTokens: 10, cacheReadTokens: 1000, cacheWriteTokens: 500 }),
+      stamplessShutdown({ inputTokens: 7000, outputTokens: 20, cacheReadTokens: 3000, cacheWriteTokens: 1000 }),
+      stamplessShutdown({ inputTokens: 10000, outputTokens: 30, cacheReadTokens: 5000, cacheWriteTokens: 1500 }),
+    ])
+    const calls = await collectCalls({ path: eventsPath, project: 'myproject', provider: 'copilot', sourceType: 'jsonl' })
+    const shutdowns = calls.filter(c => c.deduplicationKey.includes(':shutdown:'))
+    expect(shutdowns.map(c => c.deduplicationKey)).toEqual([
+      'copilot:sess-stampless:shutdown:claude-sonnet-5:1',
+      'copilot:sess-stampless:shutdown:claude-sonnet-5:2',
+      'copilot:sess-stampless:shutdown:claude-sonnet-5:3',
+    ])
+    expect(shutdowns.map(c => c.timestamp)).toEqual([lastEvent, lastEvent, lastEvent])
+    expect(shutdowns[0]!.inputTokens).toBe(1500)
+    expect(shutdowns[1]!.inputTokens).toBe(1500)
+    expect(shutdowns[2]!.inputTokens).toBe(500)
+    expect(shutdowns.reduce((a, c) => a + c.inputTokens, 0)).toBe(3500)
+    expect(shutdowns.reduce((a, c) => a + c.cacheReadInputTokens, 0)).toBe(5000)
+    expect(shutdowns.reduce((a, c) => a + c.cacheCreationInputTokens, 0)).toBe(1500)
   })
 
   it('falls back to the last stamped event when shutdown carries no timestamp at all', async () => {

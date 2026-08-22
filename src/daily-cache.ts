@@ -6,7 +6,7 @@ import { join } from 'path'
 import { getCodeburnCacheDir } from './cache-dir.js'
 import type { DateRange, ProjectSummary } from './types.js'
 
-// Bumped to 25: copilot input/cache tokens for sessions covered by the CLI's
+// Bumped to 26: copilot input/cache tokens for sessions covered by the CLI's
 // session-store.db move from one shutdown-rollup lump (stamped at session end)
 // to per-request DB rows with real timestamps, supplementary accounting calls
 // (rollups, residuals, paired rows) stop counting as api/model calls, and
@@ -15,16 +15,29 @@ import type { DateRange, ProjectSummary } from './types.js'
 // costs all move, so days finalized under an earlier version would disagree
 // with the live parse.
 //
-// Why 25 and not 21 (the number this change first claimed): 20 is #1040 (codex
+// Why 26 and not 21 (the number this change first claimed): 20 is #1040 (codex
 // model attribution), 18 was burned by an earlier public head of THIS change
-// under different accounting, and 21-24 landed on main while this branch was in
-// validation. 25 is the first free number on main's ladder — and it is load
+// under different accounting, and 21-25 landed on main while this branch was in
+// validation — 25 in particular was spent by #1056 (`codex-auto-review`
+// pricing) after this PR had already minted it, which is why the number moves
+// again here. 26 is the first free number on main's ladder — and it is load
 // bearing beyond the collision: the branch's own validators already hold
 // daily-cache.v21.json files whose copilot slices were carried stale by the
 // bug PENDING_REDERIVE_PROVIDERS fixes below, and only a number those files
 // cannot claim gets them re-derived. isMigratableCache/adoptOlderDailyCaches
 // carry a same-or-newer version forward as FINALIZED without re-deriving it,
-// so a number can never mean two accountings.
+// so a number can never mean two accountings. (feat/core-extraction also sits
+// at 26 and reconciles at its final merge by keeping the max.)
+//
+// Bumped to 25: `codex-auto-review` now prices as the recommended GPT-5.5
+// row (#1047). Days already finalized under v24 keep that id at $0
+// forever unless MIN_SUPPORTED_VERSION moves: the daily cache has no
+// per-provider invalidation. The Codex parse version and CODEX_CACHE_VERSION
+// move with this so the lower caches reprice first; this pass then re-derives
+// ALL days from the warm session cache (seconds, not a full re-parse).
+// adoptOlderDailyCaches keeps the superseded file as the baseline. v21 is
+// #946, v22 was this PR's earlier claim, v23 is #1075, v24 is #1090.
+//
 // Bumped to 20: the Codex fast-path read a nested
 // `base_instructions.provenance.model` out of `session_meta` as if it were
 // `payload.model` (#1040), so every call a rollout attributed from session
@@ -129,11 +142,32 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 25
-const MIN_SUPPORTED_VERSION = 25
+// v23: codex pricing fix (#1075) - reasoning tokens were billed on top of
+// output (they are a subset of it) and cache_write_input_tokens was ignored, so
+// days finalized at v20 carry codex costs overstated by ~3.5% and codex output
+// tokens overstated by ~34.6%. Raising MIN_SUPPORTED_VERSION forces the
+// one-time re-derivation.
+// It takes 23, not 21: v21 is claimed by the #946 landing branch and v22 by
+// PR #1056, so those numbers are spoken for and reusing one would let two
+// incompatible schemas share a filename. (feat/core-extraction sits at 26 and
+// reconciles at its final merge by keeping the max.)
+//
+// v24: gpt-5.6-codex / gpt-5.6-codex-max pricing (#1077) - added as explicit
+// litellm-snapshot.json rows. getModelCosts already resolved both ids to the
+// correct rate via the `gpt-5.6` prefix fallback before this landed, so a day
+// finalized on any binary that had a `gpt-5.6` snapshot row already carries
+// the right cost; this bump only matters for a day finalized before THAT (a
+// window where neither existed). The daily cache has no per-provider
+// invalidation, so there is no way to tell those days apart from here -
+// raising MIN_SUPPORTED_VERSION forces the one-time re-derivation for
+// everyone, which is a lossless no-op for days already correct.
+// v25: #1047 activity-id pricing. v24 on main already shipped #1090.
+// v26: #946 copilot session-store accounting (see the top of this ladder).
+export const DAILY_CACHE_VERSION = 26
+const MIN_SUPPORTED_VERSION = 26
 
 /// Providers whose per-day CALL COUNT means something different at
-/// DAILY_CACHE_VERSION 25 than it did before it. Copilot's supplementary
+/// DAILY_CACHE_VERSION 26 than it did before it. Copilot's supplementary
 /// accounting calls (rollups, residuals, store rows paired with a per-turn
 /// call) stopped counting as api calls here, so a settled day's re-derivation
 /// legitimately reports FEWER calls than the cache holds — which is exactly

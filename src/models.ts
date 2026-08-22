@@ -13,6 +13,32 @@ export type ModelCosts = {
   cacheReadCostPerToken: number
   webSearchCostPerRequest: number
   fastMultiplier: number
+  /// True only when the pricing source carried a real cache-write rate. When
+  /// absent/false, `cacheWriteCostPerToken` is the fabricated `1.25 x input`
+  /// default, which is right for Anthropic-style pricing but would invent a
+  /// surcharge on providers that charge nothing extra to write cache. Callers
+  /// that decide WHICH bucket to put tokens in (rather than what to multiply
+  /// them by) must consult this before routing tokens to the cache-write
+  /// bucket. Optional so an incomplete literal defaults to the safe answer.
+  cacheWriteCostIsExplicit?: boolean
+}
+
+/// Providers whose reported `reasoningTokens` are a SUBSET of `outputTokens`
+/// rather than a separate bucket to add on top. OpenAI bills reasoning as part
+/// of output (every codex `token_count` event satisfies input + output ==
+/// total), and Anthropic folds thinking into output the same way, so summing
+/// the two double-counts both the cost and the displayed output tokens. Copilot
+/// is the same case: its per-request token_details_json prices input/cache/output
+/// and nothing else, and its supplementary store-row/shutdown calls carry
+/// reasoningTokens with outputTokens 0 while the per-turn assistant.message call
+/// bills the full output, so adding reasoning on top bills it twice.
+const REASONING_INCLUDED_IN_OUTPUT = new Set(['claude', 'codex', 'copilot'])
+
+/// Output tokens to bill and display for one call. Single source of truth so
+/// the pricing sites and the display sums can never disagree about whether a
+/// provider's reasoning tokens are already inside its output count (#1075).
+export function billableOutputTokens(provider: string, outputTokens: number, reasoningTokens: number): number {
+  return REASONING_INCLUDED_IN_OUTPUT.has(provider) ? outputTokens : outputTokens + reasoningTokens
 }
 
 type PriceOverrideRates = {
@@ -37,6 +63,11 @@ type SnapshotEntry = [number, number, number | null, number | null, (number | nu
 
 const LITELLM_URL = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json'
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000
+// Bump whenever a ModelCosts field changes pricing behavior (cacheWriteCostIsExplicit,
+// added in #1075/#1078). A cache written under an older/missing version is treated as a
+// miss instead of read verbatim, so a stale on-disk file can't reintroduce a killed bug
+// for up to CACHE_TTL_MS after an upgrade.
+const CACHE_SCHEMA_VERSION = 2
 const WEB_SEARCH_COST = 0.01
 const ONE_HOUR_CACHE_WRITE_MULTIPLIER_FROM_FIVE_MINUTE_RATE = 1.6
 
@@ -71,6 +102,7 @@ function buildCosts(
     cacheReadCostPerToken: cacheRead ?? input * 0.1,
     webSearchCostPerRequest: WEB_SEARCH_COST,
     fastMultiplier: fast ?? 1,
+    cacheWriteCostIsExplicit: cacheWrite !== null && cacheWrite !== undefined,
   }
 }
 
@@ -200,6 +232,7 @@ async function fetchAndCachePricing(): Promise<Map<string, ModelCosts>> {
 
   await mkdir(getCodeburnCacheDir(), { recursive: true })
   await writeFile(getCachePath(), JSON.stringify({
+    version: CACHE_SCHEMA_VERSION,
     timestamp: Date.now(),
     data: Object.fromEntries(pricing),
   }))
@@ -210,7 +243,8 @@ async function fetchAndCachePricing(): Promise<Map<string, ModelCosts>> {
 async function loadCachedPricing(): Promise<Map<string, ModelCosts> | null> {
   try {
     const raw = await readFile(getCachePath(), 'utf-8')
-    const cached = JSON.parse(raw) as { timestamp: number; data: Record<string, ModelCosts> }
+    const cached = JSON.parse(raw) as { version?: number; timestamp: number; data: Record<string, ModelCosts> }
+    if (cached.version !== CACHE_SCHEMA_VERSION) return null
     if (Date.now() - cached.timestamp > CACHE_TTL_MS) return null
     return new Map(Object.entries(cached.data))
   } catch {
@@ -282,6 +316,16 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'openclaw-auto':                 'claude-sonnet-4-5',
   'warp-auto-efficient':           'gpt-5.3-codex',
   'warp-auto-powerful':            'claude-opus-4-6',
+  // Codex activity ids are product surfaces, not subscription SKUs and not
+  // LiteLLM rows. OpenAI's tracker (openai/codex#32224) says auto review
+  // consumes normal model usage. Public evidence: review_model defaults to
+  // the session model; GPT-5.5 is the currently recommended review model.
+  // Price as that existing bundled row. Do not invent a rate. Do not treat
+  // the id as honestly $0 — it draws from the same credit pool. Display
+  // stays on autoModelNames (same class as cursor-auto / copilot-openai-auto).
+  // Only alias ids observed in Codex source / real rollouts. Do not infer
+  // `codex-code-review` from the activity name "code review".
+  'codex-auto-review':             'gpt-5.5',
   'grok-build':                    'grok-build-0.1',
   'GPT-5.3 Codex (low reasoning)': 'gpt-5.3-codex',
   'GPT-5.3 Codex (medium reasoning)': 'gpt-5.3-codex',
@@ -529,6 +573,117 @@ export function getLocalModelSavingsConfigHash(): string {
   return parts.join('\u0002')
 }
 
+// Subscription / flat-rate product SKUs. $0 is the correct cost; aliasing
+// them onto a per-token row fabricates spend (#968). Distinct from
+// model-savings (counterfactual local baseline) and from a zero-rate
+// price-override (user-declared free). Built-in families plus a user hatch.
+let userFlatRateModels = new Set<string>()
+let userFlatRateLeaves = new Set<string>()
+let userFlatRateRemoved = new Set<string>()
+let userFlatRateRemovedLeaves = new Set<string>()
+
+function flatRateLeaf(model: string): string {
+  const trimmed = model.trim().replace(/@.*$/, '').replace(/-\d{8}$/, '')
+  const leaf = trimmed.includes('/') ? trimmed.slice(trimmed.lastIndexOf('/') + 1) : trimmed
+  return leaf.toLowerCase()
+}
+
+function fillFlatRateSet(
+  models: Iterable<string>,
+): { ids: Set<string>; leaves: Set<string> } {
+  const ids = new Set<string>()
+  const leaves = new Set<string>()
+  for (const model of models) {
+    if (!model || typeof model !== 'string') continue
+    ids.add(model)
+    const leaf = flatRateLeaf(model)
+    if (leaf) leaves.add(leaf)
+  }
+  return { ids, leaves }
+}
+
+export function setFlatRateModels(models: Iterable<string>): void {
+  const filled = fillFlatRateSet(models)
+  userFlatRateModels = filled.ids
+  userFlatRateLeaves = filled.leaves
+}
+
+export function setFlatRateRemoved(models: Iterable<string>): void {
+  const filled = fillFlatRateSet(models)
+  userFlatRateRemoved = filled.ids
+  userFlatRateRemovedLeaves = filled.leaves
+}
+
+export function getFlatRateModelsConfigHash(): string {
+  const added = [...userFlatRateModels].sort().join('\u0002')
+  const removed = [...userFlatRateRemoved].sort().join('\u0002')
+  if (!removed) return added
+  return `${added}\u0003${removed}`
+}
+
+export function getFlatRateModels(): string[] {
+  return [...userFlatRateModels]
+}
+
+export function getFlatRateRemoved(): string[] {
+  return [...userFlatRateRemoved]
+}
+
+export function isSameFlatRateModel(a: string, b: string): boolean {
+  if (!a || !b) return false
+  if (a === b) return true
+  const leaf = flatRateLeaf(a)
+  return leaf.length > 0 && leaf === flatRateLeaf(b)
+}
+
+function isUserFlatRateModel(model: string): boolean {
+  if (userFlatRateModels.has(model)) return true
+  const leaf = flatRateLeaf(model)
+  return leaf.length > 0 && userFlatRateLeaves.has(leaf)
+}
+
+function isFlatRateRemoved(model: string): boolean {
+  if (userFlatRateRemoved.has(model)) return true
+  const leaf = flatRateLeaf(model)
+  return leaf.length > 0 && userFlatRateRemovedLeaves.has(leaf)
+}
+
+/// Product SKUs billed as a subscription, not missing LiteLLM rows.
+/// Match raw ids and path-prefixed ids (`cline-pass/auto-genius`). Display
+/// names from getShortModelName are matched only when the aggregation key
+/// is not the raw leaf (Warp Auto *, Grok Composer *).
+export function isBuiltInFlatRateModel(model: string): boolean {
+  const leaf = flatRateLeaf(model)
+  // Warp's product SKU is the bare id `auto`. Kiro rewrites its own `auto`
+  // to `kiro-auto` before pricing, so this leaf does not swallow Kiro.
+  if (
+    leaf === 'auto'
+    || leaf === 'auto-genius'
+    || leaf === 'kimi-for-coding-highspeed'
+  ) return true
+  if (leaf.startsWith('grok-composer-')) return true
+  if (leaf.startsWith('warp-auto-')) return true
+  const display = model.trim()
+  if (/^grok composer\b/i.test(display)) return true
+  if (/^warp auto\b/i.test(display)) return true
+  return false
+}
+
+export function isFlatRateModel(model: string): boolean {
+  if (!model) return false
+  if (isFlatRateRemoved(model)) return false
+  return isUserFlatRateModel(model) || isBuiltInFlatRateModel(model)
+}
+
+/// Shared unpriced-warning copy. Never tell the user to alias unconditionally:
+/// mapping a subscription SKU onto a priced row invents spend. Optional `model`
+/// interpolates the sanitized id so the verbose calculateCost path names the
+/// same two hatches.
+export function unpricedModelHint(model = '<model>'): string {
+  const safe = model.replace(/[\x00-\x1F\x7F-\x9F]/g, '?').slice(0, 200)
+  return `If a model is billed per token, map it with: codeburn model-alias "${safe}" <known-model>. If $0 is correct (subscription / flat-rate): codeburn model-flat-rate "${safe}".`
+}
+
 /// Stable hash of the model-alias map, for the same staleness class as the
 /// hashes below: a resident process (codeburn serve) must not serve memoized
 /// parse results priced under aliases the user has since changed.
@@ -623,6 +778,19 @@ function getCanonicalName(model: string): string {
       .replace(/-\d{8}$/, '')
       .replace(/\[[^\]]*\]$/, ''),
   )
+}
+
+/// Alias-resolved identity for report merge. Display names stay cosmetic —
+/// prefix matches in SHORT_NAMES must not fold distinct SKUs into one row.
+/// Path-form ids (`accounts/fireworks/models/<slug>`, `cline-pass/<slug>`)
+/// peel to the leaf so they share a bucket with the bare slug.
+export function resolveCanonicalModelId(model: string): string {
+  const viaUser = Object.hasOwn(userAliases, model) ? userAliases[model]! : model
+  const aliased = resolveAlias(getCanonicalName(viaUser))
+  if (!aliased.includes('/')) return aliased
+  const leaf = aliased.slice(aliased.lastIndexOf('/') + 1)
+  if (!leaf) return aliased
+  return resolveAlias(getCanonicalName(leaf))
 }
 
 // Namespaces the pricing catalog itself uses, plus the ones below. An unknown
@@ -857,14 +1025,18 @@ function exactPriceOverrideFor(model: string): ModelCosts | null {
 // correct cost, as are zero-rate USER overrides (explicitly declared free).
 /// Models whose $0 cost is CORRECT rather than a pricing gap, mirroring the
 /// exclusions findUnpricedModels applies: local-looking models, models mapped
-/// to a local-savings baseline, and models an exact zero-rate user override
-/// declares free. Used to keep their calls out of the pricing-coverage
-/// denominator — otherwise a 95%-ollama user reads high coverage while every
-/// genuinely cost-bearing call is unpriced.
+/// to a local-savings baseline, subscription / flat-rate product SKUs, and
+/// models an exact zero-rate user override declares free. Used to keep their
+/// calls out of the pricing-coverage denominator — otherwise a 95%-ollama
+/// user reads high coverage while every genuinely cost-bearing call is unpriced.
 export function isExpectedFreeModel(model: string): boolean {
   if (looksLikeLocalModel(model)) return true
   if (getLocalSavingsBaseline(model)) return true
   const costs = getModelCosts(model)
+  // A builtin/user alias can still attach a billable rate to a subscription
+  // SKU (warp-auto-* today). Those calls are priced, so they stay in the
+  // coverage denominator. Only the $0 / no-rate case is expected-free.
+  if (isFlatRateModel(model) && (!costs || !hasBillableRate(costs))) return true
   if (costs && !hasBillableRate(costs) && exactPriceOverrideFor(model)) return true
   return false
 }
@@ -881,6 +1053,7 @@ export function findUnpricedModels(
     if (row.cost > 0) continue
     if (looksLikeLocalModel(model)) continue
     if (getLocalSavingsBaseline(model)) continue
+    if (isFlatRateModel(model)) continue
     const costs = getModelCosts(model)
     if (costs && hasBillableRate(costs)) continue
     if (costs && exactPriceOverrideFor(model)) continue
@@ -897,6 +1070,7 @@ function shouldWarnAboutUnknownModel(name: string): boolean {
   // actively misleading there. Users who need cost visibility for local
   // inference can still set an alias via `codeburn model-alias`.
   if (looksLikeLocalModel(name)) return false
+  if (isFlatRateModel(name)) return false
   // The warning fired on every CLI invocation (including the default
   // dashboard) which made first launches look broken — three "no pricing
   // data" lines greet a user before the dashboard even draws. Now opt-in
@@ -929,10 +1103,9 @@ export function calculateCost(
       // payloads written by external tools, so a hostile or corrupt file
       // could embed terminal escape sequences here.
       const safeName = sanitizeModelForDisplay(model)
-      const aliasHint = `Map it with: codeburn model-alias "${safeName}" <known-model>, or track local-model savings with: codeburn model-savings "${safeName}" <baseline-model>`
       process.stderr.write(
         `codeburn: no pricing data for model "${safeName}" — costs for this model will show $0. ` +
-        `${aliasHint}, or update with: npx codeburn@latest.\n`
+        `${unpricedModelHint(safeName)} Or track local-model savings with: codeburn model-savings "${safeName}" <baseline-model>, or update with: npx codeburn@latest.\n`,
       )
     }
     return 0
@@ -974,6 +1147,7 @@ const autoModelNames: Record<string, string> = {
   'openclaw-auto': 'OpenClaw (auto)',
   'qwen-auto': 'Qwen (auto)',
   'kimi-auto': 'Kimi (auto)',
+  'codex-auto-review': 'Codex Auto Review',
 }
 
 const SHORT_NAMES: Record<string, string> = {
@@ -1114,6 +1288,14 @@ export function getShortModelName(model: string): string {
   return shortModelName(model, new Set())
 }
 
+/// Provider-first display name. Local labels win (Cursor estimated suffixes,
+/// provider tables that intentionally override the global map). If the provider
+/// echoed the raw id, it missed — fall back to the global resolver instead of
+/// showing `gpt-5.6-sol` / `accounts/fireworks/models/kimi-k2p6`.
+export function fallbackRawModelDisplayName(localLabel: string, rawModel: string): string {
+  return localLabel === rawModel ? getShortModelName(rawModel) : localLabel
+}
+
 function shortModelName(model: string, seen: Set<string>): string {
   if (autoModelNames[model]) return autoModelNames[model]
   if (seen.has(model)) {
@@ -1166,6 +1348,8 @@ export type PricingSnapshot = {
   aliases: Record<string, string>
   priceOverrides: Record<string, PriceOverrideRates>
   localModelSavings: Record<string, string>
+  flatRateModels?: string[]
+  flatRateModelsRemoved?: string[]
 }
 
 export function snapshotPricingState(): PricingSnapshot {
@@ -1174,6 +1358,8 @@ export function snapshotPricingState(): PricingSnapshot {
     aliases: userAliases,
     priceOverrides: userPriceOverridesConfig,
     localModelSavings: userLocalModelSavings,
+    flatRateModels: getFlatRateModels(),
+    flatRateModelsRemoved: getFlatRateRemoved(),
   }
 }
 
@@ -1185,4 +1371,6 @@ export function restorePricingState(snapshot: PricingSnapshot): void {
   setModelAliases(snapshot.aliases)
   setPriceOverrides(snapshot.priceOverrides)
   setLocalModelSavings(snapshot.localModelSavings)
+  setFlatRateModels(snapshot.flatRateModels ?? [])
+  setFlatRateRemoved(snapshot.flatRateModelsRemoved ?? [])
 }

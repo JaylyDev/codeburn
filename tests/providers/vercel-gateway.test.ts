@@ -66,6 +66,11 @@ describe('vercel-gateway provider', () => {
     expect(calls[0]?.costUSD).toBe(1.25)
     expect(calls[0]?.model).toBe('anthropic/claude-sonnet-4.6')
   })
+
+  it('resolves vendor/slug ids through the global short-name table', () => {
+    expect(vercelGateway.modelDisplayName('openai/gpt-5.6-terra')).toBe('GPT-5.6 Terra')
+    expect(vercelGateway.modelDisplayName('accounts/fireworks/models/kimi-k2p6')).toBe('Kimi K2.6')
+  })
 })
 
 describe('vercel-gateway end-to-end (parseAllSessions network path)', () => {

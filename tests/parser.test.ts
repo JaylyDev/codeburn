@@ -18,7 +18,7 @@ import { calculateCost } from '../src/models.js'
 import { aggregateProjectsIntoDays } from '../src/day-aggregator.js'
 import { DAILY_CACHE_VERSION, currentTzKey, ensureCacheHydrated, saveDailyCache } from '../src/daily-cache.js'
 import { clearSessionCache, isSessionHydrationComplete, parseAllSessions, setParseReuseValidator } from '../src/parser.js'
-import { CACHE_VERSION, clearLoadCacheMemo, computeEnvFingerprint, loadCache, saveCache } from '../src/session-cache.js'
+import { CACHE_VERSION, clearLoadCacheMemo, computeEnvFingerprint, loadCache, PROVIDER_PARSE_VERSIONS, saveCache } from '../src/session-cache.js'
 import { cacheDirSnapshot, readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 import type { SessionSource, SessionParser, ParsedProviderCall } from '../src/providers/types.js'
 
