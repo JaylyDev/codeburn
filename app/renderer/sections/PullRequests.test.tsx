@@ -307,4 +307,12 @@ describe('PullRequests', () => {
     expect(await screen.findByText(/Lifetime has 2 pull requests/)).toBeInTheDocument()
     expect(getOverview).toHaveBeenCalledWith('lifetime', 'all')
   })
+
+  it('names the custom range, not the dormant standard period', async () => {
+    getOverview.mockResolvedValue(makePayload())
+    render(<PullRequests period="30days" provider="all" range={{ from: '2026-08-20', to: '2026-08-22' }} />)
+
+    expect(await screen.findByText(/No sessions in Aug 20 – 22 mentioned a pull request URL/)).toBeInTheDocument()
+    expect(screen.queryByText(/Last 30 days/)).toBeNull()
+  })
 })

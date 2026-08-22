@@ -485,6 +485,27 @@ describe('App shortcuts', () => {
     expect(screen.getByText('30D')).not.toHaveClass('on')
   })
 
+  it('names a selected custom range on the Pull requests empty note', async () => {
+    render(<App />)
+    fireEvent.keyDown(document, { key: '3', metaKey: true })
+    expect(await screen.findByText(/No sessions in Last 30 days mentioned a pull request URL/)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Choose date range' }))
+    const to = new Date()
+    const from = new Date(to.getFullYear(), to.getMonth(), to.getDate() - 2)
+    const fromLabel = from.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
+    const toLabel = to.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
+    fireEvent.mouseDown(screen.getByRole('button', { name: fromLabel }))
+    fireEvent.mouseEnter(screen.getByRole('button', { name: toLabel }))
+    fireEvent.mouseUp(screen.getByRole('button', { name: toLabel }))
+
+    const left = from.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+    const right = to.toLocaleDateString('en-US', { month: from.getMonth() === to.getMonth() ? undefined : 'short', day: 'numeric' })
+    expect(await screen.findByText(new RegExp(`No sessions in ${left} [–-] ${right} mentioned a pull request URL`))).toBeInTheDocument()
+    expect(screen.getByText('30D')).not.toHaveClass('on')
+    expect(screen.queryByText(/No sessions in Last 30 days/)).toBeNull()
+  })
+
   it('shows no daily budget banner when none is configured', async () => {
     render(<App />)
     expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()

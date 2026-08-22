@@ -11,6 +11,7 @@ import { formatDayShort, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import { PERIOD_LABELS } from '../lib/period'
 import type { CliError, DateRange, MenubarPayload, Period } from '../lib/types'
+import { rangeLabel } from '../components/TopBar'
 
 type PullRequests = NonNullable<MenubarPayload['current']['pullRequests']>
 type PrRow = PullRequests['rows'][number]
@@ -118,7 +119,7 @@ function PrEmptyNote({ period, provider, range }: { period: Period; provider: st
     return () => { cancelled = true }
   }, [canProbeWider, provider])
 
-  const periodLabel = PERIOD_LABELS[period]
+  const periodLabel = range ? rangeLabel(range) : PERIOD_LABELS[period]
   const widerHint = widerCount && widerCount > 0
     ? ` Lifetime has ${widerCount.toLocaleString('en-US')} pull requests — switch the period control to Life.`
     : ''
