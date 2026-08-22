@@ -12,6 +12,7 @@ import { normalizeContentBlocks } from '../content-utils.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ToolCall } from '../types.js'
 import type { Provider, ProbeRoot, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import { defaultLauncherRoots, isNestedLauncherCodexHome } from '../launcher-homes.js'
 
 const modelDisplayNames: Record<string, string> = {
   'codex-auto-review': 'Codex Auto Review',
@@ -1329,8 +1330,15 @@ export async function parseCodexFileFull(source: SessionSource, seenKeys: Set<st
   return { calls, ...(capture.write ? { write: capture.write } : {}) }
 }
 
-export function createCodexProvider(codexDir?: string): Provider {
+export function createCodexProvider(
+  codexDir?: string,
+  opts?: { primaryDir?: string; launcherRoots?: string[] },
+): Provider {
   const dir = getCodexDir(codexDir)
+  const skipNested = isNestedLauncherCodexHome(dir, {
+    primaryDir: opts?.primaryDir ?? getCodexDir(),
+    launcherRoots: opts?.launcherRoots ?? defaultLauncherRoots(),
+  })
 
   return {
     name: 'codex',
@@ -1357,6 +1365,7 @@ export function createCodexProvider(codexDir?: string): Provider {
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
+      if (skipNested) return []
       return discoverSessionsInDir(dir)
     },
 
