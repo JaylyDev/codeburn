@@ -13,10 +13,16 @@ import {
   setModelAliases,
   setPriceOverrides,
   setLocalModelSavings,
+  setFlatRateModels,
+  setFlatRateRemoved,
+  isExpectedFreeModel,
+  isFlatRateModel,
   getLocalModelSavingsConfigHash,
   getPriceOverridesConfigHash,
   getModelAliasesConfigHash,
+  getFlatRateModelsConfigHash,
   parseLiteLLMEntry,
+  unpricedModelHint,
 } from '../src/models.js'
 import { getDailyCacheConfigHash } from '../src/usage-aggregator.js'
 import snapshotData from '../src/data/litellm-snapshot.json' with { type: 'json' }
@@ -29,6 +35,8 @@ afterEach(() => {
   setModelAliases({})
   setPriceOverrides({})
   setLocalModelSavings({})
+  setFlatRateModels([])
+  setFlatRateRemoved([])
 })
 
 describe('getModelCosts', () => {
@@ -529,6 +537,17 @@ describe('user price overrides', () => {
     expect(firstCombined).not.toBe(baseline)
     expect(secondCombined).not.toBe(baseline)
     expect(secondCombined).not.toBe(firstCombined)
+  })
+
+  it('includes flat-rate marks in the daily cache config hash', () => {
+    setLocalModelSavings({})
+    setPriceOverrides({})
+    setFlatRateModels([])
+    const baseline = getDailyCacheConfigHash()
+    setFlatRateModels(['zz-flat-hash'])
+    expect(getDailyCacheConfigHash()).not.toBe(baseline)
+    setFlatRateModels([])
+    expect(getDailyCacheConfigHash()).toBe(baseline)
   })
 })
 
@@ -1087,6 +1106,71 @@ describe('findUnpricedModels', () => {
     expect(findUnpricedModels([{ model, calls: 1, cost: 0, tokens: 10 }])).toEqual([])
   })
 
+  it('skips subscription / flat-rate product SKUs where $0 is correct', () => {
+    const rows = [
+      { model: 'auto-genius', calls: 898, cost: 0, tokens: 35_300_000 },
+      { model: 'cline-pass/auto-genius', calls: 4, cost: 0, tokens: 33_900 },
+      { model: 'auto', calls: 449, cost: 0, tokens: 17_700_000 },
+      { model: 'kimi-for-coding-highspeed', calls: 12, cost: 0, tokens: 3_400_000 },
+      { model: 'moonshot/kimi-for-coding-highspeed', calls: 2, cost: 0, tokens: 80_000 },
+      { model: 'grok-composer-2.5-fast', calls: 10, cost: 0, tokens: 1_900_000 },
+      { model: 'Grok Composer 2.5 Fast', calls: 10, cost: 0, tokens: 1_900_000 },
+      { model: 'Warp Auto (efficient)', calls: 3, cost: 0, tokens: 50_000 },
+      { model: 'warp', calls: 449, cost: 0, tokens: 17_700_000 },
+      { model: 'codex-auto-review', calls: 940, cost: 0, tokens: 7_200_000 },
+      { model: 'Codex Auto Review', calls: 2, cost: 0, tokens: 100 },
+      { model: 'big-pickle', calls: 4, cost: 0, tokens: 33_900 },
+      { model: 'zz-mystery-paid-model-999', calls: 3, cost: 0, tokens: 1200 },
+    ]
+    expect(findUnpricedModels(rows)).toEqual([
+      { model: 'warp', calls: 449, tokens: 17_700_000 },
+      // Note: NOT 'codex-auto-review' — #1056 aliases it to gpt-5.5, so it
+      // now resolves a billable rate and is filtered out here (a $0 row for
+      // it is stale data, not evidence of missing pricing). It still left
+      // the flat-rate list, verified separately in the "Codex activity ids
+      // (#1047)" describe block below.
+      { model: 'big-pickle', calls: 4, tokens: 33_900 },
+      { model: 'zz-mystery-paid-model-999', calls: 3, tokens: 1200 },
+      { model: 'Codex Auto Review', calls: 2, tokens: 100 },
+    ])
+  })
+
+  it('skips a user-declared flat-rate model, including path-prefixed siblings', () => {
+    const model = 'zz-my-pass-codename'
+    expect(findUnpricedModels([{ model, calls: 1, cost: 0, tokens: 10 }])).toHaveLength(1)
+    setFlatRateModels([model])
+    expect(findUnpricedModels([{ model, calls: 1, cost: 0, tokens: 10 }])).toEqual([])
+    expect(findUnpricedModels([{ model: `vendor/${model}`, calls: 1, cost: 0, tokens: 10 }])).toEqual([])
+    expect(findUnpricedModels([{ model: 'zz-other-unknown', calls: 1, cost: 0, tokens: 10 }])).toHaveLength(1)
+  })
+
+  it('does not treat a priced sibling as expected-free just because a family is flat-rate', () => {
+    // warp-auto-* is a subscription SKU, but main already aliases it onto a
+    // billable row. Coverage must still count those priced calls.
+    expect(isFlatRateModel('warp-auto-efficient')).toBe(true)
+    expect(getModelCosts('warp-auto-efficient')).not.toBeNull()
+    expect(isExpectedFreeModel('warp-auto-efficient')).toBe(false)
+    expect(isExpectedFreeModel('auto-genius')).toBe(true)
+    expect(isExpectedFreeModel('auto')).toBe(true)
+    expect(isExpectedFreeModel('kimi-for-coding-highspeed')).toBe(true)
+    expect(isExpectedFreeModel('warp')).toBe(false)
+    expect(isExpectedFreeModel('codex-auto-review')).toBe(false)
+    expect(isExpectedFreeModel('zz-mystery-paid-model-999')).toBe(false)
+  })
+
+  it('lets --remove opt out of a built-in so a false positive can warn again', () => {
+    expect(findUnpricedModels([{ model: 'auto-genius', calls: 1, cost: 0, tokens: 10 }])).toEqual([])
+    setFlatRateRemoved(['auto-genius'])
+    expect(isFlatRateModel('auto-genius')).toBe(false)
+    expect(findUnpricedModels([{ model: 'auto-genius', calls: 1, cost: 0, tokens: 10 }])).toEqual([
+      { model: 'auto-genius', calls: 1, tokens: 10 },
+    ])
+    expect(findUnpricedModels([{ model: 'cline-pass/auto-genius', calls: 1, cost: 0, tokens: 10 }])).toEqual([
+      { model: 'cline-pass/auto-genius', calls: 1, tokens: 10 },
+    ])
+    expect(isFlatRateModel('auto')).toBe(true)
+  })
+
   it('sorts by tokens, then calls', () => {
     const unpriced = findUnpricedModels([
       { model: 'zz-small', calls: 9, cost: 0, tokens: 10 },
@@ -1124,5 +1208,99 @@ describe('getModelAliasesConfigHash', () => {
     setModelAliases({ 'my-model': 'claude-opus-4-6', 'b-model': 'gpt-5' })
     expect(getModelAliasesConfigHash()).toBe(two)
     setModelAliases({})
+  })
+})
+
+describe('getFlatRateModelsConfigHash', () => {
+  it('is empty for no marks, changes with content, ignores insertion order', () => {
+    setFlatRateModels([])
+    expect(getFlatRateModelsConfigHash()).toBe('')
+    setFlatRateModels(['auto-genius'])
+    const one = getFlatRateModelsConfigHash()
+    expect(one).not.toBe('')
+    setFlatRateModels(['warp', 'auto-genius'])
+    const two = getFlatRateModelsConfigHash()
+    expect(two).not.toBe(one)
+    setFlatRateModels(['auto-genius', 'warp'])
+    expect(getFlatRateModelsConfigHash()).toBe(two)
+    setFlatRateModels([])
+  })
+
+  it('changes when a built-in is opted out', () => {
+    setFlatRateModels([])
+    setFlatRateRemoved([])
+    const baseline = getFlatRateModelsConfigHash()
+    setFlatRateRemoved(['auto-genius'])
+    expect(getFlatRateModelsConfigHash()).not.toBe(baseline)
+    setFlatRateRemoved([])
+    expect(getFlatRateModelsConfigHash()).toBe(baseline)
+  })
+})
+
+describe('pricing snapshot carries flat-rate marks', () => {
+  it('restorePricingState reapplies user flat-rate marks', async () => {
+    const { snapshotPricingState, restorePricingState } = await import('../src/models.js')
+    setFlatRateModels(['zz-snapshot-flat'])
+    const snap = snapshotPricingState()
+    expect(snap.flatRateModels).toEqual(['zz-snapshot-flat'])
+    setFlatRateModels([])
+    expect(isFlatRateModel('zz-snapshot-flat')).toBe(false)
+    restorePricingState(snap)
+    expect(isFlatRateModel('zz-snapshot-flat')).toBe(true)
+    setFlatRateModels([])
+  })
+
+  it('restorePricingState reapplies built-in opt-outs', async () => {
+    const { snapshotPricingState, restorePricingState } = await import('../src/models.js')
+    setFlatRateRemoved(['auto-genius'])
+    const snap = snapshotPricingState()
+    expect(snap.flatRateModelsRemoved).toEqual(['auto-genius'])
+    setFlatRateRemoved([])
+    expect(isFlatRateModel('auto-genius')).toBe(true)
+    restorePricingState(snap)
+    expect(isFlatRateModel('auto-genius')).toBe(false)
+    setFlatRateRemoved([])
+  })
+})
+
+describe('unpricedModelHint', () => {
+  it('never tells the user to alias unconditionally', () => {
+    expect(unpricedModelHint()).toContain('If a model is billed per token')
+    expect(unpricedModelHint()).toContain('model-flat-rate')
+    expect(unpricedModelHint()).not.toContain('Fix: codeburn model-alias')
+  })
+
+  it('names both hatches for a concrete unknown SKU', () => {
+    const hint = unpricedModelHint('zz-new-subscription-pass-sku')
+    expect(hint).toContain('codeburn model-alias "zz-new-subscription-pass-sku"')
+    expect(hint).toContain('codeburn model-flat-rate "zz-new-subscription-pass-sku"')
+    expect(hint).toContain('If a model is billed per token')
+    expect(hint).toContain('If $0 is correct')
+  })
+})
+
+describe('calculateCost verbose unknown-model warning', () => {
+  it('does not present model-alias as the only fix for an unknown SKU', () => {
+    const previous = process.env['CODEBURN_VERBOSE']
+    process.env['CODEBURN_VERBOSE'] = '1'
+    const chunks: string[] = []
+    const originalWrite = process.stderr.write.bind(process.stderr)
+    process.stderr.write = ((chunk: string | Uint8Array, ...args: unknown[]) => {
+      chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString())
+      return (originalWrite as (chunk: string | Uint8Array, ...rest: unknown[]) => boolean)(chunk, ...args)
+    }) as typeof process.stderr.write
+    try {
+      expect(calculateCost('zz-new-subscription-pass-sku', 10, 10, 0, 0, 0)).toBe(0)
+    } finally {
+      process.stderr.write = originalWrite
+      if (previous === undefined) delete process.env['CODEBURN_VERBOSE']
+      else process.env['CODEBURN_VERBOSE'] = previous
+    }
+    const text = chunks.join('')
+    expect(text).toContain('zz-new-subscription-pass-sku')
+    expect(text).toContain('If a model is billed per token')
+    expect(text).toContain('model-flat-rate')
+    expect(text).toContain('model-alias')
+    expect(text).not.toMatch(/Map it with: codeburn model-alias/)
   })
 })

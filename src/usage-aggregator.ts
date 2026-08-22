@@ -2,7 +2,7 @@ import { homedir } from 'node:os'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory, type DateRange } from './types.js'
 import { type PeriodData, type ProviderCost, type BreakdownArrays, type MenubarPayload, type ClaudeConfigSelector, buildMenubarPayload } from './menubar-json.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, isSessionHydrationComplete } from './parser.js'
-import { findUnpricedModels, getLocalModelSavingsConfigHash, getPriceOverridesConfigHash, getShortModelName, isExpectedFreeModel } from './models.js'
+import { findUnpricedModels, getFlatRateModelsConfigHash, getLocalModelSavingsConfigHash, getPriceOverridesConfigHash, getShortModelName, isExpectedFreeModel } from './models.js'
 import { getAllProviders, safeDiscoverSessions } from './providers/index.js'
 import { claude, getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { stat } from 'node:fs/promises'
@@ -82,8 +82,8 @@ export function buildPeriodData(label: string, projects: ProjectSummary[]): Peri
 export function getDailyCacheConfigHash(): string {
   const savingsHash = getLocalModelSavingsConfigHash()
   const overridesHash = getPriceOverridesConfigHash()
-  if (!overridesHash) return savingsHash
-  return `localModelSavings=${savingsHash}\u0002priceOverrides=${overridesHash}`
+  const flatRateHash = getFlatRateModelsConfigHash()
+  return `localModelSavings=${savingsHash}\u0002priceOverrides=${overridesHash}\u0002flatRateModels=${flatRateHash}`
 }
 
 async function hydrateCache(): Promise<DailyCache> {

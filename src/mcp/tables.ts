@@ -1,5 +1,6 @@
 import { formatCost, formatTokens, markEstimated } from '../format.js'
 import type { MenubarPayload } from '../menubar-json.js'
+import { unpricedModelHint } from '../models.js'
 
 const ESTIMATED_LEGEND = '_~ estimated cost (priced from estimated tokens)_'
 const isEstimated = (m: { estimatedCostUSD?: number }) => (m.estimatedCostUSD ?? 0) > 0
@@ -23,7 +24,7 @@ export function renderSummaryTable(p: MenubarPayload): string {
     `**${c.label}** — ${formatCost(c.cost)} · ${c.calls} calls · ${c.sessions} sessions`,
     `cache hit ${pct(c.cacheHitPercent)} · one-shot ${oneShot(c.oneShotRate)} · in ${formatTokens(c.inputTokens)} / out ${formatTokens(c.outputTokens)}`,
     ...(unpriced.length > 0
-      ? [`⚠ ${unpriced.length} model${unpriced.length === 1 ? '' : 's'} unpriced, counted at $0: ${unpriced.map(u => `${u.model} (${u.calls} calls)`).join(', ')}. Cost above understates real spend; fix with \`codeburn model-alias\` or \`codeburn price-override\`.`]
+      ? [`⚠ ${unpriced.length} model${unpriced.length === 1 ? '' : 's'} unpriced, counted at $0: ${unpriced.map(u => `${u.model} (${u.calls} calls)`).join(', ')}. ${unpricedModelHint()}`]
       : []),
     '',
     '_Top models_',
