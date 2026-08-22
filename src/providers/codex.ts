@@ -1340,6 +1340,9 @@ export function createCodexProvider(
     primaryDir,
     launcherRoots: opts?.launcherRoots ?? defaultLauncherRoots(),
   })
+  // One tree for discovery and probeRoots. A nest CODEX_HOME with a distinct
+  // billed home redirects the default factory; an explicit nest factory is empty.
+  const scannedDir = skipNested ? (codexDir === undefined ? primaryDir : null) : dir
 
   return {
     name: 'codex',
@@ -1359,20 +1362,16 @@ export function createCodexProvider(
     // Same `dir` discoverSessionsInDir walks: <codexDir>/sessions (dated
     // rollout files) and <codexDir>/archived_sessions. Honors CODEX_HOME.
     async probeRoots(): Promise<ProbeRoot[]> {
+      if (!scannedDir) return []
       return [
-        { path: join(dir, 'sessions'), label: 'sessions' },
-        { path: join(dir, 'archived_sessions'), label: 'archived' },
+        { path: join(scannedDir, 'sessions'), label: 'sessions' },
+        { path: join(scannedDir, 'archived_sessions'), label: 'archived' },
       ]
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
-      if (skipNested) {
-        // CODEX_HOME pointed at a launcher nest: walk the billed ~/.codex home
-        // instead. An explicit nested factory (tests / second tree) stays empty.
-        if (codexDir === undefined) return discoverSessionsInDir(primaryDir)
-        return []
-      }
-      return discoverSessionsInDir(dir)
+      if (!scannedDir) return []
+      return discoverSessionsInDir(scannedDir)
     },
 
     createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {

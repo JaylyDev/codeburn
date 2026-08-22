@@ -74,6 +74,11 @@ describe('Codex discover skips nested Buzz home', () => {
     try {
       const provider = createCodexProvider()
       expect((await provider.discoverSessions()).map(s => s.path.split('/').pop())).toEqual(['rollout-primary.jsonl'])
+      const roots = await provider.probeRoots!()
+      expect(roots.map(r => r.path)).toEqual([
+        join(primary, 'sessions'),
+        join(primary, 'archived_sessions'),
+      ])
     } finally {
       if (prevHome === undefined) delete process.env.HOME
       else process.env.HOME = prevHome
