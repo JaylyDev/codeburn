@@ -178,6 +178,12 @@ export type ClaudeConfigSelector = {
 
 export type MenubarPayload = {
   generated: string
+  /// Optional. Present and `true` only when this payload was assembled from a
+  /// read-only stale serve (see `isSessionHydrationComplete` in `parser.ts`).
+  /// Omitted — never `false` — on a fresh/complete payload, so absence always
+  /// means "assume fresh," including for payloads from a CLI version that
+  /// predates this field.
+  stale?: boolean
   current: {
     label: string
     cost: number
@@ -507,6 +513,7 @@ export function buildMenubarPayload(
   breakdowns?: BreakdownArrays,
   claudeConfigs?: ClaudeConfigSelector,
   granularHistory?: GranularHistory,
+  stale?: boolean,
 ): MenubarPayload {
   const payload: MenubarPayload = {
     generated: new Date().toISOString(),
@@ -556,6 +563,9 @@ export function buildMenubarPayload(
   }
   if (claudeConfigs && claudeConfigs.options.length > 1) {
     payload.claudeConfigs = claudeConfigs
+  }
+  if (stale) {
+    payload.stale = true
   }
   return payload
 }

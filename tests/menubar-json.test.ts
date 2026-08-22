@@ -413,4 +413,14 @@ describe('buildMenubarPayload', () => {
       ],
     })
   })
+
+  it('sets stale:true when the caller reports an incomplete hydration', () => {
+    const payload = buildMenubarPayload(emptyPeriod('Today'), [], null, undefined, undefined, undefined, undefined, undefined, undefined, true)
+    expect(payload.stale).toBe(true)
+  })
+
+  it('omits stale on a normal fresh build', () => {
+    const payload = buildMenubarPayload(emptyPeriod('Today'), [], null)
+    expect(payload.stale).toBeUndefined()
+  })
 })

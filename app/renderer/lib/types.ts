@@ -127,6 +127,9 @@ export type ClaudeConfigSelector = {
 
 export type MenubarPayload = {
   generated: string
+  // Optional: older CLIs omit it. Present and true only on a stale read-only
+  // serve; absent otherwise. Absence must always be read as "assume fresh."
+  stale?: boolean
   current: {
     label: string
     cost: number
