@@ -26,6 +26,10 @@ export function isNestedLauncherCodexHome(
   return existsSync(primary)
 }
 
+export function defaultBilledCodexHome(): string {
+  return join(homedir(), '.codex')
+}
+
 export function defaultLauncherRoots(): string[] {
   return [join(homedir(), '.buzz')]
 }

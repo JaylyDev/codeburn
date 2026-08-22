@@ -12,7 +12,7 @@ import { normalizeContentBlocks } from '../content-utils.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ToolCall } from '../types.js'
 import type { Provider, ProbeRoot, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
-import { defaultLauncherRoots, isNestedLauncherCodexHome } from '../launcher-homes.js'
+import { defaultBilledCodexHome, defaultLauncherRoots, isNestedLauncherCodexHome } from '../launcher-homes.js'
 
 const modelDisplayNames: Record<string, string> = {
   'codex-auto-review': 'Codex Auto Review',
@@ -1335,8 +1335,9 @@ export function createCodexProvider(
   opts?: { primaryDir?: string; launcherRoots?: string[] },
 ): Provider {
   const dir = getCodexDir(codexDir)
+  const primaryDir = opts?.primaryDir ?? defaultBilledCodexHome()
   const skipNested = isNestedLauncherCodexHome(dir, {
-    primaryDir: opts?.primaryDir ?? getCodexDir(),
+    primaryDir,
     launcherRoots: opts?.launcherRoots ?? defaultLauncherRoots(),
   })
 
@@ -1365,7 +1366,12 @@ export function createCodexProvider(
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
-      if (skipNested) return []
+      if (skipNested) {
+        // CODEX_HOME pointed at a launcher nest: walk the billed ~/.codex home
+        // instead. An explicit nested factory (tests / second tree) stays empty.
+        if (codexDir === undefined) return discoverSessionsInDir(primaryDir)
+        return []
+      }
       return discoverSessionsInDir(dir)
     },
 

@@ -60,6 +60,46 @@ describe('Codex discover skips nested Buzz home', () => {
     expect((await real.discoverSessions()).map(s => s.path.split('/').pop())).toEqual(['rollout-primary.jsonl'])
     expect(await nest.discoverSessions()).toEqual([])
   })
+
+  it('default factory with CODEX_HOME in .buzz walks ~/.codex, not the nest', async () => {
+    const home = root
+    const primary = join(home, '.codex')
+    const nested = join(home, '.buzz', '.codex')
+    await writeCodexSession(primary, 'rollout-primary.jsonl')
+    await writeCodexSession(nested, 'rollout-buzz.jsonl')
+    const prevHome = process.env.HOME
+    const prevCodex = process.env.CODEX_HOME
+    process.env.HOME = home
+    process.env.CODEX_HOME = nested
+    try {
+      const provider = createCodexProvider()
+      expect((await provider.discoverSessions()).map(s => s.path.split('/').pop())).toEqual(['rollout-primary.jsonl'])
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME
+      else process.env.HOME = prevHome
+      if (prevCodex === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = prevCodex
+    }
+  })
+
+  it('keeps a sole CODEX_HOME nest when ~/.codex does not exist', async () => {
+    const home = root
+    const nested = join(home, '.buzz', '.codex')
+    await writeCodexSession(nested, 'rollout-buzz.jsonl')
+    const prevHome = process.env.HOME
+    const prevCodex = process.env.CODEX_HOME
+    process.env.HOME = home
+    process.env.CODEX_HOME = nested
+    try {
+      const provider = createCodexProvider()
+      expect((await provider.discoverSessions()).map(s => s.path.split('/').pop())).toEqual(['rollout-buzz.jsonl'])
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME
+      else process.env.HOME = prevHome
+      if (prevCodex === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = prevCodex
+    }
+  })
 })
 
 describe('doctor launchers', () => {
@@ -69,7 +109,7 @@ describe('doctor launchers', () => {
     const notes = collectLauncherNotes(home)
     expect(notes).toEqual([expect.objectContaining({ name: 'buzz', billedVia: 'codex' })])
     expect(notes[0]!.verdict).toMatch(/LAUNCHER/)
-    expect(notes[0]!.verdict).not.toMatch(/\\d+ session/)
+    expect(notes[0]!.verdict).not.toMatch(/\d+\s+session/)
 
     const report = await collectDoctorReport('all', {
       providers: [createCodexProvider(join(home, 'empty-codex'))],
