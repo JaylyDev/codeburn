@@ -2942,10 +2942,9 @@ export function emitScanProgress(event: ScanProgressEvent): void {
 // that an interrupted long run loses little work, high enough that repeated
 // cache writes never dominate the parse.
 const PROGRESS_SAVE_FILE_INTERVAL = 2000
-// Only the claude scan reports per file; every other provider calls saveProgress
-// once, at its own boundary. Without a time floor the counter would never reach
-// the interval during a long non-claude phase and progress saves would simply
-// stop happening there.
+// Every parse phase now reports per file (claude via scanProjectDirs, the rest
+// via parseProviderSources), so this wall-clock floor bounds how much work a
+// mid-phase kill can lose even when the file counter moves slowly.
 const PROGRESS_SAVE_MAX_INTERVAL_MS = 30_000
 
 export function createScanProgress(label: string, total: number) {
