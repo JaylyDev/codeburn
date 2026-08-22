@@ -121,7 +121,7 @@ function PrEmptyNote({ period, provider, range }: { period: Period; provider: st
 
   const periodLabel = range ? rangeLabel(range) : PERIOD_LABELS[period]
   const widerHint = widerCount && widerCount > 0
-    ? ` Lifetime has ${widerCount.toLocaleString('en-US')} pull requests — switch the period control to Life.`
+    ? ` Lifetime has ${widerCount.toLocaleString('en-US')} pull requests. Switch the period control to Life.`
     : ''
   return (
     <EmptyNote>
