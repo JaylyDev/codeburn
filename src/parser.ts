@@ -2951,18 +2951,14 @@ function getOrCreateProviderSection(cache: SessionCache, provider: string): Prov
   // union counts it twice. Changing a provider's key shape is therefore a
   // cache-version (CACHE_VERSION) change, not a parse-version change.
   //
-  // The price of that contract, worth knowing before writing the next bump: a
-  // bump no longer RE-DERIVES a durable call it carried forward. The union
-  // appends only unseen keys, so a call already in the cache keeps the FIELDS
-  // the old parser gave it. A bump that changes what a call is worth in
-  // dollars still lands (cost is recomputed at serve time from the cached
-  // usage), but a bump that changes a call's metadata or its day attribution
-  // — this PR's own shutdown-timestamp fallback, capture-only fields like
-  // nanoAiu/compactedAt — reaches only calls the bump parses for the first
-  // time. Fixing those for existing caches needs CACHE_VERSION, which drops
-  // the cache outright, and that is exactly the history loss this block
-  // exists to prevent: the two cannot both be had for a source that has
-  // pruned its rows.
+  // What the re-read is FOR, beyond appending new keys: the union replaces a
+  // cached call with the freshly-derived one wherever the key matches, so a
+  // bump that changes a call's metadata or day attribution (this PR's
+  // shutdown-timestamp fallback, capture-only fields like nanoAiu/compactedAt,
+  // the compaction row's output) lands on existing caches too. Only keys the
+  // re-read did NOT produce keep the old parser's fields, and those are
+  // precisely the ones the source can no longer re-derive — where stale
+  // accounting is the only alternative to nothing at all.
   if (existing && DURABLE_PROVIDER_NAMES.has(provider)) {
     if (existing.durable) section.durable = true
     for (const [path, file] of Object.entries(existing.files)) {
@@ -3397,16 +3393,30 @@ async function parseProviderSources(
 
         // Store/merge parsed turns into the cache.
         // Durable providers use a union-by-deduplicationKey merge: existing turns
-        // are NEVER deleted (preserves data for spans pruned from the DB), and
-        // only turns whose dedup keys are not already cached are appended. A
-        // deliberate consequence: capture-only metadata on an already-cached key
-        // (copilot nanoAiu/requestMultiplier) is not backfilled by a re-parse.
-        // Safe because the parse version that admits store rows is the same one
-        // that captures the metadata, and the CLI never rewrites old rows.
+        // are NEVER deleted (preserves data for spans pruned from the DB). Keys
+        // the parse did not produce - rows the source has since pruned - are
+        // exactly what the cache is the last record of, so they stay untouched.
+        // A key the parse DID produce is re-derived from the live source in this
+        // very pass, so the fresh call replaces the cached one in place.
+        //
+        // That replacement is load-bearing, not tidiness. Fields a parse-version
+        // bump adds to a call whose key is stable (copilot `compactedAt` on the
+        // shutdown rollup, `initiator`/output on a store row) could otherwise
+        // never reach a cache written before the bump: append-only left the old
+        // field-set in place forever, and the reconciliation then ran on a
+        // migrated cache with an anchor the virgin cache had - dropping the
+        // post-compaction residual (#946 validation round 6, see (c6)).
         // Non-durable providers keep the original overwrite-or-append behaviour.
         if (provider.durableSources) {
           const existingEntry = section.files[source.path]
           if (existingEntry) {
+            const freshByKey = new Map(turns.flatMap(t => t.calls).map(c => [c.deduplicationKey, c]))
+            if (freshByKey.size > 0) {
+              existingEntry.turns = existingEntry.turns.map(t => {
+                const calls = t.calls.map(c => freshByKey.get(c.deduplicationKey) ?? c)
+                return calls.some((c, i) => c !== t.calls[i]) ? { ...t, calls } : t
+              })
+            }
             const existingKeys = new Set(
               existingEntry.turns.flatMap(t => t.calls.map(c => c.deduplicationKey))
             )
