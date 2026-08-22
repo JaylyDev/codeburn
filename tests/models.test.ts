@@ -117,6 +117,19 @@ describe('getModelCosts', () => {
     expect(calculateCost('gpt-5.6-codex-max', 1_000_000, 1_000_000, 0, 0, 0)).toBeGreaterThan(0)
   })
 
+  it('prices claude-haiku-4.5 (copilot session-store raw id), aliased to the existing claude-haiku-4-5 row (#1093)', () => {
+    const haiku45 = getModelCosts('claude-haiku-4.5')
+    const haiku45Dash = getModelCosts('claude-haiku-4-5')
+    expect(haiku45).not.toBeNull()
+    expect(haiku45).toEqual(haiku45Dash)
+    expect(haiku45!.inputCostPerToken).toBe(1e-6)
+    expect(haiku45!.outputCostPerToken).toBe(5e-6)
+    expect(haiku45!.cacheWriteCostPerToken).toBe(1.25e-6)
+    expect(haiku45!.cacheReadCostPerToken).toBe(1e-7)
+    expect(haiku45!.cacheWriteCostIsExplicit).toBe(true)
+    expect(calculateCost('claude-haiku-4.5', 1_000_000, 1_000_000, 0, 0, 0)).toBe(6)
+  })
+
   // A price override on a synthetic bare id can only be reached if the leading
   // segment was stripped, so these assert the namespace allowlist itself without
   // pinning to any real model's presence in (or absence from) the snapshot.
