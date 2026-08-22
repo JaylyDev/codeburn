@@ -67,17 +67,44 @@ const toolNameMap: Record<string, string> = {
 // false-positive, an accepted tradeoff for the common case. \s+ and the token
 // class don't overlap, so there is no catastrophic backtracking.
 const MCP_CLI_CALL = /(?<![\w.-])mcp-cli(?:\s+(?!call\b)[^\s;|&]+)*\s+call\s+(\S+)\s+(\S+)/
-function mcpToolFromShellCommand(command: unknown): string | null {
-  const text = typeof command === 'string'
-    ? command
-    : Array.isArray(command) ? command.filter(x => typeof x === 'string').join(' ') : ''
-  if (!text) return null
+function mcpToolFromShellCommand(text: string): string | null {
   const m = MCP_CLI_CALL.exec(text)
   if (!m) return null
   const server = m[1]!.replace(/['"]/g, '')
   const tool = m[2]!.replace(/['"]/g, '')
   if (!server || !tool) return null
   return `mcp__${server}__${tool}`
+}
+
+// Codex has no dedicated skill tool: loading a skill is an ordinary shell exec
+// that reads the skill's `SKILL.md`, so the usage landed entirely under Bash and
+// the Skills dimension stayed empty (#478). Recognize only a *read* of a
+// SKILL.md, deliberately narrowly:
+//   - the command segment must start with a file-reading binary (cat/sed/head/
+//     tail/less/more/bat) — a `grep`/`rg`/`ls` that merely mentions a SKILL.md
+//     is a search near the file, not a skill load, and stays plain Bash;
+//   - the path it reads must END in `<name>/SKILL.md`, so `<name>` is the skill.
+// The name is the parent directory, the same key `src/providers/pi.ts` derives
+// for a native skill read (#588) and the same vocabulary the Claude parser
+// records from the `Skill` tool, so the Skills breakdown stays cross-provider
+// coherent. Substring matching, so a command that merely quotes the phrase can
+// false-positive — the same accepted tradeoff as MCP_CLI_CALL above.
+const SKILL_MD_READ = /(?<![\w.-])(?:cat|bat|sed|head|tail|less|more)\b[^;|&]*?[\s'"]([^\s;|&'"]*[\\/]([^\\/;|&'"]+)[\\/]SKILL\.md)\b/
+function skillFromShellCommand(text: string): string | null {
+  const m = SKILL_MD_READ.exec(text)
+  const name = m?.[2]?.trim()
+  return name ? name : null
+}
+
+/// Flatten every shape Codex records a shell command in to one string:
+/// `function_call` arguments carry it as a plain string, the item model's
+/// `CommandExecution` item as an argv array (`["/bin/zsh","-lc","..."]`), and
+/// the `exec` custom tool as the JS program that calls `tools.exec_command`.
+/// One text, one classification pipeline (#478).
+function shellCommandText(command: unknown): string {
+  if (typeof command === 'string') return command
+  if (Array.isArray(command)) return command.filter(x => typeof x === 'string').join(' ')
+  return ''
 }
 
 // Count added/removed lines from a Codex `patch_apply_end` change's
@@ -604,6 +631,9 @@ type CodexResumeState = {
   prevReasoning: number
   pendingTools: string[]
   pendingToolSequence: ToolCall[][]
+  /// Optional so a resume state written before skills attribution existed still
+  /// decodes (isResumeState does not require it); absent reads as "no skills".
+  pendingSkills?: string[]
   pendingUserMessage: string
   pendingOutputChars: number
   pendingLocAdded: number
@@ -697,6 +727,46 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
       let prevReasoning = resume?.state.prevReasoning ?? 0
       let pendingTools: string[] = resume ? [...resume.state.pendingTools] : []
       let pendingToolSequence: ToolCall[][] = resume ? [...resume.state.pendingToolSequence] : []
+      let pendingSkills: string[] = resume?.state.pendingSkills ? [...resume.state.pendingSkills] : []
+      // Attribution names already emitted from a `response_item` tool call.
+      // Codex's item model repeats a finished shell command as
+      // `item_completed`/`CommandExecution`; a rollout that carries BOTH shapes
+      // must attribute the call once, and one that carries ONLY the item must
+      // still attribute it. Counting per derived name (not per command text,
+      // which the two shapes spell differently - argv array vs plain string)
+      // makes repeats of the same call line up one-for-one. The response item is
+      // always written first (the model requests the call, the item completes
+      // it), so the item side only ever cancels an attribution, never adds a
+      // duplicate.
+      const itemDedup = new Map<string, number>()
+
+      /// The single classification pipeline every Codex shell-command shape
+      /// feeds (#478): `function_call` arguments, the `exec` custom tool's JS
+      /// `input`, and the item model's `CommandExecution` item. It adds MCP and
+      /// Skill attribution only - the exec itself is counted as Bash by its
+      /// response item, and `viaItem` calls never add a tool of their own, so
+      /// call/token/cost totals cannot move.
+      const attributeShellCommand = (text: string, viaItem: boolean): void => {
+        if (!text) return
+        const claim = (name: string): boolean => {
+          const pending = itemDedup.get(name) ?? 0
+          if (!viaItem) { itemDedup.set(name, pending + 1); return true }
+          if (pending === 0) return true
+          itemDedup.set(name, pending - 1)
+          return false
+        }
+        const mcpTool = mcpToolFromShellCommand(text)
+        if (mcpTool && claim(mcpTool)) {
+          pendingTools.push(mcpTool)
+          pendingToolSequence.push([{ tool: mcpTool }])
+        }
+        const skill = skillFromShellCommand(text)
+        if (skill && claim(`skill:${skill}`)) {
+          pendingSkills.push(skill)
+          pendingTools.push('Skill')
+          pendingToolSequence.push([{ tool: 'Skill', file: skill }])
+        }
+      }
       let pendingUserMessage = resume?.state.pendingUserMessage ?? ''
       let pendingOutputChars = resume?.state.pendingOutputChars ?? 0
       // Rich-session-capture: edit LOC deltas and failed-patch count accumulated
@@ -801,6 +871,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           entry.payload?.type === 'custom_tool_call' ||
           entry.payload?.type === 'custom_tool_call_output' ||
           entry.payload?.type === 'mcp_tool_call_end' ||
+          entry.payload?.type === 'item_completed' ||
           entry.payload?.type === 'patch_apply_end'
         )) continue
 
@@ -833,6 +904,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             prevReasoning,
             pendingTools: [...pendingTools],
             pendingToolSequence: [...pendingToolSequence],
+            pendingSkills: [...pendingSkills],
             pendingUserMessage,
             pendingOutputChars,
             pendingLocAdded,
@@ -861,13 +933,21 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             if (typeof fp === 'string') call.file = fp
             const cmd = args['command'] ?? args['cmd']
             if (typeof cmd === 'string') call.command = cmd
-            // Attribute a CLI-wrapped MCP call (e.g. `mcp-cli call server tool`)
-            // to the MCP breakdown too; the exec still counts as Bash above.
-            const mcpTool = mcpToolFromShellCommand(cmd)
-            if (mcpTool) {
-              pendingTools.push(mcpTool)
-              pendingToolSequence.push([{ tool: mcpTool }])
-            }
+            attributeShellCommand(shellCommandText(cmd), false)
+          }
+          // A `custom_tool_call` has no `arguments`: the shell tool's payload is
+          // the `input` program that calls `tools.exec_command({cmd: ...})`. The
+          // MCP/skill matchers never saw it, so a CLI-wrapped MCP call or a
+          // SKILL.md read made through Codex's custom-tool transport counted only
+          // as Bash (#478). Restricted to the shell tool: `apply_patch` is a
+          // custom tool too and its `input` is file content, where a documented
+          // command would read as a real invocation. `call.command` is
+          // deliberately NOT set from it either - that field feeds the retry
+          // heuristic's read-shaped-command test, and a JS program is not a
+          // shell command.
+          if (mapped === 'Bash') {
+            const input = (entry.payload as Record<string, unknown>)['input']
+            if (typeof input === 'string') attributeShellCommand(input, false)
           }
           const callId = entry.payload.call_id
           const started = entry.timestamp ? Date.parse(entry.timestamp) : NaN
@@ -965,6 +1045,21 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           continue
         }
 
+        // Codex's item model records a finished shell command as
+        // `event_msg`/`item_completed` carrying a `CommandExecution` item whose
+        // `command` is the argv array (`["/bin/zsh","-lc","..."]`) - a shape the
+        // `function_call`-only tool path never reached, so a CLI-wrapped MCP call
+        // or a SKILL.md read made under it stayed invisible (#478). Attribution
+        // only: the exec's own Bash count comes from its response item, exactly
+        // as `exec_command_end` is left alone for the classic transport.
+        if (entry.type === 'event_msg' && entry.payload?.type === 'item_completed') {
+          const item = (entry.payload as Record<string, unknown>)['item'] as Record<string, unknown> | undefined
+          if (item && item['type'] === 'CommandExecution') {
+            attributeShellCommand(shellCommandText(item['command']), true)
+          }
+          continue
+        }
+
         if (entry.type === 'response_item' && entry.payload?.type === 'message' && entry.payload?.role === 'user') {
           const texts = normalizeContentBlocks(entry.payload.content)
             .filter(c => c.type === 'input_text')
@@ -1001,7 +1096,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             const timestamp = entry.timestamp ?? ''
             const dedupKey = `codex:${sessionId}:${timestamp}:est${estCounter++}`
 
-            if (seenKeys.has(dedupKey)) { pendingTools = []; pendingToolSequence = []; pendingUserMessage = ''; pendingOutputChars = 0; pendingLocAdded = 0; pendingLocRemoved = 0; pendingEditFailed = 0; continue }
+            if (seenKeys.has(dedupKey)) { pendingTools = []; pendingToolSequence = []; pendingSkills = []; pendingUserMessage = ''; pendingOutputChars = 0; pendingLocAdded = 0; pendingLocRemoved = 0; pendingEditFailed = 0; continue }
             seenKeys.add(dedupKey)
 
             const costUSD = calculateCost(model, estInput, estOutput, 0, 0, 0)
@@ -1025,6 +1120,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
               deduplicationKey: dedupKey,
               turnId: currentTurnId,
               toolSequence: pendingToolSequence.length > 0 ? pendingToolSequence : undefined,
+              ...(pendingSkills.length > 0 ? { skills: pendingSkills } : {}),
               userMessage: pendingUserMessage,
               sessionId,
               ...(sessionCwd ? { projectPath: sessionCwd, workingDirectory: sessionCwd } : {}),
@@ -1036,6 +1132,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
 
             pendingTools = []
             pendingToolSequence = []
+            pendingSkills = []
             pendingUserMessage = ''
             pendingOutputChars = 0
             pendingLocAdded = 0
@@ -1170,6 +1267,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             deduplicationKey: dedupKey,
             turnId: currentTurnId,
             toolSequence: pendingToolSequence.length > 0 ? pendingToolSequence : undefined,
+            ...(pendingSkills.length > 0 ? { skills: pendingSkills } : {}),
             userMessage: pendingUserMessage,
             sessionId,
             ...(sessionCwd ? { projectPath: sessionCwd, workingDirectory: sessionCwd } : {}),
@@ -1181,6 +1279,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
 
           pendingTools = []
           pendingToolSequence = []
+          pendingSkills = []
           pendingUserMessage = ''
           pendingOutputChars = 0
           pendingLocAdded = 0

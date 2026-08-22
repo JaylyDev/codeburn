@@ -1030,6 +1030,79 @@ describe('codex provider - JSONL parsing', () => {
     ])
   })
 
+  // #478 follow-up: the shapes the `function_call` path never reached. Fixtures
+  // are synthesized from the real shapes seen in Codex rollouts (a `custom_tool_call`
+  // whose payload is an `input` JS program, and an item-model `item_completed`
+  // carrying a `CommandExecution` item with an argv `command`); no real session
+  // content is used.
+  it('attributes MCP + Skill usage from the exec custom tool and the item model', async () => {
+    const customExec = (input: string, callId: string) => JSON.stringify({
+      type: 'response_item',
+      timestamp: '2026-04-14T10:00:30Z',
+      payload: { type: 'custom_tool_call', call_id: callId, name: 'exec', input },
+    })
+    const commandExecutionItem = (command: string[]) => JSON.stringify({
+      type: 'event_msg',
+      timestamp: '2026-04-14T10:00:40Z',
+      payload: { type: 'item_completed', item: { type: 'CommandExecution', command, exit_code: 0 } },
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-exec-items.jsonl', [
+      sessionMeta({ session_id: 'sess-exec-items', model: 'gpt-5.5' }),
+      userMessage('use the MCP CLI and load a skill'),
+      // custom-tool transport: MCP call and a skill read, both inside the JS program.
+      customExec('const r = await tools.exec_command({cmd:"mcp-cli call github get_issue \'{}\'"}); text(r.output);', 'c1'),
+      customExec('const r = await tools.exec_command({cmd:"sed -n \'1,200p\' /Users/x/.codex/skills/control-in-app-browser/SKILL.md"}); text(r.output);', 'c2'),
+      // Negatives: a lookup subcommand, and a grep that merely mentions a SKILL.md.
+      customExec('const r = await tools.exec_command({cmd:"mcp-cli info github"}); text(r.output);', 'c3'),
+      customExec('const r = await tools.exec_command({cmd:"grep -rn TODO /Users/x/.codex/skills/deploy/SKILL.md"}); text(r.output);', 'c4'),
+      // item model, no matching response item: must attribute on its own.
+      commandExecutionItem(['/bin/zsh', '-lc', "mcp-cli call optimizely-cms-mcp help '{}'"]),
+      commandExecutionItem(['/bin/zsh', '-lc', 'cat /Users/x/.codex/skills/graphify/SKILL.md']),
+      commandExecutionItem(['/bin/zsh', '-lc', 'ls -la']),
+      tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    const tools = calls[0]!.tools
+    // Attribution only: the four custom-tool execs stay Bash, and the item-model
+    // entries add no tool of their own, so the Bash count is unchanged at 4.
+    expect(tools.filter(t => t === 'Bash')).toHaveLength(4)
+    expect(tools.filter(t => t.startsWith('mcp__')).sort()).toEqual([
+      'mcp__github__get_issue',
+      'mcp__optimizely-cms-mcp__help',
+    ])
+    expect(calls[0]!.skills?.slice().sort()).toEqual(['control-in-app-browser', 'graphify'])
+    expect(tools.filter(t => t === 'Skill')).toHaveLength(2)
+  })
+
+  it('counts a command carried by BOTH the response item and the item model once', async () => {
+    const cmd = "mcp-cli call github get_issue '{}'"
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-both-shapes.jsonl', [
+      sessionMeta({ session_id: 'sess-both-shapes', model: 'gpt-5.5' }),
+      userMessage('call it twice'),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:30Z', payload: { type: 'function_call', name: 'exec_command', arguments: JSON.stringify({ cmd }) } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:31Z', payload: { type: 'item_completed', item: { type: 'CommandExecution', command: ['/bin/zsh', '-lc', cmd] } } }),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:32Z', payload: { type: 'function_call', name: 'exec_command', arguments: JSON.stringify({ cmd }) } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:33Z', payload: { type: 'item_completed', item: { type: 'CommandExecution', command: ['/bin/zsh', '-lc', cmd] } } }),
+      tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    // Two execs, two MCP attributions - not four.
+    expect(calls[0]!.tools.filter(t => t === 'Bash')).toHaveLength(2)
+    expect(calls[0]!.tools.filter(t => t === 'mcp__github__get_issue')).toHaveLength(2)
+  })
+
   it('normalizes Codex subagent tool calls to Agent', async () => {
     const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-agent.jsonl', [
       sessionMeta({ session_id: 'sess-agent', model: 'gpt-5.5' }),
