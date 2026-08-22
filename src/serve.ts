@@ -36,6 +36,11 @@ import type { ParseReuseValidation } from './parser.js'
 // observed corpora while bounding a pathological one.
 const SERVE_MAX_RSS_BYTES = 3 * 1024 * 1024 * 1024
 
+// How long a closing serve child waits for an already-accepted request before
+// giving up and exiting. CODEBURN_SERVE_DRAIN_MS overrides it so the e2e can
+// prove the bound without a 45-second test.
+const DEFAULT_DRAIN_MS = 45_000
+
 type OutputMemoEntry = {
   createdAt: number
   validatedFrom: number
@@ -403,6 +408,13 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
         write({ id: request.id, ok: true, output: memoHit.output })
         return
       }
+      // Heartbeat the WHOLE request, not just its parse: the aggregation and
+      // payload serialization after a parse measured ~8s of further silence, and
+      // it lands back-to-back with the parse's own quiet stretches. Wrapping
+      // here (rather than at each command's exits) covers every served command
+      // at one seam, and runCaptured routes the beats out as progress frames.
+      const { startProgressKeepalive, stopProgressKeepalive } = await import('./parser.js')
+      startProgressKeepalive()
       try {
         const parseStartedAt = Date.now()
         const { output, code } = await runCaptured(
@@ -423,6 +435,8 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
         else write({ id: request.id, ok: false, error: `exit ${code}`, output })
       } catch (err) {
         write({ id: request.id, ok: false, error: err instanceof Error ? err.message : String(err) })
+      } finally {
+        stopProgressKeepalive()
       }
       // Memory guard: a resident process accumulates parse memos that a
       // one-shot CLI never lives long enough to hold (up to 10 entries of
@@ -456,6 +470,21 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
     await transportClosed
   } finally {
     rl.close()
+    // Drain the in-flight request BEFORE returning. The caller exits the process
+    // once this resolves, and runCaptured() has process.exit monkeypatched into
+    // a thrown ExitSignal - returning mid-request would lose that request's
+    // response frame and turn a clean exit into a failure.
+    //
+    // Bounded, because the app is already gone and this child must not become
+    // the orphan the drain was added to prevent. The bound is generous: no
+    // legitimate request answered at EOF comes close to it, and an ASYNC-wedged
+    // one is released cleanly here. Note the ceiling: a parse wedged in a
+    // SYNCHRONOUS loop never yields to this timer, or to any other JS path -
+    // only a signal can end that process.
+    const drainMs = Number(process.env['CODEBURN_SERVE_DRAIN_MS']) || DEFAULT_DRAIN_MS
+    let drainTimer: ReturnType<typeof setTimeout> | undefined
+    await Promise.race([queue, new Promise<void>(resolve => { drainTimer = setTimeout(resolve, drainMs) })])
+    clearTimeout(drainTimer)
     await watcherSetup
     rootReuseValidation = null
     try {

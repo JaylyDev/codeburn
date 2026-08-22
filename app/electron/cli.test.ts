@@ -1,10 +1,11 @@
 // @vitest-environment node
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { spawn } from 'node:child_process'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, isAbsolute, relative, win32, posix } from 'node:path'
 
-import { spawnCli, spawnCliAction, spawnEnvFor, spawnSpecFor, startServe, killAll, shutdownAll, CliError, nodeManagerDirs, notFoundStage, resolveCodeburnPath, resolveTarget } from './cli'
+import { spawnCli, spawnCliAction, spawnEnvFor, spawnSpecFor, startServe, killAll, shutdownAll, CliError, nodeManagerDirs, notFoundStage, reapOrphanServe, resolveCodeburnPath, resolveTarget } from './cli'
 
 let dir: string
 const originalBin = process.env.CODEBURN_BIN
@@ -364,7 +365,7 @@ describe('spawnCli', () => {
 
   it('rejects with kind "timeout" when the binary hangs', async () => {
     fakeBin('hang.js', 'setInterval(() => {}, 1000)')
-    await expect(spawnCli(['status'], { timeoutMs: 150 })).rejects.toMatchObject({ kind: 'timeout' })
+    await expect(spawnCli(['status'], { timeoutMs: 300 })).rejects.toMatchObject({ kind: 'timeout' })
   })
 
   it('rejects with kind "not-found" when no binary resolves', async () => {
@@ -382,6 +383,195 @@ describe('spawnCli', () => {
   it('rejects with kind "too-large" and kills a binary that floods stdout', async () => {
     fakeBin('flood.js', "const s='x'.repeat(1024*1024); for(let i=0;i<20;i++) process.stdout.write(s); setInterval(()=>{},1000)")
     await expect(spawnCli(['status'])).rejects.toMatchObject({ kind: 'too-large' } satisfies Partial<CliError>)
+  })
+})
+
+describe('no-output watchdog (timeoutMs bounds SILENCE, not total runtime)', () => {
+  /** Emits one progress byte every `everyMs` for `ticks` ticks, then the payload. */
+  function chattyBin(everyMs: number, ticks: number): void {
+    fakeBin(
+      'chatty.js',
+      `let n = 0;
+       const t = setInterval(() => {
+         process.stderr.write('CODEBURN_PROGRESS {"kind":"tick","provider":"claude","done":' + n + ',"total":${ticks}}\\n');
+         if (++n >= ${ticks}) { clearInterval(t); process.stdout.write(JSON.stringify({ ok: 1, ticks: n })); }
+       }, ${everyMs});`,
+    )
+  }
+
+  // The 0.9.20 failure class: a warm `optimize` measured 52.5s against a fixed
+  // 45s cap and was SIGKILLed even though the parse was making steady progress.
+  // Scaled down here — total runtime is 5x the window, so the OLD fixed-timeout
+  // code fails this test and only a resetting watchdog passes.
+  it('never kills a child that keeps producing output past the window', async () => {
+    chattyBin(100, 15) // ~1.5s of work under a 600ms window
+    await expect(spawnCli(['optimize'], { timeoutMs: 600 })).resolves.toEqual({ ok: 1, ticks: 15 })
+  })
+
+  it('kills a child that goes silent, measured from its LAST byte', async () => {
+    // One byte lands ~300ms in (plus node boot), well inside the 1s window, then
+    // silence. A fixed cap kills at 1s; only a window measured from the LAST byte
+    // waits past 1.3s. The gap is wide enough that node's boot cost cannot blur it.
+    fakeBin(
+      'talks-then-hangs.js',
+      `setTimeout(() => process.stderr.write('CODEBURN_PROGRESS {"kind":"keepalive"}\\n'), 300);
+       setInterval(() => {}, 1000);`,
+    )
+    const began = Date.now()
+    await expect(spawnCli(['optimize'], { timeoutMs: 1_000 })).rejects.toMatchObject({ kind: 'timeout' })
+    expect(Date.now() - began).toBeGreaterThanOrEqual(1_250)
+  })
+
+  it('keeps progress heartbeats out of the surfaced error message', async () => {
+    fakeBin(
+      'progress-then-fails.js',
+      `process.stderr.write('CODEBURN_PROGRESS {"kind":"tick","provider":"claude","done":1,"total":2}\\n');
+       process.stderr.write('permission denied\\n');
+       process.exit(2);`,
+    )
+    await expect(spawnCli(['status'])).rejects.toMatchObject({ kind: 'nonzero', message: 'permission denied' })
+  })
+
+  it('enables CODEBURN_PROGRESS on every read spawn so long parses heartbeat', async () => {
+    fakeBin('env-echo.js', 'process.stdout.write(JSON.stringify({ progress: process.env.CODEBURN_PROGRESS }))')
+    await expect(spawnCli(['act', 'report', '--json'])).resolves.toEqual({ progress: '1' })
+  })
+})
+
+describe('graceful kill (SIGTERM, then SIGKILL after the grace)', () => {
+  it('sends SIGTERM first and SIGKILLs a child that ignores it', async () => {
+    const signalFile = join(dir, 'signals')
+    const pidFile = join(dir, 'stubborn-pid')
+    fakeBin(
+      'ignores-sigterm.js',
+      `const fs = require('node:fs');
+       fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+       process.on('SIGTERM', () => fs.appendFileSync(${JSON.stringify(signalFile)}, 'TERM'));
+       setInterval(() => {}, 1000);`,
+    )
+
+    await expect(spawnCli(['status'], { timeoutMs: 300 })).rejects.toMatchObject({ kind: 'timeout' })
+    // SIGTERM arrives with the rejection; the child survives it and is SIGKILLed
+    // only after KILL_GRACE_MS (5s).
+    await waitFor(() => readMaybe(signalFile) === 'TERM')
+    const pid = Number(readMaybe(pidFile))
+    expect(Number.isInteger(pid)).toBe(true)
+    expect(() => process.kill(pid, 0)).not.toThrow() // still alive inside the grace
+    await waitFor(() => {
+      try { process.kill(pid, 0); return false } catch { return true }
+    }, 12_000)
+  }, 20_000)
+
+  it('keeps a child inside the SIGTERM grace reapable, so quit cannot orphan it', async () => {
+    // The grace timer dies with the app. A child that ignores SIGTERM must still
+    // be in the reap set when quit sweeps, or it survives the app that spawned it.
+    //
+    // The child emits one byte the instant it is ready (pidfile written, handler
+    // installed). Because the watchdog restarts on output, the window is measured
+    // from READINESS rather than from spawn — so node's cold boot, however slow
+    // the machine is, can never eat into it and make this flake.
+    const pidFile = join(dir, 'grace-pid')
+    fakeBin(
+      'ignores-sigterm-quit.js',
+      `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+       process.on('SIGTERM', () => {});
+       process.stderr.write('CODEBURN_PROGRESS {"kind":"keepalive"}\\n');
+       setInterval(() => {}, 1000);`,
+    )
+
+    await expect(spawnCli(['status'], { timeoutMs: 1_500 })).rejects.toMatchObject({ kind: 'timeout' })
+    await waitFor(() => readMaybe(pidFile).length > 0)
+    const pid = Number(readMaybe(pidFile))
+    expect(() => process.kill(pid, 0)).not.toThrow() // alive, mid-grace
+
+    shutdownAll() // the quit sweep, landing inside the 5s grace
+    await waitFor(() => {
+      try { process.kill(pid, 0); return false } catch { return true }
+    }, 3_000)
+  })
+
+  it('lets a SIGTERM-handling child exit on its own without waiting for SIGKILL', async () => {
+    const cleanupFile = join(dir, 'cleanup')
+    fakeBin(
+      'handles-sigterm.js',
+      `const fs = require('node:fs');
+       process.on('SIGTERM', () => { fs.writeFileSync(${JSON.stringify(cleanupFile)}, 'released'); process.exit(0); });
+       setInterval(() => {}, 1000);`,
+    )
+    const began = Date.now()
+    await expect(spawnCli(['status'], { timeoutMs: 300 })).rejects.toMatchObject({ kind: 'timeout' })
+    await waitFor(() => readMaybe(cleanupFile) === 'released')
+    expect(Date.now() - began).toBeLessThan(5_000) // never waited out the grace
+  })
+})
+
+describe('orphan serve reaping', () => {
+  /** A long-lived stand-in for an orphaned `codeburn serve --stdio` child. */
+  function orphanServe(): { pid: number; pidFile: string } {
+    const bin = join(dir, 'codeburn')
+    writeFileSync(bin, '#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n', { mode: 0o755 })
+    chmodSync(bin, 0o755)
+    const child = spawn(process.execPath, [bin, 'serve', '--stdio'], { stdio: 'ignore' })
+    child.unref()
+    const pidFile = join(dir, 'serve.pid')
+    writeFileSync(pidFile, JSON.stringify({ pid: child.pid, cmd: [process.execPath, bin, 'serve', '--stdio'].join(' ') }))
+    return { pid: child.pid!, pidFile }
+  }
+
+  it('startServe records the resident pid so a later launch can find it', async () => {
+    fakeResidentBin()
+    const pidFile = join(dir, 'recorded.pid')
+    startServe(pidFile)
+    await waitFor(() => readMaybe(pidFile).length > 0)
+    const record = JSON.parse(readMaybe(pidFile)) as { pid: number; cmd: string }
+    expect(record.pid).toBeGreaterThan(1)
+    expect(record.cmd).toContain('serve --stdio')
+  })
+
+  it('kills a serve child orphaned by a previous run and clears the pidfile', async () => {
+    const { pid, pidFile } = orphanServe()
+    await waitFor(() => { try { process.kill(pid, 0); return true } catch { return false } })
+
+    reapOrphanServe(pidFile)
+
+    await waitFor(() => {
+      try { process.kill(pid, 0); return false } catch { return true }
+    })
+    expect(readMaybe(pidFile)).toBe('')
+  })
+
+  // A keyword sniff ("looks like a cli.js running serve") matches plenty of
+  // unrelated tools. Identity is the exact argv we recorded, nothing looser.
+  it.each([
+    ['an unrelated tool', 'unrelated-tool', ['work']],
+    ['a lookalike cli.js running serve', 'cli.js', ['serve', '--stdio']],
+    ['a lookalike named codeburn', 'codeburn', ['serve', '--stdio']],
+  ])('never signals a recycled pid belonging to %s', async (_label, name, args) => {
+    const bin = join(dir, name)
+    writeFileSync(bin, '#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n', { mode: 0o755 })
+    chmodSync(bin, 0o755)
+    const bystander = spawn(process.execPath, [bin, ...args], { stdio: 'ignore' })
+    const pidFile = join(dir, `recycled-${name}.pid`)
+    // The pid is right; the recorded command belongs to the serve child that
+    // used to own it. Only an exact match may fire.
+    writeFileSync(pidFile, JSON.stringify({ pid: bystander.pid, cmd: '/opt/codeburn/dist/cli.js serve --stdio' }))
+    try {
+      reapOrphanServe(pidFile)
+      await new Promise(resolve => setTimeout(resolve, 200))
+      expect(() => process.kill(bystander.pid!, 0)).not.toThrow()
+    } finally {
+      bystander.kill('SIGKILL')
+    }
+  })
+
+  it('ignores a missing, unparseable, or incomplete pidfile', () => {
+    expect(() => reapOrphanServe(join(dir, 'absent.pid'))).not.toThrow()
+    const junk = join(dir, 'junk.pid')
+    writeFileSync(junk, 'not-a-pid')
+    expect(() => reapOrphanServe(junk)).not.toThrow()
+    const noCmd = join(dir, 'no-cmd.pid')
+    writeFileSync(noCmd, JSON.stringify({ pid: 999999 }))
+    expect(() => reapOrphanServe(noCmd)).not.toThrow()
   })
 })
 
@@ -617,6 +807,43 @@ describe('resident serve single-flight', () => {
     expect(chunks.join('')).toBe('CODEBURN_PROGRESS {"kind":"provider","provider":"claude","state":"start","generation":1}\n')
   })
 
+  it('resets the resident watchdog on every progress frame of a long request', async () => {
+    // Same contract as a one-shot spawn: a warm serve request that keeps
+    // streaming progress is never killed, however long the parse takes. The
+    // first status request warms serve, so the second runs under the plain
+    // (non-cold-floor) window and can only survive by resetting it.
+    fakeBin(
+      'streaming-resident.js',
+      `const readline = require('node:readline');
+       if (process.argv[2] === 'serve') {
+         const rl = readline.createInterface({ input: process.stdin });
+         rl.on('line', line => {
+           const request = JSON.parse(line);
+           if (!request.args.includes('--stream')) {
+             process.stdout.write(JSON.stringify({ id: request.id, ok: true, output: JSON.stringify({ via: 'serve' }) }) + '\\n');
+             return;
+           }
+           let n = 0;
+           const t = setInterval(() => {
+             process.stdout.write(JSON.stringify({ id: request.id, progress: 'CODEBURN_PROGRESS {"kind":"tick","provider":"claude","done":' + n + ',"total":15}\\n' }) + '\\n');
+             if (++n >= 15) {
+               clearInterval(t);
+               process.stdout.write(JSON.stringify({ id: request.id, ok: true, output: JSON.stringify({ via: 'serve', ticks: n }) }) + '\\n');
+             }
+           }, 100);
+         });
+       } else {
+         process.stdout.write(JSON.stringify({ via: 'spawn' }));
+       }`,
+    )
+    startServe()
+
+    await expect(spawnCli(['status', '--warm'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve' })
+    // ~1.5s of streamed work under a 600ms silence window.
+    await expect(spawnCli(['optimize', '--stream'], { timeoutMs: 600 }))
+      .resolves.toEqual({ via: 'serve', ticks: 15 })
+  })
+
   it('rejects and terminates a resident that emits an oversized valid JSON frame', async () => {
     const startsFile = join(dir, 'oversized-frame-starts')
     const oneShotsFile = join(dir, 'oversized-frame-one-shots')
@@ -754,6 +981,35 @@ describe('resident serve single-flight', () => {
     expect(readMaybe(files.startsFile)).toBe('ss')
     expect(readMaybe(files.heavyFile)).toBe('hh')
     expect(readMaybe(files.actionsFile)).toBe('a')
+  })
+
+  it('SIGTERMs the outgoing resident on a mutation restart instead of hard-killing it', async () => {
+    // A settings mutation replaces a child that may hold the cache refresh lock.
+    // Same hazard as a timeout, so it gets the same grace: only a catchable
+    // signal lets the outgoing child unlink its own lock instead of leaving it
+    // for the next parse's stale-pid takeover.
+    const signalFile = join(dir, 'restart-signals')
+    fakeBin(
+      'sigterm-aware-resident.js',
+      `const fs = require('node:fs'); const readline = require('node:readline');
+       const command = process.argv[2];
+       if (command === 'serve') {
+         process.on('SIGTERM', () => { fs.appendFileSync(${JSON.stringify(signalFile)}, 'TERM'); process.exit(0); });
+         const rl = readline.createInterface({ input: process.stdin });
+         rl.on('line', line => {
+           const request = JSON.parse(line);
+           process.stdout.write(JSON.stringify({ id: request.id, ok: true, output: JSON.stringify({ via: 'serve' }) }) + '\\n');
+         });
+       } else {
+         process.stdout.write('currency updated');
+       }`,
+    )
+    startServe()
+
+    await expect(spawnCli(['status'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve' })
+    await expect(spawnCliAction(['currency', 'EUR'], { timeoutMs: 5_000 })).resolves.toMatchObject({ ok: true })
+
+    await waitFor(() => readMaybe(signalFile) === 'TERM')
   })
 
   it('preserves the unexpected-death budget across mutation restarts', async () => {

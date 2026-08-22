@@ -205,6 +205,23 @@ describe('App shortcuts', () => {
     clearPlatform()
   })
 
+  it('keeps sections gated (and the splash up) while a cold hydration times out', async () => {
+    // The repro: the overview timed out cold, `ready` latched anyway, and every
+    // section then spawned its own 45s read behind the still-running parse.
+    mocks.getOverview.mockRejectedValue({ kind: 'timeout', message: 'no output for 45000ms', cold: true })
+    render(<App />)
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalled())
+    await act(async () => { await Promise.resolve() })
+    expect(mocks.getActReport).not.toHaveBeenCalled()
+    expect(screen.queryByText("Couldn't read data")).not.toBeInTheDocument()
+  })
+
+  it('releases the sections when the overview fails for a real reason', async () => {
+    mocks.getOverview.mockRejectedValue({ kind: 'nonzero', message: 'permission denied' })
+    render(<App />)
+    await waitFor(() => expect(mocks.getActReport).toHaveBeenCalled())
+  })
+
   it('applies the persisted theme on app boot before Settings mounts', async () => {
     localStorage.setItem('codeburn.theme', 'dark')
     render(<App />)

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import { isColdHydrating } from './components/CliErrorPanel'
 import { EmptyNote } from './components/EmptyState'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { Hint } from './components/Hint'
@@ -258,10 +259,15 @@ function AppMain() {
   // full-history parse per section. Flips true the moment overview first has data
   // OR a (resolved) error; LATCHED, so a later uncached switch (which clears
   // overview.data to paint a skeleton) can never re-gate the sections.
+  // A cold-hydration failure is NOT a resolution: flipping ready on it released
+  // every section to spawn its own read behind the still-running parse, and each
+  // one then died on its own timeout. Stay gated (and keep the splash) until the
+  // hydration actually settles.
+  const overviewCold = isColdHydrating(overview.error)
   const [ready, setReady] = useState(false)
   useEffect(() => {
-    if (overview.data != null || overview.error != null) setReady(true)
-  }, [overview.data, overview.error])
+    if (overview.data != null || (overview.error != null && !overviewCold)) setReady(true)
+  }, [overview.data, overview.error, overviewCold])
 
   // First-launch onboarding: shown until the telemetry consent screen has been
   // completed once. All telemetry bridge calls are typeof-guarded so an older
@@ -525,7 +531,7 @@ function AppMain() {
     <Window>
       <Sidebar active={section} onNavigate={navigate} status={<StatusLine polled={overview} />} />
       <ToastHost />
-      <Splash hasData={overview.data != null} hasError={overview.error != null} />
+      <Splash hasData={overview.data != null} hasError={overview.error != null && !overviewCold} />
       {onboardingStatus && <Onboarding defaultEnabled={onboardingStatus.defaultEnabled} onDone={finishOnboarding} />}
       <div className="ct">
         <div className={overview.switching ? 'switch-line on' : 'switch-line'} aria-hidden="true" />

@@ -1,5 +1,5 @@
-import { spawn, type ChildProcess } from 'node:child_process'
-import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
+import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir, platform } from 'node:os'
 import { delimiter, dirname, isAbsolute, join } from 'node:path'
 
@@ -53,11 +53,27 @@ export class CliError extends Error {
   }
 }
 
+// Read timeouts are a NO-OUTPUT watchdog, not a total-runtime cap: the window
+// restarts every time the child emits a byte on stdout/stderr (serve: every
+// frame for that request). A long-but-progressing parse on a slow machine is
+// therefore never killed — only a genuinely silent child is. Read spawns all
+// set CODEBURN_PROGRESS=1 so a multi-minute parse heartbeats through it.
 const DEFAULT_TIMEOUT_MS = 45_000
 // The first status query may hydrate a power-user cache from scratch. Every
 // resident request admitted before that succeeds shares this floor so a later
 // short request cannot kill the child while it waits behind the cold scan.
 export const DESKTOP_COLD_TIMEOUT_MS = 10 * 60_000
+// Backstop for the watchdog: a livelocked child that chatters forever without
+// ever finishing still gets reaped.
+const MAX_RUNTIME_MS = 15 * 60_000
+// SIGTERM is catchable, so the CLI's armSignalCleanup (src/session-cache.ts)
+// unlinks its own cache refresh lock before dying. Under SIGKILL the lock file
+// is simply left behind and the next cold parse takes it over once it sees the
+// dead pid — self-healing, but via the stale-takeover path rather than a clean
+// release. Neither signal publishes a partial parse; nothing does.
+const KILL_GRACE_MS = 5_000
+/** Wire marker for CLI scan-progress lines (src/parser.ts: PROGRESS_LINE_PREFIX). */
+export const PROGRESS_LINE_PREFIX = 'CODEBURN_PROGRESS '
 // A runaway CLI (or a compromised binary) must not exhaust main-process memory.
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 // A cold-cache CLI spawn costs seconds at ~120% CPU; letting every poll +
@@ -110,6 +126,10 @@ function releaseSlot(): void {
 function reapAll(): void {
   serveClient?.destroy()
   serveClient = null
+  // Deliberately harder than every other kill path: quit has a 1.5s flush budget,
+  // shorter than the SIGTERM grace, so waiting one out would just wedge the quit.
+  // A lock left behind here still self-heals via the next parse's stale-pid
+  // takeover; a quit that hangs does not.
   for (const child of activeChildren) child.kill('SIGKILL')
   activeChildren.clear()
   // A queued waiter has no child to reap, so releaseSlot never fires for it;
@@ -332,6 +352,25 @@ export function notFoundStage(): NotFoundStage {
   return 'no-path-match'
 }
 
+/** Ask a child to exit, then insist. See {@link KILL_GRACE_MS}. The child is
+ *  (re-)registered as active for the whole grace: a quit landing inside that
+ *  window must still find it and SIGKILL it rather than orphan it. */
+function killGracefully(child: ChildProcess): void {
+  activeChildren.add(child)
+  let grace: NodeJS.Timeout | undefined
+  const settle = () => { activeChildren.delete(child); if (grace) clearTimeout(grace) }
+  child.once('exit', settle)
+  try { child.kill('SIGTERM') } catch { settle(); return }
+  grace = setTimeout(() => { try { child.kill('SIGKILL') } catch { /* already gone */ } settle() }, KILL_GRACE_MS)
+  grace.unref?.()
+}
+
+/** Progress heartbeats share the stderr stream with real diagnostics, and every
+ *  read spawn now enables them — so they must never become the error message. */
+function withoutProgressLines(stderr: string): string {
+  return stderr.split('\n').filter(line => !line.startsWith(PROGRESS_LINE_PREFIX)).join('\n').trim()
+}
+
 function runCli(spec: SpawnSpec, cmdLabel: string, timeoutMs: number, onStderr?: (chunk: string) => void): Promise<unknown> {
   return new Promise<unknown>((resolve, reject) => {
     const child = spawn(spec.bin, spec.args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'], env: spec.env })
@@ -344,19 +383,33 @@ function runCli(spec: SpawnSpec, cmdLabel: string, timeoutMs: number, onStderr?:
     const finish = (fn: () => void) => {
       if (settled) return
       settled = true
-      clearTimeout(timer)
+      clearTimeout(idleTimer)
+      clearTimeout(ceiling)
       activeChildren.delete(child)
       fn()
     }
 
-    const timer = setTimeout(() => {
+    const expire = (message: string) => {
       finish(() => {
-        child.kill('SIGKILL')
-        reject(new CliError('timeout', `codeburn ${cmdLabel} timed out after ${timeoutMs}ms`))
+        killGracefully(child)
+        reject(new CliError('timeout', message))
       })
-    }, timeoutMs)
+    }
+
+    // Restarted on every byte the child produces: `timeoutMs` bounds SILENCE.
+    let idleTimer: NodeJS.Timeout
+    const armIdle = () => {
+      clearTimeout(idleTimer)
+      idleTimer = setTimeout(() => expire(`codeburn ${cmdLabel} produced no output for ${timeoutMs}ms`), timeoutMs)
+    }
+    armIdle()
+    const ceiling = setTimeout(() => expire(`codeburn ${cmdLabel} exceeded ${MAX_RUNTIME_MS}ms`), MAX_RUNTIME_MS)
 
     const bump = (n: number) => {
+      // Buffered bytes can still land after the kill; re-arming then would leave
+      // a timer nobody clears (finish() already ran).
+      if (settled) return
+      armIdle()
       total += n
       if (total > MAX_OUTPUT_BYTES) {
         finish(() => {
@@ -382,7 +435,7 @@ function runCli(spec: SpawnSpec, cmdLabel: string, timeoutMs: number, onStderr?:
     child.on('close', code => {
       finish(() => {
         if (code !== 0) {
-          reject(new CliError('nonzero', stderr.trim() || `codeburn exited with code ${code}`))
+          reject(new CliError('nonzero', withoutProgressLines(stderr) || `codeburn exited with code ${code}`))
           return
         }
         try {
@@ -443,16 +496,21 @@ async function runScheduledCli(
 const SERVE_ROUTED = new Set(['status', 'models', 'sessions', 'compare', 'yield', 'spend', 'optimize', 'audit'])
 const SERVE_MAX_RESTARTS = 3
 
+type PendingServeRequest = {
+  resolve: (v: unknown) => void
+  reject: (e: Error) => void
+  /** Restart the no-output watchdog — called for every frame carrying this id. */
+  arm: () => void
+  /** Cancel both the watchdog and the absolute ceiling. */
+  clear: () => void
+  warmsServe: boolean
+  decodedBytes: number
+  onStderr?: (chunk: string) => void
+}
+
 class ServeClient {
   private child: ReturnType<typeof spawn> | null = null
-  private pending = new Map<number, {
-    resolve: (v: unknown) => void
-    reject: (e: Error) => void
-    timer: NodeJS.Timeout
-    warmsServe: boolean
-    decodedBytes: number
-    onStderr?: (chunk: string) => void
-  }>()
+  private pending = new Map<number, PendingServeRequest>()
   private nextId = 1
   private deaths = 0
   private buffer = ''
@@ -461,7 +519,7 @@ class ServeClient {
   private destroyed = false
   private requestTail: Promise<void> = Promise.resolve()
 
-  constructor(private readonly spec: SpawnSpec) {}
+  constructor(private readonly spec: SpawnSpec, private readonly pidFile?: string) {}
 
   isRunning(): boolean { return this.child !== null }
   disabled(): boolean { return this.deaths >= SERVE_MAX_RESTARTS }
@@ -471,6 +529,10 @@ class ServeClient {
     if (this.child || this.disabled() || this.destroyed) return
     const child = spawn(this.spec.bin, [...this.spec.args], { shell: false, stdio: ['pipe', 'pipe', 'ignore'], env: this.spec.env })
     this.child = child
+    if (this.pidFile && child.pid) {
+      const record = JSON.stringify({ pid: child.pid, cmd: [this.spec.bin, ...this.spec.args].join(' ') })
+      try { writeFileSync(this.pidFile, record) } catch { /* reaping is best-effort */ }
+    }
     child.stdout!.setEncoding('utf8')
     child.stdout!.on('data', (chunk: string) => {
       // A replaced child's stream can drain after its exit callback. Never let
@@ -503,6 +565,9 @@ class ServeClient {
       if (typeof msg.id !== 'number') continue
       const waiter = this.pending.get(msg.id)
       if (!waiter) continue
+      // Any frame for this request is proof of life: restart its watchdog so a
+      // long cold parse that heartbeats progress is never killed mid-flight.
+      waiter.arm()
       if (typeof msg.progress === 'string') {
         if (!this.consumeDecodedOutput(child, waiter, msg.progress)) return
         if (waiter.onStderr) {
@@ -513,7 +578,7 @@ class ServeClient {
       const terminalOutput = typeof msg.output === 'string' ? msg.output : typeof msg.error === 'string' ? msg.error : ''
       if (!this.consumeDecodedOutput(child, waiter, terminalOutput)) return
       this.pending.delete(msg.id)
-      clearTimeout(waiter.timer)
+      waiter.clear()
       if (msg.ok && typeof msg.output === 'string') {
         if (waiter.warmsServe) this.warmed = true
         try { waiter.resolve(JSON.parse(msg.output)) }
@@ -551,7 +616,7 @@ class ServeClient {
     // budget, or three oversized payloads would disable serve for the app run.
     activeChildren.delete(child as never)
     for (const [, waiter] of this.pending) {
-      clearTimeout(waiter.timer)
+      waiter.clear()
       waiter.reject(error)
     }
     this.pending.clear()
@@ -570,7 +635,7 @@ class ServeClient {
     if (countsTowardBudget) this.deaths += 1
     activeChildren.delete(child as never)
     for (const [, waiter] of this.pending) {
-      clearTimeout(waiter.timer)
+      waiter.clear()
       waiter.reject(new CliError('nonzero', 'codeburn serve exited'))
     }
     this.pending.clear()
@@ -580,9 +645,11 @@ class ServeClient {
     const child = this.child
     if (child) {
       // This is an intentional replacement, not a crash. Detach first so the
-      // later exit event cannot consume the unexpected-death budget.
+      // later exit event cannot consume the unexpected-death budget. The
+      // outgoing child may hold the refresh lock, so it gets the same SIGTERM
+      // grace a timed-out one does and can unlink that lock on its way out.
       this.onDeath(child, false)
-      child.kill('SIGKILL')
+      killGracefully(child)
     }
     this.start()
   }
@@ -601,27 +668,36 @@ class ServeClient {
     const child = this.child
     if (!child?.stdin) return Promise.reject(new CliError('nonzero', 'serve not running'))
     const id = this.nextId++
-    const effectiveTimeoutMs = this.warmed ? timeoutMs : Math.max(timeoutMs, DESKTOP_COLD_TIMEOUT_MS)
+    const idleMs = this.warmed ? timeoutMs : Math.max(timeoutMs, DESKTOP_COLD_TIMEOUT_MS)
     return new Promise<unknown>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        // A hung request would block the serialized queue behind it; kill the
-        // child so everything falls back to spawns and a fresh serve restarts.
+      let idleTimer: NodeJS.Timeout
+      // A hung request would block the serialized queue behind it; kill the
+      // child so everything falls back to spawns and a fresh serve restarts.
+      const expire = (message: string) => {
+        entry.clear()
         this.pending.delete(id)
-        reject(new CliError('timeout', 'codeburn serve timed out'))
-        child.kill('SIGKILL')
-      }, effectiveTimeoutMs)
-      this.pending.set(id, {
+        reject(new CliError('timeout', message))
+        killGracefully(child)
+      }
+      const ceiling = setTimeout(() => expire(`codeburn serve exceeded ${MAX_RUNTIME_MS}ms`), MAX_RUNTIME_MS)
+      const entry: PendingServeRequest = {
         resolve,
         reject,
-        timer,
+        arm: () => {
+          clearTimeout(idleTimer)
+          idleTimer = setTimeout(() => expire(`codeburn serve produced no output for ${idleMs}ms`), idleMs)
+        },
+        clear: () => { clearTimeout(idleTimer); clearTimeout(ceiling) },
         warmsServe: args[0] === 'status',
         decodedBytes: 0,
         ...(onStderr ? { onStderr } : {}),
-      })
+      }
+      entry.arm()
+      this.pending.set(id, entry)
       child.stdin!.write(JSON.stringify({ id, args }) + '\n', (err) => {
         if (err) {
           this.pending.delete(id)
-          clearTimeout(timer)
+          entry.clear()
           reject(new CliError('nonzero', 'serve write failed'))
         }
       })
@@ -634,7 +710,7 @@ class ServeClient {
     const child = this.child
     if (!child) return
     this.onDeath(child, false)
-    child.kill('SIGKILL')
+    killGracefully(child)
   }
 }
 
@@ -642,8 +718,10 @@ let serveClient: ServeClient | null = null
 
 /** Start the resident serve child without issuing a query. The first real panel
  *  request is accepted immediately (even before the ready frame) and performs
- *  the one cold-cache hydration while streaming progress back to the splash. */
-export function startServe(): void {
+ *  the one cold-cache hydration while streaming progress back to the splash.
+ *  `pidFile` records the child so {@link reapOrphanServe} can clean it up if the
+ *  app dies without ever closing the child's stdin. */
+export function startServe(pidFile?: string): void {
   if (shuttingDown) return
   const target = resolveTarget()
   if (!target) return
@@ -651,9 +729,66 @@ export function startServe(): void {
   if (!serveClient) {
     const spec = spawnSpecFor(target, ['serve', '--stdio'])
     spec.env = { ...spec.env, CODEBURN_PROGRESS: '1' }
-    serveClient = new ServeClient(spec)
+    serveClient = new ServeClient(spec, pidFile)
   }
   serveClient.start()
+}
+
+/**
+ * Best-effort reap of a serve child orphaned by a previous run (an app crash
+ * leaves no one to close its stdin). Reads the pid recorded by
+ * {@link startServe}, and — because pids are recycled — signals it only after
+ * `ps` confirms the process is still a codeburn serve. SIGTERM, never SIGKILL:
+ * the orphan may be holding the cache refresh lock.
+ */
+/**
+ * The live command line of `pid`, or null if it cannot be established.
+ *
+ * POSIX uses `ps -ww` (`-ww` defeats ps's width truncation). Windows has no
+ * equivalent that reports argv: `tasklist` only ever reports the image name and
+ * window title, and `wmic` is removed from current Windows, so this asks CIM for
+ * Win32_Process.CommandLine. `pid` is a validated integer before it is
+ * interpolated, and neither call goes through a shell.
+ */
+function processCommandLine(pid: number): string | null {
+  try {
+    const out = platform() === 'win32'
+      ? execFileSync(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`],
+          { encoding: 'utf-8', timeout: 5_000, windowsHide: true },
+        )
+      : execFileSync('ps', ['-ww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf-8', timeout: 2_000 })
+    return out.trim() || null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Whether a live command line is the serve child we recorded. Exact match, not
+ * a keyword sniff: any looser test signals whatever unrelated process inherited
+ * the pid. Quoting is normalized away because the two sides quote differently —
+ * we record a plain space-joined argv, while Windows reports the real command
+ * line with its quotes intact — so a path containing spaces still round-trips.
+ */
+export function serveCommandMatches(recorded: string, observed: string | null): boolean {
+  if (!observed) return false
+  const normalize = (value: string): string => value.replace(/"/g, ' ').replace(/\s+/g, ' ').trim()
+  const wanted = normalize(recorded)
+  return wanted.length > 0 && normalize(observed) === wanted
+}
+
+export function reapOrphanServe(pidFile: string): void {
+  let record: { pid?: unknown; cmd?: unknown }
+  try { record = JSON.parse(readFileSync(pidFile, 'utf-8')) } catch { return }
+  try { unlinkSync(pidFile) } catch { /* stale file is harmless */ }
+  const pid = record.pid
+  const cmd = record.cmd
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 1 || pid === process.pid) return
+  if (typeof cmd !== 'string' || !cmd) return
+  if (!serveCommandMatches(cmd, processCommandLine(pid))) return
+  try { process.kill(pid, 'SIGTERM') } catch { /* already gone */ }
 }
 
 function restartServeAfterMutation(): void {
@@ -687,6 +822,10 @@ export function spawnCli(
   const target = resolveTarget()
   if (!target) return Promise.reject(new CliError('not-found', 'codeburn CLI not found', notFoundStage()))
   const spec = spawnSpecFor(target, args)
+  // Heartbeats for the no-output watchdog: a multi-minute parse writes progress
+  // lines to stderr instead of going silent. Only reads get this — mutations
+  // (spawnCliAction) keep their plain total-runtime cap.
+  spec.env = { ...spec.env, CODEBURN_PROGRESS: '1' }
   if (opts.extraEnv) spec.env = { ...spec.env, ...opts.extraEnv }
 
   const generation = readGeneration
@@ -766,6 +905,9 @@ export function spawnCliAction(args: string[], opts: { timeoutMs?: number } = {}
   })()
 }
 
+// Mutations keep a plain total-runtime cap and no progress env: they are short
+// by design (a config write, an export), never a full-history parse, so there is
+// no long silent stretch for a watchdog to misread.
 function runAction(spec: SpawnSpec, args: string[], timeoutMs: number): Promise<ActionResult> {
   return new Promise<ActionResult>(resolve => {
     const child = spawn(spec.bin, spec.args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'], env: spec.env })

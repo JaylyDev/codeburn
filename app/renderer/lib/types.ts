@@ -18,6 +18,11 @@ export type CliErrorKind = 'not-found' | 'nonzero' | 'bad-json' | 'timeout' | 't
 export interface CliError {
   kind: CliErrorKind
   message: string
+  /** Set by the main process when the failure happened while the cold cache
+   *  hydration was still running. Such a failure is a "not ready yet", not a
+   *  broken install, so the UI keeps its splash/progress state. Optional so an
+   *  older preload simply never sets it. */
+  cold?: true
 }
 
 export type AliasRow = { from: string; to: string }
@@ -641,6 +646,8 @@ export type ScanProgressEvent =
   | { kind: 'providers'; providers: string[]; cold?: boolean }
   | { kind: 'provider'; provider: string; state: 'start' | 'done' | 'skipped'; files?: number }
   | { kind: 'tick'; provider: string; done: number; total: number }
+  /** Proof of life during a silent parse phase; carries nothing else. */
+  | { kind: 'keepalive' }
   | { kind: 'done' }
 
 /** Update-availability status from the main process (app/electron/updates.ts). */
