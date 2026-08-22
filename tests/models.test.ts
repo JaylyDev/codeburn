@@ -1124,7 +1124,11 @@ describe('findUnpricedModels', () => {
     ]
     expect(findUnpricedModels(rows)).toEqual([
       { model: 'warp', calls: 449, tokens: 17_700_000 },
-      { model: 'codex-auto-review', calls: 940, tokens: 7_200_000 },
+      // Note: NOT 'codex-auto-review' — #1056 aliases it to gpt-5.5, so it
+      // now resolves a billable rate and is filtered out here (a $0 row for
+      // it is stale data, not evidence of missing pricing). It still left
+      // the flat-rate list, verified separately in the "Codex activity ids
+      // (#1047)" describe block below.
       { model: 'big-pickle', calls: 4, tokens: 33_900 },
       { model: 'zz-mystery-paid-model-999', calls: 3, tokens: 1200 },
       { model: 'Codex Auto Review', calls: 2, tokens: 100 },
