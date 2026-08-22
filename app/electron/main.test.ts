@@ -467,6 +467,46 @@ describe('createBridgeHandlers (cold-start warmup)', () => {
     expect(opts[1]?.timeoutMs).toBe(10 * 60_000)
   })
 
+  it('gives every section read the cold floor while hydration is still running', async () => {
+    // The repro: the moment `ready` flipped, act report / plan spawned with the
+    // plain 45s cap and were killed waiting behind the cold parse's lock.
+    const opts: Array<{ timeoutMs?: number } | undefined> = []
+    const spawnCli = vi.fn(async (_args: string[], o?: { timeoutMs?: number }) => {
+      opts.push(o)
+      return { current: { cost: 1 } }
+    })
+    const handlers = createBridgeHandlers(base({ spawnCli, emitProgress: vi.fn() }))
+
+    await handlers['codeburn:getActReport']!()
+    await handlers['codeburn:getPlans']!('30days')
+    await handlers['codeburn:getOptimizeReport']!('30days', 'all')
+    expect(opts.map(o => o?.timeoutMs)).toEqual([10 * 60_000, 10 * 60_000, 10 * 60_000])
+
+    // Once the overview lands, the cold cache is hot and reads revert to the
+    // plain default so a genuinely stuck child is still caught quickly.
+    await handlers['codeburn:getOverview']!('30days', 'all')
+    await handlers['codeburn:getActReport']!()
+    expect(opts[4]?.timeoutMs).toBeUndefined()
+  })
+
+  it('flags a cold-hydration timeout so the renderer keeps the splash', async () => {
+    const spawnCli = vi.fn(async () => { throw new CliError('timeout', 'no output for 45000ms') })
+    const handlers = createBridgeHandlers(base({ spawnCli, emitProgress: vi.fn() }))
+
+    expect(await handlers['codeburn:getActReport']!())
+      .toMatchObject({ ok: false, error: { kind: 'timeout', cold: true } })
+    expect(await handlers['codeburn:getOverview']!('30days', 'all'))
+      .toMatchObject({ ok: false, error: { kind: 'timeout', cold: true } })
+  })
+
+  it('never flags a non-timeout failure as cold (a real error is real news)', async () => {
+    const spawnCli = vi.fn(async () => { throw new CliError('nonzero', 'permission denied') })
+    const handlers = createBridgeHandlers(base({ spawnCli, emitProgress: vi.fn() }))
+
+    const res = await handlers['codeburn:getActReport']!() as { error: { cold?: true } }
+    expect(res.error.cold).toBeUndefined()
+  })
+
   it('parses CLI scan-progress stderr lines and forwards them to emitProgress', async () => {
     const spawnCli = vi.fn(async (_args: string[], o?: { onStderr?: (chunk: string) => void }) => {
       // A split line proves the reader buffers across chunks.

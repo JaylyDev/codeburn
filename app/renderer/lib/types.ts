@@ -18,6 +18,11 @@ export type CliErrorKind = 'not-found' | 'nonzero' | 'bad-json' | 'timeout' | 't
 export interface CliError {
   kind: CliErrorKind
   message: string
+  /** Set by the main process when the failure happened while the cold cache
+   *  hydration was still running. Such a failure is a "not ready yet", not a
+   *  broken install, so the UI keeps its splash/progress state. Optional so an
+   *  older preload simply never sets it. */
+  cold?: true
 }
 
 export type AliasRow = { from: string; to: string }
