@@ -1987,7 +1987,14 @@ function createOtelParser(
 // The emitted calls mirror the shutdown-call contract exactly: input/cache/
 // reasoning only, output 0 — per-turn output (and its tools/userMessage
 // metadata) stays owned by the events.jsonl assistant.message calls, so
-// emitting output here would double-count it. The per-request billing
+// emitting output here would double-count it. The ONE exception is the
+// `initiator='compaction'` row: that request is the CLI summarizing its own
+// context, it has no assistant.message anywhere in events.jsonl, and nothing
+// else in the journal carries its output — so leaving it at 0 simply loses
+// those tokens (measured: a matched 30-session corpus reconciled to the
+// store's own row totals within -3,085 tokens, exactly one compaction row's
+// output). It is counted here because here is the only place it exists.
+// The per-request billing
 // metadata (total_nano_aiu, request_multiplier) is captured onto the cached
 // calls but not priced or displayed — that design is upstream #890; the
 // throughput/latency columns are deliberately not read yet.
@@ -2026,9 +2033,14 @@ const SESSION_STORE_USAGE_SELECT = `SELECT ${SESSION_STORE_USAGE_COLUMNS}${SESSI
 // but not `initiator` keeps its billing metadata instead of falling all the
 // way back — the columns arrived in different CLI releases and a single
 // all-or-nothing enrichment would lose the older one.
+//
+// `output_tokens` rides on the SAME rung as `initiator` deliberately: it is
+// only ever read for a row the label identifies as a compaction, so a store
+// too old to have the label has no use for it either and must not be pushed
+// down another fallback rung for it.
 const SESSION_STORE_USAGE_SELECTS = [
   `SELECT ${SESSION_STORE_USAGE_COLUMNS},
-       e.total_nano_aiu, e.request_multiplier, e.initiator${SESSION_STORE_USAGE_FROM}`,
+       e.total_nano_aiu, e.request_multiplier, e.initiator, e.output_tokens${SESSION_STORE_USAGE_FROM}`,
   `SELECT ${SESSION_STORE_USAGE_COLUMNS},
        e.total_nano_aiu, e.request_multiplier${SESSION_STORE_USAGE_FROM}`,
   SESSION_STORE_USAGE_SELECT,
@@ -2052,6 +2064,7 @@ type SessionStoreUsageRow = {
   total_nano_aiu?: number | null
   request_multiplier?: number | null
   initiator?: string | null
+  output_tokens?: number | null
 }
 
 // FNV-1a 64-bit over the row's identifying content, base36. Collisions only
@@ -2185,9 +2198,14 @@ function createSessionStoreParser(
             numberOrZero(row.input_tokens) - cacheReadTokens - cacheWriteTokens
           )
 
-          // Nothing this call would add over the per-turn events (output is
-          // intentionally excluded), so skip it to avoid an empty $0 row.
-          if (inputTokens === 0 && cacheReadTokens === 0 && cacheWriteTokens === 0 && reasoningTokens === 0) continue
+          // A compaction row's output has no assistant.message to own it, so
+          // this row is the only place it can be counted. Every other row's
+          // output IS owned by a per-turn call and stays excluded here.
+          const outputTokens = row.initiator === 'compaction' ? numberOrZero(row.output_tokens) : 0
+
+          // Nothing this call would add over the per-turn events, so skip it to
+          // avoid an empty $0 row.
+          if (inputTokens === 0 && cacheReadTokens === 0 && cacheWriteTokens === 0 && reasoningTokens === 0 && outputTokens === 0) continue
 
           // `id` is AUTOINCREMENT: stable across re-parses and never reused
           // WITHIN one database lifetime — but recreating the DB at the same
@@ -2225,7 +2243,9 @@ function createSessionStoreParser(
           // input/cache_read/cache_write/output, no reasoning entry), and
           // output — reasoning included — is billed by the per-turn
           // assistant.message call. Pricing reasoning here would double-count.
-          const costUSD = calculateCost(model, inputTokens, 0, cacheWriteTokens, cacheReadTokens, 0)
+          // `outputTokens` is non-zero only for the compaction row, whose
+          // output no per-turn call bills, so it is priced exactly once.
+          const costUSD = calculateCost(model, inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens, 0)
 
           yield {
             provider: 'copilot',
@@ -2233,7 +2253,7 @@ function createSessionStoreParser(
             project,
             model,
             inputTokens,
-            outputTokens: 0,
+            outputTokens,
             cacheCreationInputTokens: cacheWriteTokens,
             cacheReadInputTokens: cacheReadTokens,
             cachedInputTokens: 0,

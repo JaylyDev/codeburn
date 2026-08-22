@@ -56,6 +56,15 @@ export const MAX_PER_PUSH = 50_000
  * i.e. the store was already complete when shutdown was written. That is one
  * machine and one CLI version (1.0.80), so this stays at a day until a second
  * machine agrees; the number to beat is seconds, not hours.
+ *
+ * Two more machines have now agreed (#946 validation): 6 sessions on CLI
+ * 1.0.79-8 and 30 sessions on 1.0.80, closest row 55 ms BEFORE shutdown, p95
+ * -0.067 s. Three corpora, 127 sessions, zero positive deltas. That is enough
+ * evidence to tighten this to a seconds-scale window - deliberately NOT done
+ * here: shortening it changes what leaves the machine and how promptly, which
+ * is a product call for the maintainers, not a fix to a validated defect. The
+ * evidence is recorded so whoever makes that call does not have to re-gather
+ * it.
  */
 export const RECONCILE_SETTLE_MS = 24 * 60 * 60 * 1000
 

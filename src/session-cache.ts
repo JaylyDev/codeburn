@@ -312,7 +312,12 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // reconciliation in parseProviderSources decides per (session, model) what
   // they still contribute. v2 (over the never-released v1): store dedup keys
   // grew a content discriminator so a same-path DB reset cannot alias rows.
-  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1-session-store-v2',
+  // v3: the `initiator='compaction'` row now carries its own output tokens (no
+  // assistant.message owns them). The dedup key deliberately did NOT change -
+  // it identifies the request, and moving it would leave the cached output-0
+  // copy beside the new row - so only this bump re-parses a v2 cache into the
+  // corrected shape.
+  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1-session-store-v3',
   // authoritative-usage-v4: persist one Grok session call from top-level
   // authoritative totals, use modelUsage only for priced attribution, clamp
   // reasoning per record, and label mixed sessions estimated.

@@ -1736,14 +1736,22 @@ describe.skipIf(!isSqliteAvailable())('(c5) compaction-initiated store rows', ()
     `)
     db.close()
   }
-  const insertLabelled = (dbPath: string, sid: string, input: number, at: string, initiator: string | null): void => {
+  const insertLabelled = (
+    dbPath: string,
+    sid: string,
+    input: number,
+    at: string,
+    initiator: string | null,
+    extra: { output?: number; cacheRead?: number } = {},
+  ): void => {
     const { DatabaseSync } = requireForTest('node:sqlite') as { DatabaseSync: new (p: string) => TestDb }
     const db = new DatabaseSync(dbPath)
     db.prepare('INSERT OR IGNORE INTO sessions (id, cwd) VALUES (?, ?)').run(sid, '/home/user/testproj')
     db.prepare(`INSERT INTO assistant_usage_events
       (session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
        reasoning_tokens, created_at, total_nano_aiu, request_multiplier, initiator)
-      VALUES (?, 'claude-sonnet-4-5', ?, 0, 0, 0, 0, ?, 1000, 1, ?)`).run(sid, input, at, initiator)
+      VALUES (?, 'claude-sonnet-4-5', ?, ?, ?, 0, 0, ?, 1000, 1, ?)`)
+      .run(sid, input, extra.output ?? 0, extra.cacheRead ?? 0, at, initiator)
     db.close()
   }
 
@@ -1834,6 +1842,82 @@ describe.skipIf(!isSqliteAvailable())('(c5) compaction-initiated store rows', ()
     expect(storeCalls).toHaveLength(2)
     expect(storeCalls.filter(c => c.supplementaryAccounting)).toHaveLength(1)
     expect(supp('copilot:sess-ci:m1')).toBe(false)
+  })
+
+  // Validation round 5, machine B, session f38d4326: the compaction row's
+  // prompt side was counted and priced while its 3,085 output tokens were
+  // dropped - the only token discrepancy across a 30-session store-matched
+  // comparison (540,158,021 served vs 540,161,106 in the store). Its output
+  // has no assistant.message anywhere in events.jsonl, so the store row is the
+  // only place it exists.
+  const totalOutput = (projects: Awaited<ReturnType<typeof parseAllSessions>>): number =>
+    projects.flatMap(p => p.sessions).flatMap(s => s.turns).flatMap(t => t.assistantCalls)
+      .reduce((sum, c) => sum + c.usage.outputTokens, 0)
+
+  it("counts the compaction row's own output, which no assistant.message owns", async () => {
+    const { sessionStateDir, dbPath, at } = await setup('compaction-output')
+    const dir = join(sessionStateDir, 'sess-ci')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'workspace.yaml'), 'id: sess-ci\ncwd: /home/user/testproj\n')
+    // The real geometry: created_at equals the compaction_complete stamp to
+    // the millisecond, and there is no assistant.message for this request.
+    await writeFile(join(dir, 'events.jsonl'), [
+      JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: 'claude-sonnet-4-5' } }),
+      JSON.stringify({ type: 'session.compaction_complete', timestamp: at(10), data: { success: true, kind: 'background' } }),
+    ].join('\n') + '\n')
+    insertLabelled(dbPath, 'sess-ci', 273205, at(10), 'compaction', { output: 3085, cacheRead: 266933 })
+
+    const projects = await parseAllSessions(undefined, 'copilot')
+    const storeCalls = projects.flatMap(p => p.sessions).flatMap(s => s.turns)
+      .flatMap(t => t.assistantCalls).filter(c => c.deduplicationKey.startsWith('copilot-store:'))
+    expect(storeCalls).toHaveLength(1)
+    // input_tokens is cache-inclusive: 273,205 - 266,933 = 6,272 uncached.
+    expect(storeCalls[0]!.usage).toMatchObject({
+      inputTokens: 6272,
+      cacheReadInputTokens: 266933,
+      outputTokens: 3085,
+    })
+    expect(totalOutput(projects)).toBe(3085)
+  })
+
+  it('leaves an UNLABELLED row at output 0 (its per-turn call owns that output)', async () => {
+    const { sessionStateDir, dbPath, at } = await setup('unlabelled-output')
+    const dir = join(sessionStateDir, 'sess-ci')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'workspace.yaml'), 'id: sess-ci\ncwd: /home/user/testproj\n')
+    await writeFile(join(dir, 'events.jsonl'), [
+      JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: 'claude-sonnet-4-5' } }),
+      JSON.stringify({ type: 'assistant.message', timestamp: at(11), data: { messageId: 'm1', outputTokens: 3085, toolRequests: [] } }),
+    ].join('\n') + '\n')
+    insertLabelled(dbPath, 'sess-ci', 273205, at(10), null, { output: 3085, cacheRead: 266933 })
+
+    // Counted once, by the per-turn call - never twice.
+    expect(totalOutput(await parseAllSessions(undefined, 'copilot'))).toBe(3085)
+  })
+
+  // The dedup hazard kelchm flagged: on the same turn index, 1.5 s apart, with
+  // near-identical token shapes. Nothing may collapse them - the store dedup
+  // key carries the row id, and the content discriminator differs too.
+  it('keeps the compaction row and its 1.5s-adjacent twin as two distinct calls', async () => {
+    const { sessionStateDir, dbPath, at } = await setup('adjacent-twin')
+    const dir = join(sessionStateDir, 'sess-ci')
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'workspace.yaml'), 'id: sess-ci\ncwd: /home/user/testproj\n')
+    await writeFile(join(dir, 'events.jsonl'), [
+      JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: 'claude-sonnet-4-5' } }),
+      JSON.stringify({ type: 'session.compaction_complete', timestamp: at(10), data: { success: true, kind: 'background' } }),
+    ].join('\n') + '\n')
+    insertLabelled(dbPath, 'sess-ci', 272139, at(8.5), null, { output: 400, cacheRead: 267005 })
+    insertLabelled(dbPath, 'sess-ci', 273205, at(10), 'compaction', { output: 3085, cacheRead: 266933 })
+
+    const projects = await parseAllSessions(undefined, 'copilot')
+    const storeCalls = projects.flatMap(p => p.sessions).flatMap(s => s.turns)
+      .flatMap(t => t.assistantCalls).filter(c => c.deduplicationKey.startsWith('copilot-store:'))
+    expect(storeCalls).toHaveLength(2)
+    expect(new Set(storeCalls.map(c => c.deduplicationKey)).size).toBe(2)
+    // Both rows' prompt sides survive; only the labelled one contributes output.
+    expect(storeCalls.reduce((s, c) => s + c.usage.inputTokens, 0)).toBe((272139 - 267005) + 6272)
+    expect(totalOutput(projects)).toBe(3085)
   })
 })
 

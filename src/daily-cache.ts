@@ -6,7 +6,7 @@ import { join } from 'path'
 import { getCodeburnCacheDir } from './cache-dir.js'
 import type { DateRange, ProjectSummary } from './types.js'
 
-// Bumped to 21: copilot input/cache tokens for sessions covered by the CLI's
+// Bumped to 25: copilot input/cache tokens for sessions covered by the CLI's
 // session-store.db move from one shutdown-rollup lump (stamped at session end)
 // to per-request DB rows with real timestamps, supplementary accounting calls
 // (rollups, residuals, paired rows) stop counting as api/model calls, and
@@ -15,12 +15,16 @@ import type { DateRange, ProjectSummary } from './types.js'
 // costs all move, so days finalized under an earlier version would disagree
 // with the live parse.
 //
-// 20 is taken by #1040 (codex model attribution, now on main) and 18 was
-// burned by an earlier public head of THIS change under different accounting
-// (whole-session rollup suppression, no supplementary weight).
-// isMigratableCache/adoptOlderDailyCaches carry a same-or-newer version
-// forward as FINALIZED without re-deriving it, so a number can never mean two
-// accountings. 21 is the first free number.
+// Why 25 and not 21 (the number this change first claimed): 20 is #1040 (codex
+// model attribution), 18 was burned by an earlier public head of THIS change
+// under different accounting, and 21-24 landed on main while this branch was in
+// validation. 25 is the first free number on main's ladder — and it is load
+// bearing beyond the collision: the branch's own validators already hold
+// daily-cache.v21.json files whose copilot slices were carried stale by the
+// bug PENDING_REDERIVE_PROVIDERS fixes below, and only a number those files
+// cannot claim gets them re-derived. isMigratableCache/adoptOlderDailyCaches
+// carry a same-or-newer version forward as FINALIZED without re-deriving it,
+// so a number can never mean two accountings.
 // Bumped to 20: the Codex fast-path read a nested
 // `base_instructions.provenance.model` out of `session_meta` as if it were
 // `payload.model` (#1040), so every call a rollout attributed from session
@@ -125,8 +129,30 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 21
-const MIN_SUPPORTED_VERSION = 21
+export const DAILY_CACHE_VERSION = 25
+const MIN_SUPPORTED_VERSION = 25
+
+/// Providers whose per-day CALL COUNT means something different at
+/// DAILY_CACHE_VERSION 25 than it did before it. Copilot's supplementary
+/// accounting calls (rollups, residuals, store rows paired with a per-turn
+/// call) stopped counting as api calls here, so a settled day's re-derivation
+/// legitimately reports FEWER calls than the cache holds — which is exactly
+/// the shape `isPartialSurvival` reads as "the sources aged out" (see the
+/// TRADE-OFF note there, which called this case out in advance). Left
+/// unhandled the guard pins every store-era copilot slice to its pre-store
+/// value: measured on a real 17 -> 21 upgrade, `overview` served 2,980,804
+/// tokens for a day whose fresh derivation is 74,811,412, while
+/// `export`/`models`/`audit` (which never read this cache) served the
+/// corrected figures off the same machine.
+///
+/// The exemption is one-shot and provider-scoped, not a relaxation of the
+/// guard: `pendingRederive` is set only when a cache is migrated FROM a
+/// version below this one, it is spent by the first complete re-derivation,
+/// and it only ever fires where that re-derivation actually produced a slice
+/// for the (day, provider). A day whose copilot sources are gone yields no
+/// fresh slice at all, so it still carries forward whole — the #1033 bar is
+/// untouched, in both directions, and every other provider keeps the guard.
+const PENDING_REDERIVE_PROVIDERS: readonly string[] = ['copilot']
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including
@@ -226,6 +252,12 @@ export type DailyCache = {
   /// on caches written before this field: distrusted once (one healing
   /// pull-back), then stamped.
   watermarkTrusted?: boolean
+  /// Providers still owed the one re-derivation that a migration from a
+  /// pre-`DAILY_CACHE_VERSION` cache entitles them to, despite a shrinking
+  /// call count (see PENDING_REDERIVE_PROVIDERS). Set by the migration,
+  /// cleared by the first COMPLETE re-derive — persisted rather than computed
+  /// so a partial parse in between does not silently spend the entitlement.
+  pendingRederive?: string[]
 }
 
 /** IANA name of the current local timezone (respects the TZ env var). Days are
@@ -372,8 +404,21 @@ function migrateDays(days: Record<string, unknown>[]): DailyEntry[] {
     }))
 }
 
+/// The providers a cache at `fromVersion` still owes a re-derivation, carrying
+/// an unspent entitlement out of the parsed file so a same-version reload does
+/// not drop it.
+function pendingRederiveFor(fromVersion: number, parsed: unknown): string[] | undefined {
+  if (fromVersion < DAILY_CACHE_VERSION) return [...PENDING_REDERIVE_PROVIDERS]
+  const raw = (parsed as { pendingRederive?: unknown } | null)?.pendingRederive
+  if (!Array.isArray(raw)) return undefined
+  const kept = raw.filter((p): p is string => typeof p === 'string')
+  return kept.length > 0 ? kept : undefined
+}
+
 function migratedFrom(parsed: { version: number; lastComputedDate: string | null; savingsConfigHash?: string; tzKey?: string; days: Record<string, unknown>[]; complete?: boolean; watermarkTrusted?: boolean }): DailyCache {
+  const pendingRederive = pendingRederiveFor(parsed.version, parsed)
   return {
+    ...(pendingRederive ? { pendingRederive } : {}),
     version: DAILY_CACHE_VERSION,
     savingsConfigHash: parsed.savingsConfigHash ?? '',
     tzKey: parsed.tzKey,
@@ -486,6 +531,11 @@ async function adoptOlderDailyCaches(): Promise<DailyCache> {
     ...base,
     lastComputedDate,
     days,
+    // Anything adopted out of an OLDER file was derived under an older
+    // accounting, so the providers whose call counts changed meaning get their
+    // one guarded-shrink-exempt re-derivation (see PENDING_REDERIVE_PROVIDERS).
+    pendingRederive: base.pendingRederive
+      ?? (rest.some(c => c.parsed.version < DAILY_CACHE_VERSION) ? [...PENDING_REDERIVE_PROVIDERS] : undefined),
     // An untrusted base means nothing here was derived under the current
     // accounting: leave complete unset so the next hydration re-derives every
     // day whose sources survive (the merge keeps the rest).
@@ -994,6 +1044,13 @@ export function mergeDayEntries(
   /// leaves it off - both sides are cache generations there and the newer
   /// schema deliberately wins per (date, provider).
   guardPartialSurvival = false,
+  /// Providers whose baseline slices were recorded under an accounting where a
+  /// call meant something else, so a shrink is not evidence of source loss for
+  /// this one re-derivation (see PENDING_REDERIVE_PROVIDERS). Only consulted
+  /// where the fresh parse actually produced a slice for the (date, provider);
+  /// a slice it could not produce at all is carried by the branch above,
+  /// exactly as before.
+  pendingRederive?: ReadonlySet<string>,
 ): DailyEntry[] {
   const byDate = new Map<string, DailyEntry>()
   const settleCutoff = settleCutoffDate(new Date())
@@ -1039,7 +1096,7 @@ export function mergeDayEntries(
         }
       }
       if (existingSlice && hasSliceData(existingSlice) && !residual) {
-        if (!guardPartialSurvival || !isPartialSurvival(day.date, slice, existingSlice, settleCutoff)) continue
+        if (!guardPartialSurvival || pendingRederive?.has(provider) || !isPartialSurvival(day.date, slice, existingSlice, settleCutoff)) continue
         // The baseline holds more evidence than the sources can still produce:
         // swap the fresh slice back out for it (inverse of addSliceIntoDay, so
         // the day's totals and nested maps stay reconciled with its slices).
@@ -1206,13 +1263,18 @@ export async function ensureCacheHydrated(
         const wideProjects = await parseSessions({ start: backfillStart, end: now })
         tzSubtraction = buildTzSubtraction(aggregateDaysInTz(wideProjects, c.tzKey))
       }
+      const pendingRederive = c.pendingRederive?.length ? new Set(c.pendingRederive) : undefined
       const merged = parseWasComplete
-        ? mergeDayEntries(freshDays, baseline, true, tzSubtraction, true)
+        ? mergeDayEntries(freshDays, baseline, true, tzSubtraction, true, pendingRederive)
         : mergeDayEntries(baseline, freshDays, false)
       c = {
         version: DAILY_CACHE_VERSION,
         savingsConfigHash,
         tzKey,
+        // Spent: this re-derivation was the one the migration owed those
+        // providers. A PARTIAL parse never got to use it (its fresh data only
+        // filled gaps), so the entitlement is kept for the next complete run.
+        ...(parseWasComplete || !c.pendingRederive ? {} : { pendingRederive: c.pendingRederive }),
         // The watermark records how far history has actually been derived, so
         // only a COMPLETE parse may advance it. A partial one produced no data
         // for whatever it could not read; moving the watermark to yesterday
