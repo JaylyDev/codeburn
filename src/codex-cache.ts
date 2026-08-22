@@ -34,7 +34,13 @@ import type { ParsedProviderCall } from './providers/types.js'
 // re-parse. Not 12: v12 is claimed by feat/core-extraction's own port of this
 // throughput feature (PR #1086), so reusing it would let two incompatible
 // schemas share a filename.
-export const CODEX_CACHE_VERSION = 13
+// v14: MCP + Skill attribution for the shapes the classic `function_call` path
+// never reached (#478) - the `exec` custom tool's `input` program and the item
+// model's `item_completed`/`CommandExecution` item - plus SKILL.md reads landing
+// in `skills`. This file stores each call's `tools`/`toolSequence`/`skills`
+// verbatim (they are passed through on read, never re-derived), so v13 entries
+// keep the old, MCP- and skill-less attribution until they re-parse.
+export const CODEX_CACHE_VERSION = 14
 export const CODEX_LEGACY_CACHE_FILE = 'codex-results.json'
 export function codexCacheFileName(version = CODEX_CACHE_VERSION): string {
   return `codex-results.v${version}.json`
