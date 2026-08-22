@@ -569,12 +569,18 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   const requestedClaudeConfigSourceId = opts.claudeConfigSourceId?.trim() || null
   const isClaudeConfigScoped = requestedClaudeConfigSourceId !== null
 
+  // Captured synchronously right after whichever branch's primary parse resolves —
+  // the ONLY safe read point for the module-level hydration global. Re-reading the
+  // global later would race against this function's own history-block re-parse and
+  // against concurrent requests (web-dashboard SWR, parallel MCP calls).
+  let hydrationComplete: boolean | undefined
   let effectivelyScoped = false
   if (isClaudeConfigScoped) {
     // A config source scopes Claude usage only, so scan just Claude (main.ts
     // rejects a contradictory non-Claude --provider). This also avoids parsing
     // every other provider's corpus on each scoped refresh.
     const rawProjects = fp(await parseAllSessions(periodInfo.range, 'claude'))
+    hydrationComplete = isSessionHydrationComplete()
     const fullProjects = daysSelection ? filterProjectsByDays(rawProjects, daysSelection.days) : rawProjects
     claudeConfigs = await claudeConfigSelector(fullProjects, requestedClaudeConfigSourceId)
     const selectedSourceId = claudeConfigs?.selectedId ?? null
@@ -601,6 +607,7 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
       exclude: opts.exclude,
       daysSelection,
     })
+    hydrationComplete = isSessionHydrationComplete()
     currentData = durable.data
     scanProjects = durable.liveProjects
     scanRange = durable.scanRange
@@ -944,5 +951,5 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   const optimize = opts.optimize === false ? null : await scanAndDetect(scanProjects, scanRange, opts.provider)
   const granularRange = opts.daysSelection?.range ?? scanRange
   const granularHistory = opts.timeline === false ? undefined : buildGranularHistory(scanProjects, granularRange)
-  return buildMenubarPayload(currentData, providers, optimize, dailyHistory, retryTax, routingWaste, breakdowns, claudeConfigs, granularHistory, isSessionHydrationComplete() ? undefined : true)
+  return buildMenubarPayload(currentData, providers, optimize, dailyHistory, retryTax, routingWaste, breakdowns, claudeConfigs, granularHistory, hydrationComplete === false ? true : undefined)
 }
