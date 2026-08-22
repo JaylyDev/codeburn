@@ -10,11 +10,13 @@ import {
   type DailyEntry,
 } from '../src/daily-cache.js'
 
-// The last SHIPPED daily-cache version before the Codex session_meta model fix,
-// so this models the real 19 -> 20 upgrade path users hit. Anything below
-// MIN_SUPPORTED_VERSION is untrusted, which is what makes the re-derivation
-// global rather than scoped to the provider the bump exists for.
-const PRE_FIX_DAILY_VERSION = 19
+// One below the current version, so this pins the ADJACENT-version case: v20
+// is the SHIPPED predecessor (#1040, codex model attribution), and its days
+// must be re-derived rather than adopted as finalized under a number that now
+// means different accounting. Anything below MIN_SUPPORTED_VERSION is
+// untrusted, which is what makes the re-derivation global rather than
+// provider-scoped.
+const PRE_FIX_DAILY_VERSION = 20
 const cacheRoot = join(tmpdir(), `codeburn-daily-rederive-${process.pid}-${Date.now()}`)
 
 function day(date: string, cost: number): DailyEntry {
@@ -71,7 +73,7 @@ afterEach(async () => {
 // daily cache has no per-provider invalidation. Which provider the seeded day
 // belongs to is incidental; the mechanism under test is version-wide.
 describe('daily-cache re-derivation on a DAILY_CACHE_VERSION bump', () => {
-  it('re-derives a day from a below-minimum v17 cache while preserving the old file', async () => {
+  it('re-derives a day from a below-minimum v20 cache while preserving the old file', async () => {
     const date = toDateString(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000))
     const yesterday = toDateString(new Date(Date.now() - 24 * 60 * 60 * 1000))
     const oldPath = join(cacheRoot, `daily-cache.v${PRE_FIX_DAILY_VERSION}.json`)

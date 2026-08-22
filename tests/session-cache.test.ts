@@ -22,6 +22,7 @@ import {
   reconcileFile,
   saveCache,
   sessionCacheDir,
+  sourcePathStatCandidates,
 } from '../src/session-cache.js'
 import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 
@@ -910,5 +911,68 @@ describe('loadCache memo', () => {
     expect(third).toBe(external)
     expect(third).not.toBe(first)
     clearLoadCacheMemo()
+  })
+})
+
+describe('sourcePathStatCandidates', () => {
+  it('mirrors the fingerprint fallbacks: plain, #-suffixed, and :-suffixed paths', () => {
+    expect(sourcePathStatCandidates('/a/b/state.vscdb')).toEqual(['/a/b/state.vscdb'])
+    expect(sourcePathStatCandidates('/a/b/state.vscdb#cursor-ws=ws1'))
+      .toEqual(['/a/b/state.vscdb#cursor-ws=ws1', '/a/b/state.vscdb'])
+    expect(sourcePathStatCandidates('/a/b/db.sqlite:sess-1'))
+      .toEqual(['/a/b/db.sqlite:sess-1', '/a/b/db.sqlite'])
+    // A plain Windows path must NOT yield the bare drive letter — a stat
+    // error on a cwd-relative 'C' must never hold hydration.
+    expect(sourcePathStatCandidates('C:\\data\\gone.jsonl')).toEqual(['C:\\data\\gone.jsonl'])
+  })
+})
+
+// A scoped load must read DURABLE_PROVIDER_NAMES providers in full even when
+// the persisted section carries no durable stamp (a section written before
+// the stamp landed, or by an older codeburn): copilot's serve-time
+// reconciliation runs over the complete serve set, and a scope-skipped shard
+// would silently make it range-dependent.
+describe('scoped load durable-by-name exemption', () => {
+  it('loads an unstamped copilot section in full while scoping out a non-durable control', async () => {
+    const oldTurnTs = '2026-01-10T10:00:00.000Z'
+    const fileWithJanTurn = (): CachedFile => makeCachedFile({
+      turns: [{ ...makeTurn(), timestamp: oldTurnTs }],
+    })
+    await writeCacheOnDisk({
+      version: CACHE_VERSION,
+      complete: true,
+      providers: {
+        // Deliberately NO durable stamp on either section.
+        copilot: { envFingerprint: computeEnvFingerprint('copilot'), files: { '/x/session-store.db': fileWithJanTurn() } },
+        claude: { envFingerprint: computeEnvFingerprint('claude'), files: { '/x/old.jsonl': fileWithJanTurn() } },
+      },
+    })
+    const scoped = await loadCache({ fromMonth: '2026-06', toMonth: '2026-07' })
+    // The claude control proves the scope actually skipped the January shard;
+    // copilot's presence is then attributable only to the by-name exemption.
+    expect(scoped.providers['claude']?.files?.['/x/old.jsonl']).toBeUndefined()
+    expect(scoped.providers['copilot']?.files?.['/x/session-store.db']?.turns).toHaveLength(1)
+  })
+})
+
+// Capture-only copilot billing metadata must survive the sharded save/load
+// round trip — including the per-shard call validation, which would silently
+// drop the call if the optional-field checks and the fields ever disagree.
+describe('copilot billing metadata round trip', () => {
+  it('keeps nanoAiu and requestMultiplier through save and load', async () => {
+    const file = makeCachedFile()
+    file.turns[0]!.calls[0] = { ...file.turns[0]!.calls[0]!, nanoAiu: 24594000000, requestMultiplier: 15 }
+    const cache: SessionCache = {
+      version: CACHE_VERSION,
+      complete: false,
+      providers: { copilot: { envFingerprint: 'fp-1', durable: true, files: { '/home/u/.copilot/session-store.db': file } } },
+    }
+    await saveCache(cache)
+    // Through the DISK, not the write-through memo — the read path is where
+    // the per-shard call validator could strip unknown or mistyped fields.
+    const loaded = await readCacheOnDisk()
+    const call = loaded.providers['copilot']!.files['/home/u/.copilot/session-store.db']!.turns[0]!.calls[0]!
+    expect(call.nanoAiu).toBe(24594000000)
+    expect(call.requestMultiplier).toBe(15)
   })
 })

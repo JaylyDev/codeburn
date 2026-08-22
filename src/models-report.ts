@@ -1,6 +1,7 @@
 import chalk from 'chalk'
 import stripAnsi from 'strip-ansi'
 
+import { isBehavioralCall } from './behavioral-weight.js'
 import { codexCredits } from './codex-credits.js'
 import { formatCost, formatTokens } from './format.js'
 import { billableOutputTokens, fallbackRawModelDisplayName, getShortModelName, resolveCanonicalModelId, sanitizeModelForDisplay } from './models.js'
@@ -137,7 +138,9 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
           if (!bucket.savingsBaselineModel && call.savingsBaselineModel) {
             bucket.savingsBaselineModel = call.savingsBaselineModel
           }
-          bucket.calls += 1
+          // Supplementary accounting calls keep their tokens and cost above but are not
+          // distinct requests, so they add no call weight (see behavioral-weight.ts).
+          if (isBehavioralCall(call)) bucket.calls += 1
 
           const modelKey = `${provider} ${model}`
           let perCat = perModelCategoryCost.get(modelKey)

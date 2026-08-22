@@ -152,6 +152,12 @@ A: No. You run `codeburn sync push` when you want. A future version may offer op
 **Q: What if I push the same data twice?**
 A: Safe. A local sent-ledger tracks what's been sent. Re-pushing the same window doesn't create duplicates.
 
+**Q: Why is today's Copilot usage missing from my dashboard?**
+A: Copilot input/cache usage is reconciled locally between the per-request `session-store.db` rows and the `session.shutdown` rollups, and that reconciliation keeps changing while a session is live — a rollup residual shrinks as the rows covering it land, and a row that looked like a crash-only request becomes supplementary once its journal entry appears. The sent-ledger is append-once, so a value sent mid-reconciliation could never be corrected at the receiver. A Copilot session is therefore held back until it has been quiet for 24 hours, then pushed once, final. Nothing is dropped; `--dry-run` reports how many calls are held.
+
+**Q: Why didn't my old Copilot sessions resync with the new per-request breakdown?**
+A: On purpose. A Copilot session's input/cache can leave your machine in one of two shapes — as one `session.shutdown` **rollup** span per (session, model), or **reconciled** into one span per API request plus a residual for whatever the rows don't cover. They describe the same tokens, so the receiver must never hold both, and a usage span cannot be retracted once the append-once ledger has sent it. Whichever shape a session was first synced in, it stays in; the other is frozen for that session permanently. That runs in both directions: a session synced by a pre-store version keeps its rollup and never sends rows, and a session synced as rows never sends a rollup later — which matters because at the 90-day durable age-out the cached rows are pruned and the rollup starts serving again under a key that was never sent. Growth within the shape a session already uses is unaffected, and per-turn output spans are never frozen. `--dry-run` reports the frozen count. `codeburn sync reset --confirm` clears the local ledger and re-pushes everything under the new breakdown — only do that if the receiver's copy is cleared too, or you get exactly the doubling this avoids.
+
 **Q: What if I'm offline for a week?**
 A: Next push catches up. The default window is 7 days; use `--since 30d` or `--since all` (up to 6 months) for longer gaps. A push runs to completion regardless of size — server rate limits (429) are waited out automatically.
 

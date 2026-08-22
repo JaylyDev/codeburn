@@ -27,8 +27,12 @@ export type ModelCosts = {
 /// rather than a separate bucket to add on top. OpenAI bills reasoning as part
 /// of output (every codex `token_count` event satisfies input + output ==
 /// total), and Anthropic folds thinking into output the same way, so summing
-/// the two double-counts both the cost and the displayed output tokens.
-const REASONING_INCLUDED_IN_OUTPUT = new Set(['claude', 'codex'])
+/// the two double-counts both the cost and the displayed output tokens. Copilot
+/// is the same case: its per-request token_details_json prices input/cache/output
+/// and nothing else, and its supplementary store-row/shutdown calls carry
+/// reasoningTokens with outputTokens 0 while the per-turn assistant.message call
+/// bills the full output, so adding reasoning on top bills it twice.
+const REASONING_INCLUDED_IN_OUTPUT = new Set(['claude', 'codex', 'copilot'])
 
 /// Output tokens to bill and display for one call. Single source of truth so
 /// the pricing sites and the display sums can never disagree about whether a

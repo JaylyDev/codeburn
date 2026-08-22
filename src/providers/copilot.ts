@@ -40,6 +40,7 @@
 //   CODEBURN_COPILOT_WS_STORAGE_DIR — Override VS Code workspaceStorage
 //   CODEBURN_COPILOT_GLOBAL_STORAGE_DIR — Override VS Code globalStorage
 //   CODEBURN_COPILOT_JETBRAINS_DIR — Override the JetBrains github-copilot root
+//   CODEBURN_COPILOT_SESSION_STORE_DB — Override the ~/.copilot/session-store.db path
 //
 // ARCHITECTURE:
 //   discoverSessions() returns OTel sessions and legacy JSONL sessions. When
@@ -68,6 +69,7 @@ import { extractBashCommands } from '../bash-utils.js'
 import { estimateTokens } from '../context-tree.js'
 import type {
   Provider,
+  ProbeRoot,
   SessionSource,
   SessionParser,
   ParsedProviderCall,
@@ -214,6 +216,17 @@ type SessionShutdownData = {
   sessionStartTime?: number
 }
 
+// In-session compaction. The CLI emits compaction_start when it decides to
+// summarize and compaction_complete when the summarization call returns; only
+// the latter carries `success`, and only a successful one resets the
+// session.shutdown rollup counters. Every other field here is read
+// tolerantly - the payload also carries token counts, the summarization
+// call's own usage (compactionTokensUsed), messagesRemoved, model, requestId
+// and a manual/background `trigger`, none of which this parser needs.
+type SessionCompactionCompleteData = {
+  success?: boolean
+}
+
 type CopilotEvent =
   | { type: 'session.start'; data: SessionStartData; timestamp?: string }
   | { type: 'session.model_change'; data: ModelChangeData; timestamp?: string }
@@ -223,6 +236,8 @@ type CopilotEvent =
   | { type: 'subagent.started'; data: SubagentSelectedData; timestamp?: string }
   | { type: 'subagent.completed'; data: SubagentSelectedData; timestamp?: string }
   | { type: 'session.shutdown'; data: SessionShutdownData; timestamp?: string }
+  | { type: 'session.compaction_start'; data: Record<string, unknown>; timestamp?: string }
+  | { type: 'session.compaction_complete'; data: SessionCompactionCompleteData; timestamp?: string }
 
 type ChatJournalPathSegment = string | number
 type ChatSessionRequest = Record<string, unknown>
@@ -260,6 +275,10 @@ interface SpanAttributes {
 
 function getCopilotSessionStateDir(override?: string): string {
   return override ?? process.env['CODEBURN_COPILOT_SESSION_STATE_DIR'] ?? join(homedir(), '.copilot', 'session-state')
+}
+
+function getSessionStoreDbPath(override?: string): string {
+  return override ?? process.env['CODEBURN_COPILOT_SESSION_STORE_DB'] ?? join(homedir(), '.copilot', 'session-store.db')
 }
 
 /**
@@ -755,6 +774,11 @@ function createJsonlParser(
       // timestamp, which the date-range filters silently drop.
       let lastEventTimestamp = ''
 
+      // Stamp of the most recent SUCCESSFUL session.compaction_complete seen so
+      // far. Carried onto each shutdown leg because a compaction resets the
+      // rollup counters, so the leg only describes requests after this point.
+      let lastCompactionTs = ''
+
       // A resumed session appends one session.shutdown PER LEG, each carrying
       // CUMULATIVE per-model totals. Emitting each rollup whole would need the
       // cache to update a prior call in place — the durable merge is
@@ -785,6 +809,26 @@ function createJsonlParser(
           currentModel = (event.data as ModelChangeData).newModel ?? currentModel
           continue
         }
+
+        // In-session compaction RESETS the session.shutdown rollup counters,
+        // so a leg that contains one describes only its post-compaction
+        // requests. Carrying the compaction's stamp onto the leg lets the
+        // serve-time reconciliation start that leg's store-row interval here
+        // instead of at the previous leg, which is the difference between
+        // subtracting only the requests the rollup actually covers and
+        // subtracting the whole pre-compaction conversation from it.
+        // compaction_start is recognized but carries nothing we need: only a
+        // COMPLETE with success:true reset anything (a failed or abandoned
+        // compaction leaves the counters alone).
+        if (event.type === 'session.compaction_complete') {
+          const data = event.data as SessionCompactionCompleteData | undefined
+          const ts = typeof event.timestamp === 'string' ? event.timestamp : ''
+          if (data?.success === true && ts && !Number.isNaN(new Date(ts).getTime())) {
+            lastCompactionTs = ts
+          }
+          continue
+        }
+        if (event.type === 'session.compaction_start') continue
 
         if (event.type === 'subagent.selected') {
           selectedSubagentType = (event.data as SubagentSelectedData).agentName
@@ -838,6 +882,18 @@ function createJsonlParser(
           // (and its cost) is not double-counted. Combined with the per-turn
           // output cost, this yields the full, CLI-measured session cost.
           if (isTranscript) continue
+          // When session-store.db holds per-request usage rows for this
+          // session, those rows are authoritative for input/cache: written
+          // per request instead of only on clean shutdown, and they describe
+          // the SAME tokens this rollup lumps together. That precedence is
+          // enforced at SERVE time, not here: this rollup is always parsed
+          // and cached, and the reconciliation in parseProviderSources
+          // decides per (session, model) — store rows replace the rollup,
+          // with any usage the rollup carried beyond the rows' sum served as
+          // a residual (see reconcileCopilotCalls there). Read-time
+          // precedence over one coherent serve set cannot be raced by
+          // writers between a coverage probe and this parse, and a briefly
+          // unreadable store never blocks this file.
           const shutdownData = event.data as SessionShutdownData
           const modelMetrics = shutdownData.modelMetrics
           if (!isRecord(modelMetrics)) continue
@@ -848,6 +904,14 @@ function createJsonlParser(
           // those legs onto one date. lastEventTimestamp is the last stamped
           // event in this journal — distinct per leg when intervening events
           // are stamped, and still a real time when they are not.
+          //
+          // Fallback order matters for accounting, not just display: this
+          // stamp anchors the leg's interval in the serve-time reconciliation,
+          // which subtracts the store rows written up to it. A shutdown
+          // happens at the END of a leg, so the last event seen is the
+          // nearest true anchor; sessionStartTime is BEFORE every row, and
+          // anchoring there would leave the leg covering nothing and re-mint
+          // its whole usage as a residual beside the rows it duplicates.
           const shutdownTimestamp =
             (event.timestamp ?? '') || lastEventTimestamp || timestampToISO(shutdownData.sessionStartTime)
 
@@ -872,7 +936,14 @@ function createJsonlParser(
             // its counters (a fresh accounting epoch): delta from zero, else
             // this leg's post-reset usage would be clamped away entirely.
             // inputTokens is the monotonic sentinel — it is cache-inclusive,
-            // so any usage at all grows it.
+            // so any usage at all grows it. In-session COMPACTION is a
+            // confirmed reset trigger (CLI 1.0.78: a clean single-process
+            // 107-request session's sole rollup covered exactly its five
+            // post-compaction requests), so rollup-only accounting
+            // undercounts any compacted session — usage between the last
+            // pre-reset rollup and the reset is simply never written here.
+            // Only the per-request session-store rows record it; that is why
+            // they are authoritative for covered sessions.
             const prev =
               prevRaw && cumulative.inputTokens < numberOrZero(prevRaw.inputTokens)
                 ? undefined
@@ -925,6 +996,7 @@ function createJsonlParser(
               speed: 'standard' as const,
               deduplicationKey: dedupKey,
               userMessage: '',
+              ...(lastCompactionTs ? { compactedAt: lastCompactionTs } : {}),
             }
           }
           continue
@@ -1873,7 +1945,7 @@ function createOtelParser(
               outputTokens,
               cacheCreationTokens,
               cacheReadTokens,
-              0 // reasoningTokens — not exposed in current OTel schema
+              0 // webSearchRequests — not applicable to OTel spans
             )
 
             yield {
@@ -1907,6 +1979,318 @@ function createOtelParser(
 }
 
 // ---------------------------------------------------------------------------
+// Session-store SQLite parser — per-request usage rows from session-store.db
+// ---------------------------------------------------------------------------
+//
+// The Copilot CLI and the GitHub Copilot desktop app both write
+// ~/.copilot/session-store.db unconditionally. Its assistant_usage_events
+// table records one row per API request AS IT HAPPENS, where the
+// session.shutdown rollup in events.jsonl is written only on clean shutdown
+// (a crash loses the whole session's input/cache accounting) and lumps a
+// session leg into one per-model total. The DB rows are therefore
+// authoritative for input/cache tokens; the serve-time reconciliation in
+// parseProviderSources replaces the covered (session, model) rollup calls
+// with the rows plus a residual for anything the rollup carried beyond them.
+//
+// The emitted calls mirror the shutdown-call contract exactly: input/cache/
+// reasoning only, output 0 — per-turn output (and its tools/userMessage
+// metadata) stays owned by the events.jsonl assistant.message calls, so
+// emitting output here would double-count it. The ONE exception is the
+// `initiator='compaction'` row: that request is the CLI summarizing its own
+// context, it has no assistant.message anywhere in events.jsonl, and nothing
+// else in the journal carries its output — so leaving it at 0 simply loses
+// those tokens (measured: a matched 30-session corpus reconciled to the
+// store's own row totals within -3,085 tokens, exactly one compaction row's
+// output). It is counted here because here is the only place it exists.
+// The per-request billing
+// metadata (total_nano_aiu, request_multiplier) is captured onto the cached
+// calls but not priced or displayed — that design is upstream #890; the
+// throughput/latency columns are deliberately not read yet.
+
+// The one REQUIRED usage query, shared verbatim between the discovery probe
+// and the parser so the two can never diverge on schema: discovery runs it
+// LIMIT 1 (prepare validates every table and column it touches) before
+// emitting the source, so a store whose shape the parser cannot read is
+// classified absent — its sessions keep their shutdown rollups — instead of
+// surfacing a source that could only ever fail.
+const SESSION_STORE_USAGE_COLUMNS = `e.id, e.session_id, e.model,
+       e.input_tokens, e.cache_read_tokens, e.cache_write_tokens,
+       e.reasoning_tokens, e.created_at,
+       s.cwd, s.repository, s.created_at AS session_created_at`
+const SESSION_STORE_USAGE_FROM = `
+  FROM assistant_usage_events e
+  LEFT JOIN sessions s ON s.id = e.session_id`
+const SESSION_STORE_USAGE_SELECT = `SELECT ${SESSION_STORE_USAGE_COLUMNS}${SESSION_STORE_USAGE_FROM}`
+
+// OPTIONAL enrichment: the billing-metadata columns plus `initiator`, tried
+// first at parse time and never probed at discovery — older CLI stores predate
+// them, and requiring them would classify a perfectly readable store as
+// absent. A `no such column` failure falls back to the base select above, so
+// an old store parses identically, just without the enrichment.
+//
+// `initiator` names what caused the request. The one value that changes
+// accounting is 'compaction': that row is the CLI summarizing its own context,
+// not a user turn, so it has no assistant.message to pair with and it belongs
+// to the compaction that resets the shutdown rollup. It is optional in the
+// strongest sense — on a real 2,509-row store 1,504 rows carried NULL here
+// (the column exists, the CLI just did not always populate it), so every rule
+// below prefers the label when present and falls back to the timestamp
+// geometry when it is not.
+// Widest first, then narrower, then the discovery-validated base. Each step
+// drops the newest optional column, so a store that has the billing columns
+// but not `initiator` keeps its billing metadata instead of falling all the
+// way back — the columns arrived in different CLI releases and a single
+// all-or-nothing enrichment would lose the older one.
+//
+// `output_tokens` rides on the SAME rung as `initiator` deliberately: it is
+// only ever read for a row the label identifies as a compaction, so a store
+// too old to have the label has no use for it either and must not be pushed
+// down another fallback rung for it.
+const SESSION_STORE_USAGE_SELECTS = [
+  `SELECT ${SESSION_STORE_USAGE_COLUMNS},
+       e.total_nano_aiu, e.request_multiplier, e.initiator, e.output_tokens${SESSION_STORE_USAGE_FROM}`,
+  `SELECT ${SESSION_STORE_USAGE_COLUMNS},
+       e.total_nano_aiu, e.request_multiplier${SESSION_STORE_USAGE_FROM}`,
+  SESSION_STORE_USAGE_SELECT,
+]
+
+// Type alias, not interface: db.query's Row constraint needs the implicit
+// index signature only anonymous object types carry.
+type SessionStoreUsageRow = {
+  id: number
+  session_id: string
+  model: string
+  input_tokens: number | null
+  cache_read_tokens: number | null
+  cache_write_tokens: number | null
+  reasoning_tokens: number | null
+  created_at: string | null
+  cwd: string | null
+  repository: string | null
+  session_created_at: string | null
+  // Present only when the billing select succeeded (schema has the columns).
+  total_nano_aiu?: number | null
+  request_multiplier?: number | null
+  initiator?: string | null
+  output_tokens?: number | null
+}
+
+// FNV-1a 64-bit over the row's identifying content, base36. Collisions only
+// matter between two rows sharing the SAME session_id and row id — i.e. a
+// same-path DB reset that happens to reuse an id — where the content strings
+// differ; 64 bits keeps even adversarial token tuples from aliasing (32-bit
+// FNV collisions between plausible tuples are constructible).
+function fnv1a64(s: string): string {
+  let h = 0xcbf29ce484222325n
+  const prime = 0x100000001b3n
+  const mask = 0xffffffffffffffffn
+  for (let i = 0; i < s.length; i++) {
+    h ^= BigInt(s.charCodeAt(i))
+    h = (h * prime) & mask
+  }
+  return h.toString(36)
+}
+
+function createSessionStoreParser(
+  source: SessionStoreSessionSource,
+  seenKeys: Set<string>
+): SessionParser {
+  return {
+    async *parse(): AsyncGenerator<ParsedProviderCall> {
+      // Lazy-load the SQLite module (same pattern as the OTel source)
+      const { openDatabase, isSqliteBusyError } = await import('../sqlite.js')
+
+      // The open sits inside the same classify-and-defer boundary as the
+      // query: discovery validated this store moments ago, so a failure HERE
+      // (EACCES/CANTOPEN/EMFILE race) is transient-shaped — letting it
+      // propagate raw would cache a failed marker at the current fingerprint
+      // and zero the covered sessions until the file next changes.
+      let db: ReturnType<typeof openDatabase>
+      try {
+        db = openDatabase(source.path)
+      } catch (err) {
+        if (isSqliteBusyError(err)) throw err
+        throw Object.assign(
+          new Error('copilot session-store.db unreadable at open; deferring'),
+          { code: 'SQLITE_BUSY' }
+        )
+      }
+      try {
+        let rows: SessionStoreUsageRow[] | undefined
+        try {
+          for (const select of SESSION_STORE_USAGE_SELECTS) {
+            try {
+              rows = db.query<SessionStoreUsageRow>(`${select} ORDER BY e.id ASC`)
+              break
+            } catch (selectErr) {
+              // Only an OPTIONAL column may be missing (older store schema):
+              // step down to the next narrower select. The last entry is the
+              // discovery-validated base, so a `no such column` there is a
+              // real shape change and re-throws with everything else.
+              const msg = selectErr instanceof Error ? selectErr.message : String(selectErr)
+              if (!/no such column/i.test(msg) || select === SESSION_STORE_USAGE_SELECT) throw selectErr
+            }
+          }
+          if (!rows) throw new Error('copilot session-store.db: no usable select')
+        } catch (err) {
+          // Discovery prepare-validated this exact query moments ago, so any
+          // failure here means the store became unreadable or changed shape
+          // mid-run. Yielding nothing would cache an EMPTY success at this
+          // fingerprint while the covered sessions' rollups stay suppressed
+          // — a silent under-count that persists until the file changes.
+          // Every failure defers instead: parseProviderSources
+          // skips-and-retries on the busy shape without writing the cache.
+          if (isSqliteBusyError(err)) throw err
+          throw Object.assign(
+            new Error('copilot session-store.db unreadable mid-parse; deferring'),
+            { code: 'SQLITE_BUSY' }
+          )
+        }
+
+        // created_at defaults to SQLite's datetime('now') — UTC but
+        // timezone-less ('2026-08-07 17:56:38', or with fractional seconds
+        // under 'subsec'), which Date.parse reads as LOCAL time and would
+        // shift the request onto the wrong day. The CLI writes explicit
+        // ISO-Z strings (audited: every observed row), so this normalizes
+        // only the defensive zoneless shapes to UTC; anything carrying its
+        // own zone/offset passes through untouched.
+        const normalizeTimestamp = (raw: string | null): string =>
+          raw
+            ? timestampToISO(
+                /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(raw)
+                  ? raw.replace(' ', 'T') + 'Z'
+                  : raw
+              )
+            : ''
+        let prevTimestamp = ''
+
+        for (const row of rows) {
+          if (!row.session_id) continue
+
+          // A call with an empty timestamp is invisible to every date-range
+          // filter, so never emit one: fall back from the row's own
+          // created_at to the previous row's timestamp, then to the
+          // session's created_at. The previous row deliberately outranks the
+          // session's own created_at even across sessions — ids are GLOBALLY
+          // insertion-ordered, so the previous row is the nearest earlier
+          // clock reading, while a resumed session's created_at can be days
+          // stale. Both columns carry SQLite defaults, so an empty chain is
+          // unreachable outside a hand-built store; such a row is skipped,
+          // and if that desert covers a whole session its rollup simply
+          // stays unsuppressed at serve time.
+          const timestamp =
+            normalizeTimestamp(row.created_at) ||
+            prevTimestamp ||
+            normalizeTimestamp(row.session_created_at)
+          if (!timestamp) continue
+          prevTimestamp = timestamp
+          // TEXT NOT NULL still admits '': a billable row must NEVER be
+          // dropped for an unnameable model — its session's rollup was
+          // suppressed on the promise that every billable row is emitted
+          // (the coverage predicate does not know about models). Price as
+          // 'unknown' instead; the pricing engine reports unknown models at
+          // $0 with a fix-it hint rather than silently losing the tokens.
+          const model = row.model || 'unknown'
+
+          const cacheReadTokens = numberOrZero(row.cache_read_tokens)
+          const cacheWriteTokens = numberOrZero(row.cache_write_tokens)
+          const reasoningTokens = numberOrZero(row.reasoning_tokens)
+          // input_tokens is cache-INCLUSIVE (input + cache_read + cache_write),
+          // the same convention the shutdown rollup uses — confirmed against
+          // token_details_json, whose tokenType:"input" entries hold exactly
+          // this difference. calculateCost expects the uncached remainder with
+          // cache tokens billed separately, so subtract; clamp guards a future
+          // schema that reports input non-inclusively.
+          const inputTokens = Math.max(
+            0,
+            numberOrZero(row.input_tokens) - cacheReadTokens - cacheWriteTokens
+          )
+
+          // A compaction row's output has no assistant.message to own it, so
+          // this row is the only place it can be counted. Every other row's
+          // output IS owned by a per-turn call and stays excluded here.
+          const outputTokens = row.initiator === 'compaction' ? numberOrZero(row.output_tokens) : 0
+
+          // Nothing this call would add over the per-turn events, so skip it to
+          // avoid an empty $0 row.
+          if (inputTokens === 0 && cacheReadTokens === 0 && cacheWriteTokens === 0 && reasoningTokens === 0 && outputTokens === 0) continue
+
+          // `id` is AUTOINCREMENT: stable across re-parses and never reused
+          // WITHIN one database lifetime — but recreating the DB at the same
+          // path restarts the sequence, and a bare `<sid>:<id>` key would then
+          // make the durable union swallow the new row as "already cached"
+          // while its usage differs. A content discriminator (raw created_at
+          // + token counts + model) makes a genuinely different request under
+          // a reused id a NEW key; a byte-identical re-insert (backup restore,
+          // VACUUM INTO) still collapses to the same key.
+          const dedupKey = `copilot-store:${row.session_id}:${row.id}:${fnv1a64(
+            `${row.created_at ?? ''}|${row.input_tokens ?? ''}|${row.cache_read_tokens ?? ''}|${row.cache_write_tokens ?? ''}|${row.reasoning_tokens ?? ''}|${row.model}`
+          )}`
+          if (seenKeys.has(dedupKey)) continue
+          seenKeys.add(dedupKey)
+
+          // One DB spans every project, so the project must ride each call
+          // (the per-source fallback would lump them all together). Prefer
+          // the label discovery derived from the session's own session-state
+          // dir (workspace.yaml cwd — the same one its per-turn output calls
+          // carry, so the session never splits across two projects); the
+          // store's sessions.cwd/repository names only sessions with no
+          // session-state dir on this machine.
+          const project =
+            source.projectsBySessionId?.get(row.session_id) ??
+            (row.cwd
+              ? basename(row.cwd)
+              : row.repository
+                ? basename(row.repository.replace(/\.git$/, ''))
+                : row.session_id)
+
+          // Tokens are real per-request counts written by the CLI, so this
+          // cost is measured, not char-estimated. reasoning_tokens rides as
+          // metadata only, never as a cost line: it is a SUBSET of the row's
+          // output_tokens (the row's own token_details_json prices exactly
+          // input/cache_read/cache_write/output, no reasoning entry), and
+          // output — reasoning included — is billed by the per-turn
+          // assistant.message call. Pricing reasoning here would double-count.
+          // `outputTokens` is non-zero only for the compaction row, whose
+          // output no per-turn call bills, so it is priced exactly once.
+          const costUSD = calculateCost(model, inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens, 0)
+
+          yield {
+            provider: 'copilot',
+            sessionId: row.session_id,
+            project,
+            model,
+            inputTokens,
+            outputTokens,
+            cacheCreationInputTokens: cacheWriteTokens,
+            cacheReadInputTokens: cacheReadTokens,
+            cachedInputTokens: 0,
+            reasoningTokens,
+            webSearchRequests: 0,
+            costUSD,
+            costIsEstimated: false,
+            tools: [],
+            bashCommands: [],
+            timestamp,
+            speed: 'standard' as const,
+            deduplicationKey: dedupKey,
+            userMessage: '',
+            // Billing metadata rides as capture-only fields (deliberately
+            // OUTSIDE the dedup-key content hash: it identifies a charge, not
+            // the request). Omitted when the schema predates the columns.
+            ...(typeof row.total_nano_aiu === 'number' ? { nanoAiu: row.total_nano_aiu } : {}),
+            ...(typeof row.request_multiplier === 'number' ? { requestMultiplier: row.request_multiplier } : {}),
+            ...(row.initiator ? { initiator: row.initiator } : {}),
+          }
+        }
+      } finally {
+        db.close()
+      }
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Extended SessionSource for OTel sessions
 // ---------------------------------------------------------------------------
 
@@ -1917,6 +2301,19 @@ interface OTelSessionSource extends SessionSource {
 
 interface JsonlSessionSource extends SessionSource {
   sourceType: 'jsonl'
+}
+
+// The Copilot CLI / GitHub desktop-app session store (~/.copilot/session-store.db).
+// One source per DB file; the parser iterates every session's usage rows in a
+// single DB open, mirroring the OTel source.
+interface SessionStoreSessionSource extends SessionSource {
+  sourceType: 'session-store'
+  // sessionId → project label derived from the session-state dirs
+  // (workspace.yaml cwd), attached at discovery. The store's own
+  // sessions.cwd can lag or miss what the session actually ran in, and the
+  // per-turn output calls already carry the jsonl-derived label — using the
+  // same one keeps a session's store rows and output calls in one session.
+  projectsBySessionId?: Map<string, string>
 }
 
 // A VS Code workspaceStorage transcript. Distinct from 'jsonl' (CLI
@@ -1964,6 +2361,10 @@ function isJetBrainsSource(source: SessionSource): source is JetBrainsSessionSou
 
 function isTranscriptSource(source: SessionSource): source is TranscriptSessionSource {
   return (source as TranscriptSessionSource).sourceType === 'transcript'
+}
+
+function isSessionStoreSource(source: SessionSource): source is SessionStoreSessionSource {
+  return (source as SessionStoreSessionSource).sourceType === 'session-store'
 }
 
 // ---------------------------------------------------------------------------
@@ -2025,6 +2426,69 @@ async function discoverOtelSessions(
     return []
   }
   return [{ path: dbPath, project: 'copilot-chat', provider: 'copilot', sourceType: 'otel' }]
+}
+
+// ---------------------------------------------------------------------------
+// Session discovery: session-store SQLite
+// ---------------------------------------------------------------------------
+
+/**
+ * Probe session-store.db. This decides only whether a store SOURCE exists;
+ * which sessions it covers is decided at serve time from what its parse
+ * actually cached (see reconcileCopilotCalls in parseProviderSources), so
+ * nothing a writer does between this probe and the parse can change
+ * accounting.
+ *
+ * Permanent absence — no file, no sqlite driver, or a schema the parser's
+ * own query cannot prepare against ("no such table": CLI builds before the
+ * store existed; "no such column": a future migration) — returns null: no
+ * source, no suppression, and the shutdown-rollup path carries the sessions
+ * exactly as before.
+ *
+ * EVERY other failure still emits the source. Measured against the real
+ * driver (node:sqlite, WAL store): a write lock never blocks readers and a
+ * hot -wal without its -shm reads fine, so the reachable failures here are
+ * corruption-class — SQLITE_CORRUPT (11), SQLITE_NOTADB (26, e.g. mid
+ * atomic-replace), SQLITE_CANTOPEN (14, deleted after the stat) — plus the
+ * classic busy/locked pair and stat-level EACCES/EIO. None of those prove
+ * the store is gone, so the path must stay discovered: the parse raises the
+ * busy shape parseProviderSources skips-and-retries, previously cached rows
+ * keep serving, and serve-time suppression keeps holding from the cache
+ * instead of flapping the covered sessions' rollups back in.
+ */
+async function discoverSessionStoreSource(
+  dbPath: string
+): Promise<SessionStoreSessionSource | null> {
+  const source: SessionStoreSessionSource = {
+    path: dbPath,
+    project: 'copilot',
+    provider: 'copilot',
+    sourceType: 'session-store',
+    // The store IS the durable record: while it sits on disk, its cached rows
+    // must never age out (crash-only rows have no rollup to fall back to).
+    // Journal-style sources keep the ordinary durable age-out.
+    retainWhilePresent: true,
+  }
+  try {
+    await stat(dbPath)
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    return code === 'ENOENT' || code === 'ENOTDIR' ? null : source
+  }
+  const { openDatabase, isSqliteAvailable } = await import('../sqlite.js')
+  if (!isSqliteAvailable()) return null
+  try {
+    const db = openDatabase(dbPath)
+    try {
+      db.query(`${SESSION_STORE_USAGE_SELECT} LIMIT 1`)
+    } finally {
+      db.close()
+    }
+    return source
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    return /no such (table|column)/i.test(message) ? null : source
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2380,7 +2844,8 @@ export function createCopilotProvider(
   sessionStateDir?: string,
   workspaceStorageDir?: string,
   globalStorageDir?: string,
-  jetbrainsDir?: string
+  jetbrainsDir?: string,
+  sessionStoreDb?: string
 ): Provider {
   // jsonlDir is resolved lazily inside discoverSessions so that env-var
   // overrides set after module load (e.g. in tests) are respected.
@@ -2410,6 +2875,28 @@ export function createCopilotProvider(
     name: 'copilot',
     displayName: 'Copilot',
     durableSources: true,
+
+    // Every directory discovery scans, resolved the same way. Besides the
+    // doctor, a resident process's root watchers are built from these — a
+    // provider without them is silently invisible to the validated-reuse
+    // "clean" verdict, which would let a memoized complete parse outlive a
+    // store append + lock that a fresh parse would have deferred on. The
+    // store DB contributes its PARENT directory, not the file: SQLite appends
+    // land in -wal/-shm siblings a file watch would miss.
+    async probeRoots(): Promise<ProbeRoot[]> {
+      const roots = new Map<string, ProbeRoot>()
+      const add = (path: string | null, label: string): void => {
+        if (path && !roots.has(path)) roots.set(path, { path, label })
+      }
+      add(dirname(getSessionStoreDbPath(sessionStoreDb)), 'session store')
+      add(getCopilotSessionStateDir(sessionStateDir), 'CLI session state')
+      for (const dir of getWsDirs()) add(dir, 'VS Code workspaceStorage')
+      for (const dir of getGlobalDirs()) add(dir, 'VS Code globalStorage')
+      add(getJetBrainsCopilotRoot(jetbrainsDir), 'JetBrains')
+      const otelDb = getAgentTracesDbPath()
+      if (otelDb) add(dirname(otelDb), 'OTel agent traces')
+      return [...roots.values()]
+    },
 
     modelDisplayName(model: string): string {
       for (const [key, display] of modelDisplayEntries) {
@@ -2441,10 +2928,41 @@ export function createCopilotProvider(
         }
       }
 
+      // 1b. Discover the CLI / GitHub desktop-app session store. Written per
+      // API request (crash-proof) where the events.jsonl shutdown rollup
+      // exists only after a clean exit, so its rows are authoritative for
+      // input/cache tokens; the serve-time reconciliation
+      // (reconcileCopilotCalls in parseProviderSources) replaces the covered
+      // (session, model) rollups with the served rows plus a residual. True
+      // absence (older CLI schema, no sqlite driver) leaves the rollup path
+      // untouched; an unreadable store still surfaces the source so its
+      // parse defers and cached rows keep serving (see
+      // discoverSessionStoreSource).
+      let storeSource: SessionStoreSessionSource | null = null
+      try {
+        storeSource = await discoverSessionStoreSource(getSessionStoreDbPath(sessionStoreDb))
+      } catch {
+        // Unreachable in practice (the probe catches its own errors): a
+        // throw here means the sqlite module itself is unusable, and
+        // rollup-only accounting is then the correct mode — the same
+        // fallback as a missing driver.
+        storeSource = null
+      }
+      if (storeSource) sources.push(storeSource)
+
       // 2. Discover JSONL sessions (fallback — output tokens only)
       try {
         const jsonlDir = getCopilotSessionStateDir(sessionStateDir)
         const jsonlSources = await discoverJsonlSessions(jsonlDir)
+        if (storeSource) {
+          // Same sessionId derivation as createJsonlParser: the CLI keys
+          // session-state dirs and session-store rows by the same id, so the
+          // store parser can attribute each session's rows to the same
+          // project its per-turn output calls carry.
+          storeSource.projectsBySessionId = new Map(
+            jsonlSources.map(src => [basename(dirname(src.path)), src.project])
+          )
+        }
         sources.push(...jsonlSources)
       } catch {
         // JSONL discovery failed
@@ -2503,6 +3021,9 @@ export function createCopilotProvider(
       // the matching assistant.message (and vice versa).
       if (isOtelSource(source)) {
         return createOtelParser(source, seenKeys)
+      }
+      if (isSessionStoreSource(source)) {
+        return createSessionStoreParser(source, seenKeys)
       }
       if (isChatSessionSource(source)) {
         return createChatSessionParser(source, seenKeys)

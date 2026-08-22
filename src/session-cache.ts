@@ -54,6 +54,17 @@ export type CachedCall = {
   activeDurationMs?: number
   activeGeneratedTokens?: number
   toolWaitMs?: number
+  // Copilot session-store billing metadata (capture-only; no report consumes
+  // these yet — see ParsedProviderCall). Omitted when the store's schema
+  // predates the columns.
+  nanoAiu?: number
+  requestMultiplier?: number
+  // Copilot shutdown rollups only: stamp of the last successful in-session
+  // compaction before this leg. See ParsedProviderCall.compactedAt.
+  compactedAt?: string
+  // Copilot session-store rows only: the store's `initiator` label when
+  // present. See ParsedProviderCall.initiator.
+  initiator?: string
 }
 
 export type CachedTurn = {
@@ -207,6 +218,15 @@ const UNREFERENCED_SHARD_MAX_AGE_MS = 60 * 60 * 1000
 // that only the cache still holds (see DURABLE_PROVIDER_NAMES below). Do not
 // "complete" the map for copilot until the durable carry-forward learns to
 // merge instead of drop.
+//
+// CODEBURN_COPILOT_SESSION_STORE_DB is covered by that ruling too, and needs
+// no exception: repointing it cannot serve stale data. Copilot's
+// rollup-vs-store reconciliation runs at SERVE time over the cached serve set
+// (parseProviderSources), never against a discovery-time snapshot, so a
+// repointed path is simply a new source parsed on sight while the old path's
+// cached rows persist as durable orphans contributing exactly what they
+// always did. There is no cross-file dependency for the fingerprint to catch,
+// so declaring it would buy nothing and cost the durable-history loss above.
 export const PROVIDER_ENV_VARS: Record<string, string[]> = {
   claude: ['CLAUDE_CONFIG_DIRS', 'CLAUDE_CONFIG_DIR', 'CODEBURN_DESKTOP_SESSIONS_DIR', 'APPDATA', 'LOCALAPPDATA'],
   'cline-cli': ['CLINE_SESSION_DATA_DIR', 'CLINE_DATA_DIR', 'CLINE_DIR'],
@@ -303,12 +323,24 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // source-provenance-v1 (#944): CLI sessions were misread as VS Code
   // transcripts (both carry producer 'copilot-agent'), skipping the shutdown
   // input/cache rollup; this bump re-parses them so the missing tokens land.
-  // #1051 does NOT bump this again. A fingerprint change drops every present
+  // #1051 did NOT bump this on its own. A fingerprint change drops every present
   // Copilot source (parser.ts getOrCreateProviderSection) and would erase
   // conversations already pruned from a still-present OTel DB. Old `:n`
   // shutdown keys migrate via cachedFileNeedsProviderReparse + a durable
   // strip of legacy shutdown calls on that JSONL file only.
-  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1',
+  // session-store-v2: input/cache for sessions covered by session-store.db
+  // moved from shutdown-rollup calls to per-request DB rows. This bump
+  // re-parses pre-store caches so the DB rows land; the rollup calls stay
+  // cached (the durable union merge never deletes) and the serve-time
+  // reconciliation in parseProviderSources decides per (session, model) what
+  // they still contribute. v2 (over the never-released v1): store dedup keys
+  // grew a content discriminator so a same-path DB reset cannot alias rows.
+  // v3: the `initiator='compaction'` row now carries its own output tokens (no
+  // assistant.message owns them). The dedup key deliberately did NOT change -
+  // it identifies the request, and moving it would leave the cached output-0
+  // copy beside the new row - so only this bump re-parses a v2 cache into the
+  // corrected shape.
+  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1-session-store-v3',
   // authoritative-usage-v4: persist one Grok session call from top-level
   // authoritative totals, use modelUsage only for priced attribution, clamp
   // reasoning per record, and label mixed sessions estimated.
@@ -564,6 +596,10 @@ function validateCall(c: unknown): c is CachedCall {
     && isOptionalNum(o['activeDurationMs'])
     && isOptionalNum(o['activeGeneratedTokens'])
     && isOptionalNum(o['toolWaitMs'])
+    && isOptionalNum(o['nanoAiu'])
+    && isOptionalNum(o['requestMultiplier'])
+    && isOptionalString(o['compactedAt'])
+    && isOptionalString(o['initiator'])
     && isStringArray(o['tools'])
     && isStringArray(o['bashCommands'])
     && isStringArray(o['skills'])
@@ -847,7 +883,12 @@ export async function loadCache(scope?: CacheLoadScope): Promise<SessionCache> {
     // belong to, and what stops the reconcile from re-parsing under a
     // fingerprint the envelope already agrees with.
     cache.providers[provider] = section
-    const full = !scope || meta.durable === true || meta.envFingerprint !== computeEnvFingerprint(provider)
+    // Durable providers are ALWAYS loaded in full, by name as well as by the
+    // envelope flag: copilot's serve-time reconciliation pairs store rows and
+    // retires residuals over the complete cached serve set, so a scoped load
+    // of a copilot section persisted before the durable stamp landed would
+    // make pairing range-dependent. The name check closes that window.
+    const full = !scope || meta.durable === true || DURABLE_PROVIDER_NAMES.has(provider) || meta.envFingerprint !== computeEnvFingerprint(provider)
     const loaded: Set<string> | null = full ? null : new Set()
     // Shards are read concurrently but merged in envelope order, so the result
     // never depends on which read finished first. A path that somehow ended up
@@ -1355,6 +1396,28 @@ export async function fingerprintFile(filePath: string): Promise<FileFingerprint
     }
     return null
   }
+}
+
+// The on-disk paths a source path may resolve to, mirroring fingerprintFile's
+// virtual-suffix fallbacks above. A caller that got a null fingerprint and
+// must distinguish "gone" (every candidate ENOENT) from "present but
+// unreadable" (any candidate erroring some other way — data may be changing
+// behind the failure) has to check the same underlying paths the fingerprint
+// would have read, or a compound path's guaranteed ENOENT masks the real
+// file's EACCES.
+export function sourcePathStatCandidates(filePath: string): string[] {
+  const candidates = [filePath]
+  const hashIdx = filePath.indexOf('#')
+  if (hashIdx > 0) candidates.push(filePath.slice(0, hashIdx))
+  const colonIdx = filePath.lastIndexOf(':')
+  if (colonIdx > 0) {
+    // Only a prefix that still looks like a path is a candidate: a plain
+    // Windows path (`C:\...`) would otherwise yield the bare drive letter,
+    // and a stat error on that cwd-relative name must never hold hydration.
+    const prefix = filePath.slice(0, colonIdx)
+    if (prefix.includes('/') || prefix.includes('\\')) candidates.push(prefix)
+  }
+  return candidates
 }
 
 // ── Reconciliation ─────────────────────────────────────────────────────
