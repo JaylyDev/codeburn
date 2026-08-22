@@ -79,6 +79,7 @@ describe('cursor-agent provider', () => {
 
     expect(provider.modelDisplayName('claude-5-future-model')).toBe('claude-5-future-model (est.)')
     expect(provider.modelDisplayName('gpt-9')).toBe('gpt-9 (est.)')
+    expect(provider.modelDisplayName('gpt-5.6-sol')).toBe('GPT-5.6 Sol (est.)')
   })
 
   it('returns identity for tool display name', () => {

@@ -7,6 +7,7 @@ import {
   findUnpricedModels,
   getModelCosts,
   getShortModelName,
+  resolveCanonicalModelId,
   calculateCost,
   loadPricing,
   setModelAliases,
@@ -147,6 +148,22 @@ describe('getModelCosts', () => {
     setPriceOverrides({ 'glm-5.3': { input: 99, output: 99 } })
     expect(getModelCosts('cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(99 / 1_000_000)
     expect(getModelCosts('omniroute:cp/cline-pass/glm-5.3')!.outputCostPerToken).toBe(99 / 1_000_000)
+  })
+})
+
+describe('resolveCanonicalModelId', () => {
+  it('aliases, peels path-form ids, and leaves display-only collisions distinct', () => {
+    expect(resolveCanonicalModelId('k3')).toBe('kimi-k3')
+    expect(resolveCanonicalModelId('k3-agent')).toBe('kimi-k3')
+    expect(resolveCanonicalModelId('kimi-k3')).toBe('kimi-k3')
+    expect(resolveCanonicalModelId('accounts/fireworks/models/glm-5p2')).toBe('glm-5p2')
+    expect(resolveCanonicalModelId('glm-5p2')).toBe('glm-5p2')
+    expect(resolveCanonicalModelId('GLM-5.2')).toBe('glm-5p1')
+    expect(resolveCanonicalModelId('gpt-5-fast')).toBe('gpt-5')
+    expect(resolveCanonicalModelId('gpt-5-untracked-xyz')).toBe('gpt-5-untracked-xyz')
+    expect(resolveCanonicalModelId('claude-opus-4.6')).toBe('claude-opus-4-6')
+    expect(resolveCanonicalModelId('kimi-code')).toBe('kimi-k2-thinking')
+    expect(resolveCanonicalModelId('cline-pass/kimi-k3')).toBe('kimi-k3')
   })
 })
 

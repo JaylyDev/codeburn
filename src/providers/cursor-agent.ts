@@ -4,7 +4,7 @@ import { readdir, readFile, stat } from 'fs/promises'
 import { join, basename } from 'path'
 import { homedir } from 'os'
 
-import { calculateCost } from '../models.js'
+import { calculateCost, getShortModelName } from '../models.js'
 import { openDatabase, type SqliteDatabase } from '../sqlite.js'
 import { normalizeContentBlocks } from '../content-utils.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
@@ -506,7 +506,7 @@ export function createCursorAgentProvider(baseDirOverride?: string): Provider {
 
     modelDisplayName(model: string): string {
       if (model === 'cursor-agent-auto') return 'Cursor (auto)'
-      const label = modelDisplayNames[model] ?? model
+      const label = modelDisplayNames[model] ?? getShortModelName(model)
       return `${label} (est.)`
     },
 
