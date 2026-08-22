@@ -553,7 +553,7 @@ describe('buildAttributionOtlpPayload', () => {
     expect(sessionSpan.spanId).not.toBe(commitSpan.spanId)
 
     const sessionAttrs = attrMap(sessionSpan.attributes)
-    expect(sessionAttrs['ai.session_id']).toEqual({ stringValue: 'sess-1' })
+    expect(sessionAttrs['ai.session_id']).toBeUndefined()
     expect(sessionAttrs['ai.project']).toEqual({ stringValue: 'app' })
     expect(sessionAttrs['git.repo']).toEqual({ stringValue: 'github.com/acme/widget' })
     expect(sessionAttrs['git.commit_count']).toEqual({ intValue: '1' })
@@ -565,10 +565,22 @@ describe('buildAttributionOtlpPayload', () => {
     expect(sessionSpan.endTimeUnixNano).toBe((BigInt(new Date('2026-01-01T11:00:00.000Z').getTime()) * 1_000_000n).toString())
 
     const commitAttrs = attrMap(commitSpan.attributes)
+    expect(commitAttrs['ai.session_id']).toBeUndefined()
     expect(commitAttrs['git.sha']).toEqual({ stringValue: 'a'.repeat(40) })
     expect(commitAttrs['git.in_main']).toEqual({ boolValue: true })
     expect(commitAttrs['git.was_reverted']).toEqual({ boolValue: false })
     expect(commitAttrs['git.repo']).toEqual({ stringValue: 'github.com/acme/widget' })
+  })
+
+  it('keeps session identity off the wire; join is the shared traceId', () => {
+    const items = flattenAttributionRecords([makeRecord()])
+    const payload = buildAttributionOtlpPayload(items)
+    const spans = payload.resourceSpans[0]!.scopeSpans[0]!.spans
+    expect(spans.length).toBeGreaterThan(0)
+    for (const span of spans) {
+      expect(attrMap(span.attributes)['ai.session_id']).toBeUndefined()
+      expect(span.traceId).toBe(deriveTraceId('sess-1'))
+    }
   })
 
   it('omits git.repo when null and pr_links when empty', () => {

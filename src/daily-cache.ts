@@ -6,6 +6,15 @@ import { join } from 'path'
 import { getCodeburnCacheDir } from './cache-dir.js'
 import type { DateRange, ProjectSummary } from './types.js'
 
+// Bumped to 25: `codex-auto-review` now prices as the recommended GPT-5.5
+// row (#1047). Days already finalized under v24 keep that id at $0
+// forever unless MIN_SUPPORTED_VERSION moves: the daily cache has no
+// per-provider invalidation. The Codex parse version and CODEX_CACHE_VERSION
+// move with this so the lower caches reprice first; this pass then re-derives
+// ALL days from the warm session cache (seconds, not a full re-parse).
+// adoptOlderDailyCaches keeps the superseded file as the baseline. v21 is
+// #946, v22 was this PR's earlier claim, v23 is #1075, v24 is #1090.
+//
 // Bumped to 20: the Codex fast-path read a nested
 // `base_instructions.provenance.model` out of `session_meta` as if it were
 // `payload.model` (#1040), so every call a rollout attributed from session
@@ -110,8 +119,28 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 20
-const MIN_SUPPORTED_VERSION = 20
+// v23: codex pricing fix (#1075) - reasoning tokens were billed on top of
+// output (they are a subset of it) and cache_write_input_tokens was ignored, so
+// days finalized at v20 carry codex costs overstated by ~3.5% and codex output
+// tokens overstated by ~34.6%. Raising MIN_SUPPORTED_VERSION forces the
+// one-time re-derivation.
+// It takes 23, not 21: v21 is claimed by the #946 landing branch and v22 by
+// PR #1056, so those numbers are spoken for and reusing one would let two
+// incompatible schemas share a filename. (feat/core-extraction sits at 26 and
+// reconciles at its final merge by keeping the max.)
+//
+// v24: gpt-5.6-codex / gpt-5.6-codex-max pricing (#1077) - added as explicit
+// litellm-snapshot.json rows. getModelCosts already resolved both ids to the
+// correct rate via the `gpt-5.6` prefix fallback before this landed, so a day
+// finalized on any binary that had a `gpt-5.6` snapshot row already carries
+// the right cost; this bump only matters for a day finalized before THAT (a
+// window where neither existed). The daily cache has no per-provider
+// invalidation, so there is no way to tell those days apart from here -
+// raising MIN_SUPPORTED_VERSION forces the one-time re-derivation for
+// everyone, which is a lossless no-op for days already correct.
+// v25: #1047 activity-id pricing. v24 on main already shipped #1090.
+export const DAILY_CACHE_VERSION = 25
+const MIN_SUPPORTED_VERSION = 25
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including

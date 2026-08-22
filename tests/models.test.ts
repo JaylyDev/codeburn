@@ -7,6 +7,7 @@ import {
   findUnpricedModels,
   getModelCosts,
   getShortModelName,
+  resolveCanonicalModelId,
   calculateCost,
   loadPricing,
   setModelAliases,
@@ -24,6 +25,7 @@ import {
   unpricedModelHint,
 } from '../src/models.js'
 import { getDailyCacheConfigHash } from '../src/usage-aggregator.js'
+import snapshotData from '../src/data/litellm-snapshot.json' with { type: 'json' }
 
 beforeAll(async () => {
   await loadPricing()
@@ -89,6 +91,32 @@ describe('getModelCosts', () => {
     expect(getModelCosts('z-ai/glm-5.3')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
   })
 
+  it('prices gpt-5.6-codex and gpt-5.6-codex-max, sourced directly from the snapshot (#1077)', () => {
+    // Directly checks the bundled snapshot data (not just the resolved lookup),
+    // so this fails if the litellm-snapshot.json entries are ever reverted even
+    // though getModelCosts would still resolve both ids via the `gpt-5.6` prefix
+    // fallback - explicit rows are still correct and match every other Codex
+    // generation LiteLLM ships (gpt-5-codex, gpt-5.1-codex, gpt-5.1-codex-max,
+    // gpt-5.2-codex, gpt-5.3-codex all carry their base model's exact rate).
+    const snapshot = snapshotData as Record<string, unknown>
+    expect(snapshot['gpt-5.6-codex']).toEqual(snapshot['gpt-5.6'])
+    expect(snapshot['gpt-5.6-codex-max']).toEqual(snapshot['gpt-5.6'])
+
+    const codex = getModelCosts('gpt-5.6-codex')
+    const codexMax = getModelCosts('gpt-5.6-codex-max')
+    expect(codex).not.toBeNull()
+    expect(codexMax).not.toBeNull()
+    expect(codex!.inputCostPerToken).toBe(5e-6)
+    expect(codex!.outputCostPerToken).toBe(3e-5)
+    expect(codex!.cacheWriteCostPerToken).toBe(6.25e-6)
+    expect(codex!.cacheReadCostPerToken).toBe(5e-7)
+    expect(codex!.cacheWriteCostIsExplicit).toBe(true)
+    expect(codexMax).toEqual(codex)
+
+    expect(calculateCost('gpt-5.6-codex', 1_000_000, 1_000_000, 0, 0, 0)).toBeGreaterThan(0)
+    expect(calculateCost('gpt-5.6-codex-max', 1_000_000, 1_000_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
   // A price override on a synthetic bare id can only be reached if the leading
   // segment was stripped, so these assert the namespace allowlist itself without
   // pinning to any real model's presence in (or absence from) the snapshot.
@@ -128,6 +156,22 @@ describe('getModelCosts', () => {
     setPriceOverrides({ 'glm-5.3': { input: 99, output: 99 } })
     expect(getModelCosts('cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(99 / 1_000_000)
     expect(getModelCosts('omniroute:cp/cline-pass/glm-5.3')!.outputCostPerToken).toBe(99 / 1_000_000)
+  })
+})
+
+describe('resolveCanonicalModelId', () => {
+  it('aliases, peels path-form ids, and leaves display-only collisions distinct', () => {
+    expect(resolveCanonicalModelId('k3')).toBe('kimi-k3')
+    expect(resolveCanonicalModelId('k3-agent')).toBe('kimi-k3')
+    expect(resolveCanonicalModelId('kimi-k3')).toBe('kimi-k3')
+    expect(resolveCanonicalModelId('accounts/fireworks/models/glm-5p2')).toBe('glm-5p2')
+    expect(resolveCanonicalModelId('glm-5p2')).toBe('glm-5p2')
+    expect(resolveCanonicalModelId('GLM-5.2')).toBe('glm-5p1')
+    expect(resolveCanonicalModelId('gpt-5-fast')).toBe('gpt-5')
+    expect(resolveCanonicalModelId('gpt-5-untracked-xyz')).toBe('gpt-5-untracked-xyz')
+    expect(resolveCanonicalModelId('claude-opus-4.6')).toBe('claude-opus-4-6')
+    expect(resolveCanonicalModelId('kimi-code')).toBe('kimi-k2-thinking')
+    expect(resolveCanonicalModelId('cline-pass/kimi-k3')).toBe('kimi-k3')
   })
 })
 
@@ -628,6 +672,8 @@ describe('Cursor model variants resolve to pricing', () => {
     ['claude-4.6-haiku', 'claude-haiku-4-5'],
     // Cursor auto proxy
     ['cursor-auto', 'claude-sonnet-4-5'],
+    // Codex activity surface (official rate card, observed raw id)
+    ['codex-auto-review', 'gpt-5.5'],
     // OpenAI variants Cursor emits
     ['gpt-5', 'gpt-5'],
     ['gpt-5-fast', 'gpt-5'],
@@ -660,6 +706,29 @@ describe('Cursor model variants resolve to pricing', () => {
   // independently of today's pricing coincidence.
   it('keeps claude-4-sonnet-thinking in the Sonnet 4 model family', () => {
     expect(getShortModelName('claude-4-sonnet-thinking')).toBe('Sonnet 4')
+  })
+})
+
+describe('Codex activity ids (#1047)', () => {
+  it('keeps the activity label instead of collapsing to the underlying model name', () => {
+    expect(getShortModelName('codex-auto-review')).toBe('Codex Auto Review')
+  })
+
+  it('prices as the exact bundled GPT-5.5 object, not an invented rate', () => {
+    expect(getModelCosts('codex-auto-review')).toBe(getModelCosts('gpt-5.5'))
+    const auto = calculateCost('codex-auto-review', 1_000_000, 1_000_000, 0, 0, 0)
+    const gpt55 = calculateCost('gpt-5.5', 1_000_000, 1_000_000, 0, 0, 0)
+    expect(auto).toBeGreaterThan(0)
+    expect(auto).toBe(gpt55)
+  })
+
+  it('does not invent a family or an unobserved sibling id', () => {
+    expect(getModelCosts('codex-code-review')).toBeNull()
+    expect(getModelCosts('codex-cloud-task')).toBeNull()
+    expect(getModelCosts('codex-automation')).toBeNull()
+    expect(getModelCosts('code-review')).toBeNull()
+    expect(getModelCosts('auto-review')).toBeNull()
+    expect(calculateCost('codex-code-review', 1_000_000, 1_000_000, 0, 0, 0)).toBe(0)
   })
 })
 
@@ -772,6 +841,7 @@ describe('DeepSeek v4 models resolve to pricing', () => {
       process.env['CODEBURN_CACHE_DIR'] = cacheRoot
       await mkdir(cacheRoot, { recursive: true })
       await writeFile(join(cacheRoot, 'litellm-pricing.json'), JSON.stringify({
+        version: 2, // must match models.ts's CACHE_SCHEMA_VERSION or the cache is treated as a miss
         timestamp: Date.now(),
         data: {
           'gpt-4o-mini': {
@@ -790,6 +860,42 @@ describe('DeepSeek v4 models resolve to pricing', () => {
       expect(getModelCosts('gpt-4o-mini')!.inputCostPerToken).toBe(9e-7)
       expect(getModelCosts('deepseek-v4-pro')!.inputCostPerToken).toBe(4.35e-7)
       expect(getModelCosts('deepseek-v4-flash')!.inputCostPerToken).toBe(1.4e-7)
+    } finally {
+      await rm(cacheRoot, { recursive: true, force: true })
+      await loadPricing()
+    }
+  })
+})
+
+describe('pricing cache schema version (#1075/#1078 follow-up)', () => {
+  it('discards a cache written by a pre-#1078 binary instead of reading its missing cacheWriteCostIsExplicit as false', async () => {
+    const cacheRoot = await mkdtemp(join(tmpdir(), 'codeburn-pricing-cache-'))
+    try {
+      process.env['CODEBURN_CACHE_DIR'] = cacheRoot
+      await mkdir(cacheRoot, { recursive: true })
+      // Shape of a cache file written before #1078 added `version` and
+      // `cacheWriteCostIsExplicit`: no version field, and entries missing the
+      // key despite carrying a real (non-default) cache-write rate.
+      await writeFile(join(cacheRoot, 'litellm-pricing.json'), JSON.stringify({
+        timestamp: Date.now(),
+        data: {
+          'gpt-5.6': {
+            inputCostPerToken: 5e-6,
+            outputCostPerToken: 3e-5,
+            cacheWriteCostPerToken: 6.25e-6,
+            cacheReadCostPerToken: 5e-7,
+            webSearchCostPerRequest: 0.01,
+            fastMultiplier: 1,
+          },
+        },
+      }), 'utf-8')
+
+      await loadPricing()
+
+      // Pre-fix, loadCachedPricing had no version check: it would read this
+      // cache verbatim, and gpt-5.6's missing key would resolve to undefined
+      // (falsy) here instead of the true its LiteLLM entry actually carries.
+      expect(getModelCosts('gpt-5.6')!.cacheWriteCostIsExplicit).toBe(true)
     } finally {
       await rm(cacheRoot, { recursive: true, force: true })
       await loadPricing()
@@ -934,6 +1040,7 @@ describe('findUnpricedModels', () => {
     try {
       process.env['CODEBURN_CACHE_DIR'] = cacheRoot
       await writeFile(join(cacheRoot, 'litellm-pricing.json'), JSON.stringify({
+        version: 2, // must match models.ts's CACHE_SCHEMA_VERSION or the cache is treated as a miss
         timestamp: Date.now(),
         data: {
           'zz-zero-stub-model': {

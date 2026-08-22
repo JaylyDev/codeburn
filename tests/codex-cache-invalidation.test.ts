@@ -88,7 +88,8 @@ describe('codex parser change invalidates stale session-cache (#478/#513)', () =
       }
     }
     await writeCacheOnDisk(cache)
-    const codexCachePath = join(CACHE_DIR, 'codex-results.json')
+    const { codexCacheFileName } = await import('../src/codex-cache.js')
+    const codexCachePath = join(CACHE_DIR, codexCacheFileName())
     const codexCache = JSON.parse(await readFile(codexCachePath, 'utf8'))
     codexCache.version = 4
     for (const f of Object.values(codexCache.files) as any[]) {

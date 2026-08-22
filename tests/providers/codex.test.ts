@@ -1,9 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises'
+import { mkdtemp, mkdir, writeFile, rm, stat } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
 import { createCodexProvider } from '../../src/providers/codex.js'
+import { clearCodexMemCaches, CODEX_CACHE_VERSION, codexCacheFileName } from '../../src/codex-cache.js'
+import { calculateCost } from '../../src/models.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
@@ -722,9 +724,56 @@ describe('codex provider - JSONL parsing', () => {
       reasoningTokens: 20,
       tools: ['Bash'],
       activeDurationMs: 7000,
-      activeGeneratedTokens: 120,
+      // Reasoning (20) is a subset of output_tokens (100), not additive
+      // (#1075/#1078/#1079): the billable/throughput numerator is 100, not 120.
+      activeGeneratedTokens: 100,
       toolWaitMs: 3000,
     })
+  })
+
+  it('REGRESSION (#1088 BUG-1): excludes the task_started -> first request-context gap from active time', async () => {
+    // Codex fires task_started before it assembles the request; the 7s gap to
+    // the first request-context event (here, the user message) is CLI/harness
+    // startup, not model wait, and must not count toward active time. If this
+    // ever reverts to windowStart = taskStartedAt, activeDurationMs becomes
+    // 20000 (the full duration_ms) instead of 13000 (20000 - the 7s gap).
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-startup-gap.jsonl', [
+      sessionMeta({ session_id: 'sess-startup-gap', model: 'gpt-5.5' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started' } }),
+      userMessage('run the tool', '2026-04-14T10:00:07Z'),
+      tokenCount({ timestamp: '2026-04-14T10:00:20Z', last: { output: 100 }, total: { output: 100, total: 100 } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:20Z', payload: { type: 'task_complete', duration_ms: 20_000 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ activeGeneratedTokens: 100, activeDurationMs: 13_000, toolWaitMs: 0 })
+  })
+
+  it('#1088 BUG-8: reads a task_complete duration reported as {secs,nanos}, not only a plain number', async () => {
+    // mcp_tool_call_end already tolerates {secs,nanos} and string durations
+    // (durationValueMs); task_complete only read the plain-number duration_ms
+    // field, so a task_complete reported the object form was silently dropped
+    // (no active timing at all) instead of parsed.
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-object-duration.jsonl', [
+      sessionMeta({ session_id: 'sess-object-duration', model: 'gpt-5.5' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started' } }),
+      userMessage('run the tool', '2026-04-14T10:00:00Z'),
+      tokenCount({ timestamp: '2026-04-14T10:00:10Z', last: { output: 100 }, total: { output: 100, total: 100 } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:10Z', payload: { type: 'task_complete', duration: { secs: 10, nanos: 0 } } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ activeGeneratedTokens: 100, activeDurationMs: 10_000 })
   })
 
   it('keeps estimated output parsing for large token lines without usage info', async () => {
@@ -983,6 +1032,79 @@ describe('codex provider - JSONL parsing', () => {
     ])
   })
 
+  // #478 follow-up: the shapes the `function_call` path never reached. Fixtures
+  // are synthesized from the real shapes seen in Codex rollouts (a `custom_tool_call`
+  // whose payload is an `input` JS program, and an item-model `item_completed`
+  // carrying a `CommandExecution` item with an argv `command`); no real session
+  // content is used.
+  it('attributes MCP + Skill usage from the exec custom tool and the item model', async () => {
+    const customExec = (input: string, callId: string) => JSON.stringify({
+      type: 'response_item',
+      timestamp: '2026-04-14T10:00:30Z',
+      payload: { type: 'custom_tool_call', call_id: callId, name: 'exec', input },
+    })
+    const commandExecutionItem = (command: string[]) => JSON.stringify({
+      type: 'event_msg',
+      timestamp: '2026-04-14T10:00:40Z',
+      payload: { type: 'item_completed', item: { type: 'CommandExecution', command, exit_code: 0 } },
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-exec-items.jsonl', [
+      sessionMeta({ session_id: 'sess-exec-items', model: 'gpt-5.5' }),
+      userMessage('use the MCP CLI and load a skill'),
+      // custom-tool transport: MCP call and a skill read, both inside the JS program.
+      customExec('const r = await tools.exec_command({cmd:"mcp-cli call github get_issue \'{}\'"}); text(r.output);', 'c1'),
+      customExec('const r = await tools.exec_command({cmd:"sed -n \'1,200p\' /Users/x/.codex/skills/control-in-app-browser/SKILL.md"}); text(r.output);', 'c2'),
+      // Negatives: a lookup subcommand, and a grep that merely mentions a SKILL.md.
+      customExec('const r = await tools.exec_command({cmd:"mcp-cli info github"}); text(r.output);', 'c3'),
+      customExec('const r = await tools.exec_command({cmd:"grep -rn TODO /Users/x/.codex/skills/deploy/SKILL.md"}); text(r.output);', 'c4'),
+      // item model, no matching response item: must attribute on its own.
+      commandExecutionItem(['/bin/zsh', '-lc', "mcp-cli call optimizely-cms-mcp help '{}'"]),
+      commandExecutionItem(['/bin/zsh', '-lc', 'cat /Users/x/.codex/skills/graphify/SKILL.md']),
+      commandExecutionItem(['/bin/zsh', '-lc', 'ls -la']),
+      tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    const tools = calls[0]!.tools
+    // Attribution only: the four custom-tool execs stay Bash, and the item-model
+    // entries add no tool of their own, so the Bash count is unchanged at 4.
+    expect(tools.filter(t => t === 'Bash')).toHaveLength(4)
+    expect(tools.filter(t => t.startsWith('mcp__')).sort()).toEqual([
+      'mcp__github__get_issue',
+      'mcp__optimizely-cms-mcp__help',
+    ])
+    expect(calls[0]!.skills?.slice().sort()).toEqual(['control-in-app-browser', 'graphify'])
+    expect(tools.filter(t => t === 'Skill')).toHaveLength(2)
+  })
+
+  it('counts a command carried by BOTH the response item and the item model once', async () => {
+    const cmd = "mcp-cli call github get_issue '{}'"
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-both-shapes.jsonl', [
+      sessionMeta({ session_id: 'sess-both-shapes', model: 'gpt-5.5' }),
+      userMessage('call it twice'),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:30Z', payload: { type: 'function_call', name: 'exec_command', arguments: JSON.stringify({ cmd }) } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:31Z', payload: { type: 'item_completed', item: { type: 'CommandExecution', command: ['/bin/zsh', '-lc', cmd] } } }),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:32Z', payload: { type: 'function_call', name: 'exec_command', arguments: JSON.stringify({ cmd }) } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:33Z', payload: { type: 'item_completed', item: { type: 'CommandExecution', command: ['/bin/zsh', '-lc', cmd] } } }),
+      tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    // Two execs, two MCP attributions - not four.
+    expect(calls[0]!.tools.filter(t => t === 'Bash')).toHaveLength(2)
+    expect(calls[0]!.tools.filter(t => t === 'mcp__github__get_issue')).toHaveLength(2)
+  })
+
   it('normalizes Codex subagent tool calls to Agent', async () => {
     const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-agent.jsonl', [
       sessionMeta({ session_id: 'sess-agent', model: 'gpt-5.5' }),
@@ -1195,5 +1317,79 @@ describe('codex provider - forked session dedupe', () => {
 
     const { tokens } = await aggregateTokens(tmpDir)
     expect(tokens).toBe(300)
+  })
+})
+
+describe('codex auto-review pricing (#1047)', () => {
+  it('parses auto-review as itself and prices it as GPT-5.5', async () => {
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-auto-review.jsonl', [
+      sessionMeta({ session_id: 'sess-auto', model: 'codex-auto-review' }),
+      userMessage('review the PR'),
+      tokenCount({
+        timestamp: '2026-04-14T10:01:00Z',
+        last: { input: 1_000_000, output: 1_000_000 },
+        total: { total: 2_000_000 },
+      }),
+    ])
+    const provider = createCodexProvider(tmpDir)
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser({ path: filePath, project: 'test', provider: 'codex' }, new Set()).parse()) {
+      calls.push(call)
+    }
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.model).toBe('codex-auto-review')
+    expect(calls[0]!.costUSD).toBe(calculateCost('gpt-5.5', 1_000_000, 1_000_000, 0, 0, 0))
+  })
+
+  it('discards a warm v11 versioned $0 exact hit so unchanged rollouts reprice', async () => {
+    const cacheDir = join(tmpDir, 'cache')
+    await mkdir(cacheDir, { recursive: true })
+    const prev = process.env['CODEBURN_CACHE_DIR']
+    process.env['CODEBURN_CACHE_DIR'] = cacheDir
+    try {
+      const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-stale-auto.jsonl', [
+        sessionMeta({ session_id: 'sess-stale-auto', model: 'codex-auto-review' }),
+        userMessage('review the PR'),
+        tokenCount({
+          timestamp: '2026-04-14T10:01:00Z',
+          last: { input: 1_000_000, output: 1_000_000 },
+          total: { total: 2_000_000 },
+        }),
+      ])
+      const st = await stat(filePath)
+      // Main's #1075 already owns v11. A colliding v11 $0 file must not be
+      // treated as current after this PR takes v12.
+      expect(CODEX_CACHE_VERSION).toBeGreaterThan(11)
+      await writeFile(join(cacheDir, codexCacheFileName(11)), JSON.stringify({
+        version: 11,
+        files: {
+          [filePath]: {
+            mtimeMs: st.mtimeMs,
+            sizeBytes: st.size,
+            project: 'test',
+            calls: [{
+              model: 'codex-auto-review',
+              costUSD: 0,
+              inputTokens: 1_000_000,
+              outputTokens: 1_000_000,
+              deduplicationKey: 'stale',
+            }],
+          },
+        },
+      }))
+      clearCodexMemCaches()
+      const provider = createCodexProvider(tmpDir)
+      const calls: ParsedProviderCall[] = []
+      for await (const call of provider.createSessionParser({ path: filePath, project: 'test', provider: 'codex' }, new Set()).parse()) {
+        calls.push(call)
+      }
+      expect(calls).toHaveLength(1)
+      expect(calls[0]!.costUSD).toBeGreaterThan(0)
+      expect(calls[0]!.costUSD).toBe(calculateCost('gpt-5.5', 1_000_000, 1_000_000, 0, 0, 0))
+    } finally {
+      clearCodexMemCaches()
+      if (prev === undefined) delete process.env['CODEBURN_CACHE_DIR']
+      else process.env['CODEBURN_CACHE_DIR'] = prev
+    }
   })
 })

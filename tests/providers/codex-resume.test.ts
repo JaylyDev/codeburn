@@ -183,7 +183,8 @@ describe('codex incremental resume', () => {
     sessionPath = await writeRollout([meta(), ...tasks(1, 2)])
     await parse(cacheDir)
 
-    const cachePath = join(cacheDir, 'codex-results.json')
+    const { codexCacheFileName } = await import('../../src/codex-cache.js')
+    const cachePath = join(cacheDir, codexCacheFileName())
     const { readFile } = await import('fs/promises')
     const raw = JSON.parse(await readFile(cachePath, 'utf-8'))
     raw.files[sessionPath].resumeState = { garbage: true }

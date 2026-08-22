@@ -13,6 +13,28 @@ export type ModelCosts = {
   cacheReadCostPerToken: number
   webSearchCostPerRequest: number
   fastMultiplier: number
+  /// True only when the pricing source carried a real cache-write rate. When
+  /// absent/false, `cacheWriteCostPerToken` is the fabricated `1.25 x input`
+  /// default, which is right for Anthropic-style pricing but would invent a
+  /// surcharge on providers that charge nothing extra to write cache. Callers
+  /// that decide WHICH bucket to put tokens in (rather than what to multiply
+  /// them by) must consult this before routing tokens to the cache-write
+  /// bucket. Optional so an incomplete literal defaults to the safe answer.
+  cacheWriteCostIsExplicit?: boolean
+}
+
+/// Providers whose reported `reasoningTokens` are a SUBSET of `outputTokens`
+/// rather than a separate bucket to add on top. OpenAI bills reasoning as part
+/// of output (every codex `token_count` event satisfies input + output ==
+/// total), and Anthropic folds thinking into output the same way, so summing
+/// the two double-counts both the cost and the displayed output tokens.
+const REASONING_INCLUDED_IN_OUTPUT = new Set(['claude', 'codex'])
+
+/// Output tokens to bill and display for one call. Single source of truth so
+/// the pricing sites and the display sums can never disagree about whether a
+/// provider's reasoning tokens are already inside its output count (#1075).
+export function billableOutputTokens(provider: string, outputTokens: number, reasoningTokens: number): number {
+  return REASONING_INCLUDED_IN_OUTPUT.has(provider) ? outputTokens : outputTokens + reasoningTokens
 }
 
 type PriceOverrideRates = {
@@ -37,6 +59,11 @@ type SnapshotEntry = [number, number, number | null, number | null, (number | nu
 
 const LITELLM_URL = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json'
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000
+// Bump whenever a ModelCosts field changes pricing behavior (cacheWriteCostIsExplicit,
+// added in #1075/#1078). A cache written under an older/missing version is treated as a
+// miss instead of read verbatim, so a stale on-disk file can't reintroduce a killed bug
+// for up to CACHE_TTL_MS after an upgrade.
+const CACHE_SCHEMA_VERSION = 2
 const WEB_SEARCH_COST = 0.01
 const ONE_HOUR_CACHE_WRITE_MULTIPLIER_FROM_FIVE_MINUTE_RATE = 1.6
 
@@ -71,6 +98,7 @@ function buildCosts(
     cacheReadCostPerToken: cacheRead ?? input * 0.1,
     webSearchCostPerRequest: WEB_SEARCH_COST,
     fastMultiplier: fast ?? 1,
+    cacheWriteCostIsExplicit: cacheWrite !== null && cacheWrite !== undefined,
   }
 }
 
@@ -200,6 +228,7 @@ async function fetchAndCachePricing(): Promise<Map<string, ModelCosts>> {
 
   await mkdir(getCodeburnCacheDir(), { recursive: true })
   await writeFile(getCachePath(), JSON.stringify({
+    version: CACHE_SCHEMA_VERSION,
     timestamp: Date.now(),
     data: Object.fromEntries(pricing),
   }))
@@ -210,7 +239,8 @@ async function fetchAndCachePricing(): Promise<Map<string, ModelCosts>> {
 async function loadCachedPricing(): Promise<Map<string, ModelCosts> | null> {
   try {
     const raw = await readFile(getCachePath(), 'utf-8')
-    const cached = JSON.parse(raw) as { timestamp: number; data: Record<string, ModelCosts> }
+    const cached = JSON.parse(raw) as { version?: number; timestamp: number; data: Record<string, ModelCosts> }
+    if (cached.version !== CACHE_SCHEMA_VERSION) return null
     if (Date.now() - cached.timestamp > CACHE_TTL_MS) return null
     return new Map(Object.entries(cached.data))
   } catch {
@@ -282,6 +312,16 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'openclaw-auto':                 'claude-sonnet-4-5',
   'warp-auto-efficient':           'gpt-5.3-codex',
   'warp-auto-powerful':            'claude-opus-4-6',
+  // Codex activity ids are product surfaces, not subscription SKUs and not
+  // LiteLLM rows. OpenAI's tracker (openai/codex#32224) says auto review
+  // consumes normal model usage. Public evidence: review_model defaults to
+  // the session model; GPT-5.5 is the currently recommended review model.
+  // Price as that existing bundled row. Do not invent a rate. Do not treat
+  // the id as honestly $0 — it draws from the same credit pool. Display
+  // stays on autoModelNames (same class as cursor-auto / copilot-openai-auto).
+  // Only alias ids observed in Codex source / real rollouts. Do not infer
+  // `codex-code-review` from the activity name "code review".
+  'codex-auto-review':             'gpt-5.5',
   'grok-build':                    'grok-build-0.1',
   'GPT-5.3 Codex (low reasoning)': 'gpt-5.3-codex',
   'GPT-5.3 Codex (medium reasoning)': 'gpt-5.3-codex',
@@ -736,6 +776,19 @@ function getCanonicalName(model: string): string {
   )
 }
 
+/// Alias-resolved identity for report merge. Display names stay cosmetic —
+/// prefix matches in SHORT_NAMES must not fold distinct SKUs into one row.
+/// Path-form ids (`accounts/fireworks/models/<slug>`, `cline-pass/<slug>`)
+/// peel to the leaf so they share a bucket with the bare slug.
+export function resolveCanonicalModelId(model: string): string {
+  const viaUser = Object.hasOwn(userAliases, model) ? userAliases[model]! : model
+  const aliased = resolveAlias(getCanonicalName(viaUser))
+  if (!aliased.includes('/')) return aliased
+  const leaf = aliased.slice(aliased.lastIndexOf('/') + 1)
+  if (!leaf) return aliased
+  return resolveAlias(getCanonicalName(leaf))
+}
+
 // Namespaces the pricing catalog itself uses, plus the ones below. An unknown
 // `provider/model` must stay unpriced — do not treat `/` as authority. Derived
 // rather than hand-listed so a vendor LiteLLM already knows (`x-ai/`, `qwen/`,
@@ -1090,6 +1143,7 @@ const autoModelNames: Record<string, string> = {
   'openclaw-auto': 'OpenClaw (auto)',
   'qwen-auto': 'Qwen (auto)',
   'kimi-auto': 'Kimi (auto)',
+  'codex-auto-review': 'Codex Auto Review',
 }
 
 const SHORT_NAMES: Record<string, string> = {
@@ -1228,6 +1282,14 @@ function lookupShortName(id: string): string | undefined {
 // Public API stays unary so Array.map/forEach cannot feed index as cycle state.
 export function getShortModelName(model: string): string {
   return shortModelName(model, new Set())
+}
+
+/// Provider-first display name. Local labels win (Cursor estimated suffixes,
+/// provider tables that intentionally override the global map). If the provider
+/// echoed the raw id, it missed — fall back to the global resolver instead of
+/// showing `gpt-5.6-sol` / `accounts/fireworks/models/kimi-k2p6`.
+export function fallbackRawModelDisplayName(localLabel: string, rawModel: string): string {
+  return localLabel === rawModel ? getShortModelName(rawModel) : localLabel
 }
 
 function shortModelName(model: string, seen: Set<string>): string {

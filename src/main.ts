@@ -474,7 +474,7 @@ program.hook('preAction', async (thisCommand) => {
   await loadCurrency()
 })
 
-function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: string, durable?: DurablePeriod) {
+function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: string, durable: DurablePeriod) {
   const sessions = projects.flatMap(p => p.sessions)
   const { code } = getCurrency()
 
@@ -482,67 +482,28 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
   // session files have expired still count), matching the menubar exactly. The
   // proxied/net split is a surviving-session concept (subscription attribution
   // isn't stored per day), so it stays live; net is taken off the durable total.
-  const totalCostUSD = durable ? durable.data.cost : projects.reduce((s, p) => s + p.totalCostUSD, 0)
-  const totalSavingsUSD = durable ? durable.data.savingsUSD : projects.reduce((s, p) => s + p.totalSavingsUSD, 0)
-  const totalEstimatedUSD = durable ? (durable.data.estimatedCostUSD ?? 0) : projects.reduce((s, p) => s + (p.totalEstimatedCostUSD ?? 0), 0)
+  const totalCostUSD = durable.data.cost
+  const totalSavingsUSD = durable.data.savingsUSD
+  const totalEstimatedUSD = durable.data.estimatedCostUSD ?? 0
   // Subscription-covered (proxied) portion of totalCostUSD, and the resulting
   // out-of-pocket figure. `cost` stays the full billable/would-be amount.
   const totalProxiedUSD = projects.reduce((s, p) => s + p.totalProxiedCostUSD, 0)
   const netCostUSD = totalCostUSD - totalProxiedUSD
-  const totalCalls = durable ? durable.data.calls : projects.reduce((s, p) => s + p.totalApiCalls, 0)
-  const totalSessions = durable ? durable.data.sessions : projects.reduce((s, p) => s + p.sessions.length, 0)
-  const totalInput = durable ? durable.data.inputTokens : sessions.reduce((s, sess) => s + sess.totalInputTokens, 0)
-  const totalOutput = durable ? durable.data.outputTokens : sessions.reduce((s, sess) => s + sess.totalOutputTokens, 0)
-  const totalCacheRead = durable ? durable.data.cacheReadTokens : sessions.reduce((s, sess) => s + sess.totalCacheReadTokens, 0)
-  const totalCacheWrite = durable ? durable.data.cacheWriteTokens : sessions.reduce((s, sess) => s + sess.totalCacheWriteTokens, 0)
+  const totalCalls = durable.data.calls
+  const totalSessions = durable.data.sessions
+  const totalInput = durable.data.inputTokens
+  const totalOutput = durable.data.outputTokens
+  const totalCacheRead = durable.data.cacheReadTokens
+  const totalCacheWrite = durable.data.cacheWriteTokens
   // Match src/menubar-json.ts:cacheHitPercent: reads over reads+fresh-input. cache_write
   // counts tokens being stored, not served, so it doesn't belong in the denominator.
   const cacheHitDenom = totalInput + totalCacheRead
   const cacheHitPercent = cacheHitDenom > 0 ? Math.round((totalCacheRead / cacheHitDenom) * 1000) / 10 : 0
 
-  // Per-day rollup. Mirrors parser.ts categoryBreakdown semantics so a
-  // consumer summing daily[].editTurns over a period gets the same total as
-  // sum(activities[].editTurns) for that period: every turn counts once for
-  // `turns`, edit turns count for `editTurns`, edit turns with zero retries
-  // count for `oneShotTurns`. Issue #279 — daily-resolution efficiency
-  // dashboards need this without re-deriving from activity-level rollups.
-  const dailyMap: Record<string, { cost: number; savings: number; calls: number; turns: number; editTurns: number; oneShotTurns: number }> = {}
-  for (const sess of sessions) {
-    for (const turn of sess.turns) {
-      // Prefer the user-message timestamp on the turn; fall back to the first
-      // assistant-call timestamp when the user line is missing (continuation
-      // sessions where the JSONL begins mid-conversation). Previously these
-      // turns dropped from daily but stayed in activities, breaking the
-      // sum(daily[].editTurns) === sum(activities[].editTurns) invariant.
-      const ts = turn.timestamp || turn.assistantCalls[0]?.timestamp
-      if (!ts) { continue }
-      const day = dateKey(ts)
-      if (!dailyMap[day]) { dailyMap[day] = { cost: 0, savings: 0, calls: 0, turns: 0, editTurns: 0, oneShotTurns: 0 } }
-      dailyMap[day].turns += 1
-      if (turn.hasEdits) {
-        dailyMap[day].editTurns += 1
-        if (turn.retries === 0) dailyMap[day].oneShotTurns += 1
-      }
-      for (const call of turn.assistantCalls) {
-        // Cost/savings/calls bucket under each call's OWN day — the same
-        // per-call rule as the durable day set (day-aggregator.ts), so this
-        // fallback and durable.days never diverge on a midnight-straddling
-        // turn (issue #852). Turn counts/edit stats stay anchored on the
-        // turn's day above. An unparseable call timestamp falls back to the
-        // turn's day rather than producing a garbage date key.
-        const callDay = Number.isNaN(new Date(call.timestamp).getTime()) ? day : dateKey(call.timestamp)
-        if (!dailyMap[callDay]) { dailyMap[callDay] = { cost: 0, savings: 0, calls: 0, turns: 0, editTurns: 0, oneShotTurns: 0 } }
-        dailyMap[callDay].cost += call.costUSD
-        dailyMap[callDay].savings += call.savingsUSD ?? 0
-        dailyMap[callDay].calls += 1
-      }
-    }
-  }
   // Daily rows come from the same durable day set as the headline so they sum
-  // to it, carried days included. The live per-turn rollup (dailyMap) is only
-  // the fallback for callers that pass no durable period.
-  const daily = durable
-    ? durable.days.map(d => {
+  // to it, carried days included. Both JSON call sites always pass durable
+  // (#1067); the live dailyMap fallback was unreachable and is gone.
+  const daily = durable.days.map(d => {
         const turns = Object.values(d.categories).reduce((s, c) => s + c.turns, 0)
         return {
           date: d.date,
@@ -557,21 +518,6 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
             : null,
         }
       })
-    : Object.entries(dailyMap).sort().map(([date, d]) => ({
-        date,
-        cost: convertCost(d.cost),
-        savings: convertCost(d.savings),
-        calls: d.calls,
-        turns: d.turns,
-        editTurns: d.editTurns,
-        oneShotTurns: d.oneShotTurns,
-        // Pre-computed convenience for dashboards that don't want to do the math.
-        // null when there are no edit turns (the rate is undefined, not zero —
-        // a day where the user only had Q&A turns shouldn't read as 0% one-shot).
-        oneShotRate: d.editTurns > 0
-          ? Math.round((d.oneShotTurns / d.editTurns) * 1000) / 10
-          : null,
-      }))
 
   const projectList = projects.map(p => ({
     name: p.project,

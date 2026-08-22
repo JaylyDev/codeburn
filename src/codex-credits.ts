@@ -20,10 +20,19 @@ const CREDITS_PER_MILLION: Record<string, CodexCreditRate> = {
   'gpt-5.4-mini': { input: 18.75, cachedInput: 1.875, output: 113 },
 }
 
+// Activity surfaces keep their product id on the call (display stays
+// "Codex Auto Review"). Credits must follow the same underlying model
+// BUILTIN_ALIASES uses for USD. Keep this table in lockstep with
+// `codex-auto-review` in src/models.ts.
+const ACTIVITY_CREDIT_MODELS: Record<string, string> = {
+  'codex-auto-review': 'gpt-5.5',
+}
+
 /// Resolve the credit rate for a Codex model name, tolerating suffix variants
 /// (e.g. "gpt-5.5-codex"). Returns null when the model has no known credit rate.
 export function codexCreditRate(model: string): CodexCreditRate | null {
-  const m = model.toLowerCase()
+  const mapped = ACTIVITY_CREDIT_MODELS[model] ?? ACTIVITY_CREDIT_MODELS[model.toLowerCase()]
+  const m = (mapped ?? model).toLowerCase()
   if (m.includes('5.4') && m.includes('mini')) return CREDITS_PER_MILLION['gpt-5.4-mini']!
   if (m.includes('5.4')) return CREDITS_PER_MILLION['gpt-5.4']!
   if (m.includes('5.5')) return CREDITS_PER_MILLION['gpt-5.5']!
@@ -36,9 +45,9 @@ export type CodexCreditTokens = {
   inputTokens: number
   /// Cache-read (cached input) tokens, billed at the cheaper cached rate.
   cachedReadTokens: number
+  /// Billable output tokens: reasoning is already included (billableOutputTokens
+  /// in models.ts), so callers must not add it on top here.
   outputTokens: number
-  /// Reasoning tokens are billed as output, matching CodeBurn's cost model.
-  reasoningTokens?: number
 }
 
 /// Credits consumed for one Codex usage record. Returns null when the model has
@@ -48,10 +57,9 @@ export function codexCredits(model: string, tokens: CodexCreditTokens): number |
   if (!rate) return null
   const safe = (n: number) => (Number.isFinite(n) && n > 0 ? n : 0)
   const PER_MILLION = 1_000_000
-  const output = safe(tokens.outputTokens) + safe(tokens.reasoningTokens ?? 0)
   return (
     (safe(tokens.inputTokens) / PER_MILLION) * rate.input +
     (safe(tokens.cachedReadTokens) / PER_MILLION) * rate.cachedInput +
-    (output / PER_MILLION) * rate.output
+    (safe(tokens.outputTokens) / PER_MILLION) * rate.output
   )
 }

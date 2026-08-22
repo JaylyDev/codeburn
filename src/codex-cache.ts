@@ -4,7 +4,7 @@ import { randomBytes } from 'crypto'
 import { join, resolve } from 'path'
 import { AsyncLocalStorage } from 'node:async_hooks'
 
-import { getCodeburnCacheDir } from './cache-dir.js'
+import { getCodeburnCacheDir, readExistingTextFile } from './cache-dir.js'
 import type { ParsedProviderCall } from './providers/types.js'
 
 // v4: attribute MCP calls emitted as event_msg/mcp_tool_call_end (issue #478).
@@ -23,8 +23,31 @@ import type { ParsedProviderCall } from './providers/types.js'
 // cannot overwrite the model selected by turn_context.
 // v10: same depth-1 window for the rest of session_meta's raw string fields
 // (cwd/name/originator/session_id/forked_from_id/model_provider).
-const CODEX_CACHE_VERSION = 10
-const CACHE_FILE = 'codex-results.json'
+// v11: codex pricing fix (#1075) - reasoning is no longer added on top of
+// output, and cache_write_input_tokens is carved out of the input bucket. This
+// file stores each call's costUSD and token buckets verbatim, so entries
+// written by v10 carry the old (overstated) cost and must be re-derived.
+// v13: codex throughput fix (#1079) - activeGeneratedTokens was summing
+// output + reasoning, the same double-count Fix A removed from cost. This
+// file stores activeGeneratedTokens/activeDurationMs/toolWaitMs verbatim (not
+// re-derived on read), so v11 entries carry the overstated numerator and must
+// re-parse. Not 12: v12 is claimed by feat/core-extraction's own port of this
+// throughput feature (PR #1086), so reusing it would let two incompatible
+// schemas share a filename.
+// v14: MCP + Skill attribution for the shapes the classic `function_call` path
+// never reached (#478) - the `exec` custom tool's `input` program and the item
+// model's `item_completed`/`CommandExecution` item - plus SKILL.md reads landing
+// in `skills`. This file stores each call's `tools`/`toolSequence`/`skills`
+// verbatim (they are passed through on read, never re-derived), so v13 entries
+// keep the old, MCP- and skill-less attribution until they re-parse.
+// v15: builtin alias prices `codex-auto-review` (#1047). Exact-hit cache
+// entries still hold the pre-alias $0; bump so unchanged rollouts reprice.
+// Must be max(main v14 #1092, this)+1 — #1092 spent v14 on MCP/skills.
+export const CODEX_CACHE_VERSION = 15
+export const CODEX_LEGACY_CACHE_FILE = 'codex-results.json'
+export function codexCacheFileName(version = CODEX_CACHE_VERSION): string {
+  return `codex-results.v${version}.json`
+}
 
 export type CodexFileFingerprint = { dev: number; ino: number; mtimeMs: number; sizeBytes: number }
 type FileFingerprint = CodexFileFingerprint
@@ -70,7 +93,15 @@ export function withCodexCacheDirectory<T>(cacheDir: string, operation: () => T)
 }
 
 function getCachePath(cacheDir: string): string {
-  return join(cacheDir, CACHE_FILE)
+  return join(cacheDir, codexCacheFileName())
+}
+
+function getLegacyCachePath(cacheDir: string): string {
+  return join(cacheDir, CODEX_LEGACY_CACHE_FILE)
+}
+
+function isCurrentCache(cache: ResultCache): boolean {
+  return cache.version === CODEX_CACHE_VERSION && !!cache.files && typeof cache.files === 'object'
 }
 
 // Embedded consumers can change CODEBURN_CACHE_DIR without reloading this
@@ -87,15 +118,33 @@ export function clearCodexMemCaches(): void {
 async function loadCache(cacheDir: string): Promise<ResultCache> {
   const inMemory = memCaches.get(cacheDir)
   if (inMemory) return inMemory
+  const empty = { version: CODEX_CACHE_VERSION, files: {} }
+  const versioned = await readExistingTextFile(getCachePath(cacheDir))
+  if (versioned.status === 'ok') {
+    try {
+      const cache = JSON.parse(versioned.text) as ResultCache
+      if (isCurrentCache(cache)) {
+        memCaches.set(cacheDir, cache)
+        return cache
+      }
+    } catch {}
+    memCaches.set(cacheDir, empty)
+    return empty
+  }
+  if (versioned.status === 'unreadable') {
+    memCaches.set(cacheDir, empty)
+    return empty
+  }
+  // Versioned file is absent (ENOENT). Adopt the unsuffixed file only when its
+  // version matches — old binaries still own that path; we never write or delete it.
   try {
-    const raw = await readFile(getCachePath(cacheDir), 'utf-8')
+    const raw = await readFile(getLegacyCachePath(cacheDir), 'utf-8')
     const cache = JSON.parse(raw) as ResultCache
-    if (cache.version === CODEX_CACHE_VERSION && cache.files && typeof cache.files === 'object') {
+    if (isCurrentCache(cache)) {
       memCaches.set(cacheDir, cache)
       return cache
     }
   } catch {}
-  const empty = { version: CODEX_CACHE_VERSION, files: {} }
   memCaches.set(cacheDir, empty)
   return empty
 }
