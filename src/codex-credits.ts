@@ -20,10 +20,19 @@ const CREDITS_PER_MILLION: Record<string, CodexCreditRate> = {
   'gpt-5.4-mini': { input: 18.75, cachedInput: 1.875, output: 113 },
 }
 
+// Activity surfaces keep their product id on the call (display stays
+// "Codex Auto Review"). Credits must follow the same underlying model
+// BUILTIN_ALIASES uses for USD. Keep this table in lockstep with
+// `codex-auto-review` in src/models.ts.
+const ACTIVITY_CREDIT_MODELS: Record<string, string> = {
+  'codex-auto-review': 'gpt-5.5',
+}
+
 /// Resolve the credit rate for a Codex model name, tolerating suffix variants
 /// (e.g. "gpt-5.5-codex"). Returns null when the model has no known credit rate.
 export function codexCreditRate(model: string): CodexCreditRate | null {
-  const m = model.toLowerCase()
+  const mapped = ACTIVITY_CREDIT_MODELS[model] ?? ACTIVITY_CREDIT_MODELS[model.toLowerCase()]
+  const m = (mapped ?? model).toLowerCase()
   if (m.includes('5.4') && m.includes('mini')) return CREDITS_PER_MILLION['gpt-5.4-mini']!
   if (m.includes('5.4')) return CREDITS_PER_MILLION['gpt-5.4']!
   if (m.includes('5.5')) return CREDITS_PER_MILLION['gpt-5.5']!

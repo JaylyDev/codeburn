@@ -6,6 +6,15 @@ import { join } from 'path'
 import { getCodeburnCacheDir } from './cache-dir.js'
 import type { DateRange, ProjectSummary } from './types.js'
 
+// Bumped to 25: `codex-auto-review` now prices as the recommended GPT-5.5
+// row (#1047). Days already finalized under v24 keep that id at $0
+// forever unless MIN_SUPPORTED_VERSION moves: the daily cache has no
+// per-provider invalidation. The Codex parse version and CODEX_CACHE_VERSION
+// move with this so the lower caches reprice first; this pass then re-derives
+// ALL days from the warm session cache (seconds, not a full re-parse).
+// adoptOlderDailyCaches keeps the superseded file as the baseline. v21 is
+// #946, v22 was this PR's earlier claim, v23 is #1075, v24 is #1090.
+//
 // Bumped to 20: the Codex fast-path read a nested
 // `base_instructions.provenance.model` out of `session_meta` as if it were
 // `payload.model` (#1040), so every call a rollout attributed from session
@@ -128,11 +137,10 @@ import type { DateRange, ProjectSummary } from './types.js'
 // window where neither existed). The daily cache has no per-provider
 // invalidation, so there is no way to tell those days apart from here -
 // raising MIN_SUPPORTED_VERSION forces the one-time re-derivation for
-// everyone, which is a lossless no-op for days already correct. #1056 also
-// claims 24 on its own branch (unmerged as of this writing); whichever lands
-// second takes the next number instead of reusing this one.
-export const DAILY_CACHE_VERSION = 24
-const MIN_SUPPORTED_VERSION = 24
+// everyone, which is a lossless no-op for days already correct.
+// v25: #1047 activity-id pricing. v24 on main already shipped #1090.
+export const DAILY_CACHE_VERSION = 25
+const MIN_SUPPORTED_VERSION = 25
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including

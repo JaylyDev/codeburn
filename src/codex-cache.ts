@@ -40,7 +40,10 @@ import type { ParsedProviderCall } from './providers/types.js'
 // in `skills`. This file stores each call's `tools`/`toolSequence`/`skills`
 // verbatim (they are passed through on read, never re-derived), so v13 entries
 // keep the old, MCP- and skill-less attribution until they re-parse.
-export const CODEX_CACHE_VERSION = 14
+// v15: builtin alias prices `codex-auto-review` (#1047). Exact-hit cache
+// entries still hold the pre-alias $0; bump so unchanged rollouts reprice.
+// Must be max(main v14 #1092, this)+1 — #1092 spent v14 on MCP/skills.
+export const CODEX_CACHE_VERSION = 15
 export const CODEX_LEGACY_CACHE_FILE = 'codex-results.json'
 export function codexCacheFileName(version = CODEX_CACHE_VERSION): string {
   return `codex-results.v${version}.json`

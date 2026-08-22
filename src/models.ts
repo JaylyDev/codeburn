@@ -312,6 +312,16 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'openclaw-auto':                 'claude-sonnet-4-5',
   'warp-auto-efficient':           'gpt-5.3-codex',
   'warp-auto-powerful':            'claude-opus-4-6',
+  // Codex activity ids are product surfaces, not subscription SKUs and not
+  // LiteLLM rows. OpenAI's tracker (openai/codex#32224) says auto review
+  // consumes normal model usage. Public evidence: review_model defaults to
+  // the session model; GPT-5.5 is the currently recommended review model.
+  // Price as that existing bundled row. Do not invent a rate. Do not treat
+  // the id as honestly $0 — it draws from the same credit pool. Display
+  // stays on autoModelNames (same class as cursor-auto / copilot-openai-auto).
+  // Only alias ids observed in Codex source / real rollouts. Do not infer
+  // `codex-code-review` from the activity name "code review".
+  'codex-auto-review':             'gpt-5.5',
   'grok-build':                    'grok-build-0.1',
   'GPT-5.3 Codex (low reasoning)': 'gpt-5.3-codex',
   'GPT-5.3 Codex (medium reasoning)': 'gpt-5.3-codex',
@@ -1017,6 +1027,7 @@ const autoModelNames: Record<string, string> = {
   'openclaw-auto': 'OpenClaw (auto)',
   'qwen-auto': 'Qwen (auto)',
   'kimi-auto': 'Kimi (auto)',
+  'codex-auto-review': 'Codex Auto Review',
 }
 
 const SHORT_NAMES: Record<string, string> = {

@@ -653,6 +653,8 @@ describe('Cursor model variants resolve to pricing', () => {
     ['claude-4.6-haiku', 'claude-haiku-4-5'],
     // Cursor auto proxy
     ['cursor-auto', 'claude-sonnet-4-5'],
+    // Codex activity surface (official rate card, observed raw id)
+    ['codex-auto-review', 'gpt-5.5'],
     // OpenAI variants Cursor emits
     ['gpt-5', 'gpt-5'],
     ['gpt-5-fast', 'gpt-5'],
@@ -685,6 +687,29 @@ describe('Cursor model variants resolve to pricing', () => {
   // independently of today's pricing coincidence.
   it('keeps claude-4-sonnet-thinking in the Sonnet 4 model family', () => {
     expect(getShortModelName('claude-4-sonnet-thinking')).toBe('Sonnet 4')
+  })
+})
+
+describe('Codex activity ids (#1047)', () => {
+  it('keeps the activity label instead of collapsing to the underlying model name', () => {
+    expect(getShortModelName('codex-auto-review')).toBe('Codex Auto Review')
+  })
+
+  it('prices as the exact bundled GPT-5.5 object, not an invented rate', () => {
+    expect(getModelCosts('codex-auto-review')).toBe(getModelCosts('gpt-5.5'))
+    const auto = calculateCost('codex-auto-review', 1_000_000, 1_000_000, 0, 0, 0)
+    const gpt55 = calculateCost('gpt-5.5', 1_000_000, 1_000_000, 0, 0, 0)
+    expect(auto).toBeGreaterThan(0)
+    expect(auto).toBe(gpt55)
+  })
+
+  it('does not invent a family or an unobserved sibling id', () => {
+    expect(getModelCosts('codex-code-review')).toBeNull()
+    expect(getModelCosts('codex-cloud-task')).toBeNull()
+    expect(getModelCosts('codex-automation')).toBeNull()
+    expect(getModelCosts('code-review')).toBeNull()
+    expect(getModelCosts('auto-review')).toBeNull()
+    expect(calculateCost('codex-code-review', 1_000_000, 1_000_000, 0, 0, 0)).toBe(0)
   })
 })
 

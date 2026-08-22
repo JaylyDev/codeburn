@@ -280,7 +280,7 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // session-meta-model-v1: parse large session_meta records structurally so a
   // nested base_instructions provenance.model cannot overwrite turn_context.
   // session-meta-fields-v1: the same depth-1 window for cwd/name/originator/
-  // session_id/forked_from_id/model_provider, not just model.
+  // session_id/forked_from_id/model_provider, not just model. (#1055)
   // codex-pricing-v1 (#1075): reasoning tokens are no longer added on top of
   // output, and cache_write_input_tokens moves out of the plain input bucket on
   // models with an explicit cache-write rate. The bucket move does NOT self-heal
@@ -294,7 +294,10 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // through the `exec` custom tool or the item model's `CommandExecution` item
   // were counted as Bash only. Cached sessions store tools/toolSequence/skills
   // verbatim, so they must re-parse to gain the attribution.
-  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1-session-meta-fields-v1-codex-pricing-v1-codex-tps-v1-codex-mcp-skills-v1',
+  // activity-price-v1: `codex-auto-review` now prices via the recommended
+  // review model. session-cache.json would otherwise keep the pre-alias $0.
+  // Compose all four — a take-ours merge would drop #1075, #1079, or #1092.
+  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1-session-meta-fields-v1-codex-pricing-v1-codex-tps-v1-codex-mcp-skills-v1-activity-price-v1',
   cursor: 'composer-anchored-crediting-v1-est-cost',
   'cursor-agent': 'workspaceless-transcript-v1',
   // source-provenance-v1 (#944): CLI sessions were misread as VS Code
