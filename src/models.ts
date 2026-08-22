@@ -298,6 +298,8 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'anthropic--claude-4.5-opus':    'claude-opus-4-5',
   'anthropic--claude-4.5-sonnet':  'claude-sonnet-4-5',
   'anthropic--claude-4.5-haiku':   'claude-haiku-4-5',
+  // #1093: copilot session-store.db writes 'claude-haiku-4.5' (tier-first, dot)
+  'claude-haiku-4.5':             'claude-haiku-4-5',
   'claude-sonnet-4.6':             'claude-sonnet-4-6',
   'claude-sonnet-4.5':             'claude-sonnet-4-5',
   'claude-opus-4.7':               'claude-opus-4-7',

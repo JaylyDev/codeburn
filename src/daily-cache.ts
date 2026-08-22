@@ -6,6 +6,10 @@ import { join } from 'path'
 import { getCodeburnCacheDir } from './cache-dir.js'
 import type { DateRange, ProjectSummary } from './types.js'
 
+// Bumped to 27: claude-haiku-4.5 copilot store rows now price correctly (alias added) — #1093.
+// Previously the raw id 'claude-haiku-4.5' (tier-first, dot) from session-store.db had no
+// pricing alias, so days finalized with this model were stuck at $0. No self-heal via prefix
+// fallback exists for this id, so a version bump is required to force re-derivation.
 // Bumped to 26: copilot input/cache tokens for sessions covered by the CLI's
 // session-store.db move from one shutdown-rollup lump (stamped at session end)
 // to per-request DB rows with real timestamps, supplementary accounting calls
@@ -163,8 +167,9 @@ import type { DateRange, ProjectSummary } from './types.js'
 // everyone, which is a lossless no-op for days already correct.
 // v25: #1047 activity-id pricing. v24 on main already shipped #1090.
 // v26: #946 copilot session-store accounting (see the top of this ladder).
-export const DAILY_CACHE_VERSION = 26
-const MIN_SUPPORTED_VERSION = 26
+// v27: #1093 claude-haiku-4.5 alias (see top).
+export const DAILY_CACHE_VERSION = 27
+const MIN_SUPPORTED_VERSION = 27
 
 /// Providers whose per-day CALL COUNT means something different at
 /// DAILY_CACHE_VERSION 26 than it did before it. Copilot's supplementary
