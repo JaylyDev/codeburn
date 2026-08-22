@@ -123,6 +123,10 @@ function releaseSlot(): void {
 function reapAll(): void {
   serveClient?.destroy()
   serveClient = null
+  // Deliberately harder than every other kill path: quit has a 1.5s flush budget,
+  // shorter than the SIGTERM grace, so waiting one out would just wedge the quit.
+  // One-shot reads hold no lock worth releasing; the resident child (destroyed
+  // above) does, and gets the grace.
   for (const child of activeChildren) child.kill('SIGKILL')
   activeChildren.clear()
   // A queued waiter has no child to reap, so releaseSlot never fires for it;
@@ -629,9 +633,11 @@ class ServeClient {
     const child = this.child
     if (child) {
       // This is an intentional replacement, not a crash. Detach first so the
-      // later exit event cannot consume the unexpected-death budget.
+      // later exit event cannot consume the unexpected-death budget. The
+      // outgoing child may be mid-write, so it gets the same SIGTERM grace a
+      // timed-out one does — a hard kill here strands the refresh lock.
       this.onDeath(child, false)
-      child.kill('SIGKILL')
+      killGracefully(child)
     }
     this.start()
   }
@@ -692,7 +698,7 @@ class ServeClient {
     const child = this.child
     if (!child) return
     this.onDeath(child, false)
-    child.kill('SIGKILL')
+    killGracefully(child)
   }
 }
 

@@ -940,6 +940,34 @@ describe('resident serve single-flight', () => {
     expect(readMaybe(files.actionsFile)).toBe('a')
   })
 
+  it('SIGTERMs the outgoing resident on a mutation restart instead of hard-killing it', async () => {
+    // A settings mutation replaces a child that may be mid-write. Same lock
+    // hazard as a timeout, so it gets the same grace: SIGKILL here strands the
+    // cache refresh lock the outgoing parse is holding.
+    const signalFile = join(dir, 'restart-signals')
+    fakeBin(
+      'sigterm-aware-resident.js',
+      `const fs = require('node:fs'); const readline = require('node:readline');
+       const command = process.argv[2];
+       if (command === 'serve') {
+         process.on('SIGTERM', () => { fs.appendFileSync(${JSON.stringify(signalFile)}, 'TERM'); process.exit(0); });
+         const rl = readline.createInterface({ input: process.stdin });
+         rl.on('line', line => {
+           const request = JSON.parse(line);
+           process.stdout.write(JSON.stringify({ id: request.id, ok: true, output: JSON.stringify({ via: 'serve' }) }) + '\\n');
+         });
+       } else {
+         process.stdout.write('currency updated');
+       }`,
+    )
+    startServe()
+
+    await expect(spawnCli(['status'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve' })
+    await expect(spawnCliAction(['currency', 'EUR'], { timeoutMs: 5_000 })).resolves.toMatchObject({ ok: true })
+
+    await waitFor(() => readMaybe(signalFile) === 'TERM')
+  })
+
   it('preserves the unexpected-death budget across mutation restarts', async () => {
     const startsFile = join(dir, 'serve-starts')
     const oneShotsFile = join(dir, 'one-shot-reads')
