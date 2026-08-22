@@ -290,10 +290,14 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // same double-count codex-pricing-v1 removed from cost. Cached entries store
   // activeGeneratedTokens/activeDurationMs/toolWaitMs verbatim (cachedCallToApiCall
   // passes them through without recomputing), so this does NOT self-heal either.
+  // codex-mcp-skills-v1 (#478): CLI-wrapped MCP calls and SKILL.md reads made
+  // through the `exec` custom tool or the item model's `CommandExecution` item
+  // were counted as Bash only. Cached sessions store tools/toolSequence/skills
+  // verbatim, so they must re-parse to gain the attribution.
   // activity-price-v1: `codex-auto-review` now prices via the recommended
   // review model. session-cache.json would otherwise keep the pre-alias $0.
-  // Compose all three — a take-ours merge would drop #1075 or #1079.
-  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1-session-meta-fields-v1-codex-pricing-v1-codex-tps-v1-activity-price-v1',
+  // Compose all four — a take-ours merge would drop #1075, #1079, or #1092.
+  codex: 'mcp-attribution-v5-est-cost-active-timing-mcp-wait-rich-capture-v1-cross-provider-pr-v1-session-meta-model-v1-session-meta-fields-v1-codex-pricing-v1-codex-tps-v1-codex-mcp-skills-v1-activity-price-v1',
   cursor: 'composer-anchored-crediting-v1-est-cost',
   'cursor-agent': 'workspaceless-transcript-v1',
   // source-provenance-v1 (#944): CLI sessions were misread as VS Code

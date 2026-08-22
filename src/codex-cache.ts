@@ -34,10 +34,16 @@ import type { ParsedProviderCall } from './providers/types.js'
 // re-parse. Not 12: v12 is claimed by feat/core-extraction's own port of this
 // throughput feature (PR #1086), so reusing it would let two incompatible
 // schemas share a filename.
-// v14: builtin alias prices `codex-auto-review` (#1047). Exact-hit cache
+// v14: MCP + Skill attribution for the shapes the classic `function_call` path
+// never reached (#478) - the `exec` custom tool's `input` program and the item
+// model's `item_completed`/`CommandExecution` item - plus SKILL.md reads landing
+// in `skills`. This file stores each call's `tools`/`toolSequence`/`skills`
+// verbatim (they are passed through on read, never re-derived), so v13 entries
+// keep the old, MCP- and skill-less attribution until they re-parse.
+// v15: builtin alias prices `codex-auto-review` (#1047). Exact-hit cache
 // entries still hold the pre-alias $0; bump so unchanged rollouts reprice.
-// Must be max(main v13 #1079, this)+1 — #1090 left Codex results alone.
-export const CODEX_CACHE_VERSION = 14
+// Must be max(main v14 #1092, this)+1 — #1092 spent v14 on MCP/skills.
+export const CODEX_CACHE_VERSION = 15
 export const CODEX_LEGACY_CACHE_FILE = 'codex-results.json'
 export function codexCacheFileName(version = CODEX_CACHE_VERSION): string {
   return `codex-results.v${version}.json`
