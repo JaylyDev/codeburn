@@ -60,27 +60,81 @@ export function PullRequests({ period, provider, range = null }: { period: Perio
   )
   // The key remounts the content on a period/provider/range switch so row state
   // (an open expansion) never survives onto the same PR rendered from new data.
-  return <PullRequestsContent key={`${period}|${provider}|${range?.from ?? ''}|${range?.to ?? ''}`} overview={overview} />
+  return <PullRequestsContent key={`${period}|${provider}|${range?.from ?? ''}|${range?.to ?? ''}`} overview={overview} period={period} provider={provider} range={range} />
 }
 
-export function PullRequestsContent({ overview }: { overview: Polled<MenubarPayload> }) {
+const PERIOD_LABEL: Record<Period, string> = {
+  today: 'Today',
+  week: 'This week',
+  '30days': 'Last 30 days',
+  month: 'This month',
+  all: 'All',
+  lifetime: 'All',
+}
+
+export function PullRequestsContent({ overview, period = 'today', provider = 'all', range = null }: {
+  overview: Polled<MenubarPayload>
+  period?: Period
+  provider?: string
+  range?: DateRange | null
+}) {
   if (!overview.data) {
     if (overview.error) return <CliErrorPanel error={overview.error} subject="pull requests" />
     return <SectionSkeleton label="Scanning pull requests…" rows={5} />
   }
-  return <PullRequestsPage pullRequests={overview.data.current.pullRequests} staleError={overview.error} />
+  return <PullRequestsPage
+    pullRequests={overview.data.current.pullRequests}
+    staleError={overview.error}
+    period={period}
+    provider={provider}
+    range={range}
+  />
 }
 
-function PullRequestsPage({ pullRequests, staleError }: { pullRequests?: PullRequests; staleError: CliError | null }) {
+function PullRequestsPage({ pullRequests, staleError, period, provider, range }: {
+  pullRequests?: PullRequests
+  staleError: CliError | null
+  period: Period
+  provider: string
+  range: DateRange | null
+}) {
+  const empty = !pullRequests || pullRequests.rows.length === 0
   return (
     <>
       {staleError && <StaleBanner error={staleError} />}
       <Panel title="Pull request spend">
-        {pullRequests && pullRequests.rows.length > 0
-          ? <PrTable pullRequests={pullRequests} />
-          : <EmptyNote>PR links are captured as sessions are parsed. Once a session references a pull request, it appears here.</EmptyNote>}
+        {empty
+          ? <PrEmptyNote period={period} provider={provider} range={range} />
+          : <PrTable pullRequests={pullRequests} />}
       </Panel>
     </>
+  )
+}
+
+function PrEmptyNote({ period, provider, range }: { period: Period; provider: string; range: DateRange | null }) {
+  const [widerCount, setWiderCount] = useState<number | null>(null)
+  const canProbeWider = !range && period !== 'all' && period !== 'lifetime'
+  useEffect(() => {
+    if (!canProbeWider) return
+    let cancelled = false
+    void codeburn.getOverview('all', provider).then(payload => {
+      if (cancelled) return
+      setWiderCount(payload.current.pullRequests?.rows.length ?? 0)
+    }).catch(() => {
+      if (!cancelled) setWiderCount(null)
+    })
+    return () => { cancelled = true }
+  }, [canProbeWider, provider])
+
+  const periodLabel = PERIOD_LABEL[period]
+  const widerHint = widerCount && widerCount > 0
+    ? ` All time has ${widerCount.toLocaleString('en-US')} pull requests — switch the period control to All.`
+    : ''
+  return (
+    <EmptyNote>
+      No sessions in {periodLabel} mentioned a pull request URL. Spend is attributed only when a transcript contains a github.com/…/pull/N link.
+      {widerHint}
+    </EmptyNote>
   )
 }
 
