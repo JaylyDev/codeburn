@@ -3088,10 +3088,9 @@ export function emitScanProgress(event: ScanProgressEvent): void {
 // that an interrupted long run loses little work, high enough that repeated
 // cache writes never dominate the parse.
 const PROGRESS_SAVE_FILE_INTERVAL = 2000
-// Only the claude scan reports per file; every other provider calls saveProgress
-// once, at its own boundary. Without a time floor the counter would never reach
-// the interval during a long non-claude phase and progress saves would simply
-// stop happening there.
+// Every parse phase now reports per file (claude via scanProjectDirs, the rest
+// via parseProviderSources), so this wall-clock floor bounds how much work a
+// mid-phase kill can lose even when the file counter moves slowly.
 const PROGRESS_SAVE_MAX_INTERVAL_MS = 30_000
 
 export function createScanProgress(label: string, total: number) {
@@ -3166,12 +3165,19 @@ function classifiedTurnSlicedToDays(turn: ClassifiedTurn, days: Set<string>): Cl
   return { ...turn, assistantCalls: inRangeCalls, timestamp: inRangeCalls[0]!.timestamp }
 }
 
-async function parseProviderSources(
+export async function parseProviderSources(
   providerName: string,
   sources: SessionSource[],
   seenKeys: Set<string>,
   diskCache: SessionCache,
   dateRange?: DateRange,
+  // Cold-run robustness: called after each source's cache entry lands (mirrors
+  // scanProjectDirs' onFileParsed) so a throttled caller can persist partial
+  // progress mid-provider. Without this a run killed during a large single-
+  // provider phase (e.g. a multi-GB codex corpus) restarted that whole phase
+  // from zero, even though Claude's phase already survived the same kill via
+  // scanProjectDirs.
+  onFileParsed?: () => Promise<void>,
   readOnly = false,
 ): Promise<ProjectSummary[]> {
   const provider = await getProvider(providerName)
@@ -3464,8 +3470,11 @@ async function parseProviderSources(
         section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns: [], failed: true }
         markCacheDirty(diskCache, providerName, source.path)
         warnProviderParseFailure(providerName, source.path, err)
-        continue
       }
+      // Outside the try/catch (matches scanProjectDirs' onFileParsed placement)
+      // so a throttled caller only ever observes this source's cache entry once
+      // it is fully installed above — success or recorded failure, never mid-write.
+      if (onFileParsed) await onFileParsed()
     }
   } finally {
     await pool?.close()
@@ -4813,7 +4822,7 @@ async function runParse(
   for (const [providerName, sources] of providerGroups) {
     emitScanProgress({ kind: 'provider', provider: providerName, state: 'start' })
     try {
-      const projects = await parseProviderSources(providerName, sources, seenKeys, diskCache, dateRange, readOnly)
+      const projects = await parseProviderSources(providerName, sources, seenKeys, diskCache, dateRange, saveProgress, readOnly)
       emitScanProgress({ kind: 'provider', provider: providerName, state: 'done', files: sources.length })
       otherProjects.push(...projects)
     } catch (err) {
@@ -4842,7 +4851,7 @@ async function runParse(
     // constant — both checks are O(1) and avoid a getProvider() dynamic-import
     // round-trip for every unprocessed provider in the disk cache.
     if (!section.durable && !DURABLE_PROVIDER_NAMES.has(providerName)) continue
-    const projects = await parseProviderSources(providerName, [], seenKeys, diskCache, dateRange, readOnly)
+    const projects = await parseProviderSources(providerName, [], seenKeys, diskCache, dateRange, saveProgress, readOnly)
     otherProjects.push(...projects)
   }
 
