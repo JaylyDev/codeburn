@@ -268,7 +268,7 @@ describe('App shortcuts', () => {
     expect(await screen.findByText('No sessions in this range yet.')).toBeInTheDocument()
 
     fireEvent.keyDown(document, { key: '3', ...chord })
-    expect(await screen.findByText(/PR links are captured as sessions are parsed/)).toBeInTheDocument()
+    expect(await screen.findByText(/No sessions in Last 30 days mentioned a pull request URL/)).toBeInTheDocument()
 
     fireEvent.keyDown(document, { key: '4', ...chord })
     expect(await screen.findByText('Cost flow · model → project')).toBeInTheDocument()

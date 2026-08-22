@@ -9,6 +9,7 @@ import { StaleBanner } from '../components/StaleBanner'
 import { type Polled, usePolled } from '../hooks/usePolled'
 import { formatDayShort, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
+import { PERIOD_LABELS } from '../lib/period'
 import type { CliError, DateRange, MenubarPayload, Period } from '../lib/types'
 
 type PullRequests = NonNullable<MenubarPayload['current']['pullRequests']>
@@ -63,19 +64,10 @@ export function PullRequests({ period, provider, range = null }: { period: Perio
   return <PullRequestsContent key={`${period}|${provider}|${range?.from ?? ''}|${range?.to ?? ''}`} overview={overview} period={period} provider={provider} range={range} />
 }
 
-const PERIOD_LABEL: Record<Period, string> = {
-  today: 'Today',
-  week: 'This week',
-  '30days': 'Last 30 days',
-  month: 'This month',
-  all: 'All',
-  lifetime: 'All',
-}
-
-export function PullRequestsContent({ overview, period = 'today', provider = 'all', range = null }: {
+export function PullRequestsContent({ overview, period, provider, range = null }: {
   overview: Polled<MenubarPayload>
-  period?: Period
-  provider?: string
+  period: Period
+  provider: string
   range?: DateRange | null
 }) {
   if (!overview.data) {
@@ -113,11 +105,11 @@ function PullRequestsPage({ pullRequests, staleError, period, provider, range }:
 
 function PrEmptyNote({ period, provider, range }: { period: Period; provider: string; range: DateRange | null }) {
   const [widerCount, setWiderCount] = useState<number | null>(null)
-  const canProbeWider = !range && period !== 'all' && period !== 'lifetime'
+  const canProbeWider = !range && period !== 'lifetime'
   useEffect(() => {
     if (!canProbeWider) return
     let cancelled = false
-    void codeburn.getOverview('all', provider).then(payload => {
+    void codeburn.getOverview('lifetime', provider).then(payload => {
       if (cancelled) return
       setWiderCount(payload.current.pullRequests?.rows.length ?? 0)
     }).catch(() => {
@@ -126,9 +118,9 @@ function PrEmptyNote({ period, provider, range }: { period: Period; provider: st
     return () => { cancelled = true }
   }, [canProbeWider, provider])
 
-  const periodLabel = PERIOD_LABEL[period]
+  const periodLabel = PERIOD_LABELS[period]
   const widerHint = widerCount && widerCount > 0
-    ? ` All time has ${widerCount.toLocaleString('en-US')} pull requests — switch the period control to All.`
+    ? ` Lifetime has ${widerCount.toLocaleString('en-US')} pull requests — switch the period control to Life.`
     : ''
   return (
     <EmptyNote>

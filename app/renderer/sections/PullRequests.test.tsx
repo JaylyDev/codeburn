@@ -284,7 +284,7 @@ describe('PullRequests', () => {
     getOverview.mockResolvedValue(makePayload())
     render(<PullRequests period="lifetime" provider="all" />)
 
-    expect(await screen.findByText(/No sessions in All mentioned a pull request URL/)).toBeInTheDocument()
+    expect(await screen.findByText(/No sessions in Lifetime mentioned a pull request URL/)).toBeInTheDocument()
     expect(screen.queryByRole('table')).toBeNull()
   })
 
@@ -292,19 +292,19 @@ describe('PullRequests', () => {
     getOverview.mockResolvedValue(makePayload({ rows: [], distinctCost: 0, distinctSessions: 0, attributedCost: 0, unattributedCost: 0 }))
     render(<PullRequests period="lifetime" provider="all" />)
 
-    expect(await screen.findByText(/No sessions in All mentioned a pull request URL/)).toBeInTheDocument()
+    expect(await screen.findByText(/No sessions in Lifetime mentioned a pull request URL/)).toBeInTheDocument()
     expect(screen.queryByRole('table')).toBeNull()
   })
 
-  it('names Today and points at All when a wider window has rows', async () => {
+  it('names Today and points at Lifetime when a wider window has rows', async () => {
     getOverview.mockImplementation(async (period: string) => {
-      if (period === 'all') return makePayload(SAMPLE)
+      if (period === 'lifetime') return makePayload(SAMPLE)
       return makePayload()
     })
     render(<PullRequests period="today" provider="all" />)
 
     expect(await screen.findByText(/No sessions in Today mentioned a pull request URL/)).toBeInTheDocument()
-    expect(await screen.findByText(/All time has 2 pull requests/)).toBeInTheDocument()
-    expect(getOverview).toHaveBeenCalledWith('all', 'all')
+    expect(await screen.findByText(/Lifetime has 2 pull requests/)).toBeInTheDocument()
+    expect(getOverview).toHaveBeenCalledWith('lifetime', 'all')
   })
 })
