@@ -271,7 +271,8 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
   // with no error and no way to reach the "Locate the CLI" recovery. Past the
   // cold window itself, a timeout stops being "still indexing" and surfaces.
   const bootedAt = Date.now()
-  const stillCold = (): boolean => !overviewWarmed && Date.now() - bootedAt < WARMUP_TIMEOUT_MS
+  const stillCold = (): boolean =>
+    !overviewWarmed && Date.now() - (coldStartBegan ?? bootedAt) < WARMUP_TIMEOUT_MS
   const coldError = (err: unknown): { kind: string; message: string; cold?: true } => {
     const error = toEnvelopeError(err)
     return stillCold() && error.kind === 'timeout' ? { ...error, cold: true } : error

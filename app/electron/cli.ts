@@ -741,6 +741,44 @@ export function startServe(pidFile?: string): void {
  * `ps` confirms the process is still a codeburn serve. SIGTERM, never SIGKILL:
  * the orphan may be holding the cache refresh lock.
  */
+/**
+ * The live command line of `pid`, or null if it cannot be established.
+ *
+ * POSIX uses `ps -ww` (`-ww` defeats ps's width truncation). Windows has no
+ * equivalent that reports argv: `tasklist` only ever reports the image name and
+ * window title, and `wmic` is removed from current Windows, so this asks CIM for
+ * Win32_Process.CommandLine. `pid` is a validated integer before it is
+ * interpolated, and neither call goes through a shell.
+ */
+function processCommandLine(pid: number): string | null {
+  try {
+    const out = platform() === 'win32'
+      ? execFileSync(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`],
+          { encoding: 'utf-8', timeout: 5_000, windowsHide: true },
+        )
+      : execFileSync('ps', ['-ww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf-8', timeout: 2_000 })
+    return out.trim() || null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Whether a live command line is the serve child we recorded. Exact match, not
+ * a keyword sniff: any looser test signals whatever unrelated process inherited
+ * the pid. Quoting is normalized away because the two sides quote differently —
+ * we record a plain space-joined argv, while Windows reports the real command
+ * line with its quotes intact — so a path containing spaces still round-trips.
+ */
+export function serveCommandMatches(recorded: string, observed: string | null): boolean {
+  if (!observed) return false
+  const normalize = (value: string): string => value.replace(/"/g, ' ').replace(/\s+/g, ' ').trim()
+  const wanted = normalize(recorded)
+  return wanted.length > 0 && normalize(observed) === wanted
+}
+
 export function reapOrphanServe(pidFile: string): void {
   let record: { pid?: unknown; cmd?: unknown }
   try { record = JSON.parse(readFileSync(pidFile, 'utf-8')) } catch { return }
@@ -749,17 +787,7 @@ export function reapOrphanServe(pidFile: string): void {
   const cmd = record.cmd
   if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 1 || pid === process.pid) return
   if (typeof cmd !== 'string' || !cmd) return
-  // No `ps` on Windows, so identity cannot be confirmed there; skipping is
-  // strictly better than signalling a recycled pid.
-  if (platform() === 'win32') return
-  try {
-    // Exact argv match, not a keyword sniff: any looser test signals whatever
-    // unrelated process inherited this pid. -ww defeats ps's width truncation.
-    const command = execFileSync('ps', ['-ww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf-8', timeout: 2_000 })
-    if (command.trim() !== cmd) return
-  } catch {
-    return
-  }
+  if (!serveCommandMatches(cmd, processCommandLine(pid))) return
   try { process.kill(pid, 'SIGTERM') } catch { /* already gone */ }
 }
 

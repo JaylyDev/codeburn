@@ -465,15 +465,21 @@ describe('graceful kill (SIGTERM, then SIGKILL after the grace)', () => {
   it('keeps a child inside the SIGTERM grace reapable, so quit cannot orphan it', async () => {
     // The grace timer dies with the app. A child that ignores SIGTERM must still
     // be in the reap set when quit sweeps, or it survives the app that spawned it.
+    //
+    // The child emits one byte the instant it is ready (pidfile written, handler
+    // installed). Because the watchdog restarts on output, the window is measured
+    // from READINESS rather than from spawn — so node's cold boot, however slow
+    // the machine is, can never eat into it and make this flake.
     const pidFile = join(dir, 'grace-pid')
     fakeBin(
       'ignores-sigterm-quit.js',
       `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
        process.on('SIGTERM', () => {});
+       process.stderr.write('CODEBURN_PROGRESS {"kind":"keepalive"}\\n');
        setInterval(() => {}, 1000);`,
     )
 
-    await expect(spawnCli(['status'], { timeoutMs: 300 })).rejects.toMatchObject({ kind: 'timeout' })
+    await expect(spawnCli(['status'], { timeoutMs: 1_500 })).rejects.toMatchObject({ kind: 'timeout' })
     await waitFor(() => readMaybe(pidFile).length > 0)
     const pid = Number(readMaybe(pidFile))
     expect(() => process.kill(pid, 0)).not.toThrow() // alive, mid-grace

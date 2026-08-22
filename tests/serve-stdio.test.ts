@@ -392,4 +392,42 @@ describe('codeburn serve --stdio', () => {
     expect(typeof answer!['output']).toBe('string')
     expect(() => JSON.parse(answer!['output'] as string)).not.toThrow()
   }, 25_000)
+
+  it('gives up on an async-wedged request at the drain bound instead of lingering', async () => {
+    // The drain must not become the orphan it was added to prevent. A request
+    // that never settles releases the child at the bound (shortened here from
+    // its 45s default, which no legitimate request comes near).
+    const drainMs = 1_500
+    const wedgeChild = spawn(process.execPath, ['--import', 'tsx', join(__dirname, 'fixtures', 'serve-wedged-request.ts')], {
+      stdio: ['pipe', 'pipe', 'ignore'],
+      env: { ...process.env, CODEBURN_SERVE_DRAIN_MS: String(drainMs) },
+    })
+    let stdout = ''
+    const becameReady = new Promise<void>((resolve, reject) => {
+      wedgeChild.once('error', reject)
+      wedgeChild.stdout!.setEncoding('utf8')
+      wedgeChild.stdout!.on('data', (chunk: string) => {
+        stdout += chunk
+        if (stdout.includes('"ready"')) resolve()
+      })
+      wedgeChild.once('exit', () => reject(new Error('serve exited before ready')))
+    })
+    const exited = new Promise<number | null>(resolve => wedgeChild.once('exit', code => resolve(code)))
+
+    await becameReady
+    wedgeChild.stdin!.write(JSON.stringify({ id: 91, args: ['status', '--format', 'json'] }) + '\n')
+    wedgeChild.stdin!.end()
+
+    const began = Date.now()
+    const outcome = await Promise.race([
+      exited.then(() => 'exited' as const),
+      new Promise<'hung'>(resolve => setTimeout(() => resolve('hung'), drainMs + 12_000)),
+    ])
+    const elapsed = Date.now() - began
+    if (outcome === 'hung') { wedgeChild.kill('SIGKILL'); await exited }
+
+    expect(outcome).toBe('exited')
+    // It waited for the request (not an instant return) but did not wait forever.
+    expect(elapsed).toBeGreaterThanOrEqual(drainMs - 250)
+  }, 30_000)
 })
