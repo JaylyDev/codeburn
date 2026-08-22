@@ -7,6 +7,7 @@ import { createHash } from 'crypto'
 import type { Provider, ProbeRoot, SessionSource, SessionParser } from './types.js'
 import { getShortModelName } from '../models.js'
 import { readConfig } from '../config.js'
+import { FS_SCAN_CONCURRENCY, mapWithConcurrency } from '../fs-utils.js'
 
 export type ClaudeConfigSource = {
   id: string
@@ -301,14 +302,19 @@ export const claude: Provider = {
         // a real and a stale path in CLAUDE_CONFIG_DIRS without breaking.
         continue
       }
-      for (const dirName of entries) {
+      // stat() (not the readdir Dirent) decides directory-ness so a symlinked
+      // project dir still counts; issue them concurrently, then apply the
+      // order-sensitive dedup serially.
+      const dirStats = await mapWithConcurrency(entries, FS_SCAN_CONCURRENCY, dirName =>
+        stat(join(projectsDir, dirName)).catch(() => null))
+      for (const [i, dirName] of entries.entries()) {
         const dirPath = join(projectsDir, dirName)
         // Resolve before deduping so two CLAUDE_CONFIG_DIRS entries that
         // reach the same projects/<slug> directory (via symlinks or
         // overlapping configs) emit only one SessionSource.
         const resolved = resolve(dirPath)
         if (seenProjectDirs.has(resolved)) continue
-        const dirStat = await stat(dirPath).catch(() => null)
+        const dirStat = dirStats[i]
         if (!dirStat?.isDirectory()) continue
         seenProjectDirs.add(resolved)
         // `project: dirName` is identical across config dirs for the same
