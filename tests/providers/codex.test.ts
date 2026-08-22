@@ -570,6 +570,82 @@ describe('codex provider - session discovery', () => {
 })
 
 describe('codex provider - JSONL parsing', () => {
+  it('does not treat a nested session_meta model as the active turn model', async () => {
+    const largeSessionMeta = JSON.stringify({
+      type: 'session_meta',
+      timestamp: '2026-04-14T10:00:00Z',
+      payload: {
+        cwd: '/Users/test/model-switch',
+        originator: 'codex-cli',
+        session_id: 'sess-model-switch',
+        base_instructions: {
+          provenance: { type: 'model', model: 'gpt-5.6-sol' },
+          text: 'x'.repeat(40_000),
+        },
+      },
+    })
+    const turnContext = JSON.stringify({
+      type: 'turn_context',
+      timestamp: '2026-04-14T10:00:01Z',
+      payload: { model: 'gpt-5.6-luna' },
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-model-switch.jsonl', [
+      largeSessionMeta,
+      turnContext,
+      tokenCount({ timestamp: '2026-04-14T10:00:02Z', last: { input: 100, output: 50 }, total: { total: 150 } }),
+      largeSessionMeta,
+      tokenCount({ timestamp: '2026-04-14T10:00:03Z', last: { input: 200, output: 100 }, total: { total: 450 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls.map(call => call.model)).toEqual(['gpt-5.6-luna', 'gpt-5.6-luna'])
+  })
+
+  it('reads session_meta cwd/session_id/originator at payload depth 1, not the first nested same-name key', async () => {
+    const largeSessionMeta = JSON.stringify({
+      type: 'session_meta',
+      timestamp: '2026-04-14T10:00:00Z',
+      payload: {
+        dynamic_tools: [{
+          name: 'shadow-tool',
+          cwd: '/shadow/cwd',
+          originator: 'shadow-originator',
+          session_id: 'shadow-session',
+          forked_from_id: 'shadow-fork',
+          model_provider: 'shadow-provider',
+        }],
+        base_instructions: { text: 'x'.repeat(40_000) },
+        cwd: '/Users/test/real-project',
+        originator: 'codex-cli',
+        session_id: 'sess-real',
+        model: 'gpt-5.6-luna',
+        model_provider: 'openai',
+        name: 'real-session-name',
+      },
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-nested-keys.jsonl', [
+      largeSessionMeta,
+      functionCall('exec_command'),
+      tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 100, output: 50 }, total: { total: 150 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.sessionId).toBe('sess-real')
+    expect(calls[0]!.workingDirectory).toBe('/Users/test/real-project')
+    expect(calls[0]!.projectPath).toBe('/Users/test/real-project')
+    expect(calls[0]!.model).toBe('gpt-5.6-luna')
+    expect(calls[0]!.tools).toEqual(['Bash'])
+  })
+
   it('extracts token usage from last_token_usage', async () => {
     const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-parse.jsonl', [
       sessionMeta({ session_id: 'sess-parse', model: 'gpt-5.3-codex' }),
@@ -646,9 +722,56 @@ describe('codex provider - JSONL parsing', () => {
       reasoningTokens: 20,
       tools: ['Bash'],
       activeDurationMs: 7000,
-      activeGeneratedTokens: 120,
+      // Reasoning (20) is a subset of output_tokens (100), not additive
+      // (#1075/#1078/#1079): the billable/throughput numerator is 100, not 120.
+      activeGeneratedTokens: 100,
       toolWaitMs: 3000,
     })
+  })
+
+  it('REGRESSION (#1088 BUG-1): excludes the task_started -> first request-context gap from active time', async () => {
+    // Codex fires task_started before it assembles the request; the 7s gap to
+    // the first request-context event (here, the user message) is CLI/harness
+    // startup, not model wait, and must not count toward active time. If this
+    // ever reverts to windowStart = taskStartedAt, activeDurationMs becomes
+    // 20000 (the full duration_ms) instead of 13000 (20000 - the 7s gap).
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-startup-gap.jsonl', [
+      sessionMeta({ session_id: 'sess-startup-gap', model: 'gpt-5.5' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started' } }),
+      userMessage('run the tool', '2026-04-14T10:00:07Z'),
+      tokenCount({ timestamp: '2026-04-14T10:00:20Z', last: { output: 100 }, total: { output: 100, total: 100 } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:20Z', payload: { type: 'task_complete', duration_ms: 20_000 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ activeGeneratedTokens: 100, activeDurationMs: 13_000, toolWaitMs: 0 })
+  })
+
+  it('#1088 BUG-8: reads a task_complete duration reported as {secs,nanos}, not only a plain number', async () => {
+    // mcp_tool_call_end already tolerates {secs,nanos} and string durations
+    // (durationValueMs); task_complete only read the plain-number duration_ms
+    // field, so a task_complete reported the object form was silently dropped
+    // (no active timing at all) instead of parsed.
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-object-duration.jsonl', [
+      sessionMeta({ session_id: 'sess-object-duration', model: 'gpt-5.5' }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:00Z', payload: { type: 'task_started' } }),
+      userMessage('run the tool', '2026-04-14T10:00:00Z'),
+      tokenCount({ timestamp: '2026-04-14T10:00:10Z', last: { output: 100 }, total: { output: 100, total: 100 } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:10Z', payload: { type: 'task_complete', duration: { secs: 10, nanos: 0 } } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ activeGeneratedTokens: 100, activeDurationMs: 10_000 })
   })
 
   it('keeps estimated output parsing for large token lines without usage info', async () => {
@@ -905,6 +1028,79 @@ describe('codex provider - JSONL parsing', () => {
       'mcp__linear__list_issues',
       'mcp__slack__post_message',
     ])
+  })
+
+  // #478 follow-up: the shapes the `function_call` path never reached. Fixtures
+  // are synthesized from the real shapes seen in Codex rollouts (a `custom_tool_call`
+  // whose payload is an `input` JS program, and an item-model `item_completed`
+  // carrying a `CommandExecution` item with an argv `command`); no real session
+  // content is used.
+  it('attributes MCP + Skill usage from the exec custom tool and the item model', async () => {
+    const customExec = (input: string, callId: string) => JSON.stringify({
+      type: 'response_item',
+      timestamp: '2026-04-14T10:00:30Z',
+      payload: { type: 'custom_tool_call', call_id: callId, name: 'exec', input },
+    })
+    const commandExecutionItem = (command: string[]) => JSON.stringify({
+      type: 'event_msg',
+      timestamp: '2026-04-14T10:00:40Z',
+      payload: { type: 'item_completed', item: { type: 'CommandExecution', command, exit_code: 0 } },
+    })
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-exec-items.jsonl', [
+      sessionMeta({ session_id: 'sess-exec-items', model: 'gpt-5.5' }),
+      userMessage('use the MCP CLI and load a skill'),
+      // custom-tool transport: MCP call and a skill read, both inside the JS program.
+      customExec('const r = await tools.exec_command({cmd:"mcp-cli call github get_issue \'{}\'"}); text(r.output);', 'c1'),
+      customExec('const r = await tools.exec_command({cmd:"sed -n \'1,200p\' /Users/x/.codex/skills/control-in-app-browser/SKILL.md"}); text(r.output);', 'c2'),
+      // Negatives: a lookup subcommand, and a grep that merely mentions a SKILL.md.
+      customExec('const r = await tools.exec_command({cmd:"mcp-cli info github"}); text(r.output);', 'c3'),
+      customExec('const r = await tools.exec_command({cmd:"grep -rn TODO /Users/x/.codex/skills/deploy/SKILL.md"}); text(r.output);', 'c4'),
+      // item model, no matching response item: must attribute on its own.
+      commandExecutionItem(['/bin/zsh', '-lc', "mcp-cli call optimizely-cms-mcp help '{}'"]),
+      commandExecutionItem(['/bin/zsh', '-lc', 'cat /Users/x/.codex/skills/graphify/SKILL.md']),
+      commandExecutionItem(['/bin/zsh', '-lc', 'ls -la']),
+      tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    const tools = calls[0]!.tools
+    // Attribution only: the four custom-tool execs stay Bash, and the item-model
+    // entries add no tool of their own, so the Bash count is unchanged at 4.
+    expect(tools.filter(t => t === 'Bash')).toHaveLength(4)
+    expect(tools.filter(t => t.startsWith('mcp__')).sort()).toEqual([
+      'mcp__github__get_issue',
+      'mcp__optimizely-cms-mcp__help',
+    ])
+    expect(calls[0]!.skills?.slice().sort()).toEqual(['control-in-app-browser', 'graphify'])
+    expect(tools.filter(t => t === 'Skill')).toHaveLength(2)
+  })
+
+  it('counts a command carried by BOTH the response item and the item model once', async () => {
+    const cmd = "mcp-cli call github get_issue '{}'"
+    const filePath = await writeSession(tmpDir, '2026-04-14', 'rollout-both-shapes.jsonl', [
+      sessionMeta({ session_id: 'sess-both-shapes', model: 'gpt-5.5' }),
+      userMessage('call it twice'),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:30Z', payload: { type: 'function_call', name: 'exec_command', arguments: JSON.stringify({ cmd }) } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:31Z', payload: { type: 'item_completed', item: { type: 'CommandExecution', command: ['/bin/zsh', '-lc', cmd] } } }),
+      JSON.stringify({ type: 'response_item', timestamp: '2026-04-14T10:00:32Z', payload: { type: 'function_call', name: 'exec_command', arguments: JSON.stringify({ cmd }) } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-04-14T10:00:33Z', payload: { type: 'item_completed', item: { type: 'CommandExecution', command: ['/bin/zsh', '-lc', cmd] } } }),
+      tokenCount({ timestamp: '2026-04-14T10:01:00Z', last: { input: 300, output: 100 }, total: { total: 400 } }),
+    ])
+
+    const provider = createCodexProvider(tmpDir)
+    const source = { path: filePath, project: 'test', provider: 'codex' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    // Two execs, two MCP attributions - not four.
+    expect(calls[0]!.tools.filter(t => t === 'Bash')).toHaveLength(2)
+    expect(calls[0]!.tools.filter(t => t === 'mcp__github__get_issue')).toHaveLength(2)
   })
 
   it('normalizes Codex subagent tool calls to Agent', async () => {

@@ -372,12 +372,15 @@ describe('aggregateModels', () => {
     expect(above.find(r => r.provider === 'cursor')).toBeUndefined()
   })
 
+  // Providers that report reasoning as a bucket SEPARATE from output still get
+  // it added in. Codex and claude do not - they bill reasoning inside
+  // output_tokens - and that carve-out is covered in codex-pricing-1075.test.ts.
   it('counts reasoning tokens as output tokens', async () => {
     const project = makeProject([
       makeTurn('feature', [
         {
-          provider: 'codex',
-          model: 'gpt-5',
+          provider: 'gemini',
+          model: 'gemini-2.5-pro',
           usage: { ...emptyTokens(), inputTokens: 100, outputTokens: 50, reasoningTokens: 200 },
           costUSD: 1.0,
           tools: [],

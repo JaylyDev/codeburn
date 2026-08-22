@@ -13,6 +13,28 @@ export type ModelCosts = {
   cacheReadCostPerToken: number
   webSearchCostPerRequest: number
   fastMultiplier: number
+  /// True only when the pricing source carried a real cache-write rate. When
+  /// absent/false, `cacheWriteCostPerToken` is the fabricated `1.25 x input`
+  /// default, which is right for Anthropic-style pricing but would invent a
+  /// surcharge on providers that charge nothing extra to write cache. Callers
+  /// that decide WHICH bucket to put tokens in (rather than what to multiply
+  /// them by) must consult this before routing tokens to the cache-write
+  /// bucket. Optional so an incomplete literal defaults to the safe answer.
+  cacheWriteCostIsExplicit?: boolean
+}
+
+/// Providers whose reported `reasoningTokens` are a SUBSET of `outputTokens`
+/// rather than a separate bucket to add on top. OpenAI bills reasoning as part
+/// of output (every codex `token_count` event satisfies input + output ==
+/// total), and Anthropic folds thinking into output the same way, so summing
+/// the two double-counts both the cost and the displayed output tokens.
+const REASONING_INCLUDED_IN_OUTPUT = new Set(['claude', 'codex'])
+
+/// Output tokens to bill and display for one call. Single source of truth so
+/// the pricing sites and the display sums can never disagree about whether a
+/// provider's reasoning tokens are already inside its output count (#1075).
+export function billableOutputTokens(provider: string, outputTokens: number, reasoningTokens: number): number {
+  return REASONING_INCLUDED_IN_OUTPUT.has(provider) ? outputTokens : outputTokens + reasoningTokens
 }
 
 type PriceOverrideRates = {
@@ -37,6 +59,11 @@ type SnapshotEntry = [number, number, number | null, number | null, (number | nu
 
 const LITELLM_URL = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json'
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000
+// Bump whenever a ModelCosts field changes pricing behavior (cacheWriteCostIsExplicit,
+// added in #1075/#1078). A cache written under an older/missing version is treated as a
+// miss instead of read verbatim, so a stale on-disk file can't reintroduce a killed bug
+// for up to CACHE_TTL_MS after an upgrade.
+const CACHE_SCHEMA_VERSION = 2
 const WEB_SEARCH_COST = 0.01
 const ONE_HOUR_CACHE_WRITE_MULTIPLIER_FROM_FIVE_MINUTE_RATE = 1.6
 
@@ -71,6 +98,7 @@ function buildCosts(
     cacheReadCostPerToken: cacheRead ?? input * 0.1,
     webSearchCostPerRequest: WEB_SEARCH_COST,
     fastMultiplier: fast ?? 1,
+    cacheWriteCostIsExplicit: cacheWrite !== null && cacheWrite !== undefined,
   }
 }
 
@@ -200,6 +228,7 @@ async function fetchAndCachePricing(): Promise<Map<string, ModelCosts>> {
 
   await mkdir(getCodeburnCacheDir(), { recursive: true })
   await writeFile(getCachePath(), JSON.stringify({
+    version: CACHE_SCHEMA_VERSION,
     timestamp: Date.now(),
     data: Object.fromEntries(pricing),
   }))
@@ -210,7 +239,8 @@ async function fetchAndCachePricing(): Promise<Map<string, ModelCosts>> {
 async function loadCachedPricing(): Promise<Map<string, ModelCosts> | null> {
   try {
     const raw = await readFile(getCachePath(), 'utf-8')
-    const cached = JSON.parse(raw) as { timestamp: number; data: Record<string, ModelCosts> }
+    const cached = JSON.parse(raw) as { version?: number; timestamp: number; data: Record<string, ModelCosts> }
+    if (cached.version !== CACHE_SCHEMA_VERSION) return null
     if (Date.now() - cached.timestamp > CACHE_TTL_MS) return null
     return new Map(Object.entries(cached.data))
   } catch {
@@ -225,21 +255,30 @@ function mergeSnapshotFallbacks(pricing: Map<string, ModelCosts>): Map<string, M
   return applyBuiltinPriceOverrides(pricing)
 }
 
+function setPricingCache(pricing: Map<string, ModelCosts>): void {
+  pricingCache = pricing
+  sortedPricingKeys = null
+  lowercasePricingIndex = null
+  knownNamespaces = null
+}
+
 export async function loadPricing(): Promise<void> {
   const cached = await loadCachedPricing()
   if (cached) {
-    pricingCache = mergeSnapshotFallbacks(cached)
-    sortedPricingKeys = null
-    lowercasePricingIndex = null
-    knownNamespaces = null
+    setPricingCache(mergeSnapshotFallbacks(cached))
+    return
+  }
+
+  // Test-only escape hatch, set for the whole suite in
+  // tests/setup/env-isolation.ts: skip the live LiteLLM fetch and price purely
+  // off the bundled snapshot, so an upstream reprice can't turn tests red.
+  if (process.env['CODEBURN_PRICING_SNAPSHOT_ONLY']) {
+    setPricingCache(mergeSnapshotFallbacks(new Map()))
     return
   }
 
   try {
-    pricingCache = mergeSnapshotFallbacks(await fetchAndCachePricing())
-    sortedPricingKeys = null
-    lowercasePricingIndex = null
-    knownNamespaces = null
+    setPricingCache(mergeSnapshotFallbacks(await fetchAndCachePricing()))
   } catch {
     // snapshot already loaded at init; nothing more to do
   }

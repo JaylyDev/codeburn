@@ -37,6 +37,19 @@ function unavailable(provider: ProviderName, connection: QuotaProvider['connecti
   return { provider, connection, primary: null, details: [], planLabel: null, footerLines: [] }
 }
 
+/**
+ * The Codex live gauge needs read-write access to the Codex CLI's own
+ * `~/.codex/auth.json`, because refreshing the OAuth grant rotates the token
+ * and writes it back. A store-distributed snap should not hold write access to
+ * another vendor's credential file, so the snap's personal-files declaration
+ * requests neither that file nor a Codex root, and the gauge is disabled here
+ * to match. Codex usage and cost analytics are unaffected: those come from the
+ * session rollouts under `~/.codex/sessions`, which the snap does read.
+ */
+function codexQuotaSupported(): boolean {
+  return !process.env['SNAP']
+}
+
 export class QuotaService {
   private readonly deps: QuotaDeps
   private cache: { at: number; value: QuotaProvider[] } | null = null
@@ -115,7 +128,10 @@ export class QuotaService {
       if (this.controllers[provider] === controller) this.controllers[provider] = undefined
       return retainOnFailure(result.quota)
     }
-    const value = await Promise.all([run('claude'), run('codex')])
+    const value = await Promise.all([
+      run('claude'),
+      codexQuotaSupported() ? run('codex') : Promise.resolve(unavailable('codex', 'disconnected')),
+    ])
     if (startingGenerations.claude === this.generations.claude && startingGenerations.codex === this.generations.codex) {
       this.cache = { at: this.deps.now(), value }
     }

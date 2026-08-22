@@ -6,6 +6,24 @@ import { join } from 'path'
 import { getCodeburnCacheDir } from './cache-dir.js'
 import type { DateRange, ProjectSummary } from './types.js'
 
+// Bumped to 20: the Codex fast-path read a nested
+// `base_instructions.provenance.model` out of `session_meta` as if it were
+// `payload.model` (#1040), so every call a rollout attributed from session
+// metadata - the ones before its first `turn_context`, and every one after a
+// mid-file `session_meta` - was credited to the wrong model. The codex parse
+// version and CODEX_CACHE_VERSION move with it, but the daily cache has no
+// per-provider invalidation, so days already finalized keep the wrong model
+// rows forever unless MIN_SUPPORTED_VERSION moves too. This pass re-derives
+// ALL days for EVERY provider off the warm session cache, so it costs seconds
+// rather than a full re-parse, and it is lossless: adoptOlderDailyCaches keeps
+// the superseded v19 file as the baseline, and the partial-survival guard from
+// #1033 holds any day whose sources have only partly aged out. On a real
+// 110-day cache the 19 -> 20 pass moved ZERO days down and lost none: 100 days
+// came back byte-identical and 9 grok days rose by $19.80 in total, clearing
+// rollups the grok parse change had left stale, while every codex model row
+// stayed identical (that corpus predates the `provenance` field, so the fix it
+// carries has nothing to correct there).
+//
 // Bumped to 19: Grok authoritative usage now keeps one session-level rollup
 // from top-level totals, clamps reasoning to reported output, and labels mixed
 // authoritative/heuristic coverage. Every day finalized under the previous
@@ -92,8 +110,29 @@ import type { DateRange, ProjectSummary } from './types.js'
 // that older binaries skipped. v8 added local-model savings to the daily
 // rollup; the `savingsConfigHash` field is invalidated separately when the
 // user changes their `localModelSavings` mapping.
-export const DAILY_CACHE_VERSION = 19
-const MIN_SUPPORTED_VERSION = 19
+// v23: codex pricing fix (#1075) - reasoning tokens were billed on top of
+// output (they are a subset of it) and cache_write_input_tokens was ignored, so
+// days finalized at v20 carry codex costs overstated by ~3.5% and codex output
+// tokens overstated by ~34.6%. Raising MIN_SUPPORTED_VERSION forces the
+// one-time re-derivation.
+// It takes 23, not 21: v21 is claimed by the #946 landing branch and v22 by
+// PR #1056, so those numbers are spoken for and reusing one would let two
+// incompatible schemas share a filename. (feat/core-extraction sits at 26 and
+// reconciles at its final merge by keeping the max.)
+//
+// v24: gpt-5.6-codex / gpt-5.6-codex-max pricing (#1077) - added as explicit
+// litellm-snapshot.json rows. getModelCosts already resolved both ids to the
+// correct rate via the `gpt-5.6` prefix fallback before this landed, so a day
+// finalized on any binary that had a `gpt-5.6` snapshot row already carries
+// the right cost; this bump only matters for a day finalized before THAT (a
+// window where neither existed). The daily cache has no per-provider
+// invalidation, so there is no way to tell those days apart from here -
+// raising MIN_SUPPORTED_VERSION forces the one-time re-derivation for
+// everyone, which is a lossless no-op for days already correct. #1056 also
+// claims 24 on its own branch (unmerged as of this writing); whichever lands
+// second takes the next number instead of reusing this one.
+export const DAILY_CACHE_VERSION = 24
+const MIN_SUPPORTED_VERSION = 24
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including

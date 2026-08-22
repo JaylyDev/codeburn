@@ -463,18 +463,19 @@ describe('buildPeriodDataFromDays', () => {
 })
 
 describe('daily-cache ↔ report daily-bucket parity', () => {
-  // The daily cache (history.daily + provider breakdown) and the live report /
-  // headline (main.ts daily rollup) must bucket days by the SAME rule, or their
-  // per-day totals drift and their period sums diverge from current.cost at
-  // window boundaries — the V1 audit's constant -$3.45/-81-calls finding. Both
-  // are now PER-CALL for cost/savings/calls (issue #852) with turn-level stats
-  // still turn-anchored: this asserts per-day equality against a reference
-  // that mirrors main.ts buildJsonReport's dailyMap fallback (each call on its
-  // own date), plus the invariant history.daily Σ == report.daily Σ == total
-  // call cost.
+  // The daily cache (history.daily + provider breakdown) and JSON-report
+  // daily[] rows (durable.days from buildDurablePeriod) must bucket days by the
+  // SAME rule, or their per-day totals drift and their period sums diverge from
+  // current.cost at window boundaries — the V1 audit's constant -$3.45/-81-calls
+  // finding. Both are now PER-CALL for cost/savings/calls (issue #852) with
+  // turn-level stats still turn-anchored: this asserts per-day equality against
+  // an independent per-call oracle for the durable day aggregation used by
+  // durable.days (each call on its own date), plus the invariant
+  // history.daily Σ == report.daily Σ == total call cost.
 
-  // Mirrors the live report/headline daily rollup fallback in src/main.ts
-  // (cost/savings/calls bucket under each call's own date).
+  // Independent per-call reference for durable.days (cost/savings/calls bucket
+  // under each call's own date). Not a live buildJsonReport fallback — that
+  // path was deleted in #1067.
   function reportDailyByDate(projects: ProjectSummary[]): Record<string, number> {
     const byDate: Record<string, number> = {}
     for (const p of projects) {

@@ -5,8 +5,9 @@ import { basename, join } from 'path'
 import { homedir } from 'os'
 
 import { readSessionLines } from '../fs-utils.js'
-import { calculateCost } from '../models.js'
+import { billableOutputTokens, calculateCost, getModelCosts } from '../models.js'
 import { readCachedCodexResults, writeCachedCodexResults, getCachedCodexProject, fingerprintFile, type CodexFileFingerprint } from '../codex-cache.js'
+import { mergeToolIntervals } from '../codex-throughput.js'
 import { normalizeContentBlocks } from '../content-utils.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ToolCall } from '../types.js'
@@ -66,17 +67,44 @@ const toolNameMap: Record<string, string> = {
 // false-positive, an accepted tradeoff for the common case. \s+ and the token
 // class don't overlap, so there is no catastrophic backtracking.
 const MCP_CLI_CALL = /(?<![\w.-])mcp-cli(?:\s+(?!call\b)[^\s;|&]+)*\s+call\s+(\S+)\s+(\S+)/
-function mcpToolFromShellCommand(command: unknown): string | null {
-  const text = typeof command === 'string'
-    ? command
-    : Array.isArray(command) ? command.filter(x => typeof x === 'string').join(' ') : ''
-  if (!text) return null
+function mcpToolFromShellCommand(text: string): string | null {
   const m = MCP_CLI_CALL.exec(text)
   if (!m) return null
   const server = m[1]!.replace(/['"]/g, '')
   const tool = m[2]!.replace(/['"]/g, '')
   if (!server || !tool) return null
   return `mcp__${server}__${tool}`
+}
+
+// Codex has no dedicated skill tool: loading a skill is an ordinary shell exec
+// that reads the skill's `SKILL.md`, so the usage landed entirely under Bash and
+// the Skills dimension stayed empty (#478). Recognize only a *read* of a
+// SKILL.md, deliberately narrowly:
+//   - the command segment must start with a file-reading binary (cat/sed/head/
+//     tail/less/more/bat) — a `grep`/`rg`/`ls` that merely mentions a SKILL.md
+//     is a search near the file, not a skill load, and stays plain Bash;
+//   - the path it reads must END in `<name>/SKILL.md`, so `<name>` is the skill.
+// The name is the parent directory, the same key `src/providers/pi.ts` derives
+// for a native skill read (#588) and the same vocabulary the Claude parser
+// records from the `Skill` tool, so the Skills breakdown stays cross-provider
+// coherent. Substring matching, so a command that merely quotes the phrase can
+// false-positive — the same accepted tradeoff as MCP_CLI_CALL above.
+const SKILL_MD_READ = /(?<![\w.-])(?:cat|bat|sed|head|tail|less|more)\b[^;|&]*?[\s'"]([^\s;|&'"]*[\\/]([^\\/;|&'"]+)[\\/]SKILL\.md)\b/
+function skillFromShellCommand(text: string): string | null {
+  const m = SKILL_MD_READ.exec(text)
+  const name = m?.[2]?.trim()
+  return name ? name : null
+}
+
+/// Flatten every shape Codex records a shell command in to one string:
+/// `function_call` arguments carry it as a plain string, the item model's
+/// `CommandExecution` item as an argv array (`["/bin/zsh","-lc","..."]`), and
+/// the `exec` custom tool as the JS program that calls `tools.exec_command`.
+/// One text, one classification pipeline (#478).
+function shellCommandText(command: unknown): string {
+  if (typeof command === 'string') return command
+  if (Array.isArray(command)) return command.filter(x => typeof x === 'string').join(' ')
+  return ''
 }
 
 // Count added/removed lines from a Codex `patch_apply_end` change's
@@ -126,6 +154,10 @@ type CodexEntry = {
 type CodexTokenUsage = {
   input_tokens?: number
   cached_input_tokens?: number
+  /// Portion of `input_tokens` that was WRITTEN to the prompt cache this call
+  /// (codex PR #33454). Like `cached_input_tokens`, it is carved out of
+  /// `input_tokens`, not added on top.
+  cache_write_input_tokens?: number
   output_tokens?: number
   reasoning_output_tokens?: number
   total_tokens?: number
@@ -323,6 +355,7 @@ function getRawTokenUsage(head: string, field: 'last_token_usage' | 'total_token
   return {
     input_tokens: getRawJsonNumberField(body, 'input_tokens'),
     cached_input_tokens: getRawJsonNumberField(body, 'cached_input_tokens'),
+    cache_write_input_tokens: getRawJsonNumberField(body, 'cache_write_input_tokens'),
     output_tokens: getRawJsonNumberField(body, 'output_tokens'),
     reasoning_output_tokens: getRawJsonNumberField(body, 'reasoning_output_tokens'),
     total_tokens: getRawJsonNumberField(body, 'total_tokens'),
@@ -431,7 +464,16 @@ function parseCodexLine(line: string | Buffer): CodexEntry | null {
     ? getRawDurationMs(getRawPayloadFieldWindow(line, 'duration') ?? '')
     : undefined
   const timingDuration = payloadDuration ?? getRawDurationMs(pHead) ?? getRawDurationMs(timingTail)
-  const compactModel = getRawJsonStringField(pHead, 'model')
+  // session_meta can embed same-name keys under base_instructions /
+  // dynamic_tools (including provenance.model). A depth-agnostic scan of the
+  // compact head steals the first nested hit and can overwrite turn_context.
+  // Restrict every session_meta string field to payload depth 1. Other event
+  // types keep the cheap first-match scan.
+  const payloadString = (field: string): string | undefined =>
+    type === 'session_meta'
+      ? getRawJsonStringField(getRawPayloadFieldWindow(line, field) ?? '', field)
+      : getRawJsonStringField(pHead, field)
+  const compactModel = payloadString('model')
   const compactModelName = getRawJsonStringField(pHead, 'model_name')
   const compactLastUsage = getRawTokenUsage(pHead, 'last_token_usage')
   const compactTotalUsage = getRawTokenUsage(pHead, 'total_token_usage')
@@ -446,13 +488,13 @@ function parseCodexLine(line: string | Buffer): CodexEntry | null {
     payload: {
       type: payloadType,
       role,
-      cwd: getRawJsonStringField(pHead, 'cwd'),
-      model_provider: getRawJsonStringField(pHead, 'model_provider'),
-      originator: getRawJsonStringField(pHead, 'originator'),
-      session_id: getRawJsonStringField(pHead, 'session_id'),
-      forked_from_id: getRawJsonStringField(pHead, 'forked_from_id'),
-      model: getRawJsonStringField(pHead, 'model'),
-      name: getRawJsonStringField(pHead, 'name'),
+      cwd: payloadString('cwd'),
+      model_provider: payloadString('model_provider'),
+      originator: payloadString('originator'),
+      session_id: payloadString('session_id'),
+      forked_from_id: payloadString('forked_from_id'),
+      model: compactModel,
+      name: payloadString('name'),
       invocation,
       call_id: getRawJsonStringField(pHead, 'call_id'),
       turn_id: getRawJsonStringField(pHead, 'turn_id'),
@@ -584,10 +626,14 @@ type CodexResumeState = {
   prevCumulativeTotal: number | null
   prevInput: number
   prevCached: number
+  prevCacheWrite: number
   prevOutput: number
   prevReasoning: number
   pendingTools: string[]
   pendingToolSequence: ToolCall[][]
+  /// Optional so a resume state written before skills attribution existed still
+  /// decodes (isResumeState does not require it); absent reads as "no skills".
+  pendingSkills?: string[]
   pendingUserMessage: string
   pendingOutputChars: number
   pendingLocAdded: number
@@ -597,6 +643,12 @@ type CodexResumeState = {
   turnCounter: number
   currentTurnId: string
   taskStartedAt?: number
+  // #1088 BUG-1: timestamp of the first request-context event (turn_context,
+  // world_state, event_msg/user_message, or response_item/message) seen since
+  // the last task_started. Codex fires task_started before it assembles the
+  // request, so the gap up to this event is CLI/harness startup, not model
+  // wait -- the active window for Tok/s starts here, not at task_started.
+  taskActiveStartedAt?: number
 }
 
 // The state comes back off our own JSON cache; a truncated or hand-edited file
@@ -610,6 +662,7 @@ function isResumeState(value: unknown): value is CodexResumeState {
     && (v['prevCumulativeTotal'] === null || typeof v['prevCumulativeTotal'] === 'number')
     && typeof v['prevInput'] === 'number'
     && typeof v['prevCached'] === 'number'
+    && typeof v['prevCacheWrite'] === 'number'
     && typeof v['prevOutput'] === 'number'
     && typeof v['prevReasoning'] === 'number'
     && Array.isArray(v['pendingTools'])
@@ -669,10 +722,51 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
       let prevCumulativeTotal: number | null = resume?.state.prevCumulativeTotal ?? null
       let prevInput = resume?.state.prevInput ?? 0
       let prevCached = resume?.state.prevCached ?? 0
+      let prevCacheWrite = resume?.state.prevCacheWrite ?? 0
       let prevOutput = resume?.state.prevOutput ?? 0
       let prevReasoning = resume?.state.prevReasoning ?? 0
       let pendingTools: string[] = resume ? [...resume.state.pendingTools] : []
       let pendingToolSequence: ToolCall[][] = resume ? [...resume.state.pendingToolSequence] : []
+      let pendingSkills: string[] = resume?.state.pendingSkills ? [...resume.state.pendingSkills] : []
+      // Attribution names already emitted from a `response_item` tool call.
+      // Codex's item model repeats a finished shell command as
+      // `item_completed`/`CommandExecution`; a rollout that carries BOTH shapes
+      // must attribute the call once, and one that carries ONLY the item must
+      // still attribute it. Counting per derived name (not per command text,
+      // which the two shapes spell differently - argv array vs plain string)
+      // makes repeats of the same call line up one-for-one. The response item is
+      // always written first (the model requests the call, the item completes
+      // it), so the item side only ever cancels an attribution, never adds a
+      // duplicate.
+      const itemDedup = new Map<string, number>()
+
+      /// The single classification pipeline every Codex shell-command shape
+      /// feeds (#478): `function_call` arguments, the `exec` custom tool's JS
+      /// `input`, and the item model's `CommandExecution` item. It adds MCP and
+      /// Skill attribution only - the exec itself is counted as Bash by its
+      /// response item, and `viaItem` calls never add a tool of their own, so
+      /// call/token/cost totals cannot move.
+      const attributeShellCommand = (text: string, viaItem: boolean): void => {
+        if (!text) return
+        const claim = (name: string): boolean => {
+          const pending = itemDedup.get(name) ?? 0
+          if (!viaItem) { itemDedup.set(name, pending + 1); return true }
+          if (pending === 0) return true
+          itemDedup.set(name, pending - 1)
+          return false
+        }
+        const mcpTool = mcpToolFromShellCommand(text)
+        if (mcpTool && claim(mcpTool)) {
+          pendingTools.push(mcpTool)
+          pendingToolSequence.push([{ tool: mcpTool }])
+        }
+        const skill = skillFromShellCommand(text)
+        if (skill && claim(`skill:${skill}`)) {
+          pendingSkills.push(skill)
+          pendingTools.push('Skill')
+          pendingToolSequence.push([{ tool: 'Skill', file: skill }])
+        }
+      }
       let pendingUserMessage = resume?.state.pendingUserMessage ?? ''
       let pendingOutputChars = resume?.state.pendingOutputChars ?? 0
       // Rich-session-capture: edit LOC deltas and failed-patch count accumulated
@@ -703,6 +797,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
       let taskGeneratedTokens = 0
       let taskToolIntervals: Array<[number, number]> = []
       let taskStartedAt: number | undefined = resume?.state.taskStartedAt
+      let taskActiveStartedAt: number | undefined = resume?.state.taskActiveStartedAt
       const openToolStarts = new Map<string, number>()
 
       // Resume point for the NEXT run, refreshed at every task boundary.
@@ -746,6 +841,22 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           continue
         }
 
+        // #1088 BUG-1: the first request-context event since task_started marks
+        // where model-request assembly actually began. Checked before any of
+        // these types `continue` below, and unconditionally (like turn_context's
+        // model capture above) so a forked replay's own request-context events
+        // still mark it -- matching how those events are already read regardless
+        // of isForkReplay, which only filters task boundaries and tool events.
+        if (taskActiveStartedAt === undefined && (
+          entry.type === 'turn_context'
+          || entry.type === 'world_state'
+          || (entry.type === 'event_msg' && entry.payload?.type === 'user_message')
+          || (entry.type === 'response_item' && entry.payload?.type === 'message')
+        )) {
+          const ctxAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+          if (Number.isFinite(ctxAt)) taskActiveStartedAt = ctxAt
+        }
+
         if (entry.type === 'turn_context' && typeof entry.payload?.model === 'string') {
           sessionModel = entry.payload.model
           continue
@@ -760,6 +871,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           entry.payload?.type === 'custom_tool_call' ||
           entry.payload?.type === 'custom_tool_call_output' ||
           entry.payload?.type === 'mcp_tool_call_end' ||
+          entry.payload?.type === 'item_completed' ||
           entry.payload?.type === 'patch_apply_end'
         )) continue
 
@@ -772,6 +884,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           taskToolIntervals = []
           const startedAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
           taskStartedAt = Number.isFinite(startedAt) ? startedAt : undefined
+          taskActiveStartedAt = undefined
           openToolStarts.clear()
           // Everything decoded so far is now in `results` and the per-task
           // accumulators are empty: a clean restart point for an appended tail.
@@ -786,10 +899,12 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             prevCumulativeTotal,
             prevInput,
             prevCached,
+            prevCacheWrite,
             prevOutput,
             prevReasoning,
             pendingTools: [...pendingTools],
             pendingToolSequence: [...pendingToolSequence],
+            pendingSkills: [...pendingSkills],
             pendingUserMessage,
             pendingOutputChars,
             pendingLocAdded,
@@ -799,6 +914,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             turnCounter,
             currentTurnId,
             ...(taskStartedAt !== undefined ? { taskStartedAt } : {}),
+            ...(taskActiveStartedAt !== undefined ? { taskActiveStartedAt } : {}),
           }
           continue
         }
@@ -817,13 +933,21 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             if (typeof fp === 'string') call.file = fp
             const cmd = args['command'] ?? args['cmd']
             if (typeof cmd === 'string') call.command = cmd
-            // Attribute a CLI-wrapped MCP call (e.g. `mcp-cli call server tool`)
-            // to the MCP breakdown too; the exec still counts as Bash above.
-            const mcpTool = mcpToolFromShellCommand(cmd)
-            if (mcpTool) {
-              pendingTools.push(mcpTool)
-              pendingToolSequence.push([{ tool: mcpTool }])
-            }
+            attributeShellCommand(shellCommandText(cmd), false)
+          }
+          // A `custom_tool_call` has no `arguments`: the shell tool's payload is
+          // the `input` program that calls `tools.exec_command({cmd: ...})`. The
+          // MCP/skill matchers never saw it, so a CLI-wrapped MCP call or a
+          // SKILL.md read made through Codex's custom-tool transport counted only
+          // as Bash (#478). Restricted to the shell tool: `apply_patch` is a
+          // custom tool too and its `input` is file content, where a documented
+          // command would read as a real invocation. `call.command` is
+          // deliberately NOT set from it either - that field feeds the retry
+          // heuristic's read-shaped-command test, and a JS program is not a
+          // shell command.
+          if (mapped === 'Bash') {
+            const input = (entry.payload as Record<string, unknown>)['input']
+            if (typeof input === 'string') attributeShellCommand(input, false)
           }
           const callId = entry.payload.call_id
           const started = entry.timestamp ? Date.parse(entry.timestamp) : NaN
@@ -842,26 +966,33 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
         }
 
         if (entry.type === 'event_msg' && entry.payload?.type === 'task_complete') {
-          const durationMs = entry.payload.duration_ms
+          // #1088 BUG-8: task_complete's duration can arrive as {secs,nanos} or
+          // a string too (mcp_tool_call_end already tolerates both, below, via
+          // this same durationValueMs helper); read it the same permissive way
+          // instead of only the plain-number `duration_ms` field.
+          const durationMs = durationValueMs(entry.payload.duration_ms) ?? durationValueMs(entry.payload.duration)
           if (typeof durationMs === 'number' && durationMs > 0 && taskGeneratedTokens > 0 && pendingTaskCalls.length > 0) {
             const completedAt = entry.timestamp ? Date.parse(entry.timestamp) : NaN
-            const windowStart = taskStartedAt ?? (Number.isFinite(completedAt) ? completedAt - durationMs : undefined)
-            const windowEnd = windowStart !== undefined ? windowStart + durationMs : undefined
-            const clipped = taskToolIntervals.map(([start, end]) => [
-              windowStart !== undefined ? Math.max(start, windowStart) : start,
-              windowEnd !== undefined ? Math.min(end, windowEnd) : end,
-            ] as [number, number]).filter(([start, end]) => end > start)
-            const merged = clipped.sort((a, b) => a[0] - b[0]).reduce<Array<[number, number]>>((acc, interval) => {
-              const previous = acc.at(-1)
-              if (previous && interval[0] <= previous[1]) previous[1] = Math.max(previous[1], interval[1])
-              else acc.push([...interval])
-              return acc
-            }, [])
-            const toolWaitMs = Math.min(durationMs, merged.reduce((sum, interval) => sum + interval[1] - interval[0], 0))
-            const activeMs = durationMs - toolWaitMs
+            // #1088 BUG-1: Codex fires task_started before it assembles the
+            // request, so the gap up to the first request-context event is
+            // CLI/harness startup, not model wait. The active window starts
+            // there instead of at task_started; task completion (windowEnd,
+            // inside mergeToolIntervals) is unchanged.
+            const activeWindowStart = taskActiveStartedAt ?? taskStartedAt
+            const startupGapMs = activeWindowStart !== undefined && taskStartedAt !== undefined
+              ? activeWindowStart - taskStartedAt
+              : 0
+            const effectiveDurationMs = Math.max(0, durationMs - startupGapMs)
+            // #1088 BUG-8: shared with codex-throughput.ts's live estimate
+            // instead of a second inline copy of the same clip/merge/cap.
+            const toolWaitMs = mergeToolIntervals(taskToolIntervals, effectiveDurationMs, activeWindowStart, Number.isFinite(completedAt) ? completedAt : undefined)
+            const activeMs = effectiveDurationMs - toolWaitMs
             if (activeMs <= 0) continue
             for (const call of pendingTaskCalls) {
-              const generated = call.outputTokens + call.reasoningTokens
+              // Reasoning is already inside output_tokens (#1075/#1078); the
+              // throughput numerator must agree with the cost numerator or
+              // Tok/s reads high for reasoning-heavy calls (#1079).
+              const generated = billableOutputTokens('codex', call.outputTokens, call.reasoningTokens)
               if (generated <= 0) continue
               call.activeGeneratedTokens = generated
               call.activeDurationMs = activeMs * (generated / taskGeneratedTokens)
@@ -914,6 +1045,21 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           continue
         }
 
+        // Codex's item model records a finished shell command as
+        // `event_msg`/`item_completed` carrying a `CommandExecution` item whose
+        // `command` is the argv array (`["/bin/zsh","-lc","..."]`) - a shape the
+        // `function_call`-only tool path never reached, so a CLI-wrapped MCP call
+        // or a SKILL.md read made under it stayed invisible (#478). Attribution
+        // only: the exec's own Bash count comes from its response item, exactly
+        // as `exec_command_end` is left alone for the classic transport.
+        if (entry.type === 'event_msg' && entry.payload?.type === 'item_completed') {
+          const item = (entry.payload as Record<string, unknown>)['item'] as Record<string, unknown> | undefined
+          if (item && item['type'] === 'CommandExecution') {
+            attributeShellCommand(shellCommandText(item['command']), true)
+          }
+          continue
+        }
+
         if (entry.type === 'response_item' && entry.payload?.type === 'message' && entry.payload?.role === 'user') {
           const texts = normalizeContentBlocks(entry.payload.content)
             .filter(c => c.type === 'input_text')
@@ -950,7 +1096,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             const timestamp = entry.timestamp ?? ''
             const dedupKey = `codex:${sessionId}:${timestamp}:est${estCounter++}`
 
-            if (seenKeys.has(dedupKey)) { pendingTools = []; pendingToolSequence = []; pendingUserMessage = ''; pendingOutputChars = 0; pendingLocAdded = 0; pendingLocRemoved = 0; pendingEditFailed = 0; continue }
+            if (seenKeys.has(dedupKey)) { pendingTools = []; pendingToolSequence = []; pendingSkills = []; pendingUserMessage = ''; pendingOutputChars = 0; pendingLocAdded = 0; pendingLocRemoved = 0; pendingEditFailed = 0; continue }
             seenKeys.add(dedupKey)
 
             const costUSD = calculateCost(model, estInput, estOutput, 0, 0, 0)
@@ -974,6 +1120,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
               deduplicationKey: dedupKey,
               turnId: currentTurnId,
               toolSequence: pendingToolSequence.length > 0 ? pendingToolSequence : undefined,
+              ...(pendingSkills.length > 0 ? { skills: pendingSkills } : {}),
               userMessage: pendingUserMessage,
               sessionId,
               ...(sessionCwd ? { projectPath: sessionCwd, workingDirectory: sessionCwd } : {}),
@@ -985,6 +1132,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
 
             pendingTools = []
             pendingToolSequence = []
+            pendingSkills = []
             pendingUserMessage = ''
             pendingOutputChars = 0
             pendingLocAdded = 0
@@ -1005,12 +1153,14 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           const last = info.last_token_usage
           let inputTokens = 0
           let cachedInputTokens = 0
+          let cacheWriteTokens = 0
           let outputTokens = 0
           let reasoningTokens = 0
 
           if (last) {
             inputTokens = last.input_tokens ?? 0
             cachedInputTokens = last.cached_input_tokens ?? 0
+            cacheWriteTokens = last.cache_write_input_tokens ?? 0
             outputTokens = last.output_tokens ?? 0
             reasoningTokens = last.reasoning_output_tokens ?? 0
           } else if (cumulativeTotal > 0) {
@@ -1018,6 +1168,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             if (!total) continue
             inputTokens = (total.input_tokens ?? 0) - prevInput
             cachedInputTokens = (total.cached_input_tokens ?? 0) - prevCached
+            cacheWriteTokens = (total.cache_write_input_tokens ?? 0) - prevCacheWrite
             outputTokens = (total.output_tokens ?? 0) - prevOutput
             reasoningTokens = (total.reasoning_output_tokens ?? 0) - prevReasoning
           }
@@ -1033,6 +1184,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           if (total) {
             prevInput = total.input_tokens ?? 0
             prevCached = total.cached_input_tokens ?? 0
+            prevCacheWrite = total.cache_write_input_tokens ?? 0
             prevOutput = total.output_tokens ?? 0
             prevReasoning = total.reasoning_output_tokens ?? 0
           }
@@ -1044,7 +1196,22 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           // Normalize to Anthropic semantics: inputTokens = non-cached only.
           const uncachedInputTokens = Math.max(0, inputTokens - cachedInputTokens)
 
+          // Cache writes are carved out of the uncached input, never added to
+          // it: clamp so a malformed or lagging count can never drive the plain
+          // input bucket negative.
+          const cacheWriteInputTokens = Math.max(0, Math.min(cacheWriteTokens, uncachedInputTokens))
+
           const model = resolveModel(entry.payload, sessionModel)
+          // Only move tokens into the cache-write bucket when the pricing
+          // source publishes a real cache-write rate for this model (gpt-5.6+
+          // charges 1.25x input; everything before it charges nothing extra).
+          // Otherwise buildCosts' fabricated 1.25x default would invent a
+          // surcharge that OpenAI never billed, so the tokens stay where they
+          // already were -- in plain input, priced exactly as before.
+          const billedCacheWriteTokens = cacheWriteInputTokens > 0 && getModelCosts(model)?.cacheWriteCostIsExplicit
+            ? cacheWriteInputTokens
+            : 0
+          const billedInputTokens = uncachedInputTokens - billedCacheWriteTokens
           const timestamp = entry.timestamp ?? ''
           // Forked sessions copy the parent's entire token_count history
           // (re-timestamped), so replays must collide with the parent's events
@@ -1062,14 +1229,22 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           // key would spuriously diverge on a replay and double-count it.
           const dedupKey = `codex:${forkedFromId || sessionId}:${cumulativeTotal}:${total?.input_tokens ?? 0}:${total?.cached_input_tokens ?? 0}:${total?.output_tokens ?? 0}:${total?.reasoning_output_tokens ?? 0}`
 
+          // A drop here can only be a byte-identical replay: the
+          // prevCumulativeTotal guard above already discards a repeated
+          // running total, so nothing reaching this point ever loses real
+          // tokens -- no active-time rescaling needed (#1088 investigation).
           if (seenKeys.has(dedupKey)) continue
           seenKeys.add(dedupKey)
 
+          // Reasoning tokens are already inside output_tokens, so they are NOT
+          // added here. The cache-rehydration twin of this line lives in
+          // src/parser.ts (cachedCallToApiCall); both call billableOutputTokens
+          // so a fresh parse and a cache read can never price differently.
           const costUSD = calculateCost(
             model,
-            uncachedInputTokens,
-            outputTokens + reasoningTokens,
-            0,
+            billedInputTokens,
+            billableOutputTokens('codex', outputTokens, reasoningTokens),
+            billedCacheWriteTokens,
             cachedInputTokens,
             0,
           )
@@ -1077,9 +1252,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
           pendingTaskCalls.push({
             provider: 'codex',
             model,
-            inputTokens: uncachedInputTokens,
+            inputTokens: billedInputTokens,
             outputTokens,
-            cacheCreationInputTokens: 0,
+            cacheCreationInputTokens: billedCacheWriteTokens,
             cacheReadInputTokens: cachedInputTokens,
             cachedInputTokens,
             reasoningTokens,
@@ -1092,6 +1267,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             deduplicationKey: dedupKey,
             turnId: currentTurnId,
             toolSequence: pendingToolSequence.length > 0 ? pendingToolSequence : undefined,
+            ...(pendingSkills.length > 0 ? { skills: pendingSkills } : {}),
             userMessage: pendingUserMessage,
             sessionId,
             ...(sessionCwd ? { projectPath: sessionCwd, workingDirectory: sessionCwd } : {}),
@@ -1099,10 +1275,11 @@ function createParser(source: SessionSource, seenKeys: Set<string>, capture?: { 
             ...(pendingLocRemoved ? { locRemoved: pendingLocRemoved } : {}),
             ...(pendingEditFailed ? { editFailed: pendingEditFailed } : {}),
           })
-          taskGeneratedTokens += outputTokens + reasoningTokens
+          taskGeneratedTokens += billableOutputTokens('codex', outputTokens, reasoningTokens)
 
           pendingTools = []
           pendingToolSequence = []
+          pendingSkills = []
           pendingUserMessage = ''
           pendingOutputChars = 0
           pendingLocAdded = 0

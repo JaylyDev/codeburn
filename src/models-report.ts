@@ -3,7 +3,7 @@ import stripAnsi from 'strip-ansi'
 
 import { codexCredits } from './codex-credits.js'
 import { formatCost, formatTokens } from './format.js'
-import { fallbackRawModelDisplayName, getShortModelName, resolveCanonicalModelId, sanitizeModelForDisplay } from './models.js'
+import { billableOutputTokens, fallbackRawModelDisplayName, getShortModelName, resolveCanonicalModelId, sanitizeModelForDisplay } from './models.js'
 import { getProvider } from './providers/index.js'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 
@@ -125,7 +125,7 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
             buckets.set(key, bucket)
           }
           bucket.inputTokens += call.usage.inputTokens
-          bucket.outputTokens += call.usage.outputTokens + call.usage.reasoningTokens
+          bucket.outputTokens += billableOutputTokens(provider, call.usage.outputTokens, call.usage.reasoningTokens)
           bucket.cacheWriteTokens += call.usage.cacheCreationInputTokens
           // cacheReadInputTokens (Anthropic vocab) and cachedInputTokens (OpenAI vocab)
           // are two names for the same thing. Providers populate one or set both to the
@@ -186,6 +186,10 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
     // Credits are per raw id (aliases can have different rates). Sum the
     // rated buckets and flag the row incomplete when any contributor is
     // unrated — nulling the whole merge would zero a real menubar total.
+    // outputTokens is already the billable output (for Codex that includes
+    // reasoning, so nothing is added on top), and inputTokens is non-cached
+    // with cacheReadTokens holding cached input - exactly what the credit
+    // rates expect.
     const bucketCredits = bucket.provider === 'codex'
       ? codexCredits(bucket.model, {
           inputTokens: bucket.inputTokens,
