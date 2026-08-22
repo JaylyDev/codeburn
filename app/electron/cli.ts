@@ -66,8 +66,11 @@ export const DESKTOP_COLD_TIMEOUT_MS = 10 * 60_000
 // Backstop for the watchdog: a livelocked child that chatters forever without
 // ever finishing still gets reaped.
 const MAX_RUNTIME_MS = 15 * 60_000
-// SIGTERM lets the CLI's signal cleanup (src/session-cache.ts) publish a partial
-// parse and release the cross-process refresh lock; SIGKILL only if it ignores it.
+// SIGTERM is catchable, so the CLI's armSignalCleanup (src/session-cache.ts)
+// unlinks its own cache refresh lock before dying. Under SIGKILL the lock file
+// is simply left behind and the next cold parse takes it over once it sees the
+// dead pid — self-healing, but via the stale-takeover path rather than a clean
+// release. Neither signal publishes a partial parse; nothing does.
 const KILL_GRACE_MS = 5_000
 /** Wire marker for CLI scan-progress lines (src/parser.ts: PROGRESS_LINE_PREFIX). */
 export const PROGRESS_LINE_PREFIX = 'CODEBURN_PROGRESS '
@@ -125,8 +128,8 @@ function reapAll(): void {
   serveClient = null
   // Deliberately harder than every other kill path: quit has a 1.5s flush budget,
   // shorter than the SIGTERM grace, so waiting one out would just wedge the quit.
-  // One-shot reads hold no lock worth releasing; the resident child (destroyed
-  // above) does, and gets the grace.
+  // A lock left behind here still self-heals via the next parse's stale-pid
+  // takeover; a quit that hangs does not.
   for (const child of activeChildren) child.kill('SIGKILL')
   activeChildren.clear()
   // A queued waiter has no child to reap, so releaseSlot never fires for it;
@@ -349,12 +352,17 @@ export function notFoundStage(): NotFoundStage {
   return 'no-path-match'
 }
 
-/** Ask a child to exit, then insist. See {@link KILL_GRACE_MS}. */
+/** Ask a child to exit, then insist. See {@link KILL_GRACE_MS}. The child is
+ *  (re-)registered as active for the whole grace: a quit landing inside that
+ *  window must still find it and SIGKILL it rather than orphan it. */
 function killGracefully(child: ChildProcess): void {
-  try { child.kill('SIGTERM') } catch { /* already gone */ }
-  const grace = setTimeout(() => { try { child.kill('SIGKILL') } catch { /* already gone */ } }, KILL_GRACE_MS)
+  activeChildren.add(child)
+  let grace: NodeJS.Timeout | undefined
+  const settle = () => { activeChildren.delete(child); if (grace) clearTimeout(grace) }
+  child.once('exit', settle)
+  try { child.kill('SIGTERM') } catch { settle(); return }
+  grace = setTimeout(() => { try { child.kill('SIGKILL') } catch { /* already gone */ } settle() }, KILL_GRACE_MS)
   grace.unref?.()
-  child.once('exit', () => clearTimeout(grace))
 }
 
 /** Progress heartbeats share the stderr stream with real diagnostics, and every
@@ -398,6 +406,9 @@ function runCli(spec: SpawnSpec, cmdLabel: string, timeoutMs: number, onStderr?:
     const ceiling = setTimeout(() => expire(`codeburn ${cmdLabel} exceeded ${MAX_RUNTIME_MS}ms`), MAX_RUNTIME_MS)
 
     const bump = (n: number) => {
+      // Buffered bytes can still land after the kill; re-arming then would leave
+      // a timer nobody clears (finish() already ran).
+      if (settled) return
       armIdle()
       total += n
       if (total > MAX_OUTPUT_BYTES) {
@@ -519,7 +530,8 @@ class ServeClient {
     const child = spawn(this.spec.bin, [...this.spec.args], { shell: false, stdio: ['pipe', 'pipe', 'ignore'], env: this.spec.env })
     this.child = child
     if (this.pidFile && child.pid) {
-      try { writeFileSync(this.pidFile, String(child.pid)) } catch { /* reaping is best-effort */ }
+      const record = JSON.stringify({ pid: child.pid, cmd: [this.spec.bin, ...this.spec.args].join(' ') })
+      try { writeFileSync(this.pidFile, record) } catch { /* reaping is best-effort */ }
     }
     child.stdout!.setEncoding('utf8')
     child.stdout!.on('data', (chunk: string) => {
@@ -634,8 +646,8 @@ class ServeClient {
     if (child) {
       // This is an intentional replacement, not a crash. Detach first so the
       // later exit event cannot consume the unexpected-death budget. The
-      // outgoing child may be mid-write, so it gets the same SIGTERM grace a
-      // timed-out one does — a hard kill here strands the refresh lock.
+      // outgoing child may hold the refresh lock, so it gets the same SIGTERM
+      // grace a timed-out one does and can unlink that lock on its way out.
       this.onDeath(child, false)
       killGracefully(child)
     }
@@ -730,16 +742,21 @@ export function startServe(pidFile?: string): void {
  * the orphan may be holding the cache refresh lock.
  */
 export function reapOrphanServe(pidFile: string): void {
-  let pid: number
-  try { pid = Number.parseInt(readFileSync(pidFile, 'utf-8').trim(), 10) } catch { return }
+  let record: { pid?: unknown; cmd?: unknown }
+  try { record = JSON.parse(readFileSync(pidFile, 'utf-8')) } catch { return }
   try { unlinkSync(pidFile) } catch { /* stale file is harmless */ }
-  if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return
+  const pid = record.pid
+  const cmd = record.cmd
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 1 || pid === process.pid) return
+  if (typeof cmd !== 'string' || !cmd) return
   // No `ps` on Windows, so identity cannot be confirmed there; skipping is
   // strictly better than signalling a recycled pid.
   if (platform() === 'win32') return
   try {
-    const command = execFileSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf-8', timeout: 2_000 })
-    if (!/codeburn|cli\.js|launch\.js/.test(command) || !/\bserve\b/.test(command)) return
+    // Exact argv match, not a keyword sniff: any looser test signals whatever
+    // unrelated process inherited this pid. -ww defeats ps's width truncation.
+    const command = execFileSync('ps', ['-ww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf-8', timeout: 2_000 })
+    if (command.trim() !== cmd) return
   } catch {
     return
   }
@@ -860,6 +877,9 @@ export function spawnCliAction(args: string[], opts: { timeoutMs?: number } = {}
   })()
 }
 
+// Mutations keep a plain total-runtime cap and no progress env: they are short
+// by design (a config write, an export), never a full-history parse, so there is
+// no long silent stretch for a watchdog to misread.
 function runAction(spec: SpawnSpec, args: string[], timeoutMs: number): Promise<ActionResult> {
   return new Promise<ActionResult>(resolve => {
     const child = spawn(spec.bin, spec.args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'], env: spec.env })

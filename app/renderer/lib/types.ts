@@ -646,6 +646,8 @@ export type ScanProgressEvent =
   | { kind: 'providers'; providers: string[]; cold?: boolean }
   | { kind: 'provider'; provider: string; state: 'start' | 'done' | 'skipped'; files?: number }
   | { kind: 'tick'; provider: string; done: number; total: number }
+  /** Proof of life during a silent parse phase; carries nothing else. */
+  | { kind: 'keepalive' }
   | { kind: 'done' }
 
 /** Update-availability status from the main process (app/electron/updates.ts). */

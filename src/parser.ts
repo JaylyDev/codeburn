@@ -2932,10 +2932,35 @@ export type ScanProgressEvent =
   | { kind: 'providers'; providers: string[]; cold?: boolean }
   | { kind: 'provider'; provider: string; state: 'start' | 'done' | 'skipped'; files?: number }
   | { kind: 'tick'; provider: string; done: number; total: number }
+  // Carries no information beyond "this parse is still alive". Consumers that
+  // do not know it must ignore it rather than fail (app/renderer Splash does).
+  | { kind: 'keepalive' }
 
 export function emitScanProgress(event: ScanProgressEvent): void {
   if (process.env['CODEBURN_PROGRESS'] !== '1') return
   try { process.stderr.write(`${PROGRESS_LINE_PREFIX}${JSON.stringify(event)}\n`) } catch { /* stderr closed */ }
+}
+
+// A cold parse has genuinely silent stretches: the inter-provider cache save at
+// the end of each provider measured 31.6s of total silence on a large corpus,
+// and the desktop app's no-output watchdog reads silence as a dead child. Beat
+// unconditionally while a parse is running, so silence means stopped, not slow.
+const PROGRESS_KEEPALIVE_MS = 10_000
+let keepaliveTimer: ReturnType<typeof setInterval> | null = null
+let keepaliveDepth = 0
+
+export function startProgressKeepalive(): void {
+  keepaliveDepth += 1
+  if (keepaliveTimer || process.env['CODEBURN_PROGRESS'] !== '1') return
+  keepaliveTimer = setInterval(() => emitScanProgress({ kind: 'keepalive' }), PROGRESS_KEEPALIVE_MS)
+  keepaliveTimer.unref?.()
+}
+
+export function stopProgressKeepalive(): void {
+  keepaliveDepth = Math.max(0, keepaliveDepth - 1)
+  if (keepaliveDepth > 0 || !keepaliveTimer) return
+  clearInterval(keepaliveTimer)
+  keepaliveTimer = null
 }
 
 // Files parsed between partial-progress saves during a cold parse. Low enough
@@ -4071,7 +4096,24 @@ type RunParseOptions = {
   parseStartedAt: number
 }
 
+/** Thin wrapper so every runParse call site heartbeats for its whole duration,
+ *  including the paths that throw. See {@link startProgressKeepalive}. */
 async function runParse(
+  key: string,
+  diskCache: SessionCache,
+  dateRange: DateRange | undefined,
+  providerFilter: string | undefined,
+  options: RunParseOptions,
+): Promise<ProjectSummary[]> {
+  startProgressKeepalive()
+  try {
+    return await runParseInner(key, diskCache, dateRange, providerFilter, options)
+  } finally {
+    stopProgressKeepalive()
+  }
+}
+
+async function runParseInner(
   key: string,
   diskCache: SessionCache,
   dateRange: DateRange | undefined,

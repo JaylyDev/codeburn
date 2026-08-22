@@ -456,6 +456,11 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
     await transportClosed
   } finally {
     rl.close()
+    // Drain the in-flight request BEFORE returning. The caller exits the process
+    // once this resolves, and runCaptured() has process.exit monkeypatched into
+    // a thrown ExitSignal - returning mid-request would lose that request's
+    // response frame and turn a clean exit into a failure.
+    await queue
     await watcherSetup
     rootReuseValidation = null
     try {

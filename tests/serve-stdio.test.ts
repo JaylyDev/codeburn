@@ -347,4 +347,49 @@ describe('codeburn serve --stdio', () => {
 
     expect(naturalExit).toBe(true)
   }, 10_000)
+
+  it('answers an in-flight request in full when stdin closes on the same tick', async () => {
+    // The transport closing does not cancel work already accepted. Returning
+    // before the queue drains loses the response frame outright, and because
+    // runCaptured() monkeypatches process.exit into a thrown ExitSignal it also
+    // turns the clean exit into a failure.
+    const raceChild = spawn(process.execPath, ['--import', 'tsx', join(__dirname, '..', 'src', 'cli.ts'), 'serve', '--stdio'], {
+      stdio: ['pipe', 'pipe', 'ignore'],
+      env: { ...process.env },
+    })
+    let stdout = ''
+    const lines = (): Array<Record<string, unknown>> => stdout.split('\n')
+      .map(line => { try { return JSON.parse(line) as Record<string, unknown> } catch { return null } })
+      .filter((v): v is Record<string, unknown> => v !== null)
+
+    const becameReady = new Promise<void>((resolve, reject) => {
+      raceChild.once('error', reject)
+      raceChild.stdout!.setEncoding('utf8')
+      raceChild.stdout!.on('data', (chunk: string) => {
+        stdout += chunk
+        if (lines().some(msg => msg['ready'] === true)) resolve()
+      })
+      raceChild.once('exit', (code, signal) => reject(new Error(`serve exited before ready: ${code ?? signal}`)))
+    })
+    const exited = new Promise<number | null>(resolve => raceChild.once('exit', code => resolve(code)))
+
+    await becameReady
+    // Request and EOF in the same tick: the request is accepted, then the
+    // transport is gone before it can possibly have finished.
+    raceChild.stdin!.write(JSON.stringify({ id: 77, args: ['status', '--format', 'json'] }) + '\n')
+    raceChild.stdin!.end()
+
+    const code = await Promise.race([
+      exited,
+      new Promise<'hung'>(resolve => setTimeout(() => resolve('hung'), 15_000)),
+    ])
+    if (code === 'hung') { raceChild.kill('SIGKILL'); await exited }
+
+    expect(code).toBe(0)
+    const answer = lines().find(msg => msg['id'] === 77)
+    expect(answer).toBeDefined()
+    expect(answer!['ok']).toBe(true)
+    expect(typeof answer!['output']).toBe('string')
+    expect(() => JSON.parse(answer!['output'] as string)).not.toThrow()
+  }, 25_000)
 })

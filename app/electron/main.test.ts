@@ -499,6 +499,31 @@ describe('createBridgeHandlers (cold-start warmup)', () => {
       .toMatchObject({ ok: false, error: { kind: 'timeout', cold: true } })
   })
 
+  it('gives up the cold claim once the cold window itself has elapsed', async () => {
+    // Without a bound this is a forever-splash: overviewWarmed only flips on
+    // success, so an install that can never hydrate would keep every timeout
+    // tagged cold and never reach the real error panel (or its CLI recovery).
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date('2026-08-16T00:00:00Z'))
+      const spawnCli = vi.fn(async () => { throw new CliError('timeout', 'no output for 45000ms') })
+      const handlers = createBridgeHandlers(base({ spawnCli, emitProgress: vi.fn() }))
+
+      expect(await handlers['codeburn:getOverview']!('30days', 'all'))
+        .toMatchObject({ ok: false, error: { cold: true } })
+
+      // Past the 10-minute cold floor, still failing: this is an error, not news
+      // that indexing is in progress.
+      vi.setSystemTime(new Date('2026-08-16T00:10:01Z'))
+      const late = await handlers['codeburn:getOverview']!('30days', 'all') as { error: { kind: string; cold?: true } }
+      expect(late.error.kind).toBe('timeout')
+      expect(late.error.cold).toBeUndefined()
+      expect((await handlers['codeburn:getActReport']!() as { error: { cold?: true } }).error.cold).toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('never flags a non-timeout failure as cold (a real error is real news)', async () => {
     const spawnCli = vi.fn(async () => { throw new CliError('nonzero', 'permission denied') })
     const handlers = createBridgeHandlers(base({ spawnCli, emitProgress: vi.fn() }))

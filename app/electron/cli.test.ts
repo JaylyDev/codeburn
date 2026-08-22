@@ -408,16 +408,18 @@ describe('no-output watchdog (timeoutMs bounds SILENCE, not total runtime)', () 
     await expect(spawnCli(['optimize'], { timeoutMs: 600 })).resolves.toEqual({ ok: 1, ticks: 15 })
   })
 
-  it('kills a child that goes silent after producing output', async () => {
+  it('kills a child that goes silent, measured from its LAST byte', async () => {
+    // One byte lands ~300ms in (plus node boot), well inside the 1s window, then
+    // silence. A fixed cap kills at 1s; only a window measured from the LAST byte
+    // waits past 1.3s. The gap is wide enough that node's boot cost cannot blur it.
     fakeBin(
       'talks-then-hangs.js',
-      `process.stderr.write('CODEBURN_PROGRESS {"kind":"provider","provider":"claude","state":"start"}\\n');
+      `setTimeout(() => process.stderr.write('CODEBURN_PROGRESS {"kind":"keepalive"}\\n'), 300);
        setInterval(() => {}, 1000);`,
     )
     const began = Date.now()
-    await expect(spawnCli(['optimize'], { timeoutMs: 400 })).rejects.toMatchObject({ kind: 'timeout' })
-    // The window restarts at the last byte, so this cannot settle before it.
-    expect(Date.now() - began).toBeGreaterThanOrEqual(400)
+    await expect(spawnCli(['optimize'], { timeoutMs: 1_000 })).rejects.toMatchObject({ kind: 'timeout' })
+    expect(Date.now() - began).toBeGreaterThanOrEqual(1_250)
   })
 
   it('keeps progress heartbeats out of the surfaced error message', async () => {
@@ -460,6 +462,28 @@ describe('graceful kill (SIGTERM, then SIGKILL after the grace)', () => {
     }, 12_000)
   }, 20_000)
 
+  it('keeps a child inside the SIGTERM grace reapable, so quit cannot orphan it', async () => {
+    // The grace timer dies with the app. A child that ignores SIGTERM must still
+    // be in the reap set when quit sweeps, or it survives the app that spawned it.
+    const pidFile = join(dir, 'grace-pid')
+    fakeBin(
+      'ignores-sigterm-quit.js',
+      `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+       process.on('SIGTERM', () => {});
+       setInterval(() => {}, 1000);`,
+    )
+
+    await expect(spawnCli(['status'], { timeoutMs: 300 })).rejects.toMatchObject({ kind: 'timeout' })
+    await waitFor(() => readMaybe(pidFile).length > 0)
+    const pid = Number(readMaybe(pidFile))
+    expect(() => process.kill(pid, 0)).not.toThrow() // alive, mid-grace
+
+    shutdownAll() // the quit sweep, landing inside the 5s grace
+    await waitFor(() => {
+      try { process.kill(pid, 0); return false } catch { return true }
+    }, 3_000)
+  })
+
   it('lets a SIGTERM-handling child exit on its own without waiting for SIGKILL', async () => {
     const cleanupFile = join(dir, 'cleanup')
     fakeBin(
@@ -484,7 +508,7 @@ describe('orphan serve reaping', () => {
     const child = spawn(process.execPath, [bin, 'serve', '--stdio'], { stdio: 'ignore' })
     child.unref()
     const pidFile = join(dir, 'serve.pid')
-    writeFileSync(pidFile, String(child.pid))
+    writeFileSync(pidFile, JSON.stringify({ pid: child.pid, cmd: [process.execPath, bin, 'serve', '--stdio'].join(' ') }))
     return { pid: child.pid!, pidFile }
   }
 
@@ -493,7 +517,9 @@ describe('orphan serve reaping', () => {
     const pidFile = join(dir, 'recorded.pid')
     startServe(pidFile)
     await waitFor(() => readMaybe(pidFile).length > 0)
-    expect(Number(readMaybe(pidFile))).toBeGreaterThan(1)
+    const record = JSON.parse(readMaybe(pidFile)) as { pid: number; cmd: string }
+    expect(record.pid).toBeGreaterThan(1)
+    expect(record.cmd).toContain('serve --stdio')
   })
 
   it('kills a serve child orphaned by a previous run and clears the pidfile', async () => {
@@ -508,13 +534,21 @@ describe('orphan serve reaping', () => {
     expect(readMaybe(pidFile)).toBe('')
   })
 
-  it('never signals a recycled pid that is not a codeburn serve', async () => {
-    const bin = join(dir, 'unrelated-tool')
+  // A keyword sniff ("looks like a cli.js running serve") matches plenty of
+  // unrelated tools. Identity is the exact argv we recorded, nothing looser.
+  it.each([
+    ['an unrelated tool', 'unrelated-tool', ['work']],
+    ['a lookalike cli.js running serve', 'cli.js', ['serve', '--stdio']],
+    ['a lookalike named codeburn', 'codeburn', ['serve', '--stdio']],
+  ])('never signals a recycled pid belonging to %s', async (_label, name, args) => {
+    const bin = join(dir, name)
     writeFileSync(bin, '#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n', { mode: 0o755 })
     chmodSync(bin, 0o755)
-    const bystander = spawn(process.execPath, [bin, 'work'], { stdio: 'ignore' })
-    const pidFile = join(dir, 'recycled.pid')
-    writeFileSync(pidFile, String(bystander.pid))
+    const bystander = spawn(process.execPath, [bin, ...args], { stdio: 'ignore' })
+    const pidFile = join(dir, `recycled-${name}.pid`)
+    // The pid is right; the recorded command belongs to the serve child that
+    // used to own it. Only an exact match may fire.
+    writeFileSync(pidFile, JSON.stringify({ pid: bystander.pid, cmd: '/opt/codeburn/dist/cli.js serve --stdio' }))
     try {
       reapOrphanServe(pidFile)
       await new Promise(resolve => setTimeout(resolve, 200))
@@ -524,11 +558,14 @@ describe('orphan serve reaping', () => {
     }
   })
 
-  it('ignores a missing or unparseable pidfile', () => {
+  it('ignores a missing, unparseable, or incomplete pidfile', () => {
     expect(() => reapOrphanServe(join(dir, 'absent.pid'))).not.toThrow()
     const junk = join(dir, 'junk.pid')
     writeFileSync(junk, 'not-a-pid')
     expect(() => reapOrphanServe(junk)).not.toThrow()
+    const noCmd = join(dir, 'no-cmd.pid')
+    writeFileSync(noCmd, JSON.stringify({ pid: 999999 }))
+    expect(() => reapOrphanServe(noCmd)).not.toThrow()
   })
 })
 
@@ -941,9 +978,10 @@ describe('resident serve single-flight', () => {
   })
 
   it('SIGTERMs the outgoing resident on a mutation restart instead of hard-killing it', async () => {
-    // A settings mutation replaces a child that may be mid-write. Same lock
-    // hazard as a timeout, so it gets the same grace: SIGKILL here strands the
-    // cache refresh lock the outgoing parse is holding.
+    // A settings mutation replaces a child that may hold the cache refresh lock.
+    // Same hazard as a timeout, so it gets the same grace: only a catchable
+    // signal lets the outgoing child unlink its own lock instead of leaving it
+    // for the next parse's stale-pid takeover.
     const signalFile = join(dir, 'restart-signals')
     fakeBin(
       'sigterm-aware-resident.js',

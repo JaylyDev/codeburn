@@ -265,9 +265,16 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
   // Marks a TIMEOUT that happened while the cold hydration was still running, so
   // the renderer keeps the splash instead of painting a red error panel. Only
   // timeouts: a permission or nonzero failure is real news even while cold.
+  //
+  // BOUNDED, deliberately. `overviewWarmed` only flips on success, so an install
+  // that can never hydrate would otherwise sit behind an indexing splash forever
+  // with no error and no way to reach the "Locate the CLI" recovery. Past the
+  // cold window itself, a timeout stops being "still indexing" and surfaces.
+  const bootedAt = Date.now()
+  const stillCold = (): boolean => !overviewWarmed && Date.now() - bootedAt < WARMUP_TIMEOUT_MS
   const coldError = (err: unknown): { kind: string; message: string; cold?: true } => {
     const error = toEnvelopeError(err)
-    return overviewWarmed || error.kind !== 'timeout' ? error : { ...error, cold: true }
+    return stillCold() && error.kind === 'timeout' ? { ...error, cold: true } : error
   }
 
   const run = (build: (...args: any[]) => string[]): Handler => async (...args: any[]) => {
