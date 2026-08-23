@@ -308,6 +308,7 @@ skipUnlessSqlite('hermes post-finalization ledger proofs', () => {
       tools: [],
       userMessage: '',
     })
+    expect(deltas[0]!.costIsEstimated).toBe(false)
     expect(deltas[0]!.deduplicationKey).toBe('hermes:default:p3:obs:1')
     expect(getHermesCursor(loadHermesSessionLedger(), 'default', 'p3')?.observations).toHaveLength(2)
     expect(getHermesCursor(loadHermesSessionLedger(), 'default', 'p3')?.observations.some(o => o.inputTokens < 0)).toBe(false)
@@ -385,5 +386,50 @@ skipUnlessSqlite('hermes post-finalization ledger proofs', () => {
     expect(calls[0]!.deduplicationKey.includes(':obs:')).toBe(false)
     expect(calls[0]!.turnId).toBe('p7-id:session')
     expect(calls[0]!.supplementaryAccounting).toBeUndefined()
+  })
+
+  it('P8: calculated-cost growth stays estimated on fresh and warm-cache reads', async () => {
+    const started = localDay(-1).unixSec
+    const dbPath = createHermesDb(hermesHome)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, { id: 'calc-est', inputTokens: 100, startedAt: started })
+    })
+
+    const first = await parseDiscovered()
+    expect(first.calls).toHaveLength(1)
+    expect(first.calls[0]!.deduplicationKey).toBe('hermes:default:calc-est')
+    expect(first.calls[0]!.costIsEstimated).toBe(true)
+    expect(first.calls[0]!.costUSD).toBeGreaterThan(0)
+    expect(getHermesCursor(loadHermesSessionLedger(), 'default', 'calc-est')?.lastSeen.costBasis).toBe('calculated')
+
+    withTestDb(dbPath, (db) => {
+      updateSession(db, 'calc-est', { inputTokens: 150 })
+    })
+    const grown = await parseDiscovered()
+    const deltas = grown.calls.filter(c => c.deduplicationKey.includes(':obs:'))
+    expect(deltas).toHaveLength(1)
+    expect(deltas[0]!.deduplicationKey).toBe('hermes:default:calc-est:obs:1')
+    expect(deltas[0]!.inputTokens).toBe(50)
+    expect(deltas[0]!.costUSD).toBeGreaterThan(0)
+    expect(deltas[0]!.costIsEstimated).toBe(true)
+    expect(getHermesCursor(loadHermesSessionLedger(), 'default', 'calc-est')?.observations[1]?.costBasis).toBe('calculated')
+
+    const parser = await loadParser()
+    parser.clearSessionCache()
+    const fresh = await parser.parseAllSessions(undefined, 'hermes')
+    const freshCalls = fresh.flatMap(p => p.sessions.flatMap(s => s.turns.flatMap(t => t.assistantCalls)))
+    const freshBaseline = freshCalls.find(c => c.deduplicationKey === 'hermes:default:calc-est')
+    const freshDelta = freshCalls.find(c => c.deduplicationKey === 'hermes:default:calc-est:obs:1')
+    expect(freshBaseline?.isEstimated).toBe(true)
+    expect(freshDelta?.isEstimated).toBe(true)
+    expect(freshDelta?.costUSD).toBeGreaterThan(0)
+
+    const warm = await parser.parseAllSessions(undefined, 'hermes')
+    const warmCalls = warm.flatMap(p => p.sessions.flatMap(s => s.turns.flatMap(t => t.assistantCalls)))
+    const warmBaseline = warmCalls.find(c => c.deduplicationKey === 'hermes:default:calc-est')
+    const warmDelta = warmCalls.find(c => c.deduplicationKey === 'hermes:default:calc-est:obs:1')
+    expect(warmBaseline?.isEstimated).toBe(true)
+    expect(warmDelta?.isEstimated).toBe(true)
+    expect(warmDelta?.costUSD).toBeGreaterThan(0)
   })
 })

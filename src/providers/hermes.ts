@@ -499,7 +499,9 @@ function observationToCall(
     reasoningTokens: observation.reasoningTokens,
     webSearchRequests: 0,
     costUSD: observation.costUSD,
-    costIsEstimated: later ? false : args.costIsEstimated,
+    // Later observations keep the stored basis: calculated stays estimated;
+    // provider-recorded actual/estimated keep main's measured behavior.
+    costIsEstimated: later ? observation.costBasis === 'calculated' : args.costIsEstimated,
     tools: later ? [] : args.tools,
     bashCommands: later ? [] : args.bashCommands,
     timestamp: observation.timestamp,
