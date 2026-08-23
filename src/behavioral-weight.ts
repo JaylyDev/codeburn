@@ -2,9 +2,10 @@
 // requests. A copilot shutdown rollup, synthesized residual, or store row
 // paired with its per-turn call (`supplementaryAccounting`, assigned at serve
 // time) carries real tokens and cost but is not a distinct behavioral
-// request. Every user-visible calls/turns counter weighs calls through these
-// helpers so no surface can disagree with the session summaries or the
-// sealed daily history. Token and cost sums intentionally keep every call —
+// request. Hermes observation-time deltas persist the same flag. Every
+// user-visible calls/turns counter weighs calls through these helpers so no
+// surface can disagree with the session summaries or the sealed daily
+// history. Token and cost sums intentionally keep every call —
 // supplementary accounting must never be filtered out, only weightless.
 
 type WeightedCall = { supplementaryAccounting?: boolean }

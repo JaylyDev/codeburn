@@ -28,6 +28,10 @@ beforeEach(async () => {
   cacheDir = await mkdtemp(join(tmpdir(), 'hermes-provider-cache-'))
   originalHermesHome = process.env['HERMES_HOME']
   originalCodeburnCacheDir = process.env['CODEBURN_CACHE_DIR']
+  process.env['HERMES_HOME'] = tmpDir
+  process.env['CODEBURN_CACHE_DIR'] = cacheDir
+  const { resetHermesSessionLedgerForTests } = await import('../../src/hermes-session-ledger.js')
+  resetHermesSessionLedgerForTests()
 })
 
 afterEach(async () => {
