@@ -1,7 +1,7 @@
 import { readdir, stat } from 'fs/promises'
 import { createReadStream } from 'fs'
 import { createInterface } from 'readline'
-import { basename, join } from 'path'
+import { basename, join, resolve } from 'path'
 import { homedir } from 'os'
 
 import { readSessionLines } from '../fs-utils.js'
@@ -12,7 +12,7 @@ import { normalizeContentBlocks } from '../content-utils.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ToolCall } from '../types.js'
 import type { Provider, ProbeRoot, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
-import { defaultBilledCodexHome, isNestedLauncherCodexHome, listRolloutBasenames } from '../launcher-homes.js'
+import { defaultBilledCodexHome, isNestedLauncherCodexHome, listRolloutBasenames, sameCodexHome } from '../launcher-homes.js'
 
 const modelDisplayNames: Record<string, string> = {
   'codex-auto-review': 'Codex Auto Review',
@@ -1342,6 +1342,12 @@ export function createCodexProvider(
   // launcherRoots}) — may drop overlapping rollout-*.jsonl basenames.
   const secondPrimary = opts?.primaryDir
   const secondRoots = opts?.launcherRoots
+  const duplicateHome =
+    codexDir !== undefined &&
+    secondPrimary !== undefined &&
+    secondRoots !== undefined &&
+    sameCodexHome(dir, secondPrimary) &&
+    resolve(dir) !== resolve(secondPrimary)
   const filterOverlap =
     codexDir !== undefined &&
     secondPrimary !== undefined &&
@@ -1376,6 +1382,9 @@ export function createCodexProvider(
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
+      // Same physical tree via two factories is complete overlap, not a
+      // distinct nest. isNestedLauncherCodexHome is false in that case.
+      if (duplicateHome) return []
       const sources = await discoverSessionsInDir(dir)
       if (!filterOverlap) return sources
       const primaryNames = listRolloutBasenames(primaryDir)

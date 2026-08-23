@@ -17,6 +17,11 @@ function resolveHome(dir: string): string {
   }
 }
 
+/** True when two Codex homes are the same physical tree. */
+export function sameCodexHome(a: string, b: string): boolean {
+  return resolveHome(a) === resolveHome(b)
+}
+
 /** True when `dir` is a Codex home nested under a launcher nest, and a distinct
  *  primary Codex home exists. Gate for overlap-only filtering on a *second*
  *  provider instance — it does not by itself drop sessions. */

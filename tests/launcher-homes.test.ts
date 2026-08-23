@@ -135,6 +135,19 @@ describe('Codex discover overlap-only nest filter', () => {
     }
   })
 
+  it('second factory on a realpath-equivalent nest emits no duplicate sources', async () => {
+    const primary = join(root, 'primary')
+    const buzz = join(root, '.buzz')
+    const nested = join(buzz, '.codex')
+    await writeCodexSession(primary, 'rollout-same-physical-tree.jsonl')
+    await mkdir(buzz, { recursive: true })
+    await symlink(primary, nested)
+    const real = createCodexProvider(primary, { primaryDir: primary, launcherRoots: [buzz] })
+    const nest = createCodexProvider(nested, { primaryDir: primary, launcherRoots: [buzz] })
+    expect(names(await real.discoverSessions())).toEqual(['rollout-same-physical-tree.jsonl'])
+    expect(await nest.discoverSessions()).toEqual([])
+  })
+
   it('explicit nest path without second-factory opts is not silently emptied', async () => {
     const primary = join(root, 'primary')
     const nested = join(root, '.buzz', '.codex')
