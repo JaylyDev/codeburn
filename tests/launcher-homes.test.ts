@@ -8,18 +8,19 @@ import { collectDoctorReport, renderDoctorTable } from '../src/doctor.js'
 import { createCodexProvider } from '../src/providers/codex.js'
 import { emptyCache } from '../src/session-cache.js'
 
-function sessionMeta(): string {
+function sessionMeta(sessionId: string): string {
   return JSON.stringify({
     type: 'session_meta',
     timestamp: '2026-04-14T10:00:00Z',
-    payload: { cwd: '/Users/test/proj', originator: 'codex-cli', session_id: 'sess-001', model: 'gpt-5.3-codex' },
+    payload: { cwd: '/Users/test/proj', originator: 'codex-cli', session_id: sessionId, model: 'gpt-5.3-codex' },
   })
 }
 
-async function writeCodexSession(codexDir: string, name = 'rollout-sess-001.jsonl'): Promise<void> {
+async function writeCodexSession(codexDir: string, name: string, sessionId?: string): Promise<void> {
+  const id = sessionId ?? name.replace(/^rollout-/, '').replace(/\.jsonl$/, '')
   const dayDir = join(codexDir, 'sessions', '2026', '04', '14')
   await mkdir(dayDir, { recursive: true })
-  await writeFile(join(dayDir, name), `${sessionMeta()}\n`)
+  await writeFile(join(dayDir, name), `${sessionMeta(id)}\n`)
 }
 
 function names(sources: { path: string }[]): string[] {
@@ -77,15 +78,25 @@ describe('Codex discover overlap-only nest filter', () => {
     expect(names(await nest.discoverSessions())).toEqual(['rollout-buzz.jsonl'])
   })
 
-  it('filters only a nest rollout whose basename overlaps the primary tree', async () => {
+  it('filters only a nest rollout whose session id overlaps the primary tree', async () => {
     const primary = join(root, 'primary')
     const buzz = join(root, '.buzz')
     const nested = join(buzz, '.codex')
-    await writeCodexSession(primary, 'rollout-shared.jsonl')
-    await writeCodexSession(nested, 'rollout-shared.jsonl')
-    await writeCodexSession(nested, 'rollout-buzz-only.jsonl')
+    await writeCodexSession(primary, 'rollout-shared.jsonl', 'sess-shared')
+    await writeCodexSession(nested, 'rollout-renamed.jsonl', 'sess-shared')
+    await writeCodexSession(nested, 'rollout-buzz-only.jsonl', 'sess-buzz')
     const nest = createCodexProvider(nested, { primaryDir: primary, launcherRoots: [buzz] })
     expect(names(await nest.discoverSessions())).toEqual(['rollout-buzz-only.jsonl'])
+  })
+
+  it('keeps a nest rollout whose basename collides but session id is unique', async () => {
+    const primary = join(root, 'primary')
+    const buzz = join(root, '.buzz')
+    const nested = join(buzz, '.codex')
+    await writeCodexSession(primary, 'rollout-shared.jsonl', 'sess-primary')
+    await writeCodexSession(nested, 'rollout-shared.jsonl', 'sess-nest')
+    const nest = createCodexProvider(nested, { primaryDir: primary, launcherRoots: [buzz] })
+    expect(names(await nest.discoverSessions())).toEqual(['rollout-shared.jsonl'])
   })
 
   it('default factory with CODEX_HOME=nest and a stub ~/.codex still discovers the nest', async () => {
@@ -148,13 +159,22 @@ describe('Codex discover overlap-only nest filter', () => {
     expect(await nest.discoverSessions()).toEqual([])
   })
 
-  it('explicit nest path without second-factory opts is not silently emptied', async () => {
-    const primary = join(root, 'primary')
-    const nested = join(root, '.buzz', '.codex')
-    await writeCodexSession(primary, 'rollout-primary.jsonl')
-    await writeCodexSession(nested, 'rollout-buzz.jsonl')
-    const provider = createCodexProvider(nested)
-    expect(names(await provider.discoverSessions())).toEqual(['rollout-buzz.jsonl'])
+  it('explicit nest path without second-factory opts uses default launcher roots', async () => {
+    const home = root
+    const primary = join(home, '.codex')
+    const nested = join(home, '.buzz', '.codex')
+    await writeCodexSession(primary, 'rollout-primary.jsonl', 'sess-shared')
+    await writeCodexSession(nested, 'rollout-renamed.jsonl', 'sess-shared')
+    await writeCodexSession(nested, 'rollout-buzz.jsonl', 'sess-buzz')
+    const prevHome = process.env.HOME
+    process.env.HOME = home
+    try {
+      const provider = createCodexProvider(nested)
+      expect(names(await provider.discoverSessions())).toEqual(['rollout-buzz.jsonl'])
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME
+      else process.env.HOME = prevHome
+    }
   })
 })
 

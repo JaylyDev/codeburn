@@ -12,7 +12,7 @@ import { normalizeContentBlocks } from '../content-utils.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ToolCall } from '../types.js'
 import type { Provider, ProbeRoot, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
-import { defaultBilledCodexHome, isNestedLauncherCodexHome, listRolloutBasenames, sameCodexHome } from '../launcher-homes.js'
+import { defaultBilledCodexHome, defaultLauncherRoots, isNestedLauncherCodexHome, listRolloutSessionIds, rolloutFileSessionId, sameCodexHome } from '../launcher-homes.js'
 
 const modelDisplayNames: Record<string, string> = {
   'codex-auto-review': 'Codex Auto Review',
@@ -1335,27 +1335,19 @@ export function createCodexProvider(
   opts?: { primaryDir?: string; launcherRoots?: string[] },
 ): Provider {
   const dir = getCodexDir(codexDir)
+  // Production singleton (no args) still honors CODEX_HOME / override as the
+  // one root. An explicit nest path — even without second-factory opts —
+  // overlap-filters against the default billed home using defaultLauncherRoots
+  // so a future createCodexProvider(nest) cannot double-count session ids.
   const primaryDir = opts?.primaryDir ?? defaultBilledCodexHome()
-  // Production singleton (no args) honors CODEX_HOME / override as the one
-  // root. Unique nest sessions must never be dropped because ~/.codex exists.
-  // Only a second factory — createCodexProvider(nestPath, {primaryDir,
-  // launcherRoots}) — may drop overlapping rollout-*.jsonl basenames.
-  const secondPrimary = opts?.primaryDir
-  const secondRoots = opts?.launcherRoots
+  const launcherRoots = opts?.launcherRoots ?? defaultLauncherRoots()
   const duplicateHome =
     codexDir !== undefined &&
-    secondPrimary !== undefined &&
-    secondRoots !== undefined &&
-    sameCodexHome(dir, secondPrimary) &&
-    resolve(dir) !== resolve(secondPrimary)
+    sameCodexHome(dir, primaryDir) &&
+    resolve(dir) !== resolve(primaryDir)
   const filterOverlap =
     codexDir !== undefined &&
-    secondPrimary !== undefined &&
-    secondRoots !== undefined &&
-    isNestedLauncherCodexHome(dir, {
-      primaryDir: secondPrimary,
-      launcherRoots: secondRoots,
-    })
+    isNestedLauncherCodexHome(dir, { primaryDir, launcherRoots })
 
   return {
     name: 'codex',
@@ -1387,8 +1379,11 @@ export function createCodexProvider(
       if (duplicateHome) return []
       const sources = await discoverSessionsInDir(dir)
       if (!filterOverlap) return sources
-      const primaryNames = listRolloutBasenames(primaryDir)
-      return sources.filter(source => !primaryNames.has(basename(source.path)))
+      const primaryIds = listRolloutSessionIds(primaryDir)
+      return sources.filter(source => {
+        const id = rolloutFileSessionId(source.path)
+        return !(id && primaryIds.has(id))
+      })
     },
 
     createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {

@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, realpathSync } from 'fs'
+import { closeSync, existsSync, openSync, readdirSync, readSync, realpathSync } from 'fs'
 import { homedir } from 'os'
 import { join, resolve, sep } from 'path'
 
@@ -40,11 +40,32 @@ export function isNestedLauncherCodexHome(
   return existsSync(primary)
 }
 
-/** Rollout basenames under a Codex home (sessions/YYYY/MM/DD + archived). */
-export function listRolloutBasenames(codexDir: string): Set<string> {
-  const names = new Set<string>()
-  const take = (file: string) => {
-    if (file.startsWith('rollout-') && file.endsWith('.jsonl')) names.add(file)
+/** Session id from the first `session_meta` line of a Codex rollout file.
+ *  Missing / unreadable files return undefined — callers must not drop those. */
+export function rolloutFileSessionId(filePath: string): string | undefined {
+  try {
+    const fd = openSync(filePath, 'r')
+    try {
+      const buf = Buffer.alloc(8192)
+      const n = readSync(fd, buf, 0, buf.length, 0)
+      const line = buf.subarray(0, n).toString('utf8').split('\n', 1)[0] ?? ''
+      if (!line) return undefined
+      const parsed: unknown = JSON.parse(line)
+      if (!parsed || typeof parsed !== 'object') return undefined
+      const payload = (parsed as { payload?: { session_id?: unknown } }).payload
+      const id = payload?.session_id
+      return typeof id === 'string' && id.length > 0 ? id : undefined
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return undefined
+  }
+}
+
+function walkRolloutFiles(codexDir: string, visit: (filePath: string) => void): void {
+  const take = (dir: string, file: string) => {
+    if (file.startsWith('rollout-') && file.endsWith('.jsonl')) visit(join(dir, file))
   }
   const sessionsDir = join(codexDir, 'sessions')
   try {
@@ -56,19 +77,33 @@ export function listRolloutBasenames(codexDir: string): Set<string> {
         const monthDir = join(yearDir, month)
         for (const day of readdirSync(monthDir)) {
           if (!/^\d{2}$/.test(day)) continue
-          for (const file of readdirSync(join(monthDir, day))) take(file)
+          const dayDir = join(monthDir, day)
+          for (const file of readdirSync(dayDir)) take(dayDir, file)
         }
       }
     }
   } catch {
     // missing tree
   }
+  const archivedDir = join(codexDir, 'archived_sessions')
   try {
-    for (const file of readdirSync(join(codexDir, 'archived_sessions'))) take(file)
+    for (const file of readdirSync(archivedDir)) take(archivedDir, file)
   } catch {
     // missing archive
   }
-  return names
+}
+
+/** Session ids under a Codex home (sessions/YYYY/MM/DD + archived).
+ *  Identity is the rollout's `payload.session_id`, not the filename: Codex
+ *  names embed a timestamp+uuid so basename collisions are rare, but a
+ *  dollar-protecting dedup cannot treat 'unlikely' as identity. */
+export function listRolloutSessionIds(codexDir: string): Set<string> {
+  const ids = new Set<string>()
+  walkRolloutFiles(codexDir, filePath => {
+    const id = rolloutFileSessionId(filePath)
+    if (id) ids.add(id)
+  })
+  return ids
 }
 
 export function defaultBilledCodexHome(): string {
@@ -79,7 +114,9 @@ export function defaultLauncherRoots(): string[] {
   return [join(homedir(), '.buzz')]
 }
 
-/** Surfaces that drive another billed store. Not providers. No session count. */
+/** Surfaces that drive another billed store. Not providers. No session count.
+ *  Presence of `~/.buzz` is the heuristic — we do not inspect a nested Codex
+ *  tree here (that store is billed via the Codex provider). */
 export function collectLauncherNotes(home = homedir()): LauncherNote[] {
   const notes: LauncherNote[] = []
   const buzz = join(home, '.buzz')
@@ -88,7 +125,7 @@ export function collectLauncherNotes(home = homedir()): LauncherNote[] {
       name: 'buzz',
       path: buzz,
       billedVia: 'codex',
-      verdict: 'LAUNCHER (no usage store; billed via Codex)',
+      verdict: 'LAUNCHER (billed via Codex)',
     })
   }
   const grokStore = join(home, '.grok')
