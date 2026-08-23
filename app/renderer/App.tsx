@@ -146,11 +146,16 @@ function isPeriod(value: string): value is Period {
   return (STANDARD_PERIODS as string[]).includes(value)
 }
 
-/** Boot period = the persisted "Default period" Settings writes, else today. */
-function initialPeriod(): Period {
+/** The persisted "Default period" Settings writes, when there is one. */
+function savedPeriod(): Period | null {
   let saved: string | null = null
   try { saved = globalThis.localStorage?.getItem('codeburn.defaultPeriod') ?? null } catch { /* storage can be unavailable */ }
-  return saved && isPeriod(saved) ? saved : 'today'
+  return saved && isPeriod(saved) ? saved : null
+}
+
+/** Boot period = the persisted "Default period" Settings writes, else today. */
+function initialPeriod(): Period {
+  return savedPeriod() ?? 'today'
 }
 
 /** Persisted Claude config override (empty/absent = aggregate all configs). */
@@ -254,6 +259,17 @@ function AppMain() {
   // every section to spawn its own read behind the still-running parse, and each
   // one then died on its own timeout. Stay gated (and keep the splash) until the
   // hydration actually settles.
+  // #1111: with no persisted default the app opens on Today and falls back to 7
+  // days once, when the first payload shows today has no sessions yet. Disarmed
+  // by the period picker, so it can never move a period the user chose.
+  const autoPeriod = useRef(savedPeriod() === null)
+  useEffect(() => {
+    const sessions = overview.data?.current.sessions
+    if (!autoPeriod.current || sessions === undefined) return
+    autoPeriod.current = false
+    if (period === 'today' && sessions === 0) setPeriod('week')
+  }, [overview.data, period])
+
   const overviewCold = isColdHydrating(overview.error)
   const [ready, setReady] = useState(false)
   useEffect(() => {
@@ -460,6 +476,7 @@ function AppMain() {
 
   const onPeriodChange = (value: string) => {
     if (isPeriod(value)) {
+      autoPeriod.current = false
       setCustomRange(null)
       setPeriod(value)
     }

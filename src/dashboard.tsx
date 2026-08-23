@@ -1921,7 +1921,7 @@ function StaticDashboard({ projects, period, activeProvider, planUsages, label, 
 /// serve the rest by slicing it — but only the ones that are a pure narrowing,
 /// so a range that genuinely needs its own file set (a plan window starting
 /// before the scan range, a past `--day`) still parses on its own.
-async function assembleDashboardData(
+export async function assembleDashboardData(
   period: Period,
   provider: string,
   projectFilter: string[] | undefined,
@@ -1929,26 +1929,40 @@ async function assembleDashboardData(
   customRange: DateRange | null | undefined,
   initialDay: string | null,
   scrollableDailyHistory: boolean,
-): Promise<{ scannedProjects: ProjectSummary[]; filteredProjects: ProjectSummary[]; planUsages: PlanUsage[]; initialDurable: DurableOverview }> {
+  autoFallback = false,
+): Promise<{ period: Period; scannedProjects: ProjectSummary[]; filteredProjects: ProjectSummary[]; planUsages: PlanUsage[]; initialDurable: DurableOverview }> {
   const range = getDashboardScanRange(period, customRange, initialDay, scrollableDailyHistory)
-  const durableRange = getDurableRange(period, customRange, initialDay)
+  // With the fallback armed the scope must cover the period it can land on too,
+  // so declare the wider of the two durable ranges.
+  const durableRange = getDurableRange(autoFallback ? AUTO_FALLBACK_PERIOD : period, customRange, initialDay)
   const superset: DateRange = {
     start: new Date(Math.min(range.start.getTime(), durableRange.start.getTime())),
     end: new Date(Math.max(range.end.getTime(), durableRange.end.getTime())),
   }
   return withSinglePassParse(superset, async () => {
     const scannedProjects = filterProjectsByName(await parseAllSessions(range, provider), projectFilter, excludeFilter)
-    const filteredProjects = selectDashboardPeriodProjects(scannedProjects, period, scrollableDailyHistory)
+    // #1111: the today-scoped slice IS the probe for the unset default — it
+    // comes out of the parse that had to happen anyway, so an empty today costs
+    // a slice, not a second pass. Sessions rather than projects: a project can
+    // survive the slice on subagent anchors alone, which carry no in-range
+    // spend and are not a day worth opening on.
+    const opened = autoFallback && !selectDashboardPeriodProjects(scannedProjects, period, scrollableDailyHistory).some(p => p.sessions.length > 0)
+      ? AUTO_FALLBACK_PERIOD
+      : period
+    const filteredProjects = selectDashboardPeriodProjects(scannedProjects, opened, scrollableDailyHistory)
     const planUsages = await getPlanUsages()
     // Durable headline totals for the initial paint (carry-forward cache + today),
     // matching the menubar/report. The interactive tree recomputes this on every
     // period/provider/refresh change; the static one-shot render uses just this.
-    const initialDurable = await computeDurableOverview(period, provider, projectFilter, excludeFilter, customRange, initialDay)
-    return { scannedProjects, filteredProjects, planUsages, initialDurable }
+    const initialDurable = await computeDurableOverview(opened, provider, projectFilter, excludeFilter, customRange, initialDay)
+    return { period: opened, scannedProjects, filteredProjects, planUsages, initialDurable }
   })
 }
 
-export async function renderDashboard(period: Period = 'week', provider: string = 'all', refreshSeconds?: number, projectFilter?: string[], excludeFilter?: string[], customRange?: DateRange | null, customRangeLabel?: string, initialDay?: string): Promise<void> {
+/// Where the unset interactive default lands when today has no sessions yet (#1111).
+export const AUTO_FALLBACK_PERIOD: Period = 'week'
+
+export async function renderDashboard(period: Period = 'week', provider: string = 'all', refreshSeconds?: number, projectFilter?: string[], excludeFilter?: string[], customRange?: DateRange | null, customRangeLabel?: string, initialDay?: string, autoPeriod = false): Promise<void> {
   // Interactive Ink UI: it renders to the same terminal and has its own in-frame
   // loading state, so the CLI scan-progress line must stay silent for its whole
   // lifetime (initial scan and every enabled auto-refresh, including the
@@ -1966,20 +1980,33 @@ export async function renderDashboard(period: Period = 'week', provider: string 
   // (json/csv/markdown, report, sessions, the app and menubar payloads) keeps
   // the full parse and can never return a partial total.
   const progressive = isTTY && dayRange == null && customRange == null && await isColdCacheOnDisk()
-  const assemble = () =>
-    assembleDashboardData(period, provider, projectFilter, excludeFilter, customRange, initialDay ?? null, scrollableDailyHistory)
-  const paint = progressive
-    ? await withColdFirstPaintFloor(getPeriodRange(period).start, assemble)
-    : { result: await assemble(), deferredFiles: 0 }
+  // #1111: with no explicit period the interactive dashboard opens on Today and
+  // falls back to 7 days only when today holds nothing yet. Explicit -p/--day/
+  // --from/--to and the non-interactive render keep the 7-day default.
+  const auto = autoPeriod && isTTY && dayRange == null && customRange == null
+  const openPeriod: Period = auto ? 'today' : period
+  const runPaint = async (p: Period, fallback: boolean) => {
+    const assemble = () =>
+      assembleDashboardData(p, provider, projectFilter, excludeFilter, customRange, initialDay ?? null, scrollableDailyHistory, fallback)
+    return progressive
+      ? await withColdFirstPaintFloor(getPeriodRange(p).start, assemble)
+      : { result: await assemble(), deferredFiles: 0 }
+  }
+  let paint = await runPaint(openPeriod, auto)
+  // A cold first paint is floored to the files its period needs, so a fallback
+  // decided under the Today floor would paint 7 days off today's files alone.
+  // Repaint it on the 7-day floor instead — pass one's files are in the cache
+  // it just wrote, so they are served rather than parsed again.
+  if (progressive && paint.result.period !== openPeriod) paint = await runPaint(paint.result.period, false)
   if (process.env['CODEBURN_VERBOSE'] === '1') {
     process.stderr.write(`codeburn: progressive cold start ${progressive ? 'on' : 'off'}, ${paint.deferredFiles} files deferred to the background fill\n`)
   }
-  const { scannedProjects, filteredProjects, planUsages, initialDurable } = paint.result
+  const { period: opened, scannedProjects, filteredProjects, planUsages, initialDurable } = paint.result
   const label = initialDay ? formatDayRangeLabel(initialDay) : customRangeLabel
   patchStdoutForWindows()
   if (isTTY) {
     const app = renderDebouncedInteractive(process.stdout, ({ columns }) => (
-      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={period} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={columns} initialIndexPendingFiles={paint.deferredFiles} />
+      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={opened} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={columns} initialIndexPendingFiles={paint.deferredFiles} />
     ))
     try {
       await app.waitUntilExit()
@@ -1987,7 +2014,7 @@ export async function renderDashboard(period: Period = 'week', provider: string 
       app.dispose()
     }
   } else {
-    const { unmount } = render(<StaticDashboard projects={filteredProjects} period={period} activeProvider={provider} planUsages={planUsages} label={label} dayMode={initialDay != null} durable={initialDurable} />, { patchConsole: false })
+    const { unmount } = render(<StaticDashboard projects={filteredProjects} period={opened} activeProvider={provider} planUsages={planUsages} label={label} dayMode={initialDay != null} durable={initialDurable} />, { patchConsole: false })
     // Non-interactive one-shot output: ink schedules the frame through a
     // throttled render, so yield a tick to let it flush to stdout before
     // unmounting. Unmounting synchronously can race the flush and drop output.

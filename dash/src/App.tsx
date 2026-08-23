@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 
 import {
@@ -495,6 +495,17 @@ export function App() {
   const primary = viewing ?? local
   const c0 = primary?.payload?.current
 
+  // #1111: the dashboard opens on Today and falls back to 7 days once, when the
+  // first local payload shows today still has no sessions. Disarmed by the
+  // period picker, so it can never move a period the user chose.
+  const autoPeriod = useRef(true)
+  useEffect(() => {
+    const sessions = local?.payload?.current?.sessions
+    if (!autoPeriod.current || sessions === undefined) return
+    autoPeriod.current = false
+    if (period === 'today' && sessions === 0) setPeriod('week')
+  }, [local, period])
+
   const providerOptions = useMemo(
     () =>
       c0
@@ -589,7 +600,7 @@ export function App() {
                 <button
                   key={p.key}
                   type="button"
-                  onClick={() => setPeriod(p.key)}
+                  onClick={() => { autoPeriod.current = false; setPeriod(p.key) }}
                   className={cn(
                     'rounded-[5px] px-3 py-1 text-xs font-medium transition-colors max-md:inline-flex max-md:min-h-9 max-md:items-center max-md:justify-center',
                     period === p.key ? 'bg-active-primary text-foreground shadow-sm' : 'text-tertiary-foreground hover:text-foreground',

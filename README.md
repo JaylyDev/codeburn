@@ -92,7 +92,7 @@ Everything runs locally. No wrapper, no proxy, no API keys, nothing leaves your 
 npx codeburn
 ```
 
-That opens the interactive dashboard (last 7 days by default). Arrow keys switch periods, `q` quits. That is the 30-second version. You now know where your AI budget goes.
+That opens the interactive dashboard (today by default, or the last 7 days when today has no usage yet). Arrow keys switch periods, `q` quits. That is the 30-second version. You now know where your AI budget goes.
 
 **Install it** for a permanent `codeburn` command:
 
@@ -440,7 +440,7 @@ Run `codeburn` for the dashboard, or use a subcommand below. Most commands also 
 
 | Command | What it does |
 |---------|--------------|
-| `codeburn` | Interactive dashboard, last 7 days (the default view) |
+| `codeburn` | Interactive dashboard, today (falls back to the last 7 days when today is empty) |
 | `codeburn today` | Today's usage |
 | `codeburn month` | This calendar month's usage |
 | `codeburn overview` | Plain-text monthly summary, copy-pasteable (`--no-color`, `--from`/`--to`) |

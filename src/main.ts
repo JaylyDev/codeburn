@@ -720,7 +720,7 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
 program
   .command('report', { isDefault: true })
   .description('Interactive usage dashboard')
-  .option('-p, --period <period>', 'Starting period: today, week, 30days, month, all, lifetime', 'week')
+  .option('-p, --period <period>', 'Starting period: today, week, 30days, month, all, lifetime (interactive default: today, or week when today is empty)', 'week')
   .option('--day <date>', 'Single day to review (YYYY-MM-DD, today, or yesterday). Overrides --period when set')
   .option('--from <date>', 'Start date (YYYY-MM-DD). Overrides --period when set')
   .option('--to <date>', 'End date (YYYY-MM-DD). Overrides --period when set')
@@ -729,7 +729,7 @@ program
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
   .option('--refresh <seconds>', 'Auto-refresh interval in seconds (minimum 60; 0 to disable)', parseInteger, 60)
-  .action(async (opts) => {
+  .action(async (opts, command) => {
     assertFormat(opts.format, ['tui', 'json'], 'report')
     assertProvider(opts.provider, 'report')
     let customRange: DateRange | null = null
@@ -761,7 +761,12 @@ program
       return
     }
     const customRangeLabel = customRange ? formatDateRangeLabel(opts.from, opts.to) : undefined
-    await renderDashboard(period, opts.provider, opts.refresh, opts.project, opts.exclude, customRange, customRangeLabel, daySelection?.day)
+    // #1111: no explicit period of any kind means the interactive dashboard
+    // picks its own — Today, or 7 days when today is still empty. Any source
+    // other than the option default (a flag, an env value) is the user's
+    // choice and is honored as given.
+    const autoPeriod = command.getOptionValueSource('period') === 'default' && !daySelection && !customRange
+    await renderDashboard(period, opts.provider, opts.refresh, opts.project, opts.exclude, customRange, customRangeLabel, daySelection?.day, autoPeriod)
   })
 
 program
