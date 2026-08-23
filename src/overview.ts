@@ -5,6 +5,7 @@ import { homedir } from 'os'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost as baseCost, getCurrency } from './currency.js'
 import { findUnpricedModels, getShortModelName, unpricedModelHint } from './models.js'
+import { callBillableOutputTokens, sessionBillableOutputTokens, sessionModelBillableOutputTokens } from './session-output.js'
 import { markEstimated } from './format.js'
 import { dateKey } from './day-aggregator.js'
 import type { DailyEntry } from './daily-cache.js'
@@ -140,7 +141,7 @@ export function renderOverview(
     byProject.set(pname, pe)
     for (const s of p.sessions) {
       inTok += s.totalInputTokens
-      outTok += s.totalOutputTokens
+      outTok += sessionBillableOutputTokens(s)
       cacheR += s.totalCacheReadTokens
       cacheW += s.totalCacheWriteTokens
       for (const [m, d] of Object.entries(s.modelBreakdown)) {
@@ -148,7 +149,14 @@ export function renderOverview(
         e.cost += d.costUSD
         e.calls += d.calls
         e.estimatedCost += d.estimatedCostUSD ?? 0
-        e.tokens += d.tokens.inputTokens + d.tokens.outputTokens + d.tokens.cacheReadInputTokens + d.tokens.cacheCreationInputTokens
+        e.tokens += d.tokens.inputTokens + d.tokens.cacheReadInputTokens + d.tokens.cacheCreationInputTokens
+        byModel.set(m, e)
+      }
+      // Output must be billed per call while provider identity is still known.
+      // Join on the same key as parser modelBreakdown (getShortModelName), not raw call.model.
+      for (const [m, output] of Object.entries(sessionModelBillableOutputTokens(s))) {
+        const e = byModel.get(m) ?? { cost: 0, calls: 0, tokens: 0, estimatedCost: 0 }
+        e.tokens += output
         byModel.set(m, e)
       }
       for (const [cat, d] of Object.entries(s.categoryBreakdown)) {
@@ -163,7 +171,9 @@ export function renderOverview(
       for (const t of s.turns) {
         const day = dateKey(t.timestamp || t.assistantCalls[0]?.timestamp || '')
         for (const call of t.assistantCalls) {
-          const tk = call.usage.inputTokens + call.usage.outputTokens + call.usage.cacheReadInputTokens + call.usage.cacheCreationInputTokens
+          const usage = call.usage
+          const billableOut = callBillableOutputTokens(call)
+          const tk = (usage?.inputTokens ?? 0) + billableOut + (usage?.cacheReadInputTokens ?? 0) + (usage?.cacheCreationInputTokens ?? 0)
           const pv = byProvider.get(call.provider) ?? { cost: 0, tokens: 0 }
           pv.cost += call.costUSD
           pv.tokens += tk

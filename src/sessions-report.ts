@@ -1,5 +1,6 @@
 import { behavioralCallCount, behavioralTurnCount } from './behavioral-weight.js'
 import { getShortModelName } from './models.js'
+import { inferSessionProvider, sessionBillableOutputTokens } from './session-output.js'
 import { CATEGORY_LABELS } from './types.js'
 import type { ProjectSummary, SessionSummary, TaskCategory } from './types.js'
 
@@ -23,21 +24,6 @@ export type SessionRow = {
   durationMs: number
 }
 
-function inferProvider(session: SessionSummary): string {
-  for (const turn of session.turns) {
-    const provider = turn.assistantCalls[0]?.provider
-    if (provider) return provider
-  }
-
-  const models = Object.keys(session.modelBreakdown)
-  const model = models[0]?.toLowerCase() ?? ''
-  if (model.startsWith('claude')) return 'claude'
-  if (model.startsWith('gpt-') || model.startsWith('o1') || model.startsWith('o3') || model.startsWith('o4')) return 'codex'
-  if (model.startsWith('gemini')) return 'gemini'
-  if (model.includes('/')) return model.split('/', 1)[0] || 'unknown'
-  return 'unknown'
-}
-
 function durationMs(startedAt: string, endedAt: string): number {
   const duration = new Date(endedAt).getTime() - new Date(startedAt).getTime()
   return Number.isFinite(duration) ? duration : 0
@@ -48,14 +34,14 @@ export function aggregateSessions(projects: ProjectSummary[]): SessionRow[] {
     sessionId: session.sessionId,
     title: session.title ?? '',
     project: session.project || project.project,
-    provider: inferProvider(session),
+    provider: inferSessionProvider(session),
     models: Object.keys(session.modelBreakdown),
     cost: session.totalCostUSD,
     savingsUSD: session.totalSavingsUSD,
     calls: session.apiCalls,
     turns: behavioralTurnCount(session.turns),
     inputTokens: session.totalInputTokens,
-    outputTokens: session.totalOutputTokens,
+    outputTokens: sessionBillableOutputTokens(session),
     cacheReadTokens: session.totalCacheReadTokens,
     cacheWriteTokens: session.totalCacheWriteTokens,
     startedAt: session.firstTimestamp,
@@ -374,7 +360,7 @@ const KEY_SEP = String.fromCharCode(0)
 
 function linkageProvider(session: SessionSummary): string {
   if (session.parentSessionId || session.agentSpawnLinks || session.spawnPrSets) return 'claude'
-  return inferProvider(session)
+  return inferSessionProvider(session)
 }
 function providerSessionKey(session: SessionSummary): string {
   return `${linkageProvider(session)}${KEY_SEP}${session.sessionId}`

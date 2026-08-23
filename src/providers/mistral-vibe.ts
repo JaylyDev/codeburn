@@ -5,7 +5,7 @@ import { homedir } from 'os'
 import { readSessionFile, readSessionLines } from '../fs-utils.js'
 import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 import { safeNumber } from '../parser.js'
 
 const METADATA_FILENAME = 'meta.json'
@@ -82,7 +82,7 @@ type VibeMessage = {
   tool_calls?: VibeToolCall[] | null
 }
 
-function getMistralVibeSessionsDir(override?: string): string {
+export function getMistralVibeSessionsDir(override?: string): string {
   if (override) return override
   const configuredHome = process.env['VIBE_HOME']
   const vibeHome = configuredHome ? expandHome(configuredHome) : join(homedir(), '.vibe')
@@ -407,6 +407,10 @@ export function createMistralVibeProvider(sessionsDir?: string): Provider {
 
     toolDisplayName(rawTool: string): string {
       return toolNameMap[rawTool] ?? rawTool
+    },
+
+    async probeRoots(): Promise<ProbeRoot[]> {
+      return [{ path: dir, label: 'sessions' }]
     },
 
     async discoverSessions(): Promise<SessionSource[]> {

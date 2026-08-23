@@ -16,6 +16,7 @@ import { formatTokens } from './format.js'
 import { recommendModelDefault, type ModelDefaultRecommendation } from './act/model-defaults.js'
 import { appliedFixGlyph, formatAppliedFix, type AppliedFix } from './act/types.js'
 import { isUserStartedSession, userStartedProjects } from './session-population.js'
+import { sessionBillableOutputTokens } from './session-output.js'
 import { aggregateFileChurn, buildCoachingNotes, scanUserCorrections, medianTimeToFirstEditMs, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 
 // ============================================================================
@@ -3030,7 +3031,7 @@ export function detectRecurringContext(openers: SessionOpener[]): WasteFinding |
 
 function sessionTokenTotal(session: ProjectSummary['sessions'][number]): number {
   return session.totalInputTokens
-    + session.totalOutputTokens
+    + sessionBillableOutputTokens(session)
     + session.totalCacheReadTokens
     + session.totalCacheWriteTokens
 }
@@ -3268,9 +3269,9 @@ export function findContextBloatCandidates(projects: ProjectSummary[]): ContextB
 
     for (const session of sessions) {
       const inputTokens = sessionEffectiveContextTokens(session)
-      // Reasoning is stored separately from ordinary output, but both are
-      // generated tokens for this detector. Reports already use their sum.
-      const outputTokens = session.totalOutputTokens + session.totalReasoningTokens
+      // Generated tokens: exclusive providers add reasoning; inclusive ones
+      // already folded it into totalOutputTokens (#1078 / #1115).
+      const outputTokens = sessionBillableOutputTokens(session)
       const ratio = inputTokens / Math.max(outputTokens, 1)
       const currentMs = new Date(session.firstTimestamp).getTime()
       const gapMs = previousTimestampMs !== null ? currentMs - previousTimestampMs : null
