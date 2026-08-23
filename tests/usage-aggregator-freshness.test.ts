@@ -100,6 +100,12 @@ vi.mock('../src/parser.js', async (importOriginal) => {
       return fixtureProjects()
     }),
     isSessionHydrationComplete: vi.fn(() => parseCalls === 1),
+    sessionHydrationSnapshot: vi.fn(() => ({
+      complete: parseCalls === 1,
+      deferredForFirstPaint: false,
+      indexedFiles: parseCalls,
+      pendingFiles: 0,
+    })),
   }
 })
 

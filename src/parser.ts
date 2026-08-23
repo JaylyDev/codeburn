@@ -4700,6 +4700,12 @@ export function isSessionHydrationComplete(): boolean {
   return sessionHydrationComplete
 }
 
+// Why the most recent parse was incomplete, when it was: true only when the
+// first-paint floor deferred files. Read by `sessionHydrationSnapshot` so the
+// serve payload can label a converging first paint without also claiming the
+// unrelated `stale` (read-only snapshot) condition.
+let sessionFirstPaintDeferred = false
+
 // Set by the read-only serving paths when the snapshot they served did NOT
 // match what is on disk: in read-only mode a changed file is served at its
 // stale fingerprint and a file with no cache entry is skipped entirely. A
@@ -4797,6 +4803,28 @@ let firstPaintDeferredThisRun = 0
 let filesParsedFromSource = 0
 export function filesParsedFromSourceCount(): number {
   return filesParsedFromSource
+}
+
+/** What the most recent parse left behind, for consumers that must present
+ *  partiality honestly (#1110). `deferredForFirstPaint` is what separates a
+ *  progressive cold start from the read-only stale case: both leave
+ *  `complete` false, but only the latter is `stale` — a first paint is fresh
+ *  data over a smaller file set, and it converges on its own.
+ *  `indexedFiles` counts files parsed from source since this process started
+ *  and `pendingFiles` the files the active first-paint scope deferred; both are
+ *  progress numbers and only meaningful while `complete` is false. */
+export function sessionHydrationSnapshot(): {
+  complete: boolean
+  deferredForFirstPaint: boolean
+  indexedFiles: number
+  pendingFiles: number
+} {
+  return {
+    complete: sessionHydrationComplete,
+    deferredForFirstPaint: sessionFirstPaintDeferred,
+    indexedFiles: filesParsedFromSource,
+    pendingFiles: firstPaintDeferredPaths?.size ?? 0,
+  }
 }
 
 /** Restrict every parse inside `fn` to files that can hold in-range data for a
@@ -5113,6 +5141,7 @@ async function runParseInner(
   // failure, reached the end of the scan without hydrating everything, and
   // the daily backfill must not finalize history off it.
   sessionHydrationComplete = (!readOnly || !readOnlyServedStale) && !deferredRetryableSource && !deferredForFirstPaint
+  sessionFirstPaintDeferred = deferredForFirstPaint
 
   // Merge across providers by normalised project path so the same repository
   // is not double-counted when it was worked on with more than one tool

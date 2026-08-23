@@ -4,8 +4,10 @@ import { createHash } from 'crypto'
 import { createInterface } from 'readline'
 
 import type { Command } from 'commander'
+import { getDateRange } from './cli-date.js'
 import { getConfigFilePath } from './config.js'
 import type { ParseReuseValidation } from './parser.js'
+import { SERVE_HYDRATION_ENV } from './usage-aggregator.js'
 
 // ---------------------------------------------------------------------------
 // codeburn serve --stdio: a resident query server for the desktop app.
@@ -40,6 +42,13 @@ const SERVE_MAX_RSS_BYTES = 3 * 1024 * 1024 * 1024
 // giving up and exiting. CODEBURN_SERVE_DRAIN_MS overrides it so the e2e can
 // prove the bound without a 45-second test.
 const DEFAULT_DRAIN_MS = 45_000
+
+// How long the background fill waits after a cold first paint before taking the
+// queue. Long enough for the client's opening burst (it is serial, so its next
+// request is already on the wire) to land in front of the fill, short enough
+// that a client which then goes quiet still converges promptly.
+// CODEBURN_SERVE_FILL_DELAY_MS overrides it for tests.
+const DEFAULT_FILL_DELAY_MS = 3_000
 
 type OutputMemoEntry = {
   createdAt: number
@@ -142,6 +151,60 @@ function allowed(args: string[]): boolean {
     if (value === undefined || value.startsWith('-')) return false
   }
   return true
+}
+
+/// Read a served option's value. `allowed()` has already proven the argv shape
+/// (no positionals, every value-bearing option followed by a value that does
+/// not start with '-'), so a token equal to the option name is always the
+/// option and never someone's value.
+function readServeOption(args: string[], name: string): string | undefined {
+  for (let i = 1; i < args.length; i++) {
+    const token = args[i]!
+    if (token === name) return args[i + 1]
+    if (token.startsWith(`${name}=`)) return token.slice(name.length + 1)
+  }
+  return undefined
+}
+
+/// The range start a cold first paint of this request may be floored to, or
+/// null when the request must not be answered partially (#1110).
+///
+/// Only `status --format menubar-json` qualifies, because it is the ONLY served
+/// output that carries the `hydration` marker. Every other served command
+/// (`models`/`sessions`/`spend` --format json ...) is a one-shot shape whose
+/// consumer has no in-band way to tell a partial answer from a final one, so it
+/// keeps the full parse. Explicit `--day`/`--from`/`--to`/`--days` are excluded
+/// for the same reason the TUI excludes them: the floor is derived from a named
+/// period, and a custom range is a deliberate question that deserves a real
+/// answer.
+export function coldFirstPaintRangeStart(
+  args: string[],
+  rangeForPeriod: (period: string) => { range: { start: Date } },
+): Date | null {
+  if (args[0] !== 'status') return null
+  if (readServeOption(args, '--format') !== 'menubar-json') return null
+  for (const flag of ['--day', '--from', '--to', '--days']) {
+    if (readServeOption(args, flag) !== undefined) return null
+  }
+  // Mirrors the `status` --period default in main.ts.
+  const period = readServeOption(args, '--period') ?? 'today'
+  try {
+    return rangeForPeriod(period).range.start
+  } catch {
+    return null
+  }
+}
+
+/// The request id of a protocol line, without committing to handling it. The
+/// client's watchdog is a NO-OUTPUT timer, so a request waiting behind the
+/// background fill has to be heartbeated by id before its turn comes.
+function peekRequestId(line: string): string | number | null {
+  try {
+    const id = (JSON.parse(line) as { id?: unknown } | null)?.id
+    return typeof id === 'string' || typeof id === 'number' ? id : null
+  } catch {
+    return null
+  }
 }
 
 class ExitSignal extends Error {
@@ -315,6 +378,12 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
   // re-running the discovery sweep per panel. Serve-only: one-shot CLI runs
   // never set this, so their results stay byte-exact.
   if (!process.env['CODEBURN_PARSE_BURST_MS']) process.env['CODEBURN_PARSE_BURST_MS'] = '10000'
+  // This process is the one producer allowed to answer partially, because its
+  // clients poll and therefore converge. The marker makes every menubar payload
+  // it emits carry `hydration` — including the warm ones, which report
+  // `complete: true` — so a consumer never has to infer completeness from a
+  // missing field within a single source.
+  process.env[SERVE_HYDRATION_ENV] = '1'
   // Event-driven reuse: while no watched session root has changed, a previous
   // parse stays valid past the burst window (capped in parser.ts, so a missed
   // filesystem event self-heals within minutes). This is what turns a warm
@@ -367,10 +436,62 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
   // Strict serialization: each request chains on the previous one.
   let queue: Promise<void> = Promise.resolve()
 
+  // Progressive cold start (#1110). Ids of requests received but not yet
+  // answered, so work that holds the queue can heartbeat them.
+  const awaiting = new Set<string | number>()
+  const beat = (progress: string): void => {
+    for (const id of awaiting) write({ id, progress })
+  }
+  // Cold detection runs at most once per paintable request until it answers
+  // "warm"; from then on this child is warm for good and every request takes
+  // the ordinary full path.
+  let firstPaintSettled = false
+  let fillTimer: ReturnType<typeof setTimeout> | undefined
+
+  // The other half of the first paint: the same request, unfloored. It is an
+  // ordinary parse, so what it writes to the session and daily caches is
+  // exactly what a full cold parse would have written — the paint only
+  // sequenced those files behind the answer, it never dropped them. Killed
+  // mid-fill, nothing is stamped complete and the next launch re-enters cold.
+  const scheduleBackgroundFill = (args: string[]): void => {
+    if (fillTimer) return
+    const delayMs = Number(process.env['CODEBURN_SERVE_FILL_DELAY_MS']) || DEFAULT_FILL_DELAY_MS
+    fillTimer = setTimeout(() => {
+      queue = queue.then(async () => {
+        const { isColdCacheOnDisk } = await import('./session-cache.js')
+        // A request that landed in front of the fill may already have done the
+        // full parse (only the menubar payload is ever floored).
+        if (!await isColdCacheOnDisk()) return
+        const { startProgressKeepalive, stopProgressKeepalive } = await import('./parser.js')
+        startProgressKeepalive()
+        const startedAt = Date.now()
+        try {
+          const { output, code } = await runCaptured(buildProgram, args, beat)
+          const fingerprint = await getConfigFingerprint()
+          // Memoized so the poll that follows the fill answers instantly with
+          // the converged payload instead of re-deriving it.
+          if (code === 0 && fingerprint !== null) {
+            outputMemo.set(args.join('\u0000'), createOutputMemoEntry(startedAt, Date.now(), output, fingerprint))
+          }
+        } catch {
+          // Best effort. A failed fill leaves the cache incomplete, which is
+          // exactly the state the next cold start knows how to resume from.
+        } finally {
+          stopProgressKeepalive()
+        }
+      })
+    }, delayMs)
+    // The app owning this child is gone once stdin closes; an unstarted fill
+    // must not keep the process alive past that.
+    fillTimer.unref?.()
+  }
+
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity })
   rl.on('line', (line) => {
     const trimmed = line.trim()
     if (!trimmed) return
+    const waitingId = peekRequestId(trimmed)
+    if (waitingId !== null) awaiting.add(waitingId)
     queue = queue.then(async () => {
       let request: unknown
       try {
@@ -408,22 +529,47 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
         write({ id: request.id, ok: true, output: memoHit.output })
         return
       }
+      // Progressive cold start (#1110): on a cold cache the menubar payload is
+      // answered from the files the requested period can actually show, and the
+      // rest are indexed behind it. Same cold test as the TUI (session-cache
+      // envelope missing or complete !== true), same floor, and the answer says
+      // so in-band via `hydration.complete: false`.
+      const paintFrom = firstPaintSettled ? null : coldFirstPaintRangeStart(request.args, getDateRange)
+      let floor: Date | null = null
+      if (paintFrom) {
+        const { isColdCacheOnDisk } = await import('./session-cache.js')
+        floor = await isColdCacheOnDisk() ? paintFrom : null
+        firstPaintSettled = true
+      }
       // Heartbeat the WHOLE request, not just its parse: the aggregation and
       // payload serialization after a parse measured ~8s of further silence, and
       // it lands back-to-back with the parse's own quiet stretches. Wrapping
       // here (rather than at each command's exits) covers every served command
       // at one seam, and runCaptured routes the beats out as progress frames.
-      const { startProgressKeepalive, stopProgressKeepalive } = await import('./parser.js')
+      const { startProgressKeepalive, stopProgressKeepalive, withColdFirstPaintFloor } = await import('./parser.js')
       startProgressKeepalive()
       try {
         const parseStartedAt = Date.now()
-        const { output, code } = await runCaptured(
+        const run = () => runCaptured(
           buildProgram,
           request.args,
           progress => write({ id: request.id, progress }),
         )
+        let deferredFiles = 0
+        let result: Awaited<ReturnType<typeof run>>
+        if (floor) {
+          const painted = await withColdFirstPaintFloor(floor, run)
+          deferredFiles = painted.deferredFiles
+          result = painted.result
+        } else {
+          result = await run()
+        }
+        const { output, code } = result
         if (code === 0) {
-          if (configFingerprint !== null) {
+          // A partial answer is never memoized. The roots stay quiet while the
+          // fill converges, so a memo hit would pin the client to the first
+          // paint for the whole memo cap.
+          if (configFingerprint !== null && deferredFiles === 0) {
             outputMemo.set(memoKey, createOutputMemoEntry(parseStartedAt, Date.now(), output, configFingerprint))
           }
           if (outputMemo.size > 32) {
@@ -431,6 +577,7 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
             if (oldest) outputMemo.delete(oldest[0])
           }
           write({ id: request.id, ok: true, output })
+          if (deferredFiles > 0) scheduleBackgroundFill(request.args)
         }
         else write({ id: request.id, ok: false, error: `exit ${code}`, output })
       } catch (err) {
@@ -455,6 +602,8 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
         clearAntigravityCacheStates()
         if (typeof globalThis.gc === 'function') globalThis.gc()
       }
+    }).finally(() => {
+      if (waitingId !== null) awaiting.delete(waitingId)
     })
   })
 
