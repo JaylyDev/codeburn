@@ -6,7 +6,7 @@ import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, typ
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost, formatTokens, markEstimated, carriedCostNote } from './format.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
-import { parseAllSessions, filterProjectsByDateRange, filterProjectsByName, setInteractiveScanUI } from './parser.js'
+import { parseAllSessions, filterProjectsByDateRange, filterProjectsByName, setInteractiveScanUI, withSinglePassParse } from './parser.js'
 import { findUnpricedModels, isExpectedFreeModel, loadPricing } from './models.js'
 import { aggregateModelTotals } from './model-breakdown.js'
 import { buildDurablePeriod } from './usage-aggregator.js'
@@ -307,6 +307,10 @@ export type DurableOverview = {
   carriedCostUSD: number
 }
 
+function getDurableRange(period: Period, customRange: DateRange | null | undefined, day: string | null): DateRange {
+  return day ? getDayRange(day) : customRange ?? getPeriodRange(period)
+}
+
 async function computeDurableOverview(
   period: Period,
   provider: string,
@@ -315,7 +319,7 @@ async function computeDurableOverview(
   customRange: DateRange | null | undefined,
   day: string | null,
 ): Promise<DurableOverview> {
-  const range = day ? getDayRange(day) : customRange ?? getPeriodRange(period)
+  const range = getDurableRange(period, customRange, day)
   const { data, carriedCostUSD } = await buildDurablePeriod(
     { range, label: PERIOD_LABELS[period] },
     { provider, project: projectFilter ?? [], exclude: excludeFilter ?? [] },
@@ -1867,6 +1871,42 @@ function StaticDashboard({ projects, period, activeProvider, planUsages, label, 
   )
 }
 
+/// The initial paint's data, assembled under one declared parse scope.
+///
+/// The scan parse, the plan window and the durable headline each ran the whole
+/// pipeline: three ranges that often share a start and differ only in where
+/// they end (end-of-day vs each caller's own `new Date()`), which the exact-key
+/// memo cannot match. Declaring the widest of them lets `withSinglePassParse`
+/// serve the rest by slicing it — but only the ones that are a pure narrowing,
+/// so a range that genuinely needs its own file set (a plan window starting
+/// before the scan range, a past `--day`) still parses on its own.
+async function assembleDashboardData(
+  period: Period,
+  provider: string,
+  projectFilter: string[] | undefined,
+  excludeFilter: string[] | undefined,
+  customRange: DateRange | null | undefined,
+  initialDay: string | null,
+  scrollableDailyHistory: boolean,
+): Promise<{ scannedProjects: ProjectSummary[]; filteredProjects: ProjectSummary[]; planUsages: PlanUsage[]; initialDurable: DurableOverview }> {
+  const range = getDashboardScanRange(period, customRange, initialDay, scrollableDailyHistory)
+  const durableRange = getDurableRange(period, customRange, initialDay)
+  const superset: DateRange = {
+    start: new Date(Math.min(range.start.getTime(), durableRange.start.getTime())),
+    end: new Date(Math.max(range.end.getTime(), durableRange.end.getTime())),
+  }
+  return withSinglePassParse(superset, async () => {
+    const scannedProjects = filterProjectsByName(await parseAllSessions(range, provider), projectFilter, excludeFilter)
+    const filteredProjects = selectDashboardPeriodProjects(scannedProjects, period, scrollableDailyHistory)
+    const planUsages = await getPlanUsages()
+    // Durable headline totals for the initial paint (carry-forward cache + today),
+    // matching the menubar/report. The interactive tree recomputes this on every
+    // period/provider/refresh change; the static one-shot render uses just this.
+    const initialDurable = await computeDurableOverview(period, provider, projectFilter, excludeFilter, customRange, initialDay)
+    return { scannedProjects, filteredProjects, planUsages, initialDurable }
+  })
+}
+
 export async function renderDashboard(period: Period = 'week', provider: string = 'all', refreshSeconds?: number, projectFilter?: string[], excludeFilter?: string[], customRange?: DateRange | null, customRangeLabel?: string, initialDay?: string): Promise<void> {
   // Interactive Ink UI: it renders to the same terminal and has its own in-frame
   // loading state, so the CLI scan-progress line must stay silent for its whole
@@ -1878,13 +1918,8 @@ export async function renderDashboard(period: Period = 'week', provider: string 
   const isTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY)
   const scrollableDailyHistory = isTTY && dayRange == null && customRange == null
   const range = getDashboardScanRange(period, customRange, initialDay ?? null, scrollableDailyHistory)
-  const scannedProjects = filterProjectsByName(await parseAllSessions(range, provider), projectFilter, excludeFilter)
-  const filteredProjects = selectDashboardPeriodProjects(scannedProjects, period, scrollableDailyHistory)
-  const planUsages = await getPlanUsages()
-  // Durable headline totals for the initial paint (carry-forward cache + today),
-  // matching the menubar/report. The interactive tree recomputes this on every
-  // period/provider/refresh change; the static one-shot render uses just this.
-  const initialDurable = await computeDurableOverview(period, provider, projectFilter, excludeFilter, customRange, initialDay ?? null)
+  const { scannedProjects, filteredProjects, planUsages, initialDurable } =
+    await assembleDashboardData(period, provider, projectFilter, excludeFilter, customRange, initialDay ?? null, scrollableDailyHistory)
   const label = initialDay ? formatDayRangeLabel(initialDay) : customRangeLabel
   patchStdoutForWindows()
   if (isTTY) {
