@@ -241,6 +241,25 @@ describe('App shortcuts', () => {
     await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('today', 'all'))
   })
 
+  it('falls back to 7 days when the boot payload shows today has no sessions', async () => {
+    localStorage.removeItem('codeburn.defaultPeriod')
+    const empty = overviewPayload()
+    mocks.getOverview.mockResolvedValue({ ...empty, current: { ...empty.current, sessions: 0 } })
+    render(<App />)
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('today', 'all'))
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('week', 'all'))
+  })
+
+  it('leaves a persisted default period alone when today has no sessions', async () => {
+    localStorage.setItem('codeburn.defaultPeriod', 'today')
+    const empty = overviewPayload()
+    mocks.getOverview.mockResolvedValue({ ...empty, current: { ...empty.current, sessions: 0 } })
+    render(<App />)
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('today', 'all'))
+    await act(async () => { await Promise.resolve() })
+    expect(mocks.getOverview).not.toHaveBeenCalledWith('week', 'all')
+  })
+
   it('switches sections with command-number shortcuts', async () => {
     render(<App />)
 
