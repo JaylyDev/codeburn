@@ -2,6 +2,7 @@ import type { DailyEntry, ProjectDayStats, ProviderDaySlice } from './daily-cach
 import type { PeriodData } from './menubar-json.js'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 import { isBehavioralCall, isBehavioralTurn } from './behavioral-weight.js'
+import { billableOutputTokens } from './models.js'
 
 function emptyEntry(date: string): DailyEntry {
   return {
@@ -189,8 +190,13 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn:
           callDay.cost += call.costUSD
           callDay.savingsUSD += callSavings
           callDay.calls += callWeight
+          const billableOut = billableOutputTokens(
+            call.provider,
+            call.usage.outputTokens,
+            call.usage.reasoningTokens,
+          )
           callDay.inputTokens += call.usage.inputTokens
-          callDay.outputTokens += call.usage.outputTokens
+          callDay.outputTokens += billableOut
           callDay.cacheReadTokens += call.usage.cacheReadInputTokens
           callDay.cacheWriteTokens += call.usage.cacheCreationInputTokens
 
@@ -208,7 +214,7 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn:
           model.cost += call.costUSD
           model.savingsUSD += callSavings
           model.inputTokens += call.usage.inputTokens
-          model.outputTokens += call.usage.outputTokens
+          model.outputTokens += billableOut
           model.cacheReadTokens += call.usage.cacheReadInputTokens
           model.cacheWriteTokens += call.usage.cacheCreationInputTokens
           callDay.models[call.model] = model
@@ -218,7 +224,7 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn:
           slice.cost += call.costUSD
           slice.savingsUSD += callSavings
           slice.inputTokens! += call.usage.inputTokens
-          slice.outputTokens! += call.usage.outputTokens
+          slice.outputTokens! += billableOut
           slice.cacheReadTokens! += call.usage.cacheReadInputTokens
           slice.cacheWriteTokens! += call.usage.cacheCreationInputTokens
 
@@ -236,7 +242,7 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[], dateKeyFn:
           sliceModel.cost += call.costUSD
           sliceModel.savingsUSD += callSavings
           sliceModel.inputTokens += call.usage.inputTokens
-          sliceModel.outputTokens += call.usage.outputTokens
+          sliceModel.outputTokens += billableOut
           sliceModel.cacheReadTokens += call.usage.cacheReadInputTokens
           sliceModel.cacheWriteTokens += call.usage.cacheCreationInputTokens
           slice.models![call.model] = sliceModel
