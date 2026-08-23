@@ -225,3 +225,26 @@ export async function* readSessionLines(
     stream.destroy()
   }
 }
+
+// Metadata syscalls (readdir/stat) issued one-at-a-time leave the OS idle
+// between them: on a 21k-file corpus the discovery sweep spent most of its wall
+// clock waiting rather than working. Results are returned in input order so
+// callers keep their deterministic, order-sensitive downstream processing.
+export const FS_SCAN_CONCURRENCY = 32
+
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length)
+  let idx = 0
+  const run = async (): Promise<void> => {
+    while (idx < items.length) {
+      const current = idx++
+      out[current] = await worker(items[current]!, current)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run))
+  return out
+}

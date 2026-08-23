@@ -1,7 +1,7 @@
 import { existsSync } from 'fs'
 import { lstat, readFile, readdir, stat } from 'fs/promises'
 import { basename, dirname, join, resolve, sep } from 'path'
-import { readSessionLines } from './fs-utils.js'
+import { FS_SCAN_CONCURRENCY, mapWithConcurrency, readSessionLines } from './fs-utils.js'
 import { billableOutputTokens, calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
 import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
 import { normalizeContentBlocks, flatSlice, flatString } from './content-utils.js'
@@ -1922,13 +1922,17 @@ async function collectJsonlInto(dir: string, out: Set<string>): Promise<void> {
 }
 
 export async function collectJsonlFiles(dirPath: string): Promise<string[]> {
-  const files = await readdir(dirPath).catch(() => [])
-  const jsonlFiles = new Set(files.filter(f => f.endsWith('.jsonl')).map(f => join(dirPath, f)))
+  const files = await readdir(dirPath, { withFileTypes: true }).catch(() => [])
+  const jsonlFiles = new Set(files.filter(f => f.name.endsWith('.jsonl')).map(f => join(dirPath, f.name)))
 
   await collectJsonlInto(join(dirPath, 'subagents'), jsonlFiles)
   for (const entry of files) {
-    if (entry.endsWith('.jsonl')) continue
-    await collectJsonlInto(join(dirPath, entry, 'subagents'), jsonlFiles)
+    if (entry.name.endsWith('.jsonl')) continue
+    // A plain file can't hold a subagents/ dir, so don't spend a readdir
+    // finding out. Anything else (real dir, symlink, unknown type) still gets
+    // probed, matching what the untyped readdir used to do.
+    if (entry.isFile()) continue
+    await collectJsonlInto(join(dirPath, entry.name, 'subagents'), jsonlFiles)
   }
 
   return [...jsonlFiles]
@@ -1969,36 +1973,47 @@ async function scanProjectDirs(
 
   const discoverProgress = createScanProgress('scanning claude project dirs', dirs.length)
   let dirsDone = 0
-  for (const { path: dirPath, name: dirName, source } of dirs) {
+  // Walk and fingerprint concurrently, then reconcile serially in discovery
+  // order: the reconcile loop feeds order-sensitive state (changedFiles order
+  // drives the worker-result pairing, seenMsgIds pre-seeding), so only the
+  // syscalls are allowed to overlap.
+  const walked = await mapWithConcurrency(dirs, FS_SCAN_CONCURRENCY, async ({ path: dirPath }) => {
     const jsonlFiles = await collectJsonlFiles(dirPath)
-    for (const filePath of jsonlFiles) {
-      allDiscoveredFiles.add(filePath)
-      const fp = await fingerprintFile(filePath)
-      if (!fp) continue
-
-      const cached = section.files[filePath]
-      const action = reconcileFile(fp, cached)
-      if (cached && (readOnly || action.action === 'unchanged')) {
-        if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
-        unchangedFiles.push({ filePath, dirName, source, cached: section.files[filePath]! })
-      } else if (!readOnly) {
-        if (action.action === 'appended') {
-          changedFiles.push({
-            filePath,
-            info: { dirName, fp, source },
-            append: { cached: section.files[filePath]!, readFromOffset: action.readFromOffset },
-          })
-          continue
-        }
-        changedFiles.push({ filePath, info: { dirName, fp, source } })
-      } else {
-        // Read-only with no cache entry at all: this file is dropped from what
-        // we serve, so the snapshot under-reports whatever days it covers.
-        readOnlyServedStale = true
-      }
-    }
     dirsDone++
     await discoverProgress.tick(dirsDone)
+    return jsonlFiles
+  })
+  const discovered: Array<{ filePath: string; dirName: string; source?: SessionSourceMetadata }> = []
+  for (let i = 0; i < dirs.length; i++) {
+    const { name: dirName, source } = dirs[i]!
+    for (const filePath of walked[i]!) discovered.push({ filePath, dirName, source })
+  }
+  const fingerprints = await mapWithConcurrency(discovered, FS_SCAN_CONCURRENCY, e => fingerprintFile(e.filePath))
+  for (const [i, { filePath, dirName, source }] of discovered.entries()) {
+    allDiscoveredFiles.add(filePath)
+    const fp = fingerprints[i]
+    if (!fp) continue
+
+    const cached = section.files[filePath]
+    const action = reconcileFile(fp, cached)
+    if (cached && (readOnly || action.action === 'unchanged')) {
+      if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
+      unchangedFiles.push({ filePath, dirName, source, cached: section.files[filePath]! })
+    } else if (!readOnly) {
+      if (action.action === 'appended') {
+        changedFiles.push({
+          filePath,
+          info: { dirName, fp, source },
+          append: { cached: section.files[filePath]!, readFromOffset: action.readFromOffset },
+        })
+        continue
+      }
+      changedFiles.push({ filePath, info: { dirName, fp, source } })
+    } else {
+      // Read-only with no cache entry at all: this file is dropped from what
+      // we serve, so the snapshot under-reports whatever days it covers.
+      readOnlyServedStale = true
+    }
   }
   discoverProgress.finish()
 
@@ -3220,19 +3235,27 @@ export async function parseProviderSources(
   const unchangedSources: Array<{ source: SessionSource; cached: CachedFile }> = []
   const changedSources: SourceInfo[] = []
 
-  for (const source of sources) {
+  // Same shape as scanProjectDirs: overlap the stat syscalls, then reconcile in
+  // discovery order. Network sources on a write run never reach fingerprintFile
+  // (they take the synthetic-fingerprint branch below), so they are skipped here.
+  const skipFingerprint = provider.network && !readOnly
+  const sourceFingerprints = skipFingerprint
+    ? []
+    : await mapWithConcurrency(sources, FS_SCAN_CONCURRENCY, s => fingerprintFile(s.path))
+
+  for (const [sourceIndex, source] of sources.entries()) {
     allDiscoveredFiles.add(source.path)
 
     // Network providers (e.g. Vercel AI Gateway) have no on-disk file — their data
     // comes from a live API fetch in createSessionParser. There's nothing to
     // fingerprint or incrementally cache, so re-fetch every run with a synthetic
     // fingerprint (mtime=now so the date-range filter below never excludes it).
-    if (provider.network && !readOnly) {
+    if (skipFingerprint) {
       changedSources.push({ source, fp: { dev: 0, ino: 0, mtimeMs: Date.now(), sizeBytes: 0 } })
       continue
     }
 
-    const fp = await fingerprintFile(source.path)
+    const fp = sourceFingerprints[sourceIndex]
     if (!fp) {
       // A source that was discovered but cannot be fingerprinted is skipped —
       // but skipping is only safe when the file is genuinely GONE (discovery

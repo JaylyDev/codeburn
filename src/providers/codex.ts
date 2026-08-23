@@ -4,7 +4,7 @@ import { createInterface } from 'readline'
 import { basename, join } from 'path'
 import { homedir } from 'os'
 
-import { readSessionLines } from '../fs-utils.js'
+import { FS_SCAN_CONCURRENCY, mapWithConcurrency, readSessionLines } from '../fs-utils.js'
 import { billableOutputTokens, calculateCost, getModelCosts } from '../models.js'
 import { readCachedCodexResults, writeCachedCodexResults, getCachedCodexProject, fingerprintFile, type CodexFileFingerprint } from '../codex-cache.js'
 import { mergeToolIntervals } from '../codex-throughput.js'
@@ -551,47 +551,46 @@ async function discoverSessionsInDir(codexDir: string): Promise<SessionSource[]>
   const seenBasenames = new Set<string>()
   const sessionsDir = join(codexDir, 'sessions')
 
-  const years = await readdir(sessionsDir).catch(() => [] as string[])
+  const years = (await readdir(sessionsDir).catch(() => [] as string[])).filter(y => /^\d{4}$/.test(y))
 
-  for (const year of years) {
-    if (!/^\d{4}$/.test(year)) continue
+  const monthDirs = (await mapWithConcurrency(years, FS_SCAN_CONCURRENCY, async year => {
     const yearDir = join(sessionsDir, year)
-    const months = await readdir(yearDir).catch(() => [] as string[])
+    return (await readdir(yearDir).catch(() => [] as string[]))
+      .filter(m => /^\d{2}$/.test(m))
+      .map(m => join(yearDir, m))
+  })).flat()
 
-    for (const month of months) {
-      if (!/^\d{2}$/.test(month)) continue
-      const monthDir = join(yearDir, month)
-      const days = await readdir(monthDir).catch(() => [] as string[])
+  const dayDirs = (await mapWithConcurrency(monthDirs, FS_SCAN_CONCURRENCY, async monthDir =>
+    (await readdir(monthDir).catch(() => [] as string[]))
+      .filter(d => /^\d{2}$/.test(d))
+      .map(d => join(monthDir, d)),
+  )).flat()
 
-      for (const day of days) {
-        if (!/^\d{2}$/.test(day)) continue
-        const dayDir = join(monthDir, day)
-        const files = await readdir(dayDir).catch(() => [] as string[])
-
-        for (const file of files) {
-          if (!file.startsWith('rollout-') || !file.endsWith('.jsonl')) continue
-          if (seenBasenames.has(file)) continue
-          seenBasenames.add(file)
-          const source = await discoverSessionFile(join(dayDir, file))
-          if (source) sources.push(source)
-        }
-      }
-    }
-  }
+  const dated = (await mapWithConcurrency(dayDirs, FS_SCAN_CONCURRENCY, async dayDir =>
+    (await readdir(dayDir).catch(() => [] as string[]))
+      .filter(f => f.startsWith('rollout-') && f.endsWith('.jsonl'))
+      .map(f => ({ file: f, path: join(dayDir, f) })),
+  )).flat()
 
   // Codex moves archived sessions into a flat directory. Keep them in usage
   // reports so archiving a conversation does not erase its historical usage.
   // Call-level deduplication (seenKeys) already collapses any remaining
-  // archived copies, while basename dedup above prevents double discovery.
+  // archived copies, while basename dedup below prevents double discovery.
   const archivedDir = join(codexDir, 'archived_sessions')
-  const archivedFiles = await readdir(archivedDir).catch(() => [] as string[])
-  for (const file of archivedFiles) {
-    if (!file.startsWith('rollout-') || !file.endsWith('.jsonl')) continue
-    if (seenBasenames.has(file)) continue
-    seenBasenames.add(file)
-    const source = await discoverSessionFile(join(archivedDir, file))
-    if (source) sources.push(source)
+  const archived = (await readdir(archivedDir).catch(() => [] as string[]))
+    .filter(f => f.startsWith('rollout-') && f.endsWith('.jsonl'))
+    .map(f => ({ file: f, path: join(archivedDir, f) }))
+
+  // Dedup before the reads so a basename is opened once, and keep the dated
+  // pass ahead of the archived one — the same precedence the serial walk had.
+  const candidates: Array<{ file: string; path: string }> = []
+  for (const entry of [...dated, ...archived]) {
+    if (seenBasenames.has(entry.file)) continue
+    seenBasenames.add(entry.file)
+    candidates.push(entry)
   }
+  const discovered = await mapWithConcurrency(candidates, FS_SCAN_CONCURRENCY, c => discoverSessionFile(c.path))
+  for (const source of discovered) if (source) sources.push(source)
 
   return sources
 }
