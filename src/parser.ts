@@ -2000,6 +2000,7 @@ async function scanProjectDirs(
       if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
       unchangedFiles.push({ filePath, dirName, source, cached: section.files[filePath]! })
     } else if (!readOnly) {
+      if (deferToBackgroundFill(filePath, fp, cached)) continue
       if (action.action === 'appended') {
         changedFiles.push({
           filePath,
@@ -2097,6 +2098,7 @@ async function scanProjectDirs(
 
   try {
     for (const { filePath, info, append } of changedFiles) {
+      filesParsedFromSource++
       // Marked here, not after the re-parse: an unreadable file `continue`s out
       // below, and the deletion would otherwise live only in memory.
       delete section.files[filePath]
@@ -3290,6 +3292,7 @@ export async function parseProviderSources(
       if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
       unchangedSources.push({ source, cached })
     } else if (!readOnly) {
+      if (deferToBackgroundFill(source.path, fp, cached)) continue
       changedSources.push({ source, fp })
     } else {
       // Read-only with no cache entry at all — see scanProjectDirs.
@@ -3387,6 +3390,7 @@ export async function parseProviderSources(
       if (dateRange) {
         if (fp.mtimeMs < dateRange.start.getTime()) continue
       }
+      filesParsedFromSource++
 
       // Clear stale entry before parse — but only once per path so that
       // multiple sources mapping to the same file path can merge their turns.
@@ -4207,7 +4211,12 @@ function cacheKey(dateRange: DateRange | undefined, providerFilter: string | und
   // Flat-rate marks do not change parse-time cost (still $0 without a LiteLLM
   // row); findUnpricedModels / coverage apply them at render time, so they
   // stay out of this serve-memo key on purpose.
-  return `${s}:${providerFilter ?? 'all'}:${claudeRoots}:${getProxyPathsConfigHash()}:${getModelAliasesConfigHash()}:${getPriceOverridesConfigHash()}:${getLocalModelSavingsConfigHash()}`
+  // A first-paint parse sees a deliberately smaller file set, so its result may
+  // not be served to (or burst-reused by) an unfloored request — including the
+  // background fill that follows it moments later. Absent outside the scope, so
+  // every non-cold-start key is byte-identical to what it was.
+  const floor = firstPaintFloorMs === null ? '' : `:paint${firstPaintFloorMs}`
+  return `${s}:${providerFilter ?? 'all'}:${claudeRoots}:${getProxyPathsConfigHash()}:${getModelAliasesConfigHash()}:${getPriceOverridesConfigHash()}:${getLocalModelSavingsConfigHash()}${floor}`
 }
 
 export function clearSessionCache(): void {
@@ -4761,6 +4770,75 @@ function singlePassParse(dateRange: DateRange | undefined, providerFilter: strin
   return parsed.then(projects => filterProjectsByDateRange(projects, dateRange))
 }
 
+// Progressive cold start (#1107). A session log is append-only, so its last
+// event timestamp is <= its mtime: a file whose mtime predates the start of the
+// range being displayed provably holds nothing that range can show. On a COLD
+// start that is what makes a fast first paint honest — the deferred files are
+// not dropped, only sequenced behind the paint, and the background fill parses
+// them into the same per-file cache a full cold parse would have written.
+//
+// The margin is pure paranoia about mtimes that lie: a restored backup, a
+// machine whose clock jumped, an rsync that preserved a wrong stamp. It only
+// widens the set that gets parsed BEFORE the paint, so it can never lose data.
+export const FIRST_PAINT_MTIME_MARGIN_MS = 48 * 60 * 60 * 1000
+
+let firstPaintFloorMs: number | null = null
+// Files this scope deferred, as a SET of paths: one first paint runs several
+// parses (the scan, the plan window, the durable backfill) and each defers the
+// same old files, so a running count would report a multiple of the real work.
+let firstPaintDeferredPaths: Set<string> | null = null
+// Same count, but reset per runParse: a run that deferred NOTHING did exactly
+// what an unfloored run would have done, so it is allowed to mark the cache
+// complete and report full hydration.
+let firstPaintDeferredThisRun = 0
+
+/** Files parsed from source (not served from cache) since the process started.
+ *  The background-fill indicator reads it to show live N/M progress. */
+let filesParsedFromSource = 0
+export function filesParsedFromSourceCount(): number {
+  return filesParsedFromSource
+}
+
+/** Restrict every parse inside `fn` to files that can hold in-range data for a
+ *  view starting at `rangeStart`, and report how many files were deferred.
+ *  Cold-start first paint only: the caller MUST follow up with an unscoped
+ *  parse (the background fill) before the run can be treated as hydrated. */
+export async function withColdFirstPaintFloor<T>(
+  rangeStart: Date,
+  fn: () => Promise<T>,
+): Promise<{ result: T; deferredFiles: number }> {
+  const outer = firstPaintFloorMs
+  const outerPaths = firstPaintDeferredPaths
+  firstPaintFloorMs = rangeStart.getTime() - FIRST_PAINT_MTIME_MARGIN_MS
+  firstPaintDeferredPaths = new Set()
+  try {
+    const result = await fn()
+    return { result, deferredFiles: firstPaintDeferredPaths.size }
+  } finally {
+    firstPaintFloorMs = outer
+    firstPaintDeferredPaths = outerPaths
+  }
+}
+
+/** True when this file's whole-file parse can be deferred to the background
+ *  fill. A file with a cache entry is never deferred: it has something to serve
+ *  and re-reading it is incremental, so deferring would only make the served
+ *  snapshot staler for no saving. */
+export function shouldDeferToBackgroundFill(
+  fp: { mtimeMs: number },
+  cached: unknown,
+  floorMs: number | null,
+): boolean {
+  return floorMs !== null && cached === undefined && fp.mtimeMs < floorMs
+}
+
+function deferToBackgroundFill(path: string, fp: { mtimeMs: number }, cached: unknown): boolean {
+  if (!shouldDeferToBackgroundFill(fp, cached, firstPaintFloorMs)) return false
+  firstPaintDeferredPaths?.add(path)
+  firstPaintDeferredThisRun++
+  return true
+}
+
 export function parseAllSessions(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
   const scoped = singlePassParse(dateRange, providerFilter)
   if (scoped) return scoped
@@ -4901,6 +4979,7 @@ async function runParseInner(
   const { isCold = false, readOnly = false, refreshLock } = options
   readOnlyServedStale = false
   deferredRetryableSource = false
+  firstPaintDeferredThisRun = 0
   const seenMsgIds = new Set<string>()
   const seenKeys = new Set<string>()
   const allSources = await discoverAllSessions(providerFilter)
@@ -5012,9 +5091,15 @@ async function runParseInner(
   // on every launch, and the completeness marker the daily backfill + splash rely
   // on is durable. A run killed before here never reaches this, so its throttled
   // partial saves keep `complete: false` and the next launch resumes cold.
+  // A first-paint run that deferred files never saw the whole corpus, so it may
+  // not stamp the cache complete — the next launch (or this run's own
+  // background fill) has to come back cold and finish the job. A floored run
+  // that deferred NOTHING parsed exactly what an unfloored run would have, so
+  // it keeps the normal stamp.
+  const deferredForFirstPaint = firstPaintDeferredThisRun > 0
   const wasComplete = isCacheComplete(diskCache)
-  if (!readOnly && !wasComplete) diskCache.complete = true
-  if (!readOnly && (isCacheDirty(diskCache) || !wasComplete)) {
+  if (!readOnly && !wasComplete && !deferredForFirstPaint) diskCache.complete = true
+  if (!readOnly && (isCacheDirty(diskCache) || (!wasComplete && !deferredForFirstPaint))) {
     try {
       const published = await saveCache(diskCache, refreshLock?.verifyStillOwner)
       if (!published) throw new RefreshFenceLostError()
@@ -5027,7 +5112,7 @@ async function runParseInner(
   // files, or a write run that deferred a changed source on a retryable
   // failure, reached the end of the scan without hydrating everything, and
   // the daily backfill must not finalize history off it.
-  sessionHydrationComplete = (!readOnly || !readOnlyServedStale) && !deferredRetryableSource
+  sessionHydrationComplete = (!readOnly || !readOnlyServedStale) && !deferredRetryableSource && !deferredForFirstPaint
 
   // Merge across providers by normalised project path so the same repository
   // is not double-counted when it was worked on with more than one tool

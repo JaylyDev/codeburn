@@ -528,6 +528,17 @@ export function isCacheComplete(cache: SessionCache): boolean {
   return cache.complete === true
 }
 
+/** Pre-parse probe of the same question `isCacheComplete` answers after a load:
+ *  is the next parse going to be a cold hydration? Reads only the (tiny)
+ *  envelope, so a caller can branch on coldness before paying for the shards.
+ *  A cache still in a legacy layout has no envelope and reads as cold — the
+ *  adoption in `loadCache` may still make it warm, which costs the caller
+ *  nothing: a warm cache has an entry for every discovered file, so a
+ *  cold-start optimisation keyed on missing entries simply finds no work. */
+export async function isColdCacheOnDisk(): Promise<boolean> {
+  return (await readEnvelope(sessionCacheDir()))?.complete !== true
+}
+
 function isNum(v: unknown): v is number {
   return typeof v === 'number' && Number.isFinite(v)
 }
