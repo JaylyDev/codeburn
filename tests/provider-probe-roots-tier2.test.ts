@@ -13,6 +13,11 @@ import {
   discoverClineTasks,
   getVSCodeGlobalStoragePaths,
 } from '../src/providers/vscode-cline-parser.js'
+import { createCodebuffProvider, getCodebuffRootSet } from '../src/providers/codebuff.js'
+import { createDevinProvider } from '../src/providers/devin.js'
+import { createGeminiProvider, getGeminiTmpDir } from '../src/providers/gemini.js'
+import { createKiroProvider, getKiroAgentDirCandidates } from '../src/providers/kiro.js'
+import { createMistralVibeProvider, getMistralVibeSessionsDir } from '../src/providers/mistral-vibe.js'
 
 // #899 Tier 2, batch 1. probeRoots() must report the roots discovery actually
 // reads: a probe pointing somewhere discovery never looks is worse than none,
@@ -106,5 +111,151 @@ describe('probeRoots mirrors discovery resolution (Tier 2, batch 1)', () => {
     expect(await createKimiProvider('/tmp/kimi-a').probeRoots!()).toEqual([
       { path: join('/tmp/kimi-a', 'sessions'), label: 'sessions' },
     ])
+  })
+})
+
+// #899 Tier 2, batch 2. Same contract as batch 1: probeRoots() is the exact
+// discovery-root set after the same resolution, pinned as full objects.
+describe('probeRoots mirrors discovery resolution (Tier 2, batch 2)', () => {
+  it('codebuff reports all three CHANNELS on default, and empty factory is unset', async () => {
+    const expected = [
+      { path: join(homedir(), '.config', 'manicode'), label: 'chats' },
+      { path: join(homedir(), '.config', 'manicode-dev'), label: 'chats' },
+      { path: join(homedir(), '.config', 'manicode-staging'), label: 'chats' },
+    ]
+    expect(await createCodebuffProvider().probeRoots!()).toEqual(expected)
+    expect(await createCodebuffProvider('').probeRoots!()).toEqual(expected)
+    expect(getCodebuffRootSet()).toEqual(expected.map(r => r.path))
+    expect(getCodebuffRootSet('')).toEqual(expected.map(r => r.path))
+    for (const root of expected) expect(isAbsolute(root.path)).toBe(true)
+  })
+
+  it('codebuff reports the factory root, or CODEBUFF_DATA_DIR when factory is empty', async () => {
+    expect(await createCodebuffProvider('/tmp/codebuff-a').probeRoots!()).toEqual([
+      { path: '/tmp/codebuff-a', label: 'chats' },
+    ])
+    process.env['CODEBUFF_DATA_DIR'] = '/tmp/codebuff-env'
+    expect(await createCodebuffProvider().probeRoots!()).toEqual([
+      { path: '/tmp/codebuff-env', label: 'chats' },
+    ])
+    expect(await createCodebuffProvider('').probeRoots!()).toEqual([
+      { path: '/tmp/codebuff-env', label: 'chats' },
+    ])
+    // Non-blank factory wins over the env root.
+    expect(await createCodebuffProvider('/tmp/codebuff-a').probeRoots!()).toEqual([
+      { path: '/tmp/codebuff-a', label: 'chats' },
+    ])
+  })
+
+  it('devin reports transcripts + sessions.db, not the parent, and empty factory is default', async () => {
+    expect(await createDevinProvider('/tmp/probe-devin').probeRoots!()).toEqual([
+      { path: join('/tmp/probe-devin', 'transcripts'), label: 'transcripts' },
+      { path: join('/tmp/probe-devin', 'sessions.db'), label: 'sessions.db' },
+    ])
+    const defaults = [
+      { path: join(homedir(), '.local', 'share', 'devin', 'cli', 'transcripts'), label: 'transcripts' },
+      { path: join(homedir(), '.local', 'share', 'devin', 'cli', 'sessions.db'), label: 'sessions.db' },
+    ]
+    expect(await createDevinProvider().probeRoots!()).toEqual(defaults)
+    expect(await createDevinProvider('').probeRoots!()).toEqual(defaults)
+    for (const root of defaults) expect(isAbsolute(root.path)).toBe(true)
+  })
+
+  it('gemini reports only the shared tmp parent', async () => {
+    const tmpDir = getGeminiTmpDir()
+    expect(tmpDir).toBe(join(homedir(), '.gemini', 'tmp'))
+    expect(await createGeminiProvider().probeRoots!()).toEqual([
+      { path: tmpDir, label: 'tmp' },
+    ])
+    expect(tmpDir).not.toContain(`${join('tmp', 'chats')}`)
+    expect(isAbsolute(tmpDir)).toBe(true)
+  })
+
+  it('kiro reports the override set exactly and never the developer Application Support tree', async () => {
+    const agent = '/tmp/kiro-agent'
+    const workspace = '/tmp/kiro-workspace'
+    const cli = '/tmp/kiro-cli'
+    const v2 = '/tmp/kiro-v2'
+    const roots = await createKiroProvider(agent, workspace, cli, v2).probeRoots!()
+    expect(roots).toEqual([
+      { path: agent, label: 'agent' },
+      { path: workspace, label: 'workspace' },
+      { path: cli, label: 'cli' },
+      { path: v2, label: 'v2' },
+    ])
+    for (const root of roots) {
+      expect(isAbsolute(root.path)).toBe(true)
+      expect(root.path).not.toContain('Application Support/Kiro')
+    }
+  })
+
+  it('kiro empty-string table matches discovery: agent/workspace fall back, empty CLI and v2 are skipped', async () => {
+    const workspace = '/tmp/kiro-ws'
+    const cli = '/tmp/kiro-cli'
+    const v2 = '/tmp/kiro-v2'
+
+    const unsetAgent = await createKiroProvider(undefined, workspace, cli, v2).probeRoots!()
+    const emptyAgent = await createKiroProvider('', workspace, cli, v2).probeRoots!()
+    expect(emptyAgent).toEqual(unsetAgent)
+    expect(emptyAgent.map(r => r.path)).toEqual([
+      ...getKiroAgentDirCandidates(''),
+      workspace,
+      cli,
+      v2,
+    ])
+    expect(emptyAgent.filter(r => r.label === 'agent').map(r => r.path)).toEqual(
+      getKiroAgentDirCandidates(),
+    )
+
+    const unsetWorkspace = await createKiroProvider('/tmp/kiro-agent', undefined, cli, v2).probeRoots!()
+    const emptyWorkspace = await createKiroProvider('/tmp/kiro-agent', '', cli, v2).probeRoots!()
+    expect(emptyWorkspace).toEqual(unsetWorkspace)
+    expect(emptyWorkspace.find(r => r.label === 'workspace')!.path).not.toBe('')
+
+    const emptyCli = await createKiroProvider('/tmp/kiro-agent', workspace, '', v2).probeRoots!()
+    expect(emptyCli).toEqual([
+      { path: '/tmp/kiro-agent', label: 'agent' },
+      { path: workspace, label: 'workspace' },
+      { path: v2, label: 'v2' },
+    ])
+    expect(emptyCli.map(r => r.path)).not.toContain('')
+    expect(emptyCli.map(r => r.path)).not.toContain('.')
+
+    const emptyV2 = await createKiroProvider('/tmp/kiro-agent', workspace, cli, '').probeRoots!()
+    expect(emptyV2).toEqual([
+      { path: '/tmp/kiro-agent', label: 'agent' },
+      { path: workspace, label: 'workspace' },
+      { path: cli, label: 'cli' },
+    ])
+    expect(emptyV2.some(r => r.label === 'v2')).toBe(false)
+
+    const emptyCliAndV2 = await createKiroProvider('/tmp/kiro-agent', workspace, '', '').probeRoots!()
+    expect(emptyCliAndV2).toEqual([
+      { path: '/tmp/kiro-agent', label: 'agent' },
+      { path: workspace, label: 'workspace' },
+    ])
+
+    const skipped = await createKiroProvider('/tmp/kiro-agent', workspace, '', '').discoverSessions()
+    expect(skipped).toEqual([])
+  })
+
+  it('mistral-vibe reports the same joined sessions dir discovery uses', async () => {
+    expect(await createMistralVibeProvider('/tmp/vibe-sessions').probeRoots!()).toEqual([
+      { path: getMistralVibeSessionsDir('/tmp/vibe-sessions'), label: 'sessions' },
+    ])
+    expect(getMistralVibeSessionsDir('/tmp/vibe-sessions')).toBe('/tmp/vibe-sessions')
+
+    const defaults = await createMistralVibeProvider().probeRoots!()
+    expect(defaults).toEqual([
+      { path: getMistralVibeSessionsDir(), label: 'sessions' },
+    ])
+    expect(defaults[0]!.path).toBe(join(homedir(), '.vibe', 'logs', 'session'))
+    expect(await createMistralVibeProvider('').probeRoots!()).toEqual(defaults)
+
+    process.env['VIBE_HOME'] = '/tmp/vibe-home'
+    expect(await createMistralVibeProvider().probeRoots!()).toEqual([
+      { path: join('/tmp/vibe-home', 'logs', 'session'), label: 'sessions' },
+    ])
+    expect(getMistralVibeSessionsDir()).toBe(join('/tmp/vibe-home', 'logs', 'session'))
   })
 })
