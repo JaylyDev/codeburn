@@ -81,9 +81,13 @@ export function sanitizeError(error: unknown): string {
   const raw = error instanceof Error ? error.message : String(error)
   return raw
     .replace(/\0/g, '')
-    .replace(/Bearer\s+[^\s,;"']+/gi, 'Bearer [REDACTED]')
+    .replace(/Bearer\s+[^\s,;"']+/gi, '[REDACTED]')
     .replace(/sk-ant-[A-Za-z0-9_-]+/gi, '[REDACTED]')
     .replace(/sk-[A-Za-z0-9_-]+/gi, '[REDACTED]')
+    // Google (ya29.) and GitHub (gho_/ghu_/ghp_) OAuth token shapes used by
+    // the Gemini/Copilot quota providers.
+    .replace(/ya29\.[A-Za-z0-9._-]+/g, '[REDACTED]')
+    .replace(/gh[opusr]_[A-Za-z0-9_]+/g, '[REDACTED]')
     .replace(/eyJ[A-Za-z0-9._-]+/g, '[REDACTED]')
     .slice(0, 240)
 }

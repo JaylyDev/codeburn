@@ -35,7 +35,7 @@ export type QuotaWindow = {
 }
 
 export type QuotaProvider = {
-  provider: 'claude' | 'codex'
+  provider: 'claude' | 'codex' | 'gemini' | 'copilot' | 'antigravity'
   connection: 'connected' | 'disconnected' | 'accessDenied' | 'loading' | 'stale' | 'transientFailure' | 'terminalFailure'
   primary: QuotaWindow | null
   details: QuotaWindow[]
@@ -44,6 +44,8 @@ export type QuotaProvider = {
   /** True when the provider is in a 429 backoff window (upstream rate limit). */
   rateLimited?: boolean
 }
+
+export type ProviderName = QuotaProvider['provider']
 
 // ————— src/menubar-json.ts —————
 
@@ -668,7 +670,7 @@ export interface CodeburnBridge {
   getUpdateStatus(): Promise<UpdateStatus>
   /** Subscribe to pushed update-availability status; returns an unsubscribe fn. */
   onUpdateStatus(cb: (status: UpdateStatus) => void): () => void
-  getQuota(force?: boolean): Promise<QuotaProvider[]>
+  getQuota(force?: boolean, disabled?: ProviderName[]): Promise<QuotaProvider[]>
   // `background` (prefetch only) requests background CLI-spawn priority; optional
   // so an older preload that ignores it degrades to interactive priority.
   // `scope` selects local-device usage ('local', default) or paired-device
