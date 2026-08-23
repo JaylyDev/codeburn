@@ -545,6 +545,53 @@ describe('copilot AI credit plan math', () => {
     expect(usage.creditsIncomplete).toBe(true)
   })
 
+  it('does not double credits when a paired rollup also carries nanoAiu', () => {
+    const usage = getPlanUsageFromProjects(copilotPro, [
+      usageProject([
+        usageCall({
+          provider: 'copilot',
+          costUSD: 0.001605,
+          timestamp: '2026-08-05T12:00:00.000Z',
+          nanoAiu: 1_500_000_000,
+          supplementaryAccounting: true,
+        }),
+        usageCall({
+          provider: 'copilot',
+          costUSD: 0.001605,
+          timestamp: '2026-08-05T12:00:01.000Z',
+          nanoAiu: 1_500_000_000,
+        }),
+      ]),
+    ], today)
+
+    expect(usage.spentCredits).toBe(1.5)
+    expect(usage.creditsIncomplete).toBe(false)
+  })
+
+  it('keeps a $0 nanoAiu-only session on copilot plans and drops it on USD plans', () => {
+    const projects = [
+      usageProject([
+        usageCall({
+          provider: 'copilot',
+          costUSD: 0,
+          timestamp: '2026-08-05T12:00:00.000Z',
+          nanoAiu: 1_500_000_000,
+          supplementaryAccounting: true,
+        }),
+      ]),
+    ]
+    const allUsd: Plan = {
+      id: 'custom',
+      monthlyUsd: 100,
+      provider: 'all',
+      resetDay: 1,
+      setAt: '2026-08-01T00:00:00.000Z',
+    }
+    expect(getPlanScopedProjects(copilotPro, projects, today)).toHaveLength(1)
+    expect(getPlanScopedProjects(allUsd, projects, today)).toHaveLength(0)
+    expect(getPlanScopedProjects(claudePro, projects, today)).toHaveLength(0)
+  })
+
   it('keeps Claude plans on costUSD against the same mixed fixture', () => {
     const projects = [
       usageProject([

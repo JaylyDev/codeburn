@@ -83,11 +83,11 @@ function planCallSpend(plan: Plan, call: { costUSD: number; nanoAiu?: number }):
   return isFiniteNanoAiu(call.nanoAiu) ? creditsToUsd(nanoAiuToCredits(call.nanoAiu)) : 0
 }
 
-function forEachPlanCall(projects: ProjectSummary[], visit: (call: ParsedApiCall) => void): void {
+function forEachPlanTurn(projects: ProjectSummary[], visit: (calls: ParsedApiCall[]) => void): void {
   for (const project of projects) {
     for (const session of project.sessions ?? []) {
       for (const turn of session.turns ?? []) {
-        for (const call of turn.assistantCalls ?? []) visit(call)
+        visit(turn.assistantCalls ?? [])
       }
     }
   }
@@ -96,13 +96,17 @@ function forEachPlanCall(projects: ProjectSummary[], visit: (call: ParsedApiCall
 export function copilotCreditSpend(projects: ProjectSummary[]): { spentCredits: number; creditsIncomplete: boolean } {
   let nanoSum = 0
   let creditsIncomplete = false
-  forEachPlanCall(projects, call => {
-    if (call.provider !== 'copilot') return
-    if (isFiniteNanoAiu(call.nanoAiu)) {
-      nanoSum += call.nanoAiu
-      return
-    }
-    creditsIncomplete = true
+  forEachPlanTurn(projects, calls => {
+    const copilot = calls.filter(call => call.provider === 'copilot')
+    if (copilot.length === 0) return
+    const primaryNano = copilot.filter(call => !call.supplementaryAccounting && isFiniteNanoAiu(call.nanoAiu))
+    const suppNano = copilot.filter(call => call.supplementaryAccounting && isFiniteNanoAiu(call.nanoAiu))
+    // Store rows are supplementary and are the bill when the JSONL twin has
+    // no nanoAiu. If both sides carry nanoAiu, count the behavioral row only
+    // so a paired rollup cannot double the credits.
+    const counted = primaryNano.length > 0 && suppNano.length > 0 ? primaryNano : [...primaryNano, ...suppNano]
+    for (const call of counted) nanoSum += call.nanoAiu!
+    if (copilot.some(call => !isFiniteNanoAiu(call.nanoAiu))) creditsIncomplete = true
   })
   return { spentCredits: nanoAiuToCredits(nanoSum), creditsIncomplete }
 }
@@ -225,8 +229,12 @@ export function getPlanScopedProjects(plan: Plan, projects: ProjectSummary[], to
           // Keep on cost as well as calls: a copilot rollup-only session has
           // zero behavioral calls but real spend, and dropping it would erase
           // that spend from the plan window. A store-row with nanoAiu and $0
-          // token cost still has to reach credit math.
-          return apiCalls > 0 || totalCostUSD > 0 || hasNanoAiu ? { ...session, turns, totalCostUSD, apiCalls } : null
+          // token cost still has to reach credit math — but only on a copilot
+          // credit plan. Claude/cursor/grok USD plans keep the old
+          // cost-or-calls predicate so a $0 nanoAiu-only session is not an
+          // unannounced retain on providers this PR is not about.
+          const keepForCredits = isCopilotCreditsPlan(plan) && hasNanoAiu
+          return apiCalls > 0 || totalCostUSD > 0 || keepForCredits ? { ...session, turns, totalCostUSD, apiCalls } : null
         })
         .filter((session): session is NonNullable<typeof session> => session !== null)
 
