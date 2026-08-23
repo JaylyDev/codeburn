@@ -4,6 +4,7 @@ import { join } from 'path'
 import type { ClassifiedTurn, ProjectSummary } from './types.js'
 import { isBehavioralCall } from './behavioral-weight.js'
 import { getShortModelName } from './models.js'
+import { callBillableOutputTokens } from './session-output.js'
 
 const PLANNING_TOOLS = new Set(['TaskCreate', 'TaskUpdate', 'TodoWrite', 'EnterPlanMode', 'ExitPlanMode'])
 
@@ -67,7 +68,7 @@ export function aggregateModelStats(projects: ProjectSummary[]): ModelStats[] {
           const cs = call.model === primaryModel ? ms : ensure(call.model)
           if (isBehavioralCall(call)) cs.calls++
           cs.cost += call.costUSD
-          cs.outputTokens += call.usage.outputTokens
+          cs.outputTokens += callBillableOutputTokens(call)
           cs.inputTokens += call.usage.inputTokens
           cs.cacheReadTokens += call.usage.cacheReadInputTokens
           cs.cacheWriteTokens += call.usage.cacheCreationInputTokens

@@ -1,9 +1,15 @@
+import { mkdtemp, readFile, rm } from 'fs/promises'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import { describe, expect, it } from 'vitest'
 
+import { aggregateModelStats, computeComparison } from '../src/compare-stats.js'
 import { aggregateProjectsIntoDays } from '../src/day-aggregator.js'
+import { exportJson } from '../src/export.js'
 import { billableOutputTokens } from '../src/models.js'
 import { findContextBloatCandidates } from '../src/optimize.js'
-import { sessionBillableOutputTokens } from '../src/session-output.js'
+import { renderOverview } from '../src/overview.js'
+import { callBillableOutputTokens, sessionBillableOutputTokens } from '../src/session-output.js'
 import { aggregateSessions } from '../src/sessions-report.js'
 import { buildPeriodData } from '../src/usage-aggregator.js'
 import type { ProjectSummary, SessionSummary } from '../src/types.js'
@@ -31,6 +37,8 @@ function makeCall(provider: string, outputTokens: number, reasoningTokens: numbe
     timestamp: '2026-08-01T12:00:00Z',
     bashCommands: [],
     deduplicationKey: `${provider}-${outputTokens}-${reasoningTokens}`,
+    savingsUSD: 1,
+    savingsBaselineModel: 'gpt-4o',
   }
 }
 
@@ -58,13 +66,20 @@ function makeSession(provider: string, outputTokens: number, reasoningTokens: nu
       hasEdits: true,
       assistantCalls: [call],
     }],
-    modelBreakdown: {},
+    modelBreakdown: {
+      [call.model]: {
+        calls: 1,
+        costUSD: 0,
+        savingsUSD: 0,
+        tokens: call.usage,
+      },
+    },
     toolBreakdown: {},
     mcpBreakdown: {},
     bashBreakdown: {},
     categoryBreakdown: {} as never,
     skillBreakdown: {} as never,
-  } as SessionSummary
+  } as unknown as SessionSummary
 }
 
 function makeProject(session: SessionSummary): ProjectSummary {
@@ -125,5 +140,72 @@ describe('#1115 billableOutputTokens on report/optimize totals', () => {
     // Direct contract: helper is what the detector uses.
     expect(sessionBillableOutputTokens(inclusive)).toBe(100_000)
     expect(sessionBillableOutputTokens(exclusive)).toBe(150_000)
+  })
+
+  it('compare-stats Output tok/call uses per-call billable output', () => {
+    const grok = aggregateModelStats([makeProject(makeSession('grok', 10, 3))])
+    const codex = aggregateModelStats([makeProject(makeSession('codex', 10, 3))])
+    expect(grok[0]!.outputTokens).toBe(13)
+    expect(codex[0]!.outputTokens).toBe(10)
+    const rows = computeComparison(grok[0]!, codex[0]!)
+    const outputRow = rows.find(r => r.label === 'Output tok / call')!
+    expect(outputRow.valueA).toBe(13)
+    expect(outputRow.valueB).toBe(10)
+  })
+
+  it('export daily/model Output Tokens use per-call billable output', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cb-1115-export-'))
+    try {
+      const path = await exportJson([
+        { label: '30 Days', projects: [makeProject(makeSession('grok', 10, 3)), makeProject(makeSession('codex', 10, 3))] },
+      ], join(dir, 'out.json'))
+      const data = JSON.parse(await readFile(path, 'utf-8')) as {
+        periods: Array<{ daily: Array<{ 'Output Tokens': number }>; models: Array<{ Model: string; 'Output Tokens': number }> }>
+        records: Array<{ outputTokens: number; reasoningTokens: number }>
+      }
+      expect(data.periods[0]!.daily[0]!['Output Tokens']).toBe(23)
+      const grokRow = data.periods[0]!.models.find(r => r.Model === 'grok-4')!
+      const codexRow = data.periods[0]!.models.find(r => r.Model === 'gpt-5.4')!
+      expect(grokRow['Output Tokens']).toBe(13)
+      expect(codexRow['Output Tokens']).toBe(10)
+      // Record-level export stays raw columns, not the billable sum.
+      expect(data.records.map(r => r.outputTokens).sort()).toEqual([10, 10])
+      expect(data.records.map(r => r.reasoningTokens).sort()).toEqual([3, 3])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('overview Top-model / By-tool / day totals use per-call billable output', () => {
+    const out = renderOverview(
+      [makeProject(makeSession('grok', 10, 3)), makeProject(makeSession('codex', 10, 3))],
+      { label: 'August 2026', color: false },
+    )
+    // Exclusive 13 + inclusive 10. Combined token totals (input/cache are 0).
+    expect(out).toContain('13')
+    expect(out).toContain('10')
+    expect(out).toMatch(/Output[\s\S]*13/)
+    expect(out).toContain('grok')
+    expect(out).toContain('codex')
+  })
+
+  it('session helper does not crash on aggregate-only or minimal calls', () => {
+    const aggregate = makeSession('grok', 10, 3)
+    aggregate.turns = []
+    expect(sessionBillableOutputTokens(aggregate)).toBe(13)
+
+    const noReasoning = makeSession('grok', 10, 3)
+    noReasoning.turns = []
+    delete (noReasoning as { totalReasoningTokens?: number }).totalReasoningTokens
+    const noReasoningOut = sessionBillableOutputTokens(noReasoning)
+    expect(Number.isFinite(noReasoningOut)).toBe(true)
+    expect(noReasoningOut).toBe(10)
+
+    const stub = makeSession('codex', 10, 3)
+    stub.turns[0]!.assistantCalls = [{ costUSD: 1, tools: [], bashCommands: [], timestamp: stub.firstTimestamp } as never]
+    expect(sessionBillableOutputTokens(stub)).toBe(10)
+
+    expect(callBillableOutputTokens({} as never)).toBe(0)
+    expect(callBillableOutputTokens({ provider: 'grok', usage: { outputTokens: 10, reasoningTokens: 3 } })).toBe(13)
   })
 })

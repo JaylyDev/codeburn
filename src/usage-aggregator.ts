@@ -13,7 +13,7 @@ import { aggregateModels } from './models-report.js'
 import { scanUserCorrections, medianTimeToFirstEditMs, aggregateFileChurn, computePricingCoverage } from './workflow-insights.js'
 import { buildPrAttribution, aggregateByBranch } from './sessions-report.js'
 import { scanAndDetect } from './optimize.js'
-import { sessionBillableOutputTokens } from './session-output.js'
+import { callBillableOutputTokens, sessionBillableOutputTokens } from './session-output.js'
 import { getDaysInRange, ensureCacheHydrated, emptyCache, BACKFILL_DAYS, toDateString, type DailyCache, type DailyEntry, type ProjectDayStats, type ProviderDaySlice } from './daily-cache.js'
 import { buildGranularHistory } from './granular-history.js'
 
@@ -926,7 +926,7 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
         acc.savingsUSD += call.savingsUSD
         acc.baselineModel = acc.baselineModel || (call.savingsBaselineModel ?? '')
         acc.inputTokens += call.usage.inputTokens
-        acc.outputTokens += call.usage.outputTokens
+        acc.outputTokens += callBillableOutputTokens(call)
         savingsByModel.set(modelKey, acc)
         const provAcc = savingsByProvider.get(call.provider) ?? { calls: 0, savingsUSD: 0 }
         provAcc.calls += callWeight

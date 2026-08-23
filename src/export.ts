@@ -6,6 +6,7 @@ import { getCurrency, convertCost, roundForActiveCurrency } from './currency.js'
 import { dateKey } from './day-aggregator.js'
 import { behavioralTurnCount, isBehavioralCall } from './behavioral-weight.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
+import { callBillableOutputTokens } from './session-output.js'
 
 function escCsv(s: string): string {
   const sanitized = /^[\t\r=+\-@]/.test(s) ? `'${s}` : s
@@ -65,7 +66,7 @@ function buildDailyRows(projects: ProjectSummary[], period: string): Row[] {
           // so daily.csv call counts must reconcile with summary.csv.
           if (isBehavioralCall(call)) daily[day].calls++
           daily[day].input += call.usage.inputTokens
-          daily[day].output += call.usage.outputTokens
+          daily[day].output += callBillableOutputTokens(call)
           daily[day].cacheRead += call.usage.cacheReadInputTokens
           daily[day].cacheWrite += call.usage.cacheCreationInputTokens
         }
@@ -149,17 +150,28 @@ function buildActivityRows(projects: ProjectSummary[], period: string): Row[] {
 function buildModelRows(projects: ProjectSummary[], period: string): Row[] {
   const modelTotals: Record<string, { calls: number; cost: number; savings: number; input: number; output: number; cacheRead: number; cacheWrite: number }> = {}
   const modelEfficiency = aggregateModelEfficiency(projects)
+  const ensure = (model: string) => {
+    if (!modelTotals[model]) modelTotals[model] = { calls: 0, cost: 0, savings: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+    return modelTotals[model]
+  }
   for (const project of projects) {
     for (const session of project.sessions) {
       for (const [model, d] of Object.entries(session.modelBreakdown)) {
-        if (!modelTotals[model]) modelTotals[model] = { calls: 0, cost: 0, savings: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-        modelTotals[model].calls += d.calls
-        modelTotals[model].cost += d.costUSD
-        modelTotals[model].savings += d.savingsUSD
-        modelTotals[model].input += d.tokens.inputTokens
-        modelTotals[model].output += d.tokens.outputTokens
-        modelTotals[model].cacheRead += d.tokens.cacheReadInputTokens ?? 0
-        modelTotals[model].cacheWrite += d.tokens.cacheCreationInputTokens ?? 0
+        const acc = ensure(model)
+        acc.calls += d.calls
+        acc.cost += d.costUSD
+        acc.savings += d.savingsUSD
+        acc.input += d.tokens.inputTokens
+        acc.cacheRead += d.tokens.cacheReadInputTokens ?? 0
+        acc.cacheWrite += d.tokens.cacheCreationInputTokens ?? 0
+      }
+      // Output must be billed per call while provider identity is still known.
+      // Grouped modelBreakdown tokens cannot distinguish exclusive vs inclusive.
+      for (const turn of session.turns) {
+        for (const call of turn.assistantCalls) {
+          if (!call.model) continue
+          ensure(call.model).output += callBillableOutputTokens(call)
+        }
       }
     }
   }
