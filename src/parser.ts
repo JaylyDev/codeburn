@@ -4213,6 +4213,7 @@ function cacheKey(dateRange: DateRange | undefined, providerFilter: string | und
 export function clearSessionCache(): void {
   sessionCache.clear()
   canonicalPathCache.clear()
+  singlePassScope?.parses.clear()
 }
 
 function cachePut(key: string, data: ProjectSummary[], parseStartedAt: number) {
@@ -4499,14 +4500,24 @@ export function correlateCrossProviderPrSessions(projects: ProjectSummary[]): vo
   // mutating the child. This lets a Codex/Gemini/etc. review launched inside a
   // Claude subagent inherit the parent turn's PR while the subagent itself still
   // folds exactly once under the existing accounting model.
+  //
+  // Indexed once rather than re-filtered per child: the loop below only writes
+  // to `evidence`, so the unlinked set is fixed for its whole duration.
+  const unlinkedByAgentId = new Map<string | undefined, SessionSummary[]>()
+  for (const s of sessions) {
+    if (s.prLinks?.length) continue
+    const bucket = unlinkedByAgentId.get(s.agentId)
+    if (bucket) bucket.push(s)
+    else unlinkedByAgentId.set(s.agentId, [s])
+  }
   for (const resolved of resolveSubagentAttribution(projects).values()) {
     for (const child of resolved) {
       // A multi-PR spawn set is valid for folding the child's own cost, but is
       // too broad to identify which PR an independently saved nested review was
       // about. Require one PR for cross-provider propagation.
       if (child.unlinked || child.prSet?.length !== 1) continue
-      const matches = sessions.filter(s => !s.prLinks?.length && s.agentId === child.fold.agentId)
-      if (matches.length === 1) evidence.set(matches[0]!, child.prSet)
+      const matches = unlinkedByAgentId.get(child.fold.agentId)
+      if (matches?.length === 1) evidence.set(matches[0]!, child.prSet)
     }
   }
 
@@ -4536,6 +4547,21 @@ export function correlateCrossProviderPrSessions(projects: ProjectSummary[]): vo
   const PROMPT_PREFIX = 160
   const PROMPT_MIN = 80
   const LAUNCH_WINDOW_MS = 15 * 60 * 1000
+  // Sorted once so each candidate scans only the launches inside its own
+  // window instead of the whole array. Launch order is not observable: the
+  // match set is collapsed into a Map keyed by the sorted ref list, and
+  // assignCorrelatedPrs re-sorts what it is handed.
+  launches.sort((a, b) => a.atMs - b.atMs)
+  const firstLaunchAtOrAfter = (atMs: number): number => {
+    let lo = 0
+    let hi = launches.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (launches[mid]!.atMs < atMs) lo = mid + 1
+      else hi = mid
+    }
+    return lo
+  }
   for (const session of candidates) {
     const provider = summaryProvider(session)
     const prompt = session.turns
@@ -4545,12 +4571,14 @@ export function correlateCrossProviderPrSessions(projects: ProjectSummary[]): vo
     const prefix = prompt.slice(0, PROMPT_PREFIX)
     const startedMs = Date.parse(session.firstTimestamp)
     if (!Number.isFinite(startedMs)) continue
-    const matches = launches.filter(launch =>
-      launch.provider !== provider
-      && Math.abs(launch.atMs - startedMs) <= LAUNCH_WINDOW_MS
-      && launch.commands.some(command => command.includes(prefix))
-    )
-    const refSets = new Map(matches.map(m => [m.refs.slice().sort().join('\0'), m.refs]))
+    const refSets = new Map<string, string[]>()
+    for (let i = firstLaunchAtOrAfter(startedMs - LAUNCH_WINDOW_MS); i < launches.length; i++) {
+      const launch = launches[i]!
+      if (launch.atMs - startedMs > LAUNCH_WINDOW_MS) break
+      if (launch.provider === provider) continue
+      if (!launch.commands.some(command => command.includes(prefix))) continue
+      refSets.set(launch.refs.slice().sort().join('\0'), launch.refs)
+    }
     if (refSets.size === 1) {
       assignCorrelatedPrs(session, [...refSets.values()][0]!, 'launcher-prompt')
       if (session.prLinks?.length) evidence.set(session, session.prLinks)
@@ -4677,7 +4705,65 @@ let readOnlyServedStale = false
 // new data, so the run must not report hydration complete even in write mode.
 let deferredRetryableSource = false
 
+// One command invocation that renders a dashboard asks for several ranges that
+// differ only in where they END — the scan range runs to end-of-day, the
+// durable headline re-anchors on its own `new Date()`. The exact-key memo needs
+// both endpoints equal, so it never hits and each ran the whole pipeline again.
+// Inside this scope the declared range is parsed ONCE per provider filter and a
+// request that is a pure NARROWING of it is served by slicing that result.
+// Anything else parses normally.
+//
+// Pure narrowing means: same start, an end that is inside, and the same month
+// shard scope. All three are load-bearing, because a parse's file set is a
+// function of its range, not just its output:
+//  - a CHANGED file with `mtimeMs < range.start` is skipped without being
+//    parsed, so an earlier start pulls in files a later start never reads;
+//  - `loadCache` reads only the shards `monthScopeForRange` selects, so a wider
+//    month span hands the query loop cached files a narrower span never sees;
+//  - either way those extra files seed `seenKeys` / `seenMsgIds` BEFORE the
+//    range slice runs, and a seeded key SUPPRESSES the matching in-range turn
+//    in a provider parsed later — usage the narrower parse would have counted.
+// Holding start and month scope equal makes both parses see an identical file
+// set in an identical order, which leaves the range slice as the only
+// difference — applied after the parse instead of during it, as burstReuse
+// already does for the mirror-image case (same start, LATER end).
+type SinglePassScope = { range: DateRange; parses: Map<string, Promise<ProjectSummary[]>> }
+let singlePassScope: SinglePassScope | null = null
+
+export async function withSinglePassParse<T>(range: DateRange, fn: () => Promise<T>): Promise<T> {
+  const outer = singlePassScope
+  singlePassScope = { range, parses: new Map() }
+  try {
+    return await fn()
+  } finally {
+    singlePassScope = outer
+  }
+}
+
+function singlePassParse(dateRange: DateRange | undefined, providerFilter: string | undefined): Promise<ProjectSummary[]> | null {
+  const scope = singlePassScope
+  if (!scope || !dateRange) return null
+  if (dateRange.start.getTime() !== scope.range.start.getTime()) return null
+  if (dateRange.end.getTime() > scope.range.end.getTime()) return null
+  const wide = monthScopeForRange(scope.range.start, scope.range.end)
+  const narrow = monthScopeForRange(dateRange.start, dateRange.end)
+  if (wide.fromMonth !== narrow.fromMonth || wide.toMonth !== narrow.toMonth) return null
+  const key = providerFilter ?? 'all'
+  let parsed = scope.parses.get(key)
+  if (!parsed) {
+    const codexCacheDir = getCodeburnCacheDir()
+    parsed = withCodexCacheDirectory(codexCacheDir, () => parseAllSessionsInCacheScope(scope.range, providerFilter))
+    scope.parses.set(key, parsed)
+  }
+  // The declared range itself is served verbatim, exactly as an unscoped run
+  // would have produced it; only a strictly narrower end pays for a slice.
+  if (dateRange.end.getTime() === scope.range.end.getTime()) return parsed
+  return parsed.then(projects => filterProjectsByDateRange(projects, dateRange))
+}
+
 export function parseAllSessions(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
+  const scoped = singlePassParse(dateRange, providerFilter)
+  if (scoped) return scoped
   // Capture synchronously, before the first await. AsyncLocalStorage keeps all
   // Codex cache reads, dirty writes, and the final flush on this call-time
   // directory even if an embedding host changes the process env mid-parse.
