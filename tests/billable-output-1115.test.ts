@@ -251,6 +251,31 @@ describe('#1115 billableOutputTokens on report/optimize totals', () => {
     expect(out).toMatch(/DeepSeek v4 Pro[\s\S]*\b1\b[\s\S]*\b10\b/)
   })
 
+  it('does not mint a $0 short-name orphan when modelBreakdown is the raw id', () => {
+    const session = makeSession('claude', 50, 0)
+    session.turns[0]!.assistantCalls[0]!.model = 'claude-opus-4-8'
+    session.modelBreakdown = {
+      'claude-opus-4-8': {
+        calls: 2,
+        costUSD: 5,
+        savingsUSD: 0,
+        tokens: {
+          inputTokens: 100,
+          outputTokens: 50,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          cachedInputTokens: 0,
+          reasoningTokens: 0,
+          webSearchRequests: 0,
+        },
+      },
+    }
+    expect(sessionModelBillableOutputTokens(session)).toEqual({ 'claude-opus-4-8': 50 })
+    const out = renderOverview([makeProject(session)], { label: 'June 2026', color: false })
+    expect(out).not.toContain('Unpriced')
+    expect(out).toContain('$5.00')
+  })
+
   it('aggregate-only model rows keep finite billable output', async () => {
     const aggregate = makeSession('grok', 10, 3)
     aggregate.turns = []

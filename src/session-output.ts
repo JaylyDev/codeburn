@@ -19,19 +19,36 @@ export function modelBreakdownKey(call: { provider?: string; model?: string }): 
 }
 
 /**
- * Per-model displayed output, keyed like parser `modelBreakdown`.
+ * Prefer a key that already exists on this session's modelBreakdown.
+ * Parser sessions are keyed by getShortModelName. Fixtures and leftover
+ * summaries may still use the raw id. Inventing the other spelling
+ * creates a $0 / 0-call orphan that findUnpricedModels flags as Unpriced.
+ */
+export function resolveModelBreakdownKey(
+  call: { provider?: string; model?: string },
+  breakdown: Record<string, unknown> | undefined,
+): string | undefined {
+  const derived = modelBreakdownKey(call)
+  if (derived && breakdown && Object.hasOwn(breakdown, derived)) return derived
+  if (call.model && breakdown && Object.hasOwn(breakdown, call.model)) return call.model
+  return derived ?? call.model
+}
+
+/**
+ * Per-model displayed output, keyed like this session's `modelBreakdown`.
  * Call usage wins while provider identity is known. Aggregate-only /
  * stub sessions fall back to each existing bucket so a finite
  * sessionBillableOutputTokens cannot leave model Output Tokens at 0.
  */
 export function sessionModelBillableOutputTokens(session: SessionSummary): Record<string, number> {
+  const breakdown = session.modelBreakdown ?? {}
   const out: Record<string, number> = {}
   let sawUsage = false
   for (const turn of session.turns ?? []) {
     for (const call of turn.assistantCalls ?? []) {
       if (!call.usage) continue
       sawUsage = true
-      const key = modelBreakdownKey(call)
+      const key = resolveModelBreakdownKey(call, breakdown)
       if (!key) continue
       out[key] = (out[key] ?? 0) + callBillableOutputTokens(call)
     }
