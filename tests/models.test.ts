@@ -218,6 +218,13 @@ describe('resolveCanonicalModelId', () => {
     expect(resolveCanonicalModelId('claude-opus-4.6')).toBe('claude-opus-4-6')
     expect(resolveCanonicalModelId('kimi-code')).toBe('kimi-k2-thinking')
     expect(resolveCanonicalModelId('cline-pass/kimi-k3')).toBe('kimi-k3')
+    expect(resolveCanonicalModelId('orcarouter/auto')).toBe(resolveCanonicalModelId('claude-sonnet-4-5'))
+    expect(resolveCanonicalModelId('orcarouter/fusion')).toBe(resolveCanonicalModelId('openai/gpt-oss-120b'))
+    expect(resolveCanonicalModelId('orcarouter/fusion-flash')).toBe(resolveCanonicalModelId('openai/gpt-oss-120b'))
+    expect(resolveCanonicalModelId('orcarouter/fusion-mini')).toBe(resolveCanonicalModelId('openai/gpt-oss-120b'))
+    expect(resolveCanonicalModelId('orcarouter/deepseek/deepseek-v4-pro')).toBe(
+      resolveCanonicalModelId('deepseek/deepseek-v4-pro'),
+    )
   })
 })
 
@@ -282,11 +289,11 @@ describe('getShortModelName', () => {
     expect(getShortModelName('cp/cline-pass/glm-5.3')).toBe('GLM-5.3')
     // OrcaRouter route ids peel to the upstream id, which keeps the upstream label.
     expect(getShortModelName('orcarouter/deepseek/deepseek-v4-pro')).toBe('DeepSeek v4 Pro')
-    // The route ids keep their branded labels (like the other `*-auto` presets).
-    expect(getShortModelName('orcarouter/auto')).toBe('OrcaRouter (auto)')
-    expect(getShortModelName('orcarouter/fusion')).toBe('OrcaRouter Fusion')
-    expect(getShortModelName('orcarouter/fusion-flash')).toBe('OrcaRouter Fusion Flash')
-    expect(getShortModelName('orcarouter/fusion-mini')).toBe('OrcaRouter Fusion Mini')
+    // Route ids display as the model they route to, not a branded gateway label.
+    expect(getShortModelName('orcarouter/auto')).toBe(getShortModelName('claude-sonnet-4-5'))
+    expect(getShortModelName('orcarouter/fusion')).toBe(getShortModelName('openai/gpt-oss-120b'))
+    expect(getShortModelName('orcarouter/fusion-flash')).toBe(getShortModelName('openai/gpt-oss-120b'))
+    expect(getShortModelName('orcarouter/fusion-mini')).toBe(getShortModelName('openai/gpt-oss-120b'))
     // Grok Build prices via the grok-build-0.1 sibling.
     expect(getShortModelName('grok-build')).toBe('Grok Build')
     expect(getShortModelName('grok-build-0.1')).toBe('Grok Build')

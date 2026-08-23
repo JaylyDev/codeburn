@@ -290,8 +290,9 @@ export async function loadPricing(): Promise<void> {
 
 // Known model name variants that providers emit but LiteLLM/fallback don't index under.
 // OMP emits 'anthropic--claude-4.6-opus' (double-dash, dot version, tier-last).
-// getCanonicalName strips a KNOWN vendor/router prefix first, so only the
-// post-strip forms need to be listed here.
+// getCanonicalName strips a KNOWN vendor/router prefix first unless the
+// full cleaned id itself is an alias (orcarouter/auto). Post-strip forms
+// still cover every other entry here.
 const BUILTIN_ALIASES: Record<string, string> = {
   'anthropic--claude-4.6-opus':    'claude-opus-4-6',
   'anthropic--claude-4.6-sonnet':  'claude-sonnet-4-6',
@@ -347,11 +348,12 @@ const BUILTIN_ALIASES: Record<string, string> = {
   // OrcaRouter's smart route. The route picks a model per request; at the time
   // of writing it lands on a Qwen/Llama flash model, so a fast Sonnet rate is
   // the honest estimate until the route's target stabilizes (mirrors the
-  // `*-auto` presets above).
+  // `*-auto` presets above). Display and report identity follow this target.
   'orcarouter/auto':               'claude-sonnet-4-5',
   // OrcaRouter's fusion routes currently serve openai/gpt-oss-120b (verified
   // live 2026-08). If the gateway re-routes them, these drift like any other
-  // preset estimate; they keep a priced row instead of reporting $0.
+  // preset estimate; they keep a priced row instead of reporting $0. Display
+  // and report identity follow this target, not a branded route label.
   'orcarouter/fusion':             'openai/gpt-oss-120b',
   'orcarouter/fusion-flash':       'openai/gpt-oss-120b',
   'orcarouter/fusion-mini':        'openai/gpt-oss-120b',
@@ -785,12 +787,21 @@ function resolveAlias(model: string): string {
   return model
 }
 function getCanonicalName(model: string): string {
-  return stripKnownFirstNamespace(
-    model
-      .replace(/@.*$/, '')
-      .replace(/-\d{8}$/, '')
-      .replace(/\[[^\]]*\]$/, ''),
-  )
+  const cleaned = model
+    .replace(/@.*$/, '')
+    .replace(/-\d{8}$/, '')
+    .replace(/\[[^\]]*\]$/, '')
+  // Full-id aliases (orcarouter/auto) must stay visible so resolveAlias can
+  // see them. Stripping first would leave a leaf (`auto`) with no mapping.
+  // Nested wrappers without an alias still peel as before.
+  if (Object.hasOwn(userAliases, cleaned) || Object.hasOwn(BUILTIN_ALIASES, cleaned)) {
+    return cleaned
+  }
+  const lowercase = cleaned.toLowerCase()
+  if (lowercase !== cleaned && Object.hasOwn(BUILTIN_ALIASES, lowercase)) {
+    return cleaned
+  }
+  return stripKnownFirstNamespace(cleaned)
 }
 
 /// Alias-resolved identity for report merge. Display names stay cosmetic —
@@ -1167,14 +1178,6 @@ const autoModelNames: Record<string, string> = {
   'openclaw-auto': 'OpenClaw (auto)',
   'qwen-auto': 'Qwen (auto)',
   'kimi-auto': 'Kimi (auto)',
-  // OrcaRouter route ids. The smart route routes per request and the fusion
-  // routes resolve to a gateway-picked upstream, so each keeps its branded
-  // route label rather than the current upstream's display name. Prices are
-  // aliased in BUILTIN_ALIASES to the route's current target.
-  'orcarouter/auto': 'OrcaRouter (auto)',
-  'orcarouter/fusion': 'OrcaRouter Fusion',
-  'orcarouter/fusion-flash': 'OrcaRouter Fusion Flash',
-  'orcarouter/fusion-mini': 'OrcaRouter Fusion Mini',
   'codex-auto-review': 'Codex Auto Review',
 }
 
