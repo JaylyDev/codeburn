@@ -65,6 +65,10 @@ export type CachedCall = {
   // Copilot session-store rows only: the store's `initiator` label when
   // present. See ParsedProviderCall.initiator.
   initiator?: string
+  // Hermes observation-time deltas persist this so a warm read does not
+  // depend on the `:obs:` key regex alone. Copilot still assigns the flag
+  // at serve time and does not persist it.
+  supplementaryAccounting?: boolean
 }
 
 export type CachedTurn = {
@@ -625,6 +629,7 @@ function validateCall(c: unknown): c is CachedCall {
     && isOptionalBool(o['userModified'])
     && isOptionalNum(o['toolErrors'])
     && isOptionalNum(o['editFailed'])
+    && isOptionalBool(o['supplementaryAccounting'])
     && validateUsage(o['usage'])
 }
 

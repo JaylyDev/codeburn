@@ -4,7 +4,7 @@ import { homedir } from 'os'
 
 import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 // Codebuff (formerly Manicode) uses a credit-based billing system. The local
 // chat-messages.json doesn't record per-call token counts the way Claude Code
@@ -123,11 +123,15 @@ type CodebuffChatMessage = {
   metadata?: CodebuffMetadata
 }
 
-function getCodebuffBaseDir(override?: string): string {
-  if (override && override.trim()) return override
+// Shared by discoverSessions and probeRoots. Factory / CODEBUFF_DATA_DIR win
+// as a single root; otherwise discovery walks every CHANNEL before existence
+// filtering. Empty / blank factory is unset (same as #938 truthiness).
+export function getCodebuffRootSet(override?: string): string[] {
+  if (override && override.trim()) return [override]
   const envPath = process.env['CODEBUFF_DATA_DIR']
-  if (envPath && envPath.trim()) return envPath
-  return join(homedir(), '.config', 'manicode')
+  if (envPath && envPath.trim()) return [envPath]
+  const configDir = join(homedir(), '.config')
+  return CHANNELS.map(channel => join(configDir, channel))
 }
 
 function pickNumber(...vals: Array<number | undefined>): number | undefined {
@@ -294,23 +298,9 @@ async function discoverChannel(root: string): Promise<SessionSource[]> {
   return sources
 }
 
-async function discoverSessionsInBase(baseDir: string): Promise<SessionSource[]> {
+async function discoverSessionsInRoots(roots: string[]): Promise<SessionSource[]> {
   const results: SessionSource[] = []
-
-  // Honor an explicit override: walk only the provided directory even if it
-  // matches one of the channel names literally.
-  if (process.env['CODEBUFF_DATA_DIR'] || baseDir !== join(homedir(), '.config', 'manicode')) {
-    const rootStat = await stat(baseDir).catch(() => null)
-    if (!rootStat?.isDirectory()) return results
-    results.push(...await discoverChannel(baseDir))
-    return results
-  }
-
-  const configDir = join(homedir(), '.config')
-  for (const channel of CHANNELS) {
-    const root = join(configDir, channel)
-    const rootStat = await stat(root).catch(() => null)
-    if (!rootStat?.isDirectory()) continue
+  for (const root of roots) {
     results.push(...await discoverChannel(root))
   }
   return results
@@ -433,7 +423,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 }
 
 export function createCodebuffProvider(baseDir?: string): Provider {
-  const dir = getCodebuffBaseDir(baseDir)
+  const roots = getCodebuffRootSet(baseDir)
 
   return {
     name: 'codebuff',
@@ -447,8 +437,12 @@ export function createCodebuffProvider(baseDir?: string): Provider {
       return toolNameMap[rawTool] ?? rawTool
     },
 
+    async probeRoots(): Promise<ProbeRoot[]> {
+      return roots.map(path => ({ path, label: 'chats' }))
+    },
+
     async discoverSessions(): Promise<SessionSource[]> {
-      return discoverSessionsInBase(dir)
+      return discoverSessionsInRoots(roots)
     },
 
     createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {

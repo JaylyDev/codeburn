@@ -168,8 +168,12 @@ import type { DateRange, ProjectSummary } from './types.js'
 // v25: #1047 activity-id pricing. v24 on main already shipped #1090.
 // v26: #946 copilot session-store accounting (see the top of this ladder).
 // v27: #1093 claude-haiku-4.5 alias (see top).
-export const DAILY_CACHE_VERSION = 27
-const MIN_SUPPORTED_VERSION = 27
+// v28: #1115 report/optimize output tokens go through billableOutputTokens.
+// Exclusive providers (Grok and the rest) were under-counted by reasoningTokens
+// in finalized daily rows; inclusive {claude,codex,copilot} were correct there
+// but optimize added reasoning again. Re-derive so report matches the live parse.
+export const DAILY_CACHE_VERSION = 28
+const MIN_SUPPORTED_VERSION = 28
 
 /// Providers whose per-day CALL COUNT means something different at
 /// DAILY_CACHE_VERSION 26 than it did before it. Copilot's supplementary

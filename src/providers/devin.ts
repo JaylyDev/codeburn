@@ -6,6 +6,7 @@ import { getShortModelName } from "../models.js";
 import { openDatabase } from "../sqlite.js";
 import { readConfig } from "../config.js";
 import type {
+  ProbeRoot,
   Provider,
   SessionParser,
   SessionSource,
@@ -524,8 +525,24 @@ class DevinSessionParser implements SessionParser {
   }
 }
 
-export function createDevinProvider(cliDir: string): Provider {
-  const sessionsDbPath = join(cliDir, DEVIN_SESSIONS_DB);
+function resolveDevinCliDir(override?: string): string {
+  return override && override.trim() ? override : DEFAULT_DEVIN_CLI_DIR;
+}
+
+function getDevinDiscoveryRoots(cliDir: string): {
+  transcriptsDir: string;
+  sessionsDbPath: string;
+} {
+  return {
+    transcriptsDir: join(cliDir, DEVIN_TRANSCRIPTS_SUBDIR),
+    sessionsDbPath: join(cliDir, DEVIN_SESSIONS_DB),
+  };
+}
+
+export function createDevinProvider(cliDir?: string): Provider {
+  const resolvedCliDir = resolveDevinCliDir(cliDir);
+  const { transcriptsDir, sessionsDbPath } =
+    getDevinDiscoveryRoots(resolvedCliDir);
   let sessionMetadata: Map<string, DevinSessionMetadata> | null = null;
 
   const getSessionMetadata = () => {
@@ -545,10 +562,16 @@ export function createDevinProvider(cliDir: string): Provider {
       return rawTool;
     },
 
+    async probeRoots(): Promise<ProbeRoot[]> {
+      return [
+        { path: transcriptsDir, label: "transcripts" },
+        { path: sessionsDbPath, label: "sessions.db" },
+      ];
+    },
+
     async discoverSessions(): Promise<SessionSource[]> {
       if ((await getCostFactor()) === null) return [];
 
-      const transcriptsDir = join(cliDir, DEVIN_TRANSCRIPTS_SUBDIR);
       const entries = await readdir(transcriptsDir).catch(() => []);
       const metadata = getSessionMetadata();
       const sources: SessionSource[] = [];

@@ -12,6 +12,11 @@ import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.
 import { isSqliteBusyError } from './sqlite.js'
 import { getCodeburnCacheDir } from './cache-dir.js'
 import {
+  isHermesLedgerPublicationError,
+  isHermesObservationKey,
+  seedHermesCursorsFromProviderSection,
+} from './hermes-session-ledger.js'
+import {
   type CachedCall,
   type CachedFile,
   type CachedTurn,
@@ -2542,6 +2547,7 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
     ...(call.requestMultiplier != null ? { requestMultiplier: call.requestMultiplier } : {}),
     ...(call.compactedAt ? { compactedAt: call.compactedAt } : {}),
     ...(call.initiator ? { initiator: call.initiator } : {}),
+    ...(call.supplementaryAccounting ? { supplementaryAccounting: true } : {}),
     activeDurationMs: call.activeDurationMs,
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
@@ -2703,6 +2709,9 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
     ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
+    ...(call.supplementaryAccounting || isHermesObservationKey(call.deduplicationKey)
+      ? { supplementaryAccounting: true }
+      : {}),
   })
 }
 
@@ -3233,6 +3242,19 @@ export async function parseProviderSources(
   const antigravityCacheDir = providerName === 'antigravity' ? getCodeburnCacheDir() : undefined
 
   const section = getOrCreateProviderSection(diskCache, providerName)
+  if (providerName === 'hermes' && !readOnly) {
+    try {
+      // Isolated migration: seed missing cursors from the already-loaded
+      // hermes section before any source is deleted in this parse loop.
+      await seedHermesCursorsFromProviderSection(section)
+    } catch (err) {
+      if (isHermesLedgerPublicationError(err)) {
+        deferredRetryableSource = true
+      } else {
+        throw err
+      }
+    }
+  }
   const allDiscoveredFiles = new Set<string>()
   const servedSources = [...sources]
 
@@ -3506,7 +3528,7 @@ export async function parseProviderSources(
         didParse = true
         markCacheDirty(diskCache, providerName, source.path)
       } catch (err) {
-        if (isSqliteBusyError(err)) {
+        if (isSqliteBusyError(err) || isHermesLedgerPublicationError(err)) {
           // Deferred, not failed: the cache keeps serving this source's
           // previous rows and the next refresh retries. But the data this
           // read would have added is MISSING from this parse, so the run is a

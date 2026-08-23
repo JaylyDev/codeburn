@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildMenubarPayload, type CombinedUsage, type PeriodData, type ProviderCost } from '../src/menubar-json.js'
+import { buildMenubarPayload, type CombinedUsage, type LocalModelSavings, type PeriodData, type ProviderCost } from '../src/menubar-json.js'
 import type { OptimizeResult } from '../src/optimize.js'
 
 function emptyPeriod(label: string): PeriodData {
@@ -422,5 +422,28 @@ describe('buildMenubarPayload', () => {
   it('omits stale on a normal fresh build', () => {
     const payload = buildMenubarPayload(emptyPeriod('Today'), [], null)
     expect(payload.stale).toBeUndefined()
+  })
+
+  it('passes localModelSavings.byModel.outputTokens through as billable output', () => {
+    // usage-aggregator writes billableOutputTokens into this field while the
+    // provider is still known. Exclusive 10+3 → 13; inclusive 10+3 → 10.
+    const localModelSavings: LocalModelSavings = {
+      totalUSD: 2,
+      calls: 2,
+      byModel: [
+        { name: 'Grok 4', calls: 1, actualUSD: 0, savingsUSD: 1, baselineModel: 'gpt-4o', inputTokens: 0, outputTokens: 13 },
+        { name: 'GPT-5.4', calls: 1, actualUSD: 0, savingsUSD: 1, baselineModel: 'gpt-4o', inputTokens: 0, outputTokens: 10 },
+      ],
+      byProvider: [
+        { name: 'grok', calls: 1, savingsUSD: 1 },
+        { name: 'codex', calls: 1, savingsUSD: 1 },
+      ],
+    }
+    const period: PeriodData = { ...emptyPeriod('Today'), outputTokens: 23 }
+    const payload = buildMenubarPayload(period, [], null, undefined, undefined, undefined, { localModelSavings })
+    expect(payload.current.outputTokens).toBe(23)
+    expect(payload.current.localModelSavings.byModel).toEqual(localModelSavings.byModel)
+    expect(payload.current.localModelSavings.byModel[0]!.outputTokens).toBe(13)
+    expect(payload.current.localModelSavings.byModel[1]!.outputTokens).toBe(10)
   })
 })
