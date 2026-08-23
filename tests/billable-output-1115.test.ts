@@ -6,10 +6,10 @@ import { describe, expect, it } from 'vitest'
 import { aggregateModelStats, computeComparison } from '../src/compare-stats.js'
 import { aggregateProjectsIntoDays } from '../src/day-aggregator.js'
 import { exportJson } from '../src/export.js'
-import { billableOutputTokens } from '../src/models.js'
+import { billableOutputTokens, getShortModelName } from '../src/models.js'
 import { findContextBloatCandidates } from '../src/optimize.js'
 import { renderOverview } from '../src/overview.js'
-import { callBillableOutputTokens, sessionBillableOutputTokens } from '../src/session-output.js'
+import { callBillableOutputTokens, sessionBillableOutputTokens, sessionModelBillableOutputTokens } from '../src/session-output.js'
 import { aggregateSessions } from '../src/sessions-report.js'
 import { buildPeriodData } from '../src/usage-aggregator.js'
 import type { ProjectSummary, SessionSummary } from '../src/types.js'
@@ -67,7 +67,7 @@ function makeSession(provider: string, outputTokens: number, reasoningTokens: nu
       assistantCalls: [call],
     }],
     modelBreakdown: {
-      [call.model]: {
+      [getShortModelName(call.model)]: {
         calls: 1,
         costUSD: 0,
         savingsUSD: 0,
@@ -164,8 +164,8 @@ describe('#1115 billableOutputTokens on report/optimize totals', () => {
         records: Array<{ outputTokens: number; reasoningTokens: number }>
       }
       expect(data.periods[0]!.daily[0]!['Output Tokens']).toBe(23)
-      const grokRow = data.periods[0]!.models.find(r => r.Model === 'grok-4')!
-      const codexRow = data.periods[0]!.models.find(r => r.Model === 'gpt-5.4')!
+      const grokRow = data.periods[0]!.models.find(r => r.Model === getShortModelName('grok-4'))!
+      const codexRow = data.periods[0]!.models.find(r => r.Model === getShortModelName('gpt-5.4'))!
       expect(grokRow['Output Tokens']).toBe(13)
       expect(codexRow['Output Tokens']).toBe(10)
       // Record-level export stays raw columns, not the billable sum.
@@ -207,5 +207,68 @@ describe('#1115 billableOutputTokens on report/optimize totals', () => {
 
     expect(callBillableOutputTokens({} as never)).toBe(0)
     expect(callBillableOutputTokens({ provider: 'grok', usage: { outputTokens: 10, reasoningTokens: 3 } })).toBe(13)
+  })
+
+  it('joins model output on getShortModelName, not raw call.model', async () => {
+    const session = makeSession('claude', 10, 0)
+    session.turns[0]!.assistantCalls[0]!.model = 'deepseek-v4-pro'
+    session.modelBreakdown = {
+      'DeepSeek v4 Pro': {
+        calls: 1,
+        costUSD: 1,
+        savingsUSD: 0,
+        tokens: session.turns[0]!.assistantCalls[0]!.usage,
+      },
+    }
+    const billed = sessionModelBillableOutputTokens(session)
+    expect(billed).toEqual({ 'DeepSeek v4 Pro': 10 })
+    expect(billed['deepseek-v4-pro']).toBeUndefined()
+
+    const dir = await mkdtemp(join(tmpdir(), 'cb-1116-display-key-'))
+    try {
+      const path = await exportJson(
+        [{ label: '30 Days', projects: [makeProject(session)] }],
+        join(dir, 'out.json'),
+      )
+      const data = JSON.parse(await readFile(path, 'utf-8')) as {
+        periods: Array<{ models: Array<{ Model: string; 'API Calls': number; 'Output Tokens': number }> }>
+      }
+      const rows = data.periods[0]!.models
+      expect(rows.filter(r => r.Model === 'deepseek-v4-pro')).toHaveLength(0)
+      const named = rows.find(r => r.Model === 'DeepSeek v4 Pro')
+      expect(named).toEqual(expect.objectContaining({
+        Model: 'DeepSeek v4 Pro',
+        'API Calls': 1,
+        'Output Tokens': 10,
+      }))
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+
+    const out = renderOverview([makeProject(session)], { label: 'May 2026', color: false })
+    expect(out).toContain('DeepSeek v4 Pro')
+    expect(out).not.toContain('deepseek-v4-pro')
+    expect(out).toMatch(/DeepSeek v4 Pro[\s\S]*\b1\b[\s\S]*\b10\b/)
+  })
+
+  it('aggregate-only model rows keep finite billable output', async () => {
+    const aggregate = makeSession('grok', 10, 3)
+    aggregate.turns = []
+    expect(sessionBillableOutputTokens(aggregate)).toBe(13)
+    expect(sessionModelBillableOutputTokens(aggregate)).toEqual({ [getShortModelName('grok-4')]: 13 })
+
+    const dir = await mkdtemp(join(tmpdir(), 'cb-1116-agg-only-'))
+    try {
+      const path = await exportJson(
+        [{ label: '30 Days', projects: [makeProject(aggregate)] }],
+        join(dir, 'out.json'),
+      )
+      const data = JSON.parse(await readFile(path, 'utf-8')) as {
+        periods: Array<{ models: Array<{ Model: string; 'Output Tokens': number }> }>
+      }
+      expect(data.periods[0]!.models.find(r => r.Model === getShortModelName('grok-4'))!['Output Tokens']).toBe(13)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

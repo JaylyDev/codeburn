@@ -1,4 +1,4 @@
-import { billableOutputTokens } from './models.js'
+import { billableOutputTokens, getShortModelName } from './models.js'
 import type { SessionSummary } from './types.js'
 
 type UsageLike = {
@@ -8,7 +8,44 @@ type UsageLike = {
 
 type CallLike = {
   provider?: string
+  model?: string
   usage?: UsageLike
+}
+
+/** Same key the parser uses for non-Devin `modelBreakdown` buckets. */
+export function modelBreakdownKey(call: { provider?: string; model?: string }): string | undefined {
+  if (!call.model) return undefined
+  return call.provider === 'devin' ? call.model : getShortModelName(call.model)
+}
+
+/**
+ * Per-model displayed output, keyed like parser `modelBreakdown`.
+ * Call usage wins while provider identity is known. Aggregate-only /
+ * stub sessions fall back to each existing bucket so a finite
+ * sessionBillableOutputTokens cannot leave model Output Tokens at 0.
+ */
+export function sessionModelBillableOutputTokens(session: SessionSummary): Record<string, number> {
+  const out: Record<string, number> = {}
+  let sawUsage = false
+  for (const turn of session.turns ?? []) {
+    for (const call of turn.assistantCalls ?? []) {
+      if (!call.usage) continue
+      sawUsage = true
+      const key = modelBreakdownKey(call)
+      if (!key) continue
+      out[key] = (out[key] ?? 0) + callBillableOutputTokens(call)
+    }
+  }
+  if (sawUsage) return out
+  const provider = inferSessionProvider(session)
+  for (const [model, d] of Object.entries(session.modelBreakdown ?? {})) {
+    out[model] = billableOutputTokens(
+      provider,
+      d.tokens?.outputTokens ?? 0,
+      d.tokens?.reasoningTokens ?? 0,
+    )
+  }
+  return out
 }
 
 /** First on-call provider, then a model-name fallback. Sessions are usually one provider. */

@@ -10,7 +10,7 @@ import { convertCost, formatCost } from './currency.js'
 import { renderStatusBar } from './format.js'
 import { toDateString } from './daily-cache.js'
 import { dateKey } from './day-aggregator.js'
-import { callBillableOutputTokens } from './session-output.js'
+import { sessionModelBillableOutputTokens } from './session-output.js'
 import { isBehavioralCall } from './behavioral-weight.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import type { AppliedFix } from './act/types.js'
@@ -547,15 +547,12 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
       modelMap[model].cacheWriteTokens += d.tokens.cacheCreationInputTokens
     }
     // Output must be billed per call while provider identity is still known.
-    // Inferring after modelBreakdown grouping is not safe for mixed-provider data.
-    for (const turn of sess.turns) {
-      for (const call of turn.assistantCalls) {
-        if (!call.model) continue
-        if (!modelMap[call.model]) {
-          modelMap[call.model] = { calls: 0, cost: 0, savings: 0, estimatedCost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, baselineModel: '' }
-        }
-        modelMap[call.model].outputTokens += callBillableOutputTokens(call)
+    // Join on the same key as parser modelBreakdown (getShortModelName), not raw call.model.
+    for (const [model, output] of Object.entries(sessionModelBillableOutputTokens(sess))) {
+      if (!modelMap[model]) {
+        modelMap[model] = { calls: 0, cost: 0, savings: 0, estimatedCost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, baselineModel: '' }
       }
+      modelMap[model].outputTokens += output
     }
   }
   // Pull the active baseline model name out of the savings config so the

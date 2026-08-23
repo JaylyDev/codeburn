@@ -6,7 +6,7 @@ import { getCurrency, convertCost, roundForActiveCurrency } from './currency.js'
 import { dateKey } from './day-aggregator.js'
 import { behavioralTurnCount, isBehavioralCall } from './behavioral-weight.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
-import { callBillableOutputTokens } from './session-output.js'
+import { callBillableOutputTokens, sessionModelBillableOutputTokens } from './session-output.js'
 
 function escCsv(s: string): string {
   const sanitized = /^[\t\r=+\-@]/.test(s) ? `'${s}` : s
@@ -166,12 +166,9 @@ function buildModelRows(projects: ProjectSummary[], period: string): Row[] {
         acc.cacheWrite += d.tokens.cacheCreationInputTokens ?? 0
       }
       // Output must be billed per call while provider identity is still known.
-      // Grouped modelBreakdown tokens cannot distinguish exclusive vs inclusive.
-      for (const turn of session.turns) {
-        for (const call of turn.assistantCalls) {
-          if (!call.model) continue
-          ensure(call.model).output += callBillableOutputTokens(call)
-        }
+      // Join on the same key as parser modelBreakdown (getShortModelName), not raw call.model.
+      for (const [model, output] of Object.entries(sessionModelBillableOutputTokens(session))) {
+        ensure(model).output += output
       }
     }
   }
