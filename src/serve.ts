@@ -166,6 +166,14 @@ function readServeOption(args: string[], name: string): string | undefined {
   return undefined
 }
 
+/// Opt-in by whichever client spawned this child. A partial answer is only
+/// honest on a surface that renders the indicator, and each client holds its
+/// OWN serve child: the desktop app sets this (app/electron/cli.ts) and shows
+/// `indexing history · N/M files`; the Swift menubar, GNOME and Windows clients
+/// do not, so their children keep the full cold parse until those UIs can label
+/// a partial payload. Unset means "answer only with complete data".
+export const SERVE_PROGRESSIVE_ENV = 'CODEBURN_SERVE_PROGRESSIVE'
+
 /// The range start a cold first paint of this request may be floored to, or
 /// null when the request must not be answered partially (#1110).
 ///
@@ -181,6 +189,7 @@ export function coldFirstPaintRangeStart(
   args: string[],
   rangeForPeriod: (period: string) => { range: { start: Date } },
 ): Date | null {
+  if (process.env[SERVE_PROGRESSIVE_ENV] !== '1') return null
   if (args[0] !== 'status') return null
   if (readServeOption(args, '--format') !== 'menubar-json') return null
   for (const flag of ['--day', '--from', '--to', '--days']) {

@@ -62,6 +62,9 @@ describe('codeburn serve --stdio progressive cold start', () => {
         CLAUDE_CONFIG_DIR: join(home, '.claude'),
         CODEBURN_CACHE_DIR: join(home, 'cache'),
         CODEBURN_DESKTOP_SESSIONS_DIR: join(home, 'desktop-sessions'),
+        // The desktop app's opt-in: only a client that renders the indexing
+        // indicator may be answered partially.
+        CODEBURN_SERVE_PROGRESSIVE: '1',
         // The fill normally waits for the client's opening burst to land.
         CODEBURN_SERVE_FILL_DELAY_MS: '200',
       },

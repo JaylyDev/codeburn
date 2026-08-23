@@ -728,7 +728,13 @@ export function startServe(pidFile?: string): void {
   if (serveClient?.disabled()) return
   if (!serveClient) {
     const spec = spawnSpecFor(target, ['serve', '--stdio'])
-    spec.env = { ...spec.env, CODEBURN_PROGRESS: '1' }
+    // CODEBURN_SERVE_PROGRESSIVE opts this child into answering a cold menubar
+    // payload from the files the requested period can show, labelled
+    // `hydration.complete: false`, with the rest indexed behind it (#1110).
+    // Only clients that render the indexing indicator may ask for that; this
+    // renderer does. One-shot spawns (including the fallback below) never get
+    // it — a one-shot cannot converge.
+    spec.env = { ...spec.env, CODEBURN_PROGRESS: '1', CODEBURN_SERVE_PROGRESSIVE: '1' }
     serveClient = new ServeClient(spec, pidFile)
   }
   serveClient.start()

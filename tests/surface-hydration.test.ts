@@ -7,7 +7,7 @@ import { parseAllSessions, clearSessionCache, withColdFirstPaintFloor } from '..
 import { clearLoadCacheMemo, isColdCacheOnDisk } from '../src/session-cache.js'
 import { buildMenubarPayloadForRange, SERVE_HYDRATION_ENV } from '../src/usage-aggregator.js'
 import { getDateRange } from '../src/cli-date.js'
-import { coldFirstPaintRangeStart } from '../src/serve.js'
+import { coldFirstPaintRangeStart, SERVE_PROGRESSIVE_ENV } from '../src/serve.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -21,12 +21,14 @@ beforeEach(async () => {
   process.env['CODEBURN_CACHE_DIR'] = join(tmpDir, 'cache')
   process.env['CODEBURN_DESKTOP_SESSIONS_DIR'] = join(tmpDir, 'desktop-sessions')
   delete process.env[SERVE_HYDRATION_ENV]
+  process.env[SERVE_PROGRESSIVE_ENV] = '1'
 })
 
 afterEach(async () => {
   clearSessionCache()
   clearLoadCacheMemo()
   delete process.env[SERVE_HYDRATION_ENV]
+  delete process.env[SERVE_PROGRESSIVE_ENV]
   await rm(tmpDir, { recursive: true, force: true })
 })
 
@@ -70,6 +72,14 @@ describe('serve first-paint gate', () => {
     expect(start(['status', '--format', 'menubar-json'])?.getTime())
       .toBe(getDateRange('today').range.start.getTime())
     expect(start(['status', '--format', 'menubar-json', '--period', 'nonsense'])).toBeNull()
+  })
+
+  it('declines every request when the client did not opt in', () => {
+    // Each surface holds its own serve child. A client that cannot render the
+    // indexing indicator (the Swift menubar, GNOME, Windows) never gets a
+    // partial answer, whatever it asks for.
+    delete process.env[SERVE_PROGRESSIVE_ENV]
+    expect(start(['status', '--format', 'menubar-json'])).toBeNull()
   })
 
   it('declines an explicit range, which is a question that deserves a real answer', () => {
