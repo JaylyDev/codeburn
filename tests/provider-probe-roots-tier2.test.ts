@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { afterEach, describe, it, expect } from 'vitest'
 import { isAbsolute, join } from 'path'
 import { homedir } from 'os'
 
@@ -117,6 +117,16 @@ describe('probeRoots mirrors discovery resolution (Tier 2, batch 1)', () => {
 // #899 Tier 2, batch 2. Same contract as batch 1: probeRoots() is the exact
 // discovery-root set after the same resolution, pinned as full objects.
 describe('probeRoots mirrors discovery resolution (Tier 2, batch 2)', () => {
+  const originalCodebuffDataDir = process.env['CODEBUFF_DATA_DIR']
+  const originalVibeHome = process.env['VIBE_HOME']
+
+  afterEach(() => {
+    if (originalCodebuffDataDir === undefined) delete process.env['CODEBUFF_DATA_DIR']
+    else process.env['CODEBUFF_DATA_DIR'] = originalCodebuffDataDir
+    if (originalVibeHome === undefined) delete process.env['VIBE_HOME']
+    else process.env['VIBE_HOME'] = originalVibeHome
+  })
+
   it('codebuff reports all three CHANNELS on default, and empty factory is unset', async () => {
     const expected = [
       { path: join(homedir(), '.config', 'manicode'), label: 'chats' },
