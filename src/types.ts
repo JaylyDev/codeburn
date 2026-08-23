@@ -162,6 +162,10 @@ export type ParsedApiCall = {
   /// tokens/cost but skip it in apiCalls / model-call / turn counts. Transient:
   /// assigned at serve time, never cached.
   supplementaryAccounting?: boolean
+  /// Copilot session-store `total_nano_aiu`. 1e9 nano-AIU = 1 credit = $0.01.
+  /// Threaded from CachedCall / ParsedProviderCall so plan math can sum credits.
+  /// Absent on older stores and on JSONL / shutdown-rollup siblings.
+  nanoAiu?: number
 }
 
 export type ToolCall = {

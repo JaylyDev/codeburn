@@ -1,8 +1,9 @@
 import { behavioralCallCount } from './behavioral-weight.js'
 import { readPlans, type Plan, type PlanMap } from './config.js'
+import { creditsToUsd, isFiniteNanoAiu, nanoAiuToCredits } from './copilot-aiu.js'
 import { parseAllSessions } from './parser.js'
 import { PLAN_PROVIDERS } from './plans.js'
-import type { DateRange, ProjectSummary } from './types.js'
+import type { DateRange, ParsedApiCall, ProjectSummary } from './types.js'
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000
 const PLAN_NEAR_THRESHOLD_PCT = 80
@@ -19,6 +20,10 @@ export type PlanUsage = {
   status: PlanStatus
   projectedMonthUsd: number
   daysUntilReset: number
+  // Copilot credit-plan fields. Absent on Claude / cursor / grok / custom-USD.
+  spentCredits?: number
+  budgetCredits?: number
+  creditsIncomplete?: boolean
 }
 
 export function clampResetDay(resetDay: number | undefined): number {
@@ -69,12 +74,46 @@ function diffCalendarDays(from: Date, to: Date): number {
   return toDayIndex(to) - toDayIndex(from)
 }
 
+export function isCopilotCreditsPlan(plan: Plan): boolean {
+  return plan.provider === 'copilot'
+}
+
+function planCallSpend(plan: Plan, call: { costUSD: number; nanoAiu?: number }): number {
+  if (!isCopilotCreditsPlan(plan)) return call.costUSD
+  return isFiniteNanoAiu(call.nanoAiu) ? creditsToUsd(nanoAiuToCredits(call.nanoAiu)) : 0
+}
+
+function forEachPlanCall(projects: ProjectSummary[], visit: (call: ParsedApiCall) => void): void {
+  for (const project of projects) {
+    for (const session of project.sessions ?? []) {
+      for (const turn of session.turns ?? []) {
+        for (const call of turn.assistantCalls ?? []) visit(call)
+      }
+    }
+  }
+}
+
+export function copilotCreditSpend(projects: ProjectSummary[]): { spentCredits: number; creditsIncomplete: boolean } {
+  let nanoSum = 0
+  let creditsIncomplete = false
+  forEachPlanCall(projects, call => {
+    if (call.provider !== 'copilot') return
+    if (isFiniteNanoAiu(call.nanoAiu)) {
+      nanoSum += call.nanoAiu
+      return
+    }
+    creditsIncomplete = true
+  })
+  return { spentCredits: nanoAiuToCredits(nanoSum), creditsIncomplete }
+}
+
 export function projectMonthEnd(
   projects: ProjectSummary[],
   periodStart: Date,
   periodEnd: Date,
   today: Date,
   spent: number,
+  spendOf: (call: { costUSD: number; nanoAiu?: number }) => number = (call) => call.costUSD,
 ): number {
   const dayCosts = new Map<string, number>()
 
@@ -88,7 +127,7 @@ export function projectMonthEnd(
           if (Number.isNaN(ts.getTime())) continue
           if (ts < periodStart || ts > today) continue
           const dayKey = toLocalDateKey(ts)
-          dayCosts.set(dayKey, (dayCosts.get(dayKey) ?? 0) + call.costUSD)
+          dayCosts.set(dayKey, (dayCosts.get(dayKey) ?? 0) + spendOf(call))
         }
       }
     }
@@ -110,12 +149,36 @@ export function projectMonthEnd(
 
 export function getPlanUsageFromProjects(plan: Plan, projects: ProjectSummary[], today = new Date()): PlanUsage {
   const { periodStart, periodEnd } = computePeriodFromResetDay(plan.resetDay, today)
-  const spent = projects.reduce((sum, p) => sum + p.totalCostUSD, 0)
   const budgetUsd = plan.monthlyUsd
+  const daysUntilReset = Math.max(0, diffCalendarDays(today, periodEnd))
+
+  if (isCopilotCreditsPlan(plan)) {
+    const { spentCredits, creditsIncomplete } = copilotCreditSpend(projects)
+    const budgetCredits = plan.monthlyCredits ?? 0
+    const percentUsed = budgetCredits > 0 ? (spentCredits / budgetCredits) * 100 : 0
+    const spent = creditsToUsd(spentCredits)
+    const status: PlanStatus = percentUsed > 100 ? 'over' : percentUsed >= PLAN_NEAR_THRESHOLD_PCT ? 'near' : 'under'
+    const projectedMonthUsd = projectMonthEnd(projects, periodStart, periodEnd, today, spent, call => planCallSpend(plan, call))
+    return {
+      plan,
+      periodStart,
+      periodEnd,
+      spentApiEquivalentUsd: spent,
+      budgetUsd,
+      percentUsed,
+      status,
+      projectedMonthUsd,
+      daysUntilReset,
+      spentCredits,
+      budgetCredits,
+      creditsIncomplete,
+    }
+  }
+
+  const spent = projects.reduce((sum, p) => sum + p.totalCostUSD, 0)
   const percentUsed = budgetUsd > 0 ? (spent / budgetUsd) * 100 : 0
   const status: PlanStatus = percentUsed > 100 ? 'over' : percentUsed >= PLAN_NEAR_THRESHOLD_PCT ? 'near' : 'under'
   const projectedMonthUsd = projectMonthEnd(projects, periodStart, periodEnd, today, spent)
-  const daysUntilReset = Math.max(0, diffCalendarDays(today, periodEnd))
 
   return {
     plan,
@@ -157,17 +220,19 @@ export function getPlanScopedProjects(plan: Plan, projects: ProjectSummary[], to
             (sum, turn) => sum + turn.assistantCalls.reduce((turnSum, call) => turnSum + call.costUSD, 0),
             0,
           )
+          const hasNanoAiu = turns.some(turn => turn.assistantCalls.some(call => isFiniteNanoAiu(call.nanoAiu)))
           const apiCalls = turns.reduce((sum, turn) => sum + behavioralCallCount(turn.assistantCalls), 0)
           // Keep on cost as well as calls: a copilot rollup-only session has
           // zero behavioral calls but real spend, and dropping it would erase
-          // that spend from the plan window.
-          return apiCalls > 0 || totalCostUSD > 0 ? { ...session, turns, totalCostUSD, apiCalls } : null
+          // that spend from the plan window. A store-row with nanoAiu and $0
+          // token cost still has to reach credit math.
+          return apiCalls > 0 || totalCostUSD > 0 || hasNanoAiu ? { ...session, turns, totalCostUSD, apiCalls } : null
         })
         .filter((session): session is NonNullable<typeof session> => session !== null)
 
       const totalCostUSD = sessions.reduce((sum, session) => sum + session.totalCostUSD, 0)
       const totalApiCalls = sessions.reduce((sum, session) => sum + session.apiCalls, 0)
-      return totalApiCalls > 0 || totalCostUSD > 0 ? { ...project, sessions, totalCostUSD, totalApiCalls } : null
+      return sessions.length > 0 ? { ...project, sessions, totalCostUSD, totalApiCalls } : null
     })
     .filter((project): project is NonNullable<typeof project> => project !== null)
 }

@@ -55,6 +55,30 @@ describe('plan budget copy', () => {
     expect(planStatusText(cursor)).toContain('Approaching budget')
   })
 
+  it('labels Copilot as AI Credits, not API-equivalent USD', () => {
+    const copilot = usage({
+      plan: {
+        id: 'copilot-pro',
+        monthlyCredits: 1500,
+        monthlyUsd: 15,
+        provider: 'copilot',
+        resetDay: 1,
+        setAt: '2026-08-01T00:00:00.000Z',
+      },
+      budgetUsd: 15,
+      spentApiEquivalentUsd: 0.015,
+      spentCredits: 1.5,
+      budgetCredits: 1500,
+      percentUsed: 0.1,
+      creditsIncomplete: false,
+    })
+    expect(planBudgetHeadline(copilot)).toBe('Copilot Pro: 1.5 / 1500 AI Credits')
+    const status = planStatusText(copilot)
+    expect(status).toContain('Not a live provider window.')
+    expect(status).not.toMatch(/GitHub|UTC|copilot_internal/i)
+    expect(status).not.toMatch(/calendar/i)
+  })
+
   // computePeriodFromResetDay builds an anniversary window from plan.resetDay
   // (1-28, settable with `codeburn plan set --reset-day`), so a plan that resets
   // on the 15th is NOT on a calendar month and must never be called one.

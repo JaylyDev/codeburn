@@ -144,10 +144,16 @@ type JsonPlanSummary = {
   daysUntilReset: number
   periodStart: string
   periodEnd: string
+  monthlyCredits?: number
+  spentCredits?: number
+  budgetCredits?: number
+  creditsIncomplete?: boolean
+  monthlyUsd?: number
+  spentApiEquivalentUsd?: number
 }
 
 function toJsonPlanSummary(planUsage: PlanUsage): JsonPlanSummary {
-  return {
+  const summary: JsonPlanSummary = {
     id: planUsage.plan.id,
     provider: planUsage.plan.provider,
     budget: convertCost(planUsage.budgetUsd),
@@ -159,6 +165,15 @@ function toJsonPlanSummary(planUsage: PlanUsage): JsonPlanSummary {
     periodStart: planUsage.periodStart.toISOString(),
     periodEnd: planUsage.periodEnd.toISOString(),
   }
+  if (planUsage.plan.provider === 'copilot') {
+    summary.monthlyCredits = planUsage.plan.monthlyCredits
+    summary.spentCredits = planUsage.spentCredits
+    summary.budgetCredits = planUsage.budgetCredits
+    summary.creditsIncomplete = planUsage.creditsIncomplete
+    summary.monthlyUsd = planUsage.plan.monthlyUsd
+    summary.spentApiEquivalentUsd = planUsage.spentApiEquivalentUsd
+  }
+  return summary
 }
 
 type JsonPlanSummaryMap = Partial<Record<PlanProvider, JsonPlanSummary>>
@@ -383,6 +398,7 @@ function toPlanDisplay(plan: Plan) {
   return {
     id: plan.id,
     monthlyUsd: plan.monthlyUsd,
+    ...(plan.monthlyCredits != null ? { monthlyCredits: plan.monthlyCredits } : {}),
     provider: plan.provider,
     resetDay: clampResetDay(plan.resetDay),
     setAt: plan.setAt || null,
@@ -1695,14 +1711,15 @@ program
   .description('Show or configure a subscription plan for overage tracking')
   .option('--format <format>', 'Output format: text or json', 'text')
   .option('--monthly-usd <n>', 'Monthly plan price in USD (for custom)', parseNumber)
-  .option('--provider <name>', 'Provider scope: all, claude, codex, cursor')
+  .option('--credits <n>', 'Monthly AI credits (copilot custom plans)', parseNumber)
+  .option('--provider <name>', `Provider scope: ${PLAN_PROVIDERS.join(', ')}`)
   .option('--reset-day <n>', 'Day of month plan resets (1-28)', parseInteger, 1)
-  .action(async (action?: string, id?: string, opts?: { format?: string; monthlyUsd?: number; provider?: string; resetDay?: number }) => {
+  .action(async (action?: string, id?: string, opts?: { format?: string; monthlyUsd?: number; credits?: number; provider?: string; resetDay?: number }) => {
     assertFormat(opts?.format ?? 'text', ['text', 'json'], 'plan')
     const mode = action ?? 'show'
     const providerOption = opts?.provider
     if (providerOption !== undefined && !isPlanProvider(providerOption)) {
-      console.error(`\n  --provider must be one of: all, claude, codex, cursor; got "${providerOption}".\n`)
+      console.error(`\n  --provider must be one of: ${PLAN_PROVIDERS.join(', ')}; got "${providerOption}".\n`)
       process.exitCode = 1
       return
     }
@@ -1731,7 +1748,7 @@ program
       console.log(`\n  Plans: ${plans.length}`)
       for (const plan of plans) {
         console.log(`  ${plan.provider}: ${planLabel(plan)} (${plan.id})`)
-        console.log(`    Budget: $${plan.monthlyUsd}/month`)
+        console.log(`    Budget: ${plan.provider === 'copilot' && plan.monthlyCredits != null ? `${plan.monthlyCredits} AI Credits` : `$${plan.monthlyUsd}/month`}`)
         console.log(`    Reset day: ${clampResetDay(plan.resetDay)}`)
         if (plan.setAt) console.log(`    Set at: ${plan.setAt}`)
       }
@@ -1779,18 +1796,56 @@ program
     }
 
     if (id === 'custom') {
-      if (opts?.monthlyUsd === undefined) {
+      const credits = opts?.credits
+      const monthlyUsdOpt = opts?.monthlyUsd
+      const provider = providerOption ?? 'all'
+
+      if (credits !== undefined && provider !== 'copilot') {
+        console.error('\n  --credits is only valid with --provider copilot.\n')
+        process.exitCode = 1
+        return
+      }
+
+      if (provider === 'copilot') {
+        if (monthlyUsdOpt !== undefined) {
+          console.error('\n  Copilot custom plans take --credits, not --monthly-usd (units mixed).\n')
+          process.exitCode = 1
+          return
+        }
+        if (credits === undefined) {
+          console.error('\n  Custom copilot plans require --credits <positive number>.\n')
+          process.exitCode = 1
+          return
+        }
+        if (!Number.isFinite(credits) || credits <= 0) {
+          console.error(`\n  --credits must be a positive finite number; got ${credits}.\n`)
+          process.exitCode = 1
+          return
+        }
+        await savePlan({
+          id: 'custom',
+          monthlyCredits: credits,
+          monthlyUsd: credits * 0.01,
+          provider: 'copilot',
+          resetDay,
+          setAt: new Date().toISOString(),
+        })
+        console.log(`\n  Plan set to custom (${credits} AI Credits, copilot, reset day ${resetDay}).`)
+        console.log(`  Config saved to ${getConfigFilePath()}\n`)
+        return
+      }
+
+      if (monthlyUsdOpt === undefined) {
         console.error('\n  Custom plans require --monthly-usd <positive number>.\n')
         process.exitCode = 1
         return
       }
-      const monthlyUsd = opts.monthlyUsd
+      const monthlyUsd = monthlyUsdOpt
       if (!Number.isFinite(monthlyUsd) || monthlyUsd <= 0) {
-        console.error(`\n  --monthly-usd must be a positive number; got ${opts.monthlyUsd}.\n`)
+        console.error(`\n  --monthly-usd must be a positive number; got ${monthlyUsdOpt}.\n`)
         process.exitCode = 1
         return
       }
-      const provider = providerOption ?? 'all'
       await savePlan({
         id: 'custom',
         monthlyUsd,

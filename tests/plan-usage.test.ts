@@ -410,3 +410,187 @@ describe('getPlanUsage', () => {
     }
   })
 })
+
+function usageCall(overrides: {
+  provider: string
+  costUSD: number
+  timestamp: string
+  nanoAiu?: number
+  supplementaryAccounting?: boolean
+}) {
+  return {
+    provider: overrides.provider,
+    model: 'claude-sonnet-4-5',
+    usage: {
+      inputTokens: 100,
+      outputTokens: 20,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 0,
+      cachedInputTokens: 0,
+      reasoningTokens: 0,
+      webSearchRequests: 0,
+    },
+    costUSD: overrides.costUSD,
+    tools: [],
+    mcpTools: [],
+    skills: [],
+    subagentTypes: [],
+    hasAgentSpawn: false,
+    hasPlanMode: false,
+    speed: 'standard' as const,
+    timestamp: overrides.timestamp,
+    bashCommands: [],
+    deduplicationKey: `${overrides.provider}-${overrides.timestamp}-${overrides.nanoAiu ?? 'none'}`,
+    ...(overrides.nanoAiu != null ? { nanoAiu: overrides.nanoAiu } : {}),
+    ...(overrides.supplementaryAccounting ? { supplementaryAccounting: true } : {}),
+  }
+}
+
+function usageProject(calls: ReturnType<typeof usageCall>[]): ProjectSummary {
+  return {
+    project: 'codeburn',
+    projectPath: '/tmp/codeburn',
+    totalCostUSD: calls.reduce((sum, call) => sum + call.costUSD, 0),
+    totalApiCalls: calls.length,
+    sessions: [{
+      turns: [{
+        timestamp: calls[0]!.timestamp,
+        assistantCalls: calls,
+      }],
+    }],
+  } as ProjectSummary
+}
+
+describe('copilot AI credit plan math', () => {
+  const today = new Date('2026-08-10T12:00:00.000Z')
+  const copilotPro: Plan = {
+    id: 'copilot-pro',
+    monthlyCredits: 1500,
+    monthlyUsd: 15,
+    provider: 'copilot',
+    resetDay: 1,
+    setAt: '2026-08-01T00:00:00.000Z',
+  }
+  const claudePro: Plan = {
+    id: 'claude-pro',
+    monthlyUsd: 20,
+    provider: 'claude',
+    resetDay: 1,
+    setAt: '2026-08-01T00:00:00.000Z',
+  }
+
+  it('turns 1.5e9 nanoAiu into 1.5 / 1500 credits (0.1%)', () => {
+    const usage = getPlanUsageFromProjects(copilotPro, [
+      usageProject([
+        usageCall({
+          provider: 'copilot',
+          costUSD: 42,
+          timestamp: '2026-08-05T12:00:00.000Z',
+          nanoAiu: 1_500_000_000,
+        }),
+      ]),
+    ], today)
+
+    expect(usage.spentCredits).toBe(1.5)
+    expect(usage.budgetCredits).toBe(1500)
+    expect(usage.percentUsed).toBeCloseTo(0.1, 10)
+    expect(usage.spentApiEquivalentUsd).toBeCloseTo(0.015, 10)
+    expect(usage.creditsIncomplete).toBe(false)
+    expect(usage.status).toBe('under')
+  })
+
+  it('does not fill the credits bar from token costUSD when nanoAiu is missing', () => {
+    const usage = getPlanUsageFromProjects(copilotPro, [
+      usageProject([
+        usageCall({
+          provider: 'copilot',
+          costUSD: 42,
+          timestamp: '2026-08-05T12:00:00.000Z',
+        }),
+      ]),
+    ], today)
+
+    expect(usage.spentCredits).toBe(0)
+    expect(usage.creditsIncomplete).toBe(true)
+    expect(usage.percentUsed).toBe(0)
+    expect(usage.spentApiEquivalentUsd).toBe(0)
+  })
+
+  it('counts a paired store-row once and ignores JSONL / rollup siblings', () => {
+    const usage = getPlanUsageFromProjects(copilotPro, [
+      usageProject([
+        usageCall({
+          provider: 'copilot',
+          costUSD: 0.001605,
+          timestamp: '2026-08-05T12:00:00.000Z',
+          nanoAiu: 1_500_000_000,
+          supplementaryAccounting: true,
+        }),
+        usageCall({
+          provider: 'copilot',
+          costUSD: 0.001605,
+          timestamp: '2026-08-05T12:00:01.000Z',
+        }),
+        usageCall({
+          provider: 'copilot',
+          costUSD: 0.25,
+          timestamp: '2026-08-06T12:00:00.000Z',
+          supplementaryAccounting: true,
+        }),
+      ]),
+    ], today)
+
+    expect(usage.spentCredits).toBe(1.5)
+    expect(usage.percentUsed).toBeCloseTo(0.1, 10)
+    expect(usage.creditsIncomplete).toBe(true)
+  })
+
+  it('keeps Claude plans on costUSD against the same mixed fixture', () => {
+    const projects = [
+      usageProject([
+        usageCall({
+          provider: 'copilot',
+          costUSD: 42,
+          timestamp: '2026-08-05T12:00:00.000Z',
+          nanoAiu: 1_500_000_000,
+        }),
+        usageCall({
+          provider: 'claude',
+          costUSD: 5,
+          timestamp: '2026-08-05T12:00:00.000Z',
+        }),
+      ]),
+    ]
+    const scopedClaude = getPlanScopedProjects(claudePro, projects, today)
+    const claudeUsage = getPlanUsageFromProjects(claudePro, scopedClaude, today)
+    const copilotUsage = getPlanUsageFromProjects(copilotPro, getPlanScopedProjects(copilotPro, projects, today), today)
+
+    expect(claudeUsage.spentApiEquivalentUsd).toBe(5)
+    expect(claudeUsage.spentCredits).toBeUndefined()
+    expect(claudeUsage.percentUsed).toBe(25)
+    expect(copilotUsage.spentCredits).toBe(1.5)
+    expect(copilotUsage.percentUsed).toBeCloseTo(0.1, 10)
+  })
+
+  it('leaves cursor and grok USD siblings at 25%', () => {
+    const cursor = getPlanUsageFromProjects({
+      id: 'cursor-pro',
+      monthlyUsd: 20,
+      provider: 'cursor',
+      resetDay: 1,
+      setAt: '2026-08-01T00:00:00.000Z',
+    }, [usageProject([usageCall({ provider: 'cursor', costUSD: 5, timestamp: '2026-08-05T12:00:00.000Z' })])], today)
+    const grok = getPlanUsageFromProjects({
+      id: 'supergrok',
+      monthlyUsd: 30,
+      provider: 'grok',
+      resetDay: 1,
+      setAt: '2026-08-01T00:00:00.000Z',
+    }, [usageProject([usageCall({ provider: 'grok', costUSD: 7.5, timestamp: '2026-08-05T12:00:00.000Z' })])], today)
+
+    expect(cursor.percentUsed).toBe(25)
+    expect(grok.percentUsed).toBe(25)
+    expect(cursor.spentCredits).toBeUndefined()
+    expect(grok.spentCredits).toBeUndefined()
+  })
+})

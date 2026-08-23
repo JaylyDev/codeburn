@@ -1,9 +1,19 @@
 import type { Plan, PlanId, PlanProvider } from './config.js'
+import { AI_CREDIT_USD } from './copilot-aiu.js'
 
-export const PLAN_PROVIDERS: PlanProvider[] = ['all', 'claude', 'codex', 'cursor', 'grok']
-export const PLAN_IDS: PlanId[] = ['claude-pro', 'claude-max', 'claude-max-5x', 'cursor-pro', 'supergrok', 'supergrok-heavy', 'custom', 'none']
+export const PLAN_PROVIDERS: PlanProvider[] = ['all', 'claude', 'codex', 'cursor', 'grok', 'copilot']
+export const PLAN_IDS: PlanId[] = ['claude-pro', 'claude-max', 'claude-max-5x', 'cursor-pro', 'supergrok', 'supergrok-heavy', 'copilot-pro', 'copilot-pro-plus', 'copilot-max', 'custom', 'none']
 
-export const PRESET_PLANS: Record<'claude-pro' | 'claude-max' | 'claude-max-5x' | 'cursor-pro' | 'supergrok' | 'supergrok-heavy', Omit<Plan, 'setAt'>> = {
+// Official Copilot individual allotments from GitHub Docs, *Usage-based
+// billing for individuals*, fetched 2026-08-23. Flex is documented as
+// variable — pin this table, do not invent a later flex number.
+// https://docs.github.com/copilot/concepts/billing/usage-based-billing-for-individuals
+// monthlyUsd is credits × $0.01 (the budget equivalent), not the sticker price.
+const COPILOT_PRO_CREDITS = 1500
+const COPILOT_PRO_PLUS_CREDITS = 7000
+const COPILOT_MAX_CREDITS = 20000
+
+export const PRESET_PLANS: Record<'claude-pro' | 'claude-max' | 'claude-max-5x' | 'cursor-pro' | 'supergrok' | 'supergrok-heavy' | 'copilot-pro' | 'copilot-pro-plus' | 'copilot-max', Omit<Plan, 'setAt'>> = {
   'claude-pro': {
     id: 'claude-pro',
     monthlyUsd: 20,
@@ -40,6 +50,27 @@ export const PRESET_PLANS: Record<'claude-pro' | 'claude-max' | 'claude-max-5x' 
     provider: 'grok',
     resetDay: 1,
   },
+  'copilot-pro': {
+    id: 'copilot-pro',
+    monthlyCredits: COPILOT_PRO_CREDITS,
+    monthlyUsd: COPILOT_PRO_CREDITS * AI_CREDIT_USD,
+    provider: 'copilot',
+    resetDay: 1,
+  },
+  'copilot-pro-plus': {
+    id: 'copilot-pro-plus',
+    monthlyCredits: COPILOT_PRO_PLUS_CREDITS,
+    monthlyUsd: COPILOT_PRO_PLUS_CREDITS * AI_CREDIT_USD,
+    provider: 'copilot',
+    resetDay: 1,
+  },
+  'copilot-max': {
+    id: 'copilot-max',
+    monthlyCredits: COPILOT_MAX_CREDITS,
+    monthlyUsd: COPILOT_MAX_CREDITS * AI_CREDIT_USD,
+    provider: 'copilot',
+    resetDay: 1,
+  },
 }
 
 export function isPlanProvider(value: string): value is PlanProvider {
@@ -71,6 +102,12 @@ export function planDisplayName(id: PlanId): string {
       return 'SuperGrok'
     case 'supergrok-heavy':
       return 'SuperGrok Heavy'
+    case 'copilot-pro':
+      return 'Copilot Pro'
+    case 'copilot-pro-plus':
+      return 'Copilot Pro+'
+    case 'copilot-max':
+      return 'Copilot Max'
     case 'custom':
       return 'Custom'
     case 'none':

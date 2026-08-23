@@ -488,7 +488,18 @@ function planColor(planUsage: PlanUsage): string {
 // end-first, so the headline stays short enough to keep the percentage visible
 // at 80 columns and the status leads with the disclaimer, not the arithmetic.
 export function planBudgetHeadline(planUsage: PlanUsage): string {
+  if (planUsage.plan.provider === 'copilot') {
+    const spent = planUsage.spentCredits ?? 0
+    const budget = planUsage.budgetCredits ?? planUsage.plan.monthlyCredits ?? 0
+    return `${planLabel(planUsage)}: ${formatCredits(spent)} / ${formatCredits(budget)} AI Credits`
+  }
   return `${planLabel(planUsage)}: ${formatCost(planUsage.spentApiEquivalentUsd)} API-equivalent / ${formatCost(planUsage.budgetUsd)} budget`
+}
+
+function formatCredits(n: number): string {
+  if (Number.isInteger(n)) return String(n)
+  const rounded = Math.round(n * 1e6) / 1e6
+  return String(rounded)
 }
 
 export function planStatusText(planUsage: PlanUsage): string {

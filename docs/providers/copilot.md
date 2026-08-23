@@ -140,8 +140,9 @@ see the #927 ruling in `src/session-cache.ts`).
   still re-derive its pruned rows.
 - **Billing metadata.** Each row's `total_nano_aiu` and `request_multiplier`
   are captured onto the cached call when the store's schema has them (older
-  stores parse identically without). Nothing prices or displays them yet —
-  billing-grade cost is upstream #890.
+  stores parse identically without). Plan math sums finite `nanoAiu` into
+  Copilot AI credits (`codeburn plan set copilot-pro`). Billing-grade cost
+  rewrite of every report is still upstream #890.
 - **Sync.** `codeburn sync push` holds a copilot session until it has been
   quiet for 24 hours. The reconciliation output is mutable (a residual shrinks
   as rows land, a rollup is dropped once rows cover its leg, a row's pairing
