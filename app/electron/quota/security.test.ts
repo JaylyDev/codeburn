@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
-import { readKeychainPassword } from './security'
+import { readKeychainPassword, sanitizeError } from './security'
 
 // readKeychainPassword short-circuits off darwin; pin the platform so the
 // classification logic is exercised on any CI host.
@@ -53,5 +53,12 @@ describe('readKeychainPassword', () => {
       throw new Error('User interaction is not allowed.')
     })
     expect(await readKeychainPassword('svc', ['alice', null], exec)).toEqual({ status: 'accessDenied' })
+  })
+})
+
+describe('sanitizeError', () => {
+  it('redacts the OAuth token shapes used by the quota providers', () => {
+    const sanitized = sanitizeError(new Error('Bearer abc123 ya29.google-token gho_ghub eyJwt.sig\0x sk-ant-one sk-two'))
+    expect(sanitized).toBe('[REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED]')
   })
 })
