@@ -5,7 +5,7 @@ import { homedir } from 'os'
 import { readSessionFile } from '../fs-utils.js'
 import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 const toolNameMap: Record<string, string> = {
   read_file: 'Read',
@@ -213,7 +213,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
   }
 }
 
-function getGeminiTmpDir(): string {
+export function getGeminiTmpDir(): string {
   return join(homedir(), '.gemini', 'tmp')
 }
 
@@ -270,6 +270,10 @@ export function createGeminiProvider(): Provider {
 
     toolDisplayName(rawTool: string): string {
       return toolNameMap[rawTool] ?? rawTool
+    },
+
+    async probeRoots(): Promise<ProbeRoot[]> {
+      return [{ path: getGeminiTmpDir(), label: 'tmp' }]
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
