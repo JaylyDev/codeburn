@@ -174,14 +174,12 @@ describe('getModelCosts', () => {
     expect(getModelCosts('omniroute:cp/cline-pass/glm-5.3')!.outputCostPerToken).toBe(99 / 1_000_000)
   })
 
-  it('prices OrcaRouter route ids at their upstream row and the smart route via alias', () => {
-    // `orcarouter/auto` is a smart route; the alias maps it to a Sonnet flash
-    // rate rather than leaving it unpriced at $0 (the CLI warns on $0 models).
-    expect(getModelCosts('orcarouter/auto')!.inputCostPerToken).toBe(
-      getModelCosts('claude-sonnet-4-5')!.inputCostPerToken,
-    )
+  it('prices OrcaRouter fusion and nested upstreams; auto stays fail-closed', () => {
+    // `orcarouter/auto` rotates onto a Qwen/Llama flash model. No live probe
+    // pins a rate, so it stays unpriced rather than inheriting Sonnet.
+    expect(getModelCosts('orcarouter/auto')).toBeNull()
 
-    // The fusion routes currently resolve to openai/gpt-oss-120b (verified live).
+    // The fusion routes currently resolve to openai/gpt-oss-120b (live 2026-08).
     expect(getModelCosts('orcarouter/fusion')!.inputCostPerToken).toBe(
       getModelCosts('openai/gpt-oss-120b')!.inputCostPerToken,
     )
@@ -218,7 +216,7 @@ describe('resolveCanonicalModelId', () => {
     expect(resolveCanonicalModelId('claude-opus-4.6')).toBe('claude-opus-4-6')
     expect(resolveCanonicalModelId('kimi-code')).toBe('kimi-k2-thinking')
     expect(resolveCanonicalModelId('cline-pass/kimi-k3')).toBe('kimi-k3')
-    expect(resolveCanonicalModelId('orcarouter/auto')).toBe(resolveCanonicalModelId('claude-sonnet-4-5'))
+    expect(resolveCanonicalModelId('orcarouter/auto')).not.toBe(resolveCanonicalModelId('claude-sonnet-4-5'))
     expect(resolveCanonicalModelId('orcarouter/fusion')).toBe(resolveCanonicalModelId('openai/gpt-oss-120b'))
     expect(resolveCanonicalModelId('orcarouter/fusion-flash')).toBe(resolveCanonicalModelId('openai/gpt-oss-120b'))
     expect(resolveCanonicalModelId('orcarouter/fusion-mini')).toBe(resolveCanonicalModelId('openai/gpt-oss-120b'))
@@ -290,7 +288,7 @@ describe('getShortModelName', () => {
     // OrcaRouter route ids peel to the upstream id, which keeps the upstream label.
     expect(getShortModelName('orcarouter/deepseek/deepseek-v4-pro')).toBe('DeepSeek v4 Pro')
     // Route ids display as the model they route to, not a branded gateway label.
-    expect(getShortModelName('orcarouter/auto')).toBe(getShortModelName('claude-sonnet-4-5'))
+    expect(getShortModelName('orcarouter/auto')).not.toBe(getShortModelName('claude-sonnet-4-5'))
     expect(getShortModelName('orcarouter/fusion')).toBe(getShortModelName('openai/gpt-oss-120b'))
     expect(getShortModelName('orcarouter/fusion-flash')).toBe(getShortModelName('openai/gpt-oss-120b'))
     expect(getShortModelName('orcarouter/fusion-mini')).toBe(getShortModelName('openai/gpt-oss-120b'))
