@@ -12,9 +12,10 @@ import type { CachedCall, ProviderSection } from './session-cache.js'
 // - Reset 150 → 0 → 40 is in contract: an all-zero (or shrinking) snapshot
 //   advances last-seen without a negative observation; later growth is new
 //   spend on the observation day.
-// - Restoring `state.db` from a backup is OUT OF CONTRACT. The cursor resets
-//   with the restored row; later regrowth is emitted again and lifetime
-//   overcounts. There is no high-water-mark guard.
+// - Restores are out of contract: state.db restored from backup without
+//   wiping the ledger ⇒ regrowth is re-credited; wipe both or accept it.
+//   A post-reset high-water-mark guard is rejected: it would eat genuine
+//   150→0→40 resets, which are treated as new spend by design.
 // - Recovery horizon is the warm session-cache baseline. `seedHermesCursorsFromProviderSection`
 //   copies cached lifetime totals into missing cursors so growth *since the
 //   last warm parse* is recovered. Growth dropped *before* that parse stays
