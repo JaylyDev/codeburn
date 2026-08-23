@@ -6,6 +6,21 @@ import { join } from 'path'
 import { getCodeburnCacheDir } from './cache-dir.js'
 import type { CachedCall, ProviderSection } from './session-cache.js'
 
+// Sidecar ledger for Hermes lifetime totals that keep growing after a day is
+// sealed. Contract (iamtoruk #1121 review):
+//
+// - Reset 150 → 0 → 40 is in contract: an all-zero (or shrinking) snapshot
+//   advances last-seen without a negative observation; later growth is new
+//   spend on the observation day.
+// - Restoring `state.db` from a backup is OUT OF CONTRACT. The cursor resets
+//   with the restored row; later regrowth is emitted again and lifetime
+//   overcounts. There is no high-water-mark guard.
+// - Recovery horizon is the warm session-cache baseline. `seedHermesCursorsFromProviderSection`
+//   copies cached lifetime totals into missing cursors so growth *since the
+//   last warm parse* is recovered. Growth dropped *before* that parse stays
+//   dropped: sealed days are not re-read. This slice does not bump
+//   DAILY_CACHE_VERSION (one cold re-parse for every user) to recover history.
+
 export const HERMES_SESSION_LEDGER_FILENAME = 'hermes-session-ledger.v1.json'
 export const HERMES_SESSION_LEDGER_VERSION = 1 as const
 
@@ -410,6 +425,10 @@ function cachedCallToSnapshotTokens(call: CachedCall): HermesTokenTotals {
 }
 
 export async function seedHermesCursorsFromProviderSection(section: ProviderSection): Promise<void> {
+  // Seeds missing cursors from the already-loaded warm cache so the next
+  // observation is a delta against last-seen lifetime, not a dump of the
+  // whole session at `now`. Does not re-read sealed days: historically
+  // dropped growth stays dropped (see file-level contract).
   const ledger = loadHermesSessionLedger()
   let next = ledger
   let dirty = false
