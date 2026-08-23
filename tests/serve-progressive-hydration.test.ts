@@ -113,11 +113,12 @@ describe('codeburn serve --stdio progressive cold start', () => {
     for (let id = 2; id < 40; id++) {
       const response = await request(id, PAYLOAD_ARGS)
       const payload = JSON.parse(response['output'] as string)
-      if (payload.hydration?.complete === true) { converged = payload; break }
+      // Convergence = the hydration block disappears (absence means complete).
+      if (payload.hydration === undefined) { converged = payload; break }
       await new Promise(resolve => setTimeout(resolve, 250))
     }
     expect(converged).not.toBeNull()
-    expect(converged!.hydration!.indexedFiles).toBe(converged!.hydration!.totalFiles)
+    expect(converged!.hydration).toBeUndefined()
   }, 60_000)
 
   it('leaves the on-disk cache exactly where a full cold parse would', async () => {

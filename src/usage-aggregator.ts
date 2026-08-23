@@ -124,6 +124,10 @@ export const SERVE_HYDRATION_ENV = 'CODEBURN_SERVE_HYDRATION'
 
 function hydrationStateFor(hydration: ReturnType<typeof sessionHydrationSnapshot> | undefined): HydrationState | undefined {
   if (process.env[SERVE_HYDRATION_ENV] !== '1' || !hydration) return undefined
+  // Emitted only while incomplete: absence means complete (the rule one-shot
+  // consumers already live by), and a warm serve payload stays byte-identical
+  // to the spawned one-shot — the upgrade-path gate asserts exactly that.
+  if (hydration.complete) return undefined
   return {
     complete: hydration.complete,
     indexedFiles: hydration.indexedFiles,

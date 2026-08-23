@@ -117,7 +117,9 @@ describe('hydration in the menubar payload', () => {
     clearSessionCache()
     const payload = await weekPayload()
 
-    expect(payload.hydration?.complete).toBe(true)
+    // Complete payloads carry no hydration block at all: absence means
+    // complete, and the warm serve payload stays byte-identical to a one-shot.
+    expect(payload.hydration).toBeUndefined()
     expect(payload.stale).toBeUndefined()
     expect(await isColdCacheOnDisk()).toBe(false)
   })
@@ -151,7 +153,7 @@ describe('hydration in the menubar payload', () => {
       weekPayload,
     )
     expect(deferredFiles).toBe(0)
-    expect(payload.hydration?.complete).toBe(true)
+    expect(payload.hydration).toBeUndefined()
   })
 
   it('keeps the spawn-fallback path on a full parse', async () => {
@@ -162,10 +164,7 @@ describe('hydration in the menubar payload', () => {
     // The spawn fallback runs the same command with no floor: it is a one-shot
     // that cannot converge, so it must see every file.
     const payload = await weekPayload()
-    expect(payload.hydration?.complete).toBe(true)
-    // Nothing pending means indexed === total, whatever the process-lifetime
-    // counter happens to stand at.
-    expect(payload.hydration?.indexedFiles).toBe(payload.hydration?.totalFiles)
+    expect(payload.hydration).toBeUndefined()
     const sessions = (await parseAllSessions()).flatMap(p => p.sessions).map(s => s.sessionId).sort()
     expect(sessions).toEqual(['old', 'recent'])
   })
