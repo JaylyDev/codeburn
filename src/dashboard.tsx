@@ -6,7 +6,8 @@ import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, typ
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost, formatTokens, markEstimated, carriedCostNote } from './format.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
-import { parseAllSessions, filterProjectsByDateRange, filterProjectsByName, setInteractiveScanUI, withSinglePassParse } from './parser.js'
+import { parseAllSessions, filterProjectsByDateRange, filterProjectsByName, setInteractiveScanUI, withSinglePassParse, withColdFirstPaintFloor, filesParsedFromSourceCount } from './parser.js'
+import { isColdCacheOnDisk } from './session-cache.js'
 import { findUnpricedModels, isExpectedFreeModel, loadPricing } from './models.js'
 import { aggregateModelTotals } from './model-breakdown.js'
 import { buildDurablePeriod } from './usage-aggregator.js'
@@ -32,6 +33,7 @@ export type DailyActivityRow = {
 }
 
 export const DAILY_ACTIVITY_PAGE_SIZE = 10
+export const INDEX_PROGRESS_TICK_MS = 1000
 export const INTERACTIVE_RENDER_OPTIONS = { alternateScreen: true } as const
 export const RESIZE_DEBOUNCE_MS = 150
 
@@ -1465,7 +1467,7 @@ function ScrollableViewport({ children, width, lineScroll = true }: { children: 
   )
 }
 
-export function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, initialPeriod, initialProvider, initialPlanUsages, initialDurable, refreshSeconds, projectFilter, excludeFilter, customRange, customRangeLabel, initialDay, windowColumns }: {
+export function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, initialPeriod, initialProvider, initialPlanUsages, initialDurable, refreshSeconds, projectFilter, excludeFilter, customRange, customRangeLabel, initialDay, windowColumns, initialIndexPendingFiles }: {
   initialProjects: ProjectSummary[]
   initialDailyHistoryProjects?: ProjectSummary[]
   initialPeriod: Period
@@ -1479,6 +1481,9 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   customRangeLabel?: string
   initialDay?: string
   windowColumns: number
+  /// Files the cold first paint deferred (#1107). Non-zero means the numbers on
+  /// screen cover only what is indexed so far, and a background fill is owed.
+  initialIndexPendingFiles?: number
 }) {
   const { exit } = useApp()
   const [period, setPeriod] = useState<Period>(initialPeriod)
@@ -1503,6 +1508,9 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   // Which coaching note the footer shows; advanced on a slow interval so the
   // whole set rotates through without demanding attention.
   const [noteTick, setNoteTick] = useState(0)
+  const indexPendingFiles = initialIndexPendingFiles ?? 0
+  const [indexing, setIndexing] = useState(indexPendingFiles > 0)
+  const [indexedFiles, setIndexedFiles] = useState(0)
   const isDayMode = dayDate != null
   const isCustomRange = customRange != null && !isDayMode
   const scrollableDailyHistory = !isCustomRange && !isDayMode
@@ -1672,6 +1680,23 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
     return () => clearInterval(id)
   }, [refreshSeconds, period, activeProvider, dayDate, reloadData, view])
 
+  // Background fill for the progressive cold start. The first paint deliberately
+  // skipped every file too old to show in the selected period; this is the pass
+  // that indexes them, and it is an ordinary unscoped reload, so what it writes
+  // to the caches — and what it puts back on screen — is exactly what a full
+  // cold parse would have produced. Mount-only: one fill per launch.
+  useEffect(() => {
+    if (indexPendingFiles === 0) return
+    const parsedBefore = filesParsedFromSourceCount()
+    const id = setInterval(() => setIndexedFiles(filesParsedFromSourceCount() - parsedBefore), INDEX_PROGRESS_TICK_MS)
+    void reloadData(initialPeriod, initialProvider, initialDay ?? null, true).finally(() => {
+      clearInterval(id)
+      setIndexing(false)
+    })
+    return () => clearInterval(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   const switchPeriod = useCallback((np: Period) => {
     if (np === period && !dayDate) return
     // Clear projects + flip loading synchronously so the dashboard never
@@ -1798,6 +1823,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
         {!isCustomRange && !isDayMode && <PeriodTabs active={period} providerName={activeProvider} showProvider={view !== 'compare' && multipleProviders} />}
         {isDayMode && <DayBanner label={headerLabel} width={dashWidth} />}
         {isCustomRange && <CustomRangeBanner label={headerLabel} width={dashWidth} />}
+        {indexing && <IndexingBanner width={dashWidth} done={indexedFiles} total={indexPendingFiles} />}
         {view === 'compare'
           ? <Box flexDirection="column" paddingX={2} paddingY={1}>
               <Box flexDirection="column" borderStyle="round" borderColor={ORANGE} paddingX={1}>
@@ -1817,6 +1843,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
         {!isCustomRange && !isDayMode && <PeriodTabs active={period} providerName={activeProvider} showProvider={multipleProviders && view !== 'compare'} />}
         {isDayMode && <DayBanner label={headerLabel} width={dashWidth} />}
         {isCustomRange && <CustomRangeBanner label={headerLabel} width={dashWidth} />}
+        {indexing && <IndexingBanner width={dashWidth} done={indexedFiles} total={indexPendingFiles} />}
         {view === 'compare'
           ? <CompareView projects={projects} onBack={() => setView('dashboard')} />
           : view === 'optimize' && optimizeResult
@@ -1839,6 +1866,20 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
     >
       {content}
     </ScrollableViewport>
+  )
+}
+
+/// Honest partial state while the background fill runs: the panels below show
+/// only what is indexed so far, and every period the fill has not reached yet
+/// (month, 6 months, lifetime) reads short until it lands.
+function IndexingBanner({ width, done, total }: { width: number; done: number; total: number }) {
+  return (
+    <Box width={width} paddingX={1}>
+      <Text wrap="truncate-end">
+        <Text color={ORANGE} bold>indexing </Text>
+        <Text dimColor>history · {Math.min(done, total)}/{total} files · totals below cover what is indexed so far</Text>
+      </Text>
+    </Box>
   )
 }
 
@@ -1918,13 +1959,27 @@ export async function renderDashboard(period: Period = 'week', provider: string 
   const isTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY)
   const scrollableDailyHistory = isTTY && dayRange == null && customRange == null
   const range = getDashboardScanRange(period, customRange, initialDay ?? null, scrollableDailyHistory)
-  const { scannedProjects, filteredProjects, planUsages, initialDurable } =
-    await assembleDashboardData(period, provider, projectFilter, excludeFilter, customRange, initialDay ?? null, scrollableDailyHistory)
+  // Progressive cold start (#1107): the first paint of the standard dated view
+  // only needs the files that can hold data the selected period displays, so on
+  // a cold cache it parses those first and hands the rest to a background fill
+  // once the dashboard is on screen. Interactive only — every one-shot output
+  // (json/csv/markdown, report, sessions, the app and menubar payloads) keeps
+  // the full parse and can never return a partial total.
+  const progressive = isTTY && dayRange == null && customRange == null && await isColdCacheOnDisk()
+  const assemble = () =>
+    assembleDashboardData(period, provider, projectFilter, excludeFilter, customRange, initialDay ?? null, scrollableDailyHistory)
+  const paint = progressive
+    ? await withColdFirstPaintFloor(getPeriodRange(period).start, assemble)
+    : { result: await assemble(), deferredFiles: 0 }
+  if (process.env['CODEBURN_VERBOSE'] === '1') {
+    process.stderr.write(`codeburn: progressive cold start ${progressive ? 'on' : 'off'}, ${paint.deferredFiles} files deferred to the background fill\n`)
+  }
+  const { scannedProjects, filteredProjects, planUsages, initialDurable } = paint.result
   const label = initialDay ? formatDayRangeLabel(initialDay) : customRangeLabel
   patchStdoutForWindows()
   if (isTTY) {
     const app = renderDebouncedInteractive(process.stdout, ({ columns }) => (
-      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={period} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={columns} />
+      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={period} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={columns} initialIndexPendingFiles={paint.deferredFiles} />
     ))
     try {
       await app.waitUntilExit()
