@@ -5,6 +5,7 @@ import { homedir } from 'os'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost as baseCost, getCurrency } from './currency.js'
 import { findUnpricedModels, getShortModelName, unpricedModelHint } from './models.js'
+import { sessionBillableOutputTokens } from './session-output.js'
 import { markEstimated } from './format.js'
 import { dateKey } from './day-aggregator.js'
 import type { DailyEntry } from './daily-cache.js'
@@ -140,7 +141,7 @@ export function renderOverview(
     byProject.set(pname, pe)
     for (const s of p.sessions) {
       inTok += s.totalInputTokens
-      outTok += s.totalOutputTokens
+      outTok += sessionBillableOutputTokens(s)
       cacheR += s.totalCacheReadTokens
       cacheW += s.totalCacheWriteTokens
       for (const [m, d] of Object.entries(s.modelBreakdown)) {
