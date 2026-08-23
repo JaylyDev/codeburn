@@ -12,7 +12,7 @@ import { normalizeContentBlocks } from '../content-utils.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ToolCall } from '../types.js'
 import type { Provider, ProbeRoot, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
-import { defaultBilledCodexHome, defaultLauncherRoots, isNestedLauncherCodexHome } from '../launcher-homes.js'
+import { defaultBilledCodexHome, isNestedLauncherCodexHome, listRolloutBasenames } from '../launcher-homes.js'
 
 const modelDisplayNames: Record<string, string> = {
   'codex-auto-review': 'Codex Auto Review',
@@ -1336,13 +1336,20 @@ export function createCodexProvider(
 ): Provider {
   const dir = getCodexDir(codexDir)
   const primaryDir = opts?.primaryDir ?? defaultBilledCodexHome()
-  const skipNested = isNestedLauncherCodexHome(dir, {
-    primaryDir,
-    launcherRoots: opts?.launcherRoots ?? defaultLauncherRoots(),
-  })
-  // One tree for discovery and probeRoots. A nest CODEX_HOME with a distinct
-  // billed home redirects the default factory; an explicit nest factory is empty.
-  const scannedDir = skipNested ? (codexDir === undefined ? primaryDir : null) : dir
+  // Production singleton (no args) honors CODEX_HOME / override as the one
+  // root. Unique nest sessions must never be dropped because ~/.codex exists.
+  // Only a second factory — createCodexProvider(nestPath, {primaryDir,
+  // launcherRoots}) — may drop overlapping rollout-*.jsonl basenames.
+  const secondPrimary = opts?.primaryDir
+  const secondRoots = opts?.launcherRoots
+  const filterOverlap =
+    codexDir !== undefined &&
+    secondPrimary !== undefined &&
+    secondRoots !== undefined &&
+    isNestedLauncherCodexHome(dir, {
+      primaryDir: secondPrimary,
+      launcherRoots: secondRoots,
+    })
 
   return {
     name: 'codex',
@@ -1362,16 +1369,17 @@ export function createCodexProvider(
     // Same `dir` discoverSessionsInDir walks: <codexDir>/sessions (dated
     // rollout files) and <codexDir>/archived_sessions. Honors CODEX_HOME.
     async probeRoots(): Promise<ProbeRoot[]> {
-      if (!scannedDir) return []
       return [
-        { path: join(scannedDir, 'sessions'), label: 'sessions' },
-        { path: join(scannedDir, 'archived_sessions'), label: 'archived' },
+        { path: join(dir, 'sessions'), label: 'sessions' },
+        { path: join(dir, 'archived_sessions'), label: 'archived' },
       ]
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
-      if (!scannedDir) return []
-      return discoverSessionsInDir(scannedDir)
+      const sources = await discoverSessionsInDir(dir)
+      if (!filterOverlap) return sources
+      const primaryNames = listRolloutBasenames(primaryDir)
+      return sources.filter(source => !primaryNames.has(basename(source.path)))
     },
 
     createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
