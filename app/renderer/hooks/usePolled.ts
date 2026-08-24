@@ -17,59 +17,36 @@ export type Polled<T> = {
   refresh: () => void
 }
 
-// Module-level LRU of last-good results per memoKey. A section that switches deps
-// to a previously-seen key (e.g. a provider switch, or a switch-back) paints the
-// cached result in the same frame while a fresh fetch runs behind it — no blank,
-// no stale-freeze.
+// Module-level store of the LAST successful result per memoKey, kept for the
+// whole app session — one payload per key, replaced on each success, never
+// evicted. A section that switches deps to a previously-seen key (a period or
+// provider switch, or a switch-back) paints the cached result in the same frame:
+// no blank, no skeleton, no stale-freeze. Keys are bounded by
+// (section × period × provider × range), so the map cannot grow without limit.
 //
-// The cap must comfortably hold every key live at once: the base overview/act/
-// yield polls PLUS one prefetched overview per detected provider. Sized too small
-// it LRU-evicts the base `overview|all` key between polls, which blanks the
-// overview and re-triggers the provider prefetch every cycle (the prefetch
-// storm). The App raises it via setPolledMemoMax to (detected providers + base
-// keys); DEFAULT_MEMO_MAX is the floor for isolated hook/component tests.
-const DEFAULT_MEMO_MAX = 8
-const MEMO_MAX_CAP = 24
-let memoMax = DEFAULT_MEMO_MAX
-const memoStore = new Map<string, unknown>()
+// Entries carry the wall-clock of the fetch that produced them. When the memoKey
+// CHANGES (a period/provider/scope switch) a cached entry younger than
+// POLLED_FRESH_MS is served as-is with no CLI spawn at all; an older one is
+// served instantly and revalidated behind the painted data
+// (stale-while-revalidate). Any reload on the SAME key — interval poll,
+// visibility catch-up, refresh() — always fetches, so the poll cadence and the
+// manual refresh are unaffected.
+const POLLED_FRESH_MS = 30_000
+type MemoEntry = { value: unknown; at: number }
+const memoStore = new Map<string, MemoEntry>()
 
-/** Raise (or lower) the instant-switch memo cap so warmed entries survive between
- *  polls. Clamped to [DEFAULT_MEMO_MAX, MEMO_MAX_CAP]; trims immediately if the
- *  new cap is smaller than the current contents. Called by the App as the set of
- *  detected providers grows. */
-export function setPolledMemoMax(n: number): void {
-  memoMax = Math.max(DEFAULT_MEMO_MAX, Math.min(MEMO_MAX_CAP, Math.floor(n)))
-  while (memoStore.size > memoMax) {
-    const oldest = memoStore.keys().next().value
-    if (oldest === undefined) break
-    memoStore.delete(oldest)
-  }
-}
-
-function memoGet<T>(key: string): T | undefined {
-  if (!memoStore.has(key)) return undefined
-  const value = memoStore.get(key) as T
-  // Touch recency.
-  memoStore.delete(key)
-  memoStore.set(key, value)
-  return value
+function memoGet<T>(key: string): { value: T; at: number } | undefined {
+  return memoStore.get(key) as { value: T; at: number } | undefined
 }
 
 function memoSet(key: string, value: unknown): void {
-  if (memoStore.has(key)) memoStore.delete(key)
-  memoStore.set(key, value)
-  while (memoStore.size > memoMax) {
-    const oldest = memoStore.keys().next().value
-    if (oldest === undefined) break
-    memoStore.delete(oldest)
-  }
+  memoStore.set(key, { value, at: Date.now() })
 }
 
 /** Test-only: clear the module-level memo between renders so cached results from
  *  one test never bleed into the next. */
 export function __resetPolledMemo(): void {
   memoStore.clear()
-  memoMax = DEFAULT_MEMO_MAX
 }
 
 /** Empty the instant-switch memo. Called when a Settings action mutates config
@@ -120,7 +97,7 @@ export function usePolled<T>(
   const intervalMs = opts.intervalMs !== undefined ? opts.intervalMs : cadence.intervalMs
   const enabled = opts.enabled ?? true
   const memoKey = opts.memoKey
-  const [data, setData] = useState<T | null>(() => (memoKey ? memoGet<T>(memoKey) ?? null : null))
+  const [data, setData] = useState<T | null>(() => (memoKey ? memoGet<T>(memoKey)?.value ?? null : null))
   const [error, setError] = useState<CliError | null>(null)
   const [loading, setLoading] = useState(true)
   const [switching, setSwitching] = useState(false)
@@ -133,10 +110,16 @@ export function usePolled<T>(
   // Wall-clock of the last successful fetch, mirrored out of state so the
   // visibilitychange catch-up can read it without re-subscribing on every poll.
   const lastSuccessRef = useRef<number | null>(null)
+  // memoKey of the previous load, so a switch can be told from a same-key reload.
+  const lastKeyRef = useRef<string | undefined>(undefined)
 
   const load = useCallback(() => {
     if (!enabled) return
     const epoch = ++epochRef.current
+    // A switch (new memoKey) may serve a still-fresh cached payload without
+    // fetching; a reload on the same key never may.
+    const keyChanged = memoKey !== undefined && memoKey !== lastKeyRef.current
+    lastKeyRef.current = memoKey
     // Instant paint: on a deps/key change, if a last-good result for the new key
     // is cached, show it immediately and flag `switching` while the fresh fetch
     // runs. If there is NO cached result for the new key, clear stale data so the
@@ -146,8 +129,22 @@ export function usePolled<T>(
     let servedCached = false
     if (memoKey) {
       const cached = memoGet<T>(memoKey)
-      if (cached !== undefined) { setData(cached); servedCached = true }
-      else setData(null)
+      if (cached !== undefined) {
+        setData(cached.value)
+        servedCached = true
+        // The footer's "refreshed Ns ago" must describe the payload on screen,
+        // not this hook instance's last fetch of some other key.
+        setLastSuccessAt(cached.at)
+        lastSuccessRef.current = cached.at
+        // Still fresh, and this is a switch rather than a poll/manual refresh:
+        // the painted answer is good enough, so skip the CLI spawn entirely.
+        if (keyChanged && Date.now() - cached.at < POLLED_FRESH_MS) {
+          setError(null)
+          setLoading(false)
+          setSwitching(false)
+          return
+        }
+      } else setData(null)
     }
     setLoading(true)
     setSwitching(servedCached)
