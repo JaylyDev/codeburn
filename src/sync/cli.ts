@@ -23,7 +23,7 @@ import {
 import { createCredentialStore } from './credentials.js'
 import { readSyncConfig, writeSyncConfig, deleteSyncConfig, updateLastSync } from './config.js'
 import { collectUnsentCalls, collectUnsentAttribution, sendBatches, sendAttributionBatches, batchCalls, MAX_PER_PUSH, MAX_ATTRIBUTION_PER_PUSH, type PushResult } from './push.js'
-import { batchAttributionItems } from './otlp.js'
+import { batchAttributionItems, wireProjectName } from './otlp.js'
 
 export function registerSyncCommands(program: Command): void {
   const sync = program
@@ -274,7 +274,8 @@ export function registerSyncCommands(program: Command): void {
           process.exit(1)
         }
         const { range } = getDateRange(period)
-        const projects = await parseAllSessions(range)
+        const projects = (await parseAllSessions(range))
+          .map(p => ({ ...p, project: wireProjectName(p.projectPath, p.project) }))
 
         // Flatten + filter against sent-ledger
         const { allCalls, unsent, held, frozen } = collectUnsentCalls(projects)

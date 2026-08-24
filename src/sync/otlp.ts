@@ -65,6 +65,16 @@ export function deriveTraceId(sessionId: string): string {
   return createHash('sha256').update(sessionId).digest('hex').slice(0, 32)
 }
 
+/**
+ * Wire-safe project identity: the leaf directory name. Several providers key a
+ * project by its sanitized absolute path ("-Users-me-Projects-app"), and
+ * docs/sync/README.md promises file paths stay local.
+ */
+export function wireProjectName(projectPath: string, fallback: string): string {
+  const normalized = projectPath.trim().replace(/\\/g, '/').replace(/\/+$/, '')
+  return normalized.split('/').filter(Boolean).pop() ?? fallback
+}
+
 // --- Timestamp conversion ---
 
 function toUnixNano(isoTimestamp: string): string {
