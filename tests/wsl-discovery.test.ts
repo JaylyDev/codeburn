@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
-import { isWslUncPath, parseWslDistros, setWslHomes, wslMode } from '../src/wsl.js'
+import { classifyWslCachePath, isWslUncPath, parseWslDistros, setWslHomes, wslMode } from '../src/wsl.js'
 import { discoverClaudeConfigSources, getClaudeConfigDirs, claude } from '../src/providers/claude.js'
 import { createCodexProvider } from '../src/providers/codex.js'
 import { reconcileFile } from '../src/session-cache.js'
@@ -15,7 +15,7 @@ function wslOutput(lines: string[], withBom = false): Buffer {
   return Buffer.from((withBom ? '\uFEFF' : '') + lines.join('\r\n') + '\r\n', 'utf16le')
 }
 
-const ENV_KEYS = ['HOME', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CONFIG_DIRS', 'CODEBURN_DESKTOP_SESSIONS_DIR', 'CODEX_HOME', 'CODEBURN_CACHE_DIR'] as const
+const ENV_KEYS = ['HOME', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CONFIG_DIRS', 'CODEBURN_DESKTOP_SESSIONS_DIR', 'CODEX_HOME', 'CODEBURN_CACHE_DIR', 'CODEBURN_WSL'] as const
 let saved: Record<string, string | undefined>
 let tmpDir: string
 
@@ -105,6 +105,20 @@ describe('UNC path classification', () => {
     expect(isWslUncPath('C:\\Users\\me\\.claude')).toBe(false)
     expect(isWslUncPath('\\\\server\\share\\wsl$')).toBe(false)
     expect(isWslUncPath('/home/me/.claude')).toBe(false)
+  })
+
+  it('distinguishes active, offline, and disabled cached WSL paths', () => {
+    setWslHomes(['\\\\wsl$\\Ubuntu\\home\\me'])
+    expect(classifyWslCachePath('\\\\wsl.localhost\\Ubuntu\\home\\me\\.claude\\projects\\s.jsonl'))
+      .toBe('active')
+    expect(classifyWslCachePath('\\\\wsl$\\Debian\\home\\me\\.claude\\projects\\s.jsonl'))
+      .toBe('offline')
+    expect(classifyWslCachePath('\\\\wsl$\\Ubuntu\\home\\Me\\.claude\\projects\\s.jsonl'))
+      .toBe('offline')
+
+    process.env['CODEBURN_WSL'] = 'off'
+    expect(classifyWslCachePath('\\\\wsl$\\Ubuntu\\home\\me\\.claude\\projects\\s.jsonl'))
+      .toBe('disabled')
   })
 })
 

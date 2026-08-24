@@ -273,6 +273,25 @@ export async function writeCachedCodexResults(
   } catch {}
 }
 
+/// Remove exact source paths after the session-cache reconciliation has proved
+/// they were deleted under an active WSL home. The generic flush cannot make
+/// that decision itself: statting an offline UNC share can hang, while treating
+/// the resulting failure as deletion would lose a stopped distro's warm cache.
+export async function evictCachedCodexResults(filePaths: Iterable<string>): Promise<boolean> {
+  try {
+    const cache = await loadCache(currentCacheDir())
+    let changed = false
+    for (const filePath of filePaths) {
+      if (!Object.hasOwn(cache.files, filePath)) continue
+      delete cache.files[filePath]
+      changed = true
+    }
+    return changed
+  } catch {
+    return false
+  }
+}
+
 export async function flushCodexCache(): Promise<void> {
   const cacheDir = currentCacheDir()
   const memCache = memCaches.get(cacheDir)
@@ -281,6 +300,11 @@ export async function flushCodexCache(): Promise<void> {
     // Evict entries for files that no longer exist on disk
     const paths = Object.keys(memCache.files)
     for (const p of paths) {
+      // A stopped WSL distro makes its UNC share unavailable. Probing it here
+      // can block for the OS/network timeout, and would evict the entry even
+      // though the source is still durable. WSL discovery owns availability;
+      // retain the entry until a later parse can observe the file again.
+      if (isWslUncPath(p)) continue
       try {
         await stat(p)
       } catch {

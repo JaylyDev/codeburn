@@ -8,7 +8,7 @@ import { clearSessionCache, parseAllSessions } from '../src/parser.js'
 import { setWslHomes } from '../src/wsl.js'
 import type { DateRange } from '../src/types.js'
 
-const ENV_KEYS = ['CODEBURN_CACHE_DIR', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CONFIG_DIRS', 'CODEBURN_DESKTOP_SESSIONS_DIR'] as const
+const ENV_KEYS = ['CODEBURN_CACHE_DIR', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CONFIG_DIRS', 'CODEBURN_DESKTOP_SESSIONS_DIR', 'CODEBURN_WSL'] as const
 let saved: Record<string, string | undefined>
 let tmpDir: string
 
@@ -57,6 +57,7 @@ beforeEach(async () => {
   process.env['CLAUDE_CONFIG_DIR'] = join(tmpDir, 'claude')
   process.env['CODEBURN_DESKTOP_SESSIONS_DIR'] = join(tmpDir, 'no-desktop')
   delete process.env['CLAUDE_CONFIG_DIRS']
+  delete process.env['CODEBURN_WSL']
   setWslHomes([])
   clearSessionCache()
   // One real, discovered transcript: the eviction pass is gated on the run
@@ -112,6 +113,7 @@ describe('a stopped WSL distro is an offline root, not a deleted file (#1059)', 
 
     // Served: spend does not vanish for the length of a `wsl --shutdown`.
     expect(projects.map(p => p.project)).toContain('wsl-proj')
+    expect(projects.filter(p => p.project === 'wsl-proj')).toHaveLength(1)
     expect(projects.find(p => p.project === 'wsl-proj')!.totalCostUSD).toBeCloseTo(4.25, 5)
     // Not widened: a normal path whose file is gone is still pruned.
     expect(projects.map(p => p.project)).not.toContain('gone-proj')
@@ -121,5 +123,29 @@ describe('a stopped WSL distro is an offline root, not a deleted file (#1059)', 
     const files = Object.keys(after.providers['claude']?.files ?? {})
     expect(files).toContain(WSL_PATH)
     expect(files).not.toContain(GONE_PATH)
+  })
+
+  it('evicts a WSL orphan when its home is still active', async () => {
+    setWslHomes(['\\\\wsl$\\Ubuntu\\home\\me'])
+    await rm(join(tmpDir, 'claude'), { recursive: true, force: true })
+
+    const projects = await parseAllSessions(dayRange('2099-05-01'), 'claude')
+    expect(projects.map(p => p.project)).not.toContain('wsl-proj')
+
+    clearSessionCache()
+    const after = await loadCache()
+    const files = Object.keys(after.providers['claude']?.files ?? {})
+    expect(files).not.toContain(WSL_PATH)
+  })
+
+  it('keeps historical WSL usage while off disables discovery and UNC access', async () => {
+    process.env['CODEBURN_WSL'] = 'off'
+
+    const projects = await parseAllSessions(dayRange('2099-05-01'), 'claude')
+    expect(projects.map(p => p.project)).toContain('wsl-proj')
+
+    clearSessionCache()
+    const after = await loadCache()
+    expect(Object.keys(after.providers['claude']?.files ?? {})).toContain(WSL_PATH)
   })
 })

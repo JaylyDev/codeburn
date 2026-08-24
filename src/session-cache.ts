@@ -237,10 +237,12 @@ const UNREFERENCED_SHARD_MAX_AGE_MS = 60 * 60 * 1000
 // so declaring it would buy nothing and cost the durable-history loss above.
 //
 // CODEBURN_WSL (src/wsl.ts) is also deliberately absent, for claude and codex
-// alike. It only adds or removes whole discovery roots, and cache entries are
-// keyed by source path — an added root brings new paths, a removed one leaves
-// orphans that evict normally. Nothing it changes can make a kept entry stale,
-// while declaring it would force a full re-parse on every toggle.
+// alike. It is a live read policy, not parsed content: active roots add paths;
+// stopped roots retain historical WSL rows without touching their UNC share;
+// and active-root deletions are reconciled explicitly by src/parser.ts.
+// `off` disables discovery/UNC access while leaving that retained history
+// readable. Hashing the policy here would instead discard the rows that make a
+// shutdown/restart cycle lossless and force a full 9P re-parse after re-enable.
 export const PROVIDER_ENV_VARS: Record<string, string[]> = {
   claude: ['CLAUDE_CONFIG_DIRS', 'CLAUDE_CONFIG_DIR', 'CODEBURN_DESKTOP_SESSIONS_DIR', 'APPDATA', 'LOCALAPPDATA'],
   'cline-cli': ['CLINE_SESSION_DATA_DIR', 'CLINE_DATA_DIR', 'CLINE_DIR'],

@@ -66,6 +66,28 @@ describe('discoverWslHomes', () => {
     expect(execFileSync.mock.calls[0]![1]).toEqual(['--list', '--quiet'])
   })
 
+  it('re-probes immediately when the mode changes inside a long-lived process', () => {
+    execFileSync.mockReturnValue(utf16(['Ubuntu']))
+    readdirSync.mockReturnValue([])
+    wslHomes(1_000)
+
+    process.env['CODEBURN_WSL'] = 'all'
+    wslHomes(1_001)
+
+    expect(execFileSync).toHaveBeenCalledTimes(2)
+    expect(execFileSync.mock.calls[1]![1]).toEqual(['--list', '--quiet'])
+  })
+
+  it('honors off immediately instead of returning a cached running home', () => {
+    execFileSync.mockReturnValue(utf16(['Ubuntu']))
+    readdirSync.mockImplementation((p: string) => (p === '\\\\wsl$\\Ubuntu\\home' ? [dirent('alice')] : []))
+    expect(wslHomes(1_000)).toEqual(['\\\\wsl$\\Ubuntu\\home\\alice'])
+
+    process.env['CODEBURN_WSL'] = 'off'
+    expect(wslHomes(1_001)).toEqual([])
+    expect(execFileSync).toHaveBeenCalledTimes(1)
+  })
+
   it('never spawns anything when CODEBURN_WSL=off', () => {
     process.env['CODEBURN_WSL'] = 'off'
     expect(wslHomes()).toEqual([])

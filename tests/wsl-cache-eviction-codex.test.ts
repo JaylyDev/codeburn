@@ -5,7 +5,7 @@
 // before anything pulls src/parser.ts in — hence the dynamic imports below.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync } from 'fs'
-import { rm } from 'fs/promises'
+import { readFile, rm } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import type { DateRange } from '../src/types.js'
@@ -16,6 +16,13 @@ process.env['CODEX_HOME'] = join(tmpDir, 'codex')
 
 const { CACHE_VERSION, computeEnvFingerprint, loadCache, saveCache } = await import('../src/session-cache.js')
 const { clearSessionCache, parseAllSessions } = await import('../src/parser.js')
+const {
+  clearCodexMemCaches,
+  codexCacheFileName,
+  flushCodexCache,
+  withCodexCacheDirectory,
+  writeCachedCodexResults,
+} = await import('../src/codex-cache.js')
 const { setWslHomes } = await import('../src/wsl.js')
 type CachedFile = Awaited<ReturnType<typeof loadCache>>['providers'][string]['files'][string]
 type SessionCache = Awaited<ReturnType<typeof loadCache>>
@@ -23,7 +30,7 @@ type SessionCache = Awaited<ReturnType<typeof loadCache>>
 const WSL_PATH = '\\\\wsl$\\Ubuntu\\home\\me\\.codex\\sessions\\2099\\05\\01\\rollout-2099-05-01T10-00-00-wsl.jsonl'
 const GONE_PATH = '/tmp/codeburn-deleted-forever/rollout-2099-05-01T10-00-00-gone.jsonl'
 
-const ENV_KEYS = ['CODEBURN_CACHE_DIR', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CONFIG_DIRS', 'CODEBURN_DESKTOP_SESSIONS_DIR'] as const
+const ENV_KEYS = ['CODEBURN_CACHE_DIR', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CONFIG_DIRS', 'CODEBURN_DESKTOP_SESSIONS_DIR', 'CODEBURN_WSL'] as const
 let saved: Record<string, string | undefined>
 
 function cachedFile(sessionId: string, project: string, cost: number): CachedFile {
@@ -63,8 +70,10 @@ beforeEach(async () => {
   process.env['CLAUDE_CONFIG_DIR'] = join(tmpDir, 'no-claude')
   process.env['CODEBURN_DESKTOP_SESSIONS_DIR'] = join(tmpDir, 'no-desktop')
   delete process.env['CLAUDE_CONFIG_DIRS']
+  delete process.env['CODEBURN_WSL']
   setWslHomes([])
   clearSessionCache()
+  clearCodexMemCaches()
 
   // One discovered rollout: the eviction pass is gated on sources.length > 0.
   const dayDir = join(tmpDir, 'codex', 'sessions', '2099', '05', '01')
@@ -95,6 +104,7 @@ beforeEach(async () => {
 afterEach(async () => {
   setWslHomes(undefined)
   clearSessionCache()
+  clearCodexMemCaches()
   for (const key of ENV_KEYS) {
     if (saved[key] === undefined) delete process.env[key]
     else process.env[key] = saved[key]!
@@ -112,6 +122,7 @@ describe('parseProviderSources: a stopped WSL distro is not a deletion (#1059)',
     const projects = await parseAllSessions(dayRange('2099-05-01'), 'codex')
 
     expect(projects.map(p => p.project)).toContain('wsl-proj')
+    expect(projects.filter(p => p.project === 'wsl-proj')).toHaveLength(1)
     expect(projects.find(p => p.project === 'wsl-proj')!.totalCostUSD).toBeCloseTo(4.25, 5)
     expect(projects.map(p => p.project)).not.toContain('gone-proj')
 
@@ -120,5 +131,55 @@ describe('parseProviderSources: a stopped WSL distro is not a deletion (#1059)',
     const files = Object.keys(after.providers['codex']?.files ?? {})
     expect(files).toContain(WSL_PATH)
     expect(files).not.toContain(GONE_PATH)
+  })
+
+  it('evicts a WSL orphan when its home is still active', async () => {
+    const cacheDir = process.env['CODEBURN_CACHE_DIR']!
+    await withCodexCacheDirectory(cacheDir, async () => {
+      await writeCachedCodexResults(
+        WSL_PATH,
+        'wsl-proj',
+        [],
+        { dev: 0, ino: 0, mtimeMs: 1000, sizeBytes: 100 },
+      )
+      await flushCodexCache()
+    })
+    // Exercise the cold-process path too: the explicit eviction must remove a
+    // valid row loaded from disk, not rely on the seeding process's memo.
+    clearCodexMemCaches()
+
+    setWslHomes(['\\\\wsl$\\Ubuntu\\home\\me'])
+    await rm(join(tmpDir, 'codex', 'sessions'), { recursive: true, force: true })
+
+    const projects = await parseAllSessions(dayRange('2099-05-01'), 'codex')
+    expect(projects.map(p => p.project)).not.toContain('wsl-proj')
+
+    clearSessionCache()
+    const after = await loadCache()
+    const files = Object.keys(after.providers['codex']?.files ?? {})
+    expect(files).not.toContain(WSL_PATH)
+
+    const rawCodexCache = JSON.parse(await readFile(join(cacheDir, codexCacheFileName()), 'utf8'))
+    expect(rawCodexCache.files[WSL_PATH]).toBeUndefined()
+  })
+
+  it('serves WSL-only cached usage when no Codex source is discoverable', async () => {
+    await rm(join(tmpDir, 'codex', 'sessions'), { recursive: true, force: true })
+
+    const projects = await parseAllSessions(dayRange('2099-05-01'), 'codex')
+    expect(projects.map(p => p.project)).toContain('wsl-proj')
+    expect(projects.find(p => p.project === 'wsl-proj')!.totalCostUSD).toBeCloseTo(4.25, 5)
+  })
+
+  it('keeps historical WSL usage while off disables discovery and UNC access', async () => {
+    process.env['CODEBURN_WSL'] = 'off'
+    await rm(join(tmpDir, 'codex', 'sessions'), { recursive: true, force: true })
+
+    const projects = await parseAllSessions(dayRange('2099-05-01'), 'codex')
+    expect(projects.map(p => p.project)).toContain('wsl-proj')
+
+    clearSessionCache()
+    const after = await loadCache()
+    expect(Object.keys(after.providers['codex']?.files ?? {})).toContain(WSL_PATH)
   })
 })
