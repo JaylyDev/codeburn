@@ -242,10 +242,14 @@ async function readJson(path: string): Promise<unknown> {
 function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
   return {
     async *parse(): AsyncGenerator<ParsedProviderCall> {
-      const meta = await readJson(source.path)
+      // `source.path` is the growing `<sessionId>.messages.json` file (see
+      // `discoverSessions` / review finding C-G1) — the static per-session
+      // metadata lives in the sibling `<sessionId>.json`, read below.
+      const metaPath = source.path.replace(/\.messages\.json$/, '.json')
+      const meta = await readJson(metaPath)
       if (!isRecord(meta)) return
 
-      const sessionId = nonEmptyString(meta['session_id']) ?? basename(source.path).replace(/\.json$/, '')
+      const sessionId = nonEmptyString(meta['session_id']) ?? basename(metaPath).replace(/\.json$/, '')
       const metadata = isRecord(meta['metadata']) ? meta['metadata'] : {}
       const workspace = nonEmptyString(meta['workspace_root']) ?? nonEmptyString(meta['cwd'])
       const sessionModel = nonEmptyString(meta['model']) ?? 'unknown'
@@ -254,10 +258,10 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       // display name, so there is nothing left to default to here.
       const project = source.project
 
-      // Prefer the co-located messages file over the recorded absolute path,
-      // which is stale once a session directory is copied between machines.
-      const sibling = join(source.path.replace(/\.json$/, '') + '.messages.json')
-      let doc = await readJson(sibling)
+      // Prefer the co-located messages file (source.path itself) over a
+      // recorded absolute path, which is stale once a session directory is
+      // copied between machines.
+      let doc = await readJson(source.path)
       if (!isRecord(doc)) {
         const recorded = nonEmptyString(meta['messages_path'])
         if (recorded) doc = await readJson(recorded)
@@ -398,9 +402,16 @@ export function createClineCliProvider(overrideDir?: string): Provider {
         const meta = await readJson(metaPath)
         if (!isRecord(meta)) continue
 
+        // Fingerprint the sibling that actually accumulates new turns, not
+        // the metadata file written once at session start — a live session's
+        // corpus fingerprint must move as new turns append, or a menubar
+        // poll can serve the pre-activity snapshot forever (review finding
+        // C-G1). `computeCorpusFingerprint` degrades this to "contributes
+        // nothing yet" if the messages file doesn't exist (a session with no
+        // turns), the same as any other missing/not-yet-created file.
         const workspace = nonEmptyString(meta['workspace_root']) ?? nonEmptyString(meta['cwd'])
         sources.push({
-          path: metaPath,
+          path: join(dir, sessionId, `${sessionId}.messages.json`),
           project: projectName(workspace),
           provider: PROVIDER_NAME,
         })

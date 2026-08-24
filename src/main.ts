@@ -2,13 +2,14 @@ import { isAbsolute } from 'path'
 import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
-import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel } from './models.js'
-import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI } from './parser.js'
+import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, getFlatRateModelsConfigHash, getPricingGenerationKey } from './models.js'
+import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint, isSessionHydrationComplete } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
 import { getProvider } from './providers/index.js'
+import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { convertCost, formatCost } from './currency.js'
 import { renderStatusBar } from './format.js'
-import { toDateString } from './daily-cache.js'
+import { DAILY_CACHE_VERSION, toDateString } from './daily-cache.js'
 import { dateKey } from './day-aggregator.js'
 import { sessionModelBillableOutputTokens } from './session-output.js'
 import { isBehavioralCall } from './behavioral-weight.js'
@@ -16,6 +17,7 @@ import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory
 import type { AppliedFix } from './act/types.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
 import { buildPeriodData, buildMenubarPayloadForRange, buildDurablePeriod, type DurablePeriod } from './usage-aggregator.js'
+import { loadStatusSnapshot, saveStatusSnapshot } from './session-cache.js'
 import { renderDashboard } from './dashboard.js'
 import { renderOverview } from './overview.js'
 import { runWebDashboard } from './web-dashboard.js'
@@ -49,6 +51,11 @@ import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
 const { version } = require('../package.json')
+// Bump when the menubar payload's rendering semantics change without a package
+// release or daily-cache version change. The envelope version in session-cache
+// protects record shape; this protects the meaning of an otherwise valid one.
+const STATUS_SNAPSHOT_RENDER_VERSION = 1
+const STATUS_SNAPSHOT_SEMANTIC_KEY = `${version}:render-${STATUS_SNAPSHOT_RENDER_VERSION}:daily-${DAILY_CACHE_VERSION}`
 import { loadCurrency, getCurrency, isValidCurrencyCode } from './currency.js'
 import { CodexThroughputReader, newestCodexSession, renderCodexThroughput } from './codex-throughput.js'
 
@@ -1104,15 +1111,98 @@ program
         : customRange
         ? { range: customRange, label: formatDateRangeLabel(opts.from, opts.to) }
         : daySelection ?? getDateRange(opts.period)
-      const payload = await buildMenubarPayloadForRange(periodInfo, {
+      // Fast path: the menubar app spawns this exact command fresh on every
+      // poll tick, so nothing in-process (parser.ts's TTL/burst caches,
+      // session-cache.ts's cacheMemo) ever survives between polls. A cheap
+      // stat-only pass (no session-cache.json parse, no transcript content
+      // read) over the discoverable corpus tells us whether anything changed
+      // since the last identical query; when it hasn't — or the only thing
+      // that changed is still within loadStatusSnapshot's settle window and
+      // may still be mid-write — skip the full parse + aggregation pipeline
+      // entirely and serve the persisted snapshot instead.
+      // Single source of truth for the fields that define the query scope,
+      // shared between the cache key below and the payload builder options
+      // — a field added to only one of the two would otherwise silently
+      // desync the cache from what it's supposed to be keying on.
+      const queryScope = {
         provider: pf,
         project: opts.project,
         exclude: opts.exclude,
-        daysSelection,
         optimize: opts.optimize !== false,
         timeline: opts.timeline !== false,
-        claudeConfigSourceId: opts.claudeConfigSource,
+        claudeConfigSourceId: opts.claudeConfigSource ?? null,
+      }
+      // The selector renders source labels/options derived from ordered Claude
+      // roots, including idle sources. Config order can change those labels
+      // without moving any transcript file, so it belongs to the query key
+      // (not the debounced corpus mismatch path).
+      const claudeSourceTopology = {
+        configDirs: await getClaudeConfigDirs(),
+        desktopSessionDirs: getDesktopSessionsDirs(),
+      }
+      const queryKey = JSON.stringify({
+        start: periodInfo.range.start.toISOString(),
+        end: periodInfo.range.end.toISOString(),
+        label: periodInfo.label,
+        ...queryScope,
+        days: daysSelection ? [...daysSelection.days].sort() : undefined,
+        claudeSourceTopology,
+        // Mirrors parser.ts's cacheKey: pricing-affecting config must
+        // invalidate this snapshot the same way it invalidates the
+        // parse-level memo, or an edited alias/override/savings config keeps
+        // serving costs priced under the old config until something
+        // unrelated moves the corpus fingerprint.
+        proxyPathsConfigHash: getProxyPathsConfigHash(),
+        modelAliasesConfigHash: getModelAliasesConfigHash(),
+        priceOverridesConfigHash: getPriceOverridesConfigHash(),
+        localModelSavingsConfigHash: getLocalModelSavingsConfigHash(),
+        flatRateModelsConfigHash: getFlatRateModelsConfigHash(),
+        // Same reasoning, different config: the rendered payload's costs are
+        // in the ACTIVE display currency (see `getCurrency`/`loadCurrency`,
+        // refreshed fresh from config.json by the `preAction` hook ahead of
+        // this handler), which the corpus fingerprint and the config hashes
+        // above never touch. Without this, switching currencies keeps
+        // serving the old currency's numbers until a session file happens to
+        // change too.
+        currency: getCurrency(),
+        // Upstream/bundled pricing DATA and CODE version, as opposed to the
+        // hashes above (user-editable pricing CONFIG): the live LiteLLM
+        // cache's freshness, the bundled snapshot's own content, and the
+        // parser/pricing logic's semantic version. None of these move the
+        // corpus fingerprint or any config hash, so without this a repricing
+        // fetch or a pricing-logic fix can keep serving old rendered costs
+        // indefinitely against an unchanged session corpus.
+        pricingGenerationKey: getPricingGenerationKey(),
       })
+      // Optimize findings (the default; see --no-optimize) depend on mutable
+      // project/config/prompt/hook state — ~/.claude and project-level
+      // settings.json, CLAUDE.md, defined skills/agents/commands, MCP config
+      // — that computeCorpusFingerprint and queryKey never observe and that
+      // has no single enumerable fingerprint. Persisting THIS class of output
+      // would mean editing a hook or removing an unused skill leaves the
+      // menubar showing stale findings with no session change to ever
+      // invalidate them. Simplest correct fix: the optimize path never reads
+      // or writes the disk snapshot at all, it always recomputes fresh.
+      // (Computing scanAndDetect's findings requires the same parsed project
+      // data the snapshot exists to avoid recomputing, so skipping the
+      // snapshot loses no additional work versus fingerprinting these inputs
+      // — that path would still force a fresh parse to re-scan them.)
+      const useSnapshot = !queryScope.optimize
+      const corpus = useSnapshot ? await computeCorpusFingerprint(pf) : null
+      const snapshot = corpus ? await loadStatusSnapshot(corpus.hash, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY) : null
+      const payload = (snapshot ?? await buildMenubarPayloadForRange(periodInfo, {
+        ...queryScope,
+        daysSelection,
+      })) as Awaited<ReturnType<typeof buildMenubarPayloadForRange>>
+      // A read-only parse that had to serve stale/skip real files
+      // (isSessionHydrationComplete() === false) is a knowingly-degraded
+      // result. Persisting it under the CURRENT (already-advanced) corpus
+      // fingerprint would make that degraded answer look authoritative to
+      // every future poll that matches this fingerprint — never checkpoint a
+      // partial hydration as if it were a real, complete parse.
+      if (useSnapshot && corpus && !snapshot && isSessionHydrationComplete()) {
+        await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, corpus.observedAtMs, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY, payload)
+      }
       if (opts.scope === 'combined') {
         // Combined multi-device usage is best-effort enrichment on the menubar's
         // hot path. Never let pulling peers (or a corrupt remotes store) take
