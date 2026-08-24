@@ -122,12 +122,53 @@ describe('discoverWslHomes', () => {
     expect(wslHomes()).toEqual([])
   })
 
-  it('memoizes so repeated discovery never respawns', () => {
+  it('memoizes within the TTL so repeated discovery never respawns', () => {
     execFileSync.mockReturnValue(utf16(['Ubuntu']))
     readdirSync.mockReturnValue([])
-    wslHomes()
-    wslHomes()
+    wslHomes(1_000)
+    wslHomes(1_000 + 59_999)
     expect(execFileSync).toHaveBeenCalledTimes(1)
+  })
+
+  it('re-probes after the TTL when a distro shuts down, and fails closed', () => {
+    execFileSync.mockReturnValue(utf16(['Ubuntu']))
+    readdirSync.mockImplementation((p: string) => (p === '\\\\wsl$\\Ubuntu\\home' ? [dirent('alice')] : []))
+    expect(wslHomes(1_000)).toEqual(['\\\\wsl$\\Ubuntu\\home\\alice'])
+
+    // The distro is gone at the next refresh: the re-probe throws/times out.
+    // The stale home must not be served, and no UNC path may be touched.
+    execFileSync.mockImplementation(() => { throw new Error('timed out') })
+    readdirSync.mockClear()
+    expect(wslHomes(1_000 + 60_000)).toEqual([])
+    expect(readdirSync).not.toHaveBeenCalled()
+  })
+
+  it('drops a shut-down distro from the refreshed result', () => {
+    execFileSync.mockReturnValue(utf16(['Ubuntu']))
+    readdirSync.mockImplementation((p: string) => (p === '\\\\wsl$\\Ubuntu\\home' ? [dirent('alice')] : []))
+    expect(wslHomes(1_000)).toEqual(['\\\\wsl$\\Ubuntu\\home\\alice'])
+
+    execFileSync.mockReturnValue(utf16([]))
+    readdirSync.mockClear()
+    expect(wslHomes(1_000 + 60_000)).toEqual([])
+    expect(readdirSync).not.toHaveBeenCalled()
+  })
+
+  it('discovers a distro started after an initial empty result', () => {
+    execFileSync.mockReturnValue(utf16([]))
+    expect(wslHomes(1_000)).toEqual([])
+
+    execFileSync.mockReturnValue(utf16(['Ubuntu']))
+    readdirSync.mockImplementation((p: string) => (p === '\\\\wsl$\\Ubuntu\\home' ? [dirent('alice')] : []))
+    expect(wslHomes(1_000 + 60_000)).toEqual(['\\\\wsl$\\Ubuntu\\home\\alice'])
+    expect(execFileSync).toHaveBeenCalledTimes(2)
+  })
+
+  it('pinned test homes never expire', () => {
+    setWslHomes(['\\\\wsl$\\Ubuntu\\home\\alice'])
+    expect(wslHomes(1_000)).toEqual(['\\\\wsl$\\Ubuntu\\home\\alice'])
+    expect(wslHomes(1_000 + 3_600_000)).toEqual(['\\\\wsl$\\Ubuntu\\home\\alice'])
+    expect(execFileSync).not.toHaveBeenCalled()
   })
 })
 

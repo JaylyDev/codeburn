@@ -112,19 +112,35 @@ function discoverWslHomes(): string[] {
   return homes
 }
 
-let cached: string[] | undefined
+// Discovery is cached for a short TTL only — never for the process lifetime.
+// In long-lived embedders (the resident serve child, menubar polling) a
+// process-lifetime memo goes stale in both directions: a distro cached as
+// running can be shut down, and touching a stopped distro's \\wsl$ path can
+// HANG win32 fs calls (worse than an error — it is the operation the
+// running-only default exists to avoid); and a distro started after an empty
+// discovery would stay invisible until restart. On expiry the running-distro
+// list is re-probed BEFORE any UNC path is touched, and a failed probe fails
+// closed to native-only discovery — stale homes are never served in place of
+// a fresh probe.
+const WSL_HOMES_TTL_MS = 60_000
 
-/// Every WSL home directory to treat as an extra provider root, memoized for
-/// the process (spawning wsl.exe and walking a 9P share is not free).
-export function wslHomes(): string[] {
-  if (cached === undefined) cached = discoverWslHomes()
-  return cached
+let cached: { homes: string[]; expiresAt: number } | undefined
+
+/// Every WSL home directory to treat as an extra provider root. Cached for
+/// WSL_HOMES_TTL_MS (spawning wsl.exe and walking a 9P share is not free);
+/// past the TTL the running-distro probe re-validates before any UNC access.
+export function wslHomes(now: number = Date.now()): string[] {
+  if (cached !== undefined && now < cached.expiresAt) return cached.homes
+  const homes = discoverWslHomes()
+  cached = { homes, expiresAt: now + WSL_HOMES_TTL_MS }
+  return homes
 }
 
 /// Test seam: discovery shells out to wsl.exe and stats a 9P share, neither of
-/// which exists on CI. Pass `undefined` to restore real discovery.
+/// which exists on CI. Pinned homes never expire; pass `undefined` to restore
+/// real discovery.
 export function setWslHomes(homes: string[] | undefined): void {
-  cached = homes
+  cached = homes === undefined ? undefined : { homes, expiresAt: Number.POSITIVE_INFINITY }
 }
 
 /// One line for `codeburn doctor` when Windows probed no WSL roots, so an
