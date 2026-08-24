@@ -7,6 +7,8 @@
 
 import { createHash } from 'crypto'
 import { hostname, userInfo } from 'os'
+import { posix, win32 } from 'path'
+import { isTrustedAbsoluteWorkingDirectory } from '../path-privacy.js'
 import type { ParsedApiCall } from '../types.js'
 import { billableOutputTokens } from '../models.js'
 import type { SessionAttributionRecord } from '../yield.js'
@@ -89,34 +91,124 @@ function toUnixNano(isoTimestamp: string): string {
 export interface CallWithSession {
   call: ParsedApiCall
   sessionId: string
-  project: string
+  /** Local reconciliation label retained for compatibility; never serialized. */
+  project?: string
+  /** Exact provider-recorded cwd. Synthetic labels and storage paths are excluded upstream. */
+  workingDirectory?: string
+}
+
+function isEmailOrCredentialShaped(value: string): boolean {
+  if (/^(?:\.?(?:ssh|aws|gnupg|kube)|\.env(?:\..*)?|credentials?|id_(?:rsa|dsa|ecdsa|ed25519)|authorized_keys|known_hosts|netrc|npmrc|pypirc)$/i.test(value.trim())) return true
+  if (/^[^@\s]{1,64}@(?![^@\s]*@)(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}$/.test(value)) return true
+  if (/(?:^|[^A-Za-z0-9])(?:x[-_]?access[-_]?token|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|token|authorization|bearer|password|passwd|private[-_]?key|client[-_]?secret|secret)(?=[:=])/i.test(value)) return true
+  if (/(?:^|[^A-Za-z0-9])(?:github_pat_|gh[pousr]_|glpat-|sk-[A-Za-z0-9]|[sr]k_(?:live|test)_|whsec_|xox[baprs]-|AIza|npm_|pypi-|hf_)/i.test(value)) return true
+  if (/(?:^|[^A-Za-z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?:$|[^A-Z0-9])/i.test(value)) return true
+  return false
+}
+
+/**
+ * Convert a trusted absolute provider cwd into the only project label allowed
+ * on usage spans. Imported Windows paths are handled on every host. Anything
+ * ambiguous fails closed.
+ */
+export function projectBasenameFromWorkingDirectory(workingDirectory: string | undefined): string | undefined {
+  if (!isTrustedAbsoluteWorkingDirectory(workingDirectory)) return undefined
+  const flavour = posix.isAbsolute(workingDirectory)
+    ? posix
+    : win32.isAbsolute(workingDirectory)
+      ? win32
+      : null
+  if (!flavour) return undefined
+
+  const value = flavour.basename(workingDirectory)
+  if (!value || value === '.' || value === '..' || value.length > 128) return undefined
+  if (/[\\/\u0000-\u001f\u007f]/.test(value)) return undefined
+  if (/%(?:2f|5c)/i.test(value)) return undefined
+  if (isEmailOrCredentialShaped(value)) return undefined
+  return value
+}
+
+const IDENTIFIER_SHAPE = /^[A-Za-z0-9][A-Za-z0-9._:+/@-]*$/
+
+function isPathUrlOrCredentialShaped(value: string): boolean {
+  if (posix.isAbsolute(value) || win32.isAbsolute(value)) return true
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value)) return true
+  if (/[=?&#\\]/.test(value) || /%(?:2f|5c)/i.test(value)) return true
+  if (/(?:^|\/)(?:\.{1,2})(?:\/|$)/.test(value)) return true
+  if (/^(?:users|home|private|tmp|var|etc|root|workspaces?|projects?)\//i.test(value)) return true
+  if (/^(?:[A-Za-z]--)?(?:users|home|private|tmp|var|etc|root|workspaces?|projects?)[-_]/i.test(value)) return true
+  return isEmailOrCredentialShaped(value)
+}
+
+function sanitizeIdentifier(value: string, maxBytes: number, fallback?: string): string | undefined {
+  if (/\p{Cc}/u.test(value)) return fallback
+  if (Buffer.byteLength(value, 'utf8') > maxBytes
+    || !IDENTIFIER_SHAPE.test(value)
+    || isPathUrlOrCredentialShaped(value)) {
+    return fallback
+  }
+  return value
+}
+
+export function sanitizeProviderIdentifier(value: string): string {
+  return sanitizeIdentifier(value, 64, 'unknown') ?? 'unknown'
+}
+
+export function sanitizeModelIdentifier(value: string): string {
+  return sanitizeIdentifier(value, 160, 'unknown') ?? 'unknown'
+}
+
+export function sanitizeToolIdentifiers(values: readonly string[]): string[] {
+  const result: string[] = []
+  let totalBytes = 0
+  for (const value of values) {
+    if (result.length >= 64) break
+    const safe = sanitizeIdentifier(value, 128)
+    if (!safe) continue
+    const bytes = Buffer.byteLength(safe, 'utf8')
+    if (totalBytes + bytes > 4096) break
+    result.push(safe)
+    totalBytes += bytes
+  }
+  return result
+}
+
+function safeProjectAttribute(project: string | undefined): OtlpAttribute | null {
+  if (!project || project.length > 128 || /[\\/\u0000-\u001f\u007f]/.test(project)
+    || /%(?:2f|5c)/i.test(project) || isEmailOrCredentialShaped(project)) return null
+  return { key: 'ai.project', value: { stringValue: project } }
 }
 
 export function buildOtlpPayload(calls: CallWithSession[]): OtlpPayload {
   const deviceId = getDeviceId()
 
-  const spans: OtlpSpan[] = calls.map(({ call, sessionId, project }) => {
+  const spans: OtlpSpan[] = calls.map(({ call, sessionId, workingDirectory }) => {
     const startNano = toUnixNano(call.timestamp)
     // End time = start + 1ms (we don't have real duration, but OTLP requires both)
     const endNano = (BigInt(startNano) + 1_000_000n).toString()
 
+    const provider = sanitizeProviderIdentifier(call.provider)
+    const model = sanitizeModelIdentifier(call.model)
+    const project = projectBasenameFromWorkingDirectory(workingDirectory)
+    const tools = sanitizeToolIdentifiers(call.tools)
     const attributes: OtlpAttribute[] = [
-      { key: 'ai.provider', value: { stringValue: call.provider } },
-      { key: 'ai.model', value: { stringValue: call.model } },
+      { key: 'ai.provider', value: { stringValue: provider } },
+      { key: 'ai.model', value: { stringValue: model } },
       { key: 'ai.input_tokens', value: { intValue: String(call.usage.inputTokens) } },
       // Billable output, not raw: for providers that bill reasoning separately
       // the raw output under-reports by the reasoning volume. Same routing the
       // display layer adopted in #1115/#1116.
       { key: 'ai.output_tokens', value: { intValue: String(billableOutputTokens(call.provider, call.usage.outputTokens, call.usage.reasoningTokens)) } },
       { key: 'ai.cost_usd', value: { doubleValue: call.costUSD } },
-      { key: 'ai.project', value: { stringValue: project } },
       { key: 'ai.speed', value: { stringValue: call.speed } },
     ]
+    const projectAttribute = safeProjectAttribute(project)
+    if (projectAttribute) attributes.push(projectAttribute)
 
-    if (call.tools.length > 0) {
+    if (tools.length > 0) {
       attributes.push({
         key: 'ai.tools',
-        value: { arrayValue: { values: call.tools.map(t => ({ stringValue: t })) } },
+        value: { arrayValue: { values: tools.map(t => ({ stringValue: t })) } },
       })
     }
 
@@ -127,7 +219,7 @@ export function buildOtlpPayload(calls: CallWithSession[]): OtlpPayload {
     return {
       traceId: deriveTraceId(sessionId),
       spanId: deriveSpanId(call.deduplicationKey),
-      name: `${call.provider}/${call.model}`,
+      name: `${provider}/${model}`,
       startTimeUnixNano: startNano,
       endTimeUnixNano: endNano,
       attributes,
@@ -178,7 +270,7 @@ export type AttributionItem = {
   /** Span end for session items (session lastTimestamp). Absent for commits. */
   endTimestamp?: string
   sessionId: string
-  project: string
+  project?: string
   repo: string | null
   // session kind
   prLinks?: string[]
@@ -187,6 +279,14 @@ export type AttributionItem = {
   sha?: string
   inMain?: boolean
   wasReverted?: boolean
+}
+
+function attributionProjectFromRepo(repo: string | null): string | undefined {
+  if (!repo) return undefined
+  const parts = repo.split('/').filter(Boolean)
+  // Normalized remotes may be either host/owner/repo or owner/repo.
+  if (parts.length < 2) return undefined
+  return projectBasenameFromWorkingDirectory(`/${parts.at(-1)}`)
 }
 
 function stateHash(parts: string[]): string {
@@ -225,13 +325,14 @@ export function sessionAttributionKeyPrefix(sessionId: string): string {
 export function flattenAttributionRecords(records: SessionAttributionRecord[]): AttributionItem[] {
   const items: AttributionItem[] = []
   for (const record of records) {
+    const project = attributionProjectFromRepo(record.repo)
     items.push({
       kind: 'session',
       dedupKey: sessionAttributionKey(record),
       timestamp: record.firstTimestamp,
       endTimestamp: record.lastTimestamp,
       sessionId: record.sessionId,
-      project: record.project,
+      ...(project ? { project } : {}),
       repo: record.repo,
       prLinks: record.prLinks,
       commitCount: record.commits.length,
@@ -242,7 +343,7 @@ export function flattenAttributionRecords(records: SessionAttributionRecord[]): 
         dedupKey: commitAttributionKey(record.sessionId, commit.sha, commit.inMain, commit.wasReverted),
         timestamp: commit.timestamp,
         sessionId: record.sessionId,
-        project: record.project,
+        ...(project ? { project } : {}),
         repo: record.repo,
         sha: commit.sha,
         inMain: commit.inMain,
@@ -269,9 +370,9 @@ export function buildAttributionOtlpPayload(items: AttributionItem[]): OtlpPaylo
     const rawEndNano = item.endTimestamp ? BigInt(toUnixNano(item.endTimestamp)) : 0n
     const endNano = (rawEndNano > minEndNano ? rawEndNano : minEndNano).toString()
 
-    const attributes: OtlpAttribute[] = [
-      { key: 'ai.project', value: { stringValue: item.project } },
-    ]
+    const attributes: OtlpAttribute[] = []
+    const projectAttribute = safeProjectAttribute(item.project)
+    if (projectAttribute) attributes.push(projectAttribute)
     if (item.repo) {
       attributes.push({ key: 'git.repo', value: { stringValue: item.repo } })
     }

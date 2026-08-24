@@ -91,9 +91,9 @@ Each AI interaction becomes one OTLP span with these attributes:
 | `ai.provider` | `kiro`, `cursor`, `claude` | Which AI tool |
 | `ai.model` | `claude-sonnet-4-6` | Model used |
 | `ai.input_tokens` | `12500` | Prompt tokens |
-| `ai.output_tokens` | `3200` | Response tokens |
+| `ai.output_tokens` | `3200` | Billable output tokens (includes separately billed reasoning where applicable) |
 | `ai.cost_usd` | `0.085` | Estimated cost |
-| `ai.project` | `my-app` | Project name |
+| `ai.project` | `my-app` | Project basename, only when backed by an exact provider-recorded working directory; otherwise omitted |
 | `ai.tools` | `["Edit", "Bash"]` | Tools invoked |
 
 A pseudonymous `device_id` distinguishes your machines without revealing hostnames.
@@ -106,10 +106,15 @@ A pseudonymous `device_id` distinguishes your machines without revealing hostnam
 
 | Field | Example | Description |
 |---|---|---|
-| `ai.project` | `my-app` | Project name |
+| `ai.project` | `my-app` | Repository basename derived from normalized `git.repo`; omitted for PR-only evidence |
 | `git.repo` | `github.com/acme/widget` | Normalized `origin` remote (credentials and ports stripped) |
 | `git.pr_links` | `["…/pull/12"]` | PR URLs captured for the session |
 | `git.commit_count` | `2` | Number of attributed commits |
+
+If usage and attribution spans for the same trace carry different safe project
+basenames, the repository basename from attribution is authoritative for project
+aggregation. The provider-recorded cwd basename on the usage span is a
+provisional label and must not create a second project bucket.
 
 **`codeburn.commit`** — one per commit attributed to a session:
 
@@ -123,7 +128,7 @@ Attribution is **inferred** (timestamp-window correlation, the same heuristic as
 
 With `--attribution`, normalized repo remote URLs, commit SHAs, commit timestamps (span start times), PR URLs, and the merged/reverted booleans leave your machine — plus the same pseudonymous `codeburn.device_id` resource attribute the usage spans carry. PR links are rebuilt client-side from scheme + host + path only (userinfo, query strings, and fragments are dropped; https, `/org/repo/pull/N` path, bounded length, max 20 per session), and the repo identity itself passes a strict hostname/path allow-list before sending — malformed or transport-helper remotes (`ext::…`, `codecommit::…`) are rejected outright rather than parsed. Precisely what is and is not sent:
 
-- **Commits**: only from repos with a network `origin` remote, and only for sessions whose own project path resolved to that repo. Local-only repos, `file://` remotes, and Windows filesystem paths are never emitted as repo identities. A session whose project path no longer resolves never inherits the repo of the directory you happen to push from.
+- **Commits**: only from repos with a network `origin` remote, and only for sessions whose trusted provider-recorded working directory resolved to that repo. Local grouping labels, provider storage paths, prompt text, local-only repos, `file://` remotes, and Windows filesystem paths are never emitted as repo identities. A session without trusted cwd provenance never inherits the repo of the directory you happen to push from.
 - **PR links**: sent whenever a session captured them, even when the session's repo could not be identified — the PR URL itself names the repo, so this adds no information beyond the link the session already recorded.
 - Without the flag, none of this is sent.
 
@@ -132,9 +137,14 @@ With `--attribution`, normalized repo remote URLs, commit SHAs, commit timestamp
 - **Prompts** — your actual messages to AI are never included
 - **Code** — file contents, diffs, and paths stay local
 - **Bash commands** — may contain secrets, never sent
-- **Your name/email** — identity is derived server-side from your login token
+- **Your name/email** — identity is derived server-side from your login token; home-directory, email-shaped, and credential-shaped project labels are omitted
 
 There is no flag to override this. Privacy is structural, not configurable. The only additive opt-in is `--attribution` (repo remotes, commit SHAs, and PR URLs — never code or prompts), described above.
+
+Legacy Hermes messages that contain a textual `Current working directory:`
+line, including Windows paths, may still supply a local grouping label. Prompt
+text never becomes trusted `projectPath`/`workingDirectory` provenance and can
+never produce outbound `ai.project`.
 
 ## Authentication
 
@@ -162,7 +172,7 @@ A: On purpose. A Copilot session's input/cache can leave your machine in one of 
 A: Next push catches up. The default window is 7 days; use `--since 30d` or `--since all` (up to 6 months) for longer gaps. A push runs to completion regardless of size — server rate limits (429) are waited out automatically.
 
 **Q: Can my admin see my prompts?**
-A: No. Prompts are never included in the payload. The server only sees token counts, costs, model names, and project names.
+A: No. Prompts are never included in the payload. The server sees token counts, costs, conservatively sanitized provider/model/tool identifiers, and an optional project basename only when CodeBurn has trusted cwd provenance.
 
 **Q: How do I stop syncing?**
 A: `codeburn sync logout` removes everything. Or just stop running `push`.

@@ -55,6 +55,7 @@ function makeCallWithSession(overrides?: Partial<ParsedApiCall> & { deduplicatio
     call: makeCall({ deduplicationKey: overrides?.deduplicationKey ?? 'test:key:1', ...overrides }),
     sessionId: 'session-abc',
     project: 'my-project',
+    workingDirectory: '/workspace/my-project',
   }
 }
 

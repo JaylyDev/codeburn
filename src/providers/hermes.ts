@@ -4,6 +4,7 @@ import { basename, dirname, join } from 'path'
 import { homedir } from 'os'
 
 import { calculateCost, getShortModelName } from '../models.js'
+import { isUserHomeRoot } from '../path-privacy.js'
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, isSqliteBusyError, type SqliteDatabase } from '../sqlite.js'
 import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 import type { ToolCall } from '../types.js'
@@ -419,7 +420,7 @@ function isRealWorkspace(cwd: string | null | undefined): cwd is string {
     : trimmed.startsWith('/') && !trimmed.startsWith('//')
   if (!isAbsolute) return false
   const normalized = trimmed.replace(/\\/g, '/').replace(/\/+$/, '')
-  if (normalized === '/' || normalized === homedir() || normalized === homedir().replace(/\\/g, '/')) return false
+  if (normalized === '/' || normalized === homedir() || normalized === homedir().replace(/\\/g, '/') || isUserHomeRoot(normalized)) return false
   if (/\.app\/Contents\//.test(normalized)) return false
   return true
 }
@@ -427,19 +428,20 @@ function isRealWorkspace(cwd: string | null | undefined): cwd is string {
 function resolveHermesWorkspace(
   row: HermesSessionRow,
   messages: HermesMessageRow[],
-): { project: string; projectPath?: string; provider: 'hermes' } {
+): { project: string; projectPath?: string; workingDirectory?: string; provider: 'hermes' } {
   const provider = 'hermes' as const
   const repo = row.git_repo_root?.trim()
   if (isRealWorkspace(repo)) {
-    return { project: sanitizeProject(basename(repo)), projectPath: repo, provider }
+    return { project: sanitizeProject(basename(repo)), projectPath: repo, workingDirectory: repo, provider }
   }
   const cwd = row.cwd?.trim()
   if (isRealWorkspace(cwd)) {
-    return { project: sanitizeProject(cwd), projectPath: cwd, provider }
+    return { project: sanitizeProject(cwd), projectPath: cwd, workingDirectory: cwd, provider }
   }
   const inferred = inferProject(messages, '')
   if (isRealWorkspace(inferred.projectPath)) {
-    return { ...inferred, provider }
+    // Prompt-derived paths remain local display/grouping labels only.
+    return { project: inferred.project, provider }
   }
   return { project: provider, provider }
 }
@@ -483,6 +485,7 @@ function observationToCall(
     userMessage: string
     project: string
     projectPath?: string
+    workingDirectory?: string
     prLinks?: string[]
     costIsEstimated: boolean
   },
@@ -515,6 +518,7 @@ function observationToCall(
     sessionId: args.sessionId,
     project: args.project,
     projectPath: args.projectPath,
+    workingDirectory: args.workingDirectory,
     ...(later || !args.prLinks?.length ? {} : { prLinks: args.prLinks }),
     ...(later ? { supplementaryAccounting: true } : {}),
   }
@@ -524,8 +528,7 @@ function inferProject(messages: HermesMessageRow[], fallback: string): { project
   const cwdPattern = /^Current working directory:\s*([a-zA-Z]:\\[^\r\n`"]+|\/[^\r\n`"\\]+)/m
   for (const msg of messages) {
     if (msg.role !== 'user' && msg.role !== 'system') continue
-    const text = msg.content ?? ''
-    const match = cwdPattern.exec(text)
+    const match = cwdPattern.exec(msg.content ?? '')
     if (match?.[1]) {
       const projectPath = match[1].trim()
       return { project: sanitizeProject(projectPath), projectPath }
@@ -745,6 +748,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
             userMessage: firstUserMessage(messages),
             project: workspace.project,
             projectPath: workspace.projectPath,
+            workingDirectory: workspace.workingDirectory,
             prLinks,
             costIsEstimated: cost.costIsEstimated,
           })),

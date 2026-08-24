@@ -219,6 +219,12 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           deduplicationKey: dedupKey,
           userMessage,
           sessionId,
+          ...(session.working_dir
+            ? {
+                projectPath: session.working_dir,
+                workingDirectory: session.working_dir,
+              }
+            : {}),
         }
       } finally {
         db.close()
