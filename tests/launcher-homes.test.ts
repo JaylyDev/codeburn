@@ -8,19 +8,24 @@ import { collectDoctorReport, renderDoctorTable } from '../src/doctor.js'
 import { createCodexProvider } from '../src/providers/codex.js'
 import { emptyCache } from '../src/session-cache.js'
 
-function sessionMeta(sessionId: string): string {
+function sessionMeta(sessionId: string, extra: Record<string, unknown> = {}): string {
   return JSON.stringify({
     type: 'session_meta',
     timestamp: '2026-04-14T10:00:00Z',
-    payload: { cwd: '/Users/test/proj', originator: 'codex-cli', session_id: sessionId, model: 'gpt-5.3-codex' },
+    payload: { cwd: '/Users/test/proj', originator: 'codex-cli', session_id: sessionId, model: 'gpt-5.3-codex', ...extra },
   })
 }
 
-async function writeCodexSession(codexDir: string, name: string, sessionId?: string): Promise<void> {
+/** Production Codex session_meta first lines are ~22–27 KB. */
+function longSessionMeta(sessionId: string): string {
+  return sessionMeta(sessionId, { base_instructions: 'x'.repeat(30 * 1024) })
+}
+
+async function writeCodexSession(codexDir: string, name: string, sessionId?: string, meta?: string): Promise<void> {
   const id = sessionId ?? name.replace(/^rollout-/, '').replace(/\.jsonl$/, '')
   const dayDir = join(codexDir, 'sessions', '2026', '04', '14')
   await mkdir(dayDir, { recursive: true })
-  await writeFile(join(dayDir, name), `${sessionMeta(id)}\n`)
+  await writeFile(join(dayDir, name), `${meta ?? sessionMeta(id)}\n`)
 }
 
 function names(sources: { path: string }[]): string[] {
@@ -171,6 +176,42 @@ describe('Codex discover overlap-only nest filter', () => {
       expect(names(await codex.discoverSessions()).sort()).toEqual([
         'rollout-billed.jsonl',
         'rollout-buzz-only.jsonl',
+      ])
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME
+      else process.env.HOME = prevHome
+      if (prevCodex === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = prevCodex
+    }
+  })
+
+  it('exported no-arg singleton dedups production-size session_meta first lines', async () => {
+    const home = root
+    const primary = join(home, '.codex')
+    const nested = join(home, '.buzz', '.codex')
+    const billedA = longSessionMeta('sess-A')
+    const nestA = longSessionMeta('sess-A')
+    const nestB = longSessionMeta('sess-B')
+    expect(Buffer.byteLength(billedA, 'utf8')).toBeGreaterThan(8 * 1024)
+    expect(Buffer.byteLength(nestA, 'utf8')).toBeGreaterThan(8 * 1024)
+    expect(Buffer.byteLength(nestB, 'utf8')).toBeGreaterThan(8 * 1024)
+    await writeCodexSession(primary, 'rollout-billed-A-long.jsonl', 'sess-A', billedA)
+    await writeCodexSession(nested, 'rollout-nest-A-long.jsonl', 'sess-A', nestA)
+    await writeCodexSession(nested, 'rollout-nest-B-long.jsonl', 'sess-B', nestB)
+    const prevHome = process.env.HOME
+    const prevCodex = process.env.CODEX_HOME
+    process.env.HOME = home
+    process.env.CODEX_HOME = nested
+    vi.resetModules()
+    try {
+      const { createCodexProvider: noArgFactory, codex } = await import('../src/providers/codex.js')
+      expect(names(await noArgFactory().discoverSessions()).sort()).toEqual([
+        'rollout-billed-A-long.jsonl',
+        'rollout-nest-B-long.jsonl',
+      ])
+      expect(names(await codex.discoverSessions()).sort()).toEqual([
+        'rollout-billed-A-long.jsonl',
+        'rollout-nest-B-long.jsonl',
       ])
     } finally {
       if (prevHome === undefined) delete process.env.HOME

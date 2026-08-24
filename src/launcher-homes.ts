@@ -41,15 +41,24 @@ export function isNestedLauncherCodexHome(
   return existsSync(primary)
 }
 
+// Same bound as `readFirstLine` in providers/codex.ts. Real Codex
+// session_meta first lines are ~22–27 KB; 8 KiB truncates them mid-JSON.
+export const FIRST_LINE_READ_CAP = 1024 * 1024
+
 /** Session id from the first `session_meta` line of a Codex rollout file.
  *  Missing / unreadable files return undefined — callers must not drop those. */
 export function rolloutFileSessionId(filePath: string): string | undefined {
   try {
     const fd = openSync(filePath, 'r')
     try {
-      const buf = Buffer.alloc(8192)
+      const buf = Buffer.alloc(FIRST_LINE_READ_CAP)
       const n = readSync(fd, buf, 0, buf.length, 0)
-      const line = buf.subarray(0, n).toString('utf8').split('\n', 1)[0] ?? ''
+      if (n === 0) return undefined
+      const slice = buf.subarray(0, n)
+      const nl = slice.indexOf(0x0a)
+      // Hit the 1 MiB cap without a newline: incomplete, not a parseable id.
+      if (nl === -1 && n === FIRST_LINE_READ_CAP) return undefined
+      const line = (nl === -1 ? slice : slice.subarray(0, nl)).toString('utf8')
       if (!line) return undefined
       const parsed: unknown = JSON.parse(line)
       if (!parsed || typeof parsed !== 'object') return undefined

@@ -12,7 +12,7 @@ import { normalizeContentBlocks } from '../content-utils.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ToolCall } from '../types.js'
 import type { Provider, ProbeRoot, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
-import { defaultBilledCodexHome, defaultLauncherRoots, isNestedLauncherCodexHome, listRolloutSessionIds, rolloutFileSessionId, sameCodexHome } from '../launcher-homes.js'
+import { defaultBilledCodexHome, defaultLauncherRoots, FIRST_LINE_READ_CAP, isNestedLauncherCodexHome, listRolloutSessionIds, rolloutFileSessionId, sameCodexHome } from '../launcher-homes.js'
 
 const modelDisplayNames: Record<string, string> = {
   'codex-auto-review': 'Codex Auto Review',
@@ -178,7 +178,7 @@ function sanitizeProject(cwd: string): string {
 // Cap how many bytes we'll read while looking for the first newline. Real
 // Codex session_meta lines are ~22-27 KB; this leaves plenty of headroom while
 // keeping memory bounded if a corrupt file has no newline at all.
-const FIRST_LINE_READ_CAP = 1024 * 1024
+// FIRST_LINE_READ_CAP is shared with rolloutFileSessionId.
 
 async function readFirstLine(filePath: string): Promise<CodexEntry | null> {
   // Codex CLI 0.128+ writes a session_meta line that can exceed 20 KB because
