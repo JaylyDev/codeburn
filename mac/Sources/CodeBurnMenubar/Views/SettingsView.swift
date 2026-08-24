@@ -1,45 +1,198 @@
 import AppKit
 import SwiftUI
 
-/// macOS-standard tabbed Settings window. New per-provider sections (Codex,
-/// Cursor, Copilot, etc.) plug in as additional tabs. Each tab owns its own
-/// concerns; this top-level view only hosts the TabView shell.
+/// System Settings–style window: a fixed-width sidebar (search, General/About,
+/// per-provider rows) drives the detail pane. New providers plug in by adding
+/// one entry to `providers`; each pane owns its own Form content and this
+/// top-level view only hosts the shell.
 struct SettingsView: View {
     @Environment(AppStore.self) private var store
+    @State private var searchText = ""
+
+    /// One entry per provider pane. `id` doubles as the deep-link tag, so the
+    /// sidebar, the detail switch, and `store.settingsTab` all speak the same
+    /// strings.
+    struct ProviderPane: Identifiable {
+        let id: String
+        let name: String
+        let icon: String
+        let isConnected: Bool
+    }
+
+    private static let mainPaneIDs: Set<String> = ["general", "about"]
+
+    private var providers: [ProviderPane] {
+        [
+            ProviderPane(id: "claude", name: "Claude", icon: "claude",
+                         isConnected: store.subscriptionLoadState == .loaded),
+            ProviderPane(id: "codex", name: "Codex", icon: "openai",
+                         isConnected: store.codexLoadState == .loaded),
+            ProviderPane(id: "kimi", name: "Kimi Code", icon: "kimi",
+                         isConnected: store.kimiLoadState == .loaded),
+            ProviderPane(id: "devin", name: "Devin", icon: "devin",
+                         isConnected: CLIDevinConfig.loadAcuUsdRate() != nil),
+            ProviderPane(id: "gemini", name: "Gemini", icon: "googlegemini",
+                         isConnected: store.geminiLoadState == .loaded),
+        ]
+    }
+
+    // Search narrows the provider list only; General/About stay put.
+    private var filteredProviders: [ProviderPane] {
+        let query = searchText.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else { return providers }
+        return providers.filter { $0.name.localizedCaseInsensitiveContains(query) }
+    }
+
+    /// Deep links can name a pane that no longer exists; those fall back to
+    /// General instead of leaving the sidebar without a selection.
+    private var selection: Binding<String> {
+        Binding(
+            get: {
+                let tab = store.settingsTab
+                return Self.mainPaneIDs.contains(tab) || providers.contains { $0.id == tab } ? tab : "general"
+            },
+            set: { store.settingsTab = $0 }
+        )
+    }
 
     var body: some View {
-        TabView(selection: Binding(get: { store.settingsTab }, set: { store.settingsTab = $0 })) {
-            GeneralSettingsTab()
-                .tabItem { Label("General", systemImage: "gearshape") }
-                .tag("general")
-
-            ClaudeSettingsTab()
-                .tabItem { Label("Claude", systemImage: "brain") }
-                .tag("claude")
-
-            CodexSettingsTab()
-                .tabItem { Label("Codex", systemImage: "chevron.left.forwardslash.chevron.right") }
-                .tag("codex")
-
-            KimiSettingsTab()
-                .tabItem { Label("Kimi", systemImage: "moon.stars") }
-                .tag("kimi")
-
-            GeminiSettingsTab()
-                .tabItem { Label("Gemini", systemImage: "sparkle") }
-                .tag("gemini")
-
-            DevinSettingsTab()
-                .tabItem { Label("Devin", systemImage: "flame.fill") }
-                .tag("devin")
-
-            AboutSettingsTab()
-                .tabItem { Label("About", systemImage: "info.circle") }
-                .tag("about")
+        NavigationSplitView {
+            VStack(spacing: 0) {
+                TextField("Search providers", text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                List(selection: selection) {
+                    Section {
+                        SidebarTileRow(icon: "general", tile: Color(nsColor: .systemGray), title: "General")
+                            .tag("general")
+                        SidebarTileRow(icon: "about", tile: Color(white: 0.13), title: "About")
+                            .tag("about")
+                    }
+                    Section {
+                        ForEach(filteredProviders) { provider in
+                            ProviderSidebarRow(provider: provider)
+                                .tag(provider.id)
+                        }
+                    } header: {
+                        HStack {
+                            Text("Providers")
+                            Spacer()
+                            Text("\(providers.filter(\.isConnected).count) on")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .listStyle(.sidebar)
+            }
+            .navigationSplitViewColumnWidth(min: 230, ideal: 230, max: 230)
+        } detail: {
+            detailView
         }
-        // 9 tabs need ~900pt to render as a visible tab bar; narrower widths
-        // make SwiftUI collapse the tab bar into a ">>" overflow menu.
-        .frame(width: 900, height: 430)
+        .frame(width: 860, height: 620)
+    }
+
+    @ViewBuilder
+    private var detailView: some View {
+        switch selection.wrappedValue {
+        case "claude": ClaudeSettingsTab()
+        case "codex": CodexSettingsTab()
+        case "kimi": KimiSettingsTab()
+        case "devin": DevinSettingsTab()
+        case "gemini": GeminiSettingsTab()
+        case "about": AboutSettingsTab()
+        default: GeneralSettingsTab()
+        }
+    }
+}
+
+// MARK: - Sidebar support
+
+/// Loads one of the bundled 512px black-glyph PNGs (Resources/ProviderIcons)
+/// as a template NSImage so `tint` fully controls the rendered color.
+private struct ProviderIconView: View {
+    let name: String
+    let tint: Color
+
+    var body: some View {
+        if let image = ProviderIconCache.image(named: name) {
+            Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .foregroundStyle(tint)
+        } else {
+            Image(systemName: "app.dashed")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .foregroundStyle(tint)
+        }
+    }
+}
+
+/// PNG decode is too expensive to redo on every hover-driven body evaluation,
+/// so loaded template images are kept for the life of the process.
+@MainActor
+private enum ProviderIconCache {
+    private static var images: [String: NSImage] = [:]
+
+    static func image(named name: String) -> NSImage? {
+        if let cached = images[name] { return cached }
+        // SwiftPM keeps the folder hierarchy for .process'd directories, but
+        // tolerate a flattened layout too so the lookup survives a rule change.
+        for subdirectory in ["Resources/ProviderIcons", "ProviderIcons", nil] {
+            if let url = Bundle.module.url(forResource: name, withExtension: "png", subdirectory: subdirectory),
+               let image = NSImage(contentsOf: url) {
+                image.isTemplate = true
+                images[name] = image
+                return image
+            }
+        }
+        return nil
+    }
+}
+
+/// General/About rows mimic System Settings: a fixed-color rounded square
+/// holding the white template glyph.
+private struct SidebarTileRow: View {
+    let icon: String
+    let tile: Color
+    let title: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ProviderIconView(name: icon, tint: .white)
+                .frame(width: 15, height: 15)
+                .frame(width: 24, height: 24)
+                .background(RoundedRectangle(cornerRadius: 5).fill(tile))
+            Text(title)
+        }
+    }
+}
+
+/// Provider rows carry no tile; the logo sits gray at rest and picks up the
+/// current accent color while hovered. A green dot marks connected panes.
+private struct ProviderSidebarRow: View {
+    @Environment(AppStore.self) private var store
+    let provider: SettingsView.ProviderPane
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ProviderIconView(
+                name: provider.icon,
+                tint: isHovered ? store.accentPreset.base : .secondary
+            )
+            .frame(width: 18, height: 18)
+            Text(provider.name)
+            Spacer()
+            if provider.isConnected {
+                Circle()
+                    .fill(.green)
+                    .frame(width: 6, height: 6)
+            }
+        }
+        .contentShape(Rectangle())
+        .onHover { isHovered = $0 }
     }
 }
 
