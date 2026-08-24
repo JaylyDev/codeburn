@@ -161,7 +161,10 @@ describe('cline-cli provider - discovery', () => {
 
     expect(sources).toHaveLength(2)
     expect(sources.map(s => s.provider)).toEqual(['cline-cli', 'cline-cli'])
-    expect(sources[0]?.path).toBe(join(tmpDir, 'sess-a', 'sess-a.json'))
+    // The growing messages file is fingerprinted, not the static metadata
+    // file written once at session start (review finding C-G1) — otherwise
+    // a live session's new turns are invisible to computeCorpusFingerprint.
+    expect(sources[0]?.path).toBe(join(tmpDir, 'sess-a', 'sess-a.messages.json'))
   })
 
   it('names the project from the workspace root', async () => {

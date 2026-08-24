@@ -127,6 +127,25 @@ describe('warm session-cache refresh lock', () => {
     }
   })
 
+  it('allows independent custom lock names to proceed concurrently', async () => {
+    const dir = await tempDir()
+    const first = await acquireCacheRefreshLock({ cacheDir: dir, lockFile: 'status-snapshot.aaaa.write.lock' })
+    expect(first.outcome).toBe('acquired')
+    if (first.outcome !== 'acquired') return
+
+    const second = await acquireCacheRefreshLock({ cacheDir: dir, lockFile: 'status-snapshot.bbbb.write.lock' })
+    expect(second.outcome).toBe('acquired')
+    if (second.outcome === 'acquired') await second.handle.release()
+    await first.handle.release()
+  })
+
+  it('rejects custom lock paths that could escape the cache directory', async () => {
+    const dir = await tempDir()
+    for (const lockFile of ['../outside.lock', '/tmp/outside.lock', 'nested/lock', 'x.takeover']) {
+      expect(await acquireCacheRefreshLock({ cacheDir: dir, lockFile })).toEqual({ outcome: 'unavailable' })
+    }
+  })
+
   it('does not take over a heartbeating owner', async () => {
     const dir = await tempDir()
     const path = lockPath(dir)

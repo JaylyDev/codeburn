@@ -13,6 +13,7 @@ import {
   type ProviderDaySlice,
   currentTzKey,
   ensureCacheHydrated,
+  loadDailyCache,
   saveDailyCache,
   toDateString,
 } from '../src/daily-cache.js'
@@ -271,6 +272,27 @@ describe('daily cache: a residue-only day is re-derived, not served', () => {
     expect(healed.cost).toBe(33)
     expect(healed.calls).toBe(210)
     expect(out.days.find(d => d.date === daysAgoStr(10))).toMatchObject({ cost: 80, calls: 700 })
+    expect(out.lastComputedDate).toBe(daysAgoStr(1))
+    expect(out.complete).toBe(true)
+  })
+})
+
+describe('daily cache: out-of-range residue days never reach the gap merge', () => {
+  it('a straddling turn anchored before the gap leaves the cached day untouched', async () => {
+    // Issue #1130: the gap range starts on D+1, but a turn anchored on day D
+    // survives range slicing whole, so the aggregator emits a residue day for
+    // D — outside the parsed range. Previously the merge guard had to defuse
+    // it; now the range filter drops it before the merge runs at all.
+    const populatedD = day(daysAgoStr(4), { claude: slice(120, 900) })
+    await seed({ days: [VANISHED, populatedD] })
+    const before = (await loadDailyCache()).days.find(d => d.date === daysAgoStr(4))!
+    const residue = residueDay(daysAgoStr(4))
+    const inRange = day(daysAgoStr(2), { claude: slice(30, 300) })
+    const out = await ensureCacheHydrated(noSessions, () => [residue, inRange], 'cfg-A', () => true)
+    // Day D persisted untouched: no residue categories leaked in.
+    const kept = out.days.find(d => d.date === daysAgoStr(4))!
+    expect(kept).toEqual(before)
+    expect(out.days.map(d => d.date)).toEqual([daysAgoStr(40), daysAgoStr(4), daysAgoStr(2)])
     expect(out.lastComputedDate).toBe(daysAgoStr(1))
     expect(out.complete).toBe(true)
   })

@@ -96,34 +96,111 @@ describe('usePolled', () => {
   })
 
   it('serves last-good data instantly on switch-back and flags `switching` while it refreshes', async () => {
+    vi.useFakeTimers()
+    try {
+      const resolvers: Array<(v: string) => void> = []
+      const fetcher = vi.fn(() => new Promise<string>(resolve => { resolvers.push(resolve) }))
+
+      // Mount on key kA, resolve to A0 → memoized under kA.
+      const { result, rerender } = renderHook(
+        ({ k }: { k: string }) => usePolled(fetcher, [k], { memoKey: k, intervalMs: null }),
+        { initialProps: { k: 'kA' } },
+      )
+      await act(async () => { resolvers[0]!('A0') })
+      expect(result.current.data).toBe('A0')
+      expect(result.current.switching).toBe(false)
+
+      // Switch to a fresh key kB, resolve to B0 → memoized under kB.
+      rerender({ k: 'kB' })
+      await act(async () => { resolvers[1]!('B0') })
+      expect(result.current.data).toBe('B0')
+
+      // Age kA past the freshness window so the switch-back revalidates.
+      await act(async () => { await vi.advanceTimersByTimeAsync(31_000) })
+
+      // Switch BACK to kA: the memoized A0 paints in the same commit (no blank, no
+      // B0 freeze) and `switching` is true while the fresh fetch runs behind it.
+      rerender({ k: 'kA' })
+      expect(result.current.data).toBe('A0')
+      expect(result.current.switching).toBe(true)
+      expect(result.current.loading).toBe(true)
+
+      // The fresh fetch resolves → new data swaps in place, switching clears.
+      await act(async () => { resolvers[2]!('A1') })
+      expect(result.current.data).toBe('A1')
+      expect(result.current.switching).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('serves a still-fresh cached key with no fetch at all (switch costs nothing)', async () => {
     const resolvers: Array<(v: string) => void> = []
     const fetcher = vi.fn(() => new Promise<string>(resolve => { resolvers.push(resolve) }))
 
-    // Mount on key kA, resolve to A0 → memoized under kA.
     const { result, rerender } = renderHook(
-      ({ k }: { k: string }) => usePolled(fetcher, [k], { memoKey: k }),
-      { initialProps: { k: 'kA' } },
+      ({ k }: { k: string }) => usePolled(fetcher, [k], { memoKey: k, intervalMs: null }),
+      { initialProps: { k: 'fA' } },
     )
     await act(async () => { resolvers[0]!('A0') })
-    expect(result.current.data).toBe('A0')
-    expect(result.current.switching).toBe(false)
-
-    // Switch to a fresh key kB, resolve to B0 → memoized under kB.
-    rerender({ k: 'kB' })
+    rerender({ k: 'fB' })
     await act(async () => { resolvers[1]!('B0') })
-    expect(result.current.data).toBe('B0')
+    expect(fetcher).toHaveBeenCalledTimes(2)
 
-    // Switch BACK to kA: the memoized A0 paints in the same commit (no blank, no
-    // B0 freeze) and `switching` is true while the fresh fetch runs behind it.
-    rerender({ k: 'kA' })
+    // Straight back to fA well inside the freshness window: painted instantly and
+    // NOT revalidated — no CLI spawn, no loading state, no switching indicator.
+    rerender({ k: 'fA' })
     expect(result.current.data).toBe('A0')
-    expect(result.current.switching).toBe(true)
-    expect(result.current.loading).toBe(true)
-
-    // The fresh fetch resolves → new data, switching clears.
-    await act(async () => { resolvers[2]!('A1') })
-    expect(result.current.data).toBe('A1')
+    expect(result.current.loading).toBe(false)
     expect(result.current.switching).toBe(false)
+    expect(fetcher).toHaveBeenCalledTimes(2)
+
+    // An explicit refresh still bypasses freshness.
+    act(() => { result.current.refresh() })
+    expect(fetcher).toHaveBeenCalledTimes(3)
+  })
+
+  it('keeps the cached payload painted when the background revalidate fails', async () => {
+    vi.useFakeTimers()
+    try {
+      const calls: Array<{ resolve: (v: string) => void; reject: (e: unknown) => void }> = []
+      const fetcher = vi.fn(() => new Promise<string>((resolve, reject) => { calls.push({ resolve, reject }) }))
+
+      const { result, rerender } = renderHook(
+        ({ k }: { k: string }) => usePolled(fetcher, [k], { memoKey: k, intervalMs: null }),
+        { initialProps: { k: 'eA' } },
+      )
+      await act(async () => { calls[0]!.resolve('A0') })
+      rerender({ k: 'eB' })
+      await act(async () => { calls[1]!.resolve('B0') })
+      await act(async () => { await vi.advanceTimersByTimeAsync(31_000) })
+
+      // Switch back to the stale eA, then fail its background revalidate: the
+      // cached payload stays on screen and the error surfaces beside it.
+      rerender({ k: 'eA' })
+      expect(result.current.data).toBe('A0')
+      await act(async () => { calls[2]!.reject({ kind: 'nonzero', message: 'boom' }) })
+      expect(result.current.data).toBe('A0')
+      expect(result.current.error).toMatchObject({ kind: 'nonzero', message: 'boom' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps a payload for the whole session, however many other keys are visited', async () => {
+    const fetcher = vi.fn().mockResolvedValue('x')
+    const { rerender } = renderHook(
+      ({ k }: { k: string }) => usePolled(fetcher, [k], { memoKey: k, intervalMs: null }),
+      { initialProps: { k: 'first' } },
+    )
+    await act(async () => {})
+    for (let i = 0; i < 40; i++) {
+      rerender({ k: `other-${i}` })
+      await act(async () => {})
+    }
+    // No LRU cap: the very first key is still memoized, so returning to it paints
+    // instantly instead of re-running its aggregation.
+    expect(hasPolledMemo('first')).toBe(true)
   })
 
   it('clears stale data on a switch to an unmemoized key (skeleton, never the prior filter)', async () => {

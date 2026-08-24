@@ -187,6 +187,7 @@ export function collectUnsentCalls(projects: ProjectSummary[], now: number = Dat
             call,
             sessionId: session.sessionId,
             project: project.project,
+            workingDirectory: session.workingDirectory,
           })
         }
       }

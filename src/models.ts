@@ -1,5 +1,6 @@
 import { readFile, writeFile, mkdir } from 'fs/promises'
 import { join } from 'path'
+import { createHash } from 'crypto'
 
 import { getCodeburnCacheDir } from './cache-dir.js'
 import snapshotData from './data/litellm-snapshot.json' with { type: 'json' }
@@ -67,7 +68,10 @@ const CACHE_TTL_MS = 24 * 60 * 60 * 1000
 // added in #1075/#1078). A cache written under an older/missing version is treated as a
 // miss instead of read verbatim, so a stale on-disk file can't reintroduce a killed bug
 // for up to CACHE_TTL_MS after an upgrade.
-const CACHE_SCHEMA_VERSION = 2
+// Also folded into getPricingGenerationKey() below: a resident/snapshot-caching
+// consumer needs the same "pricing behavior changed" signal this already gives
+// the on-disk LiteLLM cache, not just the on-disk cache itself.
+export const CACHE_SCHEMA_VERSION = 2
 const WEB_SEARCH_COST = 0.01
 const ONE_HOUR_CACHE_WRITE_MULTIPLIER_FROM_FIVE_MINUTE_RATE = 1.6
 
@@ -209,6 +213,16 @@ export function parseLiteLLMEntry(entry: LiteLLMEntry): ModelCosts | null {
   )
 }
 
+// Timestamp of whichever live LiteLLM data (freshly fetched or read back from
+// the on-disk cache) is currently loaded into pricingCache; null when nothing
+// live is loaded and pricing is purely the bundled snapshot (offline/first
+// run, CODEBURN_PRICING_SNAPSHOT_ONLY, or a failed fetch with no cache hit).
+// Read by getPricingGenerationKey() so a consumer that persists rendered
+// costs across process invocations (the menubar's status snapshot) can tell
+// "the live pricing data actually changed" apart from "nothing changed" —
+// this module has no other way to signal that across a fresh CLI process.
+let livePricingTimestamp: number | null = null
+
 async function fetchAndCachePricing(): Promise<Map<string, ModelCosts>> {
   // Bounded: runs on every CLI invocation (the menubar shells out and blocks on
   // it). Without a timeout a half-open network after wake-from-sleep makes
@@ -230,12 +244,14 @@ async function fetchAndCachePricing(): Promise<Map<string, ModelCosts>> {
     if (stripped !== name && !pricing.has(stripped)) pricing.set(stripped, costs)
   }
 
+  const timestamp = Date.now()
   await mkdir(getCodeburnCacheDir(), { recursive: true })
   await writeFile(getCachePath(), JSON.stringify({
     version: CACHE_SCHEMA_VERSION,
-    timestamp: Date.now(),
+    timestamp,
     data: Object.fromEntries(pricing),
   }))
+  livePricingTimestamp = timestamp
 
   return pricing
 }
@@ -246,6 +262,7 @@ async function loadCachedPricing(): Promise<Map<string, ModelCosts> | null> {
     const cached = JSON.parse(raw) as { version?: number; timestamp: number; data: Record<string, ModelCosts> }
     if (cached.version !== CACHE_SCHEMA_VERSION) return null
     if (Date.now() - cached.timestamp > CACHE_TTL_MS) return null
+    livePricingTimestamp = cached.timestamp
     return new Map(Object.entries(cached.data))
   } catch {
     return null
@@ -277,6 +294,7 @@ export async function loadPricing(): Promise<void> {
   // tests/setup/env-isolation.ts: skip the live LiteLLM fetch and price purely
   // off the bundled snapshot, so an upstream reprice can't turn tests red.
   if (process.env['CODEBURN_PRICING_SNAPSHOT_ONLY']) {
+    livePricingTimestamp = null
     setPricingCache(mergeSnapshotFallbacks(new Map()))
     return
   }
@@ -285,7 +303,39 @@ export async function loadPricing(): Promise<void> {
     setPricingCache(mergeSnapshotFallbacks(await fetchAndCachePricing()))
   } catch {
     // snapshot already loaded at init; nothing more to do
+    livePricingTimestamp = null
   }
+}
+
+// Content digest of the two bundled pricing files, computed once and memoized
+// (they're static imports; nothing in-process can change them). Changes only
+// when `scripts/bundle-litellm.mjs` regenerates litellm-snapshot.json /
+// pricing-fallback.json and that regeneration ships in a new codeburn build —
+// exactly the "bundled data" staleness class getPricingGenerationKey exists
+// to catch, distinct from the live cache's own timestamp.
+let bundledPricingDigest: string | null = null
+function getBundledPricingDigest(): string {
+  if (bundledPricingDigest === null) {
+    bundledPricingDigest = createHash('sha256')
+      .update(JSON.stringify(snapshotData))
+      .update(JSON.stringify(fallbackData))
+      .digest('hex')
+  }
+  return bundledPricingDigest
+}
+
+/// Stable signature of everything that can silently change a session's
+/// RENDERED cost with no session file ever changing: the live LiteLLM cache's
+/// freshness (a repricing fetch, or its absence), the bundled snapshot's own
+/// content (a repriced model shipped in a new build), and this module's
+/// pricing-behavior version (CACHE_SCHEMA_VERSION). A caller that persists a
+/// fully-rendered payload across process invocations (the menubar's status
+/// snapshot) must fold this into its own cache key the same way it already
+/// folds the four *ConfigHash getters above — those cover user-editable
+/// pricing CONFIG, this covers upstream/bundled pricing DATA and code version,
+/// a different staleness gap with no other invalidation path of its own.
+export function getPricingGenerationKey(): string {
+  return `${CACHE_SCHEMA_VERSION}:${livePricingTimestamp ?? 'bundled'}:${getBundledPricingDigest()}`
 }
 
 // Known model name variants that providers emit but LiteLLM/fallback don't index under.

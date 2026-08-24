@@ -432,6 +432,8 @@ skipUnlessSqlite('hermes provider', () => {
     expect(sessions.reduce((sum, session) => sum + session.totalCacheReadTokens, 0)).toBe(41)
     expect(sessions.reduce((sum, session) => sum + session.totalCacheWriteTokens, 0)).toBe(53)
     expect(sessions.reduce((sum, session) => sum + session.totalCostUSD, 0)).toBeCloseTo(0.72)
+    // Prompt-derived names remain useful for local grouping, but never become
+    // trusted projectPath/workingDirectory provenance.
     expect(projects.map(project => project.project).sort()).toEqual(['tmp-profile-project', 'tmp-root-project'])
 
     const modelTokens = sessions.flatMap(session => Object.values(session.modelBreakdown).map(model => model.tokens))
@@ -618,6 +620,7 @@ skipUnlessSqlite('hermes provider', () => {
     const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=home-cwd`)
     expect(calls[0]?.provider).toBe('hermes')
     expect(calls[0]?.project).toBe('hermes')
+    expect(calls[0]?.workingDirectory).toBeUndefined()
   })
 
   it('does not treat a relative cwd as a workspace', async () => {
@@ -858,7 +861,7 @@ skipUnlessSqlite('hermes provider', () => {
     expect(calls[0]?.projectPath).toBeUndefined()
   })
 
-  it('infers projects from Windows current working directory messages', async () => {
+  it('never promotes prompt text into project or cwd provenance', async () => {
     const dbPath = createHermesDb(tmpDir)
     withTestDb(dbPath, (db) => {
       insertSession(db, {
@@ -871,19 +874,13 @@ skipUnlessSqlite('hermes provider', () => {
         startedAt: 1779549200,
       })
       db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
-        .run('windows-cwd-session', 'user', 'Current working directory: C:\\AI_LAB\\OPENCLAW\nAdd Windows path support', 1779549201)
+        .run('windows-cwd-session', 'user', 'Current working directory: /tmp/secret-client\nAdd path support', 1779549201)
     })
 
     const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=windows-cwd-session`)
-    if (process.platform === 'win32') {
-      expect(calls[0]).toMatchObject({
-        project: 'C--AI_LAB-OPENCLAW',
-        projectPath: 'C:\\AI_LAB\\OPENCLAW',
-      })
-    } else {
-      expect(calls[0]?.project).toBe('hermes')
-      expect(calls[0]?.projectPath).toBeUndefined()
-    }
+    expect(calls[0]?.project).toBe('tmp-secret-client')
+    expect(calls[0]?.projectPath).toBeUndefined()
+    expect(calls[0]?.workingDirectory).toBeUndefined()
   })
 
   it('groups by the sessions.cwd column when present, ahead of message scraping', async () => {
@@ -907,6 +904,7 @@ skipUnlessSqlite('hermes provider', () => {
     expect(calls[0]).toMatchObject({
       project: 'Users-me-projects-codeburn',
       projectPath: '/Users/me/projects/codeburn',
+      workingDirectory: '/Users/me/projects/codeburn',
     })
   })
 

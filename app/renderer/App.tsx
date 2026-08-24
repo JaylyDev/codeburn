@@ -12,7 +12,7 @@ import { ToastHost } from './components/ToastHost'
 import { UpdateBanner } from './components/UpdateBanner'
 import { rangeLabel, TopBar } from './components/TopBar'
 import { Window } from './components/Window'
-import { clearPolledMemo, hasPolledMemo, primePolledMemo, setPolledMemoMax, usePolled } from './hooks/usePolled'
+import { clearPolledMemo, hasPolledMemo, primePolledMemo, usePolled } from './hooks/usePolled'
 import { readDailyBudget } from './lib/budget'
 import { formatCompact, formatUsd, setActiveCurrency } from './lib/format'
 import { motionClass } from './lib/motion'
@@ -134,14 +134,6 @@ const PREFETCH_START_DELAY_MS = 1500
 // A warm spawn takes seconds, so a 400ms stagger let the loop fire the whole set
 // almost at once; pace it wide enough that each warm genuinely trails the last.
 const PREFETCH_STAGGER_MS = 2000
-// Base instant-switch memo keys live during overview polling besides the per-
-// provider prefetch entries: `overview|all`, `overview-act`, `overview-yield`,
-// plus one slot of headroom for section navigation. The memo cap is sized to
-// (detected providers + this) so warmed entries — and the base overview key —
-// never LRU-evict between polls (which would blank the overview and re-arm the
-// prefetch every cycle).
-const BASE_MEMO_KEYS = 4
-
 function isPeriod(value: string): value is Period {
   return (STANDARD_PERIODS as string[]).includes(value)
 }
@@ -362,12 +354,6 @@ function AppMain() {
     setActiveCurrency(currency)
     setCurrencyTick(tick => tick + 1)
   }, [overview.data?.currency?.code, overview.data?.currency?.rate, overview.data?.currency?.symbol, overview.switching])
-
-  // Size the instant-switch memo to hold every prefetched provider overview plus
-  // the base keys, so warmed entries survive between polls instead of evicting.
-  useEffect(() => {
-    setPolledMemoMax(detectedProviders.length + BASE_MEMO_KEYS)
-  }, [detectedProviders.length])
 
   // Prefetch for millisecond switches: once the first overview has resolved,
   // quietly warm the instant-switch memo for every OTHER detected provider at the

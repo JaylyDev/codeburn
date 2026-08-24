@@ -767,7 +767,12 @@ describe('currency correctness', () => {
     const eur = { ...overviewPayload(), currency: EUR }
     mocks.getOverview.mockImplementation((_period: string, provider: string) =>
       provider === 'claude' ? new Promise<MenubarPayload>(() => {}) : Promise.resolve(usd))
+    // Stamp the entry older than the memo's freshness window so the switch
+    // revalidates behind it (a still-fresh entry is served without a refetch).
+    const staleAt = Date.now() - 60_000
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(staleAt)
     primePolledMemo(overviewMemoKey('claude', '30days', null, null), eur)
+    nowSpy.mockRestore()
 
     render(<App />)
     // Boot on the USD ('all') view.

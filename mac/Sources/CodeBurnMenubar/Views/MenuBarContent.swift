@@ -95,7 +95,7 @@ struct MenuBarContent: View {
         // Plan-capable providers keep their sections visible so the Plan tab
         // (live subscription quota) stays reachable even on days with no
         // local usage — the quota endpoint doesn't depend on local sessions.
-        if store.selectedProvider == .claude || store.selectedProvider == .codex || store.selectedProvider == .kimiCode { return false }
+        if store.selectedProvider == .claude || store.selectedProvider == .codex || store.selectedProvider == .kimiCode || store.selectedProvider == .gemini { return false }
         if store.payload.current.cost > 0 || store.payload.current.calls > 0 { return false }
         if providerHasCostInAllPayload { return false }
         return true
@@ -383,13 +383,8 @@ private struct Header: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 VStack(alignment: .leading, spacing: 1) {
-                    (
-                        Text("Code").foregroundStyle(.primary)
-                        + Text("Burn").foregroundStyle(Theme.brandEmber)
-                    )
-                    .font(.system(size: 13, weight: .semibold))
-                    .tracking(-0.15)
-                    Text("AI Coding Cost Tracker")
+                    FlameWordmark()
+                    Text("Your AI Bill, Itemized")
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                 }

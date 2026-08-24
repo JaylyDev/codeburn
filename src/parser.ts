@@ -1,5 +1,7 @@
 import { existsSync } from 'fs'
 import { lstat, readFile, readdir, stat } from 'fs/promises'
+import { createHash } from 'crypto'
+import { performance } from 'node:perf_hooks'
 import { basename, dirname, join, resolve, sep } from 'path'
 import { FS_SCAN_CONCURRENCY, mapWithConcurrency, readSessionLines } from './fs-utils.js'
 import { billableOutputTokens, calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
@@ -42,7 +44,7 @@ import { decideParseWorkers, parseFilesInOrder, ParseWorkerPool, type ClaudeWork
 import type { CodexFullParse } from './providers/codex.js'
 import { dateKey } from './day-aggregator.js'
 import { isBehavioralCall, isBehavioralTurn } from './behavioral-weight.js'
-import type { ParsedProviderCall, SessionSource } from './providers/types.js'
+import type { ParsedProviderCall, Provider, SessionSource } from './providers/types.js'
 import type {
   ApiUsageIteration,
   AssistantMessageContent,
@@ -61,6 +63,7 @@ import type {
 } from './types.js'
 import { classifyTurn, BASH_TOOLS, EDIT_TOOLS } from './classifier.js'
 import { extractBashCommands } from './bash-utils.js'
+import { isTrustedAbsoluteWorkingDirectory } from './path-privacy.js'
 
 function unsanitizePath(dirName: string): string {
   return dirName.replace(/-/g, '/')
@@ -2086,12 +2089,13 @@ async function scanProjectDirs(
 
   const installClaudeFile = async (filePath: string, info: FileInfo, parsed: ClaudeFileParse): Promise<void> => {
     const cwd = parsed.workingDirectory
-    const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
+    const trustedCwd = cwd && !isCoworkSession(cwd, filePath) ? cwd : undefined
+    const canonical = trustedCwd ? await resolveCanonicalProjectPath(trustedCwd) : undefined
     section.files[filePath] = {
       fingerprint: info.fp,
       lastCompleteLineOffset: parsed.lastCompleteLineOffset,
       canonicalCwd: canonical?.path,
-      ...(cwd ? { workingDirectory: cwd } : {}),
+      ...(trustedCwd ? { workingDirectory: trustedCwd } : {}),
       canonicalProjectName: canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined,
       mcpInventory: parsed.mcpInventory,
       turns: parsed.turns,
@@ -2210,10 +2214,12 @@ async function scanProjectDirs(
             let canonicalCwd = cached.canonicalCwd
             let canonicalProjectName = cached.canonicalProjectName
             let workingDirectory = cached.workingDirectory
+            if (workingDirectory && isCoworkSession(workingDirectory, filePath)) workingDirectory = undefined
             if (canonicalCwd === undefined && newEntries) {
               const cwd = extractCanonicalCwd(newEntries)
-              workingDirectory = workingDirectory ?? cwd
-              const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
+              const trustedCwd = cwd && !isCoworkSession(cwd, filePath) ? cwd : undefined
+              workingDirectory = workingDirectory ?? trustedCwd
+              const canonical = trustedCwd ? await resolveCanonicalProjectPath(trustedCwd) : undefined
               canonicalCwd = canonical?.path
               canonicalProjectName = canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined
             }
@@ -2380,7 +2386,9 @@ async function scanProjectDirs(
     const projectName = cachedFile.canonicalProjectName ?? dirName
     const mcpInv = cachedFile.mcpInventory.length > 0 ? cachedFile.mcpInventory : undefined
     const session = buildSessionSummary(sessionId, projectName, classifiedTurns, mcpInv, source)
-    if (cachedFile.workingDirectory) session.workingDirectory = cachedFile.workingDirectory
+    if (cachedFile.workingDirectory && !isCoworkSession(cachedFile.workingDirectory, filePath)) {
+      session.workingDirectory = cachedFile.workingDirectory
+    }
     session.agentType = cachedFile.agentType
     if (everHadBranch) session.everHadBranch = true
     const observedPrLinks = new Set(classifiedTurns.flatMap(turn => turn.prRefs ?? []))
@@ -2546,7 +2554,9 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
     deduplicationKey: call.deduplicationKey,
     project: call.project,
     projectPath: call.projectPath,
-    workingDirectory: call.workingDirectory,
+    ...(isTrustedAbsoluteWorkingDirectory(call.workingDirectory)
+      ? { workingDirectory: call.workingDirectory, workingDirectoryProvenance: 'provider-field' as const }
+      : {}),
     toolSequence: call.toolSequence,
     ...(call.locAdded ? { locAdded: call.locAdded } : {}),
     ...(call.locRemoved ? { locRemoved: call.locRemoved } : {}),
@@ -2566,11 +2576,13 @@ async function canonicalizeProviderCallProject(call: ParsedProviderCall): Promis
   if (!call.projectPath) return call
 
   const canonical = await resolveCanonicalProjectPath(call.projectPath)
-  if (!canonical.isWorktree) return { ...call, workingDirectory: call.workingDirectory ?? call.projectPath }
+  // projectPath is also used for local grouping and can be a provider storage
+  // directory or derived label. Only a dedicated provider cwd is trusted for
+  // outbound project and attribution data.
+  if (!canonical.isWorktree) return call
 
   return {
     ...call,
-    workingDirectory: call.workingDirectory ?? call.projectPath,
     project: projectNameFromPath(canonical.path, call.project ?? canonical.path),
     projectPath: canonical.path,
   }
@@ -3924,13 +3936,20 @@ export async function parseProviderSources(
       const project = copilotServeProject(turn.sessionId) ?? slicedTurn.calls[0]?.project ?? source.project
       const key = `${providerName}:${turn.sessionId}:${project}`
 
+      // Old caches can contain workingDirectory synthesized from projectPath.
+      // Marker absence fails closed while preserving historical usage totals.
+      const trustedWorkingDirectory = slicedTurn.calls[0]?.workingDirectoryProvenance === 'provider-field'
+        && isTrustedAbsoluteWorkingDirectory(slicedTurn.calls[0].workingDirectory)
+        ? slicedTurn.calls[0].workingDirectory
+        : undefined
+
       const existing = sessionMap.get(key)
       if (existing) {
         existing.turns.push(classified)
         if (!existing.projectPath && slicedTurn.calls[0]?.projectPath) {
           existing.projectPath = slicedTurn.calls[0]!.projectPath
         }
-        if (!existing.workingDirectory && slicedTurn.calls[0]?.workingDirectory) existing.workingDirectory = slicedTurn.calls[0].workingDirectory
+        if (!existing.workingDirectory && trustedWorkingDirectory) existing.workingDirectory = trustedWorkingDirectory
         if (cachedFile.prLinks?.length) {
           const links = (existing.prLinks ??= new Set())
           for (const link of cachedFile.prLinks) links.add(link)
@@ -3940,7 +3959,7 @@ export async function parseProviderSources(
         sessionMap.set(key, {
           project,
           projectPath: slicedTurn.calls[0]?.projectPath,
-          workingDirectory: slicedTurn.calls[0]?.workingDirectory,
+          workingDirectory: trustedWorkingDirectory,
           turns: [classified],
           ...(cachedFile.prLinks?.length ? { prLinks: new Set(cachedFile.prLinks) } : {}),
           ...(cachedFile.title ? { title: cachedFile.title } : {}),
@@ -3987,6 +4006,10 @@ export async function parseProviderSources(
         const project = copilotServeProject(turn.sessionId) ?? slicedTurn.calls[0]?.project ?? providerName
         const key = `${providerName}:${turn.sessionId}:${project}`
 
+        const trustedWorkingDirectory = slicedTurn.calls[0]?.workingDirectoryProvenance === 'provider-field'
+          && isTrustedAbsoluteWorkingDirectory(slicedTurn.calls[0].workingDirectory)
+          ? slicedTurn.calls[0].workingDirectory
+          : undefined
         const existingEntry = sessionMap.get(key)
         if (existingEntry) {
           existingEntry.turns.push(classified)
@@ -3994,7 +4017,7 @@ export async function parseProviderSources(
             existingEntry.projectPath = slicedTurn.calls[0]!.projectPath
           }
         } else {
-          sessionMap.set(key, { project, projectPath: slicedTurn.calls[0]?.projectPath, workingDirectory: slicedTurn.calls[0]?.workingDirectory, turns: [classified] })
+          sessionMap.set(key, { project, projectPath: slicedTurn.calls[0]?.projectPath, workingDirectory: trustedWorkingDirectory, turns: [classified] })
         }
       }
     }
@@ -4753,6 +4776,163 @@ let sessionFirstPaintDeferred = false
 // finalizing daily history off it freezes the days it never saw out of the
 // chart (gapStart = lastComputedDate + 1 never looks back at them).
 let readOnlyServedStale = false
+
+export type CorpusFingerprint = {
+  /** High-resolution epoch time captured before discovery begins. Competing
+   *  snapshot writers use it as an observation-order fence. */
+  observedAtMs: number
+  /** Content-free signature of every discovered source's dev/ino/mtime/size. */
+  hash: string
+  /** Newest mtime observed across all discovered sources, 0 when there are
+   *  none. Lets a caller tell "definitely changed" apart from "may still be
+   *  mid-write" without re-stat'ing anything itself. */
+  newestMtimeMs: number
+}
+
+// Generic counterpart to `collectJsonlInto`: every regular file under a
+// directory, any extension, recursively. Used to expand a directory-shaped
+// SessionSource for fingerprinting purposes only — not for parsing, which
+// stays with each provider's own (narrower, extension-aware) file layout
+// knowledge. Being over-inclusive here is safe: an extra file in the hash
+// can only cause an extra cache miss, never a missed update.
+async function collectFilesRecursive(dirPath: string, visitedDirs: Set<string> = new Set()): Promise<string[]> {
+  const entries = await readdir(dirPath, { withFileTypes: true }).catch(() => [])
+  const files: string[] = []
+  for (const entry of entries) {
+    const p = join(dirPath, entry.name)
+    if (entry.isDirectory()) {
+      files.push(...await collectFilesRecursive(p, visitedDirs))
+      continue
+    }
+    if (entry.isSymbolicLink()) {
+      // `Dirent.isDirectory()` is false for a symlink even when its target
+      // IS a directory — without this check a symlinked subdirectory falls
+      // into the `else` below and gets pushed as a leaf "file"; a later
+      // `stat()` (which follows symlinks) then returns the DIRECTORY
+      // inode's own mtime/size as a bogus stand-in for its contents, with no
+      // recursion into it at all (review finding C-G2). Resolve it and
+      // recurse for real. A visited-inode guard bounds the walk against a
+      // symlink cycle (impossible for real directories, which is why the
+      // `isDirectory()` branch above needs no such guard).
+      const target = await stat(p).catch(() => null)
+      if (target?.isDirectory()) {
+        const key = `${target.dev}:${target.ino}`
+        if (visitedDirs.has(key)) continue
+        visitedDirs.add(key)
+        files.push(...await collectFilesRecursive(p, visitedDirs))
+        continue
+      }
+    }
+    files.push(p)
+  }
+  return files
+}
+
+// Cheap, content-free signature of "has anything in the discoverable session
+// corpus changed since the last check" — a stat-only pass (readdir + stat per
+// discovered source; no session-cache.json read/parse, no transcript content
+// read) hashed into one string, plus the newest mtime seen along the way.
+// Order-independent (sorted before hashing) so discovery order never causes a
+// spurious miss. Lets a fresh, short-lived CLI invocation (e.g. a menubar
+// poll) cheaply decide whether it can skip the full parse+aggregation
+// pipeline and serve a persisted result instead, without ever needing to
+// `JSON.parse` the (potentially hundreds-of-MB) session cache file just to
+// answer that question.
+//
+// Claude `SessionSource.path` is a project DIRECTORY, not a leaf transcript
+// (see `scanProjectDirs`/`collectJsonlFiles` above) — every other provider's
+// path IS the leaf file/DB it parses, with two exceptions. Fingerprinting a
+// directory itself would miss an in-place rewrite of an existing file inside
+// it: a directory's own mtime only moves when entries are added or removed,
+// not when one of its files' content changes. So:
+// - Claude sources are expanded to their actual `.jsonl` files first, exactly
+//   the way scanProjectDirs discovers them, and each is fingerprinted
+//   individually.
+// - Any OTHER directory-shaped source (e.g. mistral-vibe, whose parser reads
+//   `join(source.path, 'messages.jsonl')`) gets the same treatment via a
+//   generic recursive file walk — this is deliberately NOT gated on provider
+//   name, so it also covers whatever directory-shaped provider shows up
+//   next instead of repeating the same blind spot one provider at a time.
+// - Network providers (e.g. Vercel AI Gateway) have no on-disk file at all —
+//   see the `provider.network` branch below, mirroring parseAllSessions'
+//   own treatment of the same sources in `parseProviderSources`.
+export async function computeCorpusFingerprint(providerFilter?: string): Promise<CorpusFingerprint> {
+  const observedAtMs = performance.timeOrigin + performance.now()
+  const sources = await discoverAllSessions(providerFilter)
+  const entries: string[] = []
+  let newestMtimeMs = 0
+  const record = async (path: string): Promise<void> => {
+    const fp = await fingerprintFile(path)
+    if (!fp) return
+    entries.push(`${path}|${fp.dev}|${fp.ino}|${fp.mtimeMs}|${fp.sizeBytes}`)
+    if (fp.mtimeMs > newestMtimeMs) newestMtimeMs = fp.mtimeMs
+  }
+  // Cache the provider lookup per name — sources routinely repeat a provider
+  // many times over (one per Claude project dir, one per mistral-vibe
+  // session dir, ...) and getProvider() can be a dynamic-import round-trip.
+  const providerByName = new Map<string, Provider | undefined>()
+  const resolveProvider = async (name: string): Promise<Provider | undefined> => {
+    if (!providerByName.has(name)) providerByName.set(name, await getProvider(name))
+    return providerByName.get(name)
+  }
+  // Non-discovery provider env vars (e.g. CODEBURN_CURSOR_MAX_BUBBLES,
+  // KIMI_MODEL_NAME — src/doctor.ts's NON_DISCOVERY_ENV_VARS) and a
+  // provider's parse-version change PARSED OUTPUT without touching any
+  // source's path/mtime/size, so the stat-only loop below would otherwise
+  // never see them move. `computeEnvFingerprint` (session-cache.ts) already
+  // hashes exactly this per provider for the parse-level cache; fold it in
+  // here too, once per distinct provider actually discovered, so this
+  // higher-layer snapshot fingerprint can't bypass that same guard (review
+  // finding A-G1).
+  const envFingerprinted = new Set<string>()
+  for (const source of sources) {
+    // Discovery metadata is itself rendered state. Claude's config selector,
+    // for example, assigns duplicate-basename labels by configured root order
+    // and exposes a config as soon as it has even an empty project directory.
+    // Hashing only transcript files (then sorting them) made those topology
+    // changes invisible when no file path/mtime/size moved, so a status
+    // snapshot could retain stale source labels/options indefinitely.
+    entries.push(`source:${JSON.stringify([
+      source.provider,
+      source.path,
+      source.project,
+      source.sourceKind ?? null,
+      source.sourceId ?? null,
+      source.sourceLabel ?? null,
+      source.sourcePath ?? null,
+      source.retainWhilePresent ?? false,
+    ])}`)
+    if (!envFingerprinted.has(source.provider)) {
+      envFingerprinted.add(source.provider)
+      entries.push(`env:${source.provider}|${computeEnvFingerprint(source.provider)}`)
+    }
+    if (source.provider === 'claude') {
+      for (const filePath of await collectJsonlFiles(source.path)) await record(filePath)
+      continue
+    }
+    const provider = await resolveProvider(source.provider)
+    if (provider?.network) {
+      // No file to fingerprint. Force a miss (and advance newestMtimeMs)
+      // every call instead of silently contributing nothing to the hash —
+      // the parser re-fetches network sources unconditionally on every real
+      // parse, and a snapshot layer sitting in front of that must not be
+      // able to hide the run that would have done the fetching.
+      const now = Date.now()
+      entries.push(`${source.path}|network|${now}`)
+      if (now > newestMtimeMs) newestMtimeMs = now
+      continue
+    }
+    const info = await stat(source.path).catch(() => null)
+    if (info?.isDirectory()) {
+      for (const filePath of await collectFilesRecursive(source.path)) await record(filePath)
+      continue
+    }
+    await record(source.path)
+  }
+  entries.sort()
+  const hash = createHash('sha256').update(entries.join('\n')).digest('hex')
+  return { hash, newestMtimeMs, observedAtMs }
+}
 
 // Set when a changed source's read was deferred on a retryable failure (e.g.
 // a SQLITE_BUSY store): the parse completed but did not hydrate that source's
