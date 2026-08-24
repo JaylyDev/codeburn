@@ -383,12 +383,7 @@ private struct Header: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 VStack(alignment: .leading, spacing: 1) {
-                    (
-                        Text("Code").foregroundStyle(.primary)
-                        + Text("Burn").foregroundStyle(Theme.brandEmber)
-                    )
-                    .font(.system(size: 13, weight: .semibold))
-                    .tracking(-0.15)
+                    FlameWordmark()
                     Text("AI Coding Cost Tracker")
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
