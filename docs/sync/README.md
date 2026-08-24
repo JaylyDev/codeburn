@@ -111,6 +111,11 @@ A pseudonymous `device_id` distinguishes your machines without revealing hostnam
 | `git.pr_links` | `["…/pull/12"]` | PR URLs captured for the session |
 | `git.commit_count` | `2` | Number of attributed commits |
 
+If usage and attribution spans for the same trace carry different safe project
+basenames, the repository basename from attribution is authoritative for project
+aggregation. The provider-recorded cwd basename on the usage span is a
+provisional label and must not create a second project bucket.
+
 **`codeburn.commit`** — one per commit attributed to a session:
 
 | Field | Example | Description |
@@ -135,6 +140,11 @@ With `--attribution`, normalized repo remote URLs, commit SHAs, commit timestamp
 - **Your name/email** — identity is derived server-side from your login token; home-directory, email-shaped, and credential-shaped project labels are omitted
 
 There is no flag to override this. Privacy is structural, not configurable. The only additive opt-in is `--attribution` (repo remotes, commit SHAs, and PR URLs — never code or prompts), described above.
+
+Legacy Hermes messages that contain a textual `Current working directory:`
+line, including Windows paths, may still supply a local grouping label. Prompt
+text never becomes trusted `projectPath`/`workingDirectory` provenance and can
+never produce outbound `ai.project`.
 
 ## Authentication
 

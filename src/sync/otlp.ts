@@ -87,6 +87,7 @@ export interface CallWithSession {
 }
 
 function isEmailOrCredentialShaped(value: string): boolean {
+  if (/^(?:\.?(?:ssh|aws|gnupg|kube)|\.env(?:\..*)?|credentials?|id_(?:rsa|dsa|ecdsa|ed25519)|authorized_keys|known_hosts|netrc|npmrc|pypirc)$/i.test(value.trim())) return true
   if (/^[^@\s]{1,64}@(?![^@\s]*@)(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}$/.test(value)) return true
   if (/(?:^|[^A-Za-z0-9])(?:x[-_]?access[-_]?token|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|token|authorization|bearer|password|passwd|private[-_]?key|client[-_]?secret|secret)(?=[:=])/i.test(value)) return true
   if (/(?:^|[^A-Za-z0-9])(?:github_pat_|gh[pousr]_|glpat-|sk-[A-Za-z0-9]|[sr]k_(?:live|test)_|whsec_|xox[baprs]-|AIza|npm_|pypi-|hf_)/i.test(value)) return true
@@ -269,7 +270,8 @@ export type AttributionItem = {
 function attributionProjectFromRepo(repo: string | null): string | undefined {
   if (!repo) return undefined
   const parts = repo.split('/').filter(Boolean)
-  if (parts.length < 3) return undefined
+  // Normalized remotes may be either host/owner/repo or owner/repo.
+  if (parts.length < 2) return undefined
   return projectBasenameFromWorkingDirectory(`/${parts.at(-1)}`)
 }
 

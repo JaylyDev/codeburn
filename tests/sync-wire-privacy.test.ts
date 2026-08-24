@@ -76,6 +76,7 @@ describe('sync project privacy boundary', () => {
     '/mnt/c/Users/alice',
     '/var/home/alice',
     '/net/home/alice',
+    '/sessions/synthetic-customer-secret',
     '\\\\server\\Users\\alice',
     'D:\\Profiles\\alice',
   ])('omits ai.project when cwd provenance is absent or unsafe: %s', cwd => {
@@ -116,6 +117,26 @@ describe('sync identifier privacy boundary', () => {
     expect(wire).not.toContain('synthetic-secret')
     expect(wire).not.toContain('alice@example.com')
   })
+
+  it('preserves real routed provider, model, and tool identifiers', () => {
+    const payload = buildOtlpPayload([usage('/workspace/widget', {
+      provider: 'openrouter',
+      model: 'anthropic/claude-sonnet-4.6',
+      tools: ['orcarouter/openai-compatible', 'mcp__github__search'],
+    })])
+    const span = payload.resourceSpans[0]!.scopeSpans[0]!.spans[0]!
+    const attrs = Object.fromEntries(span.attributes.map(attribute => [attribute.key, attribute.value]))
+
+    expect(attrs['ai.provider']).toEqual({ stringValue: 'openrouter' })
+    expect(attrs['ai.model']).toEqual({ stringValue: 'anthropic/claude-sonnet-4.6' })
+    expect(attrs['ai.tools']).toEqual({
+      arrayValue: { values: [
+        { stringValue: 'orcarouter/openai-compatible' },
+        { stringValue: 'mcp__github__search' },
+      ] },
+    })
+    expect(span.name).toBe('openrouter/anthropic/claude-sonnet-4.6')
+  })
 })
 
 describe('sync attribution project privacy boundary', () => {
@@ -149,5 +170,20 @@ describe('sync attribution project privacy boundary', () => {
       .map(attribute => [attribute.key, attribute.value]))
     expect(attrs['ai.project']).toBeUndefined()
     expect(JSON.stringify(payload)).not.toContain('/Users/alice/secret')
+  })
+
+  it('accepts owner/repo identities and rejects credential-directory repo labels', () => {
+    const [legitimate, credentialShaped] = flattenAttributionRecords([
+      record({ repo: 'acme/widget' }),
+      record({ sessionId: 'privacy-session-2', repo: 'acme/.ssh' }),
+    ])
+
+    expect(legitimate?.project).toBe('widget')
+    expect(credentialShaped?.project).toBeUndefined()
+    const payload = buildAttributionOtlpPayload([legitimate!, credentialShaped!])
+    const spans = payload.resourceSpans[0]!.scopeSpans[0]!.spans
+    const credentialAttributes = Object.fromEntries(spans[1]!.attributes
+      .map(attribute => [attribute.key, attribute.value]))
+    expect(credentialAttributes['ai.project']).toBeUndefined()
   })
 })
