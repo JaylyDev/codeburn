@@ -176,7 +176,9 @@ function QuotaContent({ quota, onReconnect }: { quota: QuotaProvider; onReconnec
     return <p className="quota-connection-note">waiting on the CLI…</p>
   }
   if (quota.connection === 'terminalFailure') {
-    return <p className="quota-connection-note quota-terminal">Quota is currently unavailable.</p>
+    // A provider that knows why (an expired Kimi login, a retired Gemini tier)
+    // says so; the generic line is the fallback.
+    return <p className="quota-connection-note quota-terminal">{quota.footerLines[0] ?? 'Quota is currently unavailable.'}</p>
   }
 
   return (

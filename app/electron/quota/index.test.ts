@@ -7,7 +7,7 @@ const quota = (provider: ProviderName): QuotaProvider => ({
   provider, connection: 'connected', primary: null, details: [], planLabel: null, footerLines: [],
 })
 
-// Every construction stubs all five fetchers: a missing dep falls back to the
+// Every construction stubs all six fetchers: a missing dep falls back to the
 // real fetcher, which would touch disk or the network inside a test.
 const noopFetchers = () => ({
   claude: vi.fn(async () => ({ quota: quota('claude') })),
@@ -15,6 +15,7 @@ const noopFetchers = () => ({
   gemini: vi.fn(async () => ({ quota: quota('gemini') })),
   copilot: vi.fn(async () => ({ quota: quota('copilot') })),
   antigravity: vi.fn(async () => ({ quota: quota('antigravity') })),
+  kimi: vi.fn(async () => ({ quota: quota('kimi') })),
 })
 
 describe('QuotaService', () => {
@@ -25,7 +26,7 @@ describe('QuotaService', () => {
       readFile: vi.fn(async () => null), writeFile: vi.fn(async () => undefined),
     })
     const results = await service.getQuota({ force: true })
-    expect(results.map(row => row.provider)).toEqual(['claude', 'codex', 'gemini', 'copilot', 'antigravity'])
+    expect(results.map(row => row.provider)).toEqual(['claude', 'codex', 'gemini', 'copilot', 'antigravity', 'kimi'])
     for (const fetcher of Object.values(fetchers)) expect(fetcher).toHaveBeenCalledTimes(1)
     // Antigravity is local-only; it must not receive keychain permission.
     expect(fetchers.antigravity).toHaveBeenCalledWith({ signal: expect.any(AbortSignal), allowKeychain: false })
@@ -64,7 +65,7 @@ describe('QuotaService', () => {
     })
     // Unknown names are ignored rather than throwing.
     const results = await service.getQuota({ force: true, disabled: ['gemini', 'copilot', 'bogus' as ProviderName] })
-    expect(results.map(row => row.provider)).toEqual(['claude', 'codex', 'antigravity'])
+    expect(results.map(row => row.provider)).toEqual(['claude', 'codex', 'antigravity', 'kimi'])
     expect(fetchers.gemini).not.toHaveBeenCalled()
     expect(fetchers.copilot).not.toHaveBeenCalled()
   })

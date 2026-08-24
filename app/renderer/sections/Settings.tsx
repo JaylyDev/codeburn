@@ -338,6 +338,8 @@ function DetectedRow({ quota, enabled, onToggle, onReconnect }: { quota: QuotaPr
       ? <div className="r set-status"><ConnectAffordance provider={quota.provider} connection={quota.connection} onRefresh={onReconnect} /></div>
       : quota.rateLimited
       ? <span className="r set-status"><span className="set-dot" />{rateLimitedNote(quota.provider)}</span>
+      : quota.connection === 'terminalFailure'
+      ? <span className="r set-status"><span className="set-dot" />{quota.footerLines[0] ?? 'Quota unavailable'}</span>
       : <span className="r set-status"><span className="set-dot ok" />{quota.planLabel ?? 'Connected'}</span>}
     <button type="button" role="switch" aria-checked={enabled} aria-label={`${PROVIDER_NAMES[quota.provider]} live quota`} className={enabled ? 'switch on' : 'switch'} onClick={onToggle}><span className="switch-knob" /></button>
   </div>
