@@ -172,7 +172,9 @@ import type { DateRange, ProjectSummary } from './types.js'
 // Exclusive providers (Grok and the rest) were under-counted by reasoningTokens
 // in finalized daily rows; inclusive {claude,codex,copilot} were correct there
 // but optimize added reasoning again. Re-derive so report matches the live parse.
-export const DAILY_CACHE_VERSION = 28
+// v29: #1118 OrcaRouter route pricing (fusion aliases + peel; auto stays unpriced).
+// v28 on main already shipped #1115.
+export const DAILY_CACHE_VERSION = 29
 const MIN_SUPPORTED_VERSION = 28
 
 /// Providers whose per-day CALL COUNT means something different at
