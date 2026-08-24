@@ -15,6 +15,7 @@ import {
   type SessionCache,
 } from './session-cache.js'
 import { renderTable } from './text-table.js'
+import { collectLauncherNotes, type LauncherNote } from './launcher-homes.js'
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -90,6 +91,8 @@ export type DoctorCacheHealth = {
 export type DoctorReport = {
   generatedAt: string
   providers: DoctorProviderReport[]
+  /** Nests that drive another billed store. Never given a session count. */
+  launchers?: LauncherNote[]
   /// Present when the Claude provider is in the report and a config dir was
   /// found. Surfaced because deleted transcripts are unrecoverable: daily
   /// totals survive in CodeBurn's cache, but per-session detail does not.
@@ -107,6 +110,8 @@ export type CollectDoctorOptions = {
   dailyCacheDays?: DailyEntry[]
   /** Max discovered sources to parse-sample per provider. */
   sampleLimit?: number
+  /** Injectable launcher notes (defaults to scanning the real home). */
+  launchers?: LauncherNote[]
 }
 
 // Bound the parse sample: at most this many discovered sources per provider,
@@ -353,6 +358,8 @@ export async function collectDoctorReport(
     providers.sort((a, b) => (a.displayName < b.displayName ? -1 : a.displayName > b.displayName ? 1 : 0))
 
     const report: DoctorReport = { generatedAt: new Date().toISOString(), providers }
+    const launchers = opts.launchers ?? collectLauncherNotes()
+    if (launchers.length > 0) report.launchers = launchers
     if (providers.some(p => p.provider === 'claude')) {
       const retention = await collectClaudeRetention()
       if (retention) report.claudeRetention = retention
@@ -509,6 +516,14 @@ export function renderDoctorTable(
       if (r.parseVersion) out.push('    ' + c.dim('parser: ') + r.parseVersion)
       if (r.cachedFailed > 0) out.push('    ' + c.dim('cached parse failures: ') + String(r.cachedFailed))
       if (r.error) out.push('    ' + c.red('error: ') + r.error)
+    }
+  }
+
+  if (report.launchers && report.launchers.length > 0) {
+    out.push('')
+    out.push(c.bold('Launchers'))
+    for (const launcher of report.launchers) {
+      out.push(`  ${launcher.name}  ${c.dim(launcher.path)}  ${launcher.verdict}`)
     }
   }
 
