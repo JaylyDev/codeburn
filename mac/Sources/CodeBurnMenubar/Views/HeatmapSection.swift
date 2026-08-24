@@ -56,14 +56,14 @@ struct HeatmapSection: View {
     }
 
     private var visibleModes: [InsightMode] {
-        // Plan sources from a provider's OAuth usage endpoint. Currently
+        // Plan sources from a provider's live quota endpoint. Currently
         // implemented for Claude (Anthropic), Codex (ChatGPT), Kimi Code,
-        // Gemini (Google Code Assist), and Copilot (GitHub). Hidden on All /
-        // Cursor / Droid until those providers ship their own quota data
-        // sources.
+        // Gemini (Google Code Assist), Copilot (GitHub), and Antigravity
+        // (local language server on 127.0.0.1). Hidden on All / Cursor /
+        // Droid, which have no quota source of their own.
         InsightMode.allCases.filter { mode in
             if mode == .plan {
-                return store.selectedProvider == .claude || store.selectedProvider == .codex || store.selectedProvider == .kimiCode || store.selectedProvider == .gemini || store.selectedProvider == .copilot
+                return store.selectedProvider == .claude || store.selectedProvider == .codex || store.selectedProvider == .kimiCode || store.selectedProvider == .gemini || store.selectedProvider == .copilot || store.selectedProvider == .antigravity
             }
             return true
         }
@@ -87,6 +87,8 @@ struct HeatmapSection: View {
                 GeminiPlanInsight()
             } else if store.selectedProvider == .copilot {
                 CopilotPlanInsight()
+            } else if store.selectedProvider == .antigravity {
+                AntigravityPlanInsight()
             } else {
                 PlanInsight(usage: store.subscription)
             }
@@ -2478,6 +2480,99 @@ private struct CopilotPlanInsight: View {
         .padding(.horizontal, 14)
         .padding(.top, 4)
         .padding(.bottom, 8)
+    }
+
+    private func shortTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f.string(from: date)
+    }
+}
+
+/// Plan tab for Antigravity. Quota comes from the Antigravity app's local
+/// language server (127.0.0.1 only, self-signed TLS) — there are no
+/// credentials to read, so the no-data state means "start the Antigravity
+/// app, then reconnect".
+private struct AntigravityPlanInsight: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        Group {
+            switch AntigravityQuotaPresentation.planContent(loadState: store.antigravityLoadState, hasUsage: store.antigravityUsage != nil) {
+            case .noCredentials:
+                PlanNoCredentialsView(
+                    title: "No local Antigravity server found",
+                    message: "Start the Antigravity app, then click Try Again."
+                ) { Task { await store.bootstrapAntigravity() } }
+            case .loading:
+                PlanLoadingView(message: "Probing the local Antigravity server...")
+            case .failed:
+                PlanFailedView(
+                    error: store.antigravityError
+                ) { Task { await store.refreshAntigravity() } }
+            case .transientFailed:
+                PlanFailedView(
+                    error: store.antigravityError ?? "Local Antigravity server unreachable — retrying."
+                ) { Task { await store.refreshAntigravity() } }
+            case let .reconnect(reason):
+                PlanReconnectView(
+                    title: "Reconnect Antigravity",
+                    reason: reason,
+                    fallback: "Start the Antigravity app, then click Reconnect."
+                ) { Task { await store.bootstrapAntigravity() } }
+            case let .usage(idle):
+                if let usage = store.antigravityUsage {
+                    loadedBody(usage: usage, idle: idle)
+                } else {
+                    PlanLoadingView(message: "Probing the local Antigravity server...")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func loadedBody(usage: AntigravityUsage, idle: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(usage.plan ?? "Antigravity")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Spacer()
+                if let resetsAt = usage.primary?.resetsAt {
+                    Text("Resets \(relativeReset(resetsAt))")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            ForEach(Array(usage.details.enumerated()), id: \.offset) { _, window in
+                UtilizationRow(
+                    label: window.label,
+                    percent: window.usedPercent,
+                    resetsAt: window.resetsAt,
+                    projection: nil
+                )
+            }
+            if idle {
+                Text("Server disconnected. Start the Antigravity app to refresh.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            if AntigravityQuotaPresentation.isStale(fetchedAt: usage.fetchedAt) {
+                Text("as of \(shortTime(usage.fetchedAt))")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+    }
+
+    private func relativeReset(_ date: Date) -> String {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .short
+        return f.localizedString(for: date, relativeTo: Date())
     }
 
     private func shortTime(_ date: Date) -> String {

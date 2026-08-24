@@ -159,6 +159,13 @@ final class AppStore {
     // auto-activate on the first refresh tick.
     var copilotLoadState: SubscriptionLoadState = CopilotSubscriptionService.hasCredential ? .dormant : .notBootstrapped
 
+    var antigravityUsage: AntigravityUsage?
+    var antigravityError: String?
+    // No credential file at all — quota comes from probing the Antigravity
+    // app's local language server, which is prompt-free, so we start dormant
+    // and auto-activate (probe) on the first refresh tick.
+    var antigravityLoadState: SubscriptionLoadState = .dormant
+
     /// Generation tokens for the in-flight refresh tasks. Incremented on every
     /// disconnect / reset so a fetch that started before the disconnect cannot
     /// resume after the await and re-populate the freshly-cleared state.
@@ -167,6 +174,7 @@ final class AppStore {
     private var kimiRefreshGen: Int = 0
     private var geminiRefreshGen: Int = 0
     private var copilotRefreshGen: Int = 0
+    private var antigravityRefreshGen: Int = 0
 
     private var cache: [PayloadCacheKey: CachedPayload] = [:]
     private var cacheDate: String = ""
@@ -1440,6 +1448,88 @@ final class AppStore {
         }
     }
 
+    // MARK: - Antigravity
+
+    /// No credential dance at all: discovery is `ps` + loopback probes of the
+    /// local language server, so the first refresh tick activates dormant
+    /// state, like Kimi/Gemini/Copilot.
+    func bootstrapAntigravity() async {
+        // Capture the generation before the await so a disconnect that lands
+        // mid-fetch cannot be resurrected into .loaded when the fetch returns.
+        let gen = antigravityRefreshGen
+        antigravityLoadState = .bootstrapping
+        do {
+            let usage = try await AntigravitySubscriptionService.refresh()
+            guard gen == antigravityRefreshGen else { return }
+            antigravityUsage = usage
+            antigravityError = nil
+            antigravityLoadState = .loaded
+        } catch let err as AntigravitySubscriptionService.FetchError {
+            guard gen == antigravityRefreshGen else { return }
+            applyAntigravityFetchError(err)
+        } catch {
+            guard gen == antigravityRefreshGen else { return }
+            antigravityError = sanitizeForUI(error.localizedDescription)
+            antigravityLoadState = .failed
+        }
+    }
+
+    func refreshAntigravity() async {
+        _ = await refreshAntigravityReportingSuccess()
+    }
+
+    @discardableResult
+    func refreshAntigravityReportingSuccess() async -> Bool {
+        if case .dormant = antigravityLoadState {
+            await bootstrapAntigravity()
+            return antigravityLoadState == .loaded
+        }
+        // Only an explicit Disconnect stops the cadence probe; there is no
+        // credential file to poll for, the probe IS the availability check.
+        if case .notBootstrapped = antigravityLoadState { return false }
+        let gen = antigravityRefreshGen
+        if antigravityUsage == nil { antigravityLoadState = .loading }
+        do {
+            let usage = try await AntigravitySubscriptionService.refresh()
+            guard gen == antigravityRefreshGen else { return false }
+            antigravityUsage = usage
+            antigravityError = nil
+            antigravityLoadState = .loaded
+            return true
+        } catch let err as AntigravitySubscriptionService.FetchError {
+            guard gen == antigravityRefreshGen else { return false }
+            applyAntigravityFetchError(err)
+            return false
+        } catch {
+            guard gen == antigravityRefreshGen else { return false }
+            antigravityError = sanitizeForUI(error.localizedDescription)
+            antigravityLoadState = .failed
+            return false
+        }
+    }
+
+    func disconnectAntigravity() {
+        antigravityRefreshGen &+= 1
+        antigravityUsage = nil
+        antigravityError = nil
+        antigravityLoadState = .notBootstrapped
+        NotificationCenter.default.post(name: .codeBurnSubscriptionDisconnected, object: nil)
+    }
+
+    private func applyAntigravityFetchError(_ err: AntigravitySubscriptionService.FetchError) {
+        let sanitized = sanitizeForUI(err.errorDescription)
+        antigravityError = sanitized
+        if case .disconnected = err {
+            // No local server answered — the routine "app not running" state,
+            // not an error; the UI shows the Connect affordance.
+            antigravityLoadState = .noCredentials
+        } else {
+            // Unexpected discovery/probe failures back off automatically,
+            // mirroring the Electron provider's transientFailure mapping.
+            antigravityLoadState = .transientFailure(retryAt: nil)
+        }
+    }
+
     private func applyFetchError(_ err: ClaudeSubscriptionService.FetchError) {
         let sanitized = sanitizeForUI(err.errorDescription)
         subscriptionError = sanitized
@@ -1520,6 +1610,10 @@ final class AppStore {
             let worst = usage.details.map(\.usedPercent).max() ?? 0
             if worst > 0 { providers.append(("Copilot", worst)) }
         }
+        if let usage = antigravityUsage, shouldIncludeCachedQuota(loadState: antigravityLoadState) {
+            let worst = usage.details.map(\.usedPercent).max() ?? 0
+            if worst > 0 { providers.append(("Antigravity", worst)) }
+        }
         let worst = providers.map(\.percent).max() ?? 0
         let severity = QuotaSummary.severity(for: worst / 100)
         let sorted = providers.sorted { $0.percent > $1.percent }
@@ -1543,6 +1637,7 @@ final class AppStore {
         case .kimiCode: return kimiQuotaSummary(filter: filter)
         case .gemini:  return geminiQuotaSummary(filter: filter)
         case .copilot: return copilotQuotaSummary(filter: filter)
+        case .antigravity: return antigravityQuotaSummary(filter: filter)
         default:      return nil
         }
     }
@@ -1768,6 +1863,38 @@ final class AppStore {
             }
         }
         return QuotaSummary(providerFilter: filter, connection: connection, primary: primary, details: details, planLabel: copilotUsage?.plan ?? "Copilot", footerLines: [])
+    }
+
+    private func antigravityQuotaSummary(filter: ProviderFilter) -> QuotaSummary? {
+        if case .notBootstrapped = antigravityLoadState { return nil }
+        if case .bootstrapping = antigravityLoadState { return nil }
+        if case .noCredentials = antigravityLoadState { return nil }
+
+        let connection: QuotaSummary.Connection = {
+            switch antigravityLoadState {
+            case .notBootstrapped, .dormant, .bootstrapping, .noCredentials: return .disconnected
+            case .loading: return antigravityUsage == nil ? .loading : .stale
+            case .loaded: return .connected
+            case .failed: return antigravityUsage == nil ? .loading : .stale
+            // A vanished local server maps to noCredentials above, so terminal
+            // is unreachable today; kept for switch exhaustivity.
+            case let .terminalFailure(reason): return antigravityUsage == nil ? .terminalFailure(reason: reason) : .stale
+            case .transientFailure: return .transientFailure
+            }
+        }()
+
+        var primary: QuotaSummary.Window?
+        var details: [QuotaSummary.Window] = []
+        if let usage = antigravityUsage {
+            // details is sorted most-constrained first, so the first row is
+            // the headline bar.
+            for w in usage.details {
+                let row = QuotaSummary.Window(label: w.label, percent: w.usedPercent / 100, resetsAt: w.resetsAt)
+                if primary == nil { primary = row }
+                details.append(row)
+            }
+        }
+        return QuotaSummary(providerFilter: filter, connection: connection, primary: primary, details: details, planLabel: antigravityUsage?.plan ?? "Antigravity", footerLines: [])
     }
 
     /// Persist one snapshot per window so we can answer "what did the prior cycle end at?"

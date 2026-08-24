@@ -533,6 +533,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     fileprivate var lastKimiRefreshAt: Date?
     fileprivate var lastGeminiRefreshAt: Date?
     fileprivate var lastCopilotRefreshAt: Date?
+    fileprivate var lastAntigravityRefreshAt: Date?
     private var claudeQuotaFailureCount = 0
     private var nextClaudeQuotaRefreshAt: Date?
 
@@ -628,9 +629,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         if let task = codexQuotaRefreshTask {
             return await task.value
         }
-        // Kimi Code, Gemini, and Copilot ride the same tick, each with its
-        // own cadence anchor: when Codex is not connected its refresh returns
-        // false
+        // Kimi Code, Gemini, Copilot, and Antigravity ride the same tick,
+        // each with its own cadence anchor: when Codex is not connected its
+        // refresh returns false
         // immediately, so lastCodexRefreshAt never advances — anchoring them
         // on it would poll the quota endpoints on every payload tick instead
         // of the configured quota cadence. Anchor on attempt (not success)
@@ -653,7 +654,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             return Date().timeIntervalSince(lastCopilotRefreshAt ?? .distantPast) >= TimeInterval(cadence.rawValue)
         }()
         if copilotDue { lastCopilotRefreshAt = Date() }
-        let task = Task { [store, kimiDue, geminiDue, copilotDue] in
+        let antigravityDue: Bool = {
+            let cadence = SubscriptionRefreshCadence.current
+            guard cadence != .manual else { return false }
+            return Date().timeIntervalSince(lastAntigravityRefreshAt ?? .distantPast) >= TimeInterval(cadence.rawValue)
+        }()
+        if antigravityDue { lastAntigravityRefreshAt = Date() }
+        let task = Task { [store, kimiDue, geminiDue, copilotDue, antigravityDue] in
             async let codex = store.refreshCodexReportingSuccess()
             if kimiDue {
                 _ = await store.refreshKimiReportingSuccess()
@@ -663,6 +670,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             }
             if copilotDue {
                 _ = await store.refreshCopilotReportingSuccess()
+            }
+            if antigravityDue {
+                _ = await store.refreshAntigravityReportingSuccess()
             }
             return await codex
         }
@@ -885,6 +895,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         lastKimiRefreshAt = nil
         lastGeminiRefreshAt = nil
         lastCopilotRefreshAt = nil
+        lastAntigravityRefreshAt = nil
         claudeQuotaFailureCount = 0
         nextClaudeQuotaRefreshAt = nil
     }
@@ -925,6 +936,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             _ = self.store.geminiLoadState
             _ = self.store.copilotUsage
             _ = self.store.copilotLoadState
+            _ = self.store.antigravityUsage
+            _ = self.store.antigravityLoadState
         } onChange: { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }

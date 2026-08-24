@@ -35,6 +35,8 @@ struct SettingsView: View {
                          isConnected: store.geminiLoadState == .loaded),
             ProviderPane(id: "copilot", name: "Copilot", icon: "githubcopilot",
                          isConnected: store.copilotLoadState == .loaded),
+            ProviderPane(id: "antigravity", name: "Antigravity", icon: "antigravity",
+                         isConnected: store.antigravityLoadState == .loaded),
         ]
     }
 
@@ -129,6 +131,7 @@ struct SettingsView: View {
         case "devin": DevinSettingsTab()
         case "gemini": GeminiSettingsTab()
         case "copilot": CopilotSettingsTab()
+        case "antigravity": AntigravitySettingsTab()
         case "about": AboutSettingsTab()
         default: GeneralSettingsTab()
         }
@@ -1315,6 +1318,136 @@ private struct CopilotConnectionRow: View {
                 .buttonStyle(.borderedProminent)
         case .notBootstrapped:
             Button("Connect") { Task { await store.bootstrapCopilot() } }
+                .buttonStyle(.borderedProminent)
+        case .bootstrapping:
+            ProgressView().controlSize(.small)
+        }
+    }
+}
+
+// MARK: - Antigravity
+
+private struct AntigravitySettingsTab: View {
+    var body: some View {
+        Form {
+            Section("Connection") {
+                AntigravityConnectionRow()
+            }
+            Section {
+                Text("Antigravity live-quota tracking talks to the Antigravity app's local language server on 127.0.0.1 only — nothing leaves the machine and no credential files are read. If it shows as disconnected, start the Antigravity app, then click Reconnect.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("How it works")
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+}
+
+private struct AntigravityConnectionRow: View {
+    @Environment(AppStore.self) private var store
+    @State private var showDisconnectConfirm = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: stateIcon)
+                .font(.system(size: 18))
+                .foregroundStyle(stateTint)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(stateTitle)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(stateDetail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+            actionButton
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var stateIcon: String {
+        switch store.antigravityLoadState {
+        case .loaded: return "checkmark.circle.fill"
+        case .terminalFailure: return "exclamationmark.triangle.fill"
+        case .transientFailure: return "clock.arrow.circlepath"
+        case .bootstrapping, .loading: return "ellipsis.circle"
+        case .notBootstrapped, .dormant, .noCredentials: return "link.circle"
+        case .failed: return "xmark.circle"
+        }
+    }
+
+    private var stateTint: Color {
+        switch store.antigravityLoadState {
+        case .loaded: return .green
+        case .terminalFailure, .failed: return .red
+        case .transientFailure: return .orange
+        default: return .secondary
+        }
+    }
+
+    private var stateTitle: String {
+        switch store.antigravityLoadState {
+        case .loaded: return "Connected"
+        case let .terminalFailure(reason): return reason ?? "Reconnect required"
+        case .transientFailure: return "Backing off"
+        case .bootstrapping: return "Connecting…"
+        case .loading: return "Refreshing…"
+        case .dormant: return "Ready"
+        case .notBootstrapped, .noCredentials: return "Not connected"
+        case .failed: return "Couldn't load Antigravity quota"
+        }
+    }
+
+    private var stateDetail: String {
+        switch store.antigravityLoadState {
+        case .loaded:
+            if let plan = store.antigravityUsage?.plan {
+                return "Plan: \(plan)"
+            }
+            return "Live quota tracked from the local Antigravity server."
+        case .terminalFailure:
+            return "Start the Antigravity app, then click Reconnect."
+        case .transientFailure: return store.antigravityError ?? "Local probe failed; auto-retrying."
+        case .bootstrapping: return "Probing the local Antigravity language server."
+        case .loading: return "Background refresh in progress."
+        case .dormant: return "Tap Load Quota to probe the local Antigravity server."
+        case .notBootstrapped:
+            return "Start the Antigravity app first, then click Connect."
+        case .noCredentials:
+            return "No local Antigravity server found. Start the Antigravity app, then click Reconnect."
+        case .failed: return store.antigravityError ?? ""
+        }
+    }
+
+    @ViewBuilder
+    private var actionButton: some View {
+        switch store.antigravityLoadState {
+        case .loaded, .transientFailure, .loading:
+            Button("Disconnect") { showDisconnectConfirm = true }
+                .confirmationDialog(
+                    "Disconnect Antigravity?",
+                    isPresented: $showDisconnectConfirm
+                ) {
+                    Button("Disconnect", role: .destructive) {
+                        store.disconnectAntigravity()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("CodeBurn will stop tracking Antigravity quota. Nothing is read from or written to disk — the Antigravity app keeps working.")
+                }
+        case .terminalFailure, .noCredentials, .failed:
+            Button("Reconnect") { Task { await store.bootstrapAntigravity() } }
+                .buttonStyle(.borderedProminent)
+        case .dormant:
+            Button("Load Quota") { Task { await store.bootstrapAntigravity() } }
+                .buttonStyle(.borderedProminent)
+        case .notBootstrapped:
+            Button("Connect") { Task { await store.bootstrapAntigravity() } }
                 .buttonStyle(.borderedProminent)
         case .bootstrapping:
             ProgressView().controlSize(.small)
