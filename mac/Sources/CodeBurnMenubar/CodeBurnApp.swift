@@ -1024,28 +1024,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     /// auto-adapts to the menu bar; a tint returns a recolored non-template copy for
     /// the budget/quota warning states.
     private static func menubarFlameImage(tint: NSColor?) -> NSImage? {
-        // SwiftPM keeps the folder hierarchy for .process'd directories, but
-        // tolerate a flattened layout too so the lookup survives a rule change.
-        for subdirectory in ["Resources/ProviderIcons", "ProviderIcons", nil] {
-            guard let url = Bundle.module.url(forResource: "flame", withExtension: "png", subdirectory: subdirectory),
-                  let image = NSImage(contentsOf: url) else { continue }
-            let aspect = image.size.width / max(image.size.height, 1)
-            let size = NSSize(width: menubarTitleFontSize * aspect, height: menubarTitleFontSize)
-            guard let tint else {
-                image.isTemplate = true
-                image.size = size
-                return image
-            }
-            let recolored = NSImage(size: size, flipped: false) { rect in
-                image.draw(in: rect)
-                tint.set()
-                rect.fill(using: .sourceAtop)
-                return true
-            }
-            recolored.isTemplate = false
-            return recolored
+        let config = NSImage.SymbolConfiguration(pointSize: menubarTitleFontSize, weight: .medium)
+        guard let symbol = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "CodeBurn")?
+            .withSymbolConfiguration(config) else { return nil }
+        guard let tint else {
+            symbol.isTemplate = true
+            return symbol
         }
-        return nil
+        let recolored = NSImage(size: symbol.size, flipped: false) { rect in
+            symbol.draw(in: rect)
+            tint.set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        recolored.isTemplate = false
+        return recolored
     }
 
     private func refreshStatusButton() {

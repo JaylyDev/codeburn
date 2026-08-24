@@ -81,7 +81,7 @@ struct SettingsView: View {
             detailView
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .frame(width: Self.windowWidth, height: Self.windowHeight)
+        .frame(minWidth: Self.windowWidth, maxWidth: .infinity, minHeight: Self.windowHeight, maxHeight: .infinity)
         .background {
             SettingsWindowStyleAccessor()
                 .allowsHitTesting(false)
@@ -205,15 +205,19 @@ private struct SettingsSidebarPaneRow: View {
 private struct SettingsSidebarAboutRow: View {
     var body: some View {
         HStack(spacing: 8) {
-            if let icon = NSApplication.shared.applicationIconImage {
-                Image(nsImage: icon)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: SettingsIconChip.side, height: SettingsIconChip.side)
-                    .accessibilityHidden(true)
-            } else {
-                SettingsIconChip(systemImage: "info.circle.fill", color: .green)
+            // Bare brand mark, no chip container — the binary flame reads
+            // better at this size than the boxed app icon.
+            Group {
+                if let flame = ProviderIconCache.image(named: "flame") {
+                    Image(nsImage: flame)
+                        .resizable()
+                        .scaledToFit()
+                } else {
+                    SettingsIconChip(systemImage: "info.circle.fill", color: .gray)
+                }
             }
+            .frame(width: SettingsIconChip.side, height: SettingsIconChip.side)
+            .accessibilityHidden(true)
             Text("About")
         }
         .tag("about")
@@ -339,6 +343,8 @@ private final class SettingsWindowStyleView: NSView {
         applyStyle()
     }
 
+    private var didPlaceWindow = false
+
     func applyStyle() {
         guard let window else { return }
         // Full-size content lets the sidebar material extend behind the
@@ -347,6 +353,18 @@ private final class SettingsWindowStyleView: NSView {
         window.titleVisibility = .visible
         window.titlebarSeparatorStyle = .none
         window.styleMask.insert(.fullSizeContentView)
+        window.styleMask.insert(.resizable)
+        window.collectionBehavior.insert(.fullScreenPrimary)
+        // The frameAutosave may restore a position saved when the window was
+        // smaller, leaving the grown window hanging off the screen edge —
+        // recenter once whenever it does not fit fully on its screen.
+        if !didPlaceWindow {
+            didPlaceWindow = true
+            if let screen = window.screen ?? NSScreen.main,
+               !screen.visibleFrame.contains(window.frame) {
+                window.center()
+            }
+        }
     }
 }
 
@@ -409,7 +427,7 @@ private struct GeneralSettingsTab: View {
                     set: { applyCurrency(code: $0) }
                 )) {
                     ForEach(SupportedCurrency.allCases) { currency in
-                        Text("\(currency.rawValue) — \(currency.displayName)").tag(currency.rawValue)
+                        Text("\(currency.rawValue) · \(currency.displayName)").tag(currency.rawValue)
                     }
                 }
                 Picker("Metric", selection: Binding(
@@ -712,7 +730,7 @@ private struct ClaudeConnectionRow: View {
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("CodeBurn will stop tracking quota and delete its local copy of your Claude credentials. Your Claude Code keychain entry is untouched — Claude Code keeps working.")
+                    Text("CodeBurn will stop tracking quota and delete its local copy of your Claude credentials. Your Claude Code keychain entry is untouched. Claude Code keeps working.")
                 }
         case .terminalFailure, .noCredentials, .failed:
             Button("Reconnect") { Task { await store.bootstrapSubscription() } }
@@ -738,7 +756,7 @@ private struct ClaudeConfigDirsSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if dirs.isEmpty {
-                Text("No extra directories — tracking the default `~/.claude`.")
+                Text("No extra directories. Tracking the default `~/.claude`.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             } else {
@@ -927,7 +945,7 @@ private struct CodexConnectionRow: View {
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("CodeBurn will stop tracking quota and delete its local copy of your Codex credentials. Your ~/.codex/auth.json is untouched — Codex CLI keeps working.")
+                    Text("CodeBurn will stop tracking quota and delete its local copy of your Codex credentials. Your ~/.codex/auth.json is untouched. Codex CLI keeps working.")
                 }
         case .terminalFailure, .noCredentials, .failed:
             Button("Reconnect") { Task { await store.bootstrapCodex() } }
@@ -953,7 +971,7 @@ private struct KimiSettingsTab: View {
                 KimiConnectionRow()
             }
             Section {
-                Text("Kimi Code live-quota tracking reads `~/.kimi-code/credentials/kimi-code.json` directly — nothing is copied or stored. Access tokens are short-lived (~15 minutes) and only the Kimi CLI refreshes them, so if the connection shows as expired, run the Kimi CLI once and click Reconnect.")
+                Text("Kimi Code live-quota tracking reads `~/.kimi-code/credentials/kimi-code.json` directly. Nothing is copied or stored. Access tokens are short-lived (~15 minutes) and only the Kimi CLI refreshes them, so if the connection shows as expired, run the Kimi CLI once and click Reconnect.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             } header: {
@@ -1052,7 +1070,7 @@ private struct KimiConnectionRow: View {
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("CodeBurn will stop tracking Kimi Code quota. Your ~/.kimi-code credentials are untouched — the Kimi CLI keeps working.")
+                    Text("CodeBurn will stop tracking Kimi Code quota. Your ~/.kimi-code credentials are untouched. The Kimi CLI keeps working.")
                 }
         case .terminalFailure, .noCredentials, .failed:
             Button("Reconnect") { Task { await store.bootstrapKimi() } }
@@ -1078,7 +1096,7 @@ private struct GeminiSettingsTab: View {
                 GeminiConnectionRow()
             }
             Section {
-                Text("Gemini live-quota tracking reads `~/.gemini/oauth_creds.json` read-only — nothing is copied or stored, and tokens stay in memory. If the connection shows as expired, run the Gemini CLI once to refresh your login, then click Reconnect.")
+                Text("Gemini live-quota tracking reads `~/.gemini/oauth_creds.json` read-only. Nothing is copied or stored, and tokens stay in memory. If the connection shows as expired, run the Gemini CLI once to refresh your login, then click Reconnect.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             } header: {
@@ -1180,7 +1198,7 @@ private struct GeminiConnectionRow: View {
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("CodeBurn will stop tracking Gemini quota. Your ~/.gemini credentials are untouched — the Gemini CLI keeps working.")
+                    Text("CodeBurn will stop tracking Gemini quota. Your ~/.gemini credentials are untouched. The Gemini CLI keeps working.")
                 }
         case .terminalFailure, .noCredentials, .failed:
             Button("Reconnect") { Task { await store.bootstrapGemini() } }
@@ -1206,7 +1224,7 @@ private struct CopilotSettingsTab: View {
                 CopilotConnectionRow()
             }
             Section {
-                Text("Copilot live-quota tracking reads the GitHub Copilot editor sign-in token from `~/.config/github-copilot` read-only — nothing is copied or stored. Sign in via an editor's Copilot plugin (VS Code, Xcode, etc.) first; if the connection shows as expired, sign in there again, then click Reconnect.")
+                Text("Copilot live-quota tracking reads the GitHub Copilot editor sign-in token from `~/.config/github-copilot` read-only. Nothing is copied or stored. Sign in via an editor's Copilot plugin (VS Code, Xcode, etc.) first; if the connection shows as expired, sign in there again, then click Reconnect.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             } header: {
@@ -1308,7 +1326,7 @@ private struct CopilotConnectionRow: View {
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("CodeBurn will stop tracking Copilot quota. Your ~/.config/github-copilot credentials are untouched — your editor's Copilot plugin keeps working.")
+                    Text("CodeBurn will stop tracking Copilot quota. Your ~/.config/github-copilot credentials are untouched. Your editor's Copilot plugin keeps working.")
                 }
         case .terminalFailure, .noCredentials, .failed:
             Button("Reconnect") { Task { await store.bootstrapCopilot() } }
@@ -1334,7 +1352,7 @@ private struct AntigravitySettingsTab: View {
                 AntigravityConnectionRow()
             }
             Section {
-                Text("Antigravity live-quota tracking talks to the Antigravity app's local language server on 127.0.0.1 only — nothing leaves the machine and no credential files are read. If it shows as disconnected, start the Antigravity app, then click Reconnect.")
+                Text("Antigravity live-quota tracking talks to the Antigravity app's local language server on 127.0.0.1 only. Nothing leaves the machine and no credential files are read. If it shows as disconnected, start the Antigravity app, then click Reconnect.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             } header: {
@@ -1438,7 +1456,7 @@ private struct AntigravityConnectionRow: View {
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("CodeBurn will stop tracking Antigravity quota. Nothing is read from or written to disk — the Antigravity app keeps working.")
+                    Text("CodeBurn will stop tracking Antigravity quota. Nothing is read from or written to disk. The Antigravity app keeps working.")
                 }
         case .terminalFailure, .noCredentials, .failed:
             Button("Reconnect") { Task { await store.bootstrapAntigravity() } }
@@ -1560,7 +1578,7 @@ private struct AboutSettingsTab: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 } else if updateChecker.updateAvailable, let latest = updateChecker.latestVersion {
-                    Text("\(AppVersion.display(latest)) is available — choose Check for Updates in the CodeBurn menu to install it.")
+                    Text("\(AppVersion.display(latest)) is available. Choose Check for Updates in the CodeBurn menu to install it.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -1584,7 +1602,7 @@ private struct AboutSettingsTab: View {
             } header: {
                 Text("Links")
             } footer: {
-                Text("© AgentSeal")
+                Text("© 2026 Resham Joshi (iamtoruk) · AgentSeal. MIT License.")
                     .frame(maxWidth: .infinity)
                     .multilineTextAlignment(.center)
             }
@@ -1595,7 +1613,12 @@ private struct AboutSettingsTab: View {
 
     private var hero: some View {
         VStack(spacing: 10) {
-            if let icon = NSApplication.shared.applicationIconImage {
+            if let flame = AboutFlameImage.load() {
+                Image(nsImage: flame)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 72, height: 72)
+            } else if let icon = NSApplication.shared.applicationIconImage {
                 Image(nsImage: icon)
                     .resizable()
                     .frame(width: 64, height: 64)
@@ -1607,7 +1630,7 @@ private struct AboutSettingsTab: View {
                     .font(.title3).fontWeight(.semibold)
                 Text("Version \(versionString)")
                     .foregroundStyle(.secondary)
-                Text("AI Coding Cost Tracker")
+                Text("Your AI Bill, Itemized")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -1643,3 +1666,24 @@ private struct AboutLinkRow: View {
         .onHover { hovering = $0 }
     }
 }
+
+/// The full-color binary-flame brand mark shown in the About hero. Loaded
+/// directly (not via ProviderIconCache) because it must keep its colors —
+/// the cache marks everything as a template image.
+@MainActor
+enum AboutFlameImage {
+    private static var cached: NSImage?
+
+    static func load() -> NSImage? {
+        if let cached { return cached }
+        for subdirectory in ["Resources/ProviderIcons", "ProviderIcons", nil] {
+            if let url = Bundle.module.url(forResource: "about-flame", withExtension: "png", subdirectory: subdirectory),
+               let image = NSImage(contentsOf: url) {
+                cached = image
+                return image
+            }
+        }
+        return nil
+    }
+}
+
