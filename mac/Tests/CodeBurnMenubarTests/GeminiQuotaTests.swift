@@ -268,7 +268,7 @@ final class GeminiQuotaTests: XCTestCase {
             XCTAssertTrue(error.isTerminal)
             XCTAssertEqual(
                 error.errorDescription,
-                "Google retired Gemini CLI OAuth for this account tier — use Antigravity.")
+                "Google retired Gemini CLI OAuth for this account tier. Use Antigravity.")
         } catch {
             XCTFail("unexpected error: \(error)")
         }
