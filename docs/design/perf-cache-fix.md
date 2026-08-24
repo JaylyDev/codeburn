@@ -141,9 +141,11 @@ needed to expire correctly:
 - `src/session-cache.ts`: add `loadStatusSnapshot(corpusFingerprint,
   newestMtimeMs, queryKey)` / `saveStatusSnapshot(corpusFingerprint,
   newestMtimeMs, queryKey, payload)` and the `statusSnapshotSettleMs()` knob
-  (new `status-snapshot.json` file in the cache dir, atomic temp+rename
-  write, best-effort — a failed read/write just falls back to a full
-  recompute). `reconcileFile` is unchanged.
+  (one `status-snapshot.<queryKeyHash>.json` file per distinct query in the
+  cache dir — so concurrent callers with different queryKeys never evict
+  each other — atomic temp+rename write with a CAS re-read guard against a
+  slower/older write clobbering a newer one, best-effort — a failed read/
+  write just falls back to a full recompute). `reconcileFile` is unchanged.
 - `src/main.ts`: in the `status` command's `--format menubar-json` branch,
   build a query key from the resolved period/day/days range, provider,
   project/exclude filters, optimize/timeline flags, and Claude config source;

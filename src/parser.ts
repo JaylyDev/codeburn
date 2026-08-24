@@ -4777,13 +4777,35 @@ export type CorpusFingerprint = {
 // stays with each provider's own (narrower, extension-aware) file layout
 // knowledge. Being over-inclusive here is safe: an extra file in the hash
 // can only cause an extra cache miss, never a missed update.
-async function collectFilesRecursive(dirPath: string): Promise<string[]> {
+async function collectFilesRecursive(dirPath: string, visitedDirs: Set<string> = new Set()): Promise<string[]> {
   const entries = await readdir(dirPath, { withFileTypes: true }).catch(() => [])
   const files: string[] = []
   for (const entry of entries) {
     const p = join(dirPath, entry.name)
-    if (entry.isDirectory()) files.push(...await collectFilesRecursive(p))
-    else files.push(p)
+    if (entry.isDirectory()) {
+      files.push(...await collectFilesRecursive(p, visitedDirs))
+      continue
+    }
+    if (entry.isSymbolicLink()) {
+      // `Dirent.isDirectory()` is false for a symlink even when its target
+      // IS a directory — without this check a symlinked subdirectory falls
+      // into the `else` below and gets pushed as a leaf "file"; a later
+      // `stat()` (which follows symlinks) then returns the DIRECTORY
+      // inode's own mtime/size as a bogus stand-in for its contents, with no
+      // recursion into it at all (review finding C-G2). Resolve it and
+      // recurse for real. A visited-inode guard bounds the walk against a
+      // symlink cycle (impossible for real directories, which is why the
+      // `isDirectory()` branch above needs no such guard).
+      const target = await stat(p).catch(() => null)
+      if (target?.isDirectory()) {
+        const key = `${target.dev}:${target.ino}`
+        if (visitedDirs.has(key)) continue
+        visitedDirs.add(key)
+        files.push(...await collectFilesRecursive(p, visitedDirs))
+        continue
+      }
+    }
+    files.push(p)
   }
   return files
 }
@@ -4834,7 +4856,21 @@ export async function computeCorpusFingerprint(providerFilter?: string): Promise
     if (!providerByName.has(name)) providerByName.set(name, await getProvider(name))
     return providerByName.get(name)
   }
+  // Non-discovery provider env vars (e.g. CODEBURN_CURSOR_MAX_BUBBLES,
+  // KIMI_MODEL_NAME — src/doctor.ts's NON_DISCOVERY_ENV_VARS) and a
+  // provider's parse-version change PARSED OUTPUT without touching any
+  // source's path/mtime/size, so the stat-only loop below would otherwise
+  // never see them move. `computeEnvFingerprint` (session-cache.ts) already
+  // hashes exactly this per provider for the parse-level cache; fold it in
+  // here too, once per distinct provider actually discovered, so this
+  // higher-layer snapshot fingerprint can't bypass that same guard (review
+  // finding A-G1).
+  const envFingerprinted = new Set<string>()
   for (const source of sources) {
+    if (!envFingerprinted.has(source.provider)) {
+      envFingerprinted.add(source.provider)
+      entries.push(`env:${source.provider}|${computeEnvFingerprint(source.provider)}`)
+    }
     if (source.provider === 'claude') {
       for (const filePath of await collectJsonlFiles(source.path)) await record(filePath)
       continue

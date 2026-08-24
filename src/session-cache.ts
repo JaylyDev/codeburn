@@ -1515,8 +1515,9 @@ export async function cleanupOrphanedTempFiles(): Promise<void> {
 
   // `session-cache.v<n>.json.<nonce>.tmp` from a pre-v8 binary interrupted
   // mid-write. Age-guarded, so an old binary's in-flight write is left alone.
-  // `status-snapshot.json.<nonce>.tmp` (see saveStatusSnapshot below) is swept
-  // here too: it lives in this same parent dir, orthogonal to the month-shard
+  // `status-snapshot.<queryKeyHash>.json.<nonce>.tmp` (see
+  // writeStatusSnapshotRecord below — one file per queryKey) is swept here
+  // too: it lives in this same parent dir, orthogonal to the month-shard
   // layout below, so the shard-dir sweep further down never sees it. Same
   // atomic temp+rename pattern, same narrow crash window between the write
   // and the rename as the versioned cache file above.
@@ -1742,7 +1743,7 @@ function statusSnapshotSettleMs(): number {
   return Number.isFinite(raw) && raw >= 0 ? Math.min(raw, 60_000) : 2000
 }
 
-const STATUS_SNAPSHOT_FILE = 'status-snapshot.json'
+const STATUS_SNAPSHOT_FILE = 'status-snapshot'
 
 // Bump on any incompatible change to the *shape* of the payload this snapshot
 // persists (i.e. whenever `buildMenubarPayloadForRange`'s return shape
@@ -1754,12 +1755,21 @@ const STATUS_SNAPSHOT_FILE = 'status-snapshot.json'
 // `validateCache`. A version mismatch is treated as a miss (same as a
 // missing/corrupt file): the caller recomputes for real and persists a fresh,
 // current-shaped snapshot.
-const STATUS_SNAPSHOT_VERSION = 1
+//
+// v2 (was v1): the file is now keyed by `queryKey` in its NAME (see
+// `statusSnapshotPath` below) instead of being one shared slot — two
+// concurrent callers with different queryKeys (a menubar poll for "today"
+// racing a manual refresh for "week") used to unconditionally evict each
+// other's save. A v1 file at the old fixed path is simply never looked at
+// again under v2 (harmless leftover, not actively cleaned).
+const STATUS_SNAPSHOT_VERSION = 2
 
 type StatusSnapshotRecord = {
   version: number
   corpusFingerprint: string
   newestMtimeMs: number
+  // Kept alongside the hash in the filename as a defensive re-check against
+  // a (vanishingly unlikely) hash collision between two different queries.
   queryKey: string
   payload: unknown
   // Wall-clock time (Date.now()) the FIRST mismatch against this record's
@@ -1769,19 +1779,29 @@ type StatusSnapshotRecord = {
   mismatchFirstSeenAt?: number
 }
 
-function statusSnapshotPath(): string {
-  return join(getCodeburnCacheDir(), STATUS_SNAPSHOT_FILE)
+// Each distinct queryKey gets its OWN file (`status-snapshot.<hash>.json`)
+// rather than sharing one slot — see the v2 note above / review finding
+// B-G1's "amplifier." This means two writers for different queryKeys never
+// touch each other's file at all, so there is no read-merge-write race to
+// close between them (a shared-map-file design was tried and demonstrably
+// races: two concurrent writers for different keys can each read before
+// either has written, then each overwrite the whole file with only their
+// own key — verified by a failing test before this per-file design replaced
+// it).
+function statusSnapshotPath(queryKey: string): string {
+  const hash = createHash('sha256').update(queryKey).digest('hex').slice(0, 16)
+  return join(getCodeburnCacheDir(), `${STATUS_SNAPSHOT_FILE}.${hash}.json`)
 }
 
-async function readStatusSnapshotRecord(): Promise<StatusSnapshotRecord | null> {
+async function readStatusSnapshotRecord(queryKey: string): Promise<StatusSnapshotRecord | null> {
   try {
-    const raw = await readFile(statusSnapshotPath(), 'utf-8')
+    const raw = await readFile(statusSnapshotPath(queryKey), 'utf-8')
     const parsed = JSON.parse(raw) as Partial<StatusSnapshotRecord>
     if (
       parsed.version !== STATUS_SNAPSHOT_VERSION ||
       typeof parsed.corpusFingerprint !== 'string' ||
       typeof parsed.newestMtimeMs !== 'number' || !Number.isFinite(parsed.newestMtimeMs) ||
-      typeof parsed.queryKey !== 'string'
+      parsed.queryKey !== queryKey
     ) return null
     return parsed as StatusSnapshotRecord
   } catch {
@@ -1795,12 +1815,27 @@ async function readStatusSnapshotRecord(): Promise<StatusSnapshotRecord | null> 
  *  the one-shot processes that call this — each CLI poll is a fresh process
  *  with no in-memory state to carry it). A failed write just means the next
  *  poll recomputes, or re-observes the mismatch as if it were first, instead
- *  of reusing/deferring — never stale or corrupt data either way. */
-async function writeStatusSnapshotRecord(record: StatusSnapshotRecord): Promise<void> {
+ *  of reusing/deferring — never stale or corrupt data either way.
+ *
+ *  Re-reads this queryKey's file immediately before rename and asks `guard`
+ *  whether the record it found still matches what the write assumed —
+ *  refusing (silently, a no-op) otherwise. This closes the race in review
+ *  finding B-G1: a slower/older recompute landing after a faster/newer one
+ *  for the SAME queryKey (guarded by `newestMtimeMs` ordering in
+ *  `saveStatusSnapshot`), and a delayed "first mismatch" bookkeeping write
+ *  reintroducing a stale payload after a real recompute already published a
+ *  fresh one (guarded by an exact prior-record match in `loadStatusSnapshot`). */
+async function writeStatusSnapshotRecord(
+  queryKey: string,
+  record: StatusSnapshotRecord,
+  guard: (existing: StatusSnapshotRecord | null) => boolean,
+): Promise<void> {
   try {
     const dir = getCodeburnCacheDir()
     if (!existsSync(dir)) await mkdir(dir, { recursive: true })
-    const finalPath = statusSnapshotPath()
+    const finalPath = statusSnapshotPath(queryKey)
+    const existing = await readStatusSnapshotRecord(queryKey)
+    if (!guard(existing)) return
     const tempPath = `${finalPath}.${randomBytes(8).toString('hex')}.tmp`
     const handle = await open(tempPath, 'w', 0o600)
     try {
@@ -1829,25 +1864,42 @@ async function writeStatusSnapshotRecord(record: StatusSnapshotRecord): Promise<
  *  THIS record's fingerprint first stopped matching makes the settle window
  *  a true bound regardless of what else in the corpus is busy. */
 export async function loadStatusSnapshot(corpusFingerprint: string, newestMtimeMs: number, queryKey: string): Promise<unknown | null> {
-  const stored = await readStatusSnapshotRecord()
-  if (!stored || stored.queryKey !== queryKey) return null
+  const stored = await readStatusSnapshotRecord(queryKey)
+  if (!stored) return null
   if (stored.corpusFingerprint === corpusFingerprint) return stored.payload ?? null
 
   const now = Date.now()
   const firstSeenAt = stored.mismatchFirstSeenAt ?? now
   if (now - firstSeenAt >= statusSnapshotSettleMs()) return null
   if (stored.mismatchFirstSeenAt === undefined) {
-    await writeStatusSnapshotRecord({ ...stored, newestMtimeMs, mismatchFirstSeenAt: firstSeenAt })
+    // Bookkeeping-only write: only proceed if the on-disk record is exactly
+    // what we just read (same corpusFingerprint, still no
+    // mismatchFirstSeenAt). If a concurrent real recompute already replaced
+    // it, this stale payload must not be reintroduced under a
+    // freshly-stamped timestamp.
+    const basisFingerprint = stored.corpusFingerprint
+    await writeStatusSnapshotRecord(
+      queryKey,
+      { ...stored, newestMtimeMs, mismatchFirstSeenAt: firstSeenAt },
+      existing => existing !== null && existing.corpusFingerprint === basisFingerprint && existing.mismatchFirstSeenAt === undefined,
+    )
   }
   return stored.payload ?? null
 }
 
 /** Best-effort: a failed write just means the next poll recomputes instead
  *  of reusing. Only ever called by the caller when `loadStatusSnapshot`
- *  missed, so a settled recompute's result always supersedes whatever was
- *  there before. Always writes a fresh record with no `mismatchFirstSeenAt`,
- *  which is exactly what clears the settle-window clock once a real
- *  recompute lands. */
+ *  missed, so a settled recompute's result should supersede whatever was
+ *  there before — UNLESS a concurrent recompute already published one based
+ *  on a strictly fresher corpus observation (`newestMtimeMs`), in which case
+ *  this (slower, now-stale) write is refused rather than clobbering it. Ties
+ *  proceed: both reflect a correct recompute of the same corpus state. Always
+ *  writes a fresh record with no `mismatchFirstSeenAt`, which is exactly what
+ *  clears the settle-window clock once a real recompute lands. */
 export async function saveStatusSnapshot(corpusFingerprint: string, newestMtimeMs: number, queryKey: string, payload: unknown): Promise<void> {
-  await writeStatusSnapshotRecord({ version: STATUS_SNAPSHOT_VERSION, corpusFingerprint, newestMtimeMs, queryKey, payload })
+  await writeStatusSnapshotRecord(
+    queryKey,
+    { version: STATUS_SNAPSHOT_VERSION, corpusFingerprint, newestMtimeMs, queryKey, payload },
+    existing => !existing || existing.newestMtimeMs <= newestMtimeMs,
+  )
 }

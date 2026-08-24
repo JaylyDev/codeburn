@@ -1,11 +1,20 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { existsSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter as pathDelimiter, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 import { describe, expect, it, vi } from 'vitest'
 import { CACHE_SCHEMA_VERSION } from '../src/models.js'
+
+// Each distinct query gets its own `status-snapshot.<queryKeyHash>.json` file
+// (review finding B-G1) rather than one shared fixed path — these tests
+// don't know the hash up front, so they locate whatever landed by pattern.
+const SNAPSHOT_FILE_RE = /^status-snapshot\.[0-9a-f]+\.json$/
+function findSnapshotFiles(cacheDir: string): string[] {
+  if (!existsSync(cacheDir)) return []
+  return readdirSync(cacheDir).filter(f => SNAPSHOT_FILE_RE.test(f)).map(f => join(cacheDir, f))
+}
 
 // Every case here spawns the real CLI and does genuine multi-provider parse
 // work; the 5s default is fine on a dev laptop and not on a shared 2-core
@@ -677,8 +686,9 @@ describe('codeburn status --format menubar-json', () => {
 
       // The persisted snapshot carries cost/usage aggregates and project
       // paths, so it must land group/world-unreadable regardless of umask.
-      const snapshotPath = join(home, '.cache', 'codeburn', 'status-snapshot.json')
-      expect(statSync(snapshotPath).mode & 0o777).toBe(0o600)
+      const snapshotFiles = findSnapshotFiles(join(home, '.cache', 'codeburn'))
+      expect(snapshotFiles).toHaveLength(1)
+      expect(statSync(snapshotFiles[0]!).mode & 0o777).toBe(0o600)
 
       // Identical query against an unchanged corpus: served from the
       // snapshot, byte-identical to the first call.
@@ -782,8 +792,8 @@ describe('codeburn status --format menubar-json', () => {
       expect(before.status, `stderr: ${before.stderr}`).toBe(0)
       const findingsBefore = (JSON.parse(before.stdout) as { optimize: { findingCount: number } }).optimize.findingCount
 
-      const snapshotPath = join(home, '.cache', 'codeburn', 'status-snapshot.json')
-      expect(existsSync(snapshotPath)).toBe(false)
+      const cacheDir = join(home, '.cache', 'codeburn')
+      expect(findSnapshotFiles(cacheDir)).toEqual([])
 
       // Mutable, non-fingerprinted optimize input: an unused custom agent
       // definition. The session corpus is untouched, so a corpus-fingerprint-
@@ -797,7 +807,7 @@ describe('codeburn status --format menubar-json', () => {
       const findingsAfter = (JSON.parse(after.stdout) as { optimize: { findingCount: number } }).optimize.findingCount
 
       expect(findingsAfter).toBe(findingsBefore + 1)
-      expect(existsSync(snapshotPath)).toBe(false)
+      expect(findSnapshotFiles(cacheDir)).toEqual([])
     } finally {
       await rm(home, { recursive: true, force: true })
     }
