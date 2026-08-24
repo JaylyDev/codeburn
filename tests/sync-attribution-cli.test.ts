@@ -172,7 +172,10 @@ describe('sync push --attribution (CLI level)', () => {
       .flatMap((rs: any) => rs.scopeSpans.flatMap((ss: any) => ss.spans))
       .flatMap((s: any) => s.attributes.filter((a: any) => a.key === 'ai.project')
         .map((a: any) => a.value.stringValue)))
-    expect(projects.length).toBeGreaterThanOrEqual(2)       // usage + attribution spans
-    expect(new Set(projects)).toEqual(new Set([basename(repoDir)]))
+    // Under fail-closed provenance (#1128) this fixture carries no trusted
+    // provider-recorded cwd, so ai.project is OMITTED entirely — stronger than
+    // the #1126 basename this test originally asserted. The positive case
+    // (trusted cwd -> basename on the wire) lives in sync-project-provenance.
+    expect(projects).toEqual([])
   })
 })
