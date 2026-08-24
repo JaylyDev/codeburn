@@ -1190,6 +1190,17 @@ export function isTurnResidueOnly(day: DailyEntry): boolean {
   return Object.values(day.categories).some(c => c.turns > 0)
 }
 
+/// Keep only the days a RANGED parse actually covered (issue #1130): a turn
+/// anchored before the range start survives range slicing whole, so the
+/// aggregator can emit a residue day outside the parsed range — and out-of-range
+/// residue days must not reach durable history even with the merge guards.
+/// Date keys are zero-padded YYYY-MM-DD, so a string compare is exact.
+export function daysInRange(days: DailyEntry[], range: DateRange, dateKeyFn: (date: Date) => string = toDateString): DailyEntry[] {
+  const first = dateKeyFn(range.start)
+  const last = dateKeyFn(range.end)
+  return days.filter(d => d.date >= first && d.date <= last)
+}
+
 export async function ensureCacheHydrated(
   parseSessions: (range: DateRange) => Promise<ProjectSummary[]>,
   aggregateDays: (projects: ProjectSummary[]) => DailyEntry[],
@@ -1318,7 +1329,7 @@ export async function ensureCacheHydrated(
         // cache, breaking that reconciliation - so the subtraction below gets
         // its own through-now parse instead.
         projects = await parseSessions({ start: backfillStart, end: yesterdayEnd })
-        freshDays = aggregateDays(projects)
+        freshDays = daysInRange(aggregateDays(projects), { start: backfillStart, end: yesterdayEnd })
       }
       const parseWasComplete = sessionComplete()
       // A PARTIAL parse must not overwrite finalized baseline days with
@@ -1390,7 +1401,7 @@ export async function ensureCacheHydrated(
     if (gapStart.getTime() <= yesterdayEnd.getTime()) {
       const gapRange: DateRange = { start: gapStart, end: yesterdayEnd }
       const gapProjects = await parseSessions(gapRange)
-      const gapDays = aggregateDays(gapProjects)
+      const gapDays = daysInRange(aggregateDays(gapProjects), gapRange)
       const parseWasComplete = sessionComplete()
       const priorWatermark = c.lastComputedDate
       // Gate the merge on parse completeness (issue #1127): replacing cached
