@@ -57,12 +57,13 @@ struct HeatmapSection: View {
 
     private var visibleModes: [InsightMode] {
         // Plan sources from a provider's OAuth usage endpoint. Currently
-        // implemented for Claude (Anthropic), Codex (ChatGPT), Kimi Code, and
-        // Gemini (Google Code Assist). Hidden on All / Cursor / Droid /
-        // Copilot until those providers ship their own quota data sources.
+        // implemented for Claude (Anthropic), Codex (ChatGPT), Kimi Code,
+        // Gemini (Google Code Assist), and Copilot (GitHub). Hidden on All /
+        // Cursor / Droid until those providers ship their own quota data
+        // sources.
         InsightMode.allCases.filter { mode in
             if mode == .plan {
-                return store.selectedProvider == .claude || store.selectedProvider == .codex || store.selectedProvider == .kimiCode || store.selectedProvider == .gemini
+                return store.selectedProvider == .claude || store.selectedProvider == .codex || store.selectedProvider == .kimiCode || store.selectedProvider == .gemini || store.selectedProvider == .copilot
             }
             return true
         }
@@ -84,6 +85,8 @@ struct HeatmapSection: View {
                 KimiPlanInsight()
             } else if store.selectedProvider == .gemini {
                 GeminiPlanInsight()
+            } else if store.selectedProvider == .copilot {
+                CopilotPlanInsight()
             } else {
                 PlanInsight(usage: store.subscription)
             }
@@ -2394,6 +2397,87 @@ private struct GeminiPlanInsight: View {
         let f = RelativeDateTimeFormatter()
         f.unitsStyle = .short
         return f.localizedString(for: date, relativeTo: Date())
+    }
+
+    private func shortTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f.string(from: date)
+    }
+}
+
+/// Plan tab for Copilot. Reads the editor plugins' credential files read-only
+/// (no keychain, no refresh path), so terminal failure means "sign in via an
+/// editor's Copilot plugin again".
+private struct CopilotPlanInsight: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        Group {
+            switch CopilotQuotaPresentation.planContent(loadState: store.copilotLoadState, hasUsage: store.copilotUsage != nil) {
+            case .noCredentials:
+                PlanNoCredentialsView(
+                    title: "No Copilot credentials found",
+                    message: "Sign in via an editor's Copilot plugin first. Then click Try Again."
+                ) { Task { await store.bootstrapCopilot() } }
+            case .loading:
+                PlanLoadingView(message: "Reading Copilot credentials...")
+            case .failed:
+                PlanFailedView(
+                    error: store.copilotError
+                ) { Task { await store.refreshCopilot() } }
+            case .transientFailed:
+                PlanFailedView(
+                    error: store.copilotError ?? "GitHub temporarily unreachable — retrying."
+                ) { Task { await store.refreshCopilot() } }
+            case let .reconnect(reason):
+                PlanReconnectView(
+                    title: "Refresh Copilot login",
+                    reason: reason,
+                    fallback: "Your Copilot sign-in has expired. Sign in via an editor's Copilot plugin again, then click Reconnect."
+                ) { Task { await store.bootstrapCopilot() } }
+            case let .usage(idle):
+                if let usage = store.copilotUsage {
+                    loadedBody(usage: usage, idle: idle)
+                } else {
+                    PlanLoadingView(message: "Reading Copilot credentials...")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func loadedBody(usage: CopilotUsage, idle: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(usage.plan ?? "Copilot")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Spacer()
+            }
+            ForEach(Array(usage.details.enumerated()), id: \.offset) { _, window in
+                UtilizationRow(
+                    label: window.label,
+                    percent: window.usedPercent,
+                    resetsAt: window.resetsAt,
+                    projection: nil
+                )
+            }
+            if idle {
+                Text("Login idle. Sign in via an editor's Copilot plugin to refresh.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            if CopilotQuotaPresentation.isStale(fetchedAt: usage.fetchedAt) {
+                Text("as of \(shortTime(usage.fetchedAt))")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
     }
 
     private func shortTime(_ date: Date) -> String {

@@ -152,6 +152,13 @@ final class AppStore {
     // refresh tick.
     var geminiLoadState: SubscriptionLoadState = GeminiSubscriptionService.hasCredential ? .dormant : .notBootstrapped
 
+    var copilotUsage: CopilotUsage?
+    var copilotError: String?
+    // Same file-based activation as Kimi/Gemini — reading
+    // ~/.config/github-copilot is prompt-free, so we start dormant and
+    // auto-activate on the first refresh tick.
+    var copilotLoadState: SubscriptionLoadState = CopilotSubscriptionService.hasCredential ? .dormant : .notBootstrapped
+
     /// Generation tokens for the in-flight refresh tasks. Incremented on every
     /// disconnect / reset so a fetch that started before the disconnect cannot
     /// resume after the await and re-populate the freshly-cleared state.
@@ -159,6 +166,7 @@ final class AppStore {
     private var codexRefreshGen: Int = 0
     private var kimiRefreshGen: Int = 0
     private var geminiRefreshGen: Int = 0
+    private var copilotRefreshGen: Int = 0
 
     private var cache: [PayloadCacheKey: CachedPayload] = [:]
     private var cacheDate: String = ""
@@ -1345,6 +1353,93 @@ final class AppStore {
         }
     }
 
+    // MARK: - Copilot
+
+    /// Same prompt-free activation as Kimi/Gemini: reading the editor plugins'
+    /// credential files needs no keychain, so the first refresh tick activates
+    /// dormant state.
+    func bootstrapCopilot() async {
+        // Capture the generation before the await so a disconnect that lands
+        // mid-fetch cannot be resurrected into .loaded when the fetch returns.
+        let gen = copilotRefreshGen
+        copilotLoadState = .bootstrapping
+        do {
+            let usage = try await CopilotSubscriptionService.refresh()
+            guard gen == copilotRefreshGen else { return }
+            copilotUsage = usage
+            copilotError = nil
+            copilotLoadState = .loaded
+        } catch let err as CopilotSubscriptionService.FetchError {
+            guard gen == copilotRefreshGen else { return }
+            applyCopilotFetchError(err)
+        } catch {
+            guard gen == copilotRefreshGen else { return }
+            copilotError = sanitizeForUI(error.localizedDescription)
+            copilotLoadState = .failed
+        }
+    }
+
+    func refreshCopilot() async {
+        _ = await refreshCopilotReportingSuccess()
+    }
+
+    @discardableResult
+    func refreshCopilotReportingSuccess() async -> Bool {
+        if case .dormant = copilotLoadState {
+            await bootstrapCopilot()
+            return copilotLoadState == .loaded
+        }
+        guard CopilotSubscriptionService.hasCredential else {
+            if copilotLoadState != .notBootstrapped { copilotLoadState = .notBootstrapped }
+            return false
+        }
+        let gen = copilotRefreshGen
+        if copilotUsage == nil { copilotLoadState = .loading }
+        do {
+            let usage = try await CopilotSubscriptionService.refresh()
+            guard gen == copilotRefreshGen else { return false }
+            copilotUsage = usage
+            copilotError = nil
+            copilotLoadState = .loaded
+            return true
+        } catch let err as CopilotSubscriptionService.FetchError {
+            guard gen == copilotRefreshGen else { return false }
+            applyCopilotFetchError(err)
+            return false
+        } catch {
+            guard gen == copilotRefreshGen else { return false }
+            copilotError = sanitizeForUI(error.localizedDescription)
+            copilotLoadState = .failed
+            return false
+        }
+    }
+
+    func disconnectCopilot() {
+        CopilotSubscriptionService.disconnect()
+        copilotRefreshGen &+= 1
+        copilotUsage = nil
+        copilotError = nil
+        copilotLoadState = .notBootstrapped
+        NotificationCenter.default.post(name: .codeBurnSubscriptionDisconnected, object: nil)
+    }
+
+    private func applyCopilotFetchError(_ err: CopilotSubscriptionService.FetchError) {
+        let sanitized = sanitizeForUI(err.errorDescription)
+        copilotError = sanitized
+        if case .noCredentials = err {
+            copilotLoadState = .noCredentials
+        } else if err.isTerminal {
+            copilotLoadState = .terminalFailure(reason: sanitized)
+        } else if let retryAt = err.rateLimitRetryAt {
+            copilotLoadState = .transientFailure(retryAt: retryAt)
+        } else {
+            // 5xx / network blips and a rejected-but-unchanged token back off
+            // automatically, mirroring the Electron provider's
+            // transientFailure mapping.
+            copilotLoadState = .transientFailure(retryAt: nil)
+        }
+    }
+
     private func applyFetchError(_ err: ClaudeSubscriptionService.FetchError) {
         let sanitized = sanitizeForUI(err.errorDescription)
         subscriptionError = sanitized
@@ -1421,6 +1516,10 @@ final class AppStore {
             let worst = usage.details.map(\.usedPercent).max() ?? 0
             if worst > 0 { providers.append(("Gemini", worst)) }
         }
+        if let usage = copilotUsage, shouldIncludeCachedQuota(loadState: copilotLoadState) {
+            let worst = usage.details.map(\.usedPercent).max() ?? 0
+            if worst > 0 { providers.append(("Copilot", worst)) }
+        }
         let worst = providers.map(\.percent).max() ?? 0
         let severity = QuotaSummary.severity(for: worst / 100)
         let sorted = providers.sorted { $0.percent > $1.percent }
@@ -1443,6 +1542,7 @@ final class AppStore {
         case .codex:  return codexQuotaSummary(filter: filter)
         case .kimiCode: return kimiQuotaSummary(filter: filter)
         case .gemini:  return geminiQuotaSummary(filter: filter)
+        case .copilot: return copilotQuotaSummary(filter: filter)
         default:      return nil
         }
     }
@@ -1635,6 +1735,39 @@ final class AppStore {
             }
         }
         return QuotaSummary(providerFilter: filter, connection: connection, primary: primary, details: details, planLabel: geminiUsage?.plan ?? "Gemini", footerLines: [])
+    }
+
+    private func copilotQuotaSummary(filter: ProviderFilter) -> QuotaSummary? {
+        if case .notBootstrapped = copilotLoadState { return nil }
+        if case .bootstrapping = copilotLoadState { return nil }
+        if case .noCredentials = copilotLoadState { return nil }
+
+        let connection: QuotaSummary.Connection = {
+            switch copilotLoadState {
+            case .notBootstrapped, .dormant, .bootstrapping, .noCredentials: return .disconnected
+            case .loading: return copilotUsage == nil ? .loading : .stale
+            case .loaded: return .connected
+            case .failed: return copilotUsage == nil ? .loading : .stale
+            // A revoked Copilot token sits terminal until the user signs in via
+            // an editor's Copilot plugin again. Keep the last-known bars
+            // (marked stale) instead of flapping the chip to a reconnect card.
+            case let .terminalFailure(reason): return copilotUsage == nil ? .terminalFailure(reason: reason) : .stale
+            case .transientFailure: return .transientFailure
+            }
+        }()
+
+        var primary: QuotaSummary.Window?
+        var details: [QuotaSummary.Window] = []
+        if let usage = copilotUsage {
+            // details leads with the premium-requests window, so the first row
+            // is the headline bar.
+            for w in usage.details {
+                let row = QuotaSummary.Window(label: w.label, percent: w.usedPercent / 100, resetsAt: w.resetsAt)
+                if primary == nil { primary = row }
+                details.append(row)
+            }
+        }
+        return QuotaSummary(providerFilter: filter, connection: connection, primary: primary, details: details, planLabel: copilotUsage?.plan ?? "Copilot", footerLines: [])
     }
 
     /// Persist one snapshot per window so we can answer "what did the prior cycle end at?"

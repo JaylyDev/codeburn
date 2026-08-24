@@ -33,6 +33,8 @@ struct SettingsView: View {
                          isConnected: CLIDevinConfig.loadAcuUsdRate() != nil),
             ProviderPane(id: "gemini", name: "Gemini", icon: "googlegemini",
                          isConnected: store.geminiLoadState == .loaded),
+            ProviderPane(id: "copilot", name: "Copilot", icon: "githubcopilot",
+                         isConnected: store.copilotLoadState == .loaded),
         ]
     }
 
@@ -100,6 +102,7 @@ struct SettingsView: View {
         case "kimi": KimiSettingsTab()
         case "devin": DevinSettingsTab()
         case "gemini": GeminiSettingsTab()
+        case "copilot": CopilotSettingsTab()
         case "about": AboutSettingsTab()
         default: GeneralSettingsTab()
         }
@@ -1036,6 +1039,134 @@ private struct GeminiConnectionRow: View {
                 .buttonStyle(.borderedProminent)
         case .notBootstrapped:
             Button("Connect") { Task { await store.bootstrapGemini() } }
+                .buttonStyle(.borderedProminent)
+        case .bootstrapping:
+            ProgressView().controlSize(.small)
+        }
+    }
+}
+
+// MARK: - Copilot
+
+private struct CopilotSettingsTab: View {
+    var body: some View {
+        Form {
+            Section("Connection") {
+                CopilotConnectionRow()
+            }
+            Section {
+                Text("Copilot live-quota tracking reads the GitHub Copilot editor sign-in token from `~/.config/github-copilot` read-only — nothing is copied or stored. Sign in via an editor's Copilot plugin (VS Code, Xcode, etc.) first; if the connection shows as expired, sign in there again, then click Reconnect.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("How it works")
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+}
+
+private struct CopilotConnectionRow: View {
+    @Environment(AppStore.self) private var store
+    @State private var showDisconnectConfirm = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: stateIcon)
+                .font(.system(size: 18))
+                .foregroundStyle(stateTint)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(stateTitle)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(stateDetail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+            actionButton
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var stateIcon: String {
+        switch store.copilotLoadState {
+        case .loaded: return "checkmark.circle.fill"
+        case .terminalFailure: return "exclamationmark.triangle.fill"
+        case .transientFailure: return "clock.arrow.circlepath"
+        case .bootstrapping, .loading: return "ellipsis.circle"
+        case .notBootstrapped, .dormant, .noCredentials: return "link.circle"
+        case .failed: return "xmark.circle"
+        }
+    }
+
+    private var stateTint: Color {
+        switch store.copilotLoadState {
+        case .loaded: return .green
+        case .terminalFailure, .failed: return .red
+        case .transientFailure: return .orange
+        default: return .secondary
+        }
+    }
+
+    private var stateTitle: String {
+        switch store.copilotLoadState {
+        case .loaded: return "Connected"
+        case let .terminalFailure(reason): return reason ?? "Login refresh required"
+        case .transientFailure: return "Backing off"
+        case .bootstrapping: return "Connecting…"
+        case .loading: return "Refreshing…"
+        case .dormant: return "Ready"
+        case .notBootstrapped, .noCredentials: return "Not connected"
+        case .failed: return "Couldn't load Copilot quota"
+        }
+    }
+
+    private var stateDetail: String {
+        switch store.copilotLoadState {
+        case .loaded:
+            if let plan = store.copilotUsage?.plan {
+                return "Plan: \(plan)"
+            }
+            return "Live quota tracked from api.github.com."
+        case .terminalFailure:
+            return "Sign in via an editor's Copilot plugin to refresh your login, then click Reconnect."
+        case .transientFailure: return store.copilotError ?? "GitHub rate-limited; auto-retrying."
+        case .bootstrapping: return "Reading ~/.config/github-copilot credentials."
+        case .loading: return "Background refresh in progress."
+        case .dormant: return "Tap Load Quota to fetch live usage from api.github.com."
+        case .notBootstrapped, .noCredentials:
+            return "Sign in via an editor's Copilot plugin first, then click Connect."
+        case .failed: return store.copilotError ?? ""
+        }
+    }
+
+    @ViewBuilder
+    private var actionButton: some View {
+        switch store.copilotLoadState {
+        case .loaded, .transientFailure, .loading:
+            Button("Disconnect") { showDisconnectConfirm = true }
+                .confirmationDialog(
+                    "Disconnect Copilot?",
+                    isPresented: $showDisconnectConfirm
+                ) {
+                    Button("Disconnect", role: .destructive) {
+                        store.disconnectCopilot()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("CodeBurn will stop tracking Copilot quota. Your ~/.config/github-copilot credentials are untouched — your editor's Copilot plugin keeps working.")
+                }
+        case .terminalFailure, .noCredentials, .failed:
+            Button("Reconnect") { Task { await store.bootstrapCopilot() } }
+                .buttonStyle(.borderedProminent)
+        case .dormant:
+            Button("Load Quota") { Task { await store.bootstrapCopilot() } }
+                .buttonStyle(.borderedProminent)
+        case .notBootstrapped:
+            Button("Connect") { Task { await store.bootstrapCopilot() } }
                 .buttonStyle(.borderedProminent)
         case .bootstrapping:
             ProgressView().controlSize(.small)

@@ -531,6 +531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     fileprivate var lastCodexRefreshAt: Date?
     fileprivate var lastKimiRefreshAt: Date?
     fileprivate var lastGeminiRefreshAt: Date?
+    fileprivate var lastCopilotRefreshAt: Date?
     private var claudeQuotaFailureCount = 0
     private var nextClaudeQuotaRefreshAt: Date?
 
@@ -626,8 +627,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         if let task = codexQuotaRefreshTask {
             return await task.value
         }
-        // Kimi Code and Gemini ride the same tick, each with its own cadence
-        // anchor: when Codex is not connected its refresh returns false
+        // Kimi Code, Gemini, and Copilot ride the same tick, each with its
+        // own cadence anchor: when Codex is not connected its refresh returns
+        // false
         // immediately, so lastCodexRefreshAt never advances — anchoring them
         // on it would poll the quota endpoints on every payload tick instead
         // of the configured quota cadence. Anchor on attempt (not success)
@@ -644,13 +646,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             return Date().timeIntervalSince(lastGeminiRefreshAt ?? .distantPast) >= TimeInterval(cadence.rawValue)
         }()
         if geminiDue { lastGeminiRefreshAt = Date() }
-        let task = Task { [store, kimiDue, geminiDue] in
+        let copilotDue: Bool = {
+            let cadence = SubscriptionRefreshCadence.current
+            guard cadence != .manual else { return false }
+            return Date().timeIntervalSince(lastCopilotRefreshAt ?? .distantPast) >= TimeInterval(cadence.rawValue)
+        }()
+        if copilotDue { lastCopilotRefreshAt = Date() }
+        let task = Task { [store, kimiDue, geminiDue, copilotDue] in
             async let codex = store.refreshCodexReportingSuccess()
             if kimiDue {
                 _ = await store.refreshKimiReportingSuccess()
             }
             if geminiDue {
                 _ = await store.refreshGeminiReportingSuccess()
+            }
+            if copilotDue {
+                _ = await store.refreshCopilotReportingSuccess()
             }
             return await codex
         }
@@ -863,8 +874,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
 
     /// Reset the cadence anchor so the next loop tick re-evaluates from "now"
     /// rather than measuring against a timestamp from the previous connection.
-    /// Triggered on disconnect of any provider — the cost of clearing both
-    /// anchors is one extra refresh tick on the unaffected provider, far less
+    /// Triggered on disconnect of any provider — the cost of clearing all
+    /// anchors is one extra refresh tick on the unaffected providers, far less
     /// disruptive than waiting a full cadence after a reconnect.
     @MainActor
     func resetSubscriptionCadenceAnchor() {
@@ -872,6 +883,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         lastCodexRefreshAt = nil
         lastKimiRefreshAt = nil
         lastGeminiRefreshAt = nil
+        lastCopilotRefreshAt = nil
         claudeQuotaFailureCount = 0
         nextClaudeQuotaRefreshAt = nil
     }
@@ -910,6 +922,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             _ = self.store.codexLoadState
             _ = self.store.geminiUsage
             _ = self.store.geminiLoadState
+            _ = self.store.copilotUsage
+            _ = self.store.copilotLoadState
         } onChange: { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
