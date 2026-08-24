@@ -8,6 +8,7 @@
 import { createHash } from 'crypto'
 import { hostname, userInfo } from 'os'
 import type { ParsedApiCall } from '../types.js'
+import { billableOutputTokens } from '../models.js'
 import type { SessionAttributionRecord } from '../yield.js'
 
 export interface OtlpSpan {
@@ -103,7 +104,10 @@ export function buildOtlpPayload(calls: CallWithSession[]): OtlpPayload {
       { key: 'ai.provider', value: { stringValue: call.provider } },
       { key: 'ai.model', value: { stringValue: call.model } },
       { key: 'ai.input_tokens', value: { intValue: String(call.usage.inputTokens) } },
-      { key: 'ai.output_tokens', value: { intValue: String(call.usage.outputTokens) } },
+      // Billable output, not raw: for providers that bill reasoning separately
+      // the raw output under-reports by the reasoning volume. Same routing the
+      // display layer adopted in #1115/#1116.
+      { key: 'ai.output_tokens', value: { intValue: String(billableOutputTokens(call.provider, call.usage.outputTokens, call.usage.reasoningTokens)) } },
       { key: 'ai.cost_usd', value: { doubleValue: call.costUSD } },
       { key: 'ai.project', value: { stringValue: project } },
       { key: 'ai.speed', value: { stringValue: call.speed } },
