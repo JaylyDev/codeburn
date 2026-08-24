@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtemp, mkdir, writeFile, rm, symlink } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
@@ -114,6 +114,8 @@ describe('Codex discover overlap-only nest filter', () => {
       expect(names(await provider.discoverSessions())).toEqual(['rollout-buzz.jsonl'])
       const roots = await provider.probeRoots!()
       expect(roots.map(r => r.path)).toEqual([
+        join(primary, 'sessions'),
+        join(primary, 'archived_sessions'),
         join(nested, 'sessions'),
         join(nested, 'archived_sessions'),
       ])
@@ -125,19 +127,51 @@ describe('Codex discover overlap-only nest filter', () => {
     }
   })
 
-  it('default factory with CODEX_HOME=nest does not drop unique nest rollouts when ~/.codex has its own', async () => {
+  it('no-arg factory discovers billed + unique nest and drops overlapping nest ids', async () => {
     const home = root
     const primary = join(home, '.codex')
     const nested = join(home, '.buzz', '.codex')
-    await writeCodexSession(primary, 'rollout-primary.jsonl')
-    await writeCodexSession(nested, 'rollout-buzz.jsonl')
+    await writeCodexSession(primary, 'rollout-billed.jsonl', 'sess-shared')
+    await writeCodexSession(primary, 'rollout-billed-only.jsonl', 'sess-billed')
+    await writeCodexSession(nested, 'rollout-renamed.jsonl', 'sess-shared')
+    await writeCodexSession(nested, 'rollout-buzz-only.jsonl', 'sess-buzz')
     const prevHome = process.env.HOME
     const prevCodex = process.env.CODEX_HOME
     process.env.HOME = home
     process.env.CODEX_HOME = nested
     try {
       const provider = createCodexProvider()
-      expect(names(await provider.discoverSessions())).toEqual(['rollout-buzz.jsonl'])
+      expect(names(await provider.discoverSessions()).sort()).toEqual([
+        'rollout-billed-only.jsonl',
+        'rollout-billed.jsonl',
+        'rollout-buzz-only.jsonl',
+      ])
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME
+      else process.env.HOME = prevHome
+      if (prevCodex === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = prevCodex
+    }
+  })
+
+  it('exported codex singleton dedups nest ids against billed home', async () => {
+    const home = root
+    const primary = join(home, '.codex')
+    const nested = join(home, '.buzz', '.codex')
+    await writeCodexSession(primary, 'rollout-billed.jsonl', 'sess-shared')
+    await writeCodexSession(nested, 'rollout-renamed.jsonl', 'sess-shared')
+    await writeCodexSession(nested, 'rollout-buzz-only.jsonl', 'sess-buzz')
+    const prevHome = process.env.HOME
+    const prevCodex = process.env.CODEX_HOME
+    process.env.HOME = home
+    process.env.CODEX_HOME = nested
+    vi.resetModules()
+    try {
+      const { codex } = await import('../src/providers/codex.js')
+      expect(names(await codex.discoverSessions()).sort()).toEqual([
+        'rollout-billed.jsonl',
+        'rollout-buzz-only.jsonl',
+      ])
     } finally {
       if (prevHome === undefined) delete process.env.HOME
       else process.env.HOME = prevHome

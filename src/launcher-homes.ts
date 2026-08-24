@@ -23,8 +23,9 @@ export function sameCodexHome(a: string, b: string): boolean {
 }
 
 /** True when `dir` is a Codex home nested under a launcher nest, and a distinct
- *  primary Codex home exists. Gate for overlap-only filtering on a *second*
- *  provider instance — it does not by itself drop sessions. */
+ *  primary Codex home exists. Gate for overlap-only filtering — it does not by
+ *  itself drop sessions. The production no-arg factory uses this to walk both
+ *  trees; an explicit nest factory uses it to drop overlapping nest ids. */
 export function isNestedLauncherCodexHome(
   dir: string,
   opts: { primaryDir: string; launcherRoots: string[] },
@@ -125,7 +126,7 @@ export function collectLauncherNotes(home = homedir()): LauncherNote[] {
       name: 'buzz',
       path: buzz,
       billedVia: 'codex',
-      verdict: 'LAUNCHER (billed via Codex)',
+      verdict: 'LAUNCHER (heuristic; billed via Codex)',
     })
   }
   const grokStore = join(home, '.grok')

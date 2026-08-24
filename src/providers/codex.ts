@@ -1330,24 +1330,40 @@ export async function parseCodexFileFull(source: SessionSource, seenKeys: Set<st
   return { calls, ...(capture.write ? { write: capture.write } : {}) }
 }
 
+function rootsFor(home: string): ProbeRoot[] {
+  return [
+    { path: join(home, 'sessions'), label: 'sessions' },
+    { path: join(home, 'archived_sessions'), label: 'archived' },
+  ]
+}
+
+function dropOverlappingNestSources(sources: SessionSource[], billedHome: string): SessionSource[] {
+  const billedIds = listRolloutSessionIds(billedHome)
+  return sources.filter(source => {
+    const id = rolloutFileSessionId(source.path)
+    return !(id && billedIds.has(id))
+  })
+}
+
 export function createCodexProvider(
   codexDir?: string,
   opts?: { primaryDir?: string; launcherRoots?: string[] },
 ): Provider {
   const dir = getCodexDir(codexDir)
-  // Production singleton (no args) still honors CODEX_HOME / override as the
-  // one root. An explicit nest path — even without second-factory opts —
-  // overlap-filters against the default billed home using defaultLauncherRoots
-  // so a future createCodexProvider(nest) cannot double-count session ids.
   const primaryDir = opts?.primaryDir ?? defaultBilledCodexHome()
   const launcherRoots = opts?.launcherRoots ?? defaultLauncherRoots()
+  // Explicit nest factory whose path is a realpath alias of the billed home:
+  // empty so a second factory cannot double-count the same tree. The no-arg
+  // singleton must not take this branch — CODEX_HOME may be that alias.
   const duplicateHome =
     codexDir !== undefined &&
     sameCodexHome(dir, primaryDir) &&
     resolve(dir) !== resolve(primaryDir)
-  const filterOverlap =
-    codexDir !== undefined &&
-    isNestedLauncherCodexHome(dir, { primaryDir, launcherRoots })
+  const nestHome = isNestedLauncherCodexHome(dir, { primaryDir, launcherRoots })
+  // Production `codex` singleton is createCodexProvider() with no args. When
+  // the resolved dir is a launcher nest and ~/.codex is a distinct existing
+  // tree, walk BOTH and drop nest sources whose session id is already billed.
+  const scanBoth = nestHome && codexDir === undefined
 
   return {
     name: 'codex',
@@ -1364,13 +1380,12 @@ export function createCodexProvider(
       return toolNameMap[rawTool] ?? rawTool
     },
 
-    // Same `dir` discoverSessionsInDir walks: <codexDir>/sessions (dated
-    // rollout files) and <codexDir>/archived_sessions. Honors CODEX_HOME.
+    // Trees discoverSessions actually walks. Honors CODEX_HOME; when the
+    // production singleton scans nest + billed home, both appear here.
     async probeRoots(): Promise<ProbeRoot[]> {
-      return [
-        { path: join(dir, 'sessions'), label: 'sessions' },
-        { path: join(dir, 'archived_sessions'), label: 'archived' },
-      ]
+      if (duplicateHome) return []
+      if (scanBoth) return [...rootsFor(primaryDir), ...rootsFor(dir)]
+      return rootsFor(dir)
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
@@ -1378,12 +1393,12 @@ export function createCodexProvider(
       // distinct nest. isNestedLauncherCodexHome is false in that case.
       if (duplicateHome) return []
       const sources = await discoverSessionsInDir(dir)
-      if (!filterOverlap) return sources
-      const primaryIds = listRolloutSessionIds(primaryDir)
-      return sources.filter(source => {
-        const id = rolloutFileSessionId(source.path)
-        return !(id && primaryIds.has(id))
-      })
+      if (scanBoth) {
+        const billed = await discoverSessionsInDir(primaryDir)
+        return [...billed, ...dropOverlappingNestSources(sources, primaryDir)]
+      }
+      if (!nestHome) return sources
+      return dropOverlappingNestSources(sources, primaryDir)
     },
 
     createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
