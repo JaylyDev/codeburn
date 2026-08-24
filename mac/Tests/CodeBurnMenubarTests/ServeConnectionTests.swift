@@ -5,8 +5,8 @@ import Testing
 
 private let ignoredSIGPIPEHandlerBits = unsafeBitCast(SIG_IGN, to: UInt.self)
 private let coldTimeoutNanoseconds: UInt64 = 10 * 60 * 1_000_000_000
-private let warmTimeoutNanoseconds: UInt64 = 60 * 1_000_000_000
-private let terminationGraceNanoseconds: UInt64 = 1_000_000_000
+private let warmTimeoutNanoseconds: UInt64 = 45 * 1_000_000_000
+private let terminationGraceNanoseconds: UInt64 = 5 * 1_000_000_000
 
 private func currentSIGPIPEHandlerBits() -> UInt {
     var action = sigaction()

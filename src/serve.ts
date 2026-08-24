@@ -485,7 +485,15 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
     let drainTimer: ReturnType<typeof setTimeout> | undefined
     await Promise.race([queue, new Promise<void>(resolve => { drainTimer = setTimeout(resolve, drainMs) })])
     clearTimeout(drainTimer)
-    await watcherSetup
+    // Bounded and non-fatal for the same reason the drain is: the app is gone,
+    // and cleanup that hangs (watcher discovery on a stalled mount) or throws
+    // must not stop this child from reaching its exit.
+    let watcherTimer: ReturnType<typeof setTimeout> | undefined
+    await Promise.race([
+      watcherSetup.catch(() => undefined),
+      new Promise<void>(resolve => { watcherTimer = setTimeout(resolve, drainMs) }),
+    ])
+    clearTimeout(watcherTimer)
     rootReuseValidation = null
     try {
       watcherLifecycle.resetValidator?.()

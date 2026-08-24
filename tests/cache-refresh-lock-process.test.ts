@@ -130,6 +130,35 @@ describe('warm refresh child-process regression', () => {
     expect(Object.keys((await loadCache()).providers['regression']?.files ?? {})).toEqual([source])
   })
 
+  // #1117: the menubar/desktop watchdog kills a CLI child with SIGTERM first,
+  // precisely so the holder can unlink its own lock instead of leaving one for
+  // every later spawn to wait out.
+  it('unlinks its own lock when the holder is SIGTERMed mid-transaction', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cb-refresh-sigterm-'))
+    roots.push(root)
+    const cacheDir = join(root, 'cache')
+    const barriers = join(root, 'barriers')
+    await mkdir(cacheDir, { recursive: true })
+    await mkdir(barriers, { recursive: true })
+    process.env['CODEBURN_CACHE_DIR'] = cacheDir
+    const initial = emptyCache()
+    initial.complete = true
+    await saveCache(initial)
+    const source = join(root, 'changed.json')
+    await writeFile(source, JSON.stringify({ output: 505 }))
+
+    const holder = worker(cacheDir, barriers, 'a', source)
+    // The worker blocks on its save barrier while holding the lock.
+    await waitFor(join(barriers, 'a.parsed'))
+    const lock = join(cacheDir, 'session-refresh.lock')
+    expect(existsSync(lock)).toBe(true)
+
+    const exited = new Promise<void>(resolve => { holder.once('exit', () => resolve()) })
+    holder.kill('SIGTERM')
+    await exited
+    expect(existsSync(lock)).toBe(false)
+  })
+
   it('serializes disjoint parsed updates so the later publication cannot drop the first', async () => {
     const root = await mkdtemp(join(tmpdir(), 'cb-refresh-process-'))
     roots.push(root)

@@ -2450,11 +2450,16 @@ return program
 
 if (process.argv[2] === 'serve') {
   const { runStdioServe } = await import('./serve.js')
+  // Bind the REAL exit before serving. runCaptured() replaces process.exit with
+  // a throw for the duration of a request, and a request still in flight when
+  // the drain bound expires never restores it - so the exit below would throw
+  // instead of exiting, which is exactly the orphan this line prevents.
+  const hardExit = process.exit.bind(process)
   await runStdioServe(buildProgram)
   // stdin closed, so the owning app is gone. Exit outright: any handle that
   // outlives the transport (a watcher, a pending timer) would otherwise leave
   // this child running as an orphan for as long as the machine is up.
-  process.exit(0)
+  hardExit(0)
 } else {
   buildProgram().parse()
 }

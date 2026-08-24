@@ -36,7 +36,7 @@ import {
   saveCache,
   sourcePathStatCandidates,
 } from './session-cache.js'
-import { acquireCacheRefreshLock, type RefreshLockHandle } from './cache-refresh-lock.js'
+import { acquireCacheRefreshLock, type RefreshLockHandle, type RefreshLockOutcome } from './cache-refresh-lock.js'
 import { decideParseWorkers, parseFilesInOrder, ParseWorkerPool, type ClaudeWorkerParse, type ParseJob } from './parse-workers.js'
 import type { CodexFullParse } from './providers/codex.js'
 import { dateKey } from './day-aggregator.js'
@@ -4942,7 +4942,18 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
   // Keep the snapshot loaded before acquisition: timeout/unavailable paths serve
   // exactly this complete snapshot and never mutate or invalidate the holder.
   const priorSnapshot = diskCache
-  const refresh = await acquireCacheRefreshLock()
+  // Heartbeat the WAIT too, not just the parse behind it. This is the one place
+  // a healthy process is deliberately idle for a long stretch, and the desktop
+  // and menubar watchdogs read silence as a dead child - which is how a waiter
+  // blocked on an abandoned lock got killed at 45s and minted the next stale
+  // lock (#1117). runParse arms its own keepalive; this covers the gap before it.
+  startProgressKeepalive()
+  let refresh: RefreshLockOutcome
+  try {
+    refresh = await acquireCacheRefreshLock()
+  } finally {
+    stopProgressKeepalive()
+  }
   if (refresh.outcome === 'timed-out' || refresh.outcome === 'unavailable') {
     return runParse(key, priorSnapshot, dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   }
