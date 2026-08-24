@@ -45,6 +45,7 @@ struct CodeBurnApp: App {
         Settings {
             SettingsView()
                 .environment(delegate.store)
+                .environment(delegate.updateChecker)
         }
     }
 }
@@ -948,14 +949,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         statusItem = NSStatusBar.system.statusItem(withLength: statusItemWidth)
         guard let button = statusItem.button else { return }
 
-        // Set a simple SF Symbol image immediately to ensure the status item renders.
+        // Set the bundled flame image immediately to ensure the status item renders.
         // On macOS Tahoe, status items may fail to appear if only an attributed title
         // is set during initial setup.
-        let flameConfig = NSImage.SymbolConfiguration(pointSize: menubarTitleFontSize, weight: .medium)
-        let flame = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "CodeBurn")?
-            .withSymbolConfiguration(flameConfig)
-        flame?.isTemplate = true
-        button.image = flame
+        button.image = Self.menubarFlameImage(tint: nil)
         button.imagePosition = .imageLeading
 
         button.target = self
@@ -1009,6 +1006,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         }
     }
 
+    /// Loads the bundled binary-flame PNG (Resources/ProviderIcons/flame.png) at the
+    /// menubar text point size. With no tint it stays a template image so the system
+    /// auto-adapts to the menu bar; a tint returns a recolored non-template copy for
+    /// the budget/quota warning states.
+    private static func menubarFlameImage(tint: NSColor?) -> NSImage? {
+        // SwiftPM keeps the folder hierarchy for .process'd directories, but
+        // tolerate a flattened layout too so the lookup survives a rule change.
+        for subdirectory in ["Resources/ProviderIcons", "ProviderIcons", nil] {
+            guard let url = Bundle.module.url(forResource: "flame", withExtension: "png", subdirectory: subdirectory),
+                  let image = NSImage(contentsOf: url) else { continue }
+            let aspect = image.size.width / max(image.size.height, 1)
+            let size = NSSize(width: menubarTitleFontSize * aspect, height: menubarTitleFontSize)
+            guard let tint else {
+                image.isTemplate = true
+                image.size = size
+                return image
+            }
+            let recolored = NSImage(size: size, flipped: false) { rect in
+                image.draw(in: rect)
+                tint.set()
+                rect.fill(using: .sourceAtop)
+                return true
+            }
+            recolored.isTemplate = false
+            return recolored
+        }
+        return nil
+    }
+
     private func refreshStatusButton() {
         guard let button = statusItem.button else { return }
         // Skip while the popover is anchored to this button. Rewriting the
@@ -1024,7 +1050,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         button.imagePosition = .noImage
 
         let font = NSFont.monospacedDigitSystemFont(ofSize: menubarTitleFontSize, weight: .regular)
-        let baseConfig = NSImage.SymbolConfiguration(pointSize: menubarTitleFontSize, weight: .medium)
         // Tint the flame based on the worst-affected connected provider's quota.
         // Normal (<70%) keeps the template (auto white-on-dark / black-on-light);
         // warning/critical/danger override with a fixed palette color so the
@@ -1034,15 +1059,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         if tint == nil, store.isOverDailyBudget {
             tint = NSColor.systemYellow
         }
-        let flameConfig: NSImage.SymbolConfiguration
-        if let tint {
-            flameConfig = baseConfig.applying(.init(paletteColors: [tint]))
-        } else {
-            flameConfig = baseConfig
-        }
-        let flame = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "CodeBurn")?
-            .withSymbolConfiguration(flameConfig)
-        flame?.isTemplate = (tint == nil)
+        let flame = Self.menubarFlameImage(tint: tint)
 
         let attachment = NSTextAttachment()
         attachment.image = flame
@@ -1321,7 +1338,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         }
 
         let hosting = NSHostingController(
-            rootView: SettingsView().environment(store)
+            rootView: SettingsView().environment(store).environment(updateChecker)
         )
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 520, height: 380),

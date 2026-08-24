@@ -57,41 +57,67 @@ struct SettingsView: View {
         )
     }
 
+    private static let windowWidth: CGFloat = 880
+    private static let windowHeight: CGFloat = 620
+    private static let sidebarWidth: CGFloat = 260
+
     var body: some View {
-        NavigationSplitView {
-            VStack(spacing: 0) {
-                TextField("Search providers", text: $searchText)
-                    .textFieldStyle(.roundedBorder)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                List(selection: selection) {
-                    Section {
-                        SidebarTileRow(icon: "general", tile: Color(nsColor: .systemGray), title: "General")
-                            .tag("general")
-                        SidebarTileRow(icon: "about", tile: Color(white: 0.13), title: "About")
-                            .tag("about")
+        HStack(spacing: 0) {
+            // Layout modeled on CodexBar (MIT, steipete/CodexBar): a fixed-width
+            // sidebar (search, General/About, per-provider rows) over an
+            // edge-to-edge sidebar material, hairline divider, then the detail pane.
+            sidebar
+                .frame(width: Self.sidebarWidth)
+                .background {
+                    SettingsSidebarMaterial()
+                        .ignoresSafeArea()
+                }
+
+            Divider()
+                .ignoresSafeArea()
+
+            detailView
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .frame(width: Self.windowWidth, height: Self.windowHeight)
+        .background {
+            SettingsWindowStyleAccessor()
+                .allowsHitTesting(false)
+        }
+    }
+
+    private var sidebar: some View {
+        VStack(spacing: 0) {
+            SettingsSidebarSearchField(searchText: $searchText)
+                .padding(.horizontal, 8)
+                .padding(.top, 16)
+                .padding(.bottom, 8)
+
+            List(selection: selection) {
+                Section {
+                    SettingsSidebarPaneRow(pane: "general", title: "General", systemImage: "gearshape.fill", color: .gray)
+                    SettingsSidebarAboutRow()
+                }
+                Section {
+                    ForEach(filteredProviders) { provider in
+                        SettingsSidebarProviderRow(provider: provider)
+                            .tag(provider.id)
                     }
-                    Section {
-                        ForEach(filteredProviders) { provider in
-                            ProviderSidebarRow(provider: provider)
-                                .tag(provider.id)
-                        }
-                    } header: {
-                        HStack {
-                            Text("Providers")
-                            Spacer()
-                            Text("\(providers.filter(\.isConnected).count) on")
-                                .foregroundStyle(.secondary)
-                        }
+                } header: {
+                    HStack(spacing: 4) {
+                        Text("Providers")
+                        Spacer()
+                        Text("\(providers.filter(\.isConnected).count) on")
+                            .foregroundStyle(.tertiary)
+                            .monospacedDigit()
+                            .padding(.trailing, 10)
                     }
                 }
-                .listStyle(.sidebar)
             }
-            .navigationSplitViewColumnWidth(min: 230, ideal: 230, max: 230)
-        } detail: {
-            detailView
+            .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
         }
-        .frame(width: 860, height: 620)
+        .padding(.horizontal, 8)
     }
 
     @ViewBuilder
@@ -111,33 +137,14 @@ struct SettingsView: View {
 
 // MARK: - Sidebar support
 
-/// Loads one of the bundled 512px black-glyph PNGs (Resources/ProviderIcons)
-/// as a template NSImage so `tint` fully controls the rendered color.
-private struct ProviderIconView: View {
-    let name: String
-    let tint: Color
-
-    var body: some View {
-        if let image = ProviderIconCache.image(named: name) {
-            Image(nsImage: image)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .foregroundStyle(tint)
-        } else {
-            Image(systemName: "app.dashed")
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .foregroundStyle(tint)
-        }
-    }
-}
-
-/// PNG decode is too expensive to redo on every hover-driven body evaluation,
-/// so loaded template images are kept for the life of the process.
+/// PNG decode is too expensive to redo on every body evaluation, so loaded
+/// template images are kept for the life of the process.
 @MainActor
 private enum ProviderIconCache {
     private static var images: [String: NSImage] = [:]
 
+    /// Loads one of the bundled 512px black-glyph PNGs (Resources/ProviderIcons)
+    /// as a template NSImage so `foregroundStyle` fully controls the color.
     static func image(named name: String) -> NSImage? {
         if let cached = images[name] { return cached }
         // SwiftPM keeps the folder hierarchy for .process'd directories, but
@@ -154,48 +161,189 @@ private enum ProviderIconCache {
     }
 }
 
-/// General/About rows mimic System Settings: a fixed-color rounded square
-/// holding the white template glyph.
-private struct SidebarTileRow: View {
-    let icon: String
-    let tile: Color
-    let title: String
+/// Colored rounded-square symbol used for app panes in the settings sidebar,
+/// mirroring the System Settings sidebar style.
+private struct SettingsIconChip: View {
+    static let side: CGFloat = 20
+
+    let systemImage: String
+    let color: Color
 
     var body: some View {
-        HStack(spacing: 8) {
-            ProviderIconView(name: icon, tint: .white)
-                .frame(width: 15, height: 15)
-                .frame(width: 24, height: 24)
-                .background(RoundedRectangle(cornerRadius: 5).fill(tile))
-            Text(title)
-        }
+        Image(systemName: systemImage)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: Self.side, height: Self.side)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(LinearGradient(
+                        colors: [color.opacity(0.85), color],
+                        startPoint: .top,
+                        endPoint: .bottom)))
+            .accessibilityHidden(true)
     }
 }
 
-/// Provider rows carry no tile; the logo sits gray at rest and picks up the
-/// current accent color while hovered. A green dot marks connected panes.
-private struct ProviderSidebarRow: View {
-    @Environment(AppStore.self) private var store
-    let provider: SettingsView.ProviderPane
-    @State private var isHovered = false
+private struct SettingsSidebarPaneRow: View {
+    let pane: String
+    let title: String
+    let systemImage: String
+    let color: Color
 
     var body: some View {
         HStack(spacing: 8) {
-            ProviderIconView(
-                name: provider.icon,
-                tint: isHovered ? store.accentPreset.base : .secondary
-            )
-            .frame(width: 18, height: 18)
+            SettingsIconChip(systemImage: systemImage, color: color)
+            Text(title)
+        }
+        .tag(pane)
+    }
+}
+
+private struct SettingsSidebarAboutRow: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            if let icon = NSApplication.shared.applicationIconImage {
+                Image(nsImage: icon)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: SettingsIconChip.side, height: SettingsIconChip.side)
+                    .accessibilityHidden(true)
+            } else {
+                SettingsIconChip(systemImage: "info.circle.fill", color: .green)
+            }
+            Text("About")
+        }
+        .tag("about")
+    }
+}
+
+private struct SettingsSidebarProviderRow: View {
+    let provider: SettingsView.ProviderPane
+
+    var body: some View {
+        HStack(spacing: 8) {
+            SettingsSidebarBrandIcon(icon: provider.icon, isConnected: provider.isConnected)
+
             Text(provider.name)
-            Spacer()
+                .foregroundStyle(provider.isConnected ? .primary : .secondary)
+
+            Spacer(minLength: 4)
+
             if provider.isConnected {
                 Circle()
                     .fill(.green)
                     .frame(width: 6, height: 6)
+                    .accessibilityHidden(true)
             }
         }
-        .contentShape(Rectangle())
-        .onHover { isHovered = $0 }
+        .opacity(provider.isConnected ? 1 : 0.62)
+    }
+}
+
+private struct SettingsSidebarBrandIcon: View {
+    let icon: String
+    let isConnected: Bool
+
+    var body: some View {
+        Group {
+            if let image = ProviderIconCache.image(named: icon) {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                Image(systemName: "circle.dotted")
+                    .resizable()
+                    .scaledToFit()
+            }
+        }
+        .frame(width: 16, height: 16)
+        .foregroundStyle(isConnected ? .primary : .secondary)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct SettingsSidebarSearchField: View {
+    @Binding var searchText: String
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+
+            TextField("Search providers", text: $searchText)
+                .textFieldStyle(.plain)
+
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Clear")
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .font(.callout)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color(nsColor: .textBackgroundColor).opacity(0.6)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.6), lineWidth: 1))
+    }
+}
+
+/// Edge-to-edge sidebar material so the sidebar runs up behind the transparent
+/// titlebar, matching System Settings.
+private struct SettingsSidebarMaterial: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        configure(view)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        configure(nsView)
+    }
+
+    private func configure(_ view: NSVisualEffectView) {
+        view.material = .sidebar
+        view.blendingMode = .behindWindow
+        view.state = .followsWindowActiveState
+    }
+}
+
+/// Applies the System Settings window chrome (transparent, separator-less
+/// titlebar over full-size content) to whichever window hosts this view.
+/// Needed because the SwiftUI Settings scene exposes no styling hooks.
+private struct SettingsWindowStyleAccessor: NSViewRepresentable {
+    func makeNSView(context: Context) -> SettingsWindowStyleView {
+        SettingsWindowStyleView()
+    }
+
+    func updateNSView(_ nsView: SettingsWindowStyleView, context: Context) {
+        nsView.applyStyle()
+    }
+}
+
+private final class SettingsWindowStyleView: NSView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applyStyle()
+    }
+
+    func applyStyle() {
+        guard let window else { return }
+        // Full-size content lets the sidebar material extend behind the
+        // titlebar so the edge-to-edge sidebar reaches the top of the window.
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .visible
+        window.titlebarSeparatorStyle = .none
+        window.styleMask.insert(.fullSizeContentView)
     }
 }
 
@@ -1252,36 +1400,113 @@ private struct DevinSettingsTab: View {
 // MARK: - About
 
 private struct AboutSettingsTab: View {
-    private let appVersion: String = AppVersion.normalizedBundleShortVersion
-    private let buildVersion: String = AppVersion.normalizedBundleBuildVersion
+    @Environment(UpdateChecker.self) private var updateChecker
+
+    private var versionString: String {
+        let version = AppVersion.normalizedBundleShortVersion
+        let build = AppVersion.normalizedBundleBuildVersion
+        return "\(version) (\(build))"
+    }
 
     var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "flame.fill")
-                .font(.system(size: 40))
-                .foregroundStyle(Theme.brandAccent)
-            Text("CodeBurn")
-                .font(.system(size: 18, weight: .semibold))
-            Text("AI Coding Cost Tracker")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-            Text("Version \(appVersion) (\(buildVersion))")
-                .font(.codeMono(size: 11))
-                .foregroundStyle(.secondary)
-            Link(destination: URL(string: "https://github.com/getagentseal/codeburn")!) {
-                Label("Star on GitHub", systemImage: "star.fill")
-                    .font(.system(size: 12, weight: .medium))
+        Form {
+            Section {
+                hero
+                    .frame(maxWidth: .infinity)
+                    .listRowBackground(Color.clear)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(Theme.brandAccent)
-            HStack(spacing: 10) {
-                Link("GitHub", destination: URL(string: "https://github.com/getagentseal/codeburn")!)
-                Link("Issues", destination: URL(string: "https://github.com/getagentseal/codeburn/issues")!)
-                Link("Sponsor", destination: URL(string: "https://github.com/sponsors/iamtoruk")!)
+
+            Section {
+                LabeledContent("Version \(versionString)") {
+                    Button("Check for Updates") {
+                        Task { await updateChecker.check() }
+                    }
+                }
+                if let error = updateChecker.updateError {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else if updateChecker.updateAvailable, let latest = updateChecker.latestVersion {
+                    Text("\(AppVersion.display(latest)) is available — choose Check for Updates in the CodeBurn menu to install it.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Updates")
             }
-            .font(.system(size: 12))
+
+            Section {
+                AboutLinkRow(
+                    icon: "chevron.left.slash.chevron.right",
+                    title: "GitHub",
+                    url: "https://github.com/getagentseal/codeburn")
+                AboutLinkRow(
+                    icon: "globe",
+                    title: "Website",
+                    url: "https://codeburn.app")
+                AboutLinkRow(
+                    icon: "exclamationmark.bubble",
+                    title: "Issues",
+                    url: "https://github.com/getagentseal/codeburn/issues")
+            } header: {
+                Text("Links")
+            } footer: {
+                Text("© AgentSeal")
+                    .frame(maxWidth: .infinity)
+                    .multilineTextAlignment(.center)
+            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding()
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+    }
+
+    private var hero: some View {
+        VStack(spacing: 10) {
+            if let icon = NSApplication.shared.applicationIconImage {
+                Image(nsImage: icon)
+                    .resizable()
+                    .frame(width: 64, height: 64)
+                    .cornerRadius(12)
+            }
+
+            VStack(spacing: 2) {
+                Text("CodeBurn")
+                    .font(.title3).fontWeight(.semibold)
+                Text("Version \(versionString)")
+                    .foregroundStyle(.secondary)
+                Text("AI Coding Cost Tracker")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+private struct AboutLinkRow: View {
+    let icon: String
+    let title: String
+    let url: String
+    @State private var hovering = false
+
+    var body: some View {
+        Button {
+            if let url = URL(string: self.url) { NSWorkspace.shared.open(url) }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .frame(width: 18)
+                    .foregroundStyle(.secondary)
+                Text(title)
+                    .foregroundStyle(.primary)
+                Spacer()
+                Image(systemName: "arrow.up.right")
+                    .font(.caption)
+                    .foregroundStyle(hovering ? Color.accentColor : Color.secondary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
     }
 }
