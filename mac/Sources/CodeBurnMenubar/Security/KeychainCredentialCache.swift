@@ -35,7 +35,7 @@ enum KeychainCredentialCacheError: Error, LocalizedError, Equatable {
         case let .deleteFailed(service, status):
             return "Keychain delete failed for \(service) (status \(status))."
         case .unavailable:
-            return "Keychain unavailable — unlock your login keychain to refresh quota."
+            return "Keychain unavailable. Unlock your login keychain to refresh quota."
         }
     }
 

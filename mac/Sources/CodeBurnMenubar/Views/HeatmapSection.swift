@@ -56,13 +56,14 @@ struct HeatmapSection: View {
     }
 
     private var visibleModes: [InsightMode] {
-        // Plan sources from a provider's OAuth usage endpoint. Currently
-        // implemented for Claude (Anthropic) and Codex (ChatGPT). Hidden on
-        // All / Cursor / Droid / Gemini / Copilot until those providers ship
-        // their own quota data sources.
+        // Plan sources from a provider's live quota endpoint. Currently
+        // implemented for Claude (Anthropic), Codex (ChatGPT), Kimi Code,
+        // Gemini (Google Code Assist), Copilot (GitHub), and Antigravity
+        // (local language server on 127.0.0.1). Hidden on All / Cursor /
+        // Droid, which have no quota source of their own.
         InsightMode.allCases.filter { mode in
             if mode == .plan {
-                return store.selectedProvider == .claude || store.selectedProvider == .codex || store.selectedProvider == .kimiCode
+                return store.selectedProvider == .claude || store.selectedProvider == .codex || store.selectedProvider == .kimiCode || store.selectedProvider == .gemini || store.selectedProvider == .copilot || store.selectedProvider == .antigravity
             }
             return true
         }
@@ -82,6 +83,12 @@ struct HeatmapSection: View {
                 CodexPlanInsight()
             } else if store.selectedProvider == .kimiCode {
                 KimiPlanInsight()
+            } else if store.selectedProvider == .gemini {
+                GeminiPlanInsight()
+            } else if store.selectedProvider == .copilot {
+                CopilotPlanInsight()
+            } else if store.selectedProvider == .antigravity {
+                AntigravityPlanInsight()
             } else {
                 PlanInsight(usage: store.subscription)
             }
@@ -1733,7 +1740,7 @@ private struct PlanInsight: View {
                     loadedBody(usage: usage)
                 } else {
                     PlanFailedView(
-                        error: store.subscriptionError ?? "Anthropic temporarily unreachable — retrying."
+                        error: store.subscriptionError ?? "Anthropic temporarily unreachable. Retrying."
                     ) { refreshSubscriptionThroughAppDelegate() }
                 }
             case let .terminalFailure(reason):
@@ -2040,7 +2047,7 @@ private struct CodexPlanInsight: View {
                     loadedBody(usage: usage)
                 } else {
                     PlanFailedView(
-                        error: store.codexError ?? "ChatGPT temporarily unreachable — retrying."
+                        error: store.codexError ?? "ChatGPT temporarily unreachable. Retrying."
                     ) { Task { await store.refreshCodex() } }
                 }
             case let .terminalFailure(reason):
@@ -2221,7 +2228,7 @@ private struct KimiPlanInsight: View {
                 ) { Task { await store.refreshKimi() } }
             case .transientFailed:
                 PlanFailedView(
-                    error: store.kimiError ?? "Kimi temporarily unreachable — retrying."
+                    error: store.kimiError ?? "Kimi temporarily unreachable. Retrying."
                 ) { Task { await store.refreshKimi() } }
             case let .reconnect(reason):
                 PlanReconnectView(
@@ -2286,6 +2293,272 @@ private struct KimiPlanInsight: View {
                     .foregroundStyle(.tertiary)
             }
             if KimiQuotaPresentation.isStale(fetchedAt: usage.fetchedAt) {
+                Text("as of \(shortTime(usage.fetchedAt))")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+    }
+
+    private func relativeReset(_ date: Date) -> String {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .short
+        return f.localizedString(for: date, relativeTo: Date())
+    }
+
+    private func shortTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f.string(from: date)
+    }
+}
+
+/// Plan tab for Gemini. Reads the CLI credential file read-only (no keychain,
+/// tokens stay in memory; refresh only via the CLI's env overrides), so
+/// terminal failure means "run the Gemini CLI once to refresh your login".
+private struct GeminiPlanInsight: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        Group {
+            switch GeminiQuotaPresentation.planContent(loadState: store.geminiLoadState, hasUsage: store.geminiUsage != nil) {
+            case .noCredentials:
+                PlanNoCredentialsView(
+                    title: "No Gemini credentials found",
+                    message: "Sign in with the Gemini CLI first. Then click Try Again."
+                ) { Task { await store.bootstrapGemini() } }
+            case .loading:
+                PlanLoadingView(message: "Reading Gemini credentials...")
+            case .failed:
+                PlanFailedView(
+                    error: store.geminiError
+                ) { Task { await store.refreshGemini() } }
+            case .transientFailed:
+                PlanFailedView(
+                    error: store.geminiError ?? "Gemini temporarily unreachable. Retrying."
+                ) { Task { await store.refreshGemini() } }
+            case let .reconnect(reason):
+                PlanReconnectView(
+                    title: "Refresh Gemini login",
+                    reason: reason,
+                    fallback: "Your Gemini login has expired. Run the Gemini CLI once to refresh it, then click Reconnect."
+                ) { Task { await store.bootstrapGemini() } }
+            case let .usage(idle):
+                if let usage = store.geminiUsage {
+                    loadedBody(usage: usage, idle: idle)
+                } else {
+                    PlanLoadingView(message: "Reading Gemini credentials...")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func loadedBody(usage: GeminiUsage, idle: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(usage.plan ?? "Gemini")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Spacer()
+                if let resetsAt = usage.primary?.resetsAt {
+                    Text("Resets \(relativeReset(resetsAt))")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            ForEach(Array(usage.details.enumerated()), id: \.offset) { _, window in
+                UtilizationRow(
+                    label: window.label,
+                    percent: window.usedPercent,
+                    resetsAt: window.resetsAt,
+                    projection: nil
+                )
+            }
+            if idle {
+                Text("Login idle. Run the Gemini CLI to refresh.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            if GeminiQuotaPresentation.isStale(fetchedAt: usage.fetchedAt) {
+                Text("as of \(shortTime(usage.fetchedAt))")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+    }
+
+    private func relativeReset(_ date: Date) -> String {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .short
+        return f.localizedString(for: date, relativeTo: Date())
+    }
+
+    private func shortTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f.string(from: date)
+    }
+}
+
+/// Plan tab for Copilot. Reads the editor plugins' credential files read-only
+/// (no keychain, no refresh path), so terminal failure means "sign in via an
+/// editor's Copilot plugin again".
+private struct CopilotPlanInsight: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        Group {
+            switch CopilotQuotaPresentation.planContent(loadState: store.copilotLoadState, hasUsage: store.copilotUsage != nil) {
+            case .noCredentials:
+                PlanNoCredentialsView(
+                    title: "No Copilot credentials found",
+                    message: "Sign in via an editor's Copilot plugin first. Then click Try Again."
+                ) { Task { await store.bootstrapCopilot() } }
+            case .loading:
+                PlanLoadingView(message: "Reading Copilot credentials...")
+            case .failed:
+                PlanFailedView(
+                    error: store.copilotError
+                ) { Task { await store.refreshCopilot() } }
+            case .transientFailed:
+                PlanFailedView(
+                    error: store.copilotError ?? "GitHub temporarily unreachable. Retrying."
+                ) { Task { await store.refreshCopilot() } }
+            case let .reconnect(reason):
+                PlanReconnectView(
+                    title: "Refresh Copilot login",
+                    reason: reason,
+                    fallback: "Your Copilot sign-in has expired. Sign in via an editor's Copilot plugin again, then click Reconnect."
+                ) { Task { await store.bootstrapCopilot() } }
+            case let .usage(idle):
+                if let usage = store.copilotUsage {
+                    loadedBody(usage: usage, idle: idle)
+                } else {
+                    PlanLoadingView(message: "Reading Copilot credentials...")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func loadedBody(usage: CopilotUsage, idle: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(usage.plan ?? "Copilot")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Spacer()
+            }
+            ForEach(Array(usage.details.enumerated()), id: \.offset) { _, window in
+                UtilizationRow(
+                    label: window.label,
+                    percent: window.usedPercent,
+                    resetsAt: window.resetsAt,
+                    projection: nil
+                )
+            }
+            if idle {
+                Text("Login idle. Sign in via an editor's Copilot plugin to refresh.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            if CopilotQuotaPresentation.isStale(fetchedAt: usage.fetchedAt) {
+                Text("as of \(shortTime(usage.fetchedAt))")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+    }
+
+    private func shortTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f.string(from: date)
+    }
+}
+
+/// Plan tab for Antigravity. Quota comes from the Antigravity app's local
+/// language server (127.0.0.1 only, self-signed TLS) — there are no
+/// credentials to read, so the no-data state means "start the Antigravity
+/// app, then reconnect".
+private struct AntigravityPlanInsight: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        Group {
+            switch AntigravityQuotaPresentation.planContent(loadState: store.antigravityLoadState, hasUsage: store.antigravityUsage != nil) {
+            case .noCredentials:
+                PlanNoCredentialsView(
+                    title: "No local Antigravity server found",
+                    message: "Start the Antigravity app, then click Try Again."
+                ) { Task { await store.bootstrapAntigravity() } }
+            case .loading:
+                PlanLoadingView(message: "Probing the local Antigravity server...")
+            case .failed:
+                PlanFailedView(
+                    error: store.antigravityError
+                ) { Task { await store.refreshAntigravity() } }
+            case .transientFailed:
+                PlanFailedView(
+                    error: store.antigravityError ?? "Local Antigravity server unreachable. Retrying."
+                ) { Task { await store.refreshAntigravity() } }
+            case let .reconnect(reason):
+                PlanReconnectView(
+                    title: "Reconnect Antigravity",
+                    reason: reason,
+                    fallback: "Start the Antigravity app, then click Reconnect."
+                ) { Task { await store.bootstrapAntigravity() } }
+            case let .usage(idle):
+                if let usage = store.antigravityUsage {
+                    loadedBody(usage: usage, idle: idle)
+                } else {
+                    PlanLoadingView(message: "Probing the local Antigravity server...")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func loadedBody(usage: AntigravityUsage, idle: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(usage.plan ?? "Antigravity")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Spacer()
+                if let resetsAt = usage.primary?.resetsAt {
+                    Text("Resets \(relativeReset(resetsAt))")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            ForEach(Array(usage.details.enumerated()), id: \.offset) { _, window in
+                UtilizationRow(
+                    label: window.label,
+                    percent: window.usedPercent,
+                    resetsAt: window.resetsAt,
+                    projection: nil
+                )
+            }
+            if idle {
+                Text("Server disconnected. Start the Antigravity app to refresh.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            if AntigravityQuotaPresentation.isStale(fetchedAt: usage.fetchedAt) {
                 Text("as of \(shortTime(usage.fetchedAt))")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)

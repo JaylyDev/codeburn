@@ -48,6 +48,13 @@ mkdir -p "${BUNDLE}/Contents/Resources"
 cp "${BUILT_BINARY}" "${BUNDLE}/Contents/MacOS/${EXECUTABLE_NAME}"
 cp "${ICON_SOURCE}" "${BUNDLE}/Contents/Resources/menubar-logo.png"
 
+# SwiftPM emits target resources as a sibling bundle; Bundle.module traps at
+# runtime if it is missing from Contents/Resources, so ship it when present.
+SPM_RESOURCE_BUNDLE="${BIN_PATH}/${EXECUTABLE_NAME}_${EXECUTABLE_NAME}.bundle"
+if [[ -d "${SPM_RESOURCE_BUNDLE}" ]]; then
+  cp -R "${SPM_RESOURCE_BUNDLE}" "${BUNDLE}/Contents/Resources/"
+fi
+
 ICONSET="${DIST_DIR}/AppIcon.iconset"
 rm -rf "${ICONSET}"
 mkdir -p "${ICONSET}"
