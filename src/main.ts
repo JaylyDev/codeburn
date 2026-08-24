@@ -2,7 +2,7 @@ import { isAbsolute } from 'path'
 import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
-import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
+import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, getPricingGenerationKey } from './models.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint, isSessionHydrationComplete } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
 import { getProvider } from './providers/index.js'
@@ -1149,9 +1149,31 @@ program
         // serving the old currency's numbers until a session file happens to
         // change too.
         currency: getCurrency(),
+        // Upstream/bundled pricing DATA and CODE version, as opposed to the
+        // four hashes above (user-editable pricing CONFIG): the live LiteLLM
+        // cache's freshness, the bundled snapshot's own content, and the
+        // parser/pricing logic's semantic version. None of these move the
+        // corpus fingerprint or any config hash, so without this a repricing
+        // fetch or a pricing-logic fix can keep serving old rendered costs
+        // indefinitely against an unchanged session corpus.
+        pricingGenerationKey: getPricingGenerationKey(),
       })
-      const corpus = await computeCorpusFingerprint(pf)
-      const snapshot = await loadStatusSnapshot(corpus.hash, corpus.newestMtimeMs, queryKey)
+      // Optimize findings (the default; see --no-optimize) depend on mutable
+      // project/config/prompt/hook state — ~/.claude and project-level
+      // settings.json, CLAUDE.md, defined skills/agents/commands, MCP config
+      // — that computeCorpusFingerprint and queryKey never observe and that
+      // has no single enumerable fingerprint. Persisting THIS class of output
+      // would mean editing a hook or removing an unused skill leaves the
+      // menubar showing stale findings with no session change to ever
+      // invalidate them. Simplest correct fix: the optimize path never reads
+      // or writes the disk snapshot at all, it always recomputes fresh.
+      // (Computing scanAndDetect's findings requires the same parsed project
+      // data the snapshot exists to avoid recomputing, so skipping the
+      // snapshot loses no additional work versus fingerprinting these inputs
+      // — that path would still force a fresh parse to re-scan them.)
+      const useSnapshot = !queryScope.optimize
+      const corpus = useSnapshot ? await computeCorpusFingerprint(pf) : null
+      const snapshot = corpus ? await loadStatusSnapshot(corpus.hash, corpus.newestMtimeMs, queryKey) : null
       const payload = (snapshot ?? await buildMenubarPayloadForRange(periodInfo, {
         ...queryScope,
         daysSelection,
@@ -1162,7 +1184,7 @@ program
       // fingerprint would make that degraded answer look authoritative to
       // every future poll that matches this fingerprint — never checkpoint a
       // partial hydration as if it were a real, complete parse.
-      if (!snapshot && isSessionHydrationComplete()) await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, queryKey, payload)
+      if (useSnapshot && corpus && !snapshot && isSessionHydrationComplete()) await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, queryKey, payload)
       if (opts.scope === 'combined') {
         // Combined multi-device usage is best-effort enrichment on the menubar's
         // hot path. Never let pulling peers (or a corrupt remotes store) take

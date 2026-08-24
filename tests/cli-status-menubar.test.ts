@@ -1,10 +1,11 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { statSync } from 'node:fs'
+import { existsSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter as pathDelimiter, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 import { describe, expect, it, vi } from 'vitest'
+import { CACHE_SCHEMA_VERSION } from '../src/models.js'
 
 // Every case here spawns the real CLI and does genuine multi-provider parse
 // work; the 5s default is fine on a dev laptop and not on a shared 2-core
@@ -708,6 +709,95 @@ describe('codeburn status --format menubar-json', () => {
       expect(settled.status, `stderr: ${settled.stderr}`).toBe(0)
       const settledPayload = JSON.parse(settled.stdout) as { current: { calls: number } }
       expect(settledPayload.current.calls).toBe(2)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('reprices from an updated live LiteLLM cache instead of serving a stale snapshot', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-pricing-gen-'))
+
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'myapp')
+      await mkdir(projectDir, { recursive: true })
+      const now = new Date()
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
+      const ts = (offset: number) => new Date(base.getTime() + offset).toISOString().replace(/\.\d+Z$/, 'Z')
+      await writeFile(
+        join(projectDir, 'session.jsonl'),
+        [userLine('s1', ts(0)), assistantLine('s1', ts(60_000), 'msg-1')].join('\n'),
+      )
+
+      const cacheDir = join(home, '.cache', 'codeburn')
+      await mkdir(cacheDir, { recursive: true })
+      const liveCachePath = join(cacheDir, 'litellm-pricing.json')
+      const writeLivePricing = (timestamp: number, inputCost: number, outputCost: number) =>
+        writeFile(liveCachePath, JSON.stringify({
+          version: CACHE_SCHEMA_VERSION,
+          timestamp,
+          data: { 'claude-sonnet-4-5': { inputCostPerToken: inputCost, outputCostPerToken: outputCost, cacheWriteCostPerToken: inputCost * 1.25, cacheReadCostPerToken: inputCost * 0.1, webSearchCostPerRequest: 0.01, fastMultiplier: 1 } },
+        }))
+
+      const args = ['status', '--format', 'menubar-json', '--period', 'today', '--provider', 'claude', '--no-optimize']
+
+      await writeLivePricing(Date.now(), 1e-6, 5e-6)
+      const first = runCli(args, home)
+      expect(first.status, `stderr: ${first.stderr}`).toBe(0)
+      const firstCost = (JSON.parse(first.stdout) as { current: { cost: number } }).current.cost
+
+      // Same session corpus, no config/currency change — only the live
+      // LiteLLM cache's price and timestamp move. Before the fix, the
+      // persisted status snapshot has no way to observe this and would keep
+      // serving `firstCost` indefinitely.
+      await writeLivePricing(Date.now() + 1000, 2e-6, 10e-6)
+      const second = runCli(args, home)
+      expect(second.status, `stderr: ${second.stderr}`).toBe(0)
+      const secondCost = (JSON.parse(second.stdout) as { current: { cost: number } }).current.cost
+
+      expect(secondCost).toBeCloseTo(firstCost * 2, 5)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('never persists or serves the default optimize-enabled payload from the status snapshot', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-optimize-cache-'))
+
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'myapp')
+      await mkdir(projectDir, { recursive: true })
+      const now = new Date()
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
+      const ts = (offset: number) => new Date(base.getTime() + offset).toISOString().replace(/\.\d+Z$/, 'Z')
+      await writeFile(
+        join(projectDir, 'session.jsonl'),
+        [userLine('s1', ts(0)), assistantLine('s1', ts(60_000), 'msg-1')].join('\n'),
+      )
+
+      const args = ['status', '--format', 'menubar-json', '--period', 'today', '--provider', 'claude']
+
+      const before = runCli(args, home)
+      expect(before.status, `stderr: ${before.stderr}`).toBe(0)
+      const findingsBefore = (JSON.parse(before.stdout) as { optimize: { findingCount: number } }).optimize.findingCount
+
+      const snapshotPath = join(home, '.cache', 'codeburn', 'status-snapshot.json')
+      expect(existsSync(snapshotPath)).toBe(false)
+
+      // Mutable, non-fingerprinted optimize input: an unused custom agent
+      // definition. The session corpus is untouched, so a corpus-fingerprint-
+      // keyed snapshot would never notice this changed.
+      const agentsDir = join(home, '.claude', 'agents')
+      await mkdir(agentsDir, { recursive: true })
+      await writeFile(join(agentsDir, 'ghost-agent.md'), '# never invoked this period')
+
+      const after = runCli(args, home)
+      expect(after.status, `stderr: ${after.stderr}`).toBe(0)
+      const findingsAfter = (JSON.parse(after.stdout) as { optimize: { findingCount: number } }).optimize.findingCount
+
+      expect(findingsAfter).toBe(findingsBefore + 1)
+      expect(existsSync(snapshotPath)).toBe(false)
     } finally {
       await rm(home, { recursive: true, force: true })
     }
