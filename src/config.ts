@@ -4,12 +4,15 @@ import { homedir } from 'os'
 import { randomBytes } from 'crypto'
 import { PLAN_PROVIDERS } from './plans.js'
 
-export type PlanId = 'claude-pro' | 'claude-max' | 'claude-max-5x' | 'cursor-pro' | 'supergrok' | 'supergrok-heavy' | 'custom' | 'none'
-export type PlanProvider = 'claude' | 'codex' | 'cursor' | 'grok' | 'all'
+export type PlanId = 'claude-pro' | 'claude-max' | 'claude-max-5x' | 'cursor-pro' | 'supergrok' | 'supergrok-heavy' | 'copilot-pro' | 'copilot-pro-plus' | 'copilot-max' | 'custom' | 'none'
+export type PlanProvider = 'claude' | 'codex' | 'cursor' | 'grok' | 'copilot' | 'all'
 
 export type Plan = {
   id: PlanId
   monthlyUsd: number
+  // Copilot plans budget in AI credits. monthlyUsd stays as credits × $0.01 so
+  // isActivePlan and add-only JSON keep working. Absent on USD plans.
+  monthlyCredits?: number
   provider: PlanProvider
   resetDay?: number
   setAt: string
