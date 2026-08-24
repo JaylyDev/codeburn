@@ -13,6 +13,7 @@ const LOGIN: Record<QuotaProvider['provider'], { command?: string; hint?: string
   gemini: { command: 'gemini', hint: 'then sign in when prompted' },
   copilot: { note: 'Sign in to GitHub Copilot in your editor (VS Code or JetBrains), then Refresh.' },
   antigravity: { note: 'Open Antigravity and sign in, then Refresh — quota comes from its local server only.' },
+  kimi: { command: 'kimi', hint: 'then sign in when prompted' },
 }
 
 /** Inline "Connect" affordance for a disconnected or access-denied provider: a
