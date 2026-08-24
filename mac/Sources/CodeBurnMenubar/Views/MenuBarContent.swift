@@ -384,7 +384,7 @@ private struct Header: View {
             HStack {
                 VStack(alignment: .leading, spacing: 1) {
                     FlameWordmark()
-                    Text("AI Coding Cost Tracker")
+                    Text("Your AI Bill, Itemized")
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                 }

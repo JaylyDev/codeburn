@@ -52,7 +52,7 @@ enum GeminiSubscriptionService {
             case .tokenExpired:
                 return "Gemini login expired. Run the Gemini CLI once to refresh, then try again."
             case .accountTierRetired:
-                return "Google retired Gemini CLI OAuth for this account tier — use Antigravity."
+                return "Google retired Gemini CLI OAuth for this account tier. Use Antigravity."
             case let .rateLimited(retryAt):
                 let f = RelativeDateTimeFormatter()
                 f.unitsStyle = .short

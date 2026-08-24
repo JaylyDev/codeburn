@@ -1740,7 +1740,7 @@ private struct PlanInsight: View {
                     loadedBody(usage: usage)
                 } else {
                     PlanFailedView(
-                        error: store.subscriptionError ?? "Anthropic temporarily unreachable — retrying."
+                        error: store.subscriptionError ?? "Anthropic temporarily unreachable. Retrying."
                     ) { refreshSubscriptionThroughAppDelegate() }
                 }
             case let .terminalFailure(reason):
@@ -2047,7 +2047,7 @@ private struct CodexPlanInsight: View {
                     loadedBody(usage: usage)
                 } else {
                     PlanFailedView(
-                        error: store.codexError ?? "ChatGPT temporarily unreachable — retrying."
+                        error: store.codexError ?? "ChatGPT temporarily unreachable. Retrying."
                     ) { Task { await store.refreshCodex() } }
                 }
             case let .terminalFailure(reason):
@@ -2228,7 +2228,7 @@ private struct KimiPlanInsight: View {
                 ) { Task { await store.refreshKimi() } }
             case .transientFailed:
                 PlanFailedView(
-                    error: store.kimiError ?? "Kimi temporarily unreachable — retrying."
+                    error: store.kimiError ?? "Kimi temporarily unreachable. Retrying."
                 ) { Task { await store.refreshKimi() } }
             case let .reconnect(reason):
                 PlanReconnectView(
@@ -2339,7 +2339,7 @@ private struct GeminiPlanInsight: View {
                 ) { Task { await store.refreshGemini() } }
             case .transientFailed:
                 PlanFailedView(
-                    error: store.geminiError ?? "Gemini temporarily unreachable — retrying."
+                    error: store.geminiError ?? "Gemini temporarily unreachable. Retrying."
                 ) { Task { await store.refreshGemini() } }
             case let .reconnect(reason):
                 PlanReconnectView(
@@ -2431,7 +2431,7 @@ private struct CopilotPlanInsight: View {
                 ) { Task { await store.refreshCopilot() } }
             case .transientFailed:
                 PlanFailedView(
-                    error: store.copilotError ?? "GitHub temporarily unreachable — retrying."
+                    error: store.copilotError ?? "GitHub temporarily unreachable. Retrying."
                 ) { Task { await store.refreshCopilot() } }
             case let .reconnect(reason):
                 PlanReconnectView(
@@ -2513,7 +2513,7 @@ private struct AntigravityPlanInsight: View {
                 ) { Task { await store.refreshAntigravity() } }
             case .transientFailed:
                 PlanFailedView(
-                    error: store.antigravityError ?? "Local Antigravity server unreachable — retrying."
+                    error: store.antigravityError ?? "Local Antigravity server unreachable. Retrying."
                 ) { Task { await store.refreshAntigravity() } }
             case let .reconnect(reason):
                 PlanReconnectView(

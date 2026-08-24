@@ -83,7 +83,7 @@ struct SettingsView: View {
         }
         .frame(minWidth: Self.windowWidth, maxWidth: .infinity, minHeight: Self.windowHeight, maxHeight: .infinity)
         .background {
-            SettingsWindowStyleAccessor()
+            SettingsWindowStyleAccessor(title: currentPaneTitle)
                 .allowsHitTesting(false)
         }
     }
@@ -120,6 +120,15 @@ struct SettingsView: View {
             .scrollContentBackground(.hidden)
         }
         .padding(.horizontal, 8)
+    }
+
+    private var currentPaneTitle: String {
+        switch selection.wrappedValue {
+        case "general": return "General"
+        case "about": return "About"
+        default:
+            return providers.first { $0.id == selection.wrappedValue }?.name ?? "Settings"
+        }
     }
 
     @ViewBuilder
@@ -328,16 +337,21 @@ private struct SettingsSidebarMaterial: NSViewRepresentable {
 /// titlebar over full-size content) to whichever window hosts this view.
 /// Needed because the SwiftUI Settings scene exposes no styling hooks.
 private struct SettingsWindowStyleAccessor: NSViewRepresentable {
+    let title: String
+
     func makeNSView(context: Context) -> SettingsWindowStyleView {
         SettingsWindowStyleView()
     }
 
     func updateNSView(_ nsView: SettingsWindowStyleView, context: Context) {
+        nsView.paneTitle = title
         nsView.applyStyle()
     }
 }
 
 private final class SettingsWindowStyleView: NSView {
+    var paneTitle = "Settings"
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         applyStyle()
@@ -354,6 +368,8 @@ private final class SettingsWindowStyleView: NSView {
         window.titlebarSeparatorStyle = .none
         window.styleMask.insert(.fullSizeContentView)
         window.styleMask.insert(.resizable)
+        // Match System Settings: the window is named after the visible pane.
+        window.title = paneTitle
         window.collectionBehavior.insert(.fullScreenPrimary)
         // The frameAutosave may restore a position saved when the window was
         // smaller, leaving the grown window hanging off the screen edge —
@@ -1556,7 +1572,7 @@ private struct AboutSettingsTab: View {
     private var versionString: String {
         let version = AppVersion.normalizedBundleShortVersion
         let build = AppVersion.normalizedBundleBuildVersion
-        return "\(version) (\(build))"
+        return build == version ? version : "\(version) (\(build))"
     }
 
     var body: some View {
