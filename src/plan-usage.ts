@@ -83,12 +83,14 @@ function planCallSpend(plan: Plan, call: { costUSD: number; nanoAiu?: number }):
   return isFiniteNanoAiu(call.nanoAiu) ? creditsToUsd(nanoAiuToCredits(call.nanoAiu)) : 0
 }
 
-function forEachPlanTurn(projects: ProjectSummary[], visit: (calls: ParsedApiCall[]) => void): void {
+function forEachPlanSession(projects: ProjectSummary[], visit: (calls: ParsedApiCall[]) => void): void {
   for (const project of projects) {
     for (const session of project.sessions ?? []) {
+      const calls: ParsedApiCall[] = []
       for (const turn of session.turns ?? []) {
-        visit(turn.assistantCalls ?? [])
+        calls.push(...(turn.assistantCalls ?? []))
       }
+      visit(calls)
     }
   }
 }
@@ -96,7 +98,10 @@ function forEachPlanTurn(projects: ProjectSummary[], visit: (calls: ParsedApiCal
 export function copilotCreditSpend(projects: ProjectSummary[]): { spentCredits: number; creditsIncomplete: boolean } {
   let nanoSum = 0
   let creditsIncomplete = false
-  forEachPlanTurn(projects, calls => {
+  // Pairing is session-wide. foldCopilotSupplementaryTurns will not fold a
+  // supplementary twin across a local-day boundary, so both nanoAiu rows can
+  // occupy separate turns of the same session. Close the twin once here.
+  forEachPlanSession(projects, calls => {
     const copilot = calls.filter(call => call.provider === 'copilot')
     if (copilot.length === 0) return
     const primaryNano = copilot.filter(call => !call.supplementaryAccounting && isFiniteNanoAiu(call.nanoAiu))

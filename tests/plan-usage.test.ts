@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 import { savePlan, type Plan } from '../src/config.js'
-import { activePlansFromMap, computePeriodFromResetDay, getPlanScopedProjects, getPlanUsage, getPlanUsageFromProjects, getPlanUsages } from '../src/plan-usage.js'
+import { activePlansFromMap, computePeriodFromResetDay, copilotCreditSpend, getPlanScopedProjects, getPlanUsage, getPlanUsageFromProjects, getPlanUsages } from '../src/plan-usage.js'
 import type { ProjectSummary } from '../src/types.js'
 
 const { parseAllSessionsMock } = vi.hoisted(() => ({
@@ -446,19 +446,24 @@ function usageCall(overrides: {
   }
 }
 
-function usageProject(calls: ReturnType<typeof usageCall>[]): ProjectSummary {
+function usageProjectFromTurns(turns: ReturnType<typeof usageCall>[][]): ProjectSummary {
+  const calls = turns.flat()
   return {
     project: 'codeburn',
     projectPath: '/tmp/codeburn',
     totalCostUSD: calls.reduce((sum, call) => sum + call.costUSD, 0),
     totalApiCalls: calls.length,
     sessions: [{
-      turns: [{
-        timestamp: calls[0]!.timestamp,
-        assistantCalls: calls,
-      }],
+      turns: turns.map(assistantCalls => ({
+        timestamp: assistantCalls[0]!.timestamp,
+        assistantCalls,
+      })),
     }],
   } as ProjectSummary
+}
+
+function usageProject(calls: ReturnType<typeof usageCall>[]): ProjectSummary {
+  return usageProjectFromTurns([calls])
 }
 
 describe('copilot AI credit plan math', () => {
@@ -564,6 +569,34 @@ describe('copilot AI credit plan math', () => {
       ]),
     ], today)
 
+    expect(usage.spentCredits).toBe(1.5)
+    expect(usage.creditsIncomplete).toBe(false)
+  })
+
+  it('does not double credits when nanoAiu twins sit in separate session turns', () => {
+    // foldCopilotSupplementaryTurns refuses a local-day-boundary pair, so the
+    // supplementary twin stays on its own turn. Credit math must still close
+    // once at session scope.
+    const projects = [
+      usageProjectFromTurns([
+        [usageCall({
+          provider: 'copilot',
+          costUSD: 0.001605,
+          timestamp: '2026-08-05T18:25:00.000Z',
+          nanoAiu: 1_500_000_000,
+        })],
+        [usageCall({
+          provider: 'copilot',
+          costUSD: 0.001605,
+          timestamp: '2026-08-05T18:35:00.000Z',
+          nanoAiu: 1_500_000_000,
+          supplementaryAccounting: true,
+        })],
+      ]),
+    ]
+
+    expect(copilotCreditSpend(projects).spentCredits).toBe(1.5)
+    const usage = getPlanUsageFromProjects(copilotPro, projects, today)
     expect(usage.spentCredits).toBe(1.5)
     expect(usage.creditsIncomplete).toBe(false)
   })
