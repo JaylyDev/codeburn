@@ -113,11 +113,25 @@ const memCaches = new Map<string, ResultCache>()
 // flushCodexCache() in the parse's finally, so the next load re-reads disk.
 export function clearCodexMemCaches(): void {
   memCaches.clear()
+  inFlightLoads.clear()
 }
 
-async function loadCache(cacheDir: string): Promise<ResultCache> {
+// Concurrent callers must share one load. The memo below is only populated
+// after the read + JSON.parse resolves, so without this every in-flight caller
+// would re-read and re-parse the same (hundreds-of-MB) cache file.
+const inFlightLoads = new Map<string, Promise<ResultCache>>()
+
+function loadCache(cacheDir: string): Promise<ResultCache> {
   const inMemory = memCaches.get(cacheDir)
-  if (inMemory) return inMemory
+  if (inMemory) return Promise.resolve(inMemory)
+  const pending = inFlightLoads.get(cacheDir)
+  if (pending) return pending
+  const load = loadCacheFromDisk(cacheDir).finally(() => inFlightLoads.delete(cacheDir))
+  inFlightLoads.set(cacheDir, load)
+  return load
+}
+
+async function loadCacheFromDisk(cacheDir: string): Promise<ResultCache> {
   const empty = { version: CODEX_CACHE_VERSION, files: {} }
   const versioned = await readExistingTextFile(getCachePath(cacheDir))
   if (versioned.status === 'ok') {

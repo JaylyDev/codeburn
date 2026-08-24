@@ -54,9 +54,9 @@ export type CachedCall = {
   activeDurationMs?: number
   activeGeneratedTokens?: number
   toolWaitMs?: number
-  // Copilot session-store billing metadata (capture-only; no report consumes
-  // these yet — see ParsedProviderCall). Omitted when the store's schema
-  // predates the columns.
+  // Copilot session-store billing metadata. Plan math reads nanoAiu (1e9 = 1
+  // credit). requestMultiplier stays capture-only. Omitted when the store's
+  // schema predates the columns.
   nanoAiu?: number
   requestMultiplier?: number
   // Copilot shutdown rollups only: stamp of the last successful in-session
@@ -65,6 +65,10 @@ export type CachedCall = {
   // Copilot session-store rows only: the store's `initiator` label when
   // present. See ParsedProviderCall.initiator.
   initiator?: string
+  // Hermes observation-time deltas persist this so a warm read does not
+  // depend on the `:obs:` key regex alone. Copilot still assigns the flag
+  // at serve time and does not persist it.
+  supplementaryAccounting?: boolean
 }
 
 export type CachedTurn = {
@@ -528,6 +532,17 @@ export function isCacheComplete(cache: SessionCache): boolean {
   return cache.complete === true
 }
 
+/** Pre-parse probe of the same question `isCacheComplete` answers after a load:
+ *  is the next parse going to be a cold hydration? Reads only the (tiny)
+ *  envelope, so a caller can branch on coldness before paying for the shards.
+ *  A cache still in a legacy layout has no envelope and reads as cold — the
+ *  adoption in `loadCache` may still make it warm, which costs the caller
+ *  nothing: a warm cache has an entry for every discovered file, so a
+ *  cold-start optimisation keyed on missing entries simply finds no work. */
+export async function isColdCacheOnDisk(): Promise<boolean> {
+  return (await readEnvelope(sessionCacheDir()))?.complete !== true
+}
+
 function isNum(v: unknown): v is number {
   return typeof v === 'number' && Number.isFinite(v)
 }
@@ -614,6 +629,7 @@ function validateCall(c: unknown): c is CachedCall {
     && isOptionalBool(o['userModified'])
     && isOptionalNum(o['toolErrors'])
     && isOptionalNum(o['editFailed'])
+    && isOptionalBool(o['supplementaryAccounting'])
     && validateUsage(o['usage'])
 }
 

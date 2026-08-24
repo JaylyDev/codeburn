@@ -117,6 +117,19 @@ describe('getModelCosts', () => {
     expect(calculateCost('gpt-5.6-codex-max', 1_000_000, 1_000_000, 0, 0, 0)).toBeGreaterThan(0)
   })
 
+  it('prices claude-haiku-4.5 (copilot session-store raw id), aliased to the existing claude-haiku-4-5 row (#1093)', () => {
+    const haiku45 = getModelCosts('claude-haiku-4.5')
+    const haiku45Dash = getModelCosts('claude-haiku-4-5')
+    expect(haiku45).not.toBeNull()
+    expect(haiku45).toEqual(haiku45Dash)
+    expect(haiku45!.inputCostPerToken).toBe(1e-6)
+    expect(haiku45!.outputCostPerToken).toBe(5e-6)
+    expect(haiku45!.cacheWriteCostPerToken).toBe(1.25e-6)
+    expect(haiku45!.cacheReadCostPerToken).toBe(1e-7)
+    expect(haiku45!.cacheWriteCostIsExplicit).toBe(true)
+    expect(calculateCost('claude-haiku-4.5', 1_000_000, 1_000_000, 0, 0, 0)).toBe(6)
+  })
+
   // A price override on a synthetic bare id can only be reached if the leading
   // segment was stripped, so these assert the namespace allowlist itself without
   // pinning to any real model's presence in (or absence from) the snapshot.
@@ -125,7 +138,7 @@ describe('getModelCosts', () => {
 
     const known = ['anthropic', 'x-ai', 'xai', 'qwen', 'moonshotai', 'nousresearch', 'kimi',
       'litellm_proxy', 'openai_like', 'zhipu', 'mimo', 'xiaomi',
-      'cp', 'cline-pass', 'cline-free', 'cmd', 'antigravity']
+      'cp', 'cline-pass', 'cline-free', 'cmd', 'antigravity', 'orcarouter']
     for (const ns of known) {
       expect(getModelCosts(`${ns}/zzz-namespace-probe`), ns).not.toBeNull()
     }
@@ -146,16 +159,47 @@ describe('getModelCosts', () => {
       'omniroute:cline-free/zzz-router-probe',
       'omniroute:antigravity/zzz-router-probe',
       'omniroute:cmd/zzz-router-probe',
+      'omniroute:orcarouter/zzz-router-probe',
     ]
     for (const id of routed) expect(getModelCosts(id), id).not.toBeNull()
 
     expect(getModelCosts('omniroute:nosuchvendor/zzz-router-probe')).toBeNull()
+    // A nested unknown vendor inside a known routing wrapper must fail closed.
+    expect(getModelCosts('omniroute:orcarouter/nosuchvendor/zzz-router-probe')).toBeNull()
   })
 
   it('lets a user price override for a bare id win over the routed catalog row', () => {
     setPriceOverrides({ 'glm-5.3': { input: 99, output: 99 } })
     expect(getModelCosts('cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(99 / 1_000_000)
     expect(getModelCosts('omniroute:cp/cline-pass/glm-5.3')!.outputCostPerToken).toBe(99 / 1_000_000)
+  })
+
+  it('prices OrcaRouter fusion and nested upstreams; auto stays fail-closed', () => {
+    // `orcarouter/auto` rotates onto a Qwen/Llama flash model. No live probe
+    // pins a rate, so it stays unpriced rather than inheriting Sonnet.
+    expect(getModelCosts('orcarouter/auto')).toBeNull()
+
+    // The fusion routes currently resolve to openai/gpt-oss-120b (live 2026-08).
+    expect(getModelCosts('orcarouter/fusion')!.inputCostPerToken).toBe(
+      getModelCosts('openai/gpt-oss-120b')!.inputCostPerToken,
+    )
+    expect(getModelCosts('orcarouter/fusion-flash')!.inputCostPerToken).toBe(
+      getModelCosts('openai/gpt-oss-120b')!.inputCostPerToken,
+    )
+    expect(getModelCosts('orcarouter/fusion-mini')!.inputCostPerToken).toBe(
+      getModelCosts('openai/gpt-oss-120b')!.inputCostPerToken,
+    )
+
+    // Fully-qualified upstream ids peel to the exact LiteLLM row.
+    expect(getModelCosts('orcarouter/deepseek/deepseek-v4-pro')!.inputCostPerToken).toBe(
+      getModelCosts('deepseek/deepseek-v4-pro')!.inputCostPerToken,
+    )
+    expect(getModelCosts('orcarouter/deepseek/deepseek-v4-flash')!.outputCostPerToken).toBe(
+      getModelCosts('deepseek/deepseek-v4-flash')!.outputCostPerToken,
+    )
+
+    // A route id for an unknown upstream stays unpriced (fail closed).
+    expect(getModelCosts('orcarouter/nosuchvendor/zzz-router-probe')).toBeNull()
   })
 })
 
@@ -172,6 +216,13 @@ describe('resolveCanonicalModelId', () => {
     expect(resolveCanonicalModelId('claude-opus-4.6')).toBe('claude-opus-4-6')
     expect(resolveCanonicalModelId('kimi-code')).toBe('kimi-k2-thinking')
     expect(resolveCanonicalModelId('cline-pass/kimi-k3')).toBe('kimi-k3')
+    expect(resolveCanonicalModelId('orcarouter/auto')).not.toBe(resolveCanonicalModelId('claude-sonnet-4-5'))
+    expect(resolveCanonicalModelId('orcarouter/fusion')).toBe(resolveCanonicalModelId('openai/gpt-oss-120b'))
+    expect(resolveCanonicalModelId('orcarouter/fusion-flash')).toBe(resolveCanonicalModelId('openai/gpt-oss-120b'))
+    expect(resolveCanonicalModelId('orcarouter/fusion-mini')).toBe(resolveCanonicalModelId('openai/gpt-oss-120b'))
+    expect(resolveCanonicalModelId('orcarouter/deepseek/deepseek-v4-pro')).toBe(
+      resolveCanonicalModelId('deepseek/deepseek-v4-pro'),
+    )
   })
 })
 
@@ -234,6 +285,13 @@ describe('getShortModelName', () => {
     expect(getShortModelName('z-ai/glm-5.3')).toBe('GLM-5.3')
     expect(getShortModelName('xiaomi/glm-5.3')).toBe('GLM-5.3')
     expect(getShortModelName('cp/cline-pass/glm-5.3')).toBe('GLM-5.3')
+    // OrcaRouter route ids peel to the upstream id, which keeps the upstream label.
+    expect(getShortModelName('orcarouter/deepseek/deepseek-v4-pro')).toBe('DeepSeek v4 Pro')
+    // Route ids display as the model they route to, not a branded gateway label.
+    expect(getShortModelName('orcarouter/auto')).not.toBe(getShortModelName('claude-sonnet-4-5'))
+    expect(getShortModelName('orcarouter/fusion')).toBe(getShortModelName('openai/gpt-oss-120b'))
+    expect(getShortModelName('orcarouter/fusion-flash')).toBe(getShortModelName('openai/gpt-oss-120b'))
+    expect(getShortModelName('orcarouter/fusion-mini')).toBe(getShortModelName('openai/gpt-oss-120b'))
     // Grok Build prices via the grok-build-0.1 sibling.
     expect(getShortModelName('grok-build')).toBe('Grok Build')
     expect(getShortModelName('grok-build-0.1')).toBe('Grok Build')

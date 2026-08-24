@@ -344,8 +344,8 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
   }
 
   return {
-    'codeburn:getQuota': async (force?: boolean) => {
-      try { return { ok: true, value: await deps.getQuota({ force: Boolean(force) }) } }
+    'codeburn:getQuota': async (force?: boolean, disabled?: string[]) => {
+      try { return { ok: true, value: await deps.getQuota({ force: Boolean(force), disabled }) } }
       catch (error) { return { ok: false, error: { kind: 'nonzero', message: sanitizeError(error) } } }
     },
     'codeburn:getOverview': getOverview,

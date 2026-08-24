@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'crypto'
-import { existsSync } from 'fs'
+import { existsSync, readFileSync, unlinkSync } from 'fs'
 import { mkdir, open, readFile, stat, unlink, utimes, writeFile } from 'fs/promises'
 import { join } from 'path'
 
@@ -9,7 +9,13 @@ const LOCK_FILE = 'session-refresh.lock'
 const TAKEOVER_FILE = `${LOCK_FILE}.takeover`
 const DEFAULT_HEARTBEAT_MS = 10_000
 const DEFAULT_STALE_MS = 90_000
-const DEFAULT_WAIT_MS = 30_000
+// A waiter that gives up before the stale gate opens can NEVER recover an
+// abandoned lock, so an abandoned lock livelocks every later process: each one
+// burns its whole wait, times out, serves read-only, and the leftover survives
+// (#1117). The default is therefore derived from staleMs rather than fixed, so
+// the two can never drift back out of order. The common abandoned case does not
+// wait this long anyway - a dead holder's pid is detected on the first poll.
+const DEFAULT_WAIT_MARGIN_MS = 30_000
 const DEFAULT_POLL_MS = 100
 const WINDOWS_RETRIES = 3
 
@@ -49,6 +55,51 @@ const defaultClock: RefreshLockClock = {
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => { setTimeout(resolve, ms) })
+}
+
+// Mirrors session-cache.ts's hydrating.lock probe. Our own pid never counts as a
+// foreign holder. EPERM means the pid exists but belongs to another user - still
+// alive. Windows supports signal 0 as an existence test the same way.
+//
+// A false "alive" (the holder died and an unrelated process inherited its pid)
+// only delays recovery to the age gate. A false "dead" would be the dangerous
+// direction, and needs the lock file to have been written by a process on
+// another host - i.e. a cache dir on a network share, which nothing supports.
+function pidLooksAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false
+  try { process.kill(pid, 0); return true }
+  catch (err) { return (err as NodeJS.ErrnoException).code === 'EPERM' }
+}
+
+// The path of the lock this process currently owns, for the signal handler.
+// Single-flight guarantees at most one owned lock per process at a time.
+let ownedLockPath: string | null = null
+
+// Synchronous variant for the signal path: a handler can't await, so read +
+// unlink synchronously. Only unlinks a lock we actually own.
+function removeOurLockSync(): void {
+  if (!ownedLockPath) return
+  try {
+    const parsed = JSON.parse(readFileSync(ownedLockPath, 'utf-8')) as Partial<LockRecord>
+    if (parsed?.pid === process.pid) unlinkSync(ownedLockPath)
+  } catch { /* best-effort; nothing to clean or already gone */ }
+}
+
+// Arm once, only while we hold the lock: on a catchable termination (Ctrl-C, or
+// the menubar/desktop watchdog's SIGTERM) clean our lock before dying so a
+// killed refresh leaves no leftover. SIGKILL can't be caught, so that path still
+// relies on the waiter's dead-pid takeover. process.once + re-raise preserves
+// the default exit and any other listener. Mirrors session-cache.ts.
+let signalCleanupArmed = false
+function armSignalCleanup(): void {
+  if (signalCleanupArmed) return
+  signalCleanupArmed = true
+  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+    process.once(sig, () => {
+      removeOurLockSync()
+      process.kill(process.pid, sig)
+    })
+  }
 }
 
 function isBusyError(err: unknown): boolean {
@@ -198,7 +249,7 @@ export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}):
   const clock = options.clock ?? defaultClock
   const heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS
   const staleMs = options.staleMs ?? DEFAULT_STALE_MS
-  const waitMs = options.waitMs ?? DEFAULT_WAIT_MS
+  const waitMs = options.waitMs ?? staleMs + DEFAULT_WAIT_MARGIN_MS
   const pollMs = options.pollMs ?? DEFAULT_POLL_MS
   const sleep = options.sleep ?? delay
   const lockPath = join(cacheDir, LOCK_FILE)
@@ -219,6 +270,24 @@ export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}):
     return next
   }
 
+  // An abandoned lock is one whose heartbeat has FROZEN - mtime stops advancing
+  // the moment the holder dies or is displaced, and a live holder rewrites it
+  // every heartbeatMs - OR whose recorded holder pid is gone. The pid check is
+  // what turns a SIGKILLed holder from a full staleMs stall into a one-poll
+  // recovery; the age check still covers every holder we cannot probe (a corrupt
+  // body, a future version's record shape, a holder on another host).
+  //
+  // A LIVE holder is never abandoned by either clause, which is the whole safety
+  // argument: its heartbeat keeps the mtime inside staleMs and its pid answers
+  // signal 0. Our own pid is treated as alive so a leaked in-process handle is
+  // never stolen from either. Callers re-observe under the takeover guard and
+  // require the bytes to be unchanged before acting on this.
+  const abandoned = (observation: Observation): boolean => {
+    if (Math.max(0, clock.wallNow() - observation.mtimeMs) > staleMs) return true
+    const pid = observation.record?.pid
+    return pid !== undefined && pid !== process.pid && !pidLooksAlive(pid)
+  }
+
   const acquireTakeoverGuard = async (): Promise<'created' | 'exists' | 'unavailable'> => {
     const created = await createExclusive(takeoverPath, body())
     if (created !== 'exists') return created
@@ -226,7 +295,10 @@ export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}):
     if (staleGuard === 'missing') return createExclusive(takeoverPath, body())
     if (staleGuard === 'changing') return 'exists'
     if (staleGuard === 'unavailable') return 'unavailable'
-    if (Math.max(0, clock.wallNow() - staleGuard.mtimeMs) <= staleMs) return 'exists'
+    // Same abandonment test as the primary lock: a holder killed while it held
+    // the guard would otherwise block every takeover for a full staleMs and
+    // defeat the dead-pid fast path on the lock itself.
+    if (!abandoned(staleGuard)) return 'exists'
     const reverified = await observe(takeoverPath)
     if (reverified === 'missing') return createExclusive(takeoverPath, body())
     if (reverified === 'changing') return 'exists'
@@ -273,6 +345,8 @@ export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}):
   const makeHandle = (): RefreshLockHandle => {
     let released = false
     let heartbeatRunning = false
+    ownedLockPath = lockPath
+    armSignalCleanup()
     const heartbeat = setInterval(() => {
       void serializeOwnerOp(async () => {
         if (released || heartbeatRunning) return
@@ -316,6 +390,7 @@ export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}):
       release: async () => {
         if (released) return
         released = true
+        ownedLockPath = null
         clearInterval(heartbeat)
         while (heartbeatRunning) await sleep(1)
         await removeIfOwned()
@@ -340,7 +415,7 @@ export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}):
       if (current === 'unavailable') return { outcome: 'unavailable' }
       if (current === 'changing') return null
       if (current === 'missing' || !sameObservation(stale, current)) return null
-      if (Math.max(0, clock.wallNow() - current.mtimeMs) <= staleMs) return null
+      if (!abandoned(current)) return null
       if (!await retryWindowsMutation(() => unlink(lockPath), sleep)) return { outcome: 'unavailable' }
       // Publish the successor while the takeover guard is still canonical.
       // Otherwise a waiter can observe neither file and misclassify the narrow
@@ -390,8 +465,7 @@ export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}):
       // and left alone, because it may belong to a live owner whose heartbeat
       // will repair it. Worst case we time out and serve the prior snapshot
       // read-only for one staleMs window instead of freezing forever.
-      const age = Math.max(0, clock.wallNow() - observation.mtimeMs)
-      if (age > staleMs) {
+      if (abandoned(observation)) {
         const takeover = await tryTakeover(observation)
         if (takeover) {
           if (takeover.outcome !== 'acquired') leave()

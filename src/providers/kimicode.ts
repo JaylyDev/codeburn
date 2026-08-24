@@ -4,6 +4,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 
 import { extractBashCommands } from '../bash-utils.js'
 import { calculateCost } from '../models.js'
+import { FS_SCAN_CONCURRENCY, mapWithConcurrency } from '../fs-utils.js'
 import type { ParsedProviderCall, ProbeRoot, Provider, SessionParser, SessionSource } from './types.js'
 
 type JsonObject = Record<string, unknown>
@@ -121,39 +122,49 @@ function projectFromWorkDir(workDir: string, workDirKey: string): string {
   return match?.[1] || workDirKey.replace(/^wd_/, '') || 'kimicode'
 }
 
+// Walked one level at a time with each level fanned out, rather than as nested
+// serial loops: the tree is thousands of tiny state.json reads and wire.jsonl
+// stats, and issuing them one at a time left the corpus scan waiting on the
+// kernel. The final sort makes the result order independent of completion order.
 async function discoverSources(root: string): Promise<SessionSource[]> {
-  const sources: SessionSource[] = []
   const sessionsDir = join(root, 'sessions')
 
-  for (const workDirEntry of await directoryEntries(sessionsDir)) {
-    if (!workDirEntry.isDirectory() || !workDirEntry.name.startsWith('wd_')) continue
-    const workDirPath = join(sessionsDir, workDirEntry.name)
+  const workDirs = (await directoryEntries(sessionsDir))
+    .filter(e => e.isDirectory() && e.name.startsWith('wd_'))
+    .map(e => ({ key: e.name, path: join(sessionsDir, e.name) }))
 
-    for (const sessionEntry of await directoryEntries(workDirPath)) {
-      // Session dir naming differs by host product: the CLI uses session_*,
-      // embedded runtimes (desktop app, IDE) use conv-*/ctitle-*. Any directory
-      // is accepted; the agents/*/wire.jsonl probe below gates real sessions.
-      if (!sessionEntry.isDirectory()) continue
-      const sessionDir = join(workDirPath, sessionEntry.name)
-      const state = await readState(sessionDir)
-      const project = projectFromWorkDir(state.workDir ?? '', workDirEntry.name)
+  // Session dir naming differs by host product: the CLI uses session_*,
+  // embedded runtimes (desktop app, IDE) use conv-*/ctitle-*. Any directory is
+  // accepted; the agents/*/wire.jsonl probe below gates real sessions.
+  const sessionDirs = (await mapWithConcurrency(workDirs, FS_SCAN_CONCURRENCY, async wd =>
+    (await directoryEntries(wd.path))
+      .filter(e => e.isDirectory())
+      .map(e => ({ workDirKey: wd.key, sessionDir: join(wd.path, e.name) })),
+  )).flat()
 
-      for (const agentEntry of await directoryEntries(join(sessionDir, 'agents'))) {
-        if (!agentEntry.isDirectory()) continue
-        const wirePath = join(sessionDir, 'agents', agentEntry.name, 'wire.jsonl')
-        if (!await isFile(wirePath)) continue
-        sources.push({
-          path: wirePath,
-          project,
-          provider: 'kimicode',
-          sourceId: agentEntry.name,
-          sourceLabel: agentEntry.name,
-          sourcePath: state.workDir,
-        })
-      }
-    }
+  const agents = (await mapWithConcurrency(sessionDirs, FS_SCAN_CONCURRENCY, async sd => {
+    const state = await readState(sd.sessionDir)
+    const project = projectFromWorkDir(state.workDir ?? '', sd.workDirKey)
+    const agentsDir = join(sd.sessionDir, 'agents')
+    return (await directoryEntries(agentsDir))
+      .filter(e => e.isDirectory())
+      .map(e => ({ agentName: e.name, wirePath: join(agentsDir, e.name, 'wire.jsonl'), project, workDir: state.workDir }))
+  })).flat()
+
+  const present = await mapWithConcurrency(agents, FS_SCAN_CONCURRENCY, a => isFile(a.wirePath))
+
+  const sources: SessionSource[] = []
+  for (const [i, a] of agents.entries()) {
+    if (!present[i]) continue
+    sources.push({
+      path: a.wirePath,
+      project: a.project,
+      provider: 'kimicode',
+      sourceId: a.agentName,
+      sourceLabel: a.agentName,
+      sourcePath: a.workDir,
+    })
   }
-
   return sources.sort((a, b) => a.path.localeCompare(b.path))
 }
 

@@ -10,6 +10,7 @@ import { convertCost, formatCost } from './currency.js'
 import { renderStatusBar } from './format.js'
 import { toDateString } from './daily-cache.js'
 import { dateKey } from './day-aggregator.js'
+import { sessionModelBillableOutputTokens } from './session-output.js'
 import { isBehavioralCall } from './behavioral-weight.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import type { AppliedFix } from './act/types.js'
@@ -144,10 +145,16 @@ type JsonPlanSummary = {
   daysUntilReset: number
   periodStart: string
   periodEnd: string
+  monthlyCredits?: number
+  spentCredits?: number
+  budgetCredits?: number
+  creditsIncomplete?: boolean
+  monthlyUsd?: number
+  spentApiEquivalentUsd?: number
 }
 
 function toJsonPlanSummary(planUsage: PlanUsage): JsonPlanSummary {
-  return {
+  const summary: JsonPlanSummary = {
     id: planUsage.plan.id,
     provider: planUsage.plan.provider,
     budget: convertCost(planUsage.budgetUsd),
@@ -159,6 +166,15 @@ function toJsonPlanSummary(planUsage: PlanUsage): JsonPlanSummary {
     periodStart: planUsage.periodStart.toISOString(),
     periodEnd: planUsage.periodEnd.toISOString(),
   }
+  if (planUsage.plan.provider === 'copilot') {
+    summary.monthlyCredits = planUsage.plan.monthlyCredits
+    summary.spentCredits = planUsage.spentCredits
+    summary.budgetCredits = planUsage.budgetCredits
+    summary.creditsIncomplete = planUsage.creditsIncomplete
+    summary.monthlyUsd = planUsage.plan.monthlyUsd
+    summary.spentApiEquivalentUsd = planUsage.spentApiEquivalentUsd
+  }
+  return summary
 }
 
 type JsonPlanSummaryMap = Partial<Record<PlanProvider, JsonPlanSummary>>
@@ -383,6 +399,7 @@ function toPlanDisplay(plan: Plan) {
   return {
     id: plan.id,
     monthlyUsd: plan.monthlyUsd,
+    ...(plan.monthlyCredits != null ? { monthlyCredits: plan.monthlyCredits } : {}),
     provider: plan.provider,
     resetDay: clampResetDay(plan.resetDay),
     setAt: plan.setAt || null,
@@ -542,9 +559,16 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
       modelMap[model].savings += d.savingsUSD
       modelMap[model].estimatedCost += d.estimatedCostUSD ?? 0
       modelMap[model].inputTokens += d.tokens.inputTokens
-      modelMap[model].outputTokens += d.tokens.outputTokens
       modelMap[model].cacheReadTokens += d.tokens.cacheReadInputTokens
       modelMap[model].cacheWriteTokens += d.tokens.cacheCreationInputTokens
+    }
+    // Output must be billed per call while provider identity is still known.
+    // Join on the same key as parser modelBreakdown (getShortModelName), not raw call.model.
+    for (const [model, output] of Object.entries(sessionModelBillableOutputTokens(sess))) {
+      if (!modelMap[model]) {
+        modelMap[model] = { calls: 0, cost: 0, savings: 0, estimatedCost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, baselineModel: '' }
+      }
+      modelMap[model].outputTokens += output
     }
   }
   // Pull the active baseline model name out of the savings config so the
@@ -720,7 +744,7 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
 program
   .command('report', { isDefault: true })
   .description('Interactive usage dashboard')
-  .option('-p, --period <period>', 'Starting period: today, week, 30days, month, all, lifetime', 'week')
+  .option('-p, --period <period>', 'Starting period: today, week, 30days, month, all, lifetime (interactive default: today, or week when today is empty)', 'week')
   .option('--day <date>', 'Single day to review (YYYY-MM-DD, today, or yesterday). Overrides --period when set')
   .option('--from <date>', 'Start date (YYYY-MM-DD). Overrides --period when set')
   .option('--to <date>', 'End date (YYYY-MM-DD). Overrides --period when set')
@@ -729,7 +753,7 @@ program
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
   .option('--refresh <seconds>', 'Auto-refresh interval in seconds (minimum 60; 0 to disable)', parseInteger, 60)
-  .action(async (opts) => {
+  .action(async (opts, command) => {
     assertFormat(opts.format, ['tui', 'json'], 'report')
     assertProvider(opts.provider, 'report')
     let customRange: DateRange | null = null
@@ -761,7 +785,12 @@ program
       return
     }
     const customRangeLabel = customRange ? formatDateRangeLabel(opts.from, opts.to) : undefined
-    await renderDashboard(period, opts.provider, opts.refresh, opts.project, opts.exclude, customRange, customRangeLabel, daySelection?.day)
+    // #1111: no explicit period of any kind means the interactive dashboard
+    // picks its own — Today, or 7 days when today is still empty. Any source
+    // other than the option default (a flag, an env value) is the user's
+    // choice and is honored as given.
+    const autoPeriod = command.getOptionValueSource('period') === 'default' && !daySelection && !customRange
+    await renderDashboard(period, opts.provider, opts.refresh, opts.project, opts.exclude, customRange, customRangeLabel, daySelection?.day, autoPeriod)
   })
 
 program
@@ -1690,14 +1719,15 @@ program
   .description('Show or configure a subscription plan for overage tracking')
   .option('--format <format>', 'Output format: text or json', 'text')
   .option('--monthly-usd <n>', 'Monthly plan price in USD (for custom)', parseNumber)
-  .option('--provider <name>', 'Provider scope: all, claude, codex, cursor')
+  .option('--credits <n>', 'Monthly AI credits (copilot custom plans)', parseNumber)
+  .option('--provider <name>', `Provider scope: ${PLAN_PROVIDERS.join(', ')}`)
   .option('--reset-day <n>', 'Day of month plan resets (1-28)', parseInteger, 1)
-  .action(async (action?: string, id?: string, opts?: { format?: string; monthlyUsd?: number; provider?: string; resetDay?: number }) => {
+  .action(async (action?: string, id?: string, opts?: { format?: string; monthlyUsd?: number; credits?: number; provider?: string; resetDay?: number }) => {
     assertFormat(opts?.format ?? 'text', ['text', 'json'], 'plan')
     const mode = action ?? 'show'
     const providerOption = opts?.provider
     if (providerOption !== undefined && !isPlanProvider(providerOption)) {
-      console.error(`\n  --provider must be one of: all, claude, codex, cursor; got "${providerOption}".\n`)
+      console.error(`\n  --provider must be one of: ${PLAN_PROVIDERS.join(', ')}; got "${providerOption}".\n`)
       process.exitCode = 1
       return
     }
@@ -1726,7 +1756,7 @@ program
       console.log(`\n  Plans: ${plans.length}`)
       for (const plan of plans) {
         console.log(`  ${plan.provider}: ${planLabel(plan)} (${plan.id})`)
-        console.log(`    Budget: $${plan.monthlyUsd}/month`)
+        console.log(`    Budget: ${plan.provider === 'copilot' && plan.monthlyCredits != null ? `${plan.monthlyCredits} AI Credits` : `$${plan.monthlyUsd}/month`}`)
         console.log(`    Reset day: ${clampResetDay(plan.resetDay)}`)
         if (plan.setAt) console.log(`    Set at: ${plan.setAt}`)
       }
@@ -1774,18 +1804,56 @@ program
     }
 
     if (id === 'custom') {
-      if (opts?.monthlyUsd === undefined) {
+      const credits = opts?.credits
+      const monthlyUsdOpt = opts?.monthlyUsd
+      const provider = providerOption ?? 'all'
+
+      if (credits !== undefined && provider !== 'copilot') {
+        console.error('\n  --credits is only valid with --provider copilot.\n')
+        process.exitCode = 1
+        return
+      }
+
+      if (provider === 'copilot') {
+        if (monthlyUsdOpt !== undefined) {
+          console.error('\n  Copilot custom plans take --credits, not --monthly-usd (units mixed).\n')
+          process.exitCode = 1
+          return
+        }
+        if (credits === undefined) {
+          console.error('\n  Custom copilot plans require --credits <positive number>.\n')
+          process.exitCode = 1
+          return
+        }
+        if (!Number.isFinite(credits) || credits <= 0) {
+          console.error(`\n  --credits must be a positive finite number; got ${credits}.\n`)
+          process.exitCode = 1
+          return
+        }
+        await savePlan({
+          id: 'custom',
+          monthlyCredits: credits,
+          monthlyUsd: credits * 0.01,
+          provider: 'copilot',
+          resetDay,
+          setAt: new Date().toISOString(),
+        })
+        console.log(`\n  Plan set to custom (${credits} AI Credits, copilot, reset day ${resetDay}).`)
+        console.log(`  Config saved to ${getConfigFilePath()}\n`)
+        return
+      }
+
+      if (monthlyUsdOpt === undefined) {
         console.error('\n  Custom plans require --monthly-usd <positive number>.\n')
         process.exitCode = 1
         return
       }
-      const monthlyUsd = opts.monthlyUsd
+      const monthlyUsd = monthlyUsdOpt
       if (!Number.isFinite(monthlyUsd) || monthlyUsd <= 0) {
-        console.error(`\n  --monthly-usd must be a positive number; got ${opts.monthlyUsd}.\n`)
+        console.error(`\n  --monthly-usd must be a positive number; got ${monthlyUsdOpt}.\n`)
         process.exitCode = 1
         return
       }
-      const provider = providerOption ?? 'all'
       await savePlan({
         id: 'custom',
         monthlyUsd,
@@ -2437,11 +2505,16 @@ return program
 
 if (process.argv[2] === 'serve') {
   const { runStdioServe } = await import('./serve.js')
+  // Bind the REAL exit before serving. runCaptured() replaces process.exit with
+  // a throw for the duration of a request, and a request still in flight when
+  // the drain bound expires never restores it - so the exit below would throw
+  // instead of exiting, which is exactly the orphan this line prevents.
+  const hardExit = process.exit.bind(process)
   await runStdioServe(buildProgram)
   // stdin closed, so the owning app is gone. Exit outright: any handle that
   // outlives the transport (a watcher, a pending timer) would otherwise leave
   // this child running as an orphan for as long as the machine is up.
-  process.exit(0)
+  hardExit(0)
 } else {
   buildProgram().parse()
 }

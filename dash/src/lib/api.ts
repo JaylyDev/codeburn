@@ -71,6 +71,10 @@ export type Current = {
 
 export type Payload = {
   generated: string
+  // Only a producer that its clients poll (the resident serve child) ever sends
+  // this, and only it may answer partially. `complete: false` means the totals
+  // cover the files indexed so far. Absence must be read as complete.
+  hydration?: { complete: boolean; indexedFiles: number; totalFiles: number }
   current: Current
   history: { daily: DailyEntry[]; timeline?: GranularHistory }
 }
@@ -125,6 +129,7 @@ function normalizePayload(p?: Payload): Payload | undefined {
   } : undefined
   return {
     generated: p.generated,
+    ...(p.hydration ? { hydration: p.hydration } : {}),
     current: {
       label: c.label ?? '',
       cost: c.cost ?? 0,

@@ -1,7 +1,7 @@
 import { existsSync } from 'fs'
 import { lstat, readFile, readdir, stat } from 'fs/promises'
 import { basename, dirname, join, resolve, sep } from 'path'
-import { readSessionLines } from './fs-utils.js'
+import { FS_SCAN_CONCURRENCY, mapWithConcurrency, readSessionLines } from './fs-utils.js'
 import { billableOutputTokens, calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
 import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
 import { normalizeContentBlocks, flatSlice, flatString } from './content-utils.js'
@@ -11,6 +11,11 @@ import { antigravityCascadeIdFromPath, flushAntigravityCache, shouldReparseAntig
 import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { isSqliteBusyError } from './sqlite.js'
 import { getCodeburnCacheDir } from './cache-dir.js'
+import {
+  isHermesLedgerPublicationError,
+  isHermesObservationKey,
+  seedHermesCursorsFromProviderSection,
+} from './hermes-session-ledger.js'
 import {
   type CachedCall,
   type CachedFile,
@@ -31,7 +36,7 @@ import {
   saveCache,
   sourcePathStatCandidates,
 } from './session-cache.js'
-import { acquireCacheRefreshLock, type RefreshLockHandle } from './cache-refresh-lock.js'
+import { acquireCacheRefreshLock, type RefreshLockHandle, type RefreshLockOutcome } from './cache-refresh-lock.js'
 import { decideParseWorkers, parseFilesInOrder, ParseWorkerPool, type ClaudeWorkerParse, type ParseJob } from './parse-workers.js'
 import type { CodexFullParse } from './providers/codex.js'
 import { dateKey } from './day-aggregator.js'
@@ -1922,13 +1927,17 @@ async function collectJsonlInto(dir: string, out: Set<string>): Promise<void> {
 }
 
 export async function collectJsonlFiles(dirPath: string): Promise<string[]> {
-  const files = await readdir(dirPath).catch(() => [])
-  const jsonlFiles = new Set(files.filter(f => f.endsWith('.jsonl')).map(f => join(dirPath, f)))
+  const files = await readdir(dirPath, { withFileTypes: true }).catch(() => [])
+  const jsonlFiles = new Set(files.filter(f => f.name.endsWith('.jsonl')).map(f => join(dirPath, f.name)))
 
   await collectJsonlInto(join(dirPath, 'subagents'), jsonlFiles)
   for (const entry of files) {
-    if (entry.endsWith('.jsonl')) continue
-    await collectJsonlInto(join(dirPath, entry, 'subagents'), jsonlFiles)
+    if (entry.name.endsWith('.jsonl')) continue
+    // A plain file can't hold a subagents/ dir, so don't spend a readdir
+    // finding out. Anything else (real dir, symlink, unknown type) still gets
+    // probed, matching what the untyped readdir used to do.
+    if (entry.isFile()) continue
+    await collectJsonlInto(join(dirPath, entry.name, 'subagents'), jsonlFiles)
   }
 
   return [...jsonlFiles]
@@ -1969,36 +1978,48 @@ async function scanProjectDirs(
 
   const discoverProgress = createScanProgress('scanning claude project dirs', dirs.length)
   let dirsDone = 0
-  for (const { path: dirPath, name: dirName, source } of dirs) {
+  // Walk and fingerprint concurrently, then reconcile serially in discovery
+  // order: the reconcile loop feeds order-sensitive state (changedFiles order
+  // drives the worker-result pairing, seenMsgIds pre-seeding), so only the
+  // syscalls are allowed to overlap.
+  const walked = await mapWithConcurrency(dirs, FS_SCAN_CONCURRENCY, async ({ path: dirPath }) => {
     const jsonlFiles = await collectJsonlFiles(dirPath)
-    for (const filePath of jsonlFiles) {
-      allDiscoveredFiles.add(filePath)
-      const fp = await fingerprintFile(filePath)
-      if (!fp) continue
-
-      const cached = section.files[filePath]
-      const action = reconcileFile(fp, cached)
-      if (cached && (readOnly || action.action === 'unchanged')) {
-        if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
-        unchangedFiles.push({ filePath, dirName, source, cached: section.files[filePath]! })
-      } else if (!readOnly) {
-        if (action.action === 'appended') {
-          changedFiles.push({
-            filePath,
-            info: { dirName, fp, source },
-            append: { cached: section.files[filePath]!, readFromOffset: action.readFromOffset },
-          })
-          continue
-        }
-        changedFiles.push({ filePath, info: { dirName, fp, source } })
-      } else {
-        // Read-only with no cache entry at all: this file is dropped from what
-        // we serve, so the snapshot under-reports whatever days it covers.
-        readOnlyServedStale = true
-      }
-    }
     dirsDone++
     await discoverProgress.tick(dirsDone)
+    return jsonlFiles
+  })
+  const discovered: Array<{ filePath: string; dirName: string; source?: SessionSourceMetadata }> = []
+  for (let i = 0; i < dirs.length; i++) {
+    const { name: dirName, source } = dirs[i]!
+    for (const filePath of walked[i]!) discovered.push({ filePath, dirName, source })
+  }
+  const fingerprints = await mapWithConcurrency(discovered, FS_SCAN_CONCURRENCY, e => fingerprintFile(e.filePath))
+  for (const [i, { filePath, dirName, source }] of discovered.entries()) {
+    allDiscoveredFiles.add(filePath)
+    const fp = fingerprints[i]
+    if (!fp) continue
+
+    const cached = section.files[filePath]
+    const action = reconcileFile(fp, cached)
+    if (cached && (readOnly || action.action === 'unchanged')) {
+      if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
+      unchangedFiles.push({ filePath, dirName, source, cached: section.files[filePath]! })
+    } else if (!readOnly) {
+      if (deferToBackgroundFill(filePath, fp, cached)) continue
+      if (action.action === 'appended') {
+        changedFiles.push({
+          filePath,
+          info: { dirName, fp, source },
+          append: { cached: section.files[filePath]!, readFromOffset: action.readFromOffset },
+        })
+        continue
+      }
+      changedFiles.push({ filePath, info: { dirName, fp, source } })
+    } else {
+      // Read-only with no cache entry at all: this file is dropped from what
+      // we serve, so the snapshot under-reports whatever days it covers.
+      readOnlyServedStale = true
+    }
   }
   discoverProgress.finish()
 
@@ -2082,6 +2103,7 @@ async function scanProjectDirs(
 
   try {
     for (const { filePath, info, append } of changedFiles) {
+      filesParsedFromSource++
       // Marked here, not after the re-parse: an unreadable file `continue`s out
       // below, and the deletion would otherwise live only in memory.
       delete section.files[filePath]
@@ -2476,6 +2498,7 @@ function providerCallToTurn(call: ParsedProviderCall): ParsedTurn {
     bashCommands: call.bashCommands,
     deduplicationKey: call.deduplicationKey,
     isEstimated: call.costIsEstimated,
+    ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
   })
 
   const prRefs = extractPrUrlsFromText(call.userMessage)
@@ -2524,6 +2547,7 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
     ...(call.requestMultiplier != null ? { requestMultiplier: call.requestMultiplier } : {}),
     ...(call.compactedAt ? { compactedAt: call.compactedAt } : {}),
     ...(call.initiator ? { initiator: call.initiator } : {}),
+    ...(call.supplementaryAccounting ? { supplementaryAccounting: true } : {}),
     activeDurationMs: call.activeDurationMs,
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
@@ -2563,6 +2587,7 @@ function apiCallToCachedCall(call: ParsedApiCall): CachedCall {
     ...(call.interrupted ? { interrupted: true } : {}),
     ...(call.userModified ? { userModified: true } : {}),
     ...(call.toolErrors ? { toolErrors: call.toolErrors } : {}),
+    ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
     activeDurationMs: call.activeDurationMs,
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
@@ -2683,6 +2708,10 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
     activeDurationMs: call.activeDurationMs,
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
+    ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
+    ...(call.supplementaryAccounting || isHermesObservationKey(call.deduplicationKey)
+      ? { supplementaryAccounting: true }
+      : {}),
   })
 }
 
@@ -3213,6 +3242,19 @@ export async function parseProviderSources(
   const antigravityCacheDir = providerName === 'antigravity' ? getCodeburnCacheDir() : undefined
 
   const section = getOrCreateProviderSection(diskCache, providerName)
+  if (providerName === 'hermes' && !readOnly) {
+    try {
+      // Isolated migration: seed missing cursors from the already-loaded
+      // hermes section before any source is deleted in this parse loop.
+      await seedHermesCursorsFromProviderSection(section)
+    } catch (err) {
+      if (isHermesLedgerPublicationError(err)) {
+        deferredRetryableSource = true
+      } else {
+        throw err
+      }
+    }
+  }
   const allDiscoveredFiles = new Set<string>()
   const servedSources = [...sources]
 
@@ -3220,19 +3262,27 @@ export async function parseProviderSources(
   const unchangedSources: Array<{ source: SessionSource; cached: CachedFile }> = []
   const changedSources: SourceInfo[] = []
 
-  for (const source of sources) {
+  // Same shape as scanProjectDirs: overlap the stat syscalls, then reconcile in
+  // discovery order. Network sources on a write run never reach fingerprintFile
+  // (they take the synthetic-fingerprint branch below), so they are skipped here.
+  const skipFingerprint = provider.network && !readOnly
+  const sourceFingerprints = skipFingerprint
+    ? []
+    : await mapWithConcurrency(sources, FS_SCAN_CONCURRENCY, s => fingerprintFile(s.path))
+
+  for (const [sourceIndex, source] of sources.entries()) {
     allDiscoveredFiles.add(source.path)
 
     // Network providers (e.g. Vercel AI Gateway) have no on-disk file — their data
     // comes from a live API fetch in createSessionParser. There's nothing to
     // fingerprint or incrementally cache, so re-fetch every run with a synthetic
     // fingerprint (mtime=now so the date-range filter below never excludes it).
-    if (provider.network && !readOnly) {
+    if (skipFingerprint) {
       changedSources.push({ source, fp: { dev: 0, ino: 0, mtimeMs: Date.now(), sizeBytes: 0 } })
       continue
     }
 
-    const fp = await fingerprintFile(source.path)
+    const fp = sourceFingerprints[sourceIndex]
     if (!fp) {
       // A source that was discovered but cannot be fingerprinted is skipped —
       // but skipping is only safe when the file is genuinely GONE (discovery
@@ -3267,6 +3317,7 @@ export async function parseProviderSources(
       if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
       unchangedSources.push({ source, cached })
     } else if (!readOnly) {
+      if (deferToBackgroundFill(source.path, fp, cached)) continue
       changedSources.push({ source, fp })
     } else {
       // Read-only with no cache entry at all — see scanProjectDirs.
@@ -3364,6 +3415,7 @@ export async function parseProviderSources(
       if (dateRange) {
         if (fp.mtimeMs < dateRange.start.getTime()) continue
       }
+      filesParsedFromSource++
 
       // Clear stale entry before parse — but only once per path so that
       // multiple sources mapping to the same file path can merge their turns.
@@ -3476,7 +3528,7 @@ export async function parseProviderSources(
         didParse = true
         markCacheDirty(diskCache, providerName, source.path)
       } catch (err) {
-        if (isSqliteBusyError(err)) {
+        if (isSqliteBusyError(err) || isHermesLedgerPublicationError(err)) {
           // Deferred, not failed: the cache keeps serving this source's
           // previous rows and the next refresh retries. But the data this
           // read would have added is MISSING from this parse, so the run is a
@@ -4184,12 +4236,18 @@ function cacheKey(dateRange: DateRange | undefined, providerFilter: string | und
   // Flat-rate marks do not change parse-time cost (still $0 without a LiteLLM
   // row); findUnpricedModels / coverage apply them at render time, so they
   // stay out of this serve-memo key on purpose.
-  return `${s}:${providerFilter ?? 'all'}:${claudeRoots}:${getProxyPathsConfigHash()}:${getModelAliasesConfigHash()}:${getPriceOverridesConfigHash()}:${getLocalModelSavingsConfigHash()}`
+  // A first-paint parse sees a deliberately smaller file set, so its result may
+  // not be served to (or burst-reused by) an unfloored request — including the
+  // background fill that follows it moments later. Absent outside the scope, so
+  // every non-cold-start key is byte-identical to what it was.
+  const floor = firstPaintFloorMs === null ? '' : `:paint${firstPaintFloorMs}`
+  return `${s}:${providerFilter ?? 'all'}:${claudeRoots}:${getProxyPathsConfigHash()}:${getModelAliasesConfigHash()}:${getPriceOverridesConfigHash()}:${getLocalModelSavingsConfigHash()}${floor}`
 }
 
 export function clearSessionCache(): void {
   sessionCache.clear()
   canonicalPathCache.clear()
+  singlePassScope?.parses.clear()
 }
 
 function cachePut(key: string, data: ProjectSummary[], parseStartedAt: number) {
@@ -4476,14 +4534,24 @@ export function correlateCrossProviderPrSessions(projects: ProjectSummary[]): vo
   // mutating the child. This lets a Codex/Gemini/etc. review launched inside a
   // Claude subagent inherit the parent turn's PR while the subagent itself still
   // folds exactly once under the existing accounting model.
+  //
+  // Indexed once rather than re-filtered per child: the loop below only writes
+  // to `evidence`, so the unlinked set is fixed for its whole duration.
+  const unlinkedByAgentId = new Map<string | undefined, SessionSummary[]>()
+  for (const s of sessions) {
+    if (s.prLinks?.length) continue
+    const bucket = unlinkedByAgentId.get(s.agentId)
+    if (bucket) bucket.push(s)
+    else unlinkedByAgentId.set(s.agentId, [s])
+  }
   for (const resolved of resolveSubagentAttribution(projects).values()) {
     for (const child of resolved) {
       // A multi-PR spawn set is valid for folding the child's own cost, but is
       // too broad to identify which PR an independently saved nested review was
       // about. Require one PR for cross-provider propagation.
       if (child.unlinked || child.prSet?.length !== 1) continue
-      const matches = sessions.filter(s => !s.prLinks?.length && s.agentId === child.fold.agentId)
-      if (matches.length === 1) evidence.set(matches[0]!, child.prSet)
+      const matches = unlinkedByAgentId.get(child.fold.agentId)
+      if (matches?.length === 1) evidence.set(matches[0]!, child.prSet)
     }
   }
 
@@ -4513,6 +4581,21 @@ export function correlateCrossProviderPrSessions(projects: ProjectSummary[]): vo
   const PROMPT_PREFIX = 160
   const PROMPT_MIN = 80
   const LAUNCH_WINDOW_MS = 15 * 60 * 1000
+  // Sorted once so each candidate scans only the launches inside its own
+  // window instead of the whole array. Launch order is not observable: the
+  // match set is collapsed into a Map keyed by the sorted ref list, and
+  // assignCorrelatedPrs re-sorts what it is handed.
+  launches.sort((a, b) => a.atMs - b.atMs)
+  const firstLaunchAtOrAfter = (atMs: number): number => {
+    let lo = 0
+    let hi = launches.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (launches[mid]!.atMs < atMs) lo = mid + 1
+      else hi = mid
+    }
+    return lo
+  }
   for (const session of candidates) {
     const provider = summaryProvider(session)
     const prompt = session.turns
@@ -4522,12 +4605,14 @@ export function correlateCrossProviderPrSessions(projects: ProjectSummary[]): vo
     const prefix = prompt.slice(0, PROMPT_PREFIX)
     const startedMs = Date.parse(session.firstTimestamp)
     if (!Number.isFinite(startedMs)) continue
-    const matches = launches.filter(launch =>
-      launch.provider !== provider
-      && Math.abs(launch.atMs - startedMs) <= LAUNCH_WINDOW_MS
-      && launch.commands.some(command => command.includes(prefix))
-    )
-    const refSets = new Map(matches.map(m => [m.refs.slice().sort().join('\0'), m.refs]))
+    const refSets = new Map<string, string[]>()
+    for (let i = firstLaunchAtOrAfter(startedMs - LAUNCH_WINDOW_MS); i < launches.length; i++) {
+      const launch = launches[i]!
+      if (launch.atMs - startedMs > LAUNCH_WINDOW_MS) break
+      if (launch.provider === provider) continue
+      if (!launch.commands.some(command => command.includes(prefix))) continue
+      refSets.set(launch.refs.slice().sort().join('\0'), launch.refs)
+    }
     if (refSets.size === 1) {
       assignCorrelatedPrs(session, [...refSets.values()][0]!, 'launcher-prompt')
       if (session.prLinks?.length) evidence.set(session, session.prLinks)
@@ -4640,6 +4725,12 @@ export function isSessionHydrationComplete(): boolean {
   return sessionHydrationComplete
 }
 
+// Why the most recent parse was incomplete, when it was: true only when the
+// first-paint floor deferred files. Read by `sessionHydrationSnapshot` so the
+// serve payload can label a converging first paint without also claiming the
+// unrelated `stale` (read-only snapshot) condition.
+let sessionFirstPaintDeferred = false
+
 // Set by the read-only serving paths when the snapshot they served did NOT
 // match what is on disk: in read-only mode a changed file is served at its
 // stale fingerprint and a file with no cache entry is skipped entirely. A
@@ -4654,7 +4745,156 @@ let readOnlyServedStale = false
 // new data, so the run must not report hydration complete even in write mode.
 let deferredRetryableSource = false
 
+// One command invocation that renders a dashboard asks for several ranges that
+// differ only in where they END — the scan range runs to end-of-day, the
+// durable headline re-anchors on its own `new Date()`. The exact-key memo needs
+// both endpoints equal, so it never hits and each ran the whole pipeline again.
+// Inside this scope the declared range is parsed ONCE per provider filter and a
+// request that is a pure NARROWING of it is served by slicing that result.
+// Anything else parses normally.
+//
+// Pure narrowing means: same start, an end that is inside, and the same month
+// shard scope. All three are load-bearing, because a parse's file set is a
+// function of its range, not just its output:
+//  - a CHANGED file with `mtimeMs < range.start` is skipped without being
+//    parsed, so an earlier start pulls in files a later start never reads;
+//  - `loadCache` reads only the shards `monthScopeForRange` selects, so a wider
+//    month span hands the query loop cached files a narrower span never sees;
+//  - either way those extra files seed `seenKeys` / `seenMsgIds` BEFORE the
+//    range slice runs, and a seeded key SUPPRESSES the matching in-range turn
+//    in a provider parsed later — usage the narrower parse would have counted.
+// Holding start and month scope equal makes both parses see an identical file
+// set in an identical order, which leaves the range slice as the only
+// difference — applied after the parse instead of during it, as burstReuse
+// already does for the mirror-image case (same start, LATER end).
+type SinglePassScope = { range: DateRange; parses: Map<string, Promise<ProjectSummary[]>> }
+let singlePassScope: SinglePassScope | null = null
+
+export async function withSinglePassParse<T>(range: DateRange, fn: () => Promise<T>): Promise<T> {
+  const outer = singlePassScope
+  singlePassScope = { range, parses: new Map() }
+  try {
+    return await fn()
+  } finally {
+    singlePassScope = outer
+  }
+}
+
+function singlePassParse(dateRange: DateRange | undefined, providerFilter: string | undefined): Promise<ProjectSummary[]> | null {
+  const scope = singlePassScope
+  if (!scope || !dateRange) return null
+  if (dateRange.start.getTime() !== scope.range.start.getTime()) return null
+  if (dateRange.end.getTime() > scope.range.end.getTime()) return null
+  const wide = monthScopeForRange(scope.range.start, scope.range.end)
+  const narrow = monthScopeForRange(dateRange.start, dateRange.end)
+  if (wide.fromMonth !== narrow.fromMonth || wide.toMonth !== narrow.toMonth) return null
+  const key = providerFilter ?? 'all'
+  let parsed = scope.parses.get(key)
+  if (!parsed) {
+    const codexCacheDir = getCodeburnCacheDir()
+    parsed = withCodexCacheDirectory(codexCacheDir, () => parseAllSessionsInCacheScope(scope.range, providerFilter))
+    scope.parses.set(key, parsed)
+  }
+  // The declared range itself is served verbatim, exactly as an unscoped run
+  // would have produced it; only a strictly narrower end pays for a slice.
+  if (dateRange.end.getTime() === scope.range.end.getTime()) return parsed
+  return parsed.then(projects => filterProjectsByDateRange(projects, dateRange))
+}
+
+// Progressive cold start (#1107). A session log is append-only, so its last
+// event timestamp is <= its mtime: a file whose mtime predates the start of the
+// range being displayed provably holds nothing that range can show. On a COLD
+// start that is what makes a fast first paint honest — the deferred files are
+// not dropped, only sequenced behind the paint, and the background fill parses
+// them into the same per-file cache a full cold parse would have written.
+//
+// The margin is pure paranoia about mtimes that lie: a restored backup, a
+// machine whose clock jumped, an rsync that preserved a wrong stamp. It only
+// widens the set that gets parsed BEFORE the paint, so it can never lose data.
+export const FIRST_PAINT_MTIME_MARGIN_MS = 48 * 60 * 60 * 1000
+
+let firstPaintFloorMs: number | null = null
+// Files this scope deferred, as a SET of paths: one first paint runs several
+// parses (the scan, the plan window, the durable backfill) and each defers the
+// same old files, so a running count would report a multiple of the real work.
+let firstPaintDeferredPaths: Set<string> | null = null
+// Same count, but reset per runParse: a run that deferred NOTHING did exactly
+// what an unfloored run would have done, so it is allowed to mark the cache
+// complete and report full hydration.
+let firstPaintDeferredThisRun = 0
+
+/** Files parsed from source (not served from cache) since the process started.
+ *  The background-fill indicator reads it to show live N/M progress. */
+let filesParsedFromSource = 0
+export function filesParsedFromSourceCount(): number {
+  return filesParsedFromSource
+}
+
+/** What the most recent parse left behind, for consumers that must present
+ *  partiality honestly (#1110). `deferredForFirstPaint` is what separates a
+ *  progressive cold start from the read-only stale case: both leave
+ *  `complete` false, but only the latter is `stale` — a first paint is fresh
+ *  data over a smaller file set, and it converges on its own.
+ *  `indexedFiles` counts files parsed from source since this process started
+ *  and `pendingFiles` the files the active first-paint scope deferred; both are
+ *  progress numbers and only meaningful while `complete` is false. */
+export function sessionHydrationSnapshot(): {
+  complete: boolean
+  deferredForFirstPaint: boolean
+  indexedFiles: number
+  pendingFiles: number
+} {
+  return {
+    complete: sessionHydrationComplete,
+    deferredForFirstPaint: sessionFirstPaintDeferred,
+    indexedFiles: filesParsedFromSource,
+    pendingFiles: firstPaintDeferredPaths?.size ?? 0,
+  }
+}
+
+/** Restrict every parse inside `fn` to files that can hold in-range data for a
+ *  view starting at `rangeStart`, and report how many files were deferred.
+ *  Cold-start first paint only: the caller MUST follow up with an unscoped
+ *  parse (the background fill) before the run can be treated as hydrated. */
+export async function withColdFirstPaintFloor<T>(
+  rangeStart: Date,
+  fn: () => Promise<T>,
+): Promise<{ result: T; deferredFiles: number }> {
+  const outer = firstPaintFloorMs
+  const outerPaths = firstPaintDeferredPaths
+  firstPaintFloorMs = rangeStart.getTime() - FIRST_PAINT_MTIME_MARGIN_MS
+  firstPaintDeferredPaths = new Set()
+  try {
+    const result = await fn()
+    return { result, deferredFiles: firstPaintDeferredPaths.size }
+  } finally {
+    firstPaintFloorMs = outer
+    firstPaintDeferredPaths = outerPaths
+  }
+}
+
+/** True when this file's whole-file parse can be deferred to the background
+ *  fill. A file with a cache entry is never deferred: it has something to serve
+ *  and re-reading it is incremental, so deferring would only make the served
+ *  snapshot staler for no saving. */
+export function shouldDeferToBackgroundFill(
+  fp: { mtimeMs: number },
+  cached: unknown,
+  floorMs: number | null,
+): boolean {
+  return floorMs !== null && cached === undefined && fp.mtimeMs < floorMs
+}
+
+function deferToBackgroundFill(path: string, fp: { mtimeMs: number }, cached: unknown): boolean {
+  if (!shouldDeferToBackgroundFill(fp, cached, firstPaintFloorMs)) return false
+  firstPaintDeferredPaths?.add(path)
+  firstPaintDeferredThisRun++
+  return true
+}
+
 export function parseAllSessions(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
+  const scoped = singlePassParse(dateRange, providerFilter)
+  if (scoped) return scoped
   // Capture synchronously, before the first await. AsyncLocalStorage keeps all
   // Codex cache reads, dirty writes, and the final flush on this call-time
   // directory even if an embedding host changes the process env mid-parse.
@@ -4733,7 +4973,18 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
   // Keep the snapshot loaded before acquisition: timeout/unavailable paths serve
   // exactly this complete snapshot and never mutate or invalidate the holder.
   const priorSnapshot = diskCache
-  const refresh = await acquireCacheRefreshLock()
+  // Heartbeat the WAIT too, not just the parse behind it. This is the one place
+  // a healthy process is deliberately idle for a long stretch, and the desktop
+  // and menubar watchdogs read silence as a dead child - which is how a waiter
+  // blocked on an abandoned lock got killed at 45s and minted the next stale
+  // lock (#1117). runParse arms its own keepalive; this covers the gap before it.
+  startProgressKeepalive()
+  let refresh: RefreshLockOutcome
+  try {
+    refresh = await acquireCacheRefreshLock()
+  } finally {
+    stopProgressKeepalive()
+  }
   if (refresh.outcome === 'timed-out' || refresh.outcome === 'unavailable') {
     return runParse(key, priorSnapshot, dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   }
@@ -4792,6 +5043,7 @@ async function runParseInner(
   const { isCold = false, readOnly = false, refreshLock } = options
   readOnlyServedStale = false
   deferredRetryableSource = false
+  firstPaintDeferredThisRun = 0
   const seenMsgIds = new Set<string>()
   const seenKeys = new Set<string>()
   const allSources = await discoverAllSessions(providerFilter)
@@ -4903,9 +5155,15 @@ async function runParseInner(
   // on every launch, and the completeness marker the daily backfill + splash rely
   // on is durable. A run killed before here never reaches this, so its throttled
   // partial saves keep `complete: false` and the next launch resumes cold.
+  // A first-paint run that deferred files never saw the whole corpus, so it may
+  // not stamp the cache complete — the next launch (or this run's own
+  // background fill) has to come back cold and finish the job. A floored run
+  // that deferred NOTHING parsed exactly what an unfloored run would have, so
+  // it keeps the normal stamp.
+  const deferredForFirstPaint = firstPaintDeferredThisRun > 0
   const wasComplete = isCacheComplete(diskCache)
-  if (!readOnly && !wasComplete) diskCache.complete = true
-  if (!readOnly && (isCacheDirty(diskCache) || !wasComplete)) {
+  if (!readOnly && !wasComplete && !deferredForFirstPaint) diskCache.complete = true
+  if (!readOnly && (isCacheDirty(diskCache) || (!wasComplete && !deferredForFirstPaint))) {
     try {
       const published = await saveCache(diskCache, refreshLock?.verifyStillOwner)
       if (!published) throw new RefreshFenceLostError()
@@ -4918,7 +5176,8 @@ async function runParseInner(
   // files, or a write run that deferred a changed source on a retryable
   // failure, reached the end of the scan without hydrating everything, and
   // the daily backfill must not finalize history off it.
-  sessionHydrationComplete = (!readOnly || !readOnlyServedStale) && !deferredRetryableSource
+  sessionHydrationComplete = (!readOnly || !readOnlyServedStale) && !deferredRetryableSource && !deferredForFirstPaint
+  sessionFirstPaintDeferred = deferredForFirstPaint
 
   // Merge across providers by normalised project path so the same repository
   // is not double-counted when it was worked on with more than one tool

@@ -92,7 +92,7 @@ Everything runs locally. No wrapper, no proxy, no API keys, nothing leaves your 
 npx codeburn
 ```
 
-That opens the interactive dashboard (last 7 days by default). Arrow keys switch periods, `q` quits. That is the 30-second version. You now know where your AI budget goes.
+That opens the interactive dashboard (today by default, or the last 7 days when today has no usage yet). Arrow keys switch periods, `q` quits. That is the 30-second version. You now know where your AI budget goes.
 
 **Install it** for a permanent `codeburn` command:
 
@@ -440,7 +440,7 @@ Run `codeburn` for the dashboard, or use a subcommand below. Most commands also 
 
 | Command | What it does |
 |---------|--------------|
-| `codeburn` | Interactive dashboard, last 7 days (the default view) |
+| `codeburn` | Interactive dashboard, today (falls back to the last 7 days when today is empty) |
 | `codeburn today` | Today's usage |
 | `codeburn month` | This calendar month's usage |
 | `codeburn overview` | Plain-text monthly summary, copy-pasteable (`--no-color`, `--from`/`--to`) |
@@ -532,7 +532,7 @@ Left/right arrow keys switch between Today, 7 Days, 30 Days, Month, 6 Months, an
 
 ### Pricing
 
-Prices every API call using input, output, cache read, cache write, and web search token counts, with a fast mode multiplier for Claude. Prices are fetched from [LiteLLM](https://github.com/BerriAI/litellm) and cached locally for 24 hours at `~/.cache/codeburn/`. Hardcoded fallbacks for all Claude and GPT-5 models prevent fuzzy-matching mispricing.
+Prices every API call using input, output, cache read, cache write, and web search token counts, with a fast mode multiplier for Claude. Prices are fetched from [LiteLLM](https://github.com/BerriAI/litellm) and cached locally for 24 hours at `~/.cache/codeburn/`. Hardcoded fallbacks for all Claude and GPT-5 models prevent fuzzy-matching mispricing. Routing-gateway model ids are priced as the model they wrap: [OrcaRouter](https://www.orcarouter.ai) fusion route ids peel to their current upstream (`openai/gpt-oss-120b`), `orcarouter/auto` stays unpriced until a live probe pins the rotating target, and a nested upstream spelling (`orcarouter/deepseek/deepseek-v4-pro`) prices at that exact row, so a gateway-routed session reports real spend instead of $0.
 
 ### Task Categories
 
@@ -568,14 +568,16 @@ For categories that involve code edits, CodeBurn tracks file-aware retry cycles.
 codeburn plan set claude-max                                  # $200/month
 codeburn plan set claude-pro                                  # $20/month
 codeburn plan set cursor-pro                                  # $20/month
+codeburn plan set copilot-pro                                 # 1500 AI Credits ($15 equivalent)
 codeburn plan set custom --monthly-usd 200 --provider codex   # ChatGPT Pro-style custom plan
+codeburn plan set custom --credits 20000 --provider copilot   # org Copilot allotment
 codeburn plan reset --provider codex                          # remove one provider plan
 codeburn plan set none                                        # disable plan view
 codeburn plan                                                 # show configured plans
 codeburn plan reset                                           # remove plan config
 ```
 
-Subscription tracking for Claude Pro, Claude Max, Cursor Pro, and custom provider plans. Plans are stored per provider, so you can track Claude and Codex/Cursor subscriptions at the same time; the dashboard shows one overage line per active provider plan. A legacy/custom `all` plan remains a single aggregate plan and is replaced when you add a provider-specific plan, avoiding double-counted overage rows. Existing single-plan config is still read as a fallback. Presets use publicly stated plan prices (as of April 2026); they do not model exact token allowances, because vendors do not publish precise consumer-plan limits.
+Subscription tracking for Claude Pro, Claude Max, Cursor Pro, Copilot (AI credits), and custom provider plans. Plans are stored per provider, so you can track Claude and Codex/Cursor subscriptions at the same time; the dashboard shows one overage line per active provider plan. A legacy/custom `all` plan remains a single aggregate plan and is replaced when you add a provider-specific plan, avoiding double-counted overage rows. Existing single-plan config is still read as a fallback. USD presets use publicly stated plan prices (as of April 2026). Copilot presets use official individual AI-credit allotments (Pro 1,500 / Pro+ 7,000 / Max 20,000; fetched 2026-08-23) — not the $10 / $39 / $100 sticker prices — and spend is `total_nano_aiu / 1e9`, never token-priced USD.
 
 ### Currency
 

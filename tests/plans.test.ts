@@ -12,6 +12,9 @@ describe('plan presets', () => {
     expect(getPresetPlan('claude-pro')).toMatchObject({ id: 'claude-pro', monthlyUsd: 20, provider: 'claude' })
     expect(getPresetPlan('claude-max')).toMatchObject({ id: 'claude-max', monthlyUsd: 200, provider: 'claude' })
     expect(getPresetPlan('cursor-pro')).toMatchObject({ id: 'cursor-pro', monthlyUsd: 20, provider: 'cursor' })
+    expect(getPresetPlan('copilot-pro')).toMatchObject({ id: 'copilot-pro', monthlyCredits: 1500, monthlyUsd: 15, provider: 'copilot' })
+    expect(getPresetPlan('copilot-pro-plus')).toMatchObject({ id: 'copilot-pro-plus', monthlyCredits: 7000, monthlyUsd: 70, provider: 'copilot' })
+    expect(getPresetPlan('copilot-max')).toMatchObject({ id: 'copilot-max', monthlyCredits: 20000, monthlyUsd: 200, provider: 'copilot' })
     expect(getPresetPlan('custom')).toBeNull()
   })
 
@@ -22,7 +25,9 @@ describe('plan presets', () => {
 
     expect(isPlanProvider('all')).toBe(true)
     expect(isPlanProvider('claude')).toBe(true)
+    expect(isPlanProvider('copilot')).toBe(true)
     expect(isPlanProvider('invalid')).toBe(false)
+    expect(isPlanId('copilot-pro')).toBe(true)
   })
 })
 

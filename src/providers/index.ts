@@ -286,12 +286,11 @@ export async function discoverAllSessions(
   const filtered = providerFilter && providerFilter !== 'all'
     ? allProviders.filter(p => p.name === providerFilter)
     : allProviders
-  const all: SessionSource[] = []
-  for (const provider of filtered) {
-    const sessions = await safeDiscoverSessions(provider)
-    all.push(...sessions)
-  }
-  return all
+  // Each provider's discovery is its own serial directory walk; run them
+  // concurrently and concatenate in registry order so the result stays
+  // byte-identical to the sequential version.
+  const perProvider = await Promise.all(filtered.map(provider => safeDiscoverSessions(provider)))
+  return perProvider.flat()
 }
 
 export async function getProvider(name: string): Promise<Provider | undefined> {

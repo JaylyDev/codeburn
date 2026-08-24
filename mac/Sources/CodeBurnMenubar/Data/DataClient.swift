@@ -6,8 +6,15 @@ import Foundation
 /// Pipe file descriptors pinned forever.
 private let maxPayloadBytes = 20 * 1024 * 1024
 private let maxStderrBytes = 256 * 1024
-private let spawnTimeoutSeconds: UInt64 = 45
 private let maxConcurrentSpawns = 6
+
+/// Whether this app run has ever completed a payload fetch. Until it has, the
+/// on-disk cache may be cold and a spawn gets the long floor; afterwards the
+/// ordinary silence window applies. Mirrors the resident client's `warmed`.
+actor SpawnWarmth {
+    private(set) var warm = false
+    func markWarm() { warm = true }
+}
 
 enum DataClientError: Error {
     case spawn(String)
@@ -62,7 +69,9 @@ struct DataClient {
             throw DataClientError.nonZeroExit(code: result.exitCode, stderr: result.stderr)
         }
         do {
-            return try JSONDecoder().decode(MenubarPayload.self, from: result.stdout)
+            let payload = try JSONDecoder().decode(MenubarPayload.self, from: result.stdout)
+            await warmth.markWarm()
+            return payload
         } catch {
             let snippet = String(decoding: result.stdout.prefix(2048), as: UTF8.self)
             throw DataClientError.decode(CLIDecodeFailure(
@@ -119,6 +128,9 @@ struct DataClient {
     /// dozens of node processes at once.
     private static let spawnLimiter = AsyncSemaphore(maxConcurrentSpawns)
 
+    /// Cold floor gate for the one-shot path. See `SpawnWarmth`.
+    static let warmth = SpawnWarmth()
+
     private static func runCLI(
         subcommand: [String],
         qualityOfService: QualityOfService = .userInitiated
@@ -135,9 +147,13 @@ struct DataClient {
                     subcommand: subcommand,
                     qualityOfService: qualityOfService
                 )
+                // Heartbeats for the no-output watchdog: a multi-minute parse
+                // writes progress lines to stderr instead of going silent.
+                process.environment = CLIWatchdog.withProgressHeartbeat(process.environment)
+                let silenceSeconds = CLIWatchdog.silenceWindow(warm: await warmth.warm)
                 return try await runProcess(
                     process,
-                    timeoutSeconds: spawnTimeoutSeconds,
+                    timeoutSeconds: silenceSeconds,
                     label: subcommand.joined(separator: " ")
                 )
             }
@@ -188,7 +204,10 @@ struct DataClient {
     }
 
     /// Runs an already-configured process to completion, draining its output and
-    /// enforcing a hard timeout.
+    /// enforcing the no-output watchdog: `timeoutSeconds` bounds SILENCE, not
+    /// total runtime, and restarts on every byte the child produces. See
+    /// `CLIWatchdog` for why (and for the absolute ceiling that still bounds a
+    /// child which chatters forever).
     ///
     /// CRITICAL: nothing here may block a worker thread waiting for the process.
     /// `process.waitUntilExit()` is a blocking syscall. An earlier fix moved it
@@ -200,7 +219,7 @@ struct DataClient {
     /// `process.terminationHandler`, which fires on a Foundation-managed queue and
     /// blocks nothing, so the timeout always has a free thread to fire on.
     static func runProcess(_ process: Process,
-                           timeoutSeconds: UInt64,
+                           timeoutSeconds: Double,
                            label: String) async throws -> ProcessResult {
         let outPipe = Pipe()
         let errPipe = Pipe()
@@ -218,14 +237,36 @@ struct DataClient {
             throw DataClientError.spawn(error.localizedDescription)
         }
 
+        // Silence watchdog, not a runtime cap: `activity` is touched by both
+        // drains, so the window restarts on every byte (progress keepalives
+        // included) and only a genuinely mute child is killed.
+        let activity = OutputActivity()
+        let startedAt = OutputActivity.now()
         let timeoutTimer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-        timeoutTimer.schedule(deadline: .now() + .seconds(Int(timeoutSeconds)))
+        timeoutTimer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1))
         timeoutTimer.setEventHandler {
-            if process.isRunning {
-                NSLog("CodeBurn: CLI subprocess timed out after %llus for %@ — terminating",
+            guard process.isRunning else { return }
+            let verdict = CLIWatchdog.verdict(
+                now: OutputActivity.now(),
+                startedAt: startedAt,
+                lastOutputAt: activity.lastOutputAt,
+                silenceSeconds: timeoutSeconds
+            )
+            switch verdict {
+            case .wait:
+                return
+            case .silent:
+                NSLog("CodeBurn: CLI subprocess produced no output for %.0fs for %@ — terminating",
                       timeoutSeconds, label)
-                terminateWithEscalation(process)
+            case .ceiling:
+                NSLog("CodeBurn: CLI subprocess exceeded %.0fs for %@ — terminating",
+                      CLIWatchdog.ceilingSeconds, label)
             }
+            // One verdict per process: the escalation owns the kill from here,
+            // and a repeating tick would re-send SIGTERM every second for the
+            // whole grace. Cancelling from inside the handler is supported.
+            timeoutTimer.cancel()
+            terminateWithEscalation(process)
         }
         timeoutTimer.resume()
         defer { timeoutTimer.cancel() }
@@ -233,8 +274,8 @@ struct DataClient {
         let outHandle = outPipe.fileHandleForReading
         let errHandle = errPipe.fileHandleForReading
         let (out, err) = await withTaskCancellationHandler {
-            async let stdoutData = drain(outHandle, limit: maxPayloadBytes)
-            async let stderrData = drain(errHandle, limit: maxStderrBytes)
+            async let stdoutData = drain(outHandle, limit: maxPayloadBytes, activity: activity)
+            async let stderrData = drain(errHandle, limit: maxStderrBytes, activity: activity)
             return await (stdoutData, stderrData)
         } onCancel: {
             terminateWithEscalation(process)
@@ -249,20 +290,23 @@ struct DataClient {
             throw DataClientError.outputTooLarge
         }
 
-        let stderrString = String(data: err, encoding: .utf8) ?? ""
+        let stderrString = CLIWatchdog.withoutProgressLines(String(data: err, encoding: .utf8) ?? "")
         return ProcessResult(stdout: out, stderr: stderrString, exitCode: process.terminationStatus)
     }
 
+    /// Ask a child to exit, then insist. The grace exists so the CLI's signal
+    /// cleanup can unlink the cache refresh lock it may be holding before it
+    /// dies; only a child that ignores SIGTERM is SIGKILLed.
     private static func terminateWithEscalation(_ process: Process) {
         guard process.isRunning else { return }
         process.terminate()
         let pid = process.processIdentifier
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + CLIWatchdog.killGraceSeconds) {
             if process.isRunning { kill(pid, SIGKILL) }
         }
     }
 
-    private static func drain(_ handle: FileHandle, limit: Int) async -> Data {
+    private static func drain(_ handle: FileHandle, limit: Int, activity: OutputActivity) async -> Data {
         let fd = handle.fileDescriptor
         let flags = Darwin.fcntl(fd, F_GETFL)
         if flags >= 0 {
@@ -280,6 +324,7 @@ struct DataClient {
                 Darwin.read(fd, ptr.baseAddress!, toRead)
             }
             if n > 0 {
+                activity.touch()
                 buffer.append(contentsOf: chunk.prefix(n))
             } else if n == 0 {
                 break
