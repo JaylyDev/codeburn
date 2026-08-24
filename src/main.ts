@@ -2,13 +2,14 @@ import { isAbsolute } from 'path'
 import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
-import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, getPricingGenerationKey } from './models.js'
+import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, getFlatRateModelsConfigHash, getPricingGenerationKey } from './models.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint, isSessionHydrationComplete } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
 import { getProvider } from './providers/index.js'
+import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { convertCost, formatCost } from './currency.js'
 import { renderStatusBar } from './format.js'
-import { toDateString } from './daily-cache.js'
+import { DAILY_CACHE_VERSION, toDateString } from './daily-cache.js'
 import { dateKey } from './day-aggregator.js'
 import { sessionModelBillableOutputTokens } from './session-output.js'
 import { isBehavioralCall } from './behavioral-weight.js'
@@ -50,6 +51,11 @@ import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
 const { version } = require('../package.json')
+// Bump when the menubar payload's rendering semantics change without a package
+// release or daily-cache version change. The envelope version in session-cache
+// protects record shape; this protects the meaning of an otherwise valid one.
+const STATUS_SNAPSHOT_RENDER_VERSION = 1
+const STATUS_SNAPSHOT_SEMANTIC_KEY = `${version}:render-${STATUS_SNAPSHOT_RENDER_VERSION}:daily-${DAILY_CACHE_VERSION}`
 import { loadCurrency, getCurrency, isValidCurrencyCode } from './currency.js'
 import { CodexThroughputReader, newestCodexSession, renderCodexThroughput } from './codex-throughput.js'
 
@@ -1126,12 +1132,21 @@ program
         timeline: opts.timeline !== false,
         claudeConfigSourceId: opts.claudeConfigSource ?? null,
       }
+      // The selector renders source labels/options derived from ordered Claude
+      // roots, including idle sources. Config order can change those labels
+      // without moving any transcript file, so it belongs to the query key
+      // (not the debounced corpus mismatch path).
+      const claudeSourceTopology = {
+        configDirs: await getClaudeConfigDirs(),
+        desktopSessionDirs: getDesktopSessionsDirs(),
+      }
       const queryKey = JSON.stringify({
         start: periodInfo.range.start.toISOString(),
         end: periodInfo.range.end.toISOString(),
         label: periodInfo.label,
         ...queryScope,
         days: daysSelection ? [...daysSelection.days].sort() : undefined,
+        claudeSourceTopology,
         // Mirrors parser.ts's cacheKey: pricing-affecting config must
         // invalidate this snapshot the same way it invalidates the
         // parse-level memo, or an edited alias/override/savings config keeps
@@ -1141,16 +1156,17 @@ program
         modelAliasesConfigHash: getModelAliasesConfigHash(),
         priceOverridesConfigHash: getPriceOverridesConfigHash(),
         localModelSavingsConfigHash: getLocalModelSavingsConfigHash(),
+        flatRateModelsConfigHash: getFlatRateModelsConfigHash(),
         // Same reasoning, different config: the rendered payload's costs are
         // in the ACTIVE display currency (see `getCurrency`/`loadCurrency`,
         // refreshed fresh from config.json by the `preAction` hook ahead of
-        // this handler), which the corpus fingerprint and the four hashes
+        // this handler), which the corpus fingerprint and the config hashes
         // above never touch. Without this, switching currencies keeps
         // serving the old currency's numbers until a session file happens to
         // change too.
         currency: getCurrency(),
         // Upstream/bundled pricing DATA and CODE version, as opposed to the
-        // four hashes above (user-editable pricing CONFIG): the live LiteLLM
+        // hashes above (user-editable pricing CONFIG): the live LiteLLM
         // cache's freshness, the bundled snapshot's own content, and the
         // parser/pricing logic's semantic version. None of these move the
         // corpus fingerprint or any config hash, so without this a repricing
@@ -1173,7 +1189,7 @@ program
       // — that path would still force a fresh parse to re-scan them.)
       const useSnapshot = !queryScope.optimize
       const corpus = useSnapshot ? await computeCorpusFingerprint(pf) : null
-      const snapshot = corpus ? await loadStatusSnapshot(corpus.hash, corpus.newestMtimeMs, queryKey) : null
+      const snapshot = corpus ? await loadStatusSnapshot(corpus.hash, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY) : null
       const payload = (snapshot ?? await buildMenubarPayloadForRange(periodInfo, {
         ...queryScope,
         daysSelection,
@@ -1184,7 +1200,9 @@ program
       // fingerprint would make that degraded answer look authoritative to
       // every future poll that matches this fingerprint — never checkpoint a
       // partial hydration as if it were a real, complete parse.
-      if (useSnapshot && corpus && !snapshot && isSessionHydrationComplete()) await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, queryKey, payload)
+      if (useSnapshot && corpus && !snapshot && isSessionHydrationComplete()) {
+        await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, corpus.observedAtMs, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY, payload)
+      }
       if (opts.scope === 'combined') {
         // Combined multi-device usage is best-effort enrichment on the menubar's
         // hot path. Never let pulling peers (or a corrupt remotes store) take

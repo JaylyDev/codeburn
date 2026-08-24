@@ -1,6 +1,7 @@
 import { existsSync } from 'fs'
 import { lstat, readFile, readdir, stat } from 'fs/promises'
 import { createHash } from 'crypto'
+import { performance } from 'node:perf_hooks'
 import { basename, dirname, join, resolve, sep } from 'path'
 import { FS_SCAN_CONCURRENCY, mapWithConcurrency, readSessionLines } from './fs-utils.js'
 import { billableOutputTokens, calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
@@ -4763,6 +4764,9 @@ let sessionFirstPaintDeferred = false
 let readOnlyServedStale = false
 
 export type CorpusFingerprint = {
+  /** High-resolution epoch time captured before discovery begins. Competing
+   *  snapshot writers use it as an observation-order fence. */
+  observedAtMs: number
   /** Content-free signature of every discovered source's dev/ino/mtime/size. */
   hash: string
   /** Newest mtime observed across all discovered sources, 0 when there are
@@ -4839,6 +4843,7 @@ async function collectFilesRecursive(dirPath: string, visitedDirs: Set<string> =
 //   see the `provider.network` branch below, mirroring parseAllSessions'
 //   own treatment of the same sources in `parseProviderSources`.
 export async function computeCorpusFingerprint(providerFilter?: string): Promise<CorpusFingerprint> {
+  const observedAtMs = performance.timeOrigin + performance.now()
   const sources = await discoverAllSessions(providerFilter)
   const entries: string[] = []
   let newestMtimeMs = 0
@@ -4867,6 +4872,22 @@ export async function computeCorpusFingerprint(providerFilter?: string): Promise
   // finding A-G1).
   const envFingerprinted = new Set<string>()
   for (const source of sources) {
+    // Discovery metadata is itself rendered state. Claude's config selector,
+    // for example, assigns duplicate-basename labels by configured root order
+    // and exposes a config as soon as it has even an empty project directory.
+    // Hashing only transcript files (then sorting them) made those topology
+    // changes invisible when no file path/mtime/size moved, so a status
+    // snapshot could retain stale source labels/options indefinitely.
+    entries.push(`source:${JSON.stringify([
+      source.provider,
+      source.path,
+      source.project,
+      source.sourceKind ?? null,
+      source.sourceId ?? null,
+      source.sourceLabel ?? null,
+      source.sourcePath ?? null,
+      source.retainWhilePresent ?? false,
+    ])}`)
     if (!envFingerprinted.has(source.provider)) {
       envFingerprinted.add(source.provider)
       entries.push(`env:${source.provider}|${computeEnvFingerprint(source.provider)}`)
@@ -4896,7 +4917,7 @@ export async function computeCorpusFingerprint(providerFilter?: string): Promise
   }
   entries.sort()
   const hash = createHash('sha256').update(entries.join('\n')).digest('hex')
-  return { hash, newestMtimeMs }
+  return { hash, newestMtimeMs, observedAtMs }
 }
 
 // Set when a changed source's read was deferred on a retryable failure (e.g.

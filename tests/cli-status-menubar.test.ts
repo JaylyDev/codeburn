@@ -46,7 +46,7 @@ function userLine(sessionId: string, timestamp: string): string {
   })
 }
 
-function assistantLine(sessionId: string, timestamp: string, messageId: string): string {
+function assistantLine(sessionId: string, timestamp: string, messageId: string, model = 'claude-sonnet-4-5'): string {
   return JSON.stringify({
     type: 'assistant',
     sessionId,
@@ -55,7 +55,7 @@ function assistantLine(sessionId: string, timestamp: string, messageId: string):
       id: messageId,
       type: 'message',
       role: 'assistant',
-      model: 'claude-sonnet-4-5',
+      model,
       content: [
         { type: 'text', text: 'done' },
         { type: 'tool_use', id: 'tu-1', name: 'Edit', input: { file_path: '/tmp/x', old_string: 'a', new_string: 'b' } },
@@ -351,6 +351,66 @@ describe('codeburn status --format menubar-json', () => {
       expect(personalPayload.current.calls).toBe(0)
       expect(personalPayload.current.sessions).toBe(0)
       expect(personalPayload.current.providers).toEqual({ claude: 0 })
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('invalidates the snapshot when ordered Claude config topology changes', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-claude-topology-'))
+
+    try {
+      // The two roots deliberately share a basename. Their user-visible labels
+      // are disambiguated by configured order ("profile 1" / "profile 2"),
+      // while their transcript paths and contents stay unchanged.
+      const firstRoot = join(home, 'account-a', 'profile')
+      const secondRoot = join(home, 'account-b', 'profile')
+      await mkdir(join(firstRoot, 'projects', 'first'), { recursive: true })
+      await mkdir(join(secondRoot, 'projects', 'second'), { recursive: true })
+      const now = new Date()
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
+      const ts = (offset: number) => new Date(base.getTime() + offset).toISOString().replace(/\.\d+Z$/, 'Z')
+      await writeFile(
+        join(firstRoot, 'projects', 'first', 'first.jsonl'),
+        [userLine('first', ts(0)), assistantLine('first', ts(60_000), 'msg-first')].join('\n'),
+      )
+      await writeFile(
+        join(secondRoot, 'projects', 'second', 'second.jsonl'),
+        [userLine('second', ts(120_000)), assistantLine('second', ts(180_000), 'msg-second')].join('\n'),
+      )
+
+      const configDir = join(home, '.config', 'codeburn')
+      const configPath = join(configDir, 'config.json')
+      await mkdir(configDir, { recursive: true })
+      await writeFile(configPath, JSON.stringify({ claudeConfigDirs: [firstRoot, secondRoot] }))
+      const args = ['status', '--format', 'menubar-json', '--period', 'today', '--provider', 'all', '--no-optimize']
+      // Empty env values select config.json instead of runCli's default single
+      // CLAUDE_CONFIG_DIR, and remain identical across both invocations.
+      const env = { CLAUDE_CONFIG_DIR: '', CLAUDE_CONFIG_DIRS: '' }
+
+      const before = runCli(args, home, env)
+      expect(before.status, `stderr: ${before.stderr}`).toBe(0)
+      const beforePayload = JSON.parse(before.stdout) as {
+        claudeConfigs?: { options: Array<{ label: string; path: string }> }
+      }
+      expect(Object.fromEntries(beforePayload.claudeConfigs!.options.map(option => [option.path, option.label]))).toEqual({
+        [firstRoot]: 'profile 1',
+        [secondRoot]: 'profile 2',
+      })
+
+      // Only config order changes. The broken fingerprint sorted transcript
+      // paths and ignored source labels, so it served the first snapshot.
+      await writeFile(configPath, JSON.stringify({ claudeConfigDirs: [secondRoot, firstRoot] }))
+      const after = runCli(args, home, env)
+      expect(after.status, `stderr: ${after.stderr}`).toBe(0)
+      const afterPayload = JSON.parse(after.stdout) as {
+        claudeConfigs?: { options: Array<{ label: string; path: string }> }
+      }
+      expect(Object.fromEntries(afterPayload.claudeConfigs!.options.map(option => [option.path, option.label]))).toEqual({
+        [firstRoot]: 'profile 2',
+        [secondRoot]: 'profile 1',
+      })
     } finally {
       await rm(home, { recursive: true, force: true })
     }
@@ -766,6 +826,43 @@ describe('codeburn status --format menubar-json', () => {
       const secondCost = (JSON.parse(second.stdout) as { current: { cost: number } }).current.cost
 
       expect(secondCost).toBeCloseTo(firstCost * 2, 5)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('invalidates the snapshot when a model is newly marked flat-rate', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-flat-rate-gen-'))
+
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'myapp')
+      await mkdir(projectDir, { recursive: true })
+      const now = new Date()
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
+      const ts = (offset: number) => new Date(base.getTime() + offset).toISOString().replace(/\.\d+Z$/, 'Z')
+      const model = 'zz-status-snapshot-flat-rate'
+      await writeFile(
+        join(projectDir, 'session.jsonl'),
+        [userLine('s1', ts(0)), assistantLine('s1', ts(60_000), 'msg-1', model)].join('\n'),
+      )
+
+      const args = ['status', '--format', 'menubar-json', '--period', 'today', '--provider', 'claude', '--no-optimize']
+      const before = runCli(args, home)
+      expect(before.status, `stderr: ${before.stderr}`).toBe(0)
+      const beforePayload = JSON.parse(before.stdout) as { current: { unpricedModels: Array<{ model: string }> } }
+      expect(beforePayload.current.unpricedModels.map(row => row.model)).toContain(model)
+
+      // This is render/daily-cache config, not a session-file change. It must
+      // still invalidate the fully-rendered status snapshot.
+      const configDir = join(home, '.config', 'codeburn')
+      await mkdir(configDir, { recursive: true })
+      await writeFile(join(configDir, 'config.json'), JSON.stringify({ flatRateModels: [model] }))
+
+      const after = runCli(args, home)
+      expect(after.status, `stderr: ${after.stderr}`).toBe(0)
+      const afterPayload = JSON.parse(after.stdout) as { current: { unpricedModels: Array<{ model: string }> } }
+      expect(afterPayload.current.unpricedModels.map(row => row.model)).not.toContain(model)
     } finally {
       await rm(home, { recursive: true, force: true })
     }

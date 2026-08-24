@@ -6,7 +6,6 @@ import { join } from 'path'
 import { getCodeburnCacheDir } from './cache-dir.js'
 
 const LOCK_FILE = 'session-refresh.lock'
-const TAKEOVER_FILE = `${LOCK_FILE}.takeover`
 const DEFAULT_HEARTBEAT_MS = 10_000
 const DEFAULT_STALE_MS = 90_000
 // A waiter that gives up before the stale gate opens can NEVER recover an
@@ -28,6 +27,9 @@ export type RefreshLockClock = {
 
 export type RefreshLockOptions = {
   cacheDir?: string
+  /** Basename only. Lets independent cache transactions reuse this lock
+   *  protocol without unnecessarily serializing each other. */
+  lockFile?: string
   clock?: RefreshLockClock
   heartbeatMs?: number
   staleMs?: number
@@ -71,18 +73,20 @@ function pidLooksAlive(pid: number): boolean {
   catch (err) { return (err as NodeJS.ErrnoException).code === 'EPERM' }
 }
 
-// The path of the lock this process currently owns, for the signal handler.
-// Single-flight guarantees at most one owned lock per process at a time.
-let ownedLockPath: string | null = null
+// Paths of locks this process currently owns, for the signal handler. The
+// in-process single-flight is per lock path, so independent cache transactions
+// may legitimately hold different locks at the same time.
+const ownedLockPaths = new Set<string>()
 
 // Synchronous variant for the signal path: a handler can't await, so read +
 // unlink synchronously. Only unlinks a lock we actually own.
 function removeOurLockSync(): void {
-  if (!ownedLockPath) return
-  try {
-    const parsed = JSON.parse(readFileSync(ownedLockPath, 'utf-8')) as Partial<LockRecord>
-    if (parsed?.pid === process.pid) unlinkSync(ownedLockPath)
-  } catch { /* best-effort; nothing to clean or already gone */ }
+  for (const lockPath of [...ownedLockPaths]) {
+    try {
+      const parsed = JSON.parse(readFileSync(lockPath, 'utf-8')) as Partial<LockRecord>
+      if (parsed?.pid === process.pid) unlinkSync(lockPath)
+    } catch { /* best-effort; nothing to clean or already gone */ }
+  }
 }
 
 // Arm once, only while we hold the lock: on a catchable termination (Ctrl-C, or
@@ -222,14 +226,18 @@ function sameObservation(a: Observation, b: Observation): boolean {
   return a.record?.token === b.record?.token && a.mtimeMs === b.mtimeMs && a.digest === b.digest
 }
 
-let singleFlightTail: Promise<void> = Promise.resolve()
+const singleFlightTails = new Map<string, Promise<void>>()
 
-async function enterSingleFlight(): Promise<() => void> {
-  const previous = singleFlightTail
+async function enterSingleFlight(lockPath: string): Promise<() => void> {
+  const previous = singleFlightTails.get(lockPath) ?? Promise.resolve()
   let leave!: () => void
-  singleFlightTail = new Promise<void>(resolve => { leave = resolve })
+  const current = new Promise<void>(resolve => { leave = resolve })
+  singleFlightTails.set(lockPath, current)
   await previous
-  return leave
+  return () => {
+    leave()
+    if (singleFlightTails.get(lockPath) === current) singleFlightTails.delete(lockPath)
+  }
 }
 
 /**
@@ -237,7 +245,16 @@ async function enterSingleFlight(): Promise<() => void> {
  * Lock ordering, when the daily-cache follow-up lands, is daily → session.
  */
 export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}): Promise<RefreshLockOutcome> {
-  const leaveSingleFlight = await enterSingleFlight()
+  const cacheDir = options.cacheDir ?? getCodeburnCacheDir()
+  const lockFile = options.lockFile ?? LOCK_FILE
+  // Never allow a caller-controlled path to escape cacheDir or collide with
+  // the takeover suffix. All current callers use fixed names or a hex digest.
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$/.test(lockFile) || lockFile.endsWith('.takeover')) {
+    return { outcome: 'unavailable' }
+  }
+  const lockPath = join(cacheDir, lockFile)
+  const takeoverPath = join(cacheDir, `${lockFile}.takeover`)
+  const leaveSingleFlight = await enterSingleFlight(lockPath)
   let ownsSingleFlight = true
   const leave = (): void => {
     if (!ownsSingleFlight) return
@@ -245,15 +262,12 @@ export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}):
     leaveSingleFlight()
   }
 
-  const cacheDir = options.cacheDir ?? getCodeburnCacheDir()
   const clock = options.clock ?? defaultClock
   const heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS
   const staleMs = options.staleMs ?? DEFAULT_STALE_MS
   const waitMs = options.waitMs ?? staleMs + DEFAULT_WAIT_MARGIN_MS
   const pollMs = options.pollMs ?? DEFAULT_POLL_MS
   const sleep = options.sleep ?? delay
-  const lockPath = join(cacheDir, LOCK_FILE)
-  const takeoverPath = join(cacheDir, TAKEOVER_FILE)
   const token = randomBytes(16).toString('hex')
   const body = (): string => JSON.stringify({ pid: process.pid, token, at: clock.wallNow() })
 
@@ -345,7 +359,7 @@ export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}):
   const makeHandle = (): RefreshLockHandle => {
     let released = false
     let heartbeatRunning = false
-    ownedLockPath = lockPath
+    ownedLockPaths.add(lockPath)
     armSignalCleanup()
     const heartbeat = setInterval(() => {
       void serializeOwnerOp(async () => {
@@ -390,11 +404,14 @@ export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}):
       release: async () => {
         if (released) return
         released = true
-        ownedLockPath = null
         clearInterval(heartbeat)
-        while (heartbeatRunning) await sleep(1)
-        await removeIfOwned()
-        leave()
+        try {
+          while (heartbeatRunning) await sleep(1)
+          await removeIfOwned()
+        } finally {
+          ownedLockPaths.delete(lockPath)
+          leave()
+        }
       },
     }
   }
