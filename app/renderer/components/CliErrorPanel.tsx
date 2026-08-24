@@ -5,7 +5,20 @@ export function isPermissionCliError(error: CliError | null): boolean {
   return error?.kind === 'nonzero' && /permission|full disk access|eacces/i.test(error.message)
 }
 
+/** A failure the main process attributed to a still-running cold hydration. The
+ *  data is coming, so nothing here is broken — never paint it red. */
+export function isColdHydrating(error: CliError | null): boolean {
+  return error?.cold === true
+}
+
 export function cliErrorDisplay(error: CliError): { title: string; message: string; tone: 'amber' | 'red' | 'muted' } {
+  if (isColdHydrating(error)) {
+    return {
+      title: 'Still indexing',
+      message: 'Reading your usage history for the first time. This can take a few minutes.',
+      tone: 'muted',
+    }
+  }
   if (error.kind === 'not-found') {
     return {
       title: 'Locate the codeburn CLI',

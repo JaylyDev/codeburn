@@ -84,6 +84,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     private var refreshLoopHeartbeatAt: Date = .distantPast
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Synchronously, before the actor hop: the app can exit before a
+        // detached Task is ever scheduled, and a serve child that outlives us
+        // is the orphan in #1117. shutdown() still runs for the tidy case.
+        ServeChildRegistry.shared.reapAll()
         Task { await ServeConnection.shared.shutdown() }
         if let monitor = rightClickMonitor {
             NSEvent.removeMonitor(monitor)

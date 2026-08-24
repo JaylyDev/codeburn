@@ -106,7 +106,6 @@ A pseudonymous `device_id` distinguishes your machines without revealing hostnam
 
 | Field | Example | Description |
 |---|---|---|
-| `ai.session_id` | `abc123…` | Session (shares the usage spans' traceId) |
 | `ai.project` | `my-app` | Project name |
 | `git.repo` | `github.com/acme/widget` | Normalized `origin` remote (credentials and ports stripped) |
 | `git.pr_links` | `["…/pull/12"]` | PR URLs captured for the session |
@@ -120,7 +119,7 @@ A pseudonymous `device_id` distinguishes your machines without revealing hostnam
 | `git.in_main` | `true` | Whether the commit landed in the main branch |
 | `git.was_reverted` | `false` | Whether a later commit reverted it |
 
-Attribution is **inferred** (timestamp-window correlation, the same heuristic as `codeburn yield`); the resource attribute `codeburn.attribution_methodology: timestamp-window` marks it as such. State transitions (a commit merging to main, or being reverted) are re-sent automatically on later pushes — receivers should upsert commits by `(git.repo, git.sha)` and session spans by `ai.session_id` (latest state wins). When a commit migrates to a later-parsed session with a tighter window, the losing session re-emits with `git.commit_count: 0` (a retraction), so summing `git.commit_count` across upserted session rows never double-counts. Retractions fire only when the commit was won by another session — commits that merely age out of the `--since` window are not retracted, so a previously-synced count stays correct. Session spans also re-emit when an ongoing session's window grows, keeping the span end time current.
+Attribution is **inferred** (timestamp-window correlation, the same heuristic as `codeburn yield`); the resource attribute `codeburn.attribution_methodology: timestamp-window` marks it as such. State transitions (a commit merging to main, or being reverted) are re-sent automatically on later pushes — receivers should upsert commits by `(git.repo, git.sha)` and session spans by `traceId` (the same id usage spans already carry; latest state wins). When a commit migrates to a later-parsed session with a tighter window, the losing session re-emits with `git.commit_count: 0` (a retraction), so summing `git.commit_count` across upserted session rows never double-counts. Retractions fire only when the commit was won by another session — commits that merely age out of the `--since` window are not retracted, so a previously-synced count stays correct. Session spans also re-emit when an ongoing session's window grows, keeping the span end time current.
 
 With `--attribution`, normalized repo remote URLs, commit SHAs, commit timestamps (span start times), PR URLs, and the merged/reverted booleans leave your machine — plus the same pseudonymous `codeburn.device_id` resource attribute the usage spans carry. PR links are rebuilt client-side from scheme + host + path only (userinfo, query strings, and fragments are dropped; https, `/org/repo/pull/N` path, bounded length, max 20 per session), and the repo identity itself passes a strict hostname/path allow-list before sending — malformed or transport-helper remotes (`ext::…`, `codecommit::…`) are rejected outright rather than parsed. Precisely what is and is not sent:
 
@@ -152,6 +151,12 @@ A: No. You run `codeburn sync push` when you want. A future version may offer op
 
 **Q: What if I push the same data twice?**
 A: Safe. A local sent-ledger tracks what's been sent. Re-pushing the same window doesn't create duplicates.
+
+**Q: Why is today's Copilot usage missing from my dashboard?**
+A: Copilot input/cache usage is reconciled locally between the per-request `session-store.db` rows and the `session.shutdown` rollups, and that reconciliation keeps changing while a session is live — a rollup residual shrinks as the rows covering it land, and a row that looked like a crash-only request becomes supplementary once its journal entry appears. The sent-ledger is append-once, so a value sent mid-reconciliation could never be corrected at the receiver. A Copilot session is therefore held back until it has been quiet for 24 hours, then pushed once, final. Nothing is dropped; `--dry-run` reports how many calls are held.
+
+**Q: Why didn't my old Copilot sessions resync with the new per-request breakdown?**
+A: On purpose. A Copilot session's input/cache can leave your machine in one of two shapes — as one `session.shutdown` **rollup** span per (session, model), or **reconciled** into one span per API request plus a residual for whatever the rows don't cover. They describe the same tokens, so the receiver must never hold both, and a usage span cannot be retracted once the append-once ledger has sent it. Whichever shape a session was first synced in, it stays in; the other is frozen for that session permanently. That runs in both directions: a session synced by a pre-store version keeps its rollup and never sends rows, and a session synced as rows never sends a rollup later — which matters because at the 90-day durable age-out the cached rows are pruned and the rollup starts serving again under a key that was never sent. Growth within the shape a session already uses is unaffected, and per-turn output spans are never frozen. `--dry-run` reports the frozen count. `codeburn sync reset --confirm` clears the local ledger and re-pushes everything under the new breakdown — only do that if the receiver's copy is cleared too, or you get exactly the doubling this avoids.
 
 **Q: What if I'm offline for a week?**
 A: Next push catches up. The default window is 7 days; use `--since 30d` or `--since all` (up to 6 months) for longer gaps. A push runs to completion regardless of size — server rate limits (429) are waited out automatically.

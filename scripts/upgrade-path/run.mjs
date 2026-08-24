@@ -33,7 +33,7 @@ const WORK = process.env['UPGRADE_PATH_WORK'] || join(tmpdir(), 'codeburn upgrad
 const OLD_SESSION_CACHE = 'session-cache.v7.json'
 const OLD_DAILY_CACHE = 'daily-cache.v17.json'
 const NEW_SESSION_CACHE_DIR = 'session-cache.v9'
-const NEW_DAILY_CACHE = 'daily-cache.v20.json'
+const NEW_DAILY_CACHE = 'daily-cache.v29.json'
 
 const HOME = join(WORK, 'user home')
 const PAYLOADS = join(WORK, 'payloads')
@@ -359,6 +359,25 @@ capture(oldBin, agingCache, join(PAYLOADS, 'aging-baseline'))
 const baseDaily = JSON.parse(readFileSync(join(agingCache, OLD_DAILY_CACHE), 'utf8'))
 const sliceOf = (cache, date) => cache.days.find(d => d.date === date)?.providers?.claude
 
+// A day KEY is not the unit of never-lose; the tokens are. A parse change that
+// re-dates a call to its true day legitimately empties one day and fills its
+// neighbour, token for token - reported from a real cache where 2026-08-08's
+// single call moved to 2026-08-07 with input/cacheRead/cacheWrite landing
+// there exactly. So every comparison below reads a WINDOW around the day
+// rather than the day alone, and only a window that shrinks is a loss.
+const windowOf = (cache, date) => {
+  const day = new Date(`${date}T00:00:00Z`).getTime()
+  const iso = ms => new Date(ms).toISOString().slice(0, 10)
+  const acc = { cost: 0, calls: 0 }
+  for (const offset of [-1, 0, 1]) {
+    const slice = sliceOf(cache, iso(day + offset * 86400000))
+    if (!slice) continue
+    acc.cost += slice.cost ?? 0
+    acc.calls += slice.calls ?? 0
+  }
+  return acc
+}
+
 // Group transcripts by the day their turns land on. Sidechain files are left out:
 // deleting a parent's subagent transcript entangles this with spawn-link
 // carry-forward, which is a different contract.
@@ -398,19 +417,123 @@ else {
   const usd = n => `$${n.toFixed(6)}`
 
   for (const a of aged) {
-    const b = sliceOf(baseDaily, a.date)
-    const u = sliceOf(upDaily, a.date)
-    if (!u) { fail(`${a.date} (${a.kind}): the claude slice is gone entirely; baseline had ${usd(b.cost)} over ${b.calls} calls`); continue }
-    // A fully sourceless day has nothing to re-derive, so it must come back
-    // EXACTLY. A partially sourceless one may legitimately grow (a re-parse
-    // under new accounting), but must never shrink.
+    const b = windowOf(baseDaily, a.date)
+    const u = windowOf(upDaily, a.date)
+    // A fully sourceless day has nothing to re-derive, so its window must come
+    // back EXACTLY. A partially sourceless one may legitimately grow (a
+    // re-parse under new accounting), but must never shrink.
     const exact = a.kind === 'fully sourceless'
     const costOk = exact ? Math.abs(u.cost - b.cost) < 1e-9 : u.cost >= b.cost - 1e-9
     const callsOk = exact ? u.calls === b.calls : u.calls >= b.calls
     const loss = costOk && callsOk ? '' :
-      ` — LOST ${usd(b.cost - u.cost)} (${(100 * (b.cost - u.cost) / b.cost).toFixed(1)}%) and ${b.calls - u.calls} calls`
+      ` — LOST ${usd(b.cost - u.cost)} (${b.cost > 0 ? (100 * (b.cost - u.cost) / b.cost).toFixed(1) : '0.0'}%) and ${b.calls - u.calls} calls`
+    const moved = sliceOf(upDaily, a.date) ? '' : ' (day key empty; window intact)'
     check(costOk && callsOk,
-      `${a.date} (${a.kind}): cost ${usd(b.cost)} -> ${usd(u.cost)}, calls ${b.calls} -> ${u.calls}${loss}`)
+      `${a.date} +/-1d (${a.kind}): cost ${usd(b.cost)} -> ${usd(u.cost)}, calls ${b.calls} -> ${u.calls}${loss}${moved}`)
+  }
+}
+
+// ── 9. durable history across a bump on an extant, pruned source ─────────────
+//
+// The other never-lose direction. A durable SQLite source keeps its file
+// forever while the provider prunes rows out of it, so "the source path is
+// gone" is not the test for whether the cache is the last remaining record.
+// A parse-version bump rebuilds the provider section, and if it drops entries
+// whose file still exists it deletes exactly the history nothing can rebuild.
+// This build bumps PROVIDER_PARSE_VERSIONS.copilot, so it takes that path for
+// real. (#946 review.)
+//
+// Measured at the SESSION-CACHE layer, from export.json's per-call records.
+// The menubar/daily numbers are the wrong instrument here: on a version bump
+// adoptOlderDailyCaches carries the superseded daily file forward as the
+// baseline for days no source can re-derive, which is exactly the days this
+// scenario creates — a session-cache loss would be masked by the very
+// carry-forward that runs beside it. And the assertion is EQUALITY, not
+// "did not shrink": the failure mode on the other side of this fix is the
+// union counting a carried-forward call twice. (The loss direction is
+// demonstrated - reverting the carry-forward takes 80 calls to 40 here. The
+// double direction is asserted but not demonstrated: a faithful re-keying
+// simulation needs the parser to mint genuinely different keys, and a cheap
+// stand-in is collapsed by the serve-time dedup before it can be counted.)
+
+step('durable history across a bump on an extant, pruned source')
+const prunedCache = join(CACHES, 'pruned')
+mkdirSync(prunedCache, { recursive: true })
+
+const copilotDb = process.platform === 'darwin'
+  ? join(HOME, 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db')
+  : process.platform === 'win32'
+    ? join(process.env['APPDATA'] ?? join(HOME, 'AppData', 'Roaming'), 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db')
+    : join(HOME, '.config', 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db')
+
+// Per-call records for one provider, straight out of the parse. No daily-cache
+// layer in between, so a lost session-cache entry cannot be papered over.
+function copilotRecords(outDir) {
+  const exported = JSON.parse(readFileSync(join(outDir, 'export.json'), 'utf8'))
+  const acc = { calls: 0, cost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 }
+  for (const r of exported.records ?? []) {
+    if ((r.provider || '') !== 'copilot') continue
+    acc.calls++
+    acc.cost += r.cost ?? 0
+    acc.inputTokens += r.inputTokens ?? 0
+    acc.outputTokens += r.outputTokens ?? 0
+    acc.cacheReadTokens += r.cacheReadTokens ?? 0
+  }
+  return acc
+}
+const sameRecords = (a, b) =>
+  a.calls === b.calls && a.inputTokens === b.inputTokens && a.outputTokens === b.outputTokens
+  && a.cacheReadTokens === b.cacheReadTokens && Math.abs(a.cost - b.cost) < 1e-9
+const showRecords = r => `${r.calls} calls, $${r.cost.toFixed(6)}, ${r.inputTokens}/${r.outputTokens}/${r.cacheReadTokens} in/out/cacheRead`
+
+capture(oldBin, prunedCache, join(PAYLOADS, 'pruned-baseline'))
+const beforeRecords = copilotRecords(join(PAYLOADS, 'pruned-baseline'))
+
+if (beforeRecords.calls === 0) {
+  skip(`${OLD_VERSION} reported no copilot usage to prune (nothing to protect)`)
+} else {
+  ok(`baseline copilot: ${showRecords(beforeRecords)}`)
+
+  // Prune HALF the conversations, leaving the DB present, valid and still
+  // populated: the surviving rows are what the bump re-parses, the pruned ones
+  // exist only in the cache from here on.
+  let pruned = 0
+  try {
+    const { DatabaseSync } = await import('node:sqlite')
+    const db = new DatabaseSync(copilotDb)
+    const ids = db.prepare('SELECT span_id FROM spans ORDER BY span_id').all().map(r => r.span_id)
+    const doomed = ids.filter((_, i) => i % 2 === 0)
+    const delSpan = db.prepare('DELETE FROM spans WHERE span_id = ?')
+    const delAttr = db.prepare('DELETE FROM span_attributes WHERE span_id = ?')
+    for (const id of doomed) { delAttr.run(id); delSpan.run(id) }
+    pruned = doomed.length
+    const left = db.prepare('SELECT COUNT(*) AS n FROM spans').get().n
+    db.close()
+    ok(`pruned ${pruned} of ${ids.length} spans; ${left} remain in a DB that still exists`)
+  } catch (err) {
+    skip(`could not prune the copilot store (${err.message})`)
+  }
+
+  if (pruned > 0) {
+    // Remove the baseline daily cache so nothing but the session cache can
+    // answer. Without this the carry-forward would serve the pruned days from
+    // the v17 file and the check would pass with the session cache emptied.
+    rmSync(join(prunedCache, OLD_DAILY_CACHE), { force: true })
+
+    capture(newBin, prunedCache, join(PAYLOADS, 'pruned-upgraded'))
+    const afterRecords = copilotRecords(join(PAYLOADS, 'pruned-upgraded'))
+    const verdict = afterRecords.calls < beforeRecords.calls ? ' — LOST history'
+      : afterRecords.calls > beforeRecords.calls ? ' — DOUBLED'
+        : ''
+    check(sameRecords(beforeRecords, afterRecords),
+      `copilot across the bump: ${showRecords(beforeRecords)} -> ${showRecords(afterRecords)}${verdict}`)
+
+    // And persisted, not merely served: the second run reads the cache the
+    // bump rewrote, so a carry-forward that only survived in memory fails.
+    capture(newBin, prunedCache, join(PAYLOADS, 'pruned-warm'))
+    const warmRecords = copilotRecords(join(PAYLOADS, 'pruned-warm'))
+    check(sameRecords(beforeRecords, warmRecords),
+      `and again from the rewritten cache: ${showRecords(warmRecords)}`)
   }
 }
 

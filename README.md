@@ -92,7 +92,7 @@ Everything runs locally. No wrapper, no proxy, no API keys, nothing leaves your 
 npx codeburn
 ```
 
-That opens the interactive dashboard (last 7 days by default). Arrow keys switch periods, `q` quits. That is the 30-second version. You now know where your AI budget goes.
+That opens the interactive dashboard (today by default, or the last 7 days when today has no usage yet). Arrow keys switch periods, `q` quits. That is the 30-second version. You now know where your AI budget goes.
 
 **Install it** for a permanent `codeburn` command:
 
@@ -377,6 +377,16 @@ gnome-extensions enable codeburn@codeburn.dev
 
 See [gnome/README.md](gnome/README.md) for settings and development notes. The Tauri tray app in `windows/` also builds and runs on Linux, but it is experimental and unreleased there — the GNOME extension is the supported Linux surface.
 
+### Omarchy
+
+Install the [CodeBurn Omarchy plugin](https://omarchyplugins.com/plugin.html?id=codeburn) to add CodeBurn to Omarchy:
+
+Community-maintained by [@erzz](https://github.com/erzz) — issues and feature requests go to [erzz/omarchy-codeburn](https://github.com/erzz/omarchy-codeburn).
+
+```bash
+omarchy plugin add https://github.com/erzz/omarchy-codeburn.git --enable
+```
+
 ## CodeBurn in your agent (MCP)
 
 ```bash
@@ -452,7 +462,7 @@ Run `codeburn` for the dashboard, or use a subcommand below. Most commands also 
 
 | Command | What it does |
 |---------|--------------|
-| `codeburn` | Interactive dashboard, last 7 days (the default view) |
+| `codeburn` | Interactive dashboard, today (falls back to the last 7 days when today is empty) |
 | `codeburn today` | Today's usage |
 | `codeburn month` | This calendar month's usage |
 | `codeburn overview` | Plain-text monthly summary, copy-pasteable (`--no-color`, `--from`/`--to`) |
@@ -528,7 +538,7 @@ Sync sends token counts, costs, models, and projects, never prompts or code. Thi
 | `codeburn models --by-task` | Break each model into per-task-type rows |
 | `codeburn models --by-agent` | Break each model into per-agent rows: which agent drove which model's spend (`(main)` covers non-agent sessions; `--min-cost 0` shows sub-cent agents) |
 | `codeburn models --top 10` | Only the 10 most expensive models |
-| `codeburn models --unpriced` | Only models with usage that currently price at $0 — the copyable form of the unpriced-models warning. Shows raw model IDs (not friendly names) so they can be pasted into `model-alias`; JSON keeps them exact |
+| `codeburn models --unpriced` | Only models with usage that currently price at $0 — the copyable form of the unpriced-models warning. Shows raw model IDs (not friendly names). Per-token gaps go to `model-alias`; subscription / flat-rate SKUs go to `model-flat-rate`. JSON keeps IDs exact |
 | `codeburn models --format markdown` | Emit a paste-friendly markdown table |
 | `codeburn models --task feature` | Filter to feature-development work |
 | `codeburn models --provider claude` | Filter to a single provider |
@@ -544,7 +554,7 @@ Left/right arrow keys switch between Today, 7 Days, 30 Days, Month, 6 Months, an
 
 ### Pricing
 
-Prices every API call using input, output, cache read, cache write, and web search token counts, with a fast mode multiplier for Claude. Prices are fetched from [LiteLLM](https://github.com/BerriAI/litellm) and cached locally for 24 hours at `~/.cache/codeburn/`. Hardcoded fallbacks for all Claude and GPT-5 models prevent fuzzy-matching mispricing.
+Prices every API call using input, output, cache read, cache write, and web search token counts, with a fast mode multiplier for Claude. Prices are fetched from [LiteLLM](https://github.com/BerriAI/litellm) and cached locally for 24 hours at `~/.cache/codeburn/`. Hardcoded fallbacks for all Claude and GPT-5 models prevent fuzzy-matching mispricing. Routing-gateway model ids are priced as the model they wrap: [OrcaRouter](https://www.orcarouter.ai) fusion route ids peel to their current upstream (`openai/gpt-oss-120b`), `orcarouter/auto` stays unpriced until a live probe pins the rotating target, and a nested upstream spelling (`orcarouter/deepseek/deepseek-v4-pro`) prices at that exact row, so a gateway-routed session reports real spend instead of $0.
 
 ### Task Categories
 
@@ -580,14 +590,16 @@ For categories that involve code edits, CodeBurn tracks file-aware retry cycles.
 codeburn plan set claude-max                                  # $200/month
 codeburn plan set claude-pro                                  # $20/month
 codeburn plan set cursor-pro                                  # $20/month
+codeburn plan set copilot-pro                                 # 1500 AI Credits ($15 equivalent)
 codeburn plan set custom --monthly-usd 200 --provider codex   # ChatGPT Pro-style custom plan
+codeburn plan set custom --credits 20000 --provider copilot   # org Copilot allotment
 codeburn plan reset --provider codex                          # remove one provider plan
 codeburn plan set none                                        # disable plan view
 codeburn plan                                                 # show configured plans
 codeburn plan reset                                           # remove plan config
 ```
 
-Subscription tracking for Claude Pro, Claude Max, Cursor Pro, and custom provider plans. Plans are stored per provider, so you can track Claude and Codex/Cursor subscriptions at the same time; the dashboard shows one overage line per active provider plan. A legacy/custom `all` plan remains a single aggregate plan and is replaced when you add a provider-specific plan, avoiding double-counted overage rows. Existing single-plan config is still read as a fallback. Presets use publicly stated plan prices (as of April 2026); they do not model exact token allowances, because vendors do not publish precise consumer-plan limits.
+Subscription tracking for Claude Pro, Claude Max, Cursor Pro, Copilot (AI credits), and custom provider plans. Plans are stored per provider, so you can track Claude and Codex/Cursor subscriptions at the same time; the dashboard shows one overage line per active provider plan. A legacy/custom `all` plan remains a single aggregate plan and is replaced when you add a provider-specific plan, avoiding double-counted overage rows. Existing single-plan config is still read as a fallback. USD presets use publicly stated plan prices (as of April 2026). Copilot presets use official individual AI-credit allotments (Pro 1,500 / Pro+ 7,000 / Max 20,000; fetched 2026-08-23) — not the $10 / $39 / $100 sticker prices — and spend is `total_nano_aiu / 1e9`, never token-priced USD.
 
 ### Currency
 
@@ -620,10 +632,11 @@ Aliases are stored in `~/.config/codeburn/config.json` and applied at runtime be
 ```bash
 codeburn price-override my-model --input 0.27 --output 1.10   # USD per 1M tokens
 codeburn model-savings "llama3.1:8b" gpt-4o                   # local model, counted as savings
+codeburn model-flat-rate auto-genius                          # subscription SKU, $0 is correct
 codeburn proxy-path ~/work/copilot-repo                       # subscription-covered project
 ```
 
-`price-override` sets exact rates for any model (input, output, cache read, cache creation), useful for private deployments or models LiteLLM prices wrong. `model-savings` maps a free local model to a paid baseline: the local calls stay $0, and the dashboard shows what the same tokens would have cost on the baseline. `proxy-path` marks a project routed through a subscription-backed proxy (e.g. Claude Code over GitHub Copilot), so its API-rate cost is reported as subscription-covered and your net out-of-pocket stays honest. All three support `--list` and `--remove`.
+`price-override` sets exact rates for any model (input, output, cache read, cache creation), useful for private deployments or models LiteLLM prices wrong. `model-savings` maps a free local model to a paid baseline: the local calls stay $0, and the dashboard shows what the same tokens would have cost on the baseline. `model-flat-rate` marks a subscription-billed product SKU so the unpriced warning stays quiet and `model-alias` is not suggested — aliasing those ids invents spend. `--remove` also opts out of a built-in SKU. `proxy-path` marks a project routed through a subscription-backed proxy (e.g. Claude Code over GitHub Copilot), so its API-rate cost is reported as subscription-covered and your net out-of-pocket stays honest. All four support `--list` and `--remove`.
 
 ### Filtering
 
@@ -711,7 +724,7 @@ These are starting points, not verdicts. A 60% cache hit on a single experimenta
 | **Claude Code** | `~/.claude/projects/<sanitized-path>/<session-id>.jsonl` | Each assistant entry carries model name, token usage (input, output, cache read, cache write), `tool_use` blocks, and timestamps. |
 | **Claude (multiple config dirs)** | Set via `CLAUDE_CONFIG_DIRS` (e.g. `~/.claude-work:~/.claude-personal`) | Scans every listed directory and merges sessions into one row per project so totals reflect all your Claude usage. Use `:` on POSIX, `;` on Windows; overrides `CLAUDE_CONFIG_DIR`. Missing or unreadable directories are skipped. |
 | **Codex (OpenAI)** | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, `~/.codex/archived_sessions/rollout-*.jsonl` | Reads `token_count` events (per-call and cumulative usage) and `function_call` entries for tool tracking; attributes cost by project working directory. `codeburn report --provider codex` views Codex alone. |
-| **Cursor** | SQLite `state.vscdb` under `globalStorage`: macOS `~/Library/Application Support/Cursor/User/globalStorage/`, Linux `~/.config/Cursor/User/globalStorage/`, Windows `%APPDATA%/Cursor/User/globalStorage/`; results cached at `~/.cache/codeburn/cursor-results.json` | Input tokens come from Cursor's own per-conversation context meter (`composerData.promptTokenBreakdown`), credited once per conversation on a stable anchor; tool calls and shell commands are read from the agent stream (`agentKv`), and Composer house models are priced from Cursor's published rates. Output is a reply-text estimate and cache tokens are server-side only, so figures are marked estimated and undercount the Cursor admin console for long conversations. The cache auto-invalidates when the database changes; the first run on a large database can take a minute. |
+| **Cursor** | SQLite `state.vscdb` under `globalStorage`: macOS `~/Library/Application Support/Cursor/User/globalStorage/`, Linux `~/.config/Cursor/User/globalStorage/`, Windows `%APPDATA%/Cursor/User/globalStorage/`; results cached at `~/.cache/codeburn/cursor-results.v<n>.json` | Input tokens come from Cursor's own per-conversation context meter (`composerData.promptTokenBreakdown`), credited once per conversation on a stable anchor; tool calls and shell commands are read from the agent stream (`agentKv`), and Composer house models are priced from Cursor's published rates. Output is a reply-text estimate and cache tokens are server-side only, so figures are marked estimated and undercount the Cursor admin console for long conversations. The cache auto-invalidates when the database changes; the first run on a large database can take a minute. |
 | **OpenCode** | SQLite `~/.local/share/opencode/opencode*.db` or file-based `~/.local/share/opencode/storage/` (respects `XDG_DATA_HOME`; `OPENCODE_DATA_DIR`/`OPENCODE_DB_PREFIX` for renamed/forked builds) | Queries `session`, `message`, and `part` read-only and recalculates cost via LiteLLM (falling back to OpenCode's own cost field for unpriced models). Subtask sessions (`parent_id IS NOT NULL`) are excluded to avoid double counting; multiple channel databases are supported. |
 | **Gemini CLI** | `~/.gemini/tmp/<project>/chats/session-*.json` | One JSON file per session with real token counts (input, output, cached, thoughts) per message, so no estimation is needed. Input is reported inclusive of cached, so CodeBurn subtracts cached before pricing to avoid double charging. |
 | **Antigravity (CLI & IDE)** | Session files under `.gemini/` folders, plus the running language server | Pulls granular trajectory and pricing from the language server process. For the short-lived CLI, optionally install a status-line hook with `codeburn antigravity-hook install` so usage is captured between menubar refreshes. The IDE is detected via the `--app-data-dir antigravity-ide` flag on Windows. |

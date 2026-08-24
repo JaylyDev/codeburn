@@ -223,11 +223,11 @@ describe('Plans', () => {
 
     const { rerender } = render(<Plans period="30days" refreshToken={0} />)
     await screen.findByText('Max 20x')
-    expect(getQuota).toHaveBeenCalledWith(false) // mount is a steady poll
+    expect(getQuota).toHaveBeenCalledWith(false, []) // mount is a steady poll
     getQuota.mockClear()
 
     rerender(<Plans period="30days" refreshToken={1} />) // manual refresh bumps the token
-    await waitFor(() => expect(getQuota).toHaveBeenCalledWith(true))
+    await waitFor(() => expect(getQuota).toHaveBeenCalledWith(true, []))
 
     getQuota.mockClear()
     rerender(<Plans period="30days" refreshToken={1} />) // unchanged token must not re-force
@@ -255,7 +255,7 @@ describe('Plans', () => {
 
     getQuota.mockClear()
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
-    await waitFor(() => expect(getQuota).toHaveBeenCalledWith(true))
+    await waitFor(() => expect(getQuota).toHaveBeenCalledWith(true, []))
   })
 
   it('renders the honest rate-limited note on a 429 backoff, per provider owner', async () => {

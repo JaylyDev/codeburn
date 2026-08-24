@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
+import { spawn } from 'child_process'
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, unlink, utimes, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -30,6 +31,15 @@ function fakeClock(start = 1_000): RefreshLockClock & { advance: (ms: number) =>
     monotonicNow: () => monotonic,
     advance: ms => { wall += ms; monotonic += ms },
   }
+}
+
+/** The pid of a process that has definitively exited, for the dead-holder gate. */
+async function exitedPid(): Promise<number> {
+  const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' })
+  const pid = child.pid
+  if (!pid) throw new Error('no pid')
+  await new Promise<void>(resolve => { child.once('exit', () => resolve()) })
+  return pid
 }
 
 afterEach(async () => {
@@ -132,6 +142,105 @@ describe('warm session-cache refresh lock', () => {
     } finally {
       clearInterval(heartbeat)
     }
+  })
+
+  // #1117: the waiter budget now outlives the stale gate by design, so the
+  // live-holder guarantee has to hold for a wait many times longer than staleMs,
+  // not just for one shorter than it.
+  it('never takes over a heartbeating owner however far the wait outlives staleMs', async () => {
+    const dir = await tempDir()
+    const path = lockPath(dir)
+    const clock = fakeClock()
+    await writeFile(path, JSON.stringify({ pid: 1, token: 'holder', at: clock.wallNow() }))
+    const beat = async (): Promise<void> => {
+      const now = new Date(clock.wallNow())
+      await utimes(path, now, now)
+    }
+    await beat()
+
+    const result = await acquireCacheRefreshLock({
+      cacheDir: dir,
+      clock,
+      staleMs: 500,
+      waitMs: 5_000,
+      pollMs: 1,
+      // pid 1 is alive and the holder keeps pace with the clock, so neither
+      // abandonment clause ever opens even though the waiter spends ten stale
+      // windows in the loop.
+      sleep: async () => { clock.advance(100); await beat() },
+    })
+    expect(result).toEqual({ outcome: 'timed-out' })
+    expect(JSON.parse(await readFile(path, 'utf-8')).token).toBe('holder')
+  })
+
+  it('takes over a lock whose holder pid is gone without waiting out the stale window', async () => {
+    const dir = await tempDir()
+    const path = lockPath(dir)
+    // Wall clock frozen so the age gate can NEVER open; monotonic still runs so
+    // the waiter budget expires instead of spinning. Only the dead pid can
+    // explain a takeover here.
+    let monotonic = 1_000
+    const clock: RefreshLockClock = { wallNow: () => 1_000, monotonicNow: () => monotonic }
+    const gone = await exitedPid()
+    await writeFile(path, JSON.stringify({ pid: gone, token: 'killed', at: clock.wallNow() }))
+    const now = new Date(clock.wallNow())
+    await utimes(path, now, now)
+
+    const result = await acquireCacheRefreshLock({
+      cacheDir: dir,
+      clock,
+      waitMs: 5_000,
+      pollMs: 1,
+      sleep: async ms => { monotonic += ms },
+    })
+    expect(result.outcome).toBe('acquired')
+    if (result.outcome !== 'acquired') return
+    expect(JSON.parse(await readFile(path, 'utf-8'))).toMatchObject({ pid: process.pid, token: result.handle.token })
+    await result.handle.release()
+  })
+
+  it('takes over a lock whose heartbeat froze even though its holder pid is alive', async () => {
+    const dir = await tempDir()
+    const path = lockPath(dir)
+    // pid 1 always answers signal 0, so only the frozen mtime can explain it.
+    await writeFile(path, JSON.stringify({ pid: 1, token: 'frozen', at: 1 }))
+    await utimes(path, new Date(1), new Date(1))
+    const clock = fakeClock(1_000_000)
+
+    const result = await acquireCacheRefreshLock({
+      cacheDir: dir,
+      clock,
+      staleMs: 90_000,
+      waitMs: 5_000,
+      pollMs: 1,
+      sleep: async ms => { clock.advance(ms) },
+    })
+    expect(result.outcome).toBe('acquired')
+    if (result.outcome !== 'acquired') return
+    await result.handle.release()
+  })
+
+  it('defaults the waiter budget past the stale gate', async () => {
+    const dir = await tempDir()
+    const path = lockPath(dir)
+    const clock = fakeClock()
+    await writeFile(path, JSON.stringify({ pid: 1, token: 'frozen', at: clock.wallNow() }))
+    const now = new Date(clock.wallNow())
+    await utimes(path, now, now)
+
+    // No waitMs override: the default must be long enough that a lock which goes
+    // stale mid-wait is still recovered by THIS waiter rather than timing out
+    // and leaving the leftover for the next process to trip over (#1117).
+    const result = await acquireCacheRefreshLock({
+      cacheDir: dir,
+      clock,
+      staleMs: 90_000,
+      pollMs: 1,
+      sleep: async () => { clock.advance(1_000) },
+    })
+    expect(result.outcome).toBe('acquired')
+    if (result.outcome !== 'acquired') return
+    await result.handle.release()
   })
 
   it('heartbeats its own lock body and mtime with the injected clock', async () => {

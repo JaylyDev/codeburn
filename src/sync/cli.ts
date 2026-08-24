@@ -23,7 +23,7 @@ import {
 import { createCredentialStore } from './credentials.js'
 import { readSyncConfig, writeSyncConfig, deleteSyncConfig, updateLastSync } from './config.js'
 import { collectUnsentCalls, collectUnsentAttribution, sendBatches, sendAttributionBatches, batchCalls, MAX_PER_PUSH, MAX_ATTRIBUTION_PER_PUSH, type PushResult } from './push.js'
-import { batchAttributionItems } from './otlp.js'
+import { batchAttributionItems, wireProjectName } from './otlp.js'
 
 export function registerSyncCommands(program: Command): void {
   const sync = program
@@ -274,10 +274,11 @@ export function registerSyncCommands(program: Command): void {
           process.exit(1)
         }
         const { range } = getDateRange(period)
-        const projects = await parseAllSessions(range)
+        const projects = (await parseAllSessions(range))
+          .map(p => ({ ...p, project: wireProjectName(p.projectPath, p.project) }))
 
         // Flatten + filter against sent-ledger
-        const { allCalls, unsent } = collectUnsentCalls(projects)
+        const { allCalls, unsent, held, frozen } = collectUnsentCalls(projects)
 
         // Attribution records (opt-in): session→commit correlation computed
         // locally from the same parsed projects. Reuses the yield engine.
@@ -294,7 +295,13 @@ export function registerSyncCommands(program: Command): void {
         if (opts.dryRun) {
           const toPushCount = Math.min(unsent.length, MAX_PER_PUSH)
           const cost = unsent.slice(0, MAX_PER_PUSH).reduce((s, c) => s + c.call.costUSD, 0)
-          process.stderr.write(`[dry-run] Window: ${opts.since} — ${allCalls.length} calls total, ${allCalls.length - unsent.length} already synced\n`)
+          process.stderr.write(`[dry-run] Window: ${opts.since} — ${allCalls.length} calls total, ${allCalls.length - unsent.length - held.length - frozen.length} already synced\n`)
+          if (held.length > 0) {
+            process.stderr.write(`[dry-run] ${held.length} calls held: their session is still reconciling and its values can still change (#988). They push once it settles.\n`)
+          }
+          if (frozen.length > 0) {
+            process.stderr.write(`[dry-run] ${frozen.length} Copilot calls frozen: their sessions were already synced in the other shape (rollup vs per-request), and a usage span cannot be retracted. See docs/sync/README.md.\n`)
+          }
           process.stderr.write(`[dry-run] Would push ${toPushCount} calls ($${cost.toFixed(2)}) to ${config.baseUrl}${config.tracesPath}\n`)
           if (unsent.length > MAX_PER_PUSH) {
             process.stderr.write(`[dry-run] ${unsent.length - MAX_PER_PUSH} more calls exceed the ${MAX_PER_PUSH} safety limit — a second push would be needed\n`)
@@ -312,7 +319,13 @@ export function registerSyncCommands(program: Command): void {
         }
 
         if (unsent.length === 0 && attributionUnsent.length === 0) {
-          process.stderr.write(`Nothing to push (${allCalls.length} calls already synced).\n`)
+          const pendingNote = [
+            held.length > 0 ? `${held.length} held while their session is still reconciling` : '',
+            frozen.length > 0 ? `${frozen.length} frozen behind an already-synced rollup` : '',
+          ].filter(Boolean).join(', ')
+          process.stderr.write(pendingNote
+            ? `Nothing to push yet (${allCalls.length - held.length - frozen.length} calls already synced, ${pendingNote}).\n`
+            : `Nothing to push (${allCalls.length} calls already synced).\n`)
           updateLastSync()
           return
         }

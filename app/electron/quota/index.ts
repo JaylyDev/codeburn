@@ -1,8 +1,11 @@
 import os from 'node:os'
 import path from 'node:path'
 
+import { fetchAntigravityQuota } from './antigravity'
 import { fetchClaudeQuota } from './claude'
 import { fetchCodexQuota } from './codex'
+import { fetchCopilotQuota } from './copilot'
+import { fetchGeminiQuota } from './gemini'
 import { atomicWriteSecureFile, readSecureFile, sanitizeError } from './security'
 import type { ProviderName, QuotaProvider } from './types'
 
@@ -11,9 +14,13 @@ export { sanitizeError } from './security'
 
 type Blocked = Partial<Record<ProviderName, string>>
 type FetchResult = { quota: QuotaProvider; retryAfterSeconds?: number }
+type FetcherOptions = { signal: AbortSignal; allowKeychain: boolean }
 type QuotaDeps = {
-  claude: (options: { signal: AbortSignal; allowKeychain: boolean }) => Promise<FetchResult>
-  codex: (options: { signal: AbortSignal; allowKeychain: boolean }) => Promise<FetchResult>
+  claude: (options: FetcherOptions) => Promise<FetchResult>
+  codex: (options: FetcherOptions) => Promise<FetchResult>
+  gemini: (options: FetcherOptions) => Promise<FetchResult>
+  copilot: (options: FetcherOptions) => Promise<FetchResult>
+  antigravity: (options: FetcherOptions) => Promise<FetchResult>
   statePath: string
   readFile: typeof readSecureFile
   writeFile: typeof atomicWriteSecureFile
@@ -21,9 +28,16 @@ type QuotaDeps = {
   refreshMs: number
 }
 
+const PROVIDERS: ProviderName[] = ['claude', 'codex', 'gemini', 'copilot', 'antigravity']
+
 const defaultDeps: QuotaDeps = {
   claude: fetchClaudeQuota,
   codex: fetchCodexQuota,
+  gemini: fetchGeminiQuota,
+  copilot: fetchCopilotQuota,
+  // The Antigravity probe talks only to localhost surfaces (no credentials,
+  // no remote endpoints), so it ignores the abort/keychain options entirely.
+  antigravity: async () => ({ quota: await fetchAntigravityQuota() }),
   statePath: path.join(os.homedir(), '.codeburn', 'quota-backoff.json'),
   readFile: readSecureFile,
   writeFile: atomicWriteSecureFile,
@@ -37,17 +51,30 @@ function unavailable(provider: ProviderName, connection: QuotaProvider['connecti
   return { provider, connection, primary: null, details: [], planLabel: null, footerLines: [] }
 }
 
+/**
+ * The Codex live gauge needs read-write access to the Codex CLI's own
+ * `~/.codex/auth.json`, because refreshing the OAuth grant rotates the token
+ * and writes it back. A store-distributed snap should not hold write access to
+ * another vendor's credential file, so the snap's personal-files declaration
+ * requests neither that file nor a Codex root, and the gauge is disabled here
+ * to match. Codex usage and cost analytics are unaffected: those come from the
+ * session rollouts under `~/.codex/sessions`, which the snap does read.
+ */
+function codexQuotaSupported(): boolean {
+  return !process.env['SNAP']
+}
+
 export class QuotaService {
   private readonly deps: QuotaDeps
   private cache: { at: number; value: QuotaProvider[] } | null = null
   private flight: Promise<QuotaProvider[]> | null = null
-  private generations: Record<ProviderName, number> = { claude: 0, codex: 0 }
+  private generations: Record<ProviderName, number> = Object.fromEntries(PROVIDERS.map(p => [p, 0])) as Record<ProviderName, number>
   private controllers: Partial<Record<ProviderName, AbortController>> = {}
 
   constructor(deps: Partial<QuotaDeps> = {}) { this.deps = { ...defaultDeps, ...deps } }
 
   invalidate(provider?: ProviderName): void {
-    const providers: ProviderName[] = provider ? [provider] : ['claude', 'codex']
+    const providers: ProviderName[] = provider ? [provider] : PROVIDERS
     for (const p of providers) {
       this.generations[p] += 1
       this.controllers[p]?.abort()
@@ -56,11 +83,13 @@ export class QuotaService {
     this.cache = null
   }
 
-  async getQuota(options: { force?: boolean; allowKeychain?: boolean } = {}): Promise<QuotaProvider[]> {
+  async getQuota(options: { force?: boolean; allowKeychain?: boolean; disabled?: string[] } = {}): Promise<QuotaProvider[]> {
     if (options.force) this.invalidate()
     if (!options.force && this.cache && this.deps.now() - this.cache.at < this.deps.refreshMs) return this.cache.value
     if (this.flight) return this.flight
-    this.flight = this.fetchAll(Boolean(options.allowKeychain)).finally(() => { this.flight = null })
+    // IPC names are untrusted strings; only known providers may be skipped.
+    const disabled = new Set((options.disabled ?? []).filter((p): p is ProviderName => PROVIDERS.includes(p as ProviderName)))
+    this.flight = this.fetchAll(Boolean(options.allowKeychain), disabled).finally(() => { this.flight = null })
     return this.flight
   }
 
@@ -79,7 +108,7 @@ export class QuotaService {
     catch (error) { console.warn(`Quota backoff state not saved: ${sanitizeError(error)}`) }
   }
 
-  private async fetchAll(allowKeychain: boolean): Promise<QuotaProvider[]> {
+  private async fetchAll(allowKeychain: boolean, disabled: Set<ProviderName>): Promise<QuotaProvider[]> {
     const startingGenerations = { ...this.generations }
     const prior = this.cache?.value ?? []
     const blocked = await this.readBlocked()
@@ -99,9 +128,7 @@ export class QuotaService {
       const generation = this.generations[provider]
       const controller = new AbortController()
       this.controllers[provider] = controller
-      const result = provider === 'claude'
-        ? await this.deps.claude({ signal: controller.signal, allowKeychain })
-        : await this.deps.codex({ signal: controller.signal, allowKeychain })
+      const result = await this.deps[provider]({ signal: controller.signal, allowKeychain })
       if (generation !== this.generations[provider] || controller.signal.aborted) return unavailable(provider, 'disconnected')
       if (result.retryAfterSeconds !== undefined) {
         blocked[provider] = new Date(this.deps.now() + result.retryAfterSeconds * 1000).toISOString()
@@ -115,8 +142,12 @@ export class QuotaService {
       if (this.controllers[provider] === controller) this.controllers[provider] = undefined
       return retainOnFailure(result.quota)
     }
-    const value = await Promise.all([run('claude'), run('codex')])
-    if (startingGenerations.claude === this.generations.claude && startingGenerations.codex === this.generations.codex) {
+    const value = await Promise.all(PROVIDERS.filter(provider => !disabled.has(provider)).map(provider =>
+      provider === 'codex' && !codexQuotaSupported()
+        ? Promise.resolve(unavailable('codex', 'disconnected'))
+        : run(provider),
+    ))
+    if (PROVIDERS.every(p => startingGenerations[p] === this.generations[p])) {
       this.cache = { at: this.deps.now(), value }
     }
     return value
@@ -128,5 +159,5 @@ export const quotaService = new QuotaService()
 // them on a user-initiated forced refresh (the Connect / Refresh affordance).
 // Background polls skip the keychain and lean on retainOnFailure to hold a
 // live connection steady between forced refreshes.
-export const getQuota = (options: { force?: boolean } = {}): Promise<QuotaProvider[]> =>
-  quotaService.getQuota({ force: options.force, allowKeychain: Boolean(options.force) })
+export const getQuota = (options: { force?: boolean; disabled?: string[] } = {}): Promise<QuotaProvider[]> =>
+  quotaService.getQuota({ force: options.force, allowKeychain: Boolean(options.force), disabled: options.disabled })

@@ -1,7 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 
-import { CliError, DESKTOP_COLD_TIMEOUT_MS, resolveCodeburnPath, shutdownAll, spawnCli, spawnCliAction, startServe, type ActionResult, type SpawnPriority } from './cli'
+import { CliError, DESKTOP_COLD_TIMEOUT_MS, PROGRESS_LINE_PREFIX, reapOrphanServe, resolveCodeburnPath, shutdownAll, spawnCli, spawnCliAction, startServe, type ActionResult, type SpawnPriority } from './cli'
 import { getQuota, sanitizeError } from './quota'
 import { Telemetry } from './telemetry'
 import { createUpdateChecker, type UpdateChecker, type UpdateStatus } from './updates'
@@ -69,7 +69,7 @@ export function createBeforeQuitHandler(deps: BeforeQuitDeps): (event: BeforeQui
 
 // Result envelope: handlers never throw across IPC so the structured error
 // `kind` survives contextBridge serialization. preload.ts unwraps it.
-export type Envelope<T = unknown> = { ok: true; value: T } | { ok: false; error: { kind: string; message: string } }
+export type Envelope<T = unknown> = { ok: true; value: T } | { ok: false; error: { kind: string; message: string; cold?: true } }
 
 // The first overview fetch after boot hydrates a cold cache from scratch (a full
 // history parse). That can far exceed the 45s read timeout, and killing it means
@@ -78,8 +78,6 @@ export type Envelope<T = unknown> = { ok: true; value: T } | { ok: false; error:
 // once it succeeds. Sections gate their own first poll on this one resolving so
 // the cold hydration runs ONCE, not once per section in parallel.
 const WARMUP_TIMEOUT_MS = DESKTOP_COLD_TIMEOUT_MS
-// Wire marker for CLI scan-progress lines (src/parser.ts: PROGRESS_LINE_PREFIX).
-const PROGRESS_LINE_PREFIX = 'CODEBURN_PROGRESS '
 // IPC channel carrying cold-start scan-progress events to the splash.
 export const PROGRESS_CHANNEL = 'codeburn:progress'
 // IPC channel pushing update-availability status to open windows (launch + 24h).
@@ -258,14 +256,36 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     telemetry?.track('cold_start', { ms: Date.now() - (coldStartBegan ?? Date.now()), timedOut })
   }
 
+  // Until the cold hydration finishes, EVERY read shares the overview's floor.
+  // Sections start polling the moment `ready` flips (which an overview error
+  // also does), and a 45s section spawn queued behind a still-running cold parse
+  // was killed on arrival — the `act report`/`plan` red panels in the repro.
+  const readOpts = (): { timeoutMs: number } | undefined =>
+    overviewWarmed ? undefined : { timeoutMs: WARMUP_TIMEOUT_MS }
+  // Marks a TIMEOUT that happened while the cold hydration was still running, so
+  // the renderer keeps the splash instead of painting a red error panel. Only
+  // timeouts: a permission or nonzero failure is real news even while cold.
+  //
+  // BOUNDED, deliberately. `overviewWarmed` only flips on success, so an install
+  // that can never hydrate would otherwise sit behind an indexing splash forever
+  // with no error and no way to reach the "Locate the CLI" recovery. Past the
+  // cold window itself, a timeout stops being "still indexing" and surfaces.
+  const bootedAt = Date.now()
+  const stillCold = (): boolean =>
+    !overviewWarmed && Date.now() - (coldStartBegan ?? bootedAt) < WARMUP_TIMEOUT_MS
+  const coldError = (err: unknown): { kind: string; message: string; cold?: true } => {
+    const error = toEnvelopeError(err)
+    return stillCold() && error.kind === 'timeout' ? { ...error, cold: true } : error
+  }
+
   const run = (build: (...args: any[]) => string[]): Handler => async (...args: any[]) => {
     let cmd: string | undefined
     try {
       const argv = build(...args)
       cmd = argv[0]
-      return { ok: true, value: await deps.spawnCli(argv) }
+      return { ok: true, value: await deps.spawnCli(argv, readOpts()) }
     } catch (err) {
-      const error = toEnvelopeError(err)
+      const error = coldError(err)
       telemetry?.track('cli_error', cliErrorProps(err, cmd))
       return { ok: false, error }
     }
@@ -308,7 +328,7 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
       emitColdStart(false)
       return { ok: true, value }
     } catch (err) {
-      const error = toEnvelopeError(err)
+      const error = coldError(err)
       if (!overviewWarmed) emitColdStart(error.kind === 'timeout')
       telemetry?.track('cli_error', cliErrorProps(err, 'status'))
       return { ok: false, error }
@@ -324,8 +344,8 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
   }
 
   return {
-    'codeburn:getQuota': async (force?: boolean) => {
-      try { return { ok: true, value: await deps.getQuota({ force: Boolean(force) }) } }
+    'codeburn:getQuota': async (force?: boolean, disabled?: string[]) => {
+      try { return { ok: true, value: await deps.getQuota({ force: Boolean(force), disabled }) } }
       catch (error) { return { ok: false, error: { kind: 'nonzero', message: sanitizeError(error) } } }
     },
     'codeburn:getOverview': getOverview,
@@ -572,7 +592,11 @@ function bootstrap(): void {
     // Start the resident child early, but issue no artificial warm-up query:
     // the first real overview request is the single cache hydration and streams
     // its progress through serve. Every later panel reuses that parsed cache.
-    startServe()
+    // A crash leaves no one to close the previous child's stdin, so reap it
+    // first — orphans hold FSEvents handles and a stale cache refresh lock.
+    const servePidFile = path.join(app.getPath('userData'), 'serve.pid')
+    reapOrphanServe(servePidFile)
+    startServe(servePidFile)
     // Consent-gated anonymous telemetry (desktop only). Nothing transmits until
     // the onboarding consent screen is completed and the toggle is on; EU/EEA/
     // UK/CH installs default the toggle off. Dev builds never send.

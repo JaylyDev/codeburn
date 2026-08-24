@@ -106,8 +106,9 @@ describe('cursor cache', () => {
       process.env['CODEBURN_CACHE_DIR'] = secondCacheDir
       await writeCachedResults(dbPath, [], secondFloor)
 
-      const firstPath = join(firstCacheDir, 'cursor-results.json')
-      const secondPath = join(secondCacheDir, 'cursor-results.json')
+      const { cursorCacheFileName } = await import('../../src/cursor-cache.js')
+      const firstPath = join(firstCacheDir, cursorCacheFileName())
+      const secondPath = join(secondCacheDir, cursorCacheFileName())
       const first = JSON.parse(await readFile(firstPath, 'utf-8')) as { lookbackFloor: string }
       const second = JSON.parse(await readFile(secondPath, 'utf-8')) as { lookbackFloor: string }
       expect(first.lookbackFloor).toBe(firstFloor)

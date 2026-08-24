@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { aggregateProjectsIntoDays, buildPeriodDataFromDays, dateKey } from '../src/day-aggregator.js'
+import { isTurnResidueOnly } from '../src/daily-cache.js'
 import type { ProjectSummary } from '../src/types.js'
 
 function makeProject(overrides: Partial<ProjectSummary> & { sessions: ProjectSummary['sessions'] }): ProjectSummary {
@@ -218,6 +219,65 @@ describe('aggregateProjectsIntoDays', () => {
     expect(days[0]).toMatchObject({ cost: 0, calls: 0, editTurns: 0, oneShotTurns: 0 })
     expect(days[0]!.categories).toEqual({})
     expect(days[0]!.providers).toEqual({})
+  })
+
+  it("pins the residue shape: a sliced straddling turn leaves turn counts but zero cost/calls on the anchor day", () => {
+    // The contract isTurnResidueOnly keys off (issue #1127). A history parse
+    // that ends at midnight slices a straddling turn to its in-range calls;
+    // when the surviving half carries the turn-level judgments (category,
+    // editTurns) onto day A but every call landed on day B, day A is left
+    // holding ONLY residue: categories.conversation.turns === 1 with
+    // cost/calls/sessions all 0. Construct in LOCAL time so the turn
+    // genuinely straddles local midnight on any machine TZ.
+    const iso = (y: number, mo: number, d: number, h: number, mi: number) =>
+      new Date(y, mo, d, h, mi, 0).toISOString()
+    const turnTs = iso(2026, 3, 16, 23, 58)  // day A, just before midnight
+    const callTs = iso(2026, 3, 17, 0, 5)    // day B: every call past midnight
+    const dayA = dateKey(turnTs)
+    const dayB = dateKey(callTs)
+    expect(dayA).not.toBe(dayB) // sanity: the fixture really straddles local midnight
+
+    const projects: ProjectSummary[] = [
+      makeProject({
+        sessions: [{
+          sessionId: 's1',
+          project: 'p',
+          firstTimestamp: callTs,
+          lastTimestamp: callTs,
+          totalCostUSD: 6,
+          totalInputTokens: 0, totalOutputTokens: 0, totalCacheReadTokens: 0, totalCacheWriteTokens: 0,
+          apiCalls: 1,
+          turns: [
+            {
+              userMessage: 'one more thing before bed', timestamp: turnTs, sessionId: 's1',
+              category: 'conversation', retries: 0, hasEdits: false,
+              assistantCalls: [makeCall(callTs, 6)],
+            },
+          ],
+          modelBreakdown: {}, toolBreakdown: {}, mcpBreakdown: {}, bashBreakdown: {},
+          categoryBreakdown: {} as never,
+          skillBreakdown: {} as never,
+        }],
+      }),
+    ]
+
+    const days = aggregateProjectsIntoDays(projects)
+    const anchor = days.find(d => d.date === dayA)!
+    const next = days.find(d => d.date === dayB)!
+
+    // Anchor day: ONLY turn-anchored residue — no cost, calls, sessions, or tokens.
+    expect(anchor.cost).toBe(0)
+    expect(anchor.calls).toBe(0)
+    expect(anchor.sessions).toBe(0)
+    expect(anchor.inputTokens + anchor.outputTokens + anchor.cacheReadTokens + anchor.cacheWriteTokens).toBe(0)
+    expect(anchor.categories['conversation']!.turns).toBe(1)
+    expect(isTurnResidueOnly(anchor)).toBe(true)
+
+    // Next day: the full cost/calls of the same turn.
+    expect(next.cost).toBe(6)
+    expect(next.calls).toBe(1)
+    expect(next.sessions).toBe(1)
+    expect(isTurnResidueOnly(next)).toBe(false)
   })
 
   it('counts a session under its firstTimestamp date', () => {
@@ -463,18 +523,19 @@ describe('buildPeriodDataFromDays', () => {
 })
 
 describe('daily-cache ↔ report daily-bucket parity', () => {
-  // The daily cache (history.daily + provider breakdown) and the live report /
-  // headline (main.ts daily rollup) must bucket days by the SAME rule, or their
-  // per-day totals drift and their period sums diverge from current.cost at
-  // window boundaries — the V1 audit's constant -$3.45/-81-calls finding. Both
-  // are now PER-CALL for cost/savings/calls (issue #852) with turn-level stats
-  // still turn-anchored: this asserts per-day equality against a reference
-  // that mirrors main.ts buildJsonReport's dailyMap fallback (each call on its
-  // own date), plus the invariant history.daily Σ == report.daily Σ == total
-  // call cost.
+  // The daily cache (history.daily + provider breakdown) and JSON-report
+  // daily[] rows (durable.days from buildDurablePeriod) must bucket days by the
+  // SAME rule, or their per-day totals drift and their period sums diverge from
+  // current.cost at window boundaries — the V1 audit's constant -$3.45/-81-calls
+  // finding. Both are now PER-CALL for cost/savings/calls (issue #852) with
+  // turn-level stats still turn-anchored: this asserts per-day equality against
+  // an independent per-call oracle for the durable day aggregation used by
+  // durable.days (each call on its own date), plus the invariant
+  // history.daily Σ == report.daily Σ == total call cost.
 
-  // Mirrors the live report/headline daily rollup fallback in src/main.ts
-  // (cost/savings/calls bucket under each call's own date).
+  // Independent per-call reference for durable.days (cost/savings/calls bucket
+  // under each call's own date). Not a live buildJsonReport fallback — that
+  // path was deleted in #1067.
   function reportDailyByDate(projects: ProjectSummary[]): Record<string, number> {
     const byDate: Record<string, number> = {}
     for (const p of projects) {
@@ -557,5 +618,36 @@ describe('daily-cache ↔ report daily-bucket parity', () => {
     // per day and the period total is conserved.
     expect(historyByDate[dayA]).toBe(2)
     expect(historyByDate[dayB]).toBe(10)
+  })
+})
+
+describe('supplementary accounting weight (copilot store/rollup calls)', () => {
+  it('adds cost and tokens but no call or turn weight, matching buildSessionSummary', () => {
+    // One real request served both ways: the per-turn call is behavioral, the
+    // paired store row is supplementary. Sealed daily history must agree with
+    // the live session summary (apiCalls 1), not double the call.
+    const behavioral = makeCall('2026-08-05T10:00:00Z', 1, 'claude-sonnet-4-5', 'copilot')
+    const supplementary = { ...makeCall('2026-08-05T10:00:05Z', 2, 'claude-sonnet-4-5', 'copilot'), supplementaryAccounting: true }
+    const day = aggregateProjectsIntoDays([makeSingleTurnProject([behavioral, supplementary])])[0]!
+    expect(day.calls).toBe(1)
+    expect(day.cost).toBeCloseTo(3, 12)
+    expect(day.inputTokens).toBe(200)
+    expect(day.models['claude-sonnet-4-5']!.calls).toBe(1)
+    expect(day.models['claude-sonnet-4-5']!.cost).toBeCloseTo(3, 12)
+    expect(day.providers['copilot']!.calls).toBe(1)
+    expect(day.categories['coding']!.turns).toBe(1)
+
+    // A turn made only of supplementary calls (a rollup-only session's
+    // accounting container): cost and tokens land, weight does not.
+    const aggOnly = aggregateProjectsIntoDays([makeSingleTurnProject([
+      { ...makeCall('2026-08-05T11:00:00Z', 2, 'claude-sonnet-4-5', 'copilot'), supplementaryAccounting: true },
+    ])])[0]!
+    expect(aggOnly.calls).toBe(0)
+    expect(aggOnly.cost).toBeCloseTo(2, 12)
+    expect(aggOnly.inputTokens).toBe(100)
+    expect(aggOnly.categories['coding']!.turns).toBe(0)
+    expect(aggOnly.editTurns).toBe(0)
+    expect(aggOnly.models['claude-sonnet-4-5']!.calls).toBe(0)
+    expect(aggOnly.providers['copilot']!.calls).toBe(0)
   })
 })

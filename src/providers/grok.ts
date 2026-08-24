@@ -2,7 +2,7 @@ import { readdir, stat } from 'fs/promises'
 import { basename, dirname, join } from 'path'
 import { homedir } from 'os'
 
-import { readSessionFile } from '../fs-utils.js'
+import { FS_SCAN_CONCURRENCY, mapWithConcurrency, readSessionFile } from '../fs-utils.js'
 import { calculateCost, getModelCosts, getShortModelName } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
@@ -405,12 +405,15 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         inputTokens: parsed.usage.input,
         // Grok reports reasoning INSIDE outputTokens, but the repo contract is
         // the opposite: ParsedProviderCall.reasoningTokens is exclusive of
-        // outputTokens, and every consumer sums the two (parser.ts's
-        // cachedCallToApiCall for cost, modelBreakdown for tokens, and the
-        // models/audit reports). tests/providers/kiro.test.ts states it
-        // outright. So split it here rather than special-casing grok in five
-        // downstream places: subtracting reasoning makes `output + reasoning`
-        // reconstruct exactly the number Grok reported.
+        // outputTokens. Downstream consumers reconstitute the billable total
+        // through billableOutputTokens() (models.ts): it adds reasoning back on
+        // top for grok and every other provider, except the
+        // REASONING_INCLUDED_IN_OUTPUT set (claude, codex) whose reasoning is
+        // already inside output_tokens and must not be added again.
+        // tests/providers/kiro.test.ts states the exclusive contract outright.
+        // So split it here rather than special-casing grok in every downstream
+        // site: subtracting reasoning makes `output + reasoning` reconstruct
+        // exactly the number Grok reported.
         outputTokens: parsed.usage.output - reasoningTokens,
         cacheCreationInputTokens: parsed.usage.cacheCreation,
         cacheReadInputTokens: parsed.usage.cacheRead,
@@ -455,30 +458,28 @@ async function discoverSessions(sessionsDir: string): Promise<SessionSource[]> {
     return sources
   }
 
-  for (const cwdName of cwdDirs) {
+  // Fanned out per level (the tree is one summary.json read per session); the
+  // per-level results are re-concatenated in readdir order so the emitted
+  // source order matches the serial walk exactly.
+  const cwds = (await mapWithConcurrency(cwdDirs, FS_SCAN_CONCURRENCY, async cwdName => {
     const cwdPath = join(sessionsDir, cwdName)
     const cwdStat = await stat(cwdPath).catch(() => null)
-    if (!cwdStat?.isDirectory()) continue
+    if (!cwdStat?.isDirectory()) return []
+    const sessionDirs = await readdir(cwdPath).catch(() => null)
+    if (!sessionDirs) return []
+    return sessionDirs.map(sessionName => ({ cwdName, sessionPath: join(cwdPath, sessionName) }))
+  })).flat()
 
-    let sessionDirs: string[]
-    try {
-      sessionDirs = await readdir(cwdPath)
-    } catch {
-      continue
-    }
+  const sessions = await mapWithConcurrency(cwds, FS_SCAN_CONCURRENCY, async ({ cwdName, sessionPath }) => {
+    const sessionStat = await stat(sessionPath).catch(() => null)
+    if (!sessionStat?.isDirectory()) return null
+    const summary = await readJson<GrokSummary>(join(sessionPath, 'summary.json'))
+    if (!summary) return null
+    const cwd = summary.info?.cwd ?? safeDecode(cwdName)
+    return { path: join(sessionPath, 'updates.jsonl'), project: basename(cwd), provider: 'grok' } as SessionSource
+  })
 
-    for (const sessionName of sessionDirs) {
-      const sessionPath = join(cwdPath, sessionName)
-      const sessionStat = await stat(sessionPath).catch(() => null)
-      if (!sessionStat?.isDirectory()) continue
-
-      const summary = await readJson<GrokSummary>(join(sessionPath, 'summary.json'))
-      if (!summary) continue
-
-      const cwd = summary.info?.cwd ?? safeDecode(cwdName)
-      sources.push({ path: join(sessionPath, 'updates.jsonl'), project: basename(cwd), provider: 'grok' })
-    }
-  }
+  for (const source of sessions) if (source) sources.push(source)
 
   return sources
 }

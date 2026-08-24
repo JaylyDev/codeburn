@@ -23,5 +23,6 @@ describe('buildMenubarPayloadForRange', () => {
     expect(payload.current.codexCredits).toBeGreaterThanOrEqual(0)
     // optimize:false => scanAndDetect skipped => empty optimize block regardless of data
     expect(payload.optimize).toEqual({ findingCount: 0, savingsUSD: 0, topFindings: [] })
+    expect(payload.stale).toBeUndefined()
   })
 })

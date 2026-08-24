@@ -713,6 +713,95 @@ describe('adoption union across older cache files', () => {
   })
 })
 
+// ═══════════════════════════════════════════════════════════════════════════
+// #946 validation round 5, item 2: the migration carried the copilot slice
+// verbatim instead of re-deriving it.
+//
+// The v21 accounting stops counting copilot's supplementary accounting calls
+// as api calls, so a settled store-era day re-derives with FEWER calls than
+// the pre-store cache holds - the exact shape `isPartialSurvival` reads as
+// "the sources aged out". The guard pinned every such slice to its pre-store
+// value: `overview` served 2,980,804 tokens for 2026-08-06 where the fresh
+// derivation is 74,811,412 (call count 21,608 vs 16,326 on 2026-08-12), while
+// `export`/`models`/`audit` - which never read this cache - served the
+// corrected figures off the same machine.
+//
+// Numbers below are kelchm's isolated machine-A day (2026-08-07): the v17
+// slice deep-equalled the migrated v21 one field-for-field, and a virgin-cache
+// run of the same build derived the store-backed slice instead.
+describe('#946: a migration re-derives copilot instead of carrying it', () => {
+  const settled = daysAgoStr(33)
+  const PRE_STORE = slice(0.630267, 37, { sessions: 6, cacheWriteTokens: 125987 })
+  const STORE_BACKED = slice(0.692094, 27, { sessions: 6, cacheWriteTokens: 150716 })
+
+  /// Seeds an older-version daily cache (what a 0.9.20 install leaves behind)
+  /// so `loadDailyCache` takes the adoption path.
+  const seedOlderCache = async (days: DailyEntry[]) => {
+    await writeFile(
+      join(TMP_CACHE_ROOT, `daily-cache.v${DAILY_CACHE_VERSION - 4}.json`),
+      JSON.stringify({
+        version: DAILY_CACHE_VERSION - 4,
+        savingsConfigHash: 'cfg-A',
+        tzKey: currentTzKey(),
+        lastComputedDate: daysAgoStr(1),
+        days,
+        complete: true,
+        watermarkTrusted: true,
+      }),
+      'utf-8',
+    )
+  }
+
+  it('re-derives the copilot slice when the store still has the sources', async () => {
+    await seedOlderCache([day(settled, { copilot: PRE_STORE })])
+    const out = await ensureCacheHydrated(noSessions, () => [day(settled, { copilot: STORE_BACKED })], 'cfg-A')
+    const got = out.days.find(d => d.date === settled)!
+    expect(got.providers['copilot']).toMatchObject({ cost: 0.692094, calls: 27, cacheWriteTokens: 150716 })
+    expect(got.cost).toBeCloseTo(0.692094, 6)
+    expect(got.calls).toBe(27)
+    // Spent by this re-derivation, so the guard is back on for every later run.
+    expect(out.pendingRederive).toBeUndefined()
+  })
+
+  it('still carries the slice whole when the sources are gone (never-lose, #1033)', async () => {
+    await seedOlderCache([day(settled, { copilot: PRE_STORE })])
+    // The re-derive finds nothing at all for that day: the store and the
+    // journals are both past their retention.
+    const out = await ensureCacheHydrated(noSessions, () => [], 'cfg-A')
+    const got = out.days.find(d => d.date === settled)!
+    expect(got.providers['copilot']).toMatchObject({ cost: 0.630267, calls: 37, cacheWriteTokens: 125987 })
+    expect(got.carried).toBe(true)
+  })
+
+  it('does not lend the exemption to any other provider', async () => {
+    await seedOlderCache([day(settled, { claude: slice(1685.17, 12530, { sessions: 214 }) })])
+    const truncated = [day(settled, { claude: slice(385.44, 560, { sessions: 0 }) })]
+    const out = await ensureCacheHydrated(noSessions, () => truncated, 'cfg-A')
+    expect(out.days.find(d => d.date === settled)!.providers['claude'])
+      .toMatchObject({ cost: 1685.17, calls: 12530 })
+  })
+
+  it('is one-shot: a LATER copilot shrink on a settled day is guarded again', async () => {
+    await seedOlderCache([day(settled, { copilot: PRE_STORE })])
+    await ensureCacheHydrated(noSessions, () => [day(settled, { copilot: STORE_BACKED })], 'cfg-A')
+    // Second run, savings config changed so the whole window re-derives again -
+    // this time the copilot sources have partly aged out.
+    const out = await ensureCacheHydrated(noSessions, () => [day(settled, { copilot: slice(0.1, 3) })], 'cfg-B')
+    expect(out.days.find(d => d.date === settled)!.providers['copilot'])
+      .toMatchObject({ cost: 0.692094, calls: 27 })
+  })
+
+  it('a PARTIAL parse does not spend the entitlement', async () => {
+    await seedOlderCache([day(settled, { copilot: PRE_STORE })])
+    const partial = await ensureCacheHydrated(noSessions, () => [], 'cfg-A', () => false)
+    expect(partial.pendingRederive).toEqual(['copilot'])
+    // The next COMPLETE run still gets to re-derive.
+    const out = await ensureCacheHydrated(noSessions, () => [day(settled, { copilot: STORE_BACKED })], 'cfg-A')
+    expect(out.days.find(d => d.date === settled)!.providers['copilot'])
+      .toMatchObject({ cost: 0.692094, calls: 27 })
+  })
+})
+
 describe('partial survival: a truncated fresh slice cannot delete a settled baseline', () => {
   // The real 0.9.20 -> next upgrade loss: transcripts age out per FILE, so a
   // mostly-forgotten day still gets a handful of turns from surviving later

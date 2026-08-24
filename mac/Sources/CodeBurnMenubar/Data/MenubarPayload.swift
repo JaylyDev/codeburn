@@ -4,6 +4,11 @@ import Foundation
 /// `current` is scoped to the requested period; the whole payload reflects that slice.
 struct MenubarPayload: Codable, Sendable {
     let generated: String
+    /// Present and `true` only when this payload was assembled from a
+    /// read-only stale serve. Absent — never `false` — on a fresh payload;
+    /// absence must be read as "assume fresh," including for payloads from
+    /// a CLI version that predates this field.
+    let stale: Bool?
     let current: CurrentBlock
     let optimize: OptimizeBlock
     let history: HistoryBlock
@@ -15,8 +20,10 @@ struct MenubarPayload: Codable, Sendable {
          optimize: OptimizeBlock,
          history: HistoryBlock,
          combined: CombinedUsage?,
-         claudeConfigs: ClaudeConfigSelector? = nil) {
+         claudeConfigs: ClaudeConfigSelector? = nil,
+         stale: Bool? = nil) {
         self.generated = generated
+        self.stale = stale
         self.current = current
         self.optimize = optimize
         self.history = history
@@ -25,12 +32,13 @@ struct MenubarPayload: Codable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case generated, current, optimize, history, combined, claudeConfigs
+        case generated, stale, current, optimize, history, combined, claudeConfigs
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         generated = try c.decode(String.self, forKey: .generated)
+        stale = try c.decodeIfPresent(Bool.self, forKey: .stale)
         current = try c.decode(CurrentBlock.self, forKey: .current)
         optimize = try c.decode(OptimizeBlock.self, forKey: .optimize)
         history = try c.decode(HistoryBlock.self, forKey: .history)

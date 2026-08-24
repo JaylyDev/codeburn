@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import { isColdHydrating } from './components/CliErrorPanel'
 import { EmptyNote } from './components/EmptyState'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { Hint } from './components/Hint'
@@ -17,7 +18,7 @@ import { formatCompact, formatUsd, setActiveCurrency } from './lib/format'
 import { motionClass } from './lib/motion'
 import { codeburn } from './lib/ipc'
 import { isModifierChord, shortcutLabel } from './lib/platform'
-import { localDateKey } from './lib/period'
+import { localDateKey, PERIOD_LABELS } from './lib/period'
 import { persistRefreshValue, readRefreshValue, refreshValueToMs, RefreshCadenceContext, type RefreshCadence } from './lib/refreshCadence'
 import { OverviewContent } from './sections/Overview'
 import { OptimizeContent } from './sections/Optimize'
@@ -117,15 +118,6 @@ const SECTION_TITLES: Record<Section, string> = {
   settings: 'Settings',
 }
 
-const PERIOD_LABELS: Record<Period, string> = {
-  today: 'Today',
-  week: 'Last 7 days',
-  month: 'This month',
-  '30days': 'Last 30 days',
-  all: 'Last 6 months',
-  lifetime: 'Lifetime',
-}
-
 const STANDARD_PERIODS: Period[] = ['today', 'week', '30days', 'month', 'all', 'lifetime']
 
 // Instant-switch memo key for an overview result. Shared by the overview poll
@@ -154,11 +146,16 @@ function isPeriod(value: string): value is Period {
   return (STANDARD_PERIODS as string[]).includes(value)
 }
 
-/** Boot period = the persisted "Default period" Settings writes, else today. */
-function initialPeriod(): Period {
+/** The persisted "Default period" Settings writes, when there is one. */
+function savedPeriod(): Period | null {
   let saved: string | null = null
   try { saved = globalThis.localStorage?.getItem('codeburn.defaultPeriod') ?? null } catch { /* storage can be unavailable */ }
-  return saved && isPeriod(saved) ? saved : 'today'
+  return saved && isPeriod(saved) ? saved : null
+}
+
+/** Boot period = the persisted "Default period" Settings writes, else today. */
+function initialPeriod(): Period {
+  return savedPeriod() ?? 'today'
 }
 
 /** Persisted Claude config override (empty/absent = aggregate all configs). */
@@ -258,10 +255,26 @@ function AppMain() {
   // full-history parse per section. Flips true the moment overview first has data
   // OR a (resolved) error; LATCHED, so a later uncached switch (which clears
   // overview.data to paint a skeleton) can never re-gate the sections.
+  // A cold-hydration failure is NOT a resolution: flipping ready on it released
+  // every section to spawn its own read behind the still-running parse, and each
+  // one then died on its own timeout. Stay gated (and keep the splash) until the
+  // hydration actually settles.
+  // #1111: with no persisted default the app opens on Today and falls back to 7
+  // days once, when the first payload shows today has no sessions yet. Disarmed
+  // by the period picker, so it can never move a period the user chose.
+  const autoPeriod = useRef(savedPeriod() === null)
+  useEffect(() => {
+    const sessions = overview.data?.current.sessions
+    if (!autoPeriod.current || sessions === undefined) return
+    autoPeriod.current = false
+    if (period === 'today' && sessions === 0) setPeriod('week')
+  }, [overview.data, period])
+
+  const overviewCold = isColdHydrating(overview.error)
   const [ready, setReady] = useState(false)
   useEffect(() => {
-    if (overview.data != null || overview.error != null) setReady(true)
-  }, [overview.data, overview.error])
+    if (overview.data != null || (overview.error != null && !overviewCold)) setReady(true)
+  }, [overview.data, overview.error, overviewCold])
 
   // First-launch onboarding: shown until the telemetry consent screen has been
   // completed once. All telemetry bridge calls are typeof-guarded so an older
@@ -463,6 +476,7 @@ function AppMain() {
 
   const onPeriodChange = (value: string) => {
     if (isPeriod(value)) {
+      autoPeriod.current = false
       setCustomRange(null)
       setPeriod(value)
     }
@@ -525,11 +539,12 @@ function AppMain() {
     <Window>
       <Sidebar active={section} onNavigate={navigate} status={<StatusLine polled={overview} />} />
       <ToastHost />
-      <Splash hasData={overview.data != null} hasError={overview.error != null} />
+      <Splash hasData={overview.data != null} hasError={overview.error != null && !overviewCold} />
       {onboardingStatus && <Onboarding defaultEnabled={onboardingStatus.defaultEnabled} onDone={finishOnboarding} />}
       <div className="ct">
         <div className={overview.switching ? 'switch-line on' : 'switch-line'} aria-hidden="true" />
         <UpdateBanner />
+        <IndexingBanner payload={overview.data ?? null} />
         <DailyBudgetBanner payload={overview.data ?? null} provider={provider} />
         <ErrorBoundary key={section}>
         {section === 'plans' ? (
@@ -559,7 +574,7 @@ function AppMain() {
               ) : section === 'sessions' ? (
                 <Sessions period={period} provider={provider} range={customRange} refreshToken={refreshToken} detectedProviders={detectedProviders} onProviderChange={onProviderSelect} ready={ready} />
               ) : section === 'pullRequests' ? (
-                <PullRequestsContent overview={overview} />
+                <PullRequestsContent overview={overview} period={period} provider={provider} range={customRange} />
               ) : section === 'spend' ? (
                 <SpendContent period={period} provider={provider} range={customRange} overview={overview} refreshToken={refreshToken} ready={ready} />
               ) : section === 'optimize' ? (
@@ -608,6 +623,20 @@ function SectionPlaceholder({ title }: { title: string }) {
     <Panel title={title}>
       <EmptyNote>{title} lands in a later task. The shell, data bridge, and design system are in place.</EmptyNote>
     </Panel>
+  )
+}
+
+/** Honest partiality (#1110): on a cold cache the resident serve child answers
+ * from the files the selected period can show and indexes the rest behind it.
+ * Wording mirrors the TUI banner. Absent `hydration` means a full parse (a
+ * one-shot spawn, or a CLI predating the field), so nothing is shown. */
+function IndexingBanner({ payload }: { payload: MenubarPayload | null }) {
+  const hydration = payload?.hydration
+  if (!hydration || hydration.complete) return null
+  return (
+    <div role="status" className="stale-banner">
+      Indexing history · {Math.min(hydration.indexedFiles, hydration.totalFiles)}/{hydration.totalFiles} files · totals below cover what is indexed so far
+    </div>
   )
 }
 

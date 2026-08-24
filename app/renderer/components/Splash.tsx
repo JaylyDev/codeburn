@@ -51,6 +51,10 @@ function reduceProgress(state: Progress, event: ScanProgressEvent): Progress {
       for (const p of state.order) status[p] = 'done'
       return { ...state, status }
     }
+    // 'keepalive' and anything a newer CLI adds: proof of life, no state change.
+    // A pinned/dev CLI can be newer than this app, so never fall off the switch.
+    default:
+      return state
   }
 }
 
