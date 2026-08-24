@@ -365,6 +365,14 @@ gnome-extensions enable codeburn@codeburn.dev
 
 See [gnome/README.md](gnome/README.md) for settings and development notes. The Tauri tray app in `windows/` also builds and runs on Linux, but it is experimental and unreleased there — the GNOME extension is the supported Linux surface.
 
+### Omarchy
+
+Install the [CodeBurn Omarchy plugin](https://omarchyplugins.com/plugin.html?id=codeburn) to add CodeBurn to Omarchy:
+
+```bash
+omarchy plugin add https://github.com/erzz/omarchy-codeburn.git --enable
+```
+
 ## CodeBurn in your agent (MCP)
 
 ```bash
