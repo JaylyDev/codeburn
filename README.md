@@ -369,6 +369,8 @@ See [gnome/README.md](gnome/README.md) for settings and development notes. The T
 
 Install the [CodeBurn Omarchy plugin](https://omarchyplugins.com/plugin.html?id=codeburn) to add CodeBurn to Omarchy:
 
+Community-maintained by [@erzz](https://github.com/erzz) — issues and feature requests go to [erzz/omarchy-codeburn](https://github.com/erzz/omarchy-codeburn).
+
 ```bash
 omarchy plugin add https://github.com/erzz/omarchy-codeburn.git --enable
 ```
