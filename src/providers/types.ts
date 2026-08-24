@@ -67,11 +67,10 @@ export type ParsedProviderCall = {
   // starts the leg's store-row subtraction interval here instead of at the
   // previous leg. Omitted when the leg contains no compaction.
   compactedAt?: string
-  // Copilot session-store billing metadata, captured only — no report consumes
-  // these yet (pricing/display design is upstream #890). total_nano_aiu is the
-  // request's charged AI-credit amount in nano-AIU (1e9 nano-AIU = 1 credit =
-  // $0.01); request_multiplier is the model's plan multiplier. Captured now so
-  // a future consumer needs no re-parse of rows the CLI may prune meanwhile.
+  // Copilot session-store billing metadata. total_nano_aiu is the request's
+  // charged AI-credit amount in nano-AIU (1e9 nano-AIU = 1 credit = $0.01);
+  // plan math sums finite nanoAiu. request_multiplier stays capture-only
+  // (billing-grade cost rewrite is upstream #890).
   nanoAiu?: number
   requestMultiplier?: number
   turnId?: string

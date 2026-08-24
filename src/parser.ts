@@ -2504,6 +2504,7 @@ function providerCallToTurn(call: ParsedProviderCall): ParsedTurn {
     bashCommands: call.bashCommands,
     deduplicationKey: call.deduplicationKey,
     isEstimated: call.costIsEstimated,
+    ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
   })
 
   const prRefs = extractPrUrlsFromText(call.userMessage)
@@ -2596,6 +2597,7 @@ function apiCallToCachedCall(call: ParsedApiCall): CachedCall {
     ...(call.interrupted ? { interrupted: true } : {}),
     ...(call.userModified ? { userModified: true } : {}),
     ...(call.toolErrors ? { toolErrors: call.toolErrors } : {}),
+    ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
     activeDurationMs: call.activeDurationMs,
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
@@ -2716,6 +2718,7 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
     activeDurationMs: call.activeDurationMs,
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
+    ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
     ...(call.supplementaryAccounting || isHermesObservationKey(call.deduplicationKey)
       ? { supplementaryAccounting: true }
       : {}),

@@ -160,6 +160,44 @@ describe('buildOtlpPayload', () => {
     expect(attrMap['ai.session_id']).toBeUndefined()
   })
 
+  it('bills reasoning into ai.output_tokens for exclusive providers (opencode)', () => {
+    const payload = buildOtlpPayload([makeCallWithSession({
+      provider: 'opencode',
+      usage: {
+        inputTokens: 1000,
+        outputTokens: 500,
+        cacheCreationInputTokens: 0,
+        cacheReadInputTokens: 0,
+        cachedInputTokens: 0,
+        reasoningTokens: 250,
+        webSearchRequests: 0,
+      },
+    })])
+    const attrs = payload.resourceSpans[0]!.scopeSpans[0]!.spans[0]!.attributes
+    const attrMap = Object.fromEntries(attrs.map(a => [a.key, a.value]))
+
+    expect(attrMap['ai.output_tokens']).toEqual({ intValue: '750' })
+  })
+
+  it('keeps ai.output_tokens raw for inclusive providers (claude)', () => {
+    const payload = buildOtlpPayload([makeCallWithSession({
+      provider: 'claude',
+      usage: {
+        inputTokens: 1000,
+        outputTokens: 500,
+        cacheCreationInputTokens: 0,
+        cacheReadInputTokens: 0,
+        cachedInputTokens: 0,
+        reasoningTokens: 250,
+        webSearchRequests: 0,
+      },
+    })])
+    const attrs = payload.resourceSpans[0]!.scopeSpans[0]!.spans[0]!.attributes
+    const attrMap = Object.fromEntries(attrs.map(a => [a.key, a.value]))
+
+    expect(attrMap['ai.output_tokens']).toEqual({ intValue: '500' })
+  })
+
   it('includes tools as array attribute', () => {
     const payload = buildOtlpPayload([makeCallWithSession()])
     const attrs = payload.resourceSpans[0]!.scopeSpans[0]!.spans[0]!.attributes

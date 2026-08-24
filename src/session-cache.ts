@@ -56,9 +56,9 @@ export type CachedCall = {
   activeDurationMs?: number
   activeGeneratedTokens?: number
   toolWaitMs?: number
-  // Copilot session-store billing metadata (capture-only; no report consumes
-  // these yet — see ParsedProviderCall). Omitted when the store's schema
-  // predates the columns.
+  // Copilot session-store billing metadata. Plan math reads nanoAiu (1e9 = 1
+  // credit). requestMultiplier stays capture-only. Omitted when the store's
+  // schema predates the columns.
   nanoAiu?: number
   requestMultiplier?: number
   // Copilot shutdown rollups only: stamp of the last successful in-session

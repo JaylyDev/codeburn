@@ -10,6 +10,7 @@ import { hostname, userInfo } from 'os'
 import { posix, win32 } from 'path'
 import { isTrustedAbsoluteWorkingDirectory } from '../path-privacy.js'
 import type { ParsedApiCall } from '../types.js'
+import { billableOutputTokens } from '../models.js'
 import type { SessionAttributionRecord } from '../yield.js'
 
 export interface OtlpSpan {
@@ -65,6 +66,16 @@ export function deriveSpanId(deduplicationKey: string): string {
 
 export function deriveTraceId(sessionId: string): string {
   return createHash('sha256').update(sessionId).digest('hex').slice(0, 32)
+}
+
+/**
+ * Wire-safe project identity: the leaf directory name. Several providers key a
+ * project by its sanitized absolute path ("-Users-me-Projects-app"), and
+ * docs/sync/README.md promises file paths stay local.
+ */
+export function wireProjectName(projectPath: string, fallback: string): string {
+  const normalized = projectPath.trim().replace(/\\/g, '/').replace(/\/+$/, '')
+  return normalized.split('/').filter(Boolean).pop() ?? fallback
 }
 
 // --- Timestamp conversion ---
@@ -184,7 +195,10 @@ export function buildOtlpPayload(calls: CallWithSession[]): OtlpPayload {
       { key: 'ai.provider', value: { stringValue: provider } },
       { key: 'ai.model', value: { stringValue: model } },
       { key: 'ai.input_tokens', value: { intValue: String(call.usage.inputTokens) } },
-      { key: 'ai.output_tokens', value: { intValue: String(call.usage.outputTokens) } },
+      // Billable output, not raw: for providers that bill reasoning separately
+      // the raw output under-reports by the reasoning volume. Same routing the
+      // display layer adopted in #1115/#1116.
+      { key: 'ai.output_tokens', value: { intValue: String(billableOutputTokens(call.provider, call.usage.outputTokens, call.usage.reasoningTokens)) } },
       { key: 'ai.cost_usd', value: { doubleValue: call.costUSD } },
       { key: 'ai.speed', value: { stringValue: call.speed } },
     ]

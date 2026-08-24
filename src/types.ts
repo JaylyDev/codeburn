@@ -163,6 +163,10 @@ export type ParsedApiCall = {
   /// model-call / turn counts. Hermes deltas persist the flag on CachedCall;
   /// Copilot remains serve-time / never cached.
   supplementaryAccounting?: boolean
+  /// Copilot session-store `total_nano_aiu`. 1e9 nano-AIU = 1 credit = $0.01.
+  /// Threaded from CachedCall / ParsedProviderCall so plan math can sum credits.
+  /// Absent on older stores and on JSONL / shutdown-rollup siblings.
+  nanoAiu?: number
 }
 
 export type ToolCall = {

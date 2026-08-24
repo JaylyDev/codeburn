@@ -1,7 +1,7 @@
 import { readdir, stat } from 'fs/promises'
 import { createReadStream } from 'fs'
 import { createInterface } from 'readline'
-import { basename, join } from 'path'
+import { basename, join, resolve } from 'path'
 import { homedir } from 'os'
 
 import { FS_SCAN_CONCURRENCY, mapWithConcurrency, readSessionLines } from '../fs-utils.js'
@@ -12,6 +12,7 @@ import { normalizeContentBlocks } from '../content-utils.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ToolCall } from '../types.js'
 import type { Provider, ProbeRoot, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import { defaultBilledCodexHome, defaultLauncherRoots, FIRST_LINE_READ_CAP, isNestedLauncherCodexHome, listRolloutSessionIds, rolloutFileSessionId, sameCodexHome } from '../launcher-homes.js'
 
 const modelDisplayNames: Record<string, string> = {
   'codex-auto-review': 'Codex Auto Review',
@@ -177,7 +178,7 @@ function sanitizeProject(cwd: string): string {
 // Cap how many bytes we'll read while looking for the first newline. Real
 // Codex session_meta lines are ~22-27 KB; this leaves plenty of headroom while
 // keeping memory bounded if a corrupt file has no newline at all.
-const FIRST_LINE_READ_CAP = 1024 * 1024
+// FIRST_LINE_READ_CAP is shared with rolloutFileSessionId.
 
 async function readFirstLine(filePath: string): Promise<CodexEntry | null> {
   // Codex CLI 0.128+ writes a session_meta line that can exceed 20 KB because
@@ -1328,8 +1329,40 @@ export async function parseCodexFileFull(source: SessionSource, seenKeys: Set<st
   return { calls, ...(capture.write ? { write: capture.write } : {}) }
 }
 
-export function createCodexProvider(codexDir?: string): Provider {
+function rootsFor(home: string): ProbeRoot[] {
+  return [
+    { path: join(home, 'sessions'), label: 'sessions' },
+    { path: join(home, 'archived_sessions'), label: 'archived' },
+  ]
+}
+
+function dropOverlappingNestSources(sources: SessionSource[], billedHome: string): SessionSource[] {
+  const billedIds = listRolloutSessionIds(billedHome)
+  return sources.filter(source => {
+    const id = rolloutFileSessionId(source.path)
+    return !(id && billedIds.has(id))
+  })
+}
+
+export function createCodexProvider(
+  codexDir?: string,
+  opts?: { primaryDir?: string; launcherRoots?: string[] },
+): Provider {
   const dir = getCodexDir(codexDir)
+  const primaryDir = opts?.primaryDir ?? defaultBilledCodexHome()
+  const launcherRoots = opts?.launcherRoots ?? defaultLauncherRoots()
+  // Explicit nest factory whose path is a realpath alias of the billed home:
+  // empty so a second factory cannot double-count the same tree. The no-arg
+  // singleton must not take this branch — CODEX_HOME may be that alias.
+  const duplicateHome =
+    codexDir !== undefined &&
+    sameCodexHome(dir, primaryDir) &&
+    resolve(dir) !== resolve(primaryDir)
+  const nestHome = isNestedLauncherCodexHome(dir, { primaryDir, launcherRoots })
+  // Production `codex` singleton is createCodexProvider() with no args. When
+  // the resolved dir is a launcher nest and ~/.codex is a distinct existing
+  // tree, walk BOTH and drop nest sources whose session id is already billed.
+  const scanBoth = nestHome && codexDir === undefined
 
   return {
     name: 'codex',
@@ -1346,17 +1379,25 @@ export function createCodexProvider(codexDir?: string): Provider {
       return toolNameMap[rawTool] ?? rawTool
     },
 
-    // Same `dir` discoverSessionsInDir walks: <codexDir>/sessions (dated
-    // rollout files) and <codexDir>/archived_sessions. Honors CODEX_HOME.
+    // Trees discoverSessions actually walks. Honors CODEX_HOME; when the
+    // production singleton scans nest + billed home, both appear here.
     async probeRoots(): Promise<ProbeRoot[]> {
-      return [
-        { path: join(dir, 'sessions'), label: 'sessions' },
-        { path: join(dir, 'archived_sessions'), label: 'archived' },
-      ]
+      if (duplicateHome) return []
+      if (scanBoth) return [...rootsFor(primaryDir), ...rootsFor(dir)]
+      return rootsFor(dir)
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
-      return discoverSessionsInDir(dir)
+      // Same physical tree via two factories is complete overlap, not a
+      // distinct nest. isNestedLauncherCodexHome is false in that case.
+      if (duplicateHome) return []
+      const sources = await discoverSessionsInDir(dir)
+      if (scanBoth) {
+        const billed = await discoverSessionsInDir(primaryDir)
+        return [...billed, ...dropOverlappingNestSources(sources, primaryDir)]
+      }
+      if (!nestHome) return sources
+      return dropOverlappingNestSources(sources, primaryDir)
     },
 
     createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {

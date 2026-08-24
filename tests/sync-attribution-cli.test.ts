@@ -10,7 +10,7 @@
 import { execFileSync } from 'node:child_process'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest'
 import { Command } from 'commander'
@@ -154,5 +154,25 @@ describe('sync push --attribution (CLI level)', () => {
     expect(names).toContain('codeburn.commit')                // commit span
     const wire = JSON.stringify(idp.tracesRequests)
     expect(wire).toContain('github.com/acme/cli-widget')
+  })
+
+  it('never puts a filesystem path on the wire as ai.project', async () => {
+    const now = Date.now()
+    const first = new Date(now - 90 * 60 * 1000).toISOString()
+    const last = new Date(now - 30 * 60 * 1000).toISOString()
+    const session = makeSession('cli-sess-1', first, last, [makeCall(`call-${now}`, first)])
+    parseAllSessionsMock.mockResolvedValue([
+      { project: `-${repoDir.replace(/^\//, '').replace(/\//g, '-')}`, projectPath: repoDir, sessions: [session] } as ProjectSummary,
+    ])
+    await runPush(['--attribution'])
+    const wire = JSON.stringify(idp.tracesRequests)
+    expect(wire).not.toContain(repoDir)                    // no absolute path
+    expect(wire).not.toContain(repoDir.replace(/\//g, '-')) // no slugified path
+    const projects = idp.tracesRequests.flatMap(r => (r.body as any).resourceSpans
+      .flatMap((rs: any) => rs.scopeSpans.flatMap((ss: any) => ss.spans))
+      .flatMap((s: any) => s.attributes.filter((a: any) => a.key === 'ai.project')
+        .map((a: any) => a.value.stringValue)))
+    expect(projects.length).toBeGreaterThanOrEqual(2)       // usage + attribution spans
+    expect(new Set(projects)).toEqual(new Set([basename(repoDir)]))
   })
 })
