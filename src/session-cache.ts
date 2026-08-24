@@ -36,6 +36,8 @@ export type CachedCall = {
   deduplicationKey: string
   project?: string
   projectPath?: string
+  /** Present only when workingDirectory came from a dedicated provider field. */
+  workingDirectoryProvenance?: 'provider-field'
   workingDirectory?: string
   toolSequence?: ToolCall[][]
   // Rich-session-capture (capture-only; no report consumes these yet). All
@@ -621,6 +623,7 @@ function validateCall(c: unknown): c is CachedCall {
     && (o['subagentTypes'] === undefined || isStringArray(o['subagentTypes']))
     && isOptionalString(o['project'])
     && isOptionalString(o['projectPath'])
+    && (o['workingDirectoryProvenance'] === undefined || o['workingDirectoryProvenance'] === 'provider-field')
     && isOptionalString(o['workingDirectory'])
     && (o['toolSequence'] === undefined || (Array.isArray(o['toolSequence']) && (o['toolSequence'] as unknown[]).every(s => isToolCallArray(s))))
     && isOptionalNum(o['locAdded'])

@@ -2,6 +2,7 @@ import { execFileSync } from 'child_process'
 import { realpathSync } from 'fs'
 import { resolve } from 'path'
 import { parseAllSessions } from './parser.js'
+import { isTrustedAbsoluteWorkingDirectory } from './path-privacy.js'
 import type { DateRange, ProjectSummary, SessionSummary } from './types.js'
 
 export type YieldCategory = 'productive' | 'reverted' | 'abandoned' | 'ambiguous'
@@ -399,6 +400,8 @@ type RepoGroup = {
   gitDir: string | null
 }
 
+type RepoIdentityMode = 'project-path' | 'trusted-session-cwd'
+
 /**
  * Group sessions by canonical repository identity and load each group's
  * commits for the range. Shared by `computeYield` (categorization) and
@@ -412,6 +415,7 @@ function buildRepoGroups(
   projects: ProjectSummary[],
   range: DateRange,
   cwd: string,
+  identityMode: RepoIdentityMode = 'project-path',
 ): Map<string, RepoGroup> {
   const repoIdentityCache = new Map<string, RepoIdentity | null>()
 
@@ -422,31 +426,34 @@ function buildRepoGroups(
 
   const repoGroups = new Map<string, RepoGroup>()
   for (const project of projects) {
-    const projectIdentity = project.projectPath
-      ? resolveRepoIdentity(project.projectPath, repoIdentityCache)
-      : null
-    const identity = projectIdentity ?? cwdIdentity
-    const groupKey = identity ? identity.key : cwd
-
-    let group = repoGroups.get(groupKey)
-    if (!group) {
-      group = {
-        commits: !identity
-          ? []
-          : cwdIdentity && identity.key === cwdIdentity.key
-            ? cwdCommits
-            : getCommitsInRange(identity.gitDir, range.start, range.end, getMainBranch(identity.gitDir)),
-        sessions: [],
-        projectNames: [],
-        ownIdentity: [],
-        gitDir: identity?.gitDir ?? null,
-      }
-      repoGroups.set(groupKey, group)
-    }
     for (const session of project.sessions) {
+      const sourcePath = identityMode === 'trusted-session-cwd'
+        ? session.workingDirectory
+        : project.projectPath
+      const ownIdentity = isTrustedAbsoluteWorkingDirectory(sourcePath)
+        ? resolveRepoIdentity(sourcePath, repoIdentityCache)
+        : null
+      const identity = ownIdentity ?? cwdIdentity
+      const groupKey = identity ? identity.key : cwd
+
+      let group = repoGroups.get(groupKey)
+      if (!group) {
+        group = {
+          commits: !identity
+            ? []
+            : cwdIdentity && identity.key === cwdIdentity.key
+              ? cwdCommits
+              : getCommitsInRange(identity.gitDir, range.start, range.end, getMainBranch(identity.gitDir)),
+          sessions: [],
+          projectNames: [],
+          ownIdentity: [],
+          gitDir: identity?.gitDir ?? null,
+        }
+        repoGroups.set(groupKey, group)
+      }
       group.sessions.push(session)
       group.projectNames.push(project.project)
-      group.ownIdentity.push(projectIdentity !== null)
+      group.ownIdentity.push(ownIdentity !== null)
     }
   }
 
@@ -652,14 +659,14 @@ export function computeAttributionRecords(
   range: DateRange,
   cwd: string,
 ): SessionAttributionRecord[] {
-  const repoGroups = buildRepoGroups(projects, range, cwd)
+  const repoGroups = buildRepoGroups(projects, range, cwd, 'trusted-session-cwd')
   const records: SessionAttributionRecord[] = []
 
   for (const group of repoGroups.values()) {
     const remote = group.gitDir ? getRepoRemote(group.gitDir) : null
 
-    // Privacy gate: only sessions whose identity came from their OWN project
-    // path participate in commit attribution. A session whose project path no
+    // Privacy gate: only sessions whose identity came from their own explicit
+    // provider-recorded cwd participate in commit attribution. A session whose cwd no
     // longer resolves (deleted/renamed dir, non-repo session) inherits the
     // cwd-fallback identity in buildRepoGroups — attributing it here would
     // egress whatever repo the user happens to be pushing from, with commits

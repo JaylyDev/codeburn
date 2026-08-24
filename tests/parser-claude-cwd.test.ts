@@ -4,6 +4,8 @@ import { join, relative } from 'path'
 import { tmpdir, homedir } from 'os'
 
 import { parseAllSessions } from '../src/parser.js'
+import { collectUnsentCalls } from '../src/sync/push.js'
+import { buildOtlpPayload } from '../src/sync/otlp.js'
 import type { DateRange } from '../src/types.js'
 
 let tmpDir: string
@@ -184,6 +186,45 @@ describe('Claude cwd project paths', () => {
     expect(projects[0]!.project).toBe(slug)
     expect(projects[0]!.projectPath).toBe(slug)
     expect(projects[0]!.projectPath).not.toBe('Projects/Content/OS')
+  })
+
+  it('does not promote a Claude Cowork container cwd into trusted session provenance', async () => {
+    const desktopBase = process.env['CODEBURN_DESKTOP_SESSIONS_DIR']!
+    const projectDir = join(
+      desktopBase,
+      'app-1',
+      'workspace-1',
+      'local_session-1',
+      '.claude',
+      'projects',
+      '-sessions-synthetic-cowork-secret',
+    )
+    await mkdir(projectDir, { recursive: true })
+    const filePath = join(projectDir, 'cowork-session.jsonl')
+    const timestamp = '2099-05-11T10:00:00.000Z'
+    await writeFile(filePath, `${JSON.stringify({
+      type: 'assistant',
+      sessionId: 'cowork-session',
+      timestamp,
+      cwd: '/sessions/synthetic-cowork-secret',
+      message: {
+        id: 'msg-cowork-session',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-sonnet-4-5',
+        content: [],
+        usage: { input_tokens: 100, output_tokens: 50 },
+      },
+    })}\n`)
+    await utimes(filePath, new Date(timestamp), new Date(timestamp))
+
+    const projects = await parseAllSessions(dayRange('2099-05-11'), 'claude')
+
+    expect(projects).toHaveLength(1)
+    expect(projects[0]!.sessions[0]!.workingDirectory).toBeUndefined()
+    const wire = JSON.stringify(buildOtlpPayload(collectUnsentCalls(projects).allCalls))
+    expect(wire).not.toContain('synthetic-cowork-secret')
+    expect(wire).not.toContain('ai.project')
   })
 
   it('does not group sibling projects under a parent directory that merely contains .git', async () => {

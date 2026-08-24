@@ -60,6 +60,7 @@ import type {
 } from './types.js'
 import { classifyTurn, BASH_TOOLS, EDIT_TOOLS } from './classifier.js'
 import { extractBashCommands } from './bash-utils.js'
+import { isTrustedAbsoluteWorkingDirectory } from './path-privacy.js'
 
 function unsanitizePath(dirName: string): string {
   return dirName.replace(/-/g, '/')
@@ -2081,12 +2082,13 @@ async function scanProjectDirs(
 
   const installClaudeFile = async (filePath: string, info: FileInfo, parsed: ClaudeFileParse): Promise<void> => {
     const cwd = parsed.workingDirectory
-    const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
+    const trustedCwd = cwd && !isCoworkSession(cwd, filePath) ? cwd : undefined
+    const canonical = trustedCwd ? await resolveCanonicalProjectPath(trustedCwd) : undefined
     section.files[filePath] = {
       fingerprint: info.fp,
       lastCompleteLineOffset: parsed.lastCompleteLineOffset,
       canonicalCwd: canonical?.path,
-      ...(cwd ? { workingDirectory: cwd } : {}),
+      ...(trustedCwd ? { workingDirectory: trustedCwd } : {}),
       canonicalProjectName: canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined,
       mcpInventory: parsed.mcpInventory,
       turns: parsed.turns,
@@ -2205,10 +2207,12 @@ async function scanProjectDirs(
             let canonicalCwd = cached.canonicalCwd
             let canonicalProjectName = cached.canonicalProjectName
             let workingDirectory = cached.workingDirectory
+            if (workingDirectory && isCoworkSession(workingDirectory, filePath)) workingDirectory = undefined
             if (canonicalCwd === undefined && newEntries) {
               const cwd = extractCanonicalCwd(newEntries)
-              workingDirectory = workingDirectory ?? cwd
-              const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
+              const trustedCwd = cwd && !isCoworkSession(cwd, filePath) ? cwd : undefined
+              workingDirectory = workingDirectory ?? trustedCwd
+              const canonical = trustedCwd ? await resolveCanonicalProjectPath(trustedCwd) : undefined
               canonicalCwd = canonical?.path
               canonicalProjectName = canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined
             }
@@ -2372,7 +2376,9 @@ async function scanProjectDirs(
     const projectName = cachedFile.canonicalProjectName ?? dirName
     const mcpInv = cachedFile.mcpInventory.length > 0 ? cachedFile.mcpInventory : undefined
     const session = buildSessionSummary(sessionId, projectName, classifiedTurns, mcpInv, source)
-    if (cachedFile.workingDirectory) session.workingDirectory = cachedFile.workingDirectory
+    if (cachedFile.workingDirectory && !isCoworkSession(cachedFile.workingDirectory, filePath)) {
+      session.workingDirectory = cachedFile.workingDirectory
+    }
     session.agentType = cachedFile.agentType
     if (everHadBranch) session.everHadBranch = true
     const observedPrLinks = new Set(classifiedTurns.flatMap(turn => turn.prRefs ?? []))
@@ -2537,7 +2543,9 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
     deduplicationKey: call.deduplicationKey,
     project: call.project,
     projectPath: call.projectPath,
-    workingDirectory: call.workingDirectory,
+    ...(isTrustedAbsoluteWorkingDirectory(call.workingDirectory)
+      ? { workingDirectory: call.workingDirectory, workingDirectoryProvenance: 'provider-field' as const }
+      : {}),
     toolSequence: call.toolSequence,
     ...(call.locAdded ? { locAdded: call.locAdded } : {}),
     ...(call.locRemoved ? { locRemoved: call.locRemoved } : {}),
@@ -2557,11 +2565,13 @@ async function canonicalizeProviderCallProject(call: ParsedProviderCall): Promis
   if (!call.projectPath) return call
 
   const canonical = await resolveCanonicalProjectPath(call.projectPath)
-  if (!canonical.isWorktree) return { ...call, workingDirectory: call.workingDirectory ?? call.projectPath }
+  // projectPath is also used for local grouping and can be a provider storage
+  // directory or derived label. Only a dedicated provider cwd is trusted for
+  // outbound project and attribution data.
+  if (!canonical.isWorktree) return call
 
   return {
     ...call,
-    workingDirectory: call.workingDirectory ?? call.projectPath,
     project: projectNameFromPath(canonical.path, call.project ?? canonical.path),
     projectPath: canonical.path,
   }
@@ -3910,13 +3920,20 @@ export async function parseProviderSources(
       const project = copilotServeProject(turn.sessionId) ?? slicedTurn.calls[0]?.project ?? source.project
       const key = `${providerName}:${turn.sessionId}:${project}`
 
+      // Old caches can contain workingDirectory synthesized from projectPath.
+      // Marker absence fails closed while preserving historical usage totals.
+      const trustedWorkingDirectory = slicedTurn.calls[0]?.workingDirectoryProvenance === 'provider-field'
+        && isTrustedAbsoluteWorkingDirectory(slicedTurn.calls[0].workingDirectory)
+        ? slicedTurn.calls[0].workingDirectory
+        : undefined
+
       const existing = sessionMap.get(key)
       if (existing) {
         existing.turns.push(classified)
         if (!existing.projectPath && slicedTurn.calls[0]?.projectPath) {
           existing.projectPath = slicedTurn.calls[0]!.projectPath
         }
-        if (!existing.workingDirectory && slicedTurn.calls[0]?.workingDirectory) existing.workingDirectory = slicedTurn.calls[0].workingDirectory
+        if (!existing.workingDirectory && trustedWorkingDirectory) existing.workingDirectory = trustedWorkingDirectory
         if (cachedFile.prLinks?.length) {
           const links = (existing.prLinks ??= new Set())
           for (const link of cachedFile.prLinks) links.add(link)
@@ -3926,7 +3943,7 @@ export async function parseProviderSources(
         sessionMap.set(key, {
           project,
           projectPath: slicedTurn.calls[0]?.projectPath,
-          workingDirectory: slicedTurn.calls[0]?.workingDirectory,
+          workingDirectory: trustedWorkingDirectory,
           turns: [classified],
           ...(cachedFile.prLinks?.length ? { prLinks: new Set(cachedFile.prLinks) } : {}),
           ...(cachedFile.title ? { title: cachedFile.title } : {}),
@@ -3970,6 +3987,10 @@ export async function parseProviderSources(
         const project = copilotServeProject(turn.sessionId) ?? slicedTurn.calls[0]?.project ?? providerName
         const key = `${providerName}:${turn.sessionId}:${project}`
 
+        const trustedWorkingDirectory = slicedTurn.calls[0]?.workingDirectoryProvenance === 'provider-field'
+          && isTrustedAbsoluteWorkingDirectory(slicedTurn.calls[0].workingDirectory)
+          ? slicedTurn.calls[0].workingDirectory
+          : undefined
         const existingEntry = sessionMap.get(key)
         if (existingEntry) {
           existingEntry.turns.push(classified)
@@ -3977,7 +3998,7 @@ export async function parseProviderSources(
             existingEntry.projectPath = slicedTurn.calls[0]!.projectPath
           }
         } else {
-          sessionMap.set(key, { project, projectPath: slicedTurn.calls[0]?.projectPath, workingDirectory: slicedTurn.calls[0]?.workingDirectory, turns: [classified] })
+          sessionMap.set(key, { project, projectPath: slicedTurn.calls[0]?.projectPath, workingDirectory: trustedWorkingDirectory, turns: [classified] })
         }
       }
     }

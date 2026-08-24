@@ -183,6 +183,7 @@ describe('computeAttributionRecords', () => {
 
       const session = makeSession({
         sessionId: 'sess-a',
+        workingDirectory: repoDir,
         prLinks: ['https://github.com/acme/widget/pull/12'],
       })
       const projects = [
@@ -218,7 +219,7 @@ describe('computeAttributionRecords', () => {
       // permanently zero a still-correct server-side count.
       commitAt(repoDir, 'feat: unrelated', '2026-01-01T20:00:00Z')
 
-      const session = makeSession({ sessionId: 'sess-idle' })
+      const session = makeSession({ sessionId: 'sess-idle', workingDirectory: repoDir })
       const projects = [
         { project: 'app', projectPath: repoDir, sessions: [session] } as ProjectSummary,
       ]
@@ -246,10 +247,11 @@ describe('computeAttributionRecords', () => {
 
       const tight = makeSession({
         sessionId: 'sess-tight',
+        workingDirectory: repoDir,
         firstTimestamp: '2026-01-01T10:15:00.000Z',
         lastTimestamp: '2026-01-01T10:45:00.000Z',
       })
-      const broadLoser = makeSession({ sessionId: 'sess-broad-loser' })
+      const broadLoser = makeSession({ sessionId: 'sess-broad-loser', workingDirectory: repoDir })
       const projects = [
         { project: 'app', projectPath: repoDir, sessions: [tight, broadLoser] } as ProjectSummary,
       ]
@@ -276,11 +278,12 @@ describe('computeAttributionRecords', () => {
 
       const withPr = makeSession({
         sessionId: 'sess-pr',
+        workingDirectory: repoDir,
         prLinks: ['https://github.com/acme/widget/pull/7'],
         firstTimestamp: '2026-01-01T10:15:00.000Z',
         lastTimestamp: '2026-01-01T10:45:00.000Z',
       })
-      const withoutPr = makeSession({ sessionId: 'sess-nopr' })
+      const withoutPr = makeSession({ sessionId: 'sess-nopr', workingDirectory: repoDir })
       const projects = [
         { project: 'app', projectPath: repoDir, sessions: [withPr, withoutPr] } as ProjectSummary,
       ]
@@ -321,7 +324,7 @@ describe('computeAttributionRecords', () => {
         lastTimestamp: '2026-01-01T12:30:00.000Z',
       })
       // Session C: genuinely belongs to the cwd repo (own path resolves)
-      const genuine = makeSession({ sessionId: 'genuine-cwd', firstTimestamp: '2026-01-01T10:00:00.000Z', lastTimestamp: '2026-01-01T11:00:00.000Z' })
+      const genuine = makeSession({ sessionId: 'genuine-cwd', workingDirectory: cwdRepo, firstTimestamp: '2026-01-01T10:00:00.000Z', lastTimestamp: '2026-01-01T11:00:00.000Z' })
 
       const projects = [
         { project: 'ghost', projectPath: join(cwdRepo, 'no-such-dir-anymore-xyz'), sessions: [orphanNoPr] },
@@ -365,7 +368,7 @@ describe('computeAttributionRecords', () => {
         firstTimestamp: '2026-01-01T10:25:00.000Z',
         lastTimestamp: '2026-01-01T10:35:00.000Z',
       })
-      const genuineBroad = makeSession({ sessionId: 'genuine-broad' })
+      const genuineBroad = makeSession({ sessionId: 'genuine-broad', workingDirectory: cwdRepo })
 
       const projects = [
         { project: 'ghost', projectPath: '', sessions: [fallbackTight] },
@@ -391,10 +394,11 @@ describe('computeAttributionRecords', () => {
 
       const tight = makeSession({
         sessionId: 'sess-tight',
+        workingDirectory: repoDir,
         firstTimestamp: '2026-01-01T10:15:00.000Z',
         lastTimestamp: '2026-01-01T10:45:00.000Z',
       })
-      const broad = makeSession({ sessionId: 'sess-broad' })
+      const broad = makeSession({ sessionId: 'sess-broad', workingDirectory: repoDir })
       const projects = [
         { project: 'app', projectPath: repoDir, sessions: [tight, broad] } as ProjectSummary,
       ]
@@ -408,6 +412,49 @@ describe('computeAttributionRecords', () => {
       const broadRecord = records.find(r => r.sessionId === 'sess-broad')!
       expect(tightRecord.commits).toHaveLength(1)
       expect(broadRecord.commits).toEqual([])
+    } finally {
+      await rm(repoDir, { recursive: true, force: true })
+    }
+  })
+
+  it('never treats a valid but unproven projectPath as attribution provenance', async () => {
+    const repoDir = await mkdtemp(join(tmpdir(), 'codeburn-attr-untrusted-path-'))
+    try {
+      initRepo(repoDir)
+      git(repoDir, ['remote', 'add', 'origin', 'git@github.com:secret-org/storage-profile.git'])
+      await writeFile(join(repoDir, 'file.txt'), 'x\n')
+      commitAt(repoDir, 'feat: unrelated storage commit', '2026-01-01T10:30:00Z')
+      const session = makeSession({
+        sessionId: 'untrusted-project-path',
+        prLinks: ['https://github.com/acme/widget/pull/9'],
+      })
+      const projects = [{ project: 'profile', projectPath: repoDir, sessions: [session] }] as ProjectSummary[]
+
+      const records = computeAttributionRecords(projects, range, repoDir)
+      expect(records).toHaveLength(1)
+      expect(records[0]).toMatchObject({ repo: null, commits: [] })
+      expect(JSON.stringify(records)).not.toContain('secret-org')
+    } finally {
+      await rm(repoDir, { recursive: true, force: true })
+    }
+  })
+
+  it('never resolves a relative workingDirectory against the sync cwd', async () => {
+    const repoDir = await mkdtemp(join(tmpdir(), 'codeburn-attr-relative-cwd-'))
+    try {
+      initRepo(repoDir)
+      git(repoDir, ['remote', 'add', 'origin', 'git@github.com:secret-org/current-repo.git'])
+      const session = makeSession({
+        sessionId: 'relative-cwd',
+        workingDirectory: '.',
+        prLinks: ['https://github.com/acme/widget/pull/10'],
+      })
+      const projects = [{ project: 'local-label', projectPath: repoDir, sessions: [session] }] as ProjectSummary[]
+
+      const records = computeAttributionRecords(projects, range, repoDir)
+      expect(records).toHaveLength(1)
+      expect(records[0]).toMatchObject({ repo: null, commits: [] })
+      expect(JSON.stringify(records)).not.toContain('secret-org')
     } finally {
       await rm(repoDir, { recursive: true, force: true })
     }
@@ -554,7 +601,7 @@ describe('buildAttributionOtlpPayload', () => {
 
     const sessionAttrs = attrMap(sessionSpan.attributes)
     expect(sessionAttrs['ai.session_id']).toBeUndefined()
-    expect(sessionAttrs['ai.project']).toEqual({ stringValue: 'app' })
+    expect(sessionAttrs['ai.project']).toEqual({ stringValue: 'widget' })
     expect(sessionAttrs['git.repo']).toEqual({ stringValue: 'github.com/acme/widget' })
     expect(sessionAttrs['git.commit_count']).toEqual({ intValue: '1' })
     expect(sessionAttrs['git.pr_links']).toEqual({

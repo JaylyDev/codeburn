@@ -105,6 +105,7 @@ beforeEach(async () => {
   const first = new Date(now - 90 * 60 * 1000).toISOString()
   const last = new Date(now - 30 * 60 * 1000).toISOString()
   const session = makeSession('cli-sess-1', first, last, [makeCall(`call-${now}`, first)])
+  session.workingDirectory = repoDir
   parseAllSessionsMock.mockResolvedValue([
     { project: 'app', projectPath: repoDir, sessions: [session] } as ProjectSummary,
   ])
