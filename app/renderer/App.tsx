@@ -544,6 +544,7 @@ function AppMain() {
       <div className="ct">
         <div className={overview.switching ? 'switch-line on' : 'switch-line'} aria-hidden="true" />
         <UpdateBanner />
+        <IndexingBanner payload={overview.data ?? null} />
         <DailyBudgetBanner payload={overview.data ?? null} provider={provider} />
         <ErrorBoundary key={section}>
         {section === 'plans' ? (
@@ -622,6 +623,20 @@ function SectionPlaceholder({ title }: { title: string }) {
     <Panel title={title}>
       <EmptyNote>{title} lands in a later task. The shell, data bridge, and design system are in place.</EmptyNote>
     </Panel>
+  )
+}
+
+/** Honest partiality (#1110): on a cold cache the resident serve child answers
+ * from the files the selected period can show and indexes the rest behind it.
+ * Wording mirrors the TUI banner. Absent `hydration` means a full parse (a
+ * one-shot spawn, or a CLI predating the field), so nothing is shown. */
+function IndexingBanner({ payload }: { payload: MenubarPayload | null }) {
+  const hydration = payload?.hydration
+  if (!hydration || hydration.complete) return null
+  return (
+    <div role="status" className="stale-banner">
+      Indexing history · {Math.min(hydration.indexedFiles, hydration.totalFiles)}/{hydration.totalFiles} files · totals below cover what is indexed so far
+    </div>
   )
 }
 

@@ -176,6 +176,16 @@ export type ClaudeConfigSelector = {
   options: ClaudeConfigOption[]
 }
 
+/// How much of the corpus is behind the numbers in this payload (#1110).
+/// `complete: false` means the totals cover only the files indexed so far and
+/// a later poll will return more. The counts are progress indicators, not
+/// inventory: they are only meaningful while `complete` is false.
+export type HydrationState = {
+  complete: boolean
+  indexedFiles: number
+  totalFiles: number
+}
+
 export type MenubarPayload = {
   generated: string
   /// Optional. Present and `true` only when this payload was assembled from a
@@ -184,6 +194,15 @@ export type MenubarPayload = {
   /// means "assume fresh," including for payloads from a CLI version that
   /// predates this field.
   stale?: boolean
+  /// Optional. Emitted ONLY by the resident `codeburn serve` child, the one
+  /// producer whose consumers poll and therefore converge. Every one-shot CLI
+  /// output omits it and is always a full parse, so absence must be read as
+  /// "complete" — including for payloads from a CLI that predates the field.
+  /// A consumer that renders totals MUST check this before presenting them as
+  /// final; it is the only in-band marker that separates a partial answer from
+  /// a converged one. Distinct from `stale`: a first paint is fresh but
+  /// partial, a stale payload is complete but old.
+  hydration?: HydrationState
   current: {
     label: string
     cost: number
@@ -514,6 +533,7 @@ export function buildMenubarPayload(
   claudeConfigs?: ClaudeConfigSelector,
   granularHistory?: GranularHistory,
   stale?: boolean,
+  hydration?: HydrationState,
 ): MenubarPayload {
   const payload: MenubarPayload = {
     generated: new Date().toISOString(),
@@ -566,6 +586,9 @@ export function buildMenubarPayload(
   }
   if (stale) {
     payload.stale = true
+  }
+  if (hydration) {
+    payload.hydration = hydration
   }
   return payload
 }

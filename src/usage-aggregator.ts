@@ -1,8 +1,8 @@
 import { homedir } from 'node:os'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory, type DateRange } from './types.js'
 import { isBehavioralCall } from './behavioral-weight.js'
-import { type PeriodData, type ProviderCost, type BreakdownArrays, type MenubarPayload, type ClaudeConfigSelector, buildMenubarPayload } from './menubar-json.js'
-import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, isSessionHydrationComplete } from './parser.js'
+import { type PeriodData, type ProviderCost, type BreakdownArrays, type MenubarPayload, type ClaudeConfigSelector, type HydrationState, buildMenubarPayload } from './menubar-json.js'
+import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, isSessionHydrationComplete, sessionHydrationSnapshot } from './parser.js'
 import { findUnpricedModels, getFlatRateModelsConfigHash, getLocalModelSavingsConfigHash, getPriceOverridesConfigHash, getShortModelName, isExpectedFreeModel } from './models.js'
 import { getAllProviders, safeDiscoverSessions } from './providers/index.js'
 import { claude, getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
@@ -112,6 +112,27 @@ async function hydrateCache(): Promise<DailyCache> {
       `${err instanceof Error ? err.message : String(err)}\n`
     )
     return emptyCache()
+  }
+}
+
+/// The `hydration` block is emitted ONLY inside the resident serve child, which
+/// sets this marker on itself at startup. That is the whole one-shot safety
+/// rule in one place: a one-shot CLI process never sets it, so `--format
+/// menubar-json` from a spawn (including the desktop app's spawn fallback, the
+/// Swift menubar, and `codeburn web`) is byte-identical to before and can never
+/// carry a partial-data label — it has no second poll to converge with.
+export const SERVE_HYDRATION_ENV = 'CODEBURN_SERVE_HYDRATION'
+
+function hydrationStateFor(hydration: ReturnType<typeof sessionHydrationSnapshot> | undefined): HydrationState | undefined {
+  if (process.env[SERVE_HYDRATION_ENV] !== '1' || !hydration) return undefined
+  // Emitted only while incomplete: absence means complete (the rule one-shot
+  // consumers already live by), and a warm serve payload stays byte-identical
+  // to the spawned one-shot — the upgrade-path gate asserts exactly that.
+  if (hydration.complete) return undefined
+  return {
+    complete: hydration.complete,
+    indexedFiles: hydration.indexedFiles,
+    totalFiles: hydration.indexedFiles + hydration.pendingFiles,
   }
 }
 
@@ -574,14 +595,14 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   // the ONLY safe read point for the module-level hydration global. Re-reading the
   // global later would race against this function's own history-block re-parse and
   // against concurrent requests (web-dashboard SWR, parallel MCP calls).
-  let hydrationComplete: boolean | undefined
+  let hydration: ReturnType<typeof sessionHydrationSnapshot> | undefined
   let effectivelyScoped = false
   if (isClaudeConfigScoped) {
     // A config source scopes Claude usage only, so scan just Claude (main.ts
     // rejects a contradictory non-Claude --provider). This also avoids parsing
     // every other provider's corpus on each scoped refresh.
     const rawProjects = fp(await parseAllSessions(periodInfo.range, 'claude'))
-    hydrationComplete = isSessionHydrationComplete()
+    hydration = sessionHydrationSnapshot()
     const fullProjects = daysSelection ? filterProjectsByDays(rawProjects, daysSelection.days) : rawProjects
     claudeConfigs = await claudeConfigSelector(fullProjects, requestedClaudeConfigSourceId)
     const selectedSourceId = claudeConfigs?.selectedId ?? null
@@ -608,7 +629,7 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
       exclude: opts.exclude,
       daysSelection,
     })
-    hydrationComplete = isSessionHydrationComplete()
+    hydration = sessionHydrationSnapshot()
     currentData = durable.data
     scanProjects = durable.liveProjects
     scanRange = durable.scanRange
@@ -952,5 +973,11 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   const optimize = opts.optimize === false ? null : await scanAndDetect(scanProjects, scanRange, opts.provider)
   const granularRange = opts.daysSelection?.range ?? scanRange
   const granularHistory = opts.timeline === false ? undefined : buildGranularHistory(scanProjects, granularRange)
-  return buildMenubarPayload(currentData, providers, optimize, dailyHistory, retryTax, routingWaste, breakdowns, claudeConfigs, granularHistory, hydrationComplete === false ? true : undefined)
+  // `stale` keeps its original meaning: a read-only serve that could not see
+  // real files. A first paint is incomplete for a different reason (files
+  // deliberately sequenced behind it) and reports that through `hydration`
+  // instead, so the two are never conflated.
+  const partialFirstPaint = hydration?.deferredForFirstPaint === true
+  const stale = hydration?.complete === false && !partialFirstPaint ? true : undefined
+  return buildMenubarPayload(currentData, providers, optimize, dailyHistory, retryTax, routingWaste, breakdowns, claudeConfigs, granularHistory, stale, hydrationStateFor(hydration))
 }

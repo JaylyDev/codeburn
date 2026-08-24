@@ -127,11 +127,23 @@ export type ClaudeConfigSelector = {
   options: ClaudeConfigOption[]
 }
 
+export type HydrationState = {
+  complete: boolean
+  indexedFiles: number
+  totalFiles: number
+}
+
 export type MenubarPayload = {
   generated: string
   // Optional: older CLIs omit it. Present and true only on a stale read-only
   // serve; absent otherwise. Absence must always be read as "assume fresh."
   stale?: boolean
+  // Optional: only the resident serve child emits it, and only it may answer
+  // partially (it polls, so it converges). `complete: false` means the totals
+  // cover the files indexed so far and a later poll returns more. Absence — an
+  // older CLI, or any one-shot spawn including the spawn fallback — must be
+  // read as complete.
+  hydration?: HydrationState
   current: {
     label: string
     cost: number

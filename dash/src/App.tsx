@@ -75,6 +75,20 @@ function Stat({ label: lbl, value }: { label: string; value: string }) {
 
 // One device's full dashboard. Remote devices arrive sanitized, so their
 // project and session detail is intentionally absent.
+/** Honest partiality: a payload from a producer that answers a cold start from
+ *  the files the period needs and indexes the rest behind it says so with
+ *  `hydration.complete: false`. Absent (every one-shot CLI output, and any
+ *  older CLI) means a full parse, so nothing is shown. */
+function IndexingNotice({ payload }: { payload?: Payload }) {
+  const hydration = payload?.hydration
+  if (!hydration || hydration.complete) return null
+  return (
+    <div role="status" className="mb-3 border-l-2 border-primary px-2.5 py-1 text-[12px] text-muted-foreground">
+      Indexing history · {Math.min(hydration.indexedFiles, hydration.totalFiles)}/{hydration.totalFiles} files · totals below cover what is indexed so far
+    </div>
+  )
+}
+
 function DeviceView({ payload, isRemote, unit }: { payload?: Payload; isRemote: boolean; unit: Unit }) {
   const c = payload?.current
   // Cache cards read the period-scoped `current` totals, matching Cost/Calls/
@@ -785,6 +799,8 @@ export function App() {
               <h1 className="font-display text-xl tracking-tight text-foreground">{page === 'context' ? 'Context' : viewTitle}</h1>
               <span className="text-xs text-tertiary-foreground">{page === 'usage' ? label : ''}</span>
             </div>
+
+            {page === 'usage' && <IndexingNotice payload={primary?.payload} />}
 
             {page === 'context' ? (
               <ContextExplorer />
