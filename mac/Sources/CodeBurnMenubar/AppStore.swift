@@ -145,12 +145,20 @@ final class AppStore {
     // first refresh tick.
     var kimiLoadState: SubscriptionLoadState = KimiSubscriptionService.hasCredential ? .dormant : .notBootstrapped
 
+    var geminiUsage: GeminiUsage?
+    var geminiError: String?
+    // Same file-based activation as Kimi — reading ~/.gemini/oauth_creds.json
+    // is prompt-free, so we start dormant and auto-activate on the first
+    // refresh tick.
+    var geminiLoadState: SubscriptionLoadState = GeminiSubscriptionService.hasCredential ? .dormant : .notBootstrapped
+
     /// Generation tokens for the in-flight refresh tasks. Incremented on every
     /// disconnect / reset so a fetch that started before the disconnect cannot
     /// resume after the await and re-populate the freshly-cleared state.
     private var claudeRefreshGen: Int = 0
     private var codexRefreshGen: Int = 0
     private var kimiRefreshGen: Int = 0
+    private var geminiRefreshGen: Int = 0
 
     private var cache: [PayloadCacheKey: CachedPayload] = [:]
     private var cacheDate: String = ""
@@ -1252,6 +1260,91 @@ final class AppStore {
         }
     }
 
+    // MARK: - Gemini
+
+    /// Same prompt-free activation as Kimi: reading the CLI's credential file
+    /// needs no keychain, so the first refresh tick activates dormant state.
+    func bootstrapGemini() async {
+        // Capture the generation before the await so a disconnect that lands
+        // mid-fetch cannot be resurrected into .loaded when the fetch returns.
+        let gen = geminiRefreshGen
+        geminiLoadState = .bootstrapping
+        do {
+            let usage = try await GeminiSubscriptionService.refresh()
+            guard gen == geminiRefreshGen else { return }
+            geminiUsage = usage
+            geminiError = nil
+            geminiLoadState = .loaded
+        } catch let err as GeminiSubscriptionService.FetchError {
+            guard gen == geminiRefreshGen else { return }
+            applyGeminiFetchError(err)
+        } catch {
+            guard gen == geminiRefreshGen else { return }
+            geminiError = sanitizeForUI(error.localizedDescription)
+            geminiLoadState = .failed
+        }
+    }
+
+    func refreshGemini() async {
+        _ = await refreshGeminiReportingSuccess()
+    }
+
+    @discardableResult
+    func refreshGeminiReportingSuccess() async -> Bool {
+        if case .dormant = geminiLoadState {
+            await bootstrapGemini()
+            return geminiLoadState == .loaded
+        }
+        guard GeminiSubscriptionService.hasCredential else {
+            if geminiLoadState != .notBootstrapped { geminiLoadState = .notBootstrapped }
+            return false
+        }
+        let gen = geminiRefreshGen
+        if geminiUsage == nil { geminiLoadState = .loading }
+        do {
+            let usage = try await GeminiSubscriptionService.refresh()
+            guard gen == geminiRefreshGen else { return false }
+            geminiUsage = usage
+            geminiError = nil
+            geminiLoadState = .loaded
+            return true
+        } catch let err as GeminiSubscriptionService.FetchError {
+            guard gen == geminiRefreshGen else { return false }
+            applyGeminiFetchError(err)
+            return false
+        } catch {
+            guard gen == geminiRefreshGen else { return false }
+            geminiError = sanitizeForUI(error.localizedDescription)
+            geminiLoadState = .failed
+            return false
+        }
+    }
+
+    func disconnectGemini() {
+        GeminiSubscriptionService.disconnect()
+        geminiRefreshGen &+= 1
+        geminiUsage = nil
+        geminiError = nil
+        geminiLoadState = .notBootstrapped
+        NotificationCenter.default.post(name: .codeBurnSubscriptionDisconnected, object: nil)
+    }
+
+    private func applyGeminiFetchError(_ err: GeminiSubscriptionService.FetchError) {
+        let sanitized = sanitizeForUI(err.errorDescription)
+        geminiError = sanitized
+        if case .noCredentials = err {
+            geminiLoadState = .noCredentials
+        } else if err.isTerminal {
+            geminiLoadState = .terminalFailure(reason: sanitized)
+        } else if let retryAt = err.rateLimitRetryAt {
+            geminiLoadState = .transientFailure(retryAt: retryAt)
+        } else {
+            // 5xx / network blips back off automatically, mirroring the
+            // Electron provider's transientFailure mapping.
+            geminiLoadState = .transientFailure(retryAt: nil)
+        }
+    }
+
     private func applyFetchError(_ err: ClaudeSubscriptionService.FetchError) {
         let sanitized = sanitizeForUI(err.errorDescription)
         subscriptionError = sanitized
@@ -1324,6 +1417,10 @@ final class AppStore {
             let worst = max(usage.primary?.usedPercent ?? 0, usage.details.map(\.usedPercent).max() ?? 0)
             if worst > 0 { providers.append(("Kimi Code", worst)) }
         }
+        if let usage = geminiUsage, shouldIncludeCachedQuota(loadState: geminiLoadState) {
+            let worst = usage.details.map(\.usedPercent).max() ?? 0
+            if worst > 0 { providers.append(("Gemini", worst)) }
+        }
         let worst = providers.map(\.percent).max() ?? 0
         let severity = QuotaSummary.severity(for: worst / 100)
         let sorted = providers.sorted { $0.percent > $1.percent }
@@ -1345,6 +1442,7 @@ final class AppStore {
         case .claude: return claudeQuotaSummary(filter: filter)
         case .codex:  return codexQuotaSummary(filter: filter)
         case .kimiCode: return kimiQuotaSummary(filter: filter)
+        case .gemini:  return geminiQuotaSummary(filter: filter)
         default:      return nil
         }
     }
@@ -1504,6 +1602,39 @@ final class AppStore {
             }
         }
         return QuotaSummary(providerFilter: filter, connection: connection, primary: primary, details: details, planLabel: kimiUsage?.plan ?? "Kimi Code", footerLines: [])
+    }
+
+    private func geminiQuotaSummary(filter: ProviderFilter) -> QuotaSummary? {
+        if case .notBootstrapped = geminiLoadState { return nil }
+        if case .bootstrapping = geminiLoadState { return nil }
+        if case .noCredentials = geminiLoadState { return nil }
+
+        let connection: QuotaSummary.Connection = {
+            switch geminiLoadState {
+            case .notBootstrapped, .dormant, .bootstrapping, .noCredentials: return .disconnected
+            case .loading: return geminiUsage == nil ? .loading : .stale
+            case .loaded: return .connected
+            case .failed: return geminiUsage == nil ? .loading : .stale
+            // An expired Gemini login without a refresh path sits terminal
+            // until the user runs the CLI. Keep the last-known bars (marked
+            // stale) instead of flapping the chip to a reconnect card.
+            case let .terminalFailure(reason): return geminiUsage == nil ? .terminalFailure(reason: reason) : .stale
+            case .transientFailure: return .transientFailure
+            }
+        }()
+
+        var primary: QuotaSummary.Window?
+        var details: [QuotaSummary.Window] = []
+        if let usage = geminiUsage {
+            // details is sorted most-constrained first, so the first row is
+            // the headline bar.
+            for w in usage.details {
+                let row = QuotaSummary.Window(label: w.label, percent: w.usedPercent / 100, resetsAt: w.resetsAt)
+                if primary == nil { primary = row }
+                details.append(row)
+            }
+        }
+        return QuotaSummary(providerFilter: filter, connection: connection, primary: primary, details: details, planLabel: geminiUsage?.plan ?? "Gemini", footerLines: [])
     }
 
     /// Persist one snapshot per window so we can answer "what did the prior cycle end at?"

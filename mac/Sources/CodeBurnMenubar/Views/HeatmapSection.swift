@@ -57,12 +57,12 @@ struct HeatmapSection: View {
 
     private var visibleModes: [InsightMode] {
         // Plan sources from a provider's OAuth usage endpoint. Currently
-        // implemented for Claude (Anthropic) and Codex (ChatGPT). Hidden on
-        // All / Cursor / Droid / Gemini / Copilot until those providers ship
-        // their own quota data sources.
+        // implemented for Claude (Anthropic), Codex (ChatGPT), Kimi Code, and
+        // Gemini (Google Code Assist). Hidden on All / Cursor / Droid /
+        // Copilot until those providers ship their own quota data sources.
         InsightMode.allCases.filter { mode in
             if mode == .plan {
-                return store.selectedProvider == .claude || store.selectedProvider == .codex || store.selectedProvider == .kimiCode
+                return store.selectedProvider == .claude || store.selectedProvider == .codex || store.selectedProvider == .kimiCode || store.selectedProvider == .gemini
             }
             return true
         }
@@ -82,6 +82,8 @@ struct HeatmapSection: View {
                 CodexPlanInsight()
             } else if store.selectedProvider == .kimiCode {
                 KimiPlanInsight()
+            } else if store.selectedProvider == .gemini {
+                GeminiPlanInsight()
             } else {
                 PlanInsight(usage: store.subscription)
             }
@@ -2286,6 +2288,98 @@ private struct KimiPlanInsight: View {
                     .foregroundStyle(.tertiary)
             }
             if KimiQuotaPresentation.isStale(fetchedAt: usage.fetchedAt) {
+                Text("as of \(shortTime(usage.fetchedAt))")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+    }
+
+    private func relativeReset(_ date: Date) -> String {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .short
+        return f.localizedString(for: date, relativeTo: Date())
+    }
+
+    private func shortTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f.string(from: date)
+    }
+}
+
+/// Plan tab for Gemini. Reads the CLI credential file read-only (no keychain,
+/// tokens stay in memory; refresh only via the CLI's env overrides), so
+/// terminal failure means "run the Gemini CLI once to refresh your login".
+private struct GeminiPlanInsight: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        Group {
+            switch GeminiQuotaPresentation.planContent(loadState: store.geminiLoadState, hasUsage: store.geminiUsage != nil) {
+            case .noCredentials:
+                PlanNoCredentialsView(
+                    title: "No Gemini credentials found",
+                    message: "Sign in with the Gemini CLI first. Then click Try Again."
+                ) { Task { await store.bootstrapGemini() } }
+            case .loading:
+                PlanLoadingView(message: "Reading Gemini credentials...")
+            case .failed:
+                PlanFailedView(
+                    error: store.geminiError
+                ) { Task { await store.refreshGemini() } }
+            case .transientFailed:
+                PlanFailedView(
+                    error: store.geminiError ?? "Gemini temporarily unreachable — retrying."
+                ) { Task { await store.refreshGemini() } }
+            case let .reconnect(reason):
+                PlanReconnectView(
+                    title: "Refresh Gemini login",
+                    reason: reason,
+                    fallback: "Your Gemini login has expired. Run the Gemini CLI once to refresh it, then click Reconnect."
+                ) { Task { await store.bootstrapGemini() } }
+            case let .usage(idle):
+                if let usage = store.geminiUsage {
+                    loadedBody(usage: usage, idle: idle)
+                } else {
+                    PlanLoadingView(message: "Reading Gemini credentials...")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func loadedBody(usage: GeminiUsage, idle: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(usage.plan ?? "Gemini")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Spacer()
+                if let resetsAt = usage.primary?.resetsAt {
+                    Text("Resets \(relativeReset(resetsAt))")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            ForEach(Array(usage.details.enumerated()), id: \.offset) { _, window in
+                UtilizationRow(
+                    label: window.label,
+                    percent: window.usedPercent,
+                    resetsAt: window.resetsAt,
+                    projection: nil
+                )
+            }
+            if idle {
+                Text("Login idle. Run the Gemini CLI to refresh.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+            if GeminiQuotaPresentation.isStale(fetchedAt: usage.fetchedAt) {
                 Text("as of \(shortTime(usage.fetchedAt))")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)

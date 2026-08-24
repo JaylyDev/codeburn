@@ -530,6 +530,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     fileprivate var lastSubscriptionRefreshAt: Date?
     fileprivate var lastCodexRefreshAt: Date?
     fileprivate var lastKimiRefreshAt: Date?
+    fileprivate var lastGeminiRefreshAt: Date?
     private var claudeQuotaFailureCount = 0
     private var nextClaudeQuotaRefreshAt: Date?
 
@@ -625,22 +626,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         if let task = codexQuotaRefreshTask {
             return await task.value
         }
-        // Kimi Code rides the same tick, but with its own cadence anchor:
-        // when Codex is not connected its refresh returns false immediately,
-        // so lastCodexRefreshAt never advances — anchoring Kimi on it would
-        // poll api.kimi.com on every payload tick instead of the configured
-        // quota cadence. Anchor on attempt (not success) so a failing Kimi
-        // endpoint also respects the cadence.
+        // Kimi Code and Gemini ride the same tick, each with its own cadence
+        // anchor: when Codex is not connected its refresh returns false
+        // immediately, so lastCodexRefreshAt never advances — anchoring them
+        // on it would poll the quota endpoints on every payload tick instead
+        // of the configured quota cadence. Anchor on attempt (not success)
+        // so a failing endpoint also respects the cadence.
         let kimiDue: Bool = {
             let cadence = SubscriptionRefreshCadence.current
             guard cadence != .manual else { return false }
             return Date().timeIntervalSince(lastKimiRefreshAt ?? .distantPast) >= TimeInterval(cadence.rawValue)
         }()
         if kimiDue { lastKimiRefreshAt = Date() }
-        let task = Task { [store, kimiDue] in
+        let geminiDue: Bool = {
+            let cadence = SubscriptionRefreshCadence.current
+            guard cadence != .manual else { return false }
+            return Date().timeIntervalSince(lastGeminiRefreshAt ?? .distantPast) >= TimeInterval(cadence.rawValue)
+        }()
+        if geminiDue { lastGeminiRefreshAt = Date() }
+        let task = Task { [store, kimiDue, geminiDue] in
             async let codex = store.refreshCodexReportingSuccess()
             if kimiDue {
                 _ = await store.refreshKimiReportingSuccess()
+            }
+            if geminiDue {
+                _ = await store.refreshGeminiReportingSuccess()
             }
             return await codex
         }
@@ -861,6 +871,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         lastSubscriptionRefreshAt = nil
         lastCodexRefreshAt = nil
         lastKimiRefreshAt = nil
+        lastGeminiRefreshAt = nil
         claudeQuotaFailureCount = 0
         nextClaudeQuotaRefreshAt = nil
     }
@@ -892,11 +903,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             // relying on payload/menubarPayload happening to touch the same cache.
             _ = self.store.isOverDailyBudget
             // Track the live-quota state too so the flame icon re-tints on
-            // every subscription / codex usage update, not just every 30s.
+            // every connected provider's usage update, not just every 30s.
             _ = self.store.subscription
             _ = self.store.subscriptionLoadState
             _ = self.store.codexUsage
             _ = self.store.codexLoadState
+            _ = self.store.geminiUsage
+            _ = self.store.geminiLoadState
         } onChange: { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
