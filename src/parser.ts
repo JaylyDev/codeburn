@@ -12,6 +12,11 @@ import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.
 import { isSqliteBusyError } from './sqlite.js'
 import { getCodeburnCacheDir } from './cache-dir.js'
 import {
+  isHermesLedgerPublicationError,
+  isHermesObservationKey,
+  seedHermesCursorsFromProviderSection,
+} from './hermes-session-ledger.js'
+import {
   type CachedCall,
   type CachedFile,
   type CachedTurn,
@@ -31,7 +36,7 @@ import {
   saveCache,
   sourcePathStatCandidates,
 } from './session-cache.js'
-import { acquireCacheRefreshLock, type RefreshLockHandle } from './cache-refresh-lock.js'
+import { acquireCacheRefreshLock, type RefreshLockHandle, type RefreshLockOutcome } from './cache-refresh-lock.js'
 import { decideParseWorkers, parseFilesInOrder, ParseWorkerPool, type ClaudeWorkerParse, type ParseJob } from './parse-workers.js'
 import type { CodexFullParse } from './providers/codex.js'
 import { dateKey } from './day-aggregator.js'
@@ -2541,6 +2546,7 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
     ...(call.requestMultiplier != null ? { requestMultiplier: call.requestMultiplier } : {}),
     ...(call.compactedAt ? { compactedAt: call.compactedAt } : {}),
     ...(call.initiator ? { initiator: call.initiator } : {}),
+    ...(call.supplementaryAccounting ? { supplementaryAccounting: true } : {}),
     activeDurationMs: call.activeDurationMs,
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
@@ -2700,6 +2706,9 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
     activeDurationMs: call.activeDurationMs,
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
+    ...(call.supplementaryAccounting || isHermesObservationKey(call.deduplicationKey)
+      ? { supplementaryAccounting: true }
+      : {}),
   })
 }
 
@@ -3230,6 +3239,19 @@ export async function parseProviderSources(
   const antigravityCacheDir = providerName === 'antigravity' ? getCodeburnCacheDir() : undefined
 
   const section = getOrCreateProviderSection(diskCache, providerName)
+  if (providerName === 'hermes' && !readOnly) {
+    try {
+      // Isolated migration: seed missing cursors from the already-loaded
+      // hermes section before any source is deleted in this parse loop.
+      await seedHermesCursorsFromProviderSection(section)
+    } catch (err) {
+      if (isHermesLedgerPublicationError(err)) {
+        deferredRetryableSource = true
+      } else {
+        throw err
+      }
+    }
+  }
   const allDiscoveredFiles = new Set<string>()
   const servedSources = [...sources]
 
@@ -3503,7 +3525,7 @@ export async function parseProviderSources(
         didParse = true
         markCacheDirty(diskCache, providerName, source.path)
       } catch (err) {
-        if (isSqliteBusyError(err)) {
+        if (isSqliteBusyError(err) || isHermesLedgerPublicationError(err)) {
           // Deferred, not failed: the cache keeps serving this source's
           // previous rows and the next refresh retries. But the data this
           // read would have added is MISSING from this parse, so the run is a
@@ -4948,7 +4970,18 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
   // Keep the snapshot loaded before acquisition: timeout/unavailable paths serve
   // exactly this complete snapshot and never mutate or invalidate the holder.
   const priorSnapshot = diskCache
-  const refresh = await acquireCacheRefreshLock()
+  // Heartbeat the WAIT too, not just the parse behind it. This is the one place
+  // a healthy process is deliberately idle for a long stretch, and the desktop
+  // and menubar watchdogs read silence as a dead child - which is how a waiter
+  // blocked on an abandoned lock got killed at 45s and minted the next stale
+  // lock (#1117). runParse arms its own keepalive; this covers the gap before it.
+  startProgressKeepalive()
+  let refresh: RefreshLockOutcome
+  try {
+    refresh = await acquireCacheRefreshLock()
+  } finally {
+    stopProgressKeepalive()
+  }
   if (refresh.outcome === 'timed-out' || refresh.outcome === 'unavailable') {
     return runParse(key, priorSnapshot, dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   }

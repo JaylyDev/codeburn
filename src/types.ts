@@ -158,9 +158,10 @@ export type ParsedApiCall = {
   toolWaitMs?: number
   /// Supplementary accounting: this call's tokens/cost are real but the call is
   /// not a distinct behavioral request (copilot shutdown rollups and store rows
-  /// that pair with an already-counted per-turn call). Aggregates keep its
-  /// tokens/cost but skip it in apiCalls / model-call / turn counts. Transient:
-  /// assigned at serve time, never cached.
+  /// that pair with an already-counted per-turn call; Hermes observation-time
+  /// deltas). Aggregates keep its tokens/cost but skip it in apiCalls /
+  /// model-call / turn counts. Hermes deltas persist the flag on CachedCall;
+  /// Copilot remains serve-time / never cached.
   supplementaryAccounting?: boolean
 }
 

@@ -10,6 +10,7 @@ import { convertCost, formatCost } from './currency.js'
 import { renderStatusBar } from './format.js'
 import { toDateString } from './daily-cache.js'
 import { dateKey } from './day-aggregator.js'
+import { sessionModelBillableOutputTokens } from './session-output.js'
 import { isBehavioralCall } from './behavioral-weight.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import type { AppliedFix } from './act/types.js'
@@ -542,9 +543,16 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
       modelMap[model].savings += d.savingsUSD
       modelMap[model].estimatedCost += d.estimatedCostUSD ?? 0
       modelMap[model].inputTokens += d.tokens.inputTokens
-      modelMap[model].outputTokens += d.tokens.outputTokens
       modelMap[model].cacheReadTokens += d.tokens.cacheReadInputTokens
       modelMap[model].cacheWriteTokens += d.tokens.cacheCreationInputTokens
+    }
+    // Output must be billed per call while provider identity is still known.
+    // Join on the same key as parser modelBreakdown (getShortModelName), not raw call.model.
+    for (const [model, output] of Object.entries(sessionModelBillableOutputTokens(sess))) {
+      if (!modelMap[model]) {
+        modelMap[model] = { calls: 0, cost: 0, savings: 0, estimatedCost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, baselineModel: '' }
+      }
+      modelMap[model].outputTokens += output
     }
   }
   // Pull the active baseline model name out of the savings config so the
@@ -2442,11 +2450,16 @@ return program
 
 if (process.argv[2] === 'serve') {
   const { runStdioServe } = await import('./serve.js')
+  // Bind the REAL exit before serving. runCaptured() replaces process.exit with
+  // a throw for the duration of a request, and a request still in flight when
+  // the drain bound expires never restores it - so the exit below would throw
+  // instead of exiting, which is exactly the orphan this line prevents.
+  const hardExit = process.exit.bind(process)
   await runStdioServe(buildProgram)
   // stdin closed, so the owning app is gone. Exit outright: any handle that
   // outlives the transport (a watcher, a pending timer) would otherwise leave
   // this child running as an orphan for as long as the machine is up.
-  process.exit(0)
+  hardExit(0)
 } else {
   buildProgram().parse()
 }

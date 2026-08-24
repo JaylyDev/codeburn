@@ -82,6 +82,9 @@ export type ParsedProviderCall = {
   projectPath?: string
   // GitHub PR URLs observed in this call's transcript (Hermes and similar).
   prLinks?: string[]
+  // Hermes observation-time deltas persist this flag (and reconstruct it at
+  // serve time from a `:obs:` key). Copilot still assigns it only at serve time.
+  supplementaryAccounting?: boolean
   // Exact provider-recorded cwd, kept separately because projectPath may later
   // canonicalize a linked worktree to its main repository.
   workingDirectory?: string

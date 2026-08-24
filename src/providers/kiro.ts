@@ -9,7 +9,7 @@ import { flatSlice, flatString } from '../content-utils.js'
 import { calculateCost } from '../models.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { ToolCall } from '../types.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 // Kiro bills in credits: individual plans are $20/mo for 1,000 credits and
 // overage is billed at $0.04 per additional credit. We price credits at the
@@ -925,7 +925,10 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
 // --- Discovery ---
 
-function getKiroAgentDir(override?: string): string[] {
+// Pre-filter candidate list shared by probeRoots and discovery. Must not
+// existsSync-filter: Linux discovery still trims in getKiroAgentDir, but
+// doctor has to report missing defaults. Empty / blank override is unset.
+export function getKiroAgentDirCandidates(override?: string): string[] {
   if (override) return [override]
   if (process.platform === 'darwin') {
     return [join(homedir(), 'Library', 'Application Support', 'Kiro', 'User', 'globalStorage', 'kiro.kiroagent')]
@@ -933,17 +936,21 @@ function getKiroAgentDir(override?: string): string[] {
   if (process.platform === 'win32') {
     return [join(homedir(), 'AppData', 'Roaming', 'Kiro', 'User', 'globalStorage', 'kiro.kiroagent')]
   }
+  return [
+    join(homedir(), '.kiro-server', 'data', 'User', 'globalStorage', 'kiro.kiroagent'),
+    join(homedir(), '.config', 'Kiro', 'User', 'globalStorage', 'kiro.kiroagent'),
+  ]
+}
+
+function getKiroAgentDir(override?: string): string[] {
+  const candidates = getKiroAgentDirCandidates(override)
+  if (override || process.platform !== 'linux') return candidates
   // On Linux, scan both ~/.kiro-server/data/... (remote dev boxes) and
   // ~/.config/Kiro/... (local installs). Both can have data simultaneously
   // if the user switches between local and remote, or if .kiro-server exists
   // but is stale while .config/Kiro has current sessions.
-  const paths: string[] = []
-  const kiroServer = join(homedir(), '.kiro-server', 'data', 'User', 'globalStorage', 'kiro.kiroagent')
-  const kiroConfig = join(homedir(), '.config', 'Kiro', 'User', 'globalStorage', 'kiro.kiroagent')
-  if (existsSync(kiroServer)) paths.push(kiroServer)
-  if (existsSync(kiroConfig)) paths.push(kiroConfig)
-  // Fallback to config path if neither exists (will just find nothing)
-  return paths.length > 0 ? paths : [kiroConfig]
+  const existing = candidates.filter(p => existsSync(p))
+  return existing.length > 0 ? existing : [candidates[candidates.length - 1]!]
 }
 
 function getKiroWorkspaceStorageDir(override?: string): string {
@@ -986,26 +993,29 @@ async function resolveWorkspaceProject(agentDir: string, workspaceStorageDir: st
   return workspaceHash
 }
 
-async function discoverSessions(agentDir: string, workspaceStorageDir: string, cliSessionsDir: string): Promise<SessionSource[]> {
+async function discoverSessions(agentDir: string, workspaceStorageDir: string, cliSessionsDir: string | undefined): Promise<SessionSource[]> {
   const sources: SessionSource[] = []
 
   // --- Kiro CLI sessions (~/.kiro/sessions/cli/) ---
-  try {
-    const cliEntries = await readdir(cliSessionsDir, { withFileTypes: true })
-    for (const entry of cliEntries) {
-      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue
-      const jsonlPath = join(cliSessionsDir, entry.name)
-      // Derive project from companion .json
-      const metaPath = jsonlPath.replace(/\.jsonl$/, '.json')
-      let project = 'kiro-cli'
-      try {
-        const raw = await readFile(metaPath, 'utf-8')
-        const meta = JSON.parse(raw) as { cwd?: string }
-        if (meta.cwd) project = basename(meta.cwd)
-      } catch {}
-      sources.push({ path: jsonlPath, project, provider: 'kiro' })
-    }
-  } catch {}
+  // Empty CLI is skipped (do not readdir '' or '.'). Same skip in probeRoots.
+  if (cliSessionsDir) {
+    try {
+      const cliEntries = await readdir(cliSessionsDir, { withFileTypes: true })
+      for (const entry of cliEntries) {
+        if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue
+        const jsonlPath = join(cliSessionsDir, entry.name)
+        // Derive project from companion .json
+        const metaPath = jsonlPath.replace(/\.jsonl$/, '.json')
+        let project = 'kiro-cli'
+        try {
+          const raw = await readFile(metaPath, 'utf-8')
+          const meta = JSON.parse(raw) as { cwd?: string }
+          if (meta.cwd) project = basename(meta.cwd)
+        } catch {}
+        sources.push({ path: jsonlPath, project, provider: 'kiro' })
+      }
+    } catch {}
+  }
 
   // --- Kiro IDE sessions ---
   let workspaceDirs: string[]
@@ -1123,18 +1133,24 @@ async function discoverV2Sessions(sessionsRoot: string): Promise<SessionSource[]
 }
 
 export function createKiroProvider(agentDirOverride?: string, workspaceStorageDirOverride?: string, cliSessionsDirOverride?: string, v2SessionsRootOverride?: string): Provider {
+  const agentCandidates = getKiroAgentDirCandidates(agentDirOverride)
   const agentDirs = getKiroAgentDir(agentDirOverride)
   const wsDir = getKiroWorkspaceStorageDir(workspaceStorageDirOverride)
-  // When overrides are provided (tests), don't scan real CLI sessions unless explicitly given
-  const cliDir = cliSessionsDirOverride ?? (agentDirOverride ? join(agentDirOverride, '..', 'cli-sessions') : join(process.env['KIRO_HOME'] || join(homedir(), '.kiro'), 'sessions', 'cli'))
+  const defaultCliDir = join(process.env['KIRO_HOME'] || join(homedir(), '.kiro'), 'sessions', 'cli')
+  // Empty CLI is skipped (do not report '' or '.'). Same skip in discoverSessions.
+  const cliDir = cliSessionsDirOverride === ''
+    ? undefined
+    : cliSessionsDirOverride ?? (agentDirOverride ? join(agentDirOverride, '..', 'cli-sessions') : defaultCliDir)
   // v2 IDE sessions live under ~/.kiro/sessions/<hash>/sess_*/, a sibling of the
-  // CLI store (.../sessions/cli). Derive the root from cliDir ONLY when cliDir was
-  // itself explicit (default path or cliSessionsDirOverride). When only
-  // agentDirOverride is set (tests), the derived cliDir parent would point at an
-  // arbitrary directory (e.g. the system tmpdir) — scan nothing in that case.
-  const v2Root = v2SessionsRootOverride ??
-    (cliSessionsDirOverride ? dirname(cliSessionsDirOverride) :
-      agentDirOverride ? undefined : dirname(cliDir))
+  // CLI store (.../sessions/cli). Derive the root from an explicit CLI override
+  // or the default CLI parent. Empty CLI does not drop default v2; empty v2
+  // is skipped on its own. When only agentDirOverride is set (tests), do not
+  // derive v2 from the test tmpdir.
+  const v2Root = v2SessionsRootOverride === ''
+    ? undefined
+    : v2SessionsRootOverride ??
+      (cliSessionsDirOverride ? dirname(cliSessionsDirOverride) :
+        agentDirOverride ? undefined : dirname(defaultCliDir))
 
   return {
     name: 'kiro',
@@ -1151,6 +1167,16 @@ export function createKiroProvider(agentDirOverride?: string, workspaceStorageDi
     toolDisplayName(rawTool: string): string {
       if (rawTool.startsWith('mcp__')) return rawTool
       return toolNameMap[rawTool] ?? rawTool
+    },
+
+    async probeRoots(): Promise<ProbeRoot[]> {
+      const roots: ProbeRoot[] = [
+        ...agentCandidates.map(path => ({ path, label: 'agent' })),
+        { path: wsDir, label: 'workspace' },
+      ]
+      if (cliDir) roots.push({ path: cliDir, label: 'cli' })
+      if (v2Root) roots.push({ path: v2Root, label: 'v2' })
+      return roots
     },
 
     async discoverSessions(): Promise<SessionSource[]> {

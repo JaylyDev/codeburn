@@ -7,6 +7,20 @@ import { calculateCost, getShortModelName } from '../models.js'
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, isSqliteBusyError, type SqliteDatabase } from '../sqlite.js'
 import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 import type { ToolCall } from '../types.js'
+import {
+  getHermesCursor,
+  hermesBaselineKey,
+  hermesLedgerNow,
+  hermesObservationKey,
+  listHermesCursorSessionIds,
+  loadHermesSessionLedger,
+  recordHermesSnapshot,
+  zeroHermesTokens,
+  isHermesLedgerPublicationError,
+  type HermesCostBasis,
+  type HermesObservation,
+  type HermesTokenTotals,
+} from '../hermes-session-ledger.js'
 
 type HermesSessionRow = {
   id: string
@@ -430,6 +444,82 @@ function resolveHermesWorkspace(
   return { project: provider, provider }
 }
 
+function tokenSum(tokens: HermesTokenTotals): number {
+  return tokens.inputTokens + tokens.outputTokens + tokens.cacheReadTokens + tokens.cacheWriteTokens + tokens.reasoningTokens
+}
+
+function resolveHermesCost(
+  row: HermesSessionRow | undefined,
+  model: string,
+  tokens: HermesTokenTotals,
+): { costUSD: number; costIsEstimated: boolean; costBasis: HermesCostBasis } {
+  const calculatedCost = calculateCost(
+    model,
+    tokens.inputTokens,
+    tokens.outputTokens + tokens.reasoningTokens,
+    tokens.cacheWriteTokens,
+    tokens.cacheReadTokens,
+    0,
+  )
+  // This slice treats explicit $0 as recorded. null still falls through.
+  if (row && row.actual_cost_usd != null) {
+    return { costUSD: row.actual_cost_usd, costIsEstimated: false, costBasis: 'actual' }
+  }
+  if (row && row.estimated_cost_usd != null) {
+    return { costUSD: row.estimated_cost_usd, costIsEstimated: false, costBasis: 'estimated' }
+  }
+  return { costUSD: calculatedCost, costIsEstimated: true, costBasis: 'calculated' }
+}
+
+function observationToCall(
+  observation: HermesObservation,
+  args: {
+    profile: string
+    sessionId: string
+    model: string
+    tools: string[]
+    bashCommands: string[]
+    toolSequence: ToolCall[][]
+    userMessage: string
+    project: string
+    projectPath?: string
+    prLinks?: string[]
+    costIsEstimated: boolean
+  },
+): ParsedProviderCall {
+  const later = observation.index > 0
+  return {
+    provider: 'hermes',
+    model: args.model,
+    inputTokens: observation.inputTokens,
+    outputTokens: observation.outputTokens,
+    cacheCreationInputTokens: observation.cacheWriteTokens,
+    cacheReadInputTokens: observation.cacheReadTokens,
+    cachedInputTokens: observation.cacheReadTokens,
+    reasoningTokens: observation.reasoningTokens,
+    webSearchRequests: 0,
+    costUSD: observation.costUSD,
+    // Later observations keep the stored basis: calculated stays estimated;
+    // provider-recorded actual/estimated keep main's measured behavior.
+    costIsEstimated: later ? observation.costBasis === 'calculated' : args.costIsEstimated,
+    tools: later ? [] : args.tools,
+    bashCommands: later ? [] : args.bashCommands,
+    timestamp: observation.timestamp,
+    speed: 'standard',
+    deduplicationKey: later
+      ? hermesObservationKey(args.profile, args.sessionId, observation.index)
+      : hermesBaselineKey(args.profile, args.sessionId),
+    turnId: later ? `${args.sessionId}:obs:${observation.index}` : `${args.sessionId}:session`,
+    toolSequence: later || args.toolSequence.length === 0 ? undefined : args.toolSequence,
+    userMessage: later ? '' : args.userMessage,
+    sessionId: args.sessionId,
+    project: args.project,
+    projectPath: args.projectPath,
+    ...(later || !args.prLinks?.length ? {} : { prLinks: args.prLinks }),
+    ...(later ? { supplementaryAccounting: true } : {}),
+  }
+}
+
 function inferProject(messages: HermesMessageRow[], fallback: string): { project: string; projectPath?: string } {
   const cwdPattern = /^Current working directory:\s*([a-zA-Z]:\\[^\r\n`"]+|\/[^\r\n`"\\]+)/m
   for (const msg of messages) {
@@ -471,11 +561,25 @@ async function discoverFromDb(dbPath: string, profile: string): Promise<SessionS
        LIMIT 10000`,
     )
 
-    return rows.map(row => ({
+    const sources = rows.map(row => ({
       path: encodeSourcePath(dbPath, row.id),
       project: displayProjectForProfile(profile),
-      provider: 'hermes',
+      provider: 'hermes' as const,
     }))
+    // After the >0 filter, reconcile every already-ledgered identity against
+    // this state.db so an all-zero (or missing) row still reaches the cursor.
+    // Without this, 150→0 is invisible and the later 40 is treated as a shrink.
+    const discoveredIds = new Set(rows.map(row => row.id))
+    const ledger = loadHermesSessionLedger()
+    for (const sessionId of listHermesCursorSessionIds(ledger, profile)) {
+      if (discoveredIds.has(sessionId)) continue
+      sources.push({
+        path: encodeSourcePath(dbPath, sessionId),
+        project: displayProjectForProfile(profile),
+        provider: 'hermes',
+      })
+    }
+    return sources
   } catch (err) {
     if (isSqliteBusyError(err)) throw err
     process.stderr.write(`codeburn: error querying Hermes database: ${err instanceof Error ? err.message : err}\n`)
@@ -505,7 +609,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
         return
       }
 
-      let result: ParsedProviderCall | undefined
+      let result: {
+        calls: ParsedProviderCall[]
+      } | undefined
       try {
         if (!validateSchema(db)) return
         const columns = getSessionColumns(db)
@@ -533,7 +639,39 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
           [decoded.sessionId],
         )
         const row = rows[0]
-        if (!row) return
+        const ledger = loadHermesSessionLedger()
+        const existingCursor = getHermesCursor(ledger, profile, decoded.sessionId)
+        if (!row) {
+          if (!existingCursor) return
+          const baselineKey = hermesBaselineKey(profile, decoded.sessionId)
+          if (seenKeys.has(baselineKey)) return
+          seenKeys.add(baselineKey)
+          const cursor = await recordHermesSnapshot({
+            profile,
+            sessionId: decoded.sessionId,
+            startedAt: existingCursor.observations[0]?.timestamp || hermesLedgerNow().toISOString(),
+            observedAt: hermesLedgerNow().toISOString(),
+            tokens: zeroHermesTokens(),
+            costUSD: 0,
+            costBasis: 'calculated',
+          })
+          for (const observation of cursor.observations) {
+            if (observation.index > 0) seenKeys.add(hermesObservationKey(profile, decoded.sessionId, observation.index))
+          }
+          result = {
+            calls: cursor.observations.map(observation => observationToCall(observation, {
+              profile,
+              sessionId: decoded.sessionId,
+              model: 'unknown',
+              tools: [],
+              bashCommands: [],
+              toolSequence: [],
+              userMessage: '',
+              project: displayProjectForProfile(profile),
+              costIsEstimated: false,
+            })),
+          }
+        } else {
 
         const messageColumns = getMessageColumns(db)
         const orderColumns = ['timestamp', 'id'].filter(name => messageColumns.has(name))
@@ -556,15 +694,22 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
         const cacheReadTokens = row.cache_read_tokens ?? 0
         const cacheWriteTokens = row.cache_write_tokens ?? 0
         const reasoningTokens = row.reasoning_tokens ?? 0
-        if (inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens + reasoningTokens === 0) return
+        const tokens: HermesTokenTotals = {
+          inputTokens,
+          outputTokens,
+          cacheReadTokens,
+          cacheWriteTokens,
+          reasoningTokens,
+        }
+        if (tokenSum(tokens) === 0 && !existingCursor) return
 
         const model = row.model ?? 'unknown'
         const { tools, toolSequence, bashCommands } = collectTools(messages)
         const workspace = resolveHermesWorkspace(row, messages)
         const timestamp = parseTimestamp(row.started_at)
-        const dedupKey = `hermes:${profile}:${row.id}`
-        if (seenKeys.has(dedupKey)) return
-        seenKeys.add(dedupKey)
+        const baselineKey = hermesBaselineKey(profile, row.id)
+        if (seenKeys.has(baselineKey)) return
+        seenKeys.add(baselineKey)
 
         const identity = workspace.projectPath
           ? githubOwnerRepoFromRoot(workspace.projectPath)
@@ -576,62 +721,50 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
           identity,
         )
 
-        // Hermes bills reasoning tokens at the output rate (same as Gemini).
-        // The LiteLLM model table is used as a fallback when Hermes has not
-        // stored an actual or estimated cost for the session.
-        const calculatedCost = calculateCost(
-          model,
-          inputTokens,
-          outputTokens + reasoningTokens,
-          cacheWriteTokens,
-          cacheReadTokens,
-          0,
-        )
-        const recordedCost =
-          (row.actual_cost_usd ?? 0) > 0 ? row.actual_cost_usd!
-          : (row.estimated_cost_usd ?? 0) > 0 ? row.estimated_cost_usd!
-          : null
-        // When Hermes stored no cost (e.g. subscription-billed sessions), the
-        // figure is our LiteLLM-priced estimate from the session token totals.
-        const costUSD = recordedCost ?? calculatedCost
-        const costIsEstimated = recordedCost === null
-
-        result = {
-          provider: workspace.provider,
-          model,
-          inputTokens,
-          outputTokens,
-          cacheCreationInputTokens: cacheWriteTokens,
-          cacheReadInputTokens: cacheReadTokens,
-          cachedInputTokens: cacheReadTokens,
-          reasoningTokens,
-          webSearchRequests: 0,
-          costUSD,
-          costIsEstimated,
-          tools,
-          bashCommands,
-          timestamp,
-          speed: 'standard',
-          deduplicationKey: dedupKey,
-          turnId: `${row.id}:session`,
-          toolSequence: toolSequence.length > 0 ? toolSequence : undefined,
-          userMessage: firstUserMessage(messages),
+        const cost = resolveHermesCost(row, model, tokens)
+        const cursor = await recordHermesSnapshot({
+          profile,
           sessionId: row.id,
-          project: workspace.project,
-          projectPath: workspace.projectPath,
-          ...(prLinks.length > 0 ? { prLinks } : {}),
+          startedAt: timestamp || hermesLedgerNow().toISOString(),
+          observedAt: hermesLedgerNow().toISOString(),
+          tokens,
+          costUSD: cost.costUSD,
+          costBasis: cost.costBasis,
+        })
+        for (const observation of cursor.observations) {
+          if (observation.index > 0) seenKeys.add(hermesObservationKey(profile, row.id, observation.index))
+        }
+        result = {
+          calls: cursor.observations.map(observation => observationToCall(observation, {
+            profile,
+            sessionId: row.id,
+            model,
+            tools,
+            bashCommands,
+            toolSequence,
+            userMessage: firstUserMessage(messages),
+            project: workspace.project,
+            projectPath: workspace.projectPath,
+            prLinks,
+            costIsEstimated: cost.costIsEstimated,
+          })),
+        }
         }
       } catch (err) {
-        // A transient lock on the live state.db must propagate so the caller
-        // retries, not get swallowed into an empty (negatively cached) result.
-        if (isSqliteBusyError(err)) throw err
-        process.stderr.write(`codeburn: error querying Hermes database: ${err instanceof Error ? err.message : err}\n`)
+        // A transient lock on the live state.db, or a ledger publication
+        // failure, must propagate so the caller retries — not get swallowed
+        // into an empty (negatively cached) result.
+        if (isSqliteBusyError(err) || isHermesLedgerPublicationError(err)) throw err
+        const detail = err instanceof Error ? err.message : err
+        process.stderr.write(`codeburn: error querying Hermes database: ${detail}\n`)
         return
       } finally {
         db.close()
       }
 
-      if (result) yield result
+      if (result) {
+        for (const call of result.calls) yield call
+      }
     },
   }
 }
