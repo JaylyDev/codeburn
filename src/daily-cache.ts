@@ -1179,6 +1179,15 @@ export function toDateString(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
 
+/// A day whose ONLY content is turn-anchored residue (one straddling turn's
+/// category/edit counts, no calls) is not a derived day — it is a day the parse
+/// under-read. Re-derive it instead of serving it.
+export function isTurnResidueOnly(day: DailyEntry): boolean {
+  if (day.cost > 0 || day.calls > 0 || day.sessions > 0) return false
+  if (day.inputTokens + day.outputTokens + day.cacheReadTokens + day.cacheWriteTokens > 0) return false
+  return Object.values(day.categories).some(c => c.turns > 0)
+}
+
 export async function ensureCacheHydrated(
   parseSessions: (range: DateRange) => Promise<ProjectSummary[]>,
   aggregateDays: (projects: ProjectSummary[]) => DailyEntry[],
@@ -1239,6 +1248,34 @@ export async function ensureCacheHydrated(
     const newestCachedDate = c.days.reduce<string | null>((max, d) => (max === null || d.date > max ? d.date : max), null)
     if (c.watermarkTrusted !== true && newestCachedDate !== null && c.lastComputedDate !== null && c.lastComputedDate > newestCachedDate) {
       c = { ...c, lastComputedDate: newestCachedDate }
+    }
+
+    // Never seal a residue-only day (issue #1127): a day whose only content is
+    // turn-anchored residue was under-read by the parse that produced it, so
+    // trust the DATA over the marker again — pull the watermark back to just
+    // before the oldest such day and let the ordinary gap parse re-derive it.
+    // This is what heals every already-broken cache on the next launch, with
+    // no version bump.
+    //
+    // Caveat: a day that GENUINELY held only one straddling turn and no other
+    // activity re-derives to the same residue shape and would be re-parsed on
+    // every launch. Bound that cost: skip the pull-back when the residue day
+    // is the oldest day in the cache, and only pull back inside the settle
+    // window — outside it the source files are gone and re-deriving cannot
+    // recover the day anyway.
+    const oldestCachedDate = c.days.reduce<string | null>((min, d) => (min === null || d.date < min ? d.date : min), null)
+    const residueSettleCutoff = settleCutoffDate(now)
+    const oldestResidueDate = c.days.reduce<string | null>(
+      (min, d) => (d.date >= residueSettleCutoff && d.date !== oldestCachedDate && isTurnResidueOnly(d) && (min === null || d.date < min) ? d.date : min),
+      null,
+    )
+    if (oldestResidueDate !== null && c.lastComputedDate !== null && c.lastComputedDate >= oldestResidueDate) {
+      const pulledBack = new Date(
+        parseInt(oldestResidueDate.slice(0, 4)),
+        parseInt(oldestResidueDate.slice(5, 7)) - 1,
+        parseInt(oldestResidueDate.slice(8, 10)) - 1
+      )
+      c = { ...c, lastComputedDate: toDateString(pulledBack) }
     }
 
     // Three reasons to re-derive the whole retention window:
@@ -1354,7 +1391,17 @@ export async function ensureCacheHydrated(
       const gapDays = aggregateDays(gapProjects)
       const parseWasComplete = sessionComplete()
       const priorWatermark = c.lastComputedDate
-      c = addNewDays(c, gapDays, yesterdayStr)
+      // Gate the merge on parse completeness (issue #1127): replacing cached
+      // days wholesale with the gap parse's days let a PARTIAL parse overwrite
+      // a populated baseline day with its under-read version — and if the
+      // day's sources die before the next complete parse, the undercount is
+      // what survives. A complete parse still wins per (date, provider)
+      // exactly as the re-derive path does (partial-survival guarded); a
+      // partial one only fills days and slices the baseline lacks, so the gap
+      // merge is strictly additive and no cached data can shrink.
+      const merged = parseWasComplete
+        ? mergeDayEntries(gapDays, c.days, false, undefined, true)
+        : mergeDayEntries(c.days, gapDays, false)
       // Finalize as complete ONLY when the session parse that produced these days
       // was itself complete. If it was partial, leave `complete: false` so the
       // next launch (once the session cache is whole) re-backfills instead of
@@ -1362,7 +1409,7 @@ export async function ensureCacheHydrated(
       // the same reason as the re-derive path above: a partial parse cannot
       // vouch for the days it never read, and gapStart is the only thing that
       // will ever bring them back.
-      c = { ...c, lastComputedDate: parseWasComplete ? c.lastComputedDate : priorWatermark, complete: parseWasComplete, watermarkTrusted: parseWasComplete }
+      c = { ...c, days: applyRetention(merged, yesterdayStr), lastComputedDate: parseWasComplete ? yesterdayStr : priorWatermark, complete: parseWasComplete, watermarkTrusted: parseWasComplete }
       await saveDailyCache(c)
     } else if (c.complete !== true && sessionComplete()) {
       // No gap to fill (already current through yesterday) but not yet marked —
