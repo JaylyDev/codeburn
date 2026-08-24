@@ -45,6 +45,7 @@ struct CodeBurnApp: App {
         Settings {
             SettingsView()
                 .environment(delegate.store)
+                .environment(delegate.updateChecker)
         }
     }
 }
@@ -530,6 +531,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     fileprivate var lastSubscriptionRefreshAt: Date?
     fileprivate var lastCodexRefreshAt: Date?
     fileprivate var lastKimiRefreshAt: Date?
+    fileprivate var lastGeminiRefreshAt: Date?
+    fileprivate var lastCopilotRefreshAt: Date?
+    fileprivate var lastAntigravityRefreshAt: Date?
     private var claudeQuotaFailureCount = 0
     private var nextClaudeQuotaRefreshAt: Date?
 
@@ -625,22 +629,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         if let task = codexQuotaRefreshTask {
             return await task.value
         }
-        // Kimi Code rides the same tick, but with its own cadence anchor:
-        // when Codex is not connected its refresh returns false immediately,
-        // so lastCodexRefreshAt never advances — anchoring Kimi on it would
-        // poll api.kimi.com on every payload tick instead of the configured
-        // quota cadence. Anchor on attempt (not success) so a failing Kimi
-        // endpoint also respects the cadence.
+        // Kimi Code, Gemini, Copilot, and Antigravity ride the same tick,
+        // each with its own cadence anchor: when Codex is not connected its
+        // refresh returns false
+        // immediately, so lastCodexRefreshAt never advances — anchoring them
+        // on it would poll the quota endpoints on every payload tick instead
+        // of the configured quota cadence. Anchor on attempt (not success)
+        // so a failing endpoint also respects the cadence.
         let kimiDue: Bool = {
             let cadence = SubscriptionRefreshCadence.current
             guard cadence != .manual else { return false }
             return Date().timeIntervalSince(lastKimiRefreshAt ?? .distantPast) >= TimeInterval(cadence.rawValue)
         }()
         if kimiDue { lastKimiRefreshAt = Date() }
-        let task = Task { [store, kimiDue] in
+        let geminiDue: Bool = {
+            let cadence = SubscriptionRefreshCadence.current
+            guard cadence != .manual else { return false }
+            return Date().timeIntervalSince(lastGeminiRefreshAt ?? .distantPast) >= TimeInterval(cadence.rawValue)
+        }()
+        if geminiDue { lastGeminiRefreshAt = Date() }
+        let copilotDue: Bool = {
+            let cadence = SubscriptionRefreshCadence.current
+            guard cadence != .manual else { return false }
+            return Date().timeIntervalSince(lastCopilotRefreshAt ?? .distantPast) >= TimeInterval(cadence.rawValue)
+        }()
+        if copilotDue { lastCopilotRefreshAt = Date() }
+        let antigravityDue: Bool = {
+            let cadence = SubscriptionRefreshCadence.current
+            guard cadence != .manual else { return false }
+            return Date().timeIntervalSince(lastAntigravityRefreshAt ?? .distantPast) >= TimeInterval(cadence.rawValue)
+        }()
+        if antigravityDue { lastAntigravityRefreshAt = Date() }
+        let task = Task { [store, kimiDue, geminiDue, copilotDue, antigravityDue] in
             async let codex = store.refreshCodexReportingSuccess()
             if kimiDue {
                 _ = await store.refreshKimiReportingSuccess()
+            }
+            if geminiDue {
+                _ = await store.refreshGeminiReportingSuccess()
+            }
+            if copilotDue {
+                _ = await store.refreshCopilotReportingSuccess()
+            }
+            if antigravityDue {
+                _ = await store.refreshAntigravityReportingSuccess()
             }
             return await codex
         }
@@ -853,14 +885,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
 
     /// Reset the cadence anchor so the next loop tick re-evaluates from "now"
     /// rather than measuring against a timestamp from the previous connection.
-    /// Triggered on disconnect of any provider — the cost of clearing both
-    /// anchors is one extra refresh tick on the unaffected provider, far less
+    /// Triggered on disconnect of any provider — the cost of clearing all
+    /// anchors is one extra refresh tick on the unaffected providers, far less
     /// disruptive than waiting a full cadence after a reconnect.
     @MainActor
     func resetSubscriptionCadenceAnchor() {
         lastSubscriptionRefreshAt = nil
         lastCodexRefreshAt = nil
         lastKimiRefreshAt = nil
+        lastGeminiRefreshAt = nil
+        lastCopilotRefreshAt = nil
+        lastAntigravityRefreshAt = nil
         claudeQuotaFailureCount = 0
         nextClaudeQuotaRefreshAt = nil
     }
@@ -892,11 +927,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             // relying on payload/menubarPayload happening to touch the same cache.
             _ = self.store.isOverDailyBudget
             // Track the live-quota state too so the flame icon re-tints on
-            // every subscription / codex usage update, not just every 30s.
+            // every connected provider's usage update, not just every 30s.
             _ = self.store.subscription
             _ = self.store.subscriptionLoadState
             _ = self.store.codexUsage
             _ = self.store.codexLoadState
+            _ = self.store.geminiUsage
+            _ = self.store.geminiLoadState
+            _ = self.store.copilotUsage
+            _ = self.store.copilotLoadState
+            _ = self.store.antigravityUsage
+            _ = self.store.antigravityLoadState
         } onChange: { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -921,14 +962,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         statusItem = NSStatusBar.system.statusItem(withLength: statusItemWidth)
         guard let button = statusItem.button else { return }
 
-        // Set a simple SF Symbol image immediately to ensure the status item renders.
+        // Set the bundled flame image immediately to ensure the status item renders.
         // On macOS Tahoe, status items may fail to appear if only an attributed title
         // is set during initial setup.
-        let flameConfig = NSImage.SymbolConfiguration(pointSize: menubarTitleFontSize, weight: .medium)
-        let flame = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "CodeBurn")?
-            .withSymbolConfiguration(flameConfig)
-        flame?.isTemplate = true
-        button.image = flame
+        button.image = Self.menubarFlameImage(tint: nil)
         button.imagePosition = .imageLeading
 
         button.target = self
@@ -982,6 +1019,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         }
     }
 
+    /// Loads the bundled binary-flame PNG (Resources/ProviderIcons/flame.png) at the
+    /// menubar text point size. With no tint it stays a template image so the system
+    /// auto-adapts to the menu bar; a tint returns a recolored non-template copy for
+    /// the budget/quota warning states.
+    private static func menubarFlameImage(tint: NSColor?) -> NSImage? {
+        let config = NSImage.SymbolConfiguration(pointSize: menubarTitleFontSize, weight: .medium)
+        guard let symbol = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "CodeBurn")?
+            .withSymbolConfiguration(config) else { return nil }
+        guard let tint else {
+            symbol.isTemplate = true
+            return symbol
+        }
+        let recolored = NSImage(size: symbol.size, flipped: false) { rect in
+            symbol.draw(in: rect)
+            tint.set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        recolored.isTemplate = false
+        return recolored
+    }
+
     private func refreshStatusButton() {
         guard let button = statusItem.button else { return }
         // Skip while the popover is anchored to this button. Rewriting the
@@ -997,7 +1056,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         button.imagePosition = .noImage
 
         let font = NSFont.monospacedDigitSystemFont(ofSize: menubarTitleFontSize, weight: .regular)
-        let baseConfig = NSImage.SymbolConfiguration(pointSize: menubarTitleFontSize, weight: .medium)
         // Tint the flame based on the worst-affected connected provider's quota.
         // Normal (<70%) keeps the template (auto white-on-dark / black-on-light);
         // warning/critical/danger override with a fixed palette color so the
@@ -1007,15 +1065,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         if tint == nil, store.isOverDailyBudget {
             tint = NSColor.systemYellow
         }
-        let flameConfig: NSImage.SymbolConfiguration
-        if let tint {
-            flameConfig = baseConfig.applying(.init(paletteColors: [tint]))
-        } else {
-            flameConfig = baseConfig
-        }
-        let flame = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "CodeBurn")?
-            .withSymbolConfiguration(flameConfig)
-        flame?.isTemplate = (tint == nil)
+        let flame = Self.menubarFlameImage(tint: tint)
 
         let attachment = NSTextAttachment()
         attachment.image = flame
@@ -1294,7 +1344,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         }
 
         let hosting = NSHostingController(
-            rootView: SettingsView().environment(store)
+            rootView: SettingsView().environment(store).environment(updateChecker)
         )
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 520, height: 380),

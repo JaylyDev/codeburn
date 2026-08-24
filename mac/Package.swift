@@ -17,6 +17,9 @@ let package = Package(
         .executableTarget(
             name: "CodeBurnMenubar",
             path: "Sources/CodeBurnMenubar",
+            resources: [
+                .process("Resources/ProviderIcons")
+            ],
             swiftSettings: [
                 .enableUpcomingFeature("StrictConcurrency")
             ]

@@ -1,41 +1,386 @@
 import AppKit
 import SwiftUI
 
-/// macOS-standard tabbed Settings window. New per-provider sections (Codex,
-/// Cursor, Copilot, etc.) plug in as additional tabs. Each tab owns its own
-/// concerns; this top-level view only hosts the TabView shell.
+/// System Settings–style window: a fixed-width sidebar (search, General/About,
+/// per-provider rows) drives the detail pane. New providers plug in by adding
+/// one entry to `providers`; each pane owns its own Form content and this
+/// top-level view only hosts the shell.
 struct SettingsView: View {
     @Environment(AppStore.self) private var store
+    @State private var searchText = ""
+
+    /// One entry per provider pane. `id` doubles as the deep-link tag, so the
+    /// sidebar, the detail switch, and `store.settingsTab` all speak the same
+    /// strings.
+    struct ProviderPane: Identifiable {
+        let id: String
+        let name: String
+        let icon: String
+        let isConnected: Bool
+    }
+
+    private static let mainPaneIDs: Set<String> = ["general", "about"]
+
+    private var providers: [ProviderPane] {
+        [
+            ProviderPane(id: "claude", name: "Claude", icon: "claude",
+                         isConnected: store.subscriptionLoadState == .loaded),
+            ProviderPane(id: "codex", name: "Codex", icon: "openai",
+                         isConnected: store.codexLoadState == .loaded),
+            ProviderPane(id: "kimi", name: "Kimi Code", icon: "kimi",
+                         isConnected: store.kimiLoadState == .loaded),
+            ProviderPane(id: "devin", name: "Devin", icon: "devin",
+                         isConnected: CLIDevinConfig.loadAcuUsdRate() != nil),
+            ProviderPane(id: "gemini", name: "Gemini", icon: "googlegemini",
+                         isConnected: store.geminiLoadState == .loaded),
+            ProviderPane(id: "copilot", name: "Copilot", icon: "githubcopilot",
+                         isConnected: store.copilotLoadState == .loaded),
+            ProviderPane(id: "antigravity", name: "Antigravity", icon: "antigravity",
+                         isConnected: store.antigravityLoadState == .loaded),
+        ]
+    }
+
+    // Search narrows the provider list only; General/About stay put.
+    private var filteredProviders: [ProviderPane] {
+        let query = searchText.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else { return providers }
+        return providers.filter { $0.name.localizedCaseInsensitiveContains(query) }
+    }
+
+    /// Deep links can name a pane that no longer exists; those fall back to
+    /// General instead of leaving the sidebar without a selection.
+    private var selection: Binding<String> {
+        Binding(
+            get: {
+                let tab = store.settingsTab
+                return Self.mainPaneIDs.contains(tab) || providers.contains { $0.id == tab } ? tab : "general"
+            },
+            set: { store.settingsTab = $0 }
+        )
+    }
+
+    private static let windowWidth: CGFloat = 880
+    private static let windowHeight: CGFloat = 620
+    private static let sidebarWidth: CGFloat = 260
 
     var body: some View {
-        TabView(selection: Binding(get: { store.settingsTab }, set: { store.settingsTab = $0 })) {
-            GeneralSettingsTab()
-                .tabItem { Label("General", systemImage: "gearshape") }
-                .tag("general")
+        HStack(spacing: 0) {
+            // Layout modeled on CodexBar (MIT, steipete/CodexBar): a fixed-width
+            // sidebar (search, General/About, per-provider rows) over an
+            // edge-to-edge sidebar material, hairline divider, then the detail pane.
+            sidebar
+                .frame(width: Self.sidebarWidth)
+                .background {
+                    SettingsSidebarMaterial()
+                        .ignoresSafeArea()
+                }
 
-            ClaudeSettingsTab()
-                .tabItem { Label("Claude", systemImage: "brain") }
-                .tag("claude")
+            Divider()
+                .ignoresSafeArea()
 
-            CodexSettingsTab()
-                .tabItem { Label("Codex", systemImage: "chevron.left.forwardslash.chevron.right") }
-                .tag("codex")
-
-            KimiSettingsTab()
-                .tabItem { Label("Kimi", systemImage: "moon.stars") }
-                .tag("kimi")
-
-            DevinSettingsTab()
-                .tabItem { Label("Devin", systemImage: "flame.fill") }
-                .tag("devin")
-
-            AboutSettingsTab()
-                .tabItem { Label("About", systemImage: "info.circle") }
-                .tag("about")
+            detailView
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        // 6 tabs need ~600pt to render as a visible tab bar; narrower widths
-        // make SwiftUI collapse the tab bar into a ">>" overflow menu.
-        .frame(width: 600, height: 430)
+        .frame(minWidth: Self.windowWidth, maxWidth: .infinity, minHeight: Self.windowHeight, maxHeight: .infinity)
+        .background {
+            SettingsWindowStyleAccessor(title: currentPaneTitle)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private var sidebar: some View {
+        VStack(spacing: 0) {
+            SettingsSidebarSearchField(searchText: $searchText)
+                .padding(.horizontal, 8)
+                .padding(.top, 16)
+                .padding(.bottom, 8)
+
+            List(selection: selection) {
+                Section {
+                    SettingsSidebarPaneRow(pane: "general", title: "General", systemImage: "gearshape.fill", color: .gray)
+                    SettingsSidebarAboutRow()
+                }
+                Section {
+                    ForEach(filteredProviders) { provider in
+                        SettingsSidebarProviderRow(provider: provider)
+                            .tag(provider.id)
+                    }
+                } header: {
+                    HStack(spacing: 4) {
+                        Text("Providers")
+                        Spacer()
+                        Text("\(providers.filter(\.isConnected).count) on")
+                            .foregroundStyle(.tertiary)
+                            .monospacedDigit()
+                            .padding(.trailing, 10)
+                    }
+                }
+            }
+            .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
+        }
+        .padding(.horizontal, 8)
+    }
+
+    private var currentPaneTitle: String {
+        switch selection.wrappedValue {
+        case "general": return "General"
+        case "about": return "About"
+        default:
+            return providers.first { $0.id == selection.wrappedValue }?.name ?? "Settings"
+        }
+    }
+
+    @ViewBuilder
+    private var detailView: some View {
+        switch selection.wrappedValue {
+        case "claude": ClaudeSettingsTab()
+        case "codex": CodexSettingsTab()
+        case "kimi": KimiSettingsTab()
+        case "devin": DevinSettingsTab()
+        case "gemini": GeminiSettingsTab()
+        case "copilot": CopilotSettingsTab()
+        case "antigravity": AntigravitySettingsTab()
+        case "about": AboutSettingsTab()
+        default: GeneralSettingsTab()
+        }
+    }
+}
+
+// MARK: - Sidebar support
+
+/// PNG decode is too expensive to redo on every body evaluation, so loaded
+/// template images are kept for the life of the process.
+@MainActor
+private enum ProviderIconCache {
+    private static var images: [String: NSImage] = [:]
+
+    /// Loads one of the bundled 512px black-glyph PNGs (Resources/ProviderIcons)
+    /// as a template NSImage so `foregroundStyle` fully controls the color.
+    static func image(named name: String) -> NSImage? {
+        if let cached = images[name] { return cached }
+        // SwiftPM keeps the folder hierarchy for .process'd directories, but
+        // tolerate a flattened layout too so the lookup survives a rule change.
+        for subdirectory in ["Resources/ProviderIcons", "ProviderIcons", nil] {
+            if let url = Bundle.module.url(forResource: name, withExtension: "png", subdirectory: subdirectory),
+               let image = NSImage(contentsOf: url) {
+                image.isTemplate = true
+                images[name] = image
+                return image
+            }
+        }
+        return nil
+    }
+}
+
+/// Colored rounded-square symbol used for app panes in the settings sidebar,
+/// mirroring the System Settings sidebar style.
+private struct SettingsIconChip: View {
+    static let side: CGFloat = 20
+
+    let systemImage: String
+    let color: Color
+
+    var body: some View {
+        Image(systemName: systemImage)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: Self.side, height: Self.side)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(LinearGradient(
+                        colors: [color.opacity(0.85), color],
+                        startPoint: .top,
+                        endPoint: .bottom)))
+            .accessibilityHidden(true)
+    }
+}
+
+private struct SettingsSidebarPaneRow: View {
+    let pane: String
+    let title: String
+    let systemImage: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 8) {
+            SettingsIconChip(systemImage: systemImage, color: color)
+            Text(title)
+        }
+        .tag(pane)
+    }
+}
+
+private struct SettingsSidebarAboutRow: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            // Bare brand mark, no chip container — the binary flame reads
+            // better at this size than the boxed app icon.
+            Group {
+                if let flame = ProviderIconCache.image(named: "flame-solid") {
+                    Image(nsImage: flame)
+                        .resizable()
+                        .scaledToFit()
+                } else {
+                    SettingsIconChip(systemImage: "info.circle.fill", color: .gray)
+                }
+            }
+            .frame(width: SettingsIconChip.side, height: SettingsIconChip.side)
+            .accessibilityHidden(true)
+            Text("About")
+        }
+        .tag("about")
+    }
+}
+
+private struct SettingsSidebarProviderRow: View {
+    let provider: SettingsView.ProviderPane
+
+    var body: some View {
+        HStack(spacing: 8) {
+            SettingsSidebarBrandIcon(icon: provider.icon, isConnected: provider.isConnected)
+
+            Text(provider.name)
+                .foregroundStyle(provider.isConnected ? .primary : .secondary)
+
+            Spacer(minLength: 4)
+
+            if provider.isConnected {
+                Circle()
+                    .fill(.green)
+                    .frame(width: 6, height: 6)
+                    .accessibilityHidden(true)
+            }
+        }
+        .opacity(provider.isConnected ? 1 : 0.62)
+    }
+}
+
+private struct SettingsSidebarBrandIcon: View {
+    let icon: String
+    let isConnected: Bool
+
+    var body: some View {
+        Group {
+            if let image = ProviderIconCache.image(named: icon) {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                Image(systemName: "circle.dotted")
+                    .resizable()
+                    .scaledToFit()
+            }
+        }
+        .frame(width: 16, height: 16)
+        .foregroundStyle(isConnected ? .primary : .secondary)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct SettingsSidebarSearchField: View {
+    @Binding var searchText: String
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+
+            TextField("Search providers", text: $searchText)
+                .textFieldStyle(.plain)
+
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Clear")
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .font(.callout)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color(nsColor: .textBackgroundColor).opacity(0.6)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.6), lineWidth: 1))
+    }
+}
+
+/// Edge-to-edge sidebar material so the sidebar runs up behind the transparent
+/// titlebar, matching System Settings.
+private struct SettingsSidebarMaterial: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        configure(view)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        configure(nsView)
+    }
+
+    private func configure(_ view: NSVisualEffectView) {
+        view.material = .sidebar
+        view.blendingMode = .behindWindow
+        view.state = .followsWindowActiveState
+    }
+}
+
+/// Applies the System Settings window chrome (transparent, separator-less
+/// titlebar over full-size content) to whichever window hosts this view.
+/// Needed because the SwiftUI Settings scene exposes no styling hooks.
+private struct SettingsWindowStyleAccessor: NSViewRepresentable {
+    let title: String
+
+    func makeNSView(context: Context) -> SettingsWindowStyleView {
+        SettingsWindowStyleView()
+    }
+
+    func updateNSView(_ nsView: SettingsWindowStyleView, context: Context) {
+        nsView.paneTitle = title
+        nsView.applyStyle()
+    }
+}
+
+private final class SettingsWindowStyleView: NSView {
+    var paneTitle = "Settings"
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applyStyle()
+    }
+
+    private var didPlaceWindow = false
+
+    func applyStyle() {
+        guard let window else { return }
+        // Full-size content lets the sidebar material extend behind the
+        // titlebar so the edge-to-edge sidebar reaches the top of the window.
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .visible
+        window.titlebarSeparatorStyle = .none
+        window.styleMask.insert(.fullSizeContentView)
+        window.styleMask.insert(.resizable)
+        // Match System Settings: the window is named after the visible pane.
+        window.title = paneTitle
+        window.collectionBehavior.insert(.fullScreenPrimary)
+        // The frameAutosave may restore a position saved when the window was
+        // smaller, leaving the grown window hanging off the screen edge —
+        // recenter once whenever it does not fit fully on its screen.
+        if !didPlaceWindow {
+            didPlaceWindow = true
+            if let screen = window.screen ?? NSScreen.main,
+               !screen.visibleFrame.contains(window.frame) {
+                window.center()
+            }
+        }
     }
 }
 
@@ -98,7 +443,7 @@ private struct GeneralSettingsTab: View {
                     set: { applyCurrency(code: $0) }
                 )) {
                     ForEach(SupportedCurrency.allCases) { currency in
-                        Text("\(currency.rawValue) — \(currency.displayName)").tag(currency.rawValue)
+                        Text("\(currency.rawValue) · \(currency.displayName)").tag(currency.rawValue)
                     }
                 }
                 Picker("Metric", selection: Binding(
@@ -401,7 +746,7 @@ private struct ClaudeConnectionRow: View {
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("CodeBurn will stop tracking quota and delete its local copy of your Claude credentials. Your Claude Code keychain entry is untouched — Claude Code keeps working.")
+                    Text("CodeBurn will stop tracking quota and delete its local copy of your Claude credentials. Your Claude Code keychain entry is untouched. Claude Code keeps working.")
                 }
         case .terminalFailure, .noCredentials, .failed:
             Button("Reconnect") { Task { await store.bootstrapSubscription() } }
@@ -427,7 +772,7 @@ private struct ClaudeConfigDirsSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if dirs.isEmpty {
-                Text("No extra directories — tracking the default `~/.claude`.")
+                Text("No extra directories. Tracking the default `~/.claude`.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             } else {
@@ -616,7 +961,7 @@ private struct CodexConnectionRow: View {
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("CodeBurn will stop tracking quota and delete its local copy of your Codex credentials. Your ~/.codex/auth.json is untouched — Codex CLI keeps working.")
+                    Text("CodeBurn will stop tracking quota and delete its local copy of your Codex credentials. Your ~/.codex/auth.json is untouched. Codex CLI keeps working.")
                 }
         case .terminalFailure, .noCredentials, .failed:
             Button("Reconnect") { Task { await store.bootstrapCodex() } }
@@ -642,7 +987,7 @@ private struct KimiSettingsTab: View {
                 KimiConnectionRow()
             }
             Section {
-                Text("Kimi Code live-quota tracking reads `~/.kimi-code/credentials/kimi-code.json` directly — nothing is copied or stored. Access tokens are short-lived (~15 minutes) and only the Kimi CLI refreshes them, so if the connection shows as expired, run the Kimi CLI once and click Reconnect.")
+                Text("Kimi Code live-quota tracking reads `~/.kimi-code/credentials/kimi-code.json` directly. Nothing is copied or stored. Access tokens are short-lived (~15 minutes) and only the Kimi CLI refreshes them, so if the connection shows as expired, run the Kimi CLI once and click Reconnect.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             } header: {
@@ -741,7 +1086,7 @@ private struct KimiConnectionRow: View {
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("CodeBurn will stop tracking Kimi Code quota. Your ~/.kimi-code credentials are untouched — the Kimi CLI keeps working.")
+                    Text("CodeBurn will stop tracking Kimi Code quota. Your ~/.kimi-code credentials are untouched. The Kimi CLI keeps working.")
                 }
         case .terminalFailure, .noCredentials, .failed:
             Button("Reconnect") { Task { await store.bootstrapKimi() } }
@@ -751,6 +1096,392 @@ private struct KimiConnectionRow: View {
                 .buttonStyle(.borderedProminent)
         case .notBootstrapped:
             Button("Connect") { Task { await store.bootstrapKimi() } }
+                .buttonStyle(.borderedProminent)
+        case .bootstrapping:
+            ProgressView().controlSize(.small)
+        }
+    }
+}
+
+// MARK: - Gemini
+
+private struct GeminiSettingsTab: View {
+    var body: some View {
+        Form {
+            Section("Connection") {
+                GeminiConnectionRow()
+            }
+            Section {
+                Text("Gemini live-quota tracking reads `~/.gemini/oauth_creds.json` read-only. Nothing is copied or stored, and tokens stay in memory. If the connection shows as expired, run the Gemini CLI once to refresh your login, then click Reconnect.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("How it works")
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+}
+
+private struct GeminiConnectionRow: View {
+    @Environment(AppStore.self) private var store
+    @State private var showDisconnectConfirm = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: stateIcon)
+                .font(.system(size: 18))
+                .foregroundStyle(stateTint)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(stateTitle)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(stateDetail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+            actionButton
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var stateIcon: String {
+        switch store.geminiLoadState {
+        case .loaded: return "checkmark.circle.fill"
+        case .terminalFailure: return "exclamationmark.triangle.fill"
+        case .transientFailure: return "clock.arrow.circlepath"
+        case .bootstrapping, .loading: return "ellipsis.circle"
+        case .notBootstrapped, .dormant, .noCredentials: return "link.circle"
+        case .failed: return "xmark.circle"
+        }
+    }
+
+    private var stateTint: Color {
+        switch store.geminiLoadState {
+        case .loaded: return .green
+        case .terminalFailure, .failed: return .red
+        case .transientFailure: return .orange
+        default: return .secondary
+        }
+    }
+
+    private var stateTitle: String {
+        switch store.geminiLoadState {
+        case .loaded: return "Connected"
+        case let .terminalFailure(reason): return reason ?? "Login refresh required"
+        case .transientFailure: return "Backing off"
+        case .bootstrapping: return "Connecting…"
+        case .loading: return "Refreshing…"
+        case .dormant: return "Ready"
+        case .notBootstrapped, .noCredentials: return "Not connected"
+        case .failed: return "Couldn't load Gemini quota"
+        }
+    }
+
+    private var stateDetail: String {
+        switch store.geminiLoadState {
+        case .loaded:
+            if let plan = store.geminiUsage?.plan {
+                return "Plan: \(plan)"
+            }
+            return "Live quota tracked from Google Code Assist."
+        case .terminalFailure:
+            return "Run the Gemini CLI once to refresh your login, then click Reconnect."
+        case .transientFailure: return store.geminiError ?? "Gemini rate-limited; auto-retrying."
+        case .bootstrapping: return "Reading ~/.gemini credentials."
+        case .loading: return "Background refresh in progress."
+        case .dormant: return "Tap Load Quota to fetch live usage from Google Code Assist."
+        case .notBootstrapped, .noCredentials:
+            return "Sign in with the Gemini CLI first, then click Connect."
+        case .failed: return store.geminiError ?? ""
+        }
+    }
+
+    @ViewBuilder
+    private var actionButton: some View {
+        switch store.geminiLoadState {
+        case .loaded, .transientFailure, .loading:
+            Button("Disconnect") { showDisconnectConfirm = true }
+                .confirmationDialog(
+                    "Disconnect Gemini?",
+                    isPresented: $showDisconnectConfirm
+                ) {
+                    Button("Disconnect", role: .destructive) {
+                        store.disconnectGemini()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("CodeBurn will stop tracking Gemini quota. Your ~/.gemini credentials are untouched. The Gemini CLI keeps working.")
+                }
+        case .terminalFailure, .noCredentials, .failed:
+            Button("Reconnect") { Task { await store.bootstrapGemini() } }
+                .buttonStyle(.borderedProminent)
+        case .dormant:
+            Button("Load Quota") { Task { await store.bootstrapGemini() } }
+                .buttonStyle(.borderedProminent)
+        case .notBootstrapped:
+            Button("Connect") { Task { await store.bootstrapGemini() } }
+                .buttonStyle(.borderedProminent)
+        case .bootstrapping:
+            ProgressView().controlSize(.small)
+        }
+    }
+}
+
+// MARK: - Copilot
+
+private struct CopilotSettingsTab: View {
+    var body: some View {
+        Form {
+            Section("Connection") {
+                CopilotConnectionRow()
+            }
+            Section {
+                Text("Copilot live-quota tracking reads the GitHub Copilot editor sign-in token from `~/.config/github-copilot` read-only. Nothing is copied or stored. Sign in via an editor's Copilot plugin (VS Code, Xcode, etc.) first; if the connection shows as expired, sign in there again, then click Reconnect.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("How it works")
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+}
+
+private struct CopilotConnectionRow: View {
+    @Environment(AppStore.self) private var store
+    @State private var showDisconnectConfirm = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: stateIcon)
+                .font(.system(size: 18))
+                .foregroundStyle(stateTint)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(stateTitle)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(stateDetail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+            actionButton
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var stateIcon: String {
+        switch store.copilotLoadState {
+        case .loaded: return "checkmark.circle.fill"
+        case .terminalFailure: return "exclamationmark.triangle.fill"
+        case .transientFailure: return "clock.arrow.circlepath"
+        case .bootstrapping, .loading: return "ellipsis.circle"
+        case .notBootstrapped, .dormant, .noCredentials: return "link.circle"
+        case .failed: return "xmark.circle"
+        }
+    }
+
+    private var stateTint: Color {
+        switch store.copilotLoadState {
+        case .loaded: return .green
+        case .terminalFailure, .failed: return .red
+        case .transientFailure: return .orange
+        default: return .secondary
+        }
+    }
+
+    private var stateTitle: String {
+        switch store.copilotLoadState {
+        case .loaded: return "Connected"
+        case let .terminalFailure(reason): return reason ?? "Login refresh required"
+        case .transientFailure: return "Backing off"
+        case .bootstrapping: return "Connecting…"
+        case .loading: return "Refreshing…"
+        case .dormant: return "Ready"
+        case .notBootstrapped, .noCredentials: return "Not connected"
+        case .failed: return "Couldn't load Copilot quota"
+        }
+    }
+
+    private var stateDetail: String {
+        switch store.copilotLoadState {
+        case .loaded:
+            if let plan = store.copilotUsage?.plan {
+                return "Plan: \(plan)"
+            }
+            return "Live quota tracked from api.github.com."
+        case .terminalFailure:
+            return "Sign in via an editor's Copilot plugin to refresh your login, then click Reconnect."
+        case .transientFailure: return store.copilotError ?? "GitHub rate-limited; auto-retrying."
+        case .bootstrapping: return "Reading ~/.config/github-copilot credentials."
+        case .loading: return "Background refresh in progress."
+        case .dormant: return "Tap Load Quota to fetch live usage from api.github.com."
+        case .notBootstrapped, .noCredentials:
+            return "Sign in via an editor's Copilot plugin first, then click Connect."
+        case .failed: return store.copilotError ?? ""
+        }
+    }
+
+    @ViewBuilder
+    private var actionButton: some View {
+        switch store.copilotLoadState {
+        case .loaded, .transientFailure, .loading:
+            Button("Disconnect") { showDisconnectConfirm = true }
+                .confirmationDialog(
+                    "Disconnect Copilot?",
+                    isPresented: $showDisconnectConfirm
+                ) {
+                    Button("Disconnect", role: .destructive) {
+                        store.disconnectCopilot()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("CodeBurn will stop tracking Copilot quota. Your ~/.config/github-copilot credentials are untouched. Your editor's Copilot plugin keeps working.")
+                }
+        case .terminalFailure, .noCredentials, .failed:
+            Button("Reconnect") { Task { await store.bootstrapCopilot() } }
+                .buttonStyle(.borderedProminent)
+        case .dormant:
+            Button("Load Quota") { Task { await store.bootstrapCopilot() } }
+                .buttonStyle(.borderedProminent)
+        case .notBootstrapped:
+            Button("Connect") { Task { await store.bootstrapCopilot() } }
+                .buttonStyle(.borderedProminent)
+        case .bootstrapping:
+            ProgressView().controlSize(.small)
+        }
+    }
+}
+
+// MARK: - Antigravity
+
+private struct AntigravitySettingsTab: View {
+    var body: some View {
+        Form {
+            Section("Connection") {
+                AntigravityConnectionRow()
+            }
+            Section {
+                Text("Antigravity live-quota tracking talks to the Antigravity app's local language server on 127.0.0.1 only. Nothing leaves the machine and no credential files are read. If it shows as disconnected, start the Antigravity app, then click Reconnect.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("How it works")
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+}
+
+private struct AntigravityConnectionRow: View {
+    @Environment(AppStore.self) private var store
+    @State private var showDisconnectConfirm = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: stateIcon)
+                .font(.system(size: 18))
+                .foregroundStyle(stateTint)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(stateTitle)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(stateDetail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+            actionButton
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var stateIcon: String {
+        switch store.antigravityLoadState {
+        case .loaded: return "checkmark.circle.fill"
+        case .terminalFailure: return "exclamationmark.triangle.fill"
+        case .transientFailure: return "clock.arrow.circlepath"
+        case .bootstrapping, .loading: return "ellipsis.circle"
+        case .notBootstrapped, .dormant, .noCredentials: return "link.circle"
+        case .failed: return "xmark.circle"
+        }
+    }
+
+    private var stateTint: Color {
+        switch store.antigravityLoadState {
+        case .loaded: return .green
+        case .terminalFailure, .failed: return .red
+        case .transientFailure: return .orange
+        default: return .secondary
+        }
+    }
+
+    private var stateTitle: String {
+        switch store.antigravityLoadState {
+        case .loaded: return "Connected"
+        case let .terminalFailure(reason): return reason ?? "Reconnect required"
+        case .transientFailure: return "Backing off"
+        case .bootstrapping: return "Connecting…"
+        case .loading: return "Refreshing…"
+        case .dormant: return "Ready"
+        case .notBootstrapped, .noCredentials: return "Not connected"
+        case .failed: return "Couldn't load Antigravity quota"
+        }
+    }
+
+    private var stateDetail: String {
+        switch store.antigravityLoadState {
+        case .loaded:
+            if let plan = store.antigravityUsage?.plan {
+                return "Plan: \(plan)"
+            }
+            return "Live quota tracked from the local Antigravity server."
+        case .terminalFailure:
+            return "Start the Antigravity app, then click Reconnect."
+        case .transientFailure: return store.antigravityError ?? "Local probe failed; auto-retrying."
+        case .bootstrapping: return "Probing the local Antigravity language server."
+        case .loading: return "Background refresh in progress."
+        case .dormant: return "Tap Load Quota to probe the local Antigravity server."
+        case .notBootstrapped:
+            return "Start the Antigravity app first, then click Connect."
+        case .noCredentials:
+            return "No local Antigravity server found. Start the Antigravity app, then click Reconnect."
+        case .failed: return store.antigravityError ?? ""
+        }
+    }
+
+    @ViewBuilder
+    private var actionButton: some View {
+        switch store.antigravityLoadState {
+        case .loaded, .transientFailure, .loading:
+            Button("Disconnect") { showDisconnectConfirm = true }
+                .confirmationDialog(
+                    "Disconnect Antigravity?",
+                    isPresented: $showDisconnectConfirm
+                ) {
+                    Button("Disconnect", role: .destructive) {
+                        store.disconnectAntigravity()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("CodeBurn will stop tracking Antigravity quota. Nothing is read from or written to disk. The Antigravity app keeps working.")
+                }
+        case .terminalFailure, .noCredentials, .failed:
+            Button("Reconnect") { Task { await store.bootstrapAntigravity() } }
+                .buttonStyle(.borderedProminent)
+        case .dormant:
+            Button("Load Quota") { Task { await store.bootstrapAntigravity() } }
+                .buttonStyle(.borderedProminent)
+        case .notBootstrapped:
+            Button("Connect") { Task { await store.bootstrapAntigravity() } }
                 .buttonStyle(.borderedProminent)
         case .bootstrapping:
             ProgressView().controlSize(.small)
@@ -836,36 +1567,139 @@ private struct DevinSettingsTab: View {
 // MARK: - About
 
 private struct AboutSettingsTab: View {
-    private let appVersion: String = AppVersion.normalizedBundleShortVersion
-    private let buildVersion: String = AppVersion.normalizedBundleBuildVersion
+    @Environment(UpdateChecker.self) private var updateChecker
+
+    private var versionString: String {
+        let version = AppVersion.normalizedBundleShortVersion
+        let build = AppVersion.normalizedBundleBuildVersion
+        return build == version ? version : "\(version) (\(build))"
+    }
 
     var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "flame.fill")
-                .font(.system(size: 40))
-                .foregroundStyle(Theme.brandAccent)
-            Text("CodeBurn")
-                .font(.system(size: 18, weight: .semibold))
-            Text("AI Coding Cost Tracker")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-            Text("Version \(appVersion) (\(buildVersion))")
-                .font(.codeMono(size: 11))
-                .foregroundStyle(.secondary)
-            Link(destination: URL(string: "https://github.com/getagentseal/codeburn")!) {
-                Label("Star on GitHub", systemImage: "star.fill")
-                    .font(.system(size: 12, weight: .medium))
+        Form {
+            Section {
+                hero
+                    .frame(maxWidth: .infinity)
+                    .listRowBackground(Color.clear)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(Theme.brandAccent)
-            HStack(spacing: 10) {
-                Link("GitHub", destination: URL(string: "https://github.com/getagentseal/codeburn")!)
-                Link("Issues", destination: URL(string: "https://github.com/getagentseal/codeburn/issues")!)
-                Link("Sponsor", destination: URL(string: "https://github.com/sponsors/iamtoruk")!)
+
+            Section {
+                LabeledContent("Version \(versionString)") {
+                    Button("Check for Updates") {
+                        Task { await updateChecker.check() }
+                    }
+                }
+                if let error = updateChecker.updateError {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else if updateChecker.updateAvailable, let latest = updateChecker.latestVersion {
+                    Text("\(AppVersion.display(latest)) is available. Choose Check for Updates in the CodeBurn menu to install it.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Updates")
             }
-            .font(.system(size: 12))
+
+            Section {
+                AboutLinkRow(
+                    icon: "chevron.left.slash.chevron.right",
+                    title: "GitHub",
+                    url: "https://github.com/getagentseal/codeburn")
+                AboutLinkRow(
+                    icon: "globe",
+                    title: "Website",
+                    url: "https://codeburn.app")
+                AboutLinkRow(
+                    icon: "exclamationmark.bubble",
+                    title: "Issues",
+                    url: "https://github.com/getagentseal/codeburn/issues")
+            } header: {
+                Text("Links")
+            } footer: {
+                Text("© 2026 Resham Joshi (iamtoruk) · AgentSeal. MIT License.")
+                    .frame(maxWidth: .infinity)
+                    .multilineTextAlignment(.center)
+            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding()
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+    }
+
+    private var hero: some View {
+        VStack(spacing: 10) {
+            if let flame = AboutFlameImage.load() {
+                Image(nsImage: flame)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 72, height: 72)
+            } else if let icon = NSApplication.shared.applicationIconImage {
+                Image(nsImage: icon)
+                    .resizable()
+                    .frame(width: 64, height: 64)
+                    .cornerRadius(12)
+            }
+
+            VStack(spacing: 2) {
+                Text("CodeBurn")
+                    .font(.title3).fontWeight(.semibold)
+                Text("Version \(versionString)")
+                    .foregroundStyle(.secondary)
+                Text("Your AI Bill, Itemized")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 6)
     }
 }
+
+private struct AboutLinkRow: View {
+    let icon: String
+    let title: String
+    let url: String
+    @State private var hovering = false
+
+    var body: some View {
+        Button {
+            if let url = URL(string: self.url) { NSWorkspace.shared.open(url) }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .frame(width: 18)
+                    .foregroundStyle(.secondary)
+                Text(title)
+                    .foregroundStyle(.primary)
+                Spacer()
+                Image(systemName: "arrow.up.right")
+                    .font(.caption)
+                    .foregroundStyle(hovering ? Color.accentColor : Color.secondary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+}
+
+/// The full-color binary-flame brand mark shown in the About hero. Loaded
+/// directly (not via ProviderIconCache) because it must keep its colors —
+/// the cache marks everything as a template image.
+@MainActor
+enum AboutFlameImage {
+    private static var cached: NSImage?
+
+    static func load() -> NSImage? {
+        if let cached { return cached }
+        for subdirectory in ["Resources/ProviderIcons", "ProviderIcons", nil] {
+            if let url = Bundle.module.url(forResource: "about-flame", withExtension: "png", subdirectory: subdirectory),
+               let image = NSImage(contentsOf: url) {
+                cached = image
+                return image
+            }
+        }
+        return nil
+    }
+}
+
