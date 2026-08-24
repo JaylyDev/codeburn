@@ -208,7 +208,7 @@ private struct SettingsSidebarAboutRow: View {
             // Bare brand mark, no chip container — the binary flame reads
             // better at this size than the boxed app icon.
             Group {
-                if let flame = ProviderIconCache.image(named: "flame") {
+                if let flame = ProviderIconCache.image(named: "flame-solid") {
                     Image(nsImage: flame)
                         .resizable()
                         .scaledToFit()
