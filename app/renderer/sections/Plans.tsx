@@ -10,6 +10,7 @@ import { usePolled } from '../hooks/usePolled'
 import { formatConverted } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import { motionClass } from '../lib/motion'
+import { PROVIDER_NAMES, PROVIDER_OWNERS, readDisabledProviders } from '../lib/providers'
 import type { JsonPlanSummary, Period, PlanId, PlanProvider, QuotaProvider, QuotaWindow, StatusJson } from '../lib/types'
 import type { SettingsPane } from './Settings'
 
@@ -33,8 +34,7 @@ function fmtPct(n: number): string {
 /** Honest copy for a 429 backoff window (the upstream quota endpoint rate
  *  limited us), replacing the generic "waiting" note. */
 export function rateLimitedNote(provider: QuotaProvider['provider']): string {
-  const owner = provider === 'claude' ? 'Anthropic' : 'OpenAI'
-  return `${owner} rate limited the quota endpoint, retrying in a few minutes`
+  return `${PROVIDER_OWNERS[provider]} rate limited the quota endpoint, retrying in a few minutes`
 }
 
 function cycleEndDate(plan: JsonPlanSummary): Date | null {
@@ -79,7 +79,7 @@ export function Plans({ period, refreshToken = 0, onNavigate, ready = true }: { 
     const key = `${refreshToken}:${reconnectNonce}`
     const force = key !== lastForced.current
     lastForced.current = key
-    return codeburn.getQuota(force)
+    return codeburn.getQuota(force, readDisabledProviders())
   }, [refreshToken, reconnectNonce])
   const reconnect = () => setReconnectNonce(value => value + 1)
   const budgetReport = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken], { enabled: ready })
@@ -146,7 +146,7 @@ function renderBudgetPlans(data: StatusJson | null, error: ReturnType<typeof use
 }
 
 function QuotaPanel({ quota, onReconnect }: { quota: QuotaProvider; onReconnect: () => void }) {
-  const providerName = quota.provider === 'claude' ? 'Claude' : 'Codex'
+  const providerName = PROVIDER_NAMES[quota.provider]
   return (
     <Panel
       className="quota-card"
@@ -231,7 +231,9 @@ function PlanPanel({ plan }: { plan: JsonPlanSummary }) {
   const right = hasBudget
     ? `${formatConverted(plan.spent)} · ${fmtPct(plan.percentUsed)}${overage > 0 ? ` · ${formatConverted(overage)} over` : ''}`
     : `${formatConverted(plan.spent)} this cycle`
-  const detail = hasBudget ? `${formatConverted(plan.budget)} / month · ${plan.provider}` : `${plan.provider} · pay as you go, no plan`
+  const detail = hasBudget
+    ? `${formatConverted(plan.budget)} / month budget · API-equivalent, not a live provider window · ${plan.provider}`
+    : `${plan.provider} · pay as you go, no plan`
 
   return (
     <Panel>

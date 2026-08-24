@@ -195,6 +195,33 @@ struct DataClientProcessTests {
                 "every concurrent process should exit 0 via the terminationHandler wait path")
     }
 
+    /// #1117: the window bounds SILENCE, not runtime. A child that keeps talking
+    /// past its window runs to completion; the old fixed timeout killed it.
+    @Test("a chattering child outlives its window", .timeLimit(.minutes(1)))
+    func chatteringChildOutlivesItsWindow() async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", "for i in 1 2 3 4 5 6; do echo tick; sleep 0.4; done"]
+        let result = try await DataClient.runProcess(process, timeoutSeconds: 1, label: "chatty")
+        #expect(result.exitCode == 0, "a child emitting output every 0.4s must survive a 1s silence window")
+    }
+
+    /// The CLI's keepalive goes to STDERR, so stderr has to re-arm the watchdog
+    /// too - and must not then turn up as the error message.
+    @Test("stderr keepalives keep a stdout-silent child alive and stay out of the error text",
+          .timeLimit(.minutes(1)))
+    func stderrKeepalivesCountAsOutput() async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            "-c",
+            #"for i in 1 2 3 4 5 6; do printf 'CODEBURN_PROGRESS {"kind":"keepalive"}\n' >&2; sleep 0.4; done; exit 3"#,
+        ]
+        let result = try await DataClient.runProcess(process, timeoutSeconds: 1, label: "keepalive")
+        #expect(result.exitCode == 3, "stderr keepalives must restart the silence window")
+        #expect(result.stderr == "", "progress lines must never become the error message")
+    }
+
     /// The async semaphore never lets more than its count run concurrently.
     @Test("async semaphore caps concurrency")
     func asyncSemaphoreCapsConcurrency() async {

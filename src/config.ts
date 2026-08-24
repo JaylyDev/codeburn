@@ -4,12 +4,15 @@ import { homedir } from 'os'
 import { randomBytes } from 'crypto'
 import { PLAN_PROVIDERS } from './plans.js'
 
-export type PlanId = 'claude-pro' | 'claude-max' | 'claude-max-5x' | 'cursor-pro' | 'supergrok' | 'supergrok-heavy' | 'custom' | 'none'
-export type PlanProvider = 'claude' | 'codex' | 'cursor' | 'grok' | 'all'
+export type PlanId = 'claude-pro' | 'claude-max' | 'claude-max-5x' | 'cursor-pro' | 'supergrok' | 'supergrok-heavy' | 'copilot-pro' | 'copilot-pro-plus' | 'copilot-max' | 'custom' | 'none'
+export type PlanProvider = 'claude' | 'codex' | 'cursor' | 'grok' | 'copilot' | 'all'
 
 export type Plan = {
   id: PlanId
   monthlyUsd: number
+  // Copilot plans budget in AI credits. monthlyUsd stays as credits × $0.01 so
+  // isActivePlan and add-only JSON keep working. Absent on USD plans.
+  monthlyCredits?: number
   provider: PlanProvider
   resetDay?: number
   setAt: string
@@ -44,6 +47,15 @@ export type CodeburnConfig = {
   // can show "saved $X by running locally". Distinct from modelAliases which
   // rewrites actual spend.
   localModelSavings?: Record<string, string>
+  // Model ids whose $0 cost is correct because they are billed as a
+  // subscription / flat-rate product, not missing LiteLLM rows. Distinct from
+  // modelAliases (which invent per-token spend) and localModelSavings
+  // (counterfactual local baseline). See `codeburn model-flat-rate`.
+  flatRateModels?: string[]
+  // Opt-outs from the built-in flat-rate classifier. `model-flat-rate --remove`
+  // on a built-in SKU records the id here so a false positive can warn again
+  // without waiting for a release.
+  flatRateModelsRemoved?: string[]
   // Spend budgets are stored in the configured display currency, not USD.
   budget?: {
     daily?: number

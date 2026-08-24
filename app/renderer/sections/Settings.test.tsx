@@ -256,7 +256,7 @@ describe('Settings', () => {
     expect(await screen.findByText('Detected subscriptions')).toBeInTheDocument()
     expect(screen.getByText('Max 20x')).toBeInTheDocument()
     expect(screen.getByText('Not connected. Log in with the Codex CLI.')).toBeInTheDocument()
-    expect(mocks.getQuota).toHaveBeenCalledWith(false)
+    expect(mocks.getQuota).toHaveBeenCalledWith(false, [])
   })
 
   it('expands the DetectedRow Connect affordance and forces a keychain refresh', async () => {
@@ -268,7 +268,7 @@ describe('Settings', () => {
     expect(screen.getByText('codex login')).toBeInTheDocument()
     mocks.getQuota.mockClear()
     await user.click(screen.getByRole('button', { name: 'Refresh' }))
-    await waitFor(() => expect(mocks.getQuota).toHaveBeenCalledWith(true))
+    await waitFor(() => expect(mocks.getQuota).toHaveBeenCalledWith(true, []))
   })
 
   it('offers only non-OAuth budget presets; Claude and Codex are excluded', async () => {

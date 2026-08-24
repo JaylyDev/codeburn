@@ -86,8 +86,11 @@ describe('aggregateAudit', () => {
     expect(r.raw.reasoningTokens).toBe(10)
     expect(r.raw.cacheReadInputTokens).toBe(200)
     expect(r.raw.cachedInputTokens).toBe(300)
-    // reasoning folds into output for pricing
-    expect(r.displayed.outputTokens).toBe(110)
+    // Reasoning does NOT fold into output for claude or codex: both bill it
+    // as part of output_tokens already, so adding it would double-count
+    // (#1075). Providers that report reasoning as a separate bucket still get
+    // the additive treatment - see tests/codex-pricing-1075.test.ts.
+    expect(r.displayed.outputTokens).toBe(100)
     // cache read is the SUM of per-call max(anthropic, openai), not max of sums
     expect(r.displayed.cacheReadTokens).toBe(500)
     // attributed cost is preserved exactly
@@ -99,6 +102,27 @@ describe('aggregateAudit', () => {
     expect(rows).toHaveLength(1)
     expect(rows[0]!.rates).toBeNull()
     expect(rows[0]!.cost.recomputedTotalUSD).toBe(0)
+  })
+
+  it('gives copilot supplementary accounting no call weight and no phantom reasoning output', async () => {
+    // One served request recorded twice: the per-turn call carries the full output, the
+    // paired store row carries that output's reasoning subset plus real input/cache tokens.
+    const perTurn = makeCall({ inputTokens: 300, outputTokens: 500, cacheReadInputTokens: 1000 }, 1.0, 'claude-sonnet-4-5', 'copilot')
+    const supplementary: ParsedApiCall = {
+      ...makeCall({ inputTokens: 40, outputTokens: 0, reasoningTokens: 800, cacheReadInputTokens: 900 }, 0.5, 'claude-sonnet-4-5', 'copilot'),
+      supplementaryAccounting: true,
+    }
+    const rows = await aggregateAudit([makeProject([perTurn, supplementary])])
+
+    expect(rows).toHaveLength(1)
+    const r = rows[0]!
+    expect(r.calls).toBe(1)
+    expect(r.displayed.outputTokens).toBe(500)
+    // Raw stays untouched, and tokens/cost keep every call, supplementary included.
+    expect(r.raw.reasoningTokens).toBe(800)
+    expect(r.raw.inputTokens).toBe(340)
+    expect(r.displayed.cacheReadTokens).toBe(1900)
+    expect(r.attributedCostUSD).toBeCloseTo(1.5)
   })
 
   it('splits buckets by (provider, model)', async () => {

@@ -236,7 +236,8 @@ async function shardBodies(cacheDir: string): Promise<Record<string, string>> {
 /// The Codex incremental cache is a single JSON file; both runs read the same
 /// rollouts, so it must come out identical byte for byte.
 async function codexResults(cacheDir: string): Promise<string | null> {
-  return readFile(join(cacheDir, 'codex-results.json'), 'utf-8').catch(() => null)
+  const { codexCacheFileName } = await import('../src/codex-cache.js')
+  return readFile(join(cacheDir, codexCacheFileName()), 'utf-8').catch(() => null)
 }
 
 function runCli(args: string[], home: string, extraEnv: Record<string, string>) {

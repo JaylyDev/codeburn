@@ -142,6 +142,21 @@ Re-sends are byte-identical. Server-side dedup is defense-in-depth.
 }
 ```
 
+`ai.project` is optional. Usage spans include it only when CodeBurn can derive
+one safe basename from a provider-recorded absolute working directory.
+Attribution spans derive it only from the normalized `git.repo`; PR-only
+evidence omits it. Receivers must group a missing project as unattributed and
+must not require the field. When usage and attribution spans for one trace carry
+different safe basenames (for example, a fork checkout whose directory name
+differs from the upstream repository), the attribution span's normalized
+`git.repo` basename is authoritative for project aggregation. The usage cwd
+basename is provisional; receivers must not count both as separate projects.
+
+`ai.output_tokens` is the billable output total. For providers that meter
+reasoning separately from response tokens, CodeBurn includes that reasoning in
+this field; providers whose response count already includes reasoning are left
+unchanged.
+
 ## Sent-Ledger
 
 Client-side deduplication source of truth at `~/.cache/codeburn/sync-ledger.json`.

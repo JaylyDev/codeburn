@@ -36,12 +36,20 @@ actor ServeConnection {
 
     private var process: Process?
     private var stdinHandle: FileHandle?
+    /// Permanent refusal (explicit shutdown, or a binary that cannot be spawned
+    /// at all). Distinct from a spent death budget, which recovers with time.
+    private var disabled = false
+    private var lastDeathAt: Date?
     private var nextId = 1
     private var nextRequestToken = 1
     private var queuedRequests: [QueuedRequest] = []
     private var activeRequest: ActiveRequest?
     private var pending: [Int: CheckedContinuation<Data, Error>] = [:]
     private var requestTimeouts: [Int: Task<Void, Never>] = [:]
+    private var requestCeilings: [Int: Task<Void, Never>] = [:]
+    /// Silence window of the in-flight request, so any frame carrying its id can
+    /// re-arm the same budget. See `CLIWatchdog`.
+    private var requestSilence: [Int: UInt64] = [:]
     private var timeoutOwners: [Int: Process] = [:]
     private var responseBytes: [Int: Int] = [:]
     private var deaths = 0
@@ -57,9 +65,18 @@ actor ServeConnection {
     private static let maxDeaths = 3
     static let maxResponseBytes = 16 * 1024 * 1024
     private static let stdoutReadChunkBytes = 64 * 1024
-    private static let terminationGraceNanoseconds: UInt64 = 1_000_000_000
-    private static let coldRequestTimeoutNanoseconds: UInt64 = 10 * 60 * 1_000_000_000
-    private static let warmRequestTimeoutNanoseconds: UInt64 = 60 * 1_000_000_000
+    private static let terminationGraceNanoseconds = nanoseconds(CLIWatchdog.killGraceSeconds)
+    /// Absolute backstop per request: a child that heartbeats forever without
+    /// ever answering is still reaped.
+    private static let requestCeilingNanoseconds = nanoseconds(CLIWatchdog.ceilingSeconds)
+    /// The death budget is spent by a transient cause as easily as a permanent
+    /// one (a cold-cache pile-up spends all three in a minute). Let a later tick
+    /// try again instead of leaving the resident dead for the whole app run.
+    private static let deathBudgetResetSeconds: TimeInterval = 300
+
+    private static func nanoseconds(_ seconds: Double) -> UInt64 {
+        UInt64(seconds * 1_000_000_000)
+    }
 
     struct ServeUnavailable: Error {}
     enum FailureReason: Sendable, Equatable {
@@ -99,19 +116,37 @@ actor ServeConnection {
 
     /// Kick the child off (idempotent). Called from app startup and again by
     /// the first request in case the startup task has not run yet.
+    ///
+    /// Re-entry: a spent death budget is a cooldown, not a life sentence. The
+    /// budget's job is to stop a crash loop from spawning a child per tick; once
+    /// `deathBudgetResetSeconds` have passed with no new death, the next tick
+    /// gets a fresh budget instead of leaving every fetch on the one-shot path
+    /// for the rest of the app run.
     func ensureStarted() {
-        guard process == nil, deaths < Self.maxDeaths else { return }
+        guard !disabled, process == nil else { return }
+        if deaths >= Self.maxDeaths {
+            guard let lastDeathAt,
+                  Date().timeIntervalSince(lastDeathAt) >= Self.deathBudgetResetSeconds else { return }
+            deaths = 0
+        }
+        // Before adding a child, clear the one a crashed previous run (or an
+        // earlier generation of this one) left behind. Idempotent: the recorded
+        // pid is only signalled if it is still that exact serve command.
+        ServeOrphanReaper.reap()
         // This single resident serves both background and user-visible status
         // requests. Its cold hydration replaces the old interactive one-shot,
         // so keep the child at the same user-initiated QoS as visible fetches.
         let child = makeProcess(["serve", "--stdio"], .userInitiated)
+        // Progress frames are what re-arm this connection's no-output watchdog
+        // during a cold hydration; without them serve is silent for minutes.
+        child.environment = CLIWatchdog.withProgressHeartbeat(child.environment)
         let stdinPipe = Pipe()
         let stdinWriter = stdinPipe.fileHandleForWriting
         // Suppress SIGPIPE only for this connection's write end. A process-wide
         // SIG_IGN leaks into unrelated libraries and children; F_SETNOSIGPIPE
         // keeps a closed child stdin on the normal throwable EPIPE path.
         guard Darwin.fcntl(stdinWriter.fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else {
-            deaths = Self.maxDeaths
+            disabled = true
             return
         }
         let stdoutPipe = Pipe()
@@ -122,11 +157,18 @@ actor ServeConnection {
         do {
             try child.run()
         } catch {
-            deaths = Self.maxDeaths // spawn path can't produce the binary either better than makeProcess did
+            disabled = true // spawn path can't produce the binary either better than makeProcess did
             return
         }
         process = child
         stdinHandle = stdinWriter
+        ServeChildRegistry.shared.add(child)
+        // Record the argv WITHOUT the `/usr/bin/env --` prefix: that is the part
+        // exec rewrites away before `ps` can see it. See serveCommandMatches.
+        ServeOrphanReaper.record(
+            pid: child.processIdentifier,
+            command: (child.arguments ?? []).drop(while: { $0 == "--" }).joined(separator: " ")
+        )
         let generation = ObjectIdentifier(child)
         // One blocking reader owns this generation's stdout. It never reads a
         // second bounded chunk until the actor has consumed the first, giving
@@ -177,16 +219,24 @@ actor ServeConnection {
     }
 
     func shutdown() {
+        disabled = true
         deaths = Self.maxDeaths
-        process?.terminate()
         for task in terminationTasks.values { task.cancel() }
         terminationTasks.removeAll()
         cancelAllTimeouts()
         failAllRequests()
+        try? stdinHandle?.close()
         process = nil
         stdinHandle = nil
         buffer = Data()
         receivedTerminalResponse = false
+        // Deliberately harder than every other kill path, and covering RETIRED
+        // generations too: quit has no budget to wait a SIGTERM grace out, and
+        // the grace task dies with the app, so a child that defers SIGTERM (a
+        // node process mid-synchronous-parse does) would outlive us. A refresh
+        // lock left behind by SIGKILL self-heals through the next parse's
+        // dead-pid takeover (src/cache-refresh-lock.ts).
+        ServeChildRegistry.shared.reapAll()
     }
 
     // MARK: - internals
@@ -226,10 +276,9 @@ actor ServeConnection {
 
         // Select and arm the timeout only when this request becomes the sole
         // protocol request in flight. A queued request must not spend its own
-        // budget while its predecessor is still hydrating or draining.
-        let timeoutNanoseconds = receivedTerminalResponse
-            ? Self.warmRequestTimeoutNanoseconds
-            : Self.coldRequestTimeoutNanoseconds
+        // budget while its predecessor is still hydrating or draining. The
+        // budget bounds SILENCE: every frame carrying this id restarts it.
+        let timeoutNanoseconds = Self.nanoseconds(CLIWatchdog.silenceWindow(warm: receivedTerminalResponse))
         activeRequest = ActiveRequest(
             token: request.token,
             id: id,
@@ -271,8 +320,26 @@ actor ServeConnection {
     }
 
     private func armTimeout(id: Int, child: Process, nanoseconds: UInt64) {
-        let sleep = timeoutSleep
         timeoutOwners[id] = child
+        requestSilence[id] = nanoseconds
+        armSilenceTimer(id: id, nanoseconds: nanoseconds)
+        // Deliberately a real sleep, not `timeoutSleep`: the ceiling is a
+        // 15-minute backstop behind the injected silence budget, and routing it
+        // through the same seam would make every test's timeout ledger carry it.
+        // Its arithmetic is covered by CLIWatchdog.verdict.
+        requestCeilings[id] = Task.detached { [weak self] in
+            do {
+                try await Task<Never, Never>.sleep(nanoseconds: Self.requestCeilingNanoseconds)
+            } catch {
+                return
+            }
+            await self?.requestTimedOut(id: id)
+        }
+    }
+
+    private func armSilenceTimer(id: Int, nanoseconds: UInt64) {
+        let sleep = timeoutSleep
+        requestTimeouts[id]?.cancel()
         requestTimeouts[id] = Task.detached { [weak self] in
             do {
                 try await sleep(nanoseconds)
@@ -281,6 +348,14 @@ actor ServeConnection {
             }
             await self?.requestTimedOut(id: id)
         }
+    }
+
+    /// Any frame carrying this request's id is proof of life: restart its
+    /// watchdog so a long cold parse that heartbeats progress is never killed
+    /// mid-flight. The absolute ceiling is untouched.
+    private func touchRequest(id: Int) {
+        guard let nanoseconds = requestSilence[id] else { return }
+        armSilenceTimer(id: id, nanoseconds: nanoseconds)
     }
 
     private func requestTimedOut(id: Int) {
@@ -302,11 +377,7 @@ actor ServeConnection {
         // reach EOF (for example, a stuck child can ignore SIGTERM or a
         // descendant can retain the pipe), so waiting for the reader would also
         // spend every queued caller's timeout before it can even be admitted.
-        process = nil
-        stdinHandle = nil
-        buffer = Data()
-        receivedTerminalResponse = false
-        deaths += 1
+        retireCurrentGeneration()
         if activeRequest?.id == id { activeRequest = nil }
         cancelTimeouts(ownedBy: child)
         terminateTimedOutChild(child)
@@ -319,6 +390,8 @@ actor ServeConnection {
     private func cancelTimeout(id: Int) {
         timeoutOwners.removeValue(forKey: id)
         requestTimeouts.removeValue(forKey: id)?.cancel()
+        requestCeilings.removeValue(forKey: id)?.cancel()
+        requestSilence.removeValue(forKey: id)
         responseBytes.removeValue(forKey: id)
     }
 
@@ -330,14 +403,34 @@ actor ServeConnection {
     private func cancelAllTimeouts() {
         for task in requestTimeouts.values { task.cancel() }
         requestTimeouts.removeAll()
+        for task in requestCeilings.values { task.cancel() }
+        requestCeilings.removeAll()
+        requestSilence.removeAll()
         timeoutOwners.removeAll()
         responseBytes.removeAll()
+    }
+
+    /// Detach the current generation. Closing our end of its stdin is the app's
+    /// half of "stdin closing ends the server loop": dropping the FileHandle is
+    /// NOT enough, because the Pipe stays alive inside `child.standardInput` for
+    /// as long as this generation's reader or termination task holds the
+    /// Process, so the write end stays open and the retired child never sees
+    /// EOF. That is how a retired-but-alive serve child becomes an orphan.
+    private func retireCurrentGeneration() {
+        try? stdinHandle?.close()
+        process = nil
+        stdinHandle = nil
+        buffer = Data()
+        receivedTerminalResponse = false
+        deaths += 1
+        lastDeathAt = Date()
     }
 
     private func outputStreamFinished(for child: Process) {
         outputTasks.removeValue(forKey: ObjectIdentifier(child))
         if !child.isRunning {
             terminationTasks.removeValue(forKey: ObjectIdentifier(child))?.cancel()
+            ServeChildRegistry.shared.remove(child)
         }
     }
 
@@ -363,17 +456,23 @@ actor ServeConnection {
 
     private func forceKillAfterGrace(_ child: Process) {
         terminationTasks.removeValue(forKey: ObjectIdentifier(child))
-        guard child.isRunning else { return }
+        guard child.isRunning else {
+            ServeChildRegistry.shared.remove(child)
+            return
+        }
         _ = Darwin.kill(child.processIdentifier, SIGKILL)
+        ServeChildRegistry.shared.remove(child)
     }
 
     private func outputStreamEnded(for child: Process) {
         guard process === child else { return }
         // EOF/read failure is a transport death even if the process has not
         // reaped yet. Terminate that exact generation so a child which closed
-        // stdout cannot survive after the actor starts its replacement.
-        if child.isRunning { child.terminate() }
+        // stdout cannot survive after the actor starts its replacement, and
+        // escalate: SIGTERM alone is deferred by a node child that is inside a
+        // synchronous parse when it arrives.
         childDied(child)
+        terminateTimedOutChild(child)
     }
 
     // Internal so the generation guard can be exercised deterministically by
@@ -420,6 +519,10 @@ actor ServeConnection {
             // Menubar has no progress UI, but must leave the request pending
             // until the terminal response arrives if such a frame is emitted.
             if let progress = object["progress"] as? String {
+                // Proof of life for a request still being worked on: restart its
+                // silence window. A terminal frame does not need this - it
+                // cancels the timers outright a few lines down.
+                touchRequest(id: id)
                 guard accountResponseBytes(Data(progress.utf8).count, id: id, child: child) else { return }
                 return
             }
@@ -467,26 +570,18 @@ actor ServeConnection {
         // Detach this exact generation before terminating it. Its eventual exit
         // and any already-scheduled stdout callbacks are then stale and cannot
         // consume a second death or corrupt a replacement generation.
-        process = nil
-        stdinHandle = nil
-        buffer = Data()
-        receivedTerminalResponse = false
-        deaths += 1
+        retireCurrentGeneration()
         cancelTimeouts(ownedBy: child)
         failAllRequests(error: ServeRequestFailed(
             message: "serve output exceeded \(responseLimitBytes) bytes",
             reason: .outputTooLarge
         ))
-        if child.isRunning { child.terminate() }
+        terminateTimedOutChild(child)
     }
 
     private func childDied(_ child: Process) {
         guard process === child else { return }
-        process = nil
-        stdinHandle = nil
-        buffer.removeAll()
-        receivedTerminalResponse = false
-        deaths += 1
+        retireCurrentGeneration()
         cancelTimeouts(ownedBy: child)
         if let activeRequest, activeRequest.child === child {
             if let continuation = pending.removeValue(forKey: activeRequest.id) {
@@ -524,6 +619,119 @@ actor ServeConnection {
         queuedRequests.removeAll()
         for request in requests {
             request.continuation.resume(throwing: error)
+        }
+    }
+}
+
+/// Best-effort reap of a serve child orphaned by a previous run: a crash leaves
+/// no one to close the child's stdin and no `applicationWillTerminate` to reap
+/// it. Port of `reapOrphanServe` in app/electron/cli.ts (#1096).
+enum ServeOrphanReaper {
+    static func pidFileURL() -> URL {
+        URL(fileURLWithPath: CodeBurnCacheDirectory.resolve())
+            .appendingPathComponent("menubar-serve.pid", isDirectory: false)
+    }
+
+    static func record(pid: pid_t, command: String) {
+        let url = pidFileURL()
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let body = ["pid": Int(pid), "cmd": command] as [String: Any]
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
+        try? data.write(to: url) // reaping is best-effort
+    }
+
+    /// Reads the pid recorded by the previous run and — because pids are
+    /// recycled — signals it only after `ps` confirms the process is still that
+    /// exact serve child. SIGTERM, never SIGKILL: the orphan may be holding the
+    /// cache refresh lock and can release it on the way out.
+    static func reap() {
+        let url = pidFileURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        guard let data = try? Data(contentsOf: url),
+              let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let pid = record["pid"] as? Int,
+              let cmd = record["cmd"] as? String,
+              pid > 1, pid != Int(ProcessInfo.processInfo.processIdentifier),
+              !cmd.isEmpty,
+              serveCommandMatches(recorded: cmd, observed: commandLine(of: pid_t(pid)))
+        else { return }
+        _ = Darwin.kill(pid_t(pid), SIGTERM)
+    }
+
+    /// Suffix match on the full recorded argv, not a keyword sniff: any looser
+    /// test signals whatever unrelated process inherited the pid.
+    ///
+    /// Electron can compare exactly because it spawns its own binary. We spawn
+    /// through `/usr/bin/env`, and the CLI is a shebang script, so by the time
+    /// `ps` sees the process the argv has been rewritten twice: `env -- <cli>
+    /// serve --stdio` becomes `node <cli> serve --stdio`. The interpreter
+    /// prefix is the only part that varies, so the recorded `<cli> serve
+    /// --stdio` has to match as a suffix rather than in full.
+    static func serveCommandMatches(recorded: String, observed: String?) -> Bool {
+        guard let observed else { return false }
+        let normalize = { (value: String) -> String in
+            value.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" || $0 == "\"" })
+                .joined(separator: " ")
+        }
+        let wanted = normalize(recorded)
+        return !wanted.isEmpty && normalize(observed).hasSuffix(wanted)
+    }
+
+    /// `-ww` defeats ps's width truncation; the pid is an integer before it is
+    /// passed, and the call never goes through a shell.
+    private static func commandLine(of pid: pid_t) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-ww", "-o", "command=", "-p", String(pid)]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return nil }
+        // readToEnd returns at EOF, which is this short-lived child exiting; no
+        // waitUntilExit, which would park the calling thread (see DataClient).
+        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? nil
+        let text = String(data: data ?? Data(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return text.isEmpty ? nil : text
+    }
+}
+
+/// Every serve child this app run has started and not yet seen exit, readable
+/// WITHOUT an actor hop.
+///
+/// `applicationWillTerminate` runs `Task { await shutdown() }`, and the app can
+/// exit before that task is ever scheduled — so the actor's own reaping is not
+/// reachable on the path that matters most. This registry is, and a Process that
+/// still reports `isRunning` has not been waited on, so its pid is still ours
+/// and cannot have been recycled under us.
+final class ServeChildRegistry: @unchecked Sendable {
+    static let shared = ServeChildRegistry()
+
+    private let lock = NSLock()
+    private var children: [ObjectIdentifier: Process] = [:]
+
+    func add(_ child: Process) {
+        lock.lock()
+        children[ObjectIdentifier(child)] = child
+        lock.unlock()
+    }
+
+    func remove(_ child: Process) {
+        lock.lock()
+        children.removeValue(forKey: ObjectIdentifier(child))
+        lock.unlock()
+    }
+
+    func reapAll() {
+        lock.lock()
+        let all = Array(children.values)
+        children.removeAll()
+        lock.unlock()
+        for child in all where child.isRunning {
+            _ = Darwin.kill(child.processIdentifier, SIGKILL)
         }
     }
 }

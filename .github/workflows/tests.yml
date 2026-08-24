@@ -33,10 +33,13 @@ jobs:
       # script since #948, so CI and a contributor's `npm test` can never drift.
       - name: Test suite (parallel)
         run: npm test
-      # Single forked worker, so lock contention comes only from the child processes the
-      # tests spawn deliberately. Quarantined (reports, never gates): the process
-      # suite still races its own takeover window even serially on slow runners -
-      # tracked in #904; drop continue-on-error once that race is settled.
-      - name: Cache-lock suite (serial, quarantined)
-        continue-on-error: true
+      # Single forked worker, so lock contention comes only from the child
+      # processes the tests spawn deliberately. Serial because the suite is
+      # parallelism-sensitive (fails under full worker pressure, passes
+      # serially). After #904 the loser of a stale-lock contest may be
+      # timed-out or completed-by-other; this step gates CI.
+      # Step-level timeout so a stalled lock suite fails this job instead of
+      # eating the 15-minute budget and cancelling a green parallel suite.
+      - name: Cache-lock suite (serial)
+        timeout-minutes: 5
         run: npm run test:locks

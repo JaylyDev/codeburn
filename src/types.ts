@@ -156,6 +156,17 @@ export type ParsedApiCall = {
   activeDurationMs?: number
   activeGeneratedTokens?: number
   toolWaitMs?: number
+  /// Supplementary accounting: this call's tokens/cost are real but the call is
+  /// not a distinct behavioral request (copilot shutdown rollups and store rows
+  /// that pair with an already-counted per-turn call; Hermes observation-time
+  /// deltas). Aggregates keep its tokens/cost but skip it in apiCalls /
+  /// model-call / turn counts. Hermes deltas persist the flag on CachedCall;
+  /// Copilot remains serve-time / never cached.
+  supplementaryAccounting?: boolean
+  /// Copilot session-store `total_nano_aiu`. 1e9 nano-AIU = 1 credit = $0.01.
+  /// Threaded from CachedCall / ParsedProviderCall so plan math can sum credits.
+  /// Absent on older stores and on JSONL / shutdown-rollup siblings.
+  nanoAiu?: number
 }
 
 export type ToolCall = {

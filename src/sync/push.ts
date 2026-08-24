@@ -26,10 +26,157 @@ import type { SessionAttributionRecord } from '../yield.js'
  */
 export const MAX_PER_PUSH = 50_000
 
+/**
+ * How long a copilot session must be quiet before its calls may be synced.
+ *
+ * The ledger is append-once and the OTLP span id derives from the same
+ * deduplication key, so the whole pipeline assumes a served call is immutable:
+ * same key, same value, forever. Copilot's serve-time reconciliation is the
+ * first producer that breaks that (#988). Three ways, all within one session:
+ * a shutdown residual SHRINKS as the store rows that cover it land; a rollup
+ * is DROPPED once rows cover its leg; and an unpaired store row becomes
+ * supplementary once its journal call appears. Sent once at an intermediate
+ * state, the receiver keeps that state forever AND receives what supersedes
+ * it — a permanent over-count that no later push can correct. Local reports
+ * re-reconcile on every pass and are unaffected; this is only about what
+ * leaves the machine.
+ *
+ * Every input to that reconciliation is written DURING the session: rows as
+ * each request completes, the rollup at shutdown. So a session with no
+ * activity for a day cannot reconcile any further, and its first send is also
+ * its last word. A day is far longer than any session and absorbs clock skew,
+ * at the cost of copilot usage reaching a receiver up to a day late.
+ *
+ * This is a holdback, never a drop: the calls are simply not yet unsent-
+ * eligible, and the next push after the window picks them up.
+ *
+ * A day is deliberately conservative. The one measurement available says it
+ * could be far shorter: across 91 sessions on a real macOS store, ZERO rows
+ * landed after their session's shutdown - median delta -0.1s, maximum -0.0s,
+ * i.e. the store was already complete when shutdown was written. That is one
+ * machine and one CLI version (1.0.80), so this stays at a day until a second
+ * machine agrees; the number to beat is seconds, not hours.
+ *
+ * Two more machines have now agreed (#946 validation): 6 sessions on CLI
+ * 1.0.79-8 and 30 sessions on 1.0.80, closest row 55 ms BEFORE shutdown, p95
+ * -0.067 s. Three corpora, 127 sessions, zero positive deltas. That is enough
+ * evidence to tighten this to a seconds-scale window - deliberately NOT done
+ * here: shortening it changes what leaves the machine and how promptly, which
+ * is a product call for the maintainers, not a fix to a validated defect. The
+ * evidence is recorded so whoever makes that call does not have to re-gather
+ * it.
+ */
+export const RECONCILE_SETTLE_MS = 24 * 60 * 60 * 1000
+
+/** Providers whose SERVED calls can change value or role between passes. */
+const RECONCILING_PROVIDERS = new Set(['copilot'])
+
+/**
+ * A copilot session's input/cache can leave this machine in one of two shapes,
+ * and the receiver must never end up holding both.
+ *
+ *   rollup      `copilot:<sid>:shutdown:<model>:<n>`
+ *               one aggregate span per leg — what every pre-store version sent,
+ *               and what still serves for a session with no store rows.
+ *   reconciled  `copilot-store:<sid>:<rowId>:<hash>`  (one span per request)
+ *             + `copilot:<sid>:shutdown-residual:...` (the part rows don't cover)
+ *               the two together are exactly the rollup, re-expressed.
+ *
+ * They describe the SAME tokens. Locally, reconciliation picks one per
+ * (session, model) on every pass and the answer can flip. Remotely there is no
+ * flipping: the ledger is append-once and a usage span has no retraction, so
+ * whatever was sent first is there forever and anything sent after it ADDS.
+ *
+ * Both directions are reachable:
+ *   - Rollup first: every session synced before this release went out that
+ *     way. The first push after upgrade would send rows and residuals on top.
+ *   - Reconciled first: rows sync, then at the 90-day durable age-out the
+ *     cached rows are pruned, the rollup stops being dropped and serves again
+ *     under a key that was never sent. Past settle, it pushes on top.
+ *
+ * So: whichever shape a session was first synced in, it stays in, and the
+ * other is frozen for that session permanently. Growth WITHIN the sent shape
+ * is unaffected — a resumed session's new rows and residuals still push if the
+ * reconciled shape was sent, a new leg's rollup still pushes if the rollup
+ * shape was — because same-shape output is additive, never substitutive.
+ *
+ * `codeburn sync reset --confirm` clears the local ledger and re-pushes
+ * everything under the new breakdown, but only helps if the receiver's own
+ * copy is cleared too — otherwise it produces exactly the doubling this
+ * avoids.
+ */
+type CopilotShape = 'rollup' | 'reconciled'
+
+/** Which shape a key belongs to; null for anything reconciliation never rewrites. */
+function keyShape(key: string): CopilotShape | null {
+  if (key.startsWith('copilot-store:')) return 'reconciled'
+  if (!key.startsWith('copilot:')) return null
+  // Order matters: `:shutdown-residual:` is reconciled output, `:shutdown:` is
+  // the raw rollup it replaces. Everything else under `copilot:` is a per-turn
+  // call, which carries output the rollup never held and reconciliation never
+  // touches.
+  if (key.includes(':shutdown-residual:')) return 'reconciled'
+  if (key.includes(':shutdown:')) return 'rollup'
+  return null
+}
+
+/** Session id out of a copilot key, or null when the key has no session segment. */
+function keySessionId(key: string): string | null {
+  for (const prefix of ['copilot-store:', 'copilot:']) {
+    if (!key.startsWith(prefix)) continue
+    const rest = key.slice(prefix.length)
+    const end = rest.indexOf(':')
+    return end > 0 ? rest.slice(0, end) : null
+  }
+  return null
+}
+
+function syncedShapes(sentKeys: ReadonlySet<string>): Map<string, Set<CopilotShape>> {
+  const bySession = new Map<string, Set<CopilotShape>>()
+  for (const key of sentKeys) {
+    const shape = keyShape(key)
+    if (!shape) continue
+    const sid = keySessionId(key)
+    if (!sid) continue
+    const set = bySession.get(sid) ?? new Set<CopilotShape>()
+    set.add(shape)
+    bySession.set(sid, set)
+  }
+  return bySession
+}
+
+/**
+ * How far ahead of now a timestamp may sit and still count as evidence of when
+ * a session was active. Clock skew is absorbed in both directions; beyond it,
+ * a stamp is broken data rather than proof the session is live.
+ */
+const FUTURE_GRACE_MS = 60 * 60 * 1000
+
+/**
+ * Newest moment a session can be SHOWN to have been active, or null when
+ * nothing about it can be dated. Unparseable and implausibly-future stamps
+ * carry no information about recency and are ignored rather than treated as
+ * "recent" — otherwise one broken row would hold a year-old session forever,
+ * while the CLI promised a settlement that could never arrive.
+ */
+function newestDatableTs(timestamps: readonly string[], now: number): number | null {
+  let newest: number | null = null
+  for (const raw of timestamps) {
+    const ts = Date.parse(raw)
+    if (isNaN(ts) || ts > now + FUTURE_GRACE_MS) continue
+    if (newest === null || ts > newest) newest = ts
+  }
+  return newest
+}
+
 /** Flatten parsed projects into individual calls and filter out already-sent ones. */
-export function collectUnsentCalls(projects: ProjectSummary[]): {
+export function collectUnsentCalls(projects: ProjectSummary[], now: number = Date.now()): {
   allCalls: CallWithSession[]
   unsent: CallWithSession[]
+  /** Not yet sent because their session is still reconciling. Retried later. */
+  held: CallWithSession[]
+  /** Never sent: the receiver already holds this session in the other shape. */
+  frozen: CallWithSession[]
 } {
   const allCalls: CallWithSession[] = []
   for (const project of projects) {
@@ -40,15 +187,53 @@ export function collectUnsentCalls(projects: ProjectSummary[]): {
             call,
             sessionId: session.sessionId,
             project: project.project,
+            workingDirectory: session.workingDirectory,
           })
         }
       }
     }
   }
 
+  // A session settles as a whole: holding only the residual would still let a
+  // row that is about to change ITS value through, and holding only the rows
+  // would still ship a rollup that is about to be dropped. So the decision is
+  // taken once per session, from the newest moment it can be SHOWN active.
+  const settleCutoff = now - RECONCILE_SETTLE_MS
+  const stampsBySession = new Map<string, string[]>()
+  for (const c of allCalls) {
+    if (!RECONCILING_PROVIDERS.has(c.call.provider)) continue
+    const key = `${c.project}\u0000${c.sessionId}`
+    const list = stampsBySession.get(key) ?? []
+    list.push(c.call.timestamp)
+    stampsBySession.set(key, list)
+  }
+  const unsettled = new Set<string>()
+  for (const [key, stamps] of stampsBySession) {
+    const newest = newestDatableTs(stamps, now)
+    if (newest !== null && newest > settleCutoff) unsettled.add(key)
+  }
+
   const sent = ledgerKeySet()
-  const unsent = allCalls.filter(c => !sent.has(c.call.deduplicationKey))
-  return { allCalls, unsent }
+  const shapes = syncedShapes(sent)
+
+  // Only the reconciliation OUTPUT is frozen, and only into the shape the
+  // session was NOT first synced in. Per-turn calls (`copilot:<sid>:<msgId>`)
+  // belong to neither shape and always sync.
+  const isFrozen = (c: CallWithSession): boolean => {
+    if (!RECONCILING_PROVIDERS.has(c.call.provider)) return false
+    const shape = keyShape(c.call.deduplicationKey)
+    if (!shape) return false
+    const already = shapes.get(c.sessionId)
+    return already !== undefined && !already.has(shape)
+  }
+
+  const isHeld = (c: CallWithSession): boolean =>
+    RECONCILING_PROVIDERS.has(c.call.provider) && unsettled.has(`${c.project}\u0000${c.sessionId}`)
+
+  const pending = allCalls.filter(c => !sent.has(c.call.deduplicationKey))
+  const frozen = pending.filter(isFrozen)
+  const rest = pending.filter(c => !isFrozen(c))
+  return { allCalls, unsent: rest.filter(c => !isHeld(c)), held: rest.filter(isHeld), frozen }
 }
 
 export type PushOutcome = 'complete' | 'auth-rejected' | 'rate-limited' | 'server-error'

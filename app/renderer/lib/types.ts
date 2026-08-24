@@ -18,6 +18,11 @@ export type CliErrorKind = 'not-found' | 'nonzero' | 'bad-json' | 'timeout' | 't
 export interface CliError {
   kind: CliErrorKind
   message: string
+  /** Set by the main process when the failure happened while the cold cache
+   *  hydration was still running. Such a failure is a "not ready yet", not a
+   *  broken install, so the UI keeps its splash/progress state. Optional so an
+   *  older preload simply never sets it. */
+  cold?: true
 }
 
 export type AliasRow = { from: string; to: string }
@@ -30,7 +35,7 @@ export type QuotaWindow = {
 }
 
 export type QuotaProvider = {
-  provider: 'claude' | 'codex'
+  provider: 'claude' | 'codex' | 'gemini' | 'copilot' | 'antigravity'
   connection: 'connected' | 'disconnected' | 'accessDenied' | 'loading' | 'stale' | 'transientFailure' | 'terminalFailure'
   primary: QuotaWindow | null
   details: QuotaWindow[]
@@ -39,6 +44,8 @@ export type QuotaProvider = {
   /** True when the provider is in a 429 backoff window (upstream rate limit). */
   rateLimited?: boolean
 }
+
+export type ProviderName = QuotaProvider['provider']
 
 // ————— src/menubar-json.ts —————
 
@@ -120,8 +127,23 @@ export type ClaudeConfigSelector = {
   options: ClaudeConfigOption[]
 }
 
+export type HydrationState = {
+  complete: boolean
+  indexedFiles: number
+  totalFiles: number
+}
+
 export type MenubarPayload = {
   generated: string
+  // Optional: older CLIs omit it. Present and true only on a stale read-only
+  // serve; absent otherwise. Absence must always be read as "assume fresh."
+  stale?: boolean
+  // Optional: only the resident serve child emits it, and only it may answer
+  // partially (it polls, so it converges). `complete: false` means the totals
+  // cover the files indexed so far and a later poll returns more. Absence — an
+  // older CLI, or any one-shot spawn including the spawn fallback — must be
+  // read as complete.
+  hydration?: HydrationState
   current: {
     label: string
     cost: number
@@ -641,6 +663,8 @@ export type ScanProgressEvent =
   | { kind: 'providers'; providers: string[]; cold?: boolean }
   | { kind: 'provider'; provider: string; state: 'start' | 'done' | 'skipped'; files?: number }
   | { kind: 'tick'; provider: string; done: number; total: number }
+  /** Proof of life during a silent parse phase; carries nothing else. */
+  | { kind: 'keepalive' }
   | { kind: 'done' }
 
 /** Update-availability status from the main process (app/electron/updates.ts). */
@@ -658,7 +682,7 @@ export interface CodeburnBridge {
   getUpdateStatus(): Promise<UpdateStatus>
   /** Subscribe to pushed update-availability status; returns an unsubscribe fn. */
   onUpdateStatus(cb: (status: UpdateStatus) => void): () => void
-  getQuota(force?: boolean): Promise<QuotaProvider[]>
+  getQuota(force?: boolean, disabled?: ProviderName[]): Promise<QuotaProvider[]>
   // `background` (prefetch only) requests background CLI-spawn priority; optional
   // so an older preload that ignores it degrades to interactive priority.
   // `scope` selects local-device usage ('local', default) or paired-device

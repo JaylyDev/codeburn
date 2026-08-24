@@ -7,6 +7,7 @@ import { Chalk } from 'chalk'
 import { getClaudeConfigDirs } from './providers/claude.js'
 import { getAllProviders } from './providers/index.js'
 import type { Provider } from './providers/types.js'
+import { dailyCachePath, isTurnResidueOnly, type DailyEntry } from './daily-cache.js'
 import {
   PROVIDER_ENV_VARS,
   PROVIDER_PARSE_VERSIONS,
@@ -14,6 +15,7 @@ import {
   type SessionCache,
 } from './session-cache.js'
 import { renderTable } from './text-table.js'
+import { collectLauncherNotes, type LauncherNote } from './launcher-homes.js'
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -68,13 +70,35 @@ export type ClaudeRetentionNote = {
   settingsPath: string
 }
 
+export type DoctorSessionCacheIssue = {
+  provider: string
+  /// Session-cache file key (the source path, including any virtual suffix).
+  path: string
+  reason: 'failed' | 'no-turns'
+}
+
+export type DoctorCacheHealth = {
+  /// Daily-cache dates whose only content is turn-anchored residue — a day the
+  /// parse under-read (isTurnResidueOnly, issue #1127). ensureCacheHydrated
+  /// re-derives them on the next launch; they are listed here so the state is
+  /// visible without an archaeology dig.
+  residueOnlyDays: string[]
+  /// Session-cache entries flagged as parse failures or cached with zero
+  /// turns — the under-read entries residue days come from.
+  sessionCacheIssues: DoctorSessionCacheIssue[]
+}
+
 export type DoctorReport = {
   generatedAt: string
   providers: DoctorProviderReport[]
+  /** Nests that drive another billed store. Never given a session count. */
+  launchers?: LauncherNote[]
   /// Present when the Claude provider is in the report and a config dir was
   /// found. Surfaced because deleted transcripts are unrecoverable: daily
   /// totals survive in CodeBurn's cache, but per-session detail does not.
   claudeRetention?: ClaudeRetentionNote
+  /// Present only when there is something to list.
+  cacheHealth?: DoctorCacheHealth
 }
 
 export type CollectDoctorOptions = {
@@ -82,8 +106,12 @@ export type CollectDoctorOptions = {
   providers?: Provider[]
   /** Injectable cache snapshot (defaults to reading session-cache.json). */
   cache?: SessionCache
+  /** Injectable daily-cache days (defaults to reading the daily cache file). */
+  dailyCacheDays?: DailyEntry[]
   /** Max discovered sources to parse-sample per provider. */
   sampleLimit?: number
+  /** Injectable launcher notes (defaults to scanning the real home). */
+  launchers?: LauncherNote[]
 }
 
 // Bound the parse sample: at most this many discovered sources per provider,
@@ -330,9 +358,16 @@ export async function collectDoctorReport(
     providers.sort((a, b) => (a.displayName < b.displayName ? -1 : a.displayName > b.displayName ? 1 : 0))
 
     const report: DoctorReport = { generatedAt: new Date().toISOString(), providers }
+    const launchers = opts.launchers ?? collectLauncherNotes()
+    if (launchers.length > 0) report.launchers = launchers
     if (providers.some(p => p.provider === 'claude')) {
       const retention = await collectClaudeRetention()
       if (retention) report.claudeRetention = retention
+    }
+    const residueOnlyDays = collectResidueOnlyDays(opts.dailyCacheDays ?? await readDailyCacheDays())
+    const sessionCacheIssues = collectSessionCacheIssues(cache)
+    if (residueOnlyDays.length > 0 || sessionCacheIssues.length > 0) {
+      report.cacheHealth = { residueOnlyDays, sessionCacheIssues }
     }
     return report
   } finally {
@@ -346,6 +381,45 @@ const CLAUDE_DEFAULT_CLEANUP_DAYS = 30
 // Below this, long-horizon views depend entirely on CodeBurn's daily cache;
 // the doctor line turns into a warning.
 const CLAUDE_RETENTION_WARN_DAYS = 365
+
+/// Read-only peek at the daily cache's days: loadDailyCache can WRITE
+/// (adoption / migration), which doctor's read-only promise forbids, so the
+/// file is read and parsed directly. Anything unreadable or foreign simply
+/// yields no days — doctor must never crash on a corrupt cache.
+async function readDailyCacheDays(): Promise<DailyEntry[]> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(dailyCachePath(), 'utf-8'))
+    const days = (parsed as { days?: unknown } | null)?.days
+    if (!Array.isArray(days)) return []
+    return days.filter((d): d is DailyEntry => !!d && typeof d === 'object' && typeof (d as DailyEntry).date === 'string')
+  } catch {
+    return []
+  }
+}
+
+function collectResidueOnlyDays(days: DailyEntry[]): string[] {
+  const out: string[] = []
+  for (const d of days) {
+    try {
+      if (isTurnResidueOnly(d)) out.push(d.date)
+    } catch {
+      // Foreign junk in a hand-edited cache: skip the day, keep diagnosing.
+    }
+  }
+  return out.sort()
+}
+
+function collectSessionCacheIssues(cache: SessionCache): DoctorSessionCacheIssue[] {
+  const out: DoctorSessionCacheIssue[] = []
+  for (const [provider, section] of Object.entries(cache.providers)) {
+    for (const [path, f] of Object.entries(section.files)) {
+      // A failed entry carries no turns by construction; report it once, as failed.
+      if (f.failed) out.push({ provider, path, reason: 'failed' })
+      else if (Array.isArray(f.turns) && f.turns.length === 0) out.push({ provider, path, reason: 'no-turns' })
+    }
+  }
+  return out
+}
 
 async function collectClaudeRetention(): Promise<ClaudeRetentionNote | undefined> {
   for (const dir of await getClaudeConfigDirs()) {
@@ -442,6 +516,28 @@ export function renderDoctorTable(
       if (r.parseVersion) out.push('    ' + c.dim('parser: ') + r.parseVersion)
       if (r.cachedFailed > 0) out.push('    ' + c.dim('cached parse failures: ') + String(r.cachedFailed))
       if (r.error) out.push('    ' + c.red('error: ') + r.error)
+    }
+  }
+
+  if (report.launchers && report.launchers.length > 0) {
+    out.push('')
+    out.push(c.bold('Launchers'))
+    for (const launcher of report.launchers) {
+      out.push(`  ${launcher.name}  ${c.dim(launcher.path)}  ${launcher.verdict}`)
+    }
+  }
+
+  if (report.cacheHealth) {
+    out.push('')
+    out.push(c.bold('Cache health') + c.dim('  (issue #1127 diagnostics — under-read cache entries)'))
+    for (const date of report.cacheHealth.residueOnlyDays) {
+      out.push('  ' + c.yellow(date) + c.dim('  residue-only day (turn counts but no calls/cost); re-derived on next launch'))
+    }
+    for (const issue of report.cacheHealth.sessionCacheIssues) {
+      out.push(
+        '  ' + c.dim(`${issue.provider}  `) + issue.path +
+        c.dim(issue.reason === 'failed' ? '  (cached parse failure)' : '  (cached with 0 turns)'),
+      )
     }
   }
 

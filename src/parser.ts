@@ -2,8 +2,8 @@ import { existsSync } from 'fs'
 import { lstat, readFile, readdir, stat } from 'fs/promises'
 import { createHash } from 'crypto'
 import { basename, dirname, join, resolve, sep } from 'path'
-import { readSessionLines } from './fs-utils.js'
-import { calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
+import { FS_SCAN_CONCURRENCY, mapWithConcurrency, readSessionLines } from './fs-utils.js'
+import { billableOutputTokens, calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
 import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
 import { normalizeContentBlocks, flatSlice, flatString } from './content-utils.js'
 import { discoverAllSessions, getProvider } from './providers/index.js'
@@ -12,6 +12,11 @@ import { antigravityCascadeIdFromPath, flushAntigravityCache, shouldReparseAntig
 import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { isSqliteBusyError } from './sqlite.js'
 import { getCodeburnCacheDir } from './cache-dir.js'
+import {
+  isHermesLedgerPublicationError,
+  isHermesObservationKey,
+  seedHermesCursorsFromProviderSection,
+} from './hermes-session-ledger.js'
 import {
   type CachedCall,
   type CachedFile,
@@ -30,11 +35,13 @@ import {
   monthScopeForRange,
   reconcileFile,
   saveCache,
+  sourcePathStatCandidates,
 } from './session-cache.js'
-import { acquireCacheRefreshLock, type RefreshLockHandle } from './cache-refresh-lock.js'
+import { acquireCacheRefreshLock, type RefreshLockHandle, type RefreshLockOutcome } from './cache-refresh-lock.js'
 import { decideParseWorkers, parseFilesInOrder, ParseWorkerPool, type ClaudeWorkerParse, type ParseJob } from './parse-workers.js'
 import type { CodexFullParse } from './providers/codex.js'
 import { dateKey } from './day-aggregator.js'
+import { isBehavioralCall, isBehavioralTurn } from './behavioral-weight.js'
 import type { ParsedProviderCall, Provider, SessionSource } from './providers/types.js'
 import type {
   ApiUsageIteration,
@@ -54,6 +61,7 @@ import type {
 } from './types.js'
 import { classifyTurn, BASH_TOOLS, EDIT_TOOLS } from './classifier.js'
 import { extractBashCommands } from './bash-utils.js'
+import { isTrustedAbsoluteWorkingDirectory } from './path-privacy.js'
 
 function unsanitizePath(dirName: string): string {
   return dirName.replace(/-/g, '/')
@@ -1708,14 +1716,21 @@ function buildSessionSummary(
   for (const turn of turns) {
     const turnCost = turn.assistantCalls.reduce((s, c) => s + c.costUSD, 0)
     const turnSavings = turn.assistantCalls.reduce((s, c) => s + (c.savingsUSD ?? 0), 0)
+    // A turn whose calls are all supplementary accounting (copilot rollup /
+    // paired store rows) is not a behavioral exchange: its cost still lands in
+    // the category so breakdowns keep summing to the totals, but it adds no
+    // turn/edit/retry weight. Sessions normally never hold such turns (they
+    // are folded into behavioral turns upstream); this covers the
+    // accounting-only container of a session with no behavioral turns at all.
+    const behavioralTurn = isBehavioralTurn(turn)
 
     if (!categoryBreakdown[turn.category]) {
       categoryBreakdown[turn.category] = { turns: 0, costUSD: 0, savingsUSD: 0, retries: 0, editTurns: 0, oneShotTurns: 0 }
     }
-    categoryBreakdown[turn.category].turns++
+    if (behavioralTurn) categoryBreakdown[turn.category].turns++
     categoryBreakdown[turn.category].costUSD += turnCost
     categoryBreakdown[turn.category].savingsUSD += turnSavings
-    if (turn.hasEdits) {
+    if (behavioralTurn && turn.hasEdits) {
       categoryBreakdown[turn.category].editTurns++
       categoryBreakdown[turn.category].retries += turn.retries
       if (turn.retries === 0) categoryBreakdown[turn.category].oneShotTurns++
@@ -1726,10 +1741,10 @@ function buildSessionSummary(
       if (!skillBreakdown[skillKey]) {
         skillBreakdown[skillKey] = { turns: 0, costUSD: 0, savingsUSD: 0, editTurns: 0, oneShotTurns: 0 }
       }
-      skillBreakdown[skillKey].turns++
+      if (behavioralTurn) skillBreakdown[skillKey].turns++
       skillBreakdown[skillKey].costUSD += turnCost
       skillBreakdown[skillKey].savingsUSD += turnSavings
-      if (turn.hasEdits) {
+      if (behavioralTurn && turn.hasEdits) {
         skillBreakdown[skillKey].editTurns++
         if (turn.retries === 0) skillBreakdown[skillKey].oneShotTurns++
       }
@@ -1746,7 +1761,9 @@ function buildSessionSummary(
       totalReasoning += call.usage.reasoningTokens
       totalCacheRead += call.usage.cacheReadInputTokens
       totalCacheWrite += call.usage.cacheCreationInputTokens
-      apiCalls++
+      // Supplementary accounting calls contribute tokens/cost above but are
+      // not distinct requests: no api-call or per-model call weight.
+      if (isBehavioralCall(call)) apiCalls++
 
       const modelKey = call.provider === 'devin' ? call.model : getShortModelName(call.model)
       if (!modelBreakdown[modelKey]) {
@@ -1758,7 +1775,7 @@ function buildSessionSummary(
           tokens: { inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0 },
         }
       }
-      modelBreakdown[modelKey].calls++
+      if (isBehavioralCall(call)) modelBreakdown[modelKey].calls++
       modelBreakdown[modelKey].costUSD += call.costUSD
       modelBreakdown[modelKey].savingsUSD += callSavings
       modelBreakdown[modelKey].estimatedCostUSD = (modelBreakdown[modelKey].estimatedCostUSD ?? 0) + callEstimated
@@ -1769,7 +1786,7 @@ function buildSessionSummary(
       modelBreakdown[modelKey].tokens.reasoningTokens += call.usage.reasoningTokens
       if (call.activeDurationMs !== undefined) {
         modelBreakdown[modelKey].activeDurationMs = (modelBreakdown[modelKey].activeDurationMs ?? 0) + call.activeDurationMs
-        modelBreakdown[modelKey].activeGeneratedTokens = (modelBreakdown[modelKey].activeGeneratedTokens ?? 0) + (call.activeGeneratedTokens ?? call.usage.outputTokens + call.usage.reasoningTokens)
+        modelBreakdown[modelKey].activeGeneratedTokens = (modelBreakdown[modelKey].activeGeneratedTokens ?? 0) + (call.activeGeneratedTokens ?? billableOutputTokens(call.provider, call.usage.outputTokens, call.usage.reasoningTokens))
         modelBreakdown[modelKey].toolWaitMs = (modelBreakdown[modelKey].toolWaitMs ?? 0) + (call.toolWaitMs ?? 0)
       }
 
@@ -1912,13 +1929,17 @@ async function collectJsonlInto(dir: string, out: Set<string>): Promise<void> {
 }
 
 export async function collectJsonlFiles(dirPath: string): Promise<string[]> {
-  const files = await readdir(dirPath).catch(() => [])
-  const jsonlFiles = new Set(files.filter(f => f.endsWith('.jsonl')).map(f => join(dirPath, f)))
+  const files = await readdir(dirPath, { withFileTypes: true }).catch(() => [])
+  const jsonlFiles = new Set(files.filter(f => f.name.endsWith('.jsonl')).map(f => join(dirPath, f.name)))
 
   await collectJsonlInto(join(dirPath, 'subagents'), jsonlFiles)
   for (const entry of files) {
-    if (entry.endsWith('.jsonl')) continue
-    await collectJsonlInto(join(dirPath, entry, 'subagents'), jsonlFiles)
+    if (entry.name.endsWith('.jsonl')) continue
+    // A plain file can't hold a subagents/ dir, so don't spend a readdir
+    // finding out. Anything else (real dir, symlink, unknown type) still gets
+    // probed, matching what the untyped readdir used to do.
+    if (entry.isFile()) continue
+    await collectJsonlInto(join(dirPath, entry.name, 'subagents'), jsonlFiles)
   }
 
   return [...jsonlFiles]
@@ -1959,36 +1980,48 @@ async function scanProjectDirs(
 
   const discoverProgress = createScanProgress('scanning claude project dirs', dirs.length)
   let dirsDone = 0
-  for (const { path: dirPath, name: dirName, source } of dirs) {
+  // Walk and fingerprint concurrently, then reconcile serially in discovery
+  // order: the reconcile loop feeds order-sensitive state (changedFiles order
+  // drives the worker-result pairing, seenMsgIds pre-seeding), so only the
+  // syscalls are allowed to overlap.
+  const walked = await mapWithConcurrency(dirs, FS_SCAN_CONCURRENCY, async ({ path: dirPath }) => {
     const jsonlFiles = await collectJsonlFiles(dirPath)
-    for (const filePath of jsonlFiles) {
-      allDiscoveredFiles.add(filePath)
-      const fp = await fingerprintFile(filePath)
-      if (!fp) continue
-
-      const cached = section.files[filePath]
-      const action = reconcileFile(fp, cached)
-      if (cached && (readOnly || action.action === 'unchanged')) {
-        if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
-        unchangedFiles.push({ filePath, dirName, source, cached: section.files[filePath]! })
-      } else if (!readOnly) {
-        if (action.action === 'appended') {
-          changedFiles.push({
-            filePath,
-            info: { dirName, fp, source },
-            append: { cached: section.files[filePath]!, readFromOffset: action.readFromOffset },
-          })
-          continue
-        }
-        changedFiles.push({ filePath, info: { dirName, fp, source } })
-      } else {
-        // Read-only with no cache entry at all: this file is dropped from what
-        // we serve, so the snapshot under-reports whatever days it covers.
-        readOnlyServedStale = true
-      }
-    }
     dirsDone++
     await discoverProgress.tick(dirsDone)
+    return jsonlFiles
+  })
+  const discovered: Array<{ filePath: string; dirName: string; source?: SessionSourceMetadata }> = []
+  for (let i = 0; i < dirs.length; i++) {
+    const { name: dirName, source } = dirs[i]!
+    for (const filePath of walked[i]!) discovered.push({ filePath, dirName, source })
+  }
+  const fingerprints = await mapWithConcurrency(discovered, FS_SCAN_CONCURRENCY, e => fingerprintFile(e.filePath))
+  for (const [i, { filePath, dirName, source }] of discovered.entries()) {
+    allDiscoveredFiles.add(filePath)
+    const fp = fingerprints[i]
+    if (!fp) continue
+
+    const cached = section.files[filePath]
+    const action = reconcileFile(fp, cached)
+    if (cached && (readOnly || action.action === 'unchanged')) {
+      if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
+      unchangedFiles.push({ filePath, dirName, source, cached: section.files[filePath]! })
+    } else if (!readOnly) {
+      if (deferToBackgroundFill(filePath, fp, cached)) continue
+      if (action.action === 'appended') {
+        changedFiles.push({
+          filePath,
+          info: { dirName, fp, source },
+          append: { cached: section.files[filePath]!, readFromOffset: action.readFromOffset },
+        })
+        continue
+      }
+      changedFiles.push({ filePath, info: { dirName, fp, source } })
+    } else {
+      // Read-only with no cache entry at all: this file is dropped from what
+      // we serve, so the snapshot under-reports whatever days it covers.
+      readOnlyServedStale = true
+    }
   }
   discoverProgress.finish()
 
@@ -2050,12 +2083,13 @@ async function scanProjectDirs(
 
   const installClaudeFile = async (filePath: string, info: FileInfo, parsed: ClaudeFileParse): Promise<void> => {
     const cwd = parsed.workingDirectory
-    const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
+    const trustedCwd = cwd && !isCoworkSession(cwd, filePath) ? cwd : undefined
+    const canonical = trustedCwd ? await resolveCanonicalProjectPath(trustedCwd) : undefined
     section.files[filePath] = {
       fingerprint: info.fp,
       lastCompleteLineOffset: parsed.lastCompleteLineOffset,
       canonicalCwd: canonical?.path,
-      ...(cwd ? { workingDirectory: cwd } : {}),
+      ...(trustedCwd ? { workingDirectory: trustedCwd } : {}),
       canonicalProjectName: canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined,
       mcpInventory: parsed.mcpInventory,
       turns: parsed.turns,
@@ -2072,6 +2106,7 @@ async function scanProjectDirs(
 
   try {
     for (const { filePath, info, append } of changedFiles) {
+      filesParsedFromSource++
       // Marked here, not after the re-parse: an unreadable file `continue`s out
       // below, and the deletion would otherwise live only in memory.
       delete section.files[filePath]
@@ -2173,10 +2208,12 @@ async function scanProjectDirs(
             let canonicalCwd = cached.canonicalCwd
             let canonicalProjectName = cached.canonicalProjectName
             let workingDirectory = cached.workingDirectory
+            if (workingDirectory && isCoworkSession(workingDirectory, filePath)) workingDirectory = undefined
             if (canonicalCwd === undefined && newEntries) {
               const cwd = extractCanonicalCwd(newEntries)
-              workingDirectory = workingDirectory ?? cwd
-              const canonical = (cwd && !isCoworkSession(cwd, filePath)) ? await resolveCanonicalProjectPath(cwd) : undefined
+              const trustedCwd = cwd && !isCoworkSession(cwd, filePath) ? cwd : undefined
+              workingDirectory = workingDirectory ?? trustedCwd
+              const canonical = trustedCwd ? await resolveCanonicalProjectPath(trustedCwd) : undefined
               canonicalCwd = canonical?.path
               canonicalProjectName = canonical?.isWorktree ? projectNameFromPath(canonical.path, info.dirName) : undefined
             }
@@ -2340,7 +2377,9 @@ async function scanProjectDirs(
     const projectName = cachedFile.canonicalProjectName ?? dirName
     const mcpInv = cachedFile.mcpInventory.length > 0 ? cachedFile.mcpInventory : undefined
     const session = buildSessionSummary(sessionId, projectName, classifiedTurns, mcpInv, source)
-    if (cachedFile.workingDirectory) session.workingDirectory = cachedFile.workingDirectory
+    if (cachedFile.workingDirectory && !isCoworkSession(cachedFile.workingDirectory, filePath)) {
+      session.workingDirectory = cachedFile.workingDirectory
+    }
     session.agentType = cachedFile.agentType
     if (everHadBranch) session.everHadBranch = true
     const observedPrLinks = new Set(classifiedTurns.flatMap(turn => turn.prRefs ?? []))
@@ -2466,6 +2505,7 @@ function providerCallToTurn(call: ParsedProviderCall): ParsedTurn {
     bashCommands: call.bashCommands,
     deduplicationKey: call.deduplicationKey,
     isEstimated: call.costIsEstimated,
+    ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
   })
 
   const prRefs = extractPrUrlsFromText(call.userMessage)
@@ -2505,11 +2545,18 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
     deduplicationKey: call.deduplicationKey,
     project: call.project,
     projectPath: call.projectPath,
-    workingDirectory: call.workingDirectory,
+    ...(isTrustedAbsoluteWorkingDirectory(call.workingDirectory)
+      ? { workingDirectory: call.workingDirectory, workingDirectoryProvenance: 'provider-field' as const }
+      : {}),
     toolSequence: call.toolSequence,
     ...(call.locAdded ? { locAdded: call.locAdded } : {}),
     ...(call.locRemoved ? { locRemoved: call.locRemoved } : {}),
     ...(call.editFailed ? { editFailed: call.editFailed } : {}),
+    ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
+    ...(call.requestMultiplier != null ? { requestMultiplier: call.requestMultiplier } : {}),
+    ...(call.compactedAt ? { compactedAt: call.compactedAt } : {}),
+    ...(call.initiator ? { initiator: call.initiator } : {}),
+    ...(call.supplementaryAccounting ? { supplementaryAccounting: true } : {}),
     activeDurationMs: call.activeDurationMs,
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
@@ -2520,11 +2567,13 @@ async function canonicalizeProviderCallProject(call: ParsedProviderCall): Promis
   if (!call.projectPath) return call
 
   const canonical = await resolveCanonicalProjectPath(call.projectPath)
-  if (!canonical.isWorktree) return { ...call, workingDirectory: call.workingDirectory ?? call.projectPath }
+  // projectPath is also used for local grouping and can be a provider storage
+  // directory or derived label. Only a dedicated provider cwd is trusted for
+  // outbound project and attribution data.
+  if (!canonical.isWorktree) return call
 
   return {
     ...call,
-    workingDirectory: call.workingDirectory ?? call.projectPath,
     project: projectNameFromPath(canonical.path, call.project ?? canonical.path),
     projectPath: canonical.path,
   }
@@ -2549,6 +2598,7 @@ function apiCallToCachedCall(call: ParsedApiCall): CachedCall {
     ...(call.interrupted ? { interrupted: true } : {}),
     ...(call.userModified ? { userModified: true } : {}),
     ...(call.toolErrors ? { toolErrors: call.toolErrors } : {}),
+    ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
     activeDurationMs: call.activeDurationMs,
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
@@ -2630,9 +2680,11 @@ function providerCallsToCachedTurns(calls: ParsedProviderCall[]): CachedTurn[] {
 
 function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
   const u = call.usage
-  const outputForCost = call.provider === 'claude'
-    ? u.outputTokens
-    : u.outputTokens + u.reasoningTokens
+  // Cache-rehydration twin of the fresh-parse pricing in
+  // src/providers/codex.ts (and every other provider's parser): both go
+  // through billableOutputTokens so a cached read and a cold parse can never
+  // disagree about whether reasoning is already inside output (#1075).
+  const outputForCost = billableOutputTokens(call.provider, u.outputTokens, u.reasoningTokens)
   const costUSD = calculateCost(
     call.model, u.inputTokens, outputForCost,
     u.cacheCreationInputTokens, u.cacheReadInputTokens,
@@ -2667,6 +2719,10 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
     activeDurationMs: call.activeDurationMs,
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
+    ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
+    ...(call.supplementaryAccounting || isHermesObservationKey(call.deduplicationKey)
+      ? { supplementaryAccounting: true }
+      : {}),
   })
 }
 
@@ -2688,6 +2744,111 @@ function cachedTurnToClassified(turn: CachedTurn, resolvedBranch?: string): Clas
     ...(turn.spawnToolUseIds?.length ? { spawnToolUseIds: turn.spawnToolUseIds } : {}),
   }
   return classifyTurn(parsed)
+}
+
+// Copilot behavioral-weight assignment + turn folding, applied per session at
+// serve time just before summarization. A shutdown rollup (or its synthesized
+// residual) is aggregate accounting, never a request, so it is always
+// supplementary. A store row is one real request, but when the request's
+// per-turn call exists in the cache its row is supplementary too — only the
+// unpaired rows (store-only requests: a crash or pruned session-state lost
+// their per-turn calls) carry behavioral weight. Which rows are paired was
+// decided upstream over the FULL serve set (timestamp-adjacency matching in
+// parseProviderSources' reconciliation sweep) and arrives as a key set, so a
+// date-range slice that separates a row from its per-turn call cannot
+// double-count the request across adjacent day queries.
+// A turn made only of supplementary calls folds into the nearest behavioral
+// turn — but only within a 30-minute window (deliberately WIDER than the
+// 2-minute pairing window: folding only moves turn structure, and same-half-
+// hour cost stays on its own day), so a rollup stamped days after the last
+// activity keeps its own (weightless) turn and its cost stays on its own
+// day. A session with no behavioral turn at all keeps its supplementary
+// turns as-is — separate weightless containers, each on its own day.
+const FOLD_WINDOW_MS = 30 * 60 * 1000
+// Local calendar day of an epoch ms value, matching day-aggregator's local
+// bucketing (not UTC): the fold must not move a turn across the boundary the
+// daily rollup buckets on.
+function localDayKey(ms: number): string {
+  const d = new Date(ms)
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`
+}
+function foldCopilotSupplementaryTurns(
+  sessionId: string,
+  turns: ClassifiedTurn[],
+  supplementaryStoreKeys: ReadonlySet<string> | undefined,
+): ClassifiedTurn[] {
+  const shutdownPrefix = `copilot:${sessionId}:shutdown`
+  let hasSupplementary = false
+  for (const t of turns) {
+    for (const c of t.assistantCalls) {
+      if (
+        c.deduplicationKey.startsWith(shutdownPrefix) ||
+        (c.deduplicationKey.startsWith('copilot-store:') && supplementaryStoreKeys?.has(c.deduplicationKey))
+      ) {
+        c.supplementaryAccounting = true
+        hasSupplementary = true
+      }
+    }
+  }
+  if (!hasSupplementary) return turns
+  const anchored: ClassifiedTurn[] = []
+  const floating: ClassifiedTurn[] = []
+  for (const t of turns) {
+    ;(t.assistantCalls.some(c => !c.supplementaryAccounting) ? anchored : floating).push(t)
+  }
+  if (floating.length === 0) return turns
+  if (anchored.length === 0) {
+    // No behavioral turn to fold into (a rollup-only session, or a range
+    // slice that excluded every behavioral turn). The supplementary turns
+    // stay SEPARATE: merging them into one container would re-anchor later
+    // legs' turn-level cost onto the first leg's day. They carry zero
+    // turn/call weight either way.
+    return turns
+  }
+  // Nearest anchored turn by timestamp via one sorted pass + binary search —
+  // a long session can hold thousands of turns and this runs on every serve.
+  const anchorTs = anchored
+    .map(a => ({ ts: new Date(a.timestamp).getTime(), turn: a }))
+    .filter(a => !Number.isNaN(a.ts))
+    .sort((a, b) => a.ts - b.ts)
+  const kept: ClassifiedTurn[] = [...anchored]
+  for (const t of floating) {
+    const ts = new Date(t.timestamp).getTime()
+    let best: ClassifiedTurn | null = null
+    let bestDist = Infinity
+    let bestAnchorTs = NaN
+    if (anchorTs.length > 0 && !Number.isNaN(ts)) {
+      let lo = 0
+      let hi = anchorTs.length - 1
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1
+        if (anchorTs[mid]!.ts < ts) lo = mid + 1
+        else hi = mid
+      }
+      for (const idx of [lo - 1, lo]) {
+        const a = anchorTs[idx]
+        if (!a) continue
+        const d = Math.abs(a.ts - ts)
+        if (d < bestDist) {
+          bestDist = d
+          best = a.turn
+          bestAnchorTs = a.ts
+        }
+      }
+    }
+    // Never fold across a local-day boundary: turn-level judgments (category
+    // cost, edit/one-shot counts) are anchored to the TURN's day while
+    // call-level totals bucket per call, so folding a 00:05 rollup into a
+    // 23:55 turn would seal its cost under the earlier day's categories while
+    // the headline counted it on its own — the two would stop reconciling.
+    const sameDay = best !== null && localDayKey(bestAnchorTs) === localDayKey(ts)
+    if (best && bestDist <= FOLD_WINDOW_MS && sameDay) {
+      best.assistantCalls = [...best.assistantCalls, ...t.assistantCalls]
+    } else {
+      kept.push(t)
+    }
+  }
+  return kept
 }
 
 // ── Cache-Aware Parsing Helpers ────────────────────────────────────────
@@ -2808,14 +2969,40 @@ function getOrCreateProviderSection(cache: SessionCache, provider: string): Prov
   const section: ProviderSection = { envFingerprint: envFp, files: {} }
   // A fingerprint change (env override or parse-version bump) must re-parse
   // every present source, but for durable providers the cache is the ONLY
-  // remaining record of usage whose source rows were already pruned (OTel
-  // orphans). Discarding those with the section would permanently erase
-  // month-to-date history that cannot be re-derived, so carry forward exactly
-  // the entries whose source no longer exists; everything present on disk is
-  // dropped and re-parsed under the new fingerprint.
+  // remaining record of usage whose source rows were already pruned. Dropping
+  // an entry because its FILE still exists is not the same question: a
+  // still-present OTel/session-store DB routinely keeps its file while the CLI
+  // prunes rows out of it, so "path exists" was being read as "the source can
+  // re-derive this", and the bump silently deleted history nothing could
+  // rebuild (#946 review). Present or absent, the entry is carried forward;
+  // a present source additionally gets an impossible fingerprint parked on it
+  // so the new parse version re-reads it in full. The durable union merge
+  // appends only turns whose dedup keys are not already cached, so the re-read
+  // ADDS whatever the source still holds without duplicating or deleting what
+  // it has already lost.
+  //
+  // The contract this rests on: a parse-version bump must not RE-KEY calls the
+  // source can still re-derive. Same event, same deduplicationKey, or the
+  // union counts it twice. Changing a provider's key shape is therefore a
+  // cache-version (CACHE_VERSION) change, not a parse-version change.
+  //
+  // What the re-read is FOR, beyond appending new keys: the union replaces a
+  // cached call with the freshly-derived one wherever the key matches, so a
+  // bump that changes a call's metadata or day attribution (this PR's
+  // shutdown-timestamp fallback, capture-only fields like nanoAiu/compactedAt,
+  // the compaction row's output) lands on existing caches too. Only keys the
+  // re-read did NOT produce keep the old parser's fields, and those are
+  // precisely the ones the source can no longer re-derive — where stale
+  // accounting is the only alternative to nothing at all.
   if (existing && DURABLE_PROVIDER_NAMES.has(provider)) {
+    if (existing.durable) section.durable = true
     for (const [path, file] of Object.entries(existing.files)) {
-      if (!existsSync(path)) section.files[path] = file
+      if (!existsSync(path)) {
+        section.files[path] = file
+        continue
+      }
+      const { lastCompleteLineOffset: _resumeOffset, failed: _failed, ...rest } = file
+      section.files[path] = { ...rest, fingerprint: { dev: 0, ino: 0, mtimeMs: 0, sizeBytes: -1 } }
     }
   }
   cache.providers[provider] = section
@@ -2931,20 +3118,44 @@ export type ScanProgressEvent =
   | { kind: 'providers'; providers: string[]; cold?: boolean }
   | { kind: 'provider'; provider: string; state: 'start' | 'done' | 'skipped'; files?: number }
   | { kind: 'tick'; provider: string; done: number; total: number }
+  // Carries no information beyond "this parse is still alive". Consumers that
+  // do not know it must ignore it rather than fail (app/renderer Splash does).
+  | { kind: 'keepalive' }
 
 export function emitScanProgress(event: ScanProgressEvent): void {
   if (process.env['CODEBURN_PROGRESS'] !== '1') return
   try { process.stderr.write(`${PROGRESS_LINE_PREFIX}${JSON.stringify(event)}\n`) } catch { /* stderr closed */ }
 }
 
+// A cold parse has genuinely silent stretches: the inter-provider cache save at
+// the end of each provider measured 31.6s of total silence on a large corpus,
+// and the desktop app's no-output watchdog reads silence as a dead child. Beat
+// unconditionally while a parse is running, so silence means stopped, not slow.
+const PROGRESS_KEEPALIVE_MS = 10_000
+let keepaliveTimer: ReturnType<typeof setInterval> | null = null
+let keepaliveDepth = 0
+
+export function startProgressKeepalive(): void {
+  keepaliveDepth += 1
+  if (keepaliveTimer || process.env['CODEBURN_PROGRESS'] !== '1') return
+  keepaliveTimer = setInterval(() => emitScanProgress({ kind: 'keepalive' }), PROGRESS_KEEPALIVE_MS)
+  keepaliveTimer.unref?.()
+}
+
+export function stopProgressKeepalive(): void {
+  keepaliveDepth = Math.max(0, keepaliveDepth - 1)
+  if (keepaliveDepth > 0 || !keepaliveTimer) return
+  clearInterval(keepaliveTimer)
+  keepaliveTimer = null
+}
+
 // Files parsed between partial-progress saves during a cold parse. Low enough
 // that an interrupted long run loses little work, high enough that repeated
 // cache writes never dominate the parse.
 const PROGRESS_SAVE_FILE_INTERVAL = 2000
-// Only the claude scan reports per file; every other provider calls saveProgress
-// once, at its own boundary. Without a time floor the counter would never reach
-// the interval during a long non-claude phase and progress saves would simply
-// stop happening there.
+// Every parse phase now reports per file (claude via scanProjectDirs, the rest
+// via parseProviderSources), so this wall-clock floor bounds how much work a
+// mid-phase kill can lose even when the file counter moves slowly.
 const PROGRESS_SAVE_MAX_INTERVAL_MS = 30_000
 
 export function createScanProgress(label: string, total: number) {
@@ -3019,12 +3230,19 @@ function classifiedTurnSlicedToDays(turn: ClassifiedTurn, days: Set<string>): Cl
   return { ...turn, assistantCalls: inRangeCalls, timestamp: inRangeCalls[0]!.timestamp }
 }
 
-async function parseProviderSources(
+export async function parseProviderSources(
   providerName: string,
   sources: SessionSource[],
   seenKeys: Set<string>,
   diskCache: SessionCache,
   dateRange?: DateRange,
+  // Cold-run robustness: called after each source's cache entry lands (mirrors
+  // scanProjectDirs' onFileParsed) so a throttled caller can persist partial
+  // progress mid-provider. Without this a run killed during a large single-
+  // provider phase (e.g. a multi-GB codex corpus) restarted that whole phase
+  // from zero, even though Claude's phase already survived the same kill via
+  // scanProjectDirs.
+  onFileParsed?: () => Promise<void>,
   readOnly = false,
 ): Promise<ProjectSummary[]> {
   const provider = await getProvider(providerName)
@@ -3035,6 +3253,19 @@ async function parseProviderSources(
   const antigravityCacheDir = providerName === 'antigravity' ? getCodeburnCacheDir() : undefined
 
   const section = getOrCreateProviderSection(diskCache, providerName)
+  if (providerName === 'hermes' && !readOnly) {
+    try {
+      // Isolated migration: seed missing cursors from the already-loaded
+      // hermes section before any source is deleted in this parse loop.
+      await seedHermesCursorsFromProviderSection(section)
+    } catch (err) {
+      if (isHermesLedgerPublicationError(err)) {
+        deferredRetryableSource = true
+      } else {
+        throw err
+      }
+    }
+  }
   const allDiscoveredFiles = new Set<string>()
   const servedSources = [...sources]
 
@@ -3042,20 +3273,51 @@ async function parseProviderSources(
   const unchangedSources: Array<{ source: SessionSource; cached: CachedFile }> = []
   const changedSources: SourceInfo[] = []
 
-  for (const source of sources) {
+  // Same shape as scanProjectDirs: overlap the stat syscalls, then reconcile in
+  // discovery order. Network sources on a write run never reach fingerprintFile
+  // (they take the synthetic-fingerprint branch below), so they are skipped here.
+  const skipFingerprint = provider.network && !readOnly
+  const sourceFingerprints = skipFingerprint
+    ? []
+    : await mapWithConcurrency(sources, FS_SCAN_CONCURRENCY, s => fingerprintFile(s.path))
+
+  for (const [sourceIndex, source] of sources.entries()) {
     allDiscoveredFiles.add(source.path)
 
     // Network providers (e.g. Vercel AI Gateway) have no on-disk file — their data
     // comes from a live API fetch in createSessionParser. There's nothing to
     // fingerprint or incrementally cache, so re-fetch every run with a synthetic
     // fingerprint (mtime=now so the date-range filter below never excludes it).
-    if (provider.network && !readOnly) {
+    if (skipFingerprint) {
       changedSources.push({ source, fp: { dev: 0, ino: 0, mtimeMs: Date.now(), sizeBytes: 0 } })
       continue
     }
 
-    const fp = await fingerprintFile(source.path)
-    if (!fp) continue
+    const fp = sourceFingerprints[sourceIndex]
+    if (!fp) {
+      // A source that was discovered but cannot be fingerprinted is skipped —
+      // but skipping is only safe when the file is genuinely GONE (discovery
+      // raced a deletion; nothing to hydrate). An unreadable-but-present file
+      // (EACCES/EIO) may hold changes no parser ever got to defer on, so the
+      // pass must not report full hydration (round-6 finding: an unreadable
+      // store fingerprint silently bypassed the deferral fence). Network
+      // sources have no file to be unreadable — their synthetic paths always
+      // stat ENOENT — and never defer here. Virtual-suffix paths (cursor
+      // `#…`, opencode `:…`) must be classified against the same underlying
+      // paths the fingerprint read: the compound path itself always ENOENTs.
+      if (provider.network) continue
+      for (const candidate of sourcePathStatCandidates(source.path)) {
+        const code = await stat(candidate).then(
+          () => null,
+          (e: unknown) => (e as NodeJS.ErrnoException).code ?? 'UNKNOWN'
+        )
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+          deferredRetryableSource = true
+          break
+        }
+      }
+      continue
+    }
 
     const cached = section.files[source.path]
     const action = reconcileFile(fp, cached)
@@ -3066,6 +3328,7 @@ async function parseProviderSources(
       if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
       unchangedSources.push({ source, cached })
     } else if (!readOnly) {
+      if (deferToBackgroundFill(source.path, fp, cached)) continue
       changedSources.push({ source, fp })
     } else {
       // Read-only with no cache entry at all — see scanProjectDirs.
@@ -3084,6 +3347,21 @@ async function parseProviderSources(
       allDiscoveredFiles.add(path)
       unchangedSources.push({ source: servedSources[servedSources.length - 1]!, cached })
     }
+  }
+
+  // Read the durable record LAST. Copilot reconciles a session.shutdown rollup
+  // against the session-store rows written up to it, and the two live in
+  // different files: a session that shuts down mid-pass appends its rollup to
+  // events.jsonl AND its last row to the store, and whichever we read first is
+  // the one that can be short. Rows commit strictly before their leg's
+  // shutdown line, so reading the store after every journal makes our row set
+  // a superset of what any rollup we read can claim — the short direction (a
+  // rollup reconciled against rows that had not landed yet) becomes
+  // unreachable, and only the harmless direction is left: a row with no
+  // journal partner yet, which serves its own tokens and pairs on the next
+  // pass. Ordering costs nothing; the parse loop already runs in array order.
+  if (changedSources.some(c => c.source.retainWhilePresent)) {
+    changedSources.sort((a, b) => Number(a.source.retainWhilePresent ?? false) - Number(b.source.retainWhilePresent ?? false))
   }
 
   // Parser dedup: cross-provider keys + cached file keys.
@@ -3148,6 +3426,7 @@ async function parseProviderSources(
       if (dateRange) {
         if (fp.mtimeMs < dateRange.start.getTime()) continue
       }
+      filesParsedFromSource++
 
       // Clear stale entry before parse — but only once per path so that
       // multiple sources mapping to the same file path can merge their turns.
@@ -3199,25 +3478,50 @@ async function parseProviderSources(
         }
         const canonicalCalls = await Promise.all(providerCalls.map(canonicalizeProviderCallProject))
         const turns = providerCallsToCachedTurns(canonicalCalls)
+        const prLinks = [...new Set(canonicalCalls.flatMap(call => call.prLinks ?? []))]
 
         // Store/merge parsed turns into the cache.
         // Durable providers use a union-by-deduplicationKey merge: existing turns
-        // are NEVER deleted (preserves data for spans pruned from the DB), and
-        // only turns whose dedup keys are not already cached are appended.
+        // are NEVER deleted (preserves data for spans pruned from the DB). Keys
+        // the parse did not produce - rows the source has since pruned - are
+        // exactly what the cache is the last record of, so they stay untouched.
+        // A key the parse DID produce is re-derived from the live source in this
+        // very pass, so the fresh call replaces the cached one in place.
+        //
+        // That replacement is load-bearing, not tidiness. Fields a parse-version
+        // bump adds to a call whose key is stable (copilot `compactedAt` on the
+        // shutdown rollup, `initiator`/output on a store row) could otherwise
+        // never reach a cache written before the bump: append-only left the old
+        // field-set in place forever, and the reconciliation then ran on a
+        // migrated cache with an anchor the virgin cache had - dropping the
+        // post-compaction residual (#946 validation round 6, see (c6)).
         // Non-durable providers keep the original overwrite-or-append behaviour.
         if (provider.durableSources) {
           const existingEntry = section.files[source.path]
           if (existingEntry) {
+            const freshByKey = new Map(turns.flatMap(t => t.calls).map(c => [c.deduplicationKey, c]))
+            if (freshByKey.size > 0) {
+              existingEntry.turns = existingEntry.turns.map(t => {
+                const calls = t.calls.map(c => freshByKey.get(c.deduplicationKey) ?? c)
+                return calls.some((c, i) => c !== t.calls[i]) ? { ...t, calls } : t
+              })
+            }
             const existingKeys = new Set(
               existingEntry.turns.flatMap(t => t.calls.map(c => c.deduplicationKey))
             )
-            const newTurns = turns.filter(t =>
-              t.calls.every(c => !existingKeys.has(c.deduplicationKey))
-            )
+            // Call level, not turn level: a re-parse that returns a turn
+            // holding one already-cached call beside a genuinely new one is
+            // rare (durable providers emit one call per turn today) but
+            // dropping the whole turn on the first match would silently lose
+            // the new call, and nothing enforces the one-call assumption.
+            const newTurns = turns
+              .map(t => ({ ...t, calls: t.calls.filter(c => !existingKeys.has(c.deduplicationKey)) }))
+              .filter(t => t.calls.length > 0)
             existingEntry.turns = [...existingEntry.turns, ...newTurns]
             existingEntry.fingerprint = fp
+            if (prLinks.length) existingEntry.prLinks = [...new Set([...(existingEntry.prLinks ?? []), ...prLinks])]
           } else {
-            section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns }
+            section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns, ...(prLinks.length ? { prLinks } : {}) }
           }
         } else {
           // Non-durable: overwrite (clearedPaths already deleted stale entry above)
@@ -3227,14 +3531,21 @@ async function parseProviderSources(
           const existingCacheEntry = section.files[source.path]
           if (existingCacheEntry) {
             existingCacheEntry.turns = [...existingCacheEntry.turns, ...turns]
+            if (prLinks.length) existingCacheEntry.prLinks = [...new Set([...(existingCacheEntry.prLinks ?? []), ...prLinks])]
           } else {
-            section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns }
+            section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns, ...(prLinks.length ? { prLinks } : {}) }
           }
         }
         didParse = true
         markCacheDirty(diskCache, providerName, source.path)
       } catch (err) {
-        if (isSqliteBusyError(err)) {
+        if (isSqliteBusyError(err) || isHermesLedgerPublicationError(err)) {
+          // Deferred, not failed: the cache keeps serving this source's
+          // previous rows and the next refresh retries. But the data this
+          // read would have added is MISSING from this parse, so the run is a
+          // partial hydration — the daily backfill must not finalize history
+          // built on it (the same fence a stale read-only serve raises).
+          deferredRetryableSource = true
           warnProviderReadFailureOnce(providerName, err)
           continue
         }
@@ -3247,8 +3558,11 @@ async function parseProviderSources(
         section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns: [], failed: true }
         markCacheDirty(diskCache, providerName, source.path)
         warnProviderParseFailure(providerName, source.path, err)
-        continue
       }
+      // Outside the try/catch (matches scanProjectDirs' onFileParsed placement)
+      // so a throttled caller only ever observes this source's cache entry once
+      // it is fully installed above — success or recorded failure, never mid-write.
+      if (onFileParsed) await onFileParsed()
     }
   } finally {
     await pool?.close()
@@ -3259,6 +3573,45 @@ async function parseProviderSources(
     if (didParse && providerName === 'antigravity') {
       const liveIds = new Set(sources.map(s => antigravityCascadeIdFromPath(s.path)))
       await flushAntigravityCache(liveIds, antigravityCacheDir)
+    }
+  }
+
+  // The other half of "read the durable record last": a store served from
+  // cache is never re-read, so ordering cannot help it. If it was unchanged at
+  // classification but has moved by the time the journals are parsed, the rows
+  // we just reconciled a rollup against are stale by exactly the window the
+  // ordering closes for a changed store. That is a partial hydration, not a
+  // wrong number to seal — hold the daily watermark and let the next refresh,
+  // which will see the store as changed and re-read it, finalize the day.
+  // Deliberately not applied to a store we DID re-read: it was read after
+  // every journal, so a row landing afterwards belongs to a session whose
+  // shutdown line we cannot have seen yet.
+  if (!readOnly && !deferredRetryableSource) {
+    for (const { source } of unchangedSources) {
+      if (!source.retainWhilePresent) continue
+      const used = section.files[source.path]?.fingerprint
+      if (!used) continue
+      const now = await fingerprintFile(source.path)
+      if (!now) {
+        // Unreadable, not necessarily gone. The classification path already
+        // treats present-but-unfingerprintable as a deferral rather than a
+        // skip; do the same here, or a store that became unreadable mid-pass
+        // would be the one shape that seals silently. A genuinely deleted
+        // store has nothing left to reconcile against and stays a skip.
+        for (const candidate of sourcePathStatCandidates(source.path)) {
+          const code = await stat(candidate).then(
+            () => null,
+            (e: unknown) => (e as NodeJS.ErrnoException).code ?? 'UNKNOWN',
+          )
+          if (code !== 'ENOENT' && code !== 'ENOTDIR') { deferredRetryableSource = true; break }
+        }
+        if (deferredRetryableSource) break
+        continue
+      }
+      if (now.mtimeMs !== used.mtimeMs || now.sizeBytes !== used.sizeBytes || now.ino !== used.ino) {
+        deferredRetryableSource = true
+        break
+      }
     }
   }
 
@@ -3280,10 +3633,15 @@ async function parseProviderSources(
 
   // 90-day age-out for durable providers: prune only orphaned entries whose
   // newest call is older than 90 days. Still-discovered sources remain live
-  // regardless of age and keep their persisted fingerprint for reuse.
+  // regardless of age and keep their persisted fingerprint for reuse (#992).
+  // retainWhilePresent (copilot's session-store.db, the durable record itself)
+  // states the same intent explicitly for a still-discovered source; under the
+  // orphan-only rule it is currently redundant rather than load-bearing.
   if (!readOnly && provider.durableSources) {
+    const retainPaths = new Set(sources.filter(s => s.retainWhilePresent).map(s => s.path))
     const cutoffMs = Date.now() - 90 * 24 * 60 * 60 * 1000
     for (const [cachedPath, cachedFile] of Object.entries(section.files)) {
+      if (retainPaths.has(cachedPath)) continue
       const newestTs = cachedFile.turns
         .flatMap(t => t.calls)
         .map(c => new Date(c.timestamp).getTime())
@@ -3296,6 +3654,241 @@ async function parseProviderSources(
     }
   }
 
+  // Copilot rollup-vs-store reconciliation, enforced at SERVE time — the sole
+  // precedence mechanism. Parsers cache both representations of a session
+  // unconditionally (per-request store rows and the shutdown rollup); the
+  // serve set is the one coherent snapshot, so deciding here cannot be raced
+  // by writers between a probe and a parse, and heals any path into the cache.
+  // Per (session, model): when store rows exist, the rollup calls are dropped
+  // and replaced by the rows PLUS per-leg residual calls for any usage a
+  // rollup leg carried beyond the rows in ITS OWN interval — rows commit
+  // strictly before their leg's shutdown line, so a leg at time T covers
+  // exactly the rows in (previous leg's T, T], and rows outside that interval
+  // (a crash tail after the last clean shutdown, a later DB reset) can never
+  // cancel a different leg's missing usage. A store missing requests a leg
+  // covered therefore still serves that tail exactly once, on the leg's own
+  // day; a complete store serves pure per-request granularity with every
+  // residual at zero. The decision reads only cached contents, never
+  // discovery: an absent or deleted store changes nothing at serve, so a
+  // finalized daily history can never flip when the store file comes and
+  // goes. Cached rows of a deleted store stop influencing results only when
+  // the 90-day age-out removes them.
+  //
+  // The same sweep resolves two identity questions from the full cached data
+  // so that answers are invariant across date ranges and file churn:
+  // - Row↔per-turn pairing (behavioral weight): a store row and the per-turn
+  //   call of the same request carry no shared id, so rows pair with same-
+  //   model per-turn calls by timestamp adjacency (monotone two-pointer
+  //   matching, 2-minute window — the two are written moments apart). The
+  //   paired rows' dedup keys become supplementary; unpaired rows are
+  //   store-only requests and keep behavioral weight. Computed over the FULL
+  //   serve set, never a range slice, so adjacent day queries agree with the
+  //   lifetime answer.
+  // - Project identity: every call of a session serves under the session's
+  //   session-state-derived label when the serve set knows it, else the store
+  //   rows' own label — so neither a store row cached before events.jsonl
+  //   existed nor an events.jsonl orphaned after a prune can split the
+  //   session across two grouping keys.
+  type CopilotStamped = { ts: number; input: number; cacheRead: number; cacheWrite: number; reasoning: number; isCompaction?: boolean }
+  let copilotRecon: {
+    storeKeys: Set<string>
+    storeCalls: Map<string, CopilotStamped[]>
+    rollupLegs: Map<string, Array<CopilotStamped & { rawTs: string; compactedAtMs: number }>>
+    supplementaryStoreKeys: Set<string>
+    sessionProject: Map<string, string>
+    storeProject: Map<string, string>
+    nanRollupFallbackTs: Map<string, string>
+    sessionEarliestValidTs: Map<string, string>
+  } | null = null
+  if (providerName === 'copilot') {
+    // DEPENDS on the durable full-load exemption in session-cache.ts
+    // (DURABLE_PROVIDER_NAMES / meta.durable): pairing and residual
+    // retirement are range-invariant only because this sweep always sees the
+    // COMPLETE cached serve set, never a month-scoped subset. If copilot ever
+    // leaves the durable set or the exemption is relaxed, reconciliation
+    // becomes range-dependent and breaks silently.
+    const seenAggKeys = new Set<string>()
+    const storeKeys = new Set<string>()
+    const storeCalls = new Map<string, CopilotStamped[]>()
+    const rollupLegs = new Map<string, Array<CopilotStamped & { rawTs: string; compactedAtMs: number }>>()
+    const storeRowIds = new Map<string, Array<{ ts: number; dedupKey: string }>>()
+    const perTurnTs = new Map<string, number[]>()
+    const sessionProject = new Map<string, string>()
+    const storeProject = new Map<string, string>()
+    // Stable timestamp fallbacks for rollup calls whose own stamp cannot
+    // parse. Stability across serves is load-bearing: the daily union seals
+    // whatever day the call served under, so the fallback must never move as
+    // the session grows. The preceding valid timestamp in the SAME file is
+    // immutable (session files are append-only); the session's EARLIEST
+    // valid timestamp is the stable backstop (appends only add later ones).
+    // "Latest valid" would move on every resume and double the call across
+    // sealed days.
+    const nanRollupFallbackTs = new Map<string, string>()
+    const sessionEarliestValidTs = new Map<string, string>()
+    // Session-state per-turn calls carry no per-call project (the serve loop
+    // takes it from source.project), so resolve it the same way here — every
+    // call of the session must serve under the SAME label, whichever of the
+    // representations parsed first or survives on disk.
+    const sourceProjectByPath = new Map(sources.map(s => [s.path, s.project]))
+    for (const [cachedPath, cachedFile] of Object.entries(section.files)) {
+      let lastValidTsInFile = ''
+      for (const turn of cachedFile.turns) {
+        const shutdownPrefix = `copilot:${turn.sessionId}:shutdown:`
+        for (const c of turn.calls) {
+          if (seenAggKeys.has(c.deduplicationKey)) continue
+          seenAggKeys.add(c.deduplicationKey)
+          const ts = new Date(c.timestamp).getTime()
+          const isStore = c.deduplicationKey.startsWith('copilot-store:')
+          const isRollup = c.deduplicationKey.startsWith(shutdownPrefix)
+          const aggKey = `${turn.sessionId}\n${c.model}`
+          if (!Number.isNaN(ts)) {
+            lastValidTsInFile = c.timestamp
+            const prev = sessionEarliestValidTs.get(turn.sessionId)
+            if (!prev || c.timestamp < prev) sessionEarliestValidTs.set(turn.sessionId, c.timestamp)
+          } else if (isRollup && lastValidTsInFile) {
+            nanRollupFallbackTs.set(c.deduplicationKey, lastValidTsInFile)
+          }
+          if (!isStore && !isRollup) {
+            const project = c.project ?? sourceProjectByPath.get(cachedPath)
+            if (project && !sessionProject.has(turn.sessionId)) sessionProject.set(turn.sessionId, project)
+            if (!Number.isNaN(ts)) {
+              const list = perTurnTs.get(aggKey) ?? []
+              list.push(ts)
+              perTurnTs.set(aggKey, list)
+            }
+            continue
+          }
+          if (Number.isNaN(ts)) continue
+          const stamped: CopilotStamped = {
+            ts,
+            input: c.usage.inputTokens,
+            cacheRead: c.usage.cacheReadInputTokens,
+            cacheWrite: c.usage.cacheCreationInputTokens,
+            reasoning: c.usage.reasoningTokens,
+          }
+          if (isStore) {
+            storeKeys.add(aggKey)
+            const list = storeCalls.get(aggKey) ?? []
+            // The CLI's own context-summarization request. It has no
+            // assistant.message, so it must not compete for a per-turn partner
+            // in the pairing pass below, and its usage belongs to the
+            // compaction that reset the rollup rather than to the interval
+            // after it. Labelled only where the store carries `initiator`;
+            // where it does not, this row is indistinguishable from a user
+            // request and keeps the pre-label behaviour.
+            const isCompaction = c.initiator === 'compaction'
+            list.push(isCompaction ? { ...stamped, isCompaction: true } : stamped)
+            storeCalls.set(aggKey, list)
+            if (!isCompaction) {
+              const ids = storeRowIds.get(aggKey) ?? []
+              ids.push({ ts, dedupKey: c.deduplicationKey })
+              storeRowIds.set(aggKey, ids)
+            }
+            if (c.project && !storeProject.has(turn.sessionId)) storeProject.set(turn.sessionId, c.project)
+          } else {
+            const legs = rollupLegs.get(aggKey) ?? []
+            const compactedAtMs = c.compactedAt ? new Date(c.compactedAt).getTime() : NaN
+            legs.push({ ...stamped, rawTs: c.timestamp, compactedAtMs: Number.isNaN(compactedAtMs) ? -Infinity : compactedAtMs })
+            rollupLegs.set(aggKey, legs)
+          }
+        }
+      }
+    }
+    // Row↔per-turn pairing: monotone two-pointer matching over the sorted
+    // timestamp lists. Paired rows are the requests whose per-turn call is
+    // already served; the unpaired excess — the crash tail, or a whole
+    // store-only history — keeps its weight. The window is TIGHT (2 minutes):
+    // a request's row and its assistant.message are written at the same
+    // completion moment, seconds apart, while a crash-only row sits minutes
+    // to hours from any unrelated call — a wide window would let it pair
+    // against a neighbor whose own row is missing and hide the crash
+    // request's call weight. The residual ambiguity (a crash row landing
+    // within the window of an unrecorded-row request) is a double-failure
+    // conjunction and affects only call counts, never tokens.
+    const PAIR_WINDOW_MS = 2 * 60 * 1000
+    const supplementaryStoreKeys = new Set<string>()
+    for (const [aggKey, ids] of storeRowIds) {
+      const callTs = perTurnTs.get(aggKey)
+      if (!callTs?.length) continue
+      ids.sort((a, b) => a.ts - b.ts)
+      callTs.sort((a, b) => a - b)
+      let i = 0
+      let j = 0
+      while (i < ids.length && j < callTs.length) {
+        const d = ids[i]!.ts - callTs[j]!
+        if (Math.abs(d) <= PAIR_WINDOW_MS) {
+          supplementaryStoreKeys.add(ids[i]!.dedupKey)
+          i++
+          j++
+        } else if (d < 0) {
+          i++
+        } else {
+          j++
+        }
+      }
+    }
+    copilotRecon = { storeKeys, storeCalls, rollupLegs, supplementaryStoreKeys, sessionProject, storeProject, nanRollupFallbackTs, sessionEarliestValidTs }
+  }
+  const copilotServeProject = (sessionId: string): string | undefined =>
+    copilotRecon
+      ? copilotRecon.sessionProject.get(sessionId) ?? copilotRecon.storeProject.get(sessionId)
+      : undefined
+  const reconcileCopilotCalls = (turn: CachedTurn): CachedTurn | null => {
+    if (!copilotRecon) return turn
+    const shutdownPrefix = `copilot:${turn.sessionId}:shutdown:`
+    let changed = false
+    const kept: CachedCall[] = []
+    for (const c of turn.calls) {
+      if (c.deduplicationKey.startsWith(shutdownPrefix)) {
+        const tsValid = !Number.isNaN(new Date(c.timestamp).getTime())
+        if (tsValid && copilotRecon.storeKeys.has(`${turn.sessionId}\n${c.model}`)) {
+          // Store rows exist for this (session, model): the rollup is
+          // replaced by the rows plus the per-leg residuals synthesized at
+          // session assembly.
+          changed = true
+          continue
+        }
+        if (!tsValid) {
+          // A rollup whose timestamp cannot parse never entered the residual
+          // sweep, so dropping it would silently lose its usage — it serves
+          // instead (weightless supplementary). But served with the broken
+          // stamp it is invisible to every date-range filter (and poisons
+          // day keys), so it adopts a STABLE valid timestamp: the one
+          // preceding it in its own append-only file, else the session's
+          // earliest. Stability matters — a moving fallback (e.g. "latest")
+          // would relocate the call after a resume, doubling it across an
+          // already-sealed day and its new one. Only a session with no valid
+          // timestamp anywhere keeps the raw value.
+          const fallbackTs =
+            copilotRecon.nanRollupFallbackTs.get(c.deduplicationKey) ??
+            copilotRecon.sessionEarliestValidTs.get(turn.sessionId)
+          if (fallbackTs) {
+            kept.push({ ...c, timestamp: fallbackTs })
+            changed = true
+            continue
+          }
+        }
+        kept.push(c)
+        continue
+      }
+      if (c.deduplicationKey.startsWith('copilot-store:')) {
+        const project = copilotRecon.sessionProject.get(turn.sessionId)
+        if (project && c.project !== project) {
+          kept.push({ ...c, project })
+          changed = true
+          continue
+        }
+      }
+      kept.push(c)
+    }
+    if (!changed) return turn
+    if (kept.length === 0) return null
+    // Re-anchor a turn whose own stamp cannot parse to its first surviving
+    // call, mirroring turnSlicedToRange — day bucketing reads the turn stamp.
+    const turnTsValid = !Number.isNaN(new Date(turn.timestamp).getTime())
+    return { ...turn, calls: kept, ...(turnTsValid ? {} : { timestamp: kept[0]!.timestamp }) }
+  }
+
   // Query-time: derive SessionSummary from all cached turns.
   // Uses seenKeys (shared across providers) for cross-provider dedup.
   const sessionMap = new Map<string, { project: string; projectPath?: string; workingDirectory?: string; turns: ClassifiedTurn[]; prLinks?: Set<string>; title?: string }>()
@@ -3304,7 +3897,9 @@ async function parseProviderSources(
     const cachedFile = section.files[source.path]
     if (!cachedFile) continue
 
-    for (const turn of cachedFile.turns) {
+    for (const rawTurn of cachedFile.turns) {
+      const turn = reconcileCopilotCalls(rawTurn)
+      if (!turn) continue
       const hasDup = turn.calls.some(c => seenKeys.has(c.deduplicationKey))
       if (hasDup) continue
 
@@ -3326,8 +3921,15 @@ async function parseProviderSources(
       const classified = dateRange
         ? (classifiedTurnSlicedToRange(classifiedFull, dateRange) ?? classifiedFull)
         : classifiedFull
-      const project = slicedTurn.calls[0]?.project ?? source.project
+      const project = copilotServeProject(turn.sessionId) ?? slicedTurn.calls[0]?.project ?? source.project
       const key = `${providerName}:${turn.sessionId}:${project}`
+
+      // Old caches can contain workingDirectory synthesized from projectPath.
+      // Marker absence fails closed while preserving historical usage totals.
+      const trustedWorkingDirectory = slicedTurn.calls[0]?.workingDirectoryProvenance === 'provider-field'
+        && isTrustedAbsoluteWorkingDirectory(slicedTurn.calls[0].workingDirectory)
+        ? slicedTurn.calls[0].workingDirectory
+        : undefined
 
       const existing = sessionMap.get(key)
       if (existing) {
@@ -3335,7 +3937,7 @@ async function parseProviderSources(
         if (!existing.projectPath && slicedTurn.calls[0]?.projectPath) {
           existing.projectPath = slicedTurn.calls[0]!.projectPath
         }
-        if (!existing.workingDirectory && slicedTurn.calls[0]?.workingDirectory) existing.workingDirectory = slicedTurn.calls[0].workingDirectory
+        if (!existing.workingDirectory && trustedWorkingDirectory) existing.workingDirectory = trustedWorkingDirectory
         if (cachedFile.prLinks?.length) {
           const links = (existing.prLinks ??= new Set())
           for (const link of cachedFile.prLinks) links.add(link)
@@ -3345,7 +3947,7 @@ async function parseProviderSources(
         sessionMap.set(key, {
           project,
           projectPath: slicedTurn.calls[0]?.projectPath,
-          workingDirectory: slicedTurn.calls[0]?.workingDirectory,
+          workingDirectory: trustedWorkingDirectory,
           turns: [classified],
           ...(cachedFile.prLinks?.length ? { prLinks: new Set(cachedFile.prLinks) } : {}),
           ...(cachedFile.title ? { title: cachedFile.title } : {}),
@@ -3361,7 +3963,9 @@ async function parseProviderSources(
     for (const [cachedPath, cachedFile] of Object.entries(section.files)) {
       if (allDiscoveredFiles.has(cachedPath)) continue  // already counted above
 
-      for (const turn of cachedFile.turns) {
+      for (const rawTurn of cachedFile.turns) {
+        const turn = reconcileCopilotCalls(rawTurn)
+        if (!turn) continue
         const hasDup = turn.calls.some(c => seenKeys.has(c.deduplicationKey))
         if (hasDup) continue
 
@@ -3381,9 +3985,16 @@ async function parseProviderSources(
         const classified = dateRange
           ? (classifiedTurnSlicedToRange(classifiedFull, dateRange) ?? classifiedFull)
           : classifiedFull
-        const project = slicedTurn.calls[0]?.project ?? providerName
+        // Orphaned files lose their source.project; for copilot the recon
+        // maps restore the session's label so an events.jsonl pruned while
+        // its store rows live on cannot split the session (round-6 finding).
+        const project = copilotServeProject(turn.sessionId) ?? slicedTurn.calls[0]?.project ?? providerName
         const key = `${providerName}:${turn.sessionId}:${project}`
 
+        const trustedWorkingDirectory = slicedTurn.calls[0]?.workingDirectoryProvenance === 'provider-field'
+          && isTrustedAbsoluteWorkingDirectory(slicedTurn.calls[0].workingDirectory)
+          ? slicedTurn.calls[0].workingDirectory
+          : undefined
         const existingEntry = sessionMap.get(key)
         if (existingEntry) {
           existingEntry.turns.push(classified)
@@ -3391,17 +4002,152 @@ async function parseProviderSources(
             existingEntry.projectPath = slicedTurn.calls[0]!.projectPath
           }
         } else {
-          sessionMap.set(key, { project, projectPath: slicedTurn.calls[0]?.projectPath, workingDirectory: slicedTurn.calls[0]?.workingDirectory, turns: [classified] })
+          sessionMap.set(key, { project, projectPath: slicedTurn.calls[0]?.projectPath, workingDirectory: trustedWorkingDirectory, turns: [classified] })
         }
       }
+    }
+  }
+
+  // Copilot residuals: for every (session, model) where BOTH representations
+  // exist, each rollup LEG subtracts only the store rows in its own interval
+  // (previous leg's timestamp, its own timestamp] — rows commit strictly
+  // before their leg's shutdown line, so rows outside the interval (a crash
+  // tail, a later same-path reset) can never cancel a different leg's
+  // missing usage — and any remainder serves once as a supplementary call
+  // anchored at that leg's own timestamp, keeping the tail on the day the
+  // leg actually recorded it. Subject to the same inclusive date-range rule
+  // as the rollup it stands in for. Derived purely from cached contents, so
+  // it is identical across refresh and read-only serves and each leg's
+  // residual shrinks monotonically as later parses append the rows it stood
+  // in for.
+  if (copilotRecon) {
+    const residualsBySession = new Map<string, ParsedApiCall[]>()
+    for (const [aggKey, legs] of copilotRecon.rollupLegs) {
+      const rows = copilotRecon.storeCalls.get(aggKey)
+      if (!rows?.length) continue
+      const nl = aggKey.indexOf('\n')
+      const sessionId = aggKey.slice(0, nl)
+      const model = aggKey.slice(nl + 1)
+      legs.sort((a, b) => a.ts - b.ts)
+      // Legs sharing one timestamp have no interval between them — the
+      // strict (prev, ts] rule would hand all their rows to the first and
+      // mint a full-delta residual for the second, double-counting. Coalesce
+      // them into one leg so the shared instant subtracts its rows once.
+      const coalesced: Array<CopilotStamped & { rawTs: string; compactedAtMs: number }> = []
+      for (const leg of legs) {
+        const last = coalesced[coalesced.length - 1]
+        if (last && last.ts === leg.ts) {
+          last.input += leg.input
+          last.cacheRead += leg.cacheRead
+          last.cacheWrite += leg.cacheWrite
+          last.reasoning += leg.reasoning
+          last.compactedAtMs = Math.max(last.compactedAtMs, leg.compactedAtMs)
+        } else {
+          coalesced.push({ ...leg })
+        }
+      }
+      rows.sort((a, b) => a.ts - b.ts)
+      let rowIdx = 0
+      let prevLegTs = -Infinity
+      for (let legIdx = 0; legIdx < coalesced.length; legIdx++) {
+        const leg = coalesced[legIdx]!
+        const covered = { input: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 }
+        // An in-session compaction RESETS the CLI's rollup counters, so a leg
+        // containing one describes only its post-compaction requests. Starting
+        // its interval at the previous leg would subtract the whole
+        // pre-compaction conversation from a rollup that never counted it, and
+        // the residual would come out short by exactly that much — the
+        // undercount is invisible while the store is complete (the floor hides
+        // it) and permanent once a partial snapshot is sealed into a day.
+        // Anchor at the compaction instead: pre-compaction rows still SERVE,
+        // they just stop cancelling usage the rollup never claimed.
+        const intervalStart = Math.max(prevLegTs, leg.compactedAtMs)
+        while (rowIdx < rows.length && rows[rowIdx]!.ts <= leg.ts) {
+          const row = rows[rowIdx]!
+          // A labelled compaction row is the summarization request itself. It
+          // commits just BEFORE the compaction stamp, so the anchor would push
+          // it outside the interval while the post-reset rollup still counts
+          // it — serving it twice. The label lets it be subtracted exactly
+          // instead. Without the label (older stores, and many rows of newer
+          // ones) the row is invisible here and the documented one-request
+          // over-serve per compaction stands.
+          if (row.ts > intervalStart || (row.isCompaction && row.ts > prevLegTs)) {
+            covered.input += row.input
+            covered.cacheRead += row.cacheRead
+            covered.cacheWrite += row.cacheWrite
+            covered.reasoning += row.reasoning
+          }
+          rowIdx++
+        }
+        prevLegTs = leg.ts
+        const input = Math.max(0, leg.input - covered.input)
+        const cacheRead = Math.max(0, leg.cacheRead - covered.cacheRead)
+        const cacheWrite = Math.max(0, leg.cacheWrite - covered.cacheWrite)
+        const reasoning = Math.max(0, leg.reasoning - covered.reasoning)
+        if (input === 0 && cacheRead === 0 && cacheWrite === 0 && reasoning === 0) continue
+        if (dateRange) {
+          const ts = new Date(leg.rawTs)
+          if (Number.isNaN(ts.getTime()) || ts < dateRange.start || ts > dateRange.end) continue
+        }
+        const calls = residualsBySession.get(sessionId) ?? []
+        calls.push({
+          provider: 'copilot',
+          model,
+          usage: { inputTokens: input, outputTokens: 0, cacheCreationInputTokens: cacheWrite, cacheReadInputTokens: cacheRead, cachedInputTokens: 0, reasoningTokens: reasoning, webSearchRequests: 0 },
+          costUSD: calculateCost(model, input, 0, cacheWrite, cacheRead, 0),
+          tools: [], mcpTools: [], skills: [], subagentTypes: [],
+          hasAgentSpawn: false, hasPlanMode: false,
+          speed: 'standard', timestamp: leg.rawTs, bashCommands: [],
+          // Keyed by the leg's own INSTANT, never its position. A second
+          // journal file discovered later can contribute a leg that sorts
+          // BEFORE existing ones, which shifts every subsequent index — and an
+          // index that shifts renames a key the sync ledger has already sent,
+          // so the receiver takes the same residual twice under two names. The
+          // instant is immutable (session files are append-only) and unique
+          // per leg after the equal-timestamp coalescing above.
+          deduplicationKey: `copilot:${sessionId}:shutdown-residual:${model}:${leg.ts}`,
+          supplementaryAccounting: true,
+        })
+        residualsBySession.set(sessionId, calls)
+      }
+    }
+    for (const [sessionId, calls] of residualsBySession) {
+      const project = copilotServeProject(sessionId) ?? providerName
+      const mapKey = `${providerName}:${sessionId}:${project}`
+      // One turn PER LEG timestamp: a session's residuals can span days, and
+      // a single container turn anchored at the first leg would let the fold
+      // drag a later leg's category cost onto an earlier day's turn.
+      const byTs = new Map<string, ParsedApiCall[]>()
+      for (const call of calls) {
+        const list = byTs.get(call.timestamp) ?? []
+        list.push(call)
+        byTs.set(call.timestamp, list)
+      }
+      const existing = sessionMap.get(mapKey)
+      const target = existing ?? { project, turns: [] as ClassifiedTurn[] }
+      for (const [ts, tsCalls] of byTs) {
+        target.turns.push({
+          userMessage: '',
+          assistantCalls: tsCalls,
+          timestamp: ts,
+          sessionId,
+          category: 'general',
+          retries: 0,
+          hasEdits: false,
+        })
+      }
+      if (!existing) sessionMap.set(mapKey, target)
     }
   }
 
   const projectMap = new Map<string, { projectPath?: string; sessions: SessionSummary[] }>()
   for (const [key, { project, projectPath, workingDirectory, turns, prLinks, title }] of sessionMap) {
     const sessionId = key.split(':')[1] ?? key
-    const session = buildSessionSummary(sessionId, project, turns)
-    const explicitLinks = new Set(turns.flatMap(turn => turn.prRefs ?? []))
+    const assembledTurns = providerName === 'copilot'
+      ? foldCopilotSupplementaryTurns(sessionId, turns, copilotRecon?.supplementaryStoreKeys)
+      : turns
+    const session = buildSessionSummary(sessionId, project, assembledTurns)
+    const explicitLinks = new Set(assembledTurns.flatMap(turn => turn.prRefs ?? []))
     for (const link of prLinks ?? []) explicitLinks.add(link)
     if (explicitLinks.size) {
       session.prLinks = [...explicitLinks].sort()
@@ -3409,7 +4155,9 @@ async function parseProviderSources(
     }
     if (workingDirectory) session.workingDirectory = workingDirectory
     if (title) session.title = title
-    if (session.apiCalls > 0) {
+    // Supplementary-only sessions (e.g. a rollup with no per-turn calls) have
+    // apiCalls 0 by design but their tokens/cost are real and must serve.
+    if (session.apiCalls > 0 || session.totalCostUSD > 0 || session.totalInputTokens + session.totalOutputTokens + session.totalCacheReadTokens + session.totalCacheWriteTokens + session.totalReasoningTokens > 0) {
       const existing = projectMap.get(project)
       if (existing) {
         existing.sessions.push(session)
@@ -3437,6 +4185,7 @@ type SessionCacheEntry = {
   startMs?: number
   endMs?: number
   sig?: string
+  hydrationComplete?: boolean
 }
 const sessionCache = new Map<string, SessionCacheEntry>()
 
@@ -3482,9 +4231,13 @@ function burstReuse(dateRange: DateRange, sig: string): ProjectSummary[] | null 
     if (validation === 'dirty') continue
     const age = now - entry.createdAt
     const insideBurst = age <= windowMs
-    const validatedClean = validation === 'clean' && age <= VALIDATED_REUSE_CAP_MS
+    // Same rule as the exact-key arm: an incomplete (deferred) parse keeps
+    // only the short burst window — the validated extension must not delay
+    // its promised retry to the five-minute cap.
+    const validatedClean = validation === 'clean' && age <= VALIDATED_REUSE_CAP_MS && entry.hydrationComplete !== false
     if (!insideBurst && !validatedClean) continue
     if (endMs < entry.endMs || endMs - entry.endMs > Math.max(windowMs, validatedClean ? VALIDATED_REUSE_CAP_MS : 0)) continue
+    if (entry.hydrationComplete !== undefined) sessionHydrationComplete = entry.hydrationComplete
     return filterProjectsByDateRange(entry.data, dateRange)
   }
   return null
@@ -3502,12 +4255,21 @@ function cacheKey(dateRange: DateRange | undefined, providerFilter: string | und
   // Pricing-affecting config participates so a memoized parse (exact-key or
   // burst-reused in a resident serve process) can never present costs priced
   // under aliases/overrides/savings the user has since changed.
-  return `${s}:${providerFilter ?? 'all'}:${claudeRoots}:${getProxyPathsConfigHash()}:${getModelAliasesConfigHash()}:${getPriceOverridesConfigHash()}:${getLocalModelSavingsConfigHash()}`
+  // Flat-rate marks do not change parse-time cost (still $0 without a LiteLLM
+  // row); findUnpricedModels / coverage apply them at render time, so they
+  // stay out of this serve-memo key on purpose.
+  // A first-paint parse sees a deliberately smaller file set, so its result may
+  // not be served to (or burst-reused by) an unfloored request — including the
+  // background fill that follows it moments later. Absent outside the scope, so
+  // every non-cold-start key is byte-identical to what it was.
+  const floor = firstPaintFloorMs === null ? '' : `:paint${firstPaintFloorMs}`
+  return `${s}:${providerFilter ?? 'all'}:${claudeRoots}:${getProxyPathsConfigHash()}:${getModelAliasesConfigHash()}:${getPriceOverridesConfigHash()}:${getLocalModelSavingsConfigHash()}${floor}`
 }
 
 export function clearSessionCache(): void {
   sessionCache.clear()
   canonicalPathCache.clear()
+  singlePassScope?.parses.clear()
 }
 
 function cachePut(key: string, data: ProjectSummary[], parseStartedAt: number) {
@@ -3519,7 +4281,11 @@ function cachePut(key: string, data: ProjectSummary[], parseStartedAt: number) {
     const oldest = [...sessionCache.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0]
     if (oldest) sessionCache.delete(oldest[0])
   }
-  sessionCache.set(key, { data, createdAt: now, validatedFrom: parseStartedAt, ...(putMeta ?? {}) })
+  // The hydration verdict is a property OF this result: a memo/burst hit
+  // must restore the verdict its data was parsed under, or a stale partial
+  // parse could be served while a later, unrelated parse's `true` lets the
+  // daily backfill seal history around the gap (round-6 finding).
+  sessionCache.set(key, { data, createdAt: now, validatedFrom: parseStartedAt, hydrationComplete: sessionHydrationComplete, ...(putMeta ?? {}) })
   putMeta = null
 }
 
@@ -3790,14 +4556,24 @@ export function correlateCrossProviderPrSessions(projects: ProjectSummary[]): vo
   // mutating the child. This lets a Codex/Gemini/etc. review launched inside a
   // Claude subagent inherit the parent turn's PR while the subagent itself still
   // folds exactly once under the existing accounting model.
+  //
+  // Indexed once rather than re-filtered per child: the loop below only writes
+  // to `evidence`, so the unlinked set is fixed for its whole duration.
+  const unlinkedByAgentId = new Map<string | undefined, SessionSummary[]>()
+  for (const s of sessions) {
+    if (s.prLinks?.length) continue
+    const bucket = unlinkedByAgentId.get(s.agentId)
+    if (bucket) bucket.push(s)
+    else unlinkedByAgentId.set(s.agentId, [s])
+  }
   for (const resolved of resolveSubagentAttribution(projects).values()) {
     for (const child of resolved) {
       // A multi-PR spawn set is valid for folding the child's own cost, but is
       // too broad to identify which PR an independently saved nested review was
       // about. Require one PR for cross-provider propagation.
       if (child.unlinked || child.prSet?.length !== 1) continue
-      const matches = sessions.filter(s => !s.prLinks?.length && s.agentId === child.fold.agentId)
-      if (matches.length === 1) evidence.set(matches[0]!, child.prSet)
+      const matches = unlinkedByAgentId.get(child.fold.agentId)
+      if (matches?.length === 1) evidence.set(matches[0]!, child.prSet)
     }
   }
 
@@ -3827,6 +4603,21 @@ export function correlateCrossProviderPrSessions(projects: ProjectSummary[]): vo
   const PROMPT_PREFIX = 160
   const PROMPT_MIN = 80
   const LAUNCH_WINDOW_MS = 15 * 60 * 1000
+  // Sorted once so each candidate scans only the launches inside its own
+  // window instead of the whole array. Launch order is not observable: the
+  // match set is collapsed into a Map keyed by the sorted ref list, and
+  // assignCorrelatedPrs re-sorts what it is handed.
+  launches.sort((a, b) => a.atMs - b.atMs)
+  const firstLaunchAtOrAfter = (atMs: number): number => {
+    let lo = 0
+    let hi = launches.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (launches[mid]!.atMs < atMs) lo = mid + 1
+      else hi = mid
+    }
+    return lo
+  }
   for (const session of candidates) {
     const provider = summaryProvider(session)
     const prompt = session.turns
@@ -3836,12 +4627,14 @@ export function correlateCrossProviderPrSessions(projects: ProjectSummary[]): vo
     const prefix = prompt.slice(0, PROMPT_PREFIX)
     const startedMs = Date.parse(session.firstTimestamp)
     if (!Number.isFinite(startedMs)) continue
-    const matches = launches.filter(launch =>
-      launch.provider !== provider
-      && Math.abs(launch.atMs - startedMs) <= LAUNCH_WINDOW_MS
-      && launch.commands.some(command => command.includes(prefix))
-    )
-    const refSets = new Map(matches.map(m => [m.refs.slice().sort().join('\0'), m.refs]))
+    const refSets = new Map<string, string[]>()
+    for (let i = firstLaunchAtOrAfter(startedMs - LAUNCH_WINDOW_MS); i < launches.length; i++) {
+      const launch = launches[i]!
+      if (launch.atMs - startedMs > LAUNCH_WINDOW_MS) break
+      if (launch.provider === provider) continue
+      if (!launch.commands.some(command => command.includes(prefix))) continue
+      refSets.set(launch.refs.slice().sort().join('\0'), launch.refs)
+    }
     if (refSets.size === 1) {
       assignCorrelatedPrs(session, [...refSets.values()][0]!, 'launcher-prompt')
       if (session.prLinks?.length) evidence.set(session, session.prLinks)
@@ -3954,6 +4747,12 @@ export function isSessionHydrationComplete(): boolean {
   return sessionHydrationComplete
 }
 
+// Why the most recent parse was incomplete, when it was: true only when the
+// first-paint floor deferred files. Read by `sessionHydrationSnapshot` so the
+// serve payload can label a converging first paint without also claiming the
+// unrelated `stale` (read-only snapshot) condition.
+let sessionFirstPaintDeferred = false
+
 // Set by the read-only serving paths when the snapshot they served did NOT
 // match what is on disk: in read-only mode a changed file is served at its
 // stale fingerprint and a file with no cache entry is skipped entirely. A
@@ -4064,7 +4863,161 @@ export async function computeCorpusFingerprint(providerFilter?: string): Promise
   return { hash, newestMtimeMs }
 }
 
+// Set when a changed source's read was deferred on a retryable failure (e.g.
+// a SQLITE_BUSY store): the parse completed but did not hydrate that source's
+// new data, so the run must not report hydration complete even in write mode.
+let deferredRetryableSource = false
+
+// One command invocation that renders a dashboard asks for several ranges that
+// differ only in where they END — the scan range runs to end-of-day, the
+// durable headline re-anchors on its own `new Date()`. The exact-key memo needs
+// both endpoints equal, so it never hits and each ran the whole pipeline again.
+// Inside this scope the declared range is parsed ONCE per provider filter and a
+// request that is a pure NARROWING of it is served by slicing that result.
+// Anything else parses normally.
+//
+// Pure narrowing means: same start, an end that is inside, and the same month
+// shard scope. All three are load-bearing, because a parse's file set is a
+// function of its range, not just its output:
+//  - a CHANGED file with `mtimeMs < range.start` is skipped without being
+//    parsed, so an earlier start pulls in files a later start never reads;
+//  - `loadCache` reads only the shards `monthScopeForRange` selects, so a wider
+//    month span hands the query loop cached files a narrower span never sees;
+//  - either way those extra files seed `seenKeys` / `seenMsgIds` BEFORE the
+//    range slice runs, and a seeded key SUPPRESSES the matching in-range turn
+//    in a provider parsed later — usage the narrower parse would have counted.
+// Holding start and month scope equal makes both parses see an identical file
+// set in an identical order, which leaves the range slice as the only
+// difference — applied after the parse instead of during it, as burstReuse
+// already does for the mirror-image case (same start, LATER end).
+type SinglePassScope = { range: DateRange; parses: Map<string, Promise<ProjectSummary[]>> }
+let singlePassScope: SinglePassScope | null = null
+
+export async function withSinglePassParse<T>(range: DateRange, fn: () => Promise<T>): Promise<T> {
+  const outer = singlePassScope
+  singlePassScope = { range, parses: new Map() }
+  try {
+    return await fn()
+  } finally {
+    singlePassScope = outer
+  }
+}
+
+function singlePassParse(dateRange: DateRange | undefined, providerFilter: string | undefined): Promise<ProjectSummary[]> | null {
+  const scope = singlePassScope
+  if (!scope || !dateRange) return null
+  if (dateRange.start.getTime() !== scope.range.start.getTime()) return null
+  if (dateRange.end.getTime() > scope.range.end.getTime()) return null
+  const wide = monthScopeForRange(scope.range.start, scope.range.end)
+  const narrow = monthScopeForRange(dateRange.start, dateRange.end)
+  if (wide.fromMonth !== narrow.fromMonth || wide.toMonth !== narrow.toMonth) return null
+  const key = providerFilter ?? 'all'
+  let parsed = scope.parses.get(key)
+  if (!parsed) {
+    const codexCacheDir = getCodeburnCacheDir()
+    parsed = withCodexCacheDirectory(codexCacheDir, () => parseAllSessionsInCacheScope(scope.range, providerFilter))
+    scope.parses.set(key, parsed)
+  }
+  // The declared range itself is served verbatim, exactly as an unscoped run
+  // would have produced it; only a strictly narrower end pays for a slice.
+  if (dateRange.end.getTime() === scope.range.end.getTime()) return parsed
+  return parsed.then(projects => filterProjectsByDateRange(projects, dateRange))
+}
+
+// Progressive cold start (#1107). A session log is append-only, so its last
+// event timestamp is <= its mtime: a file whose mtime predates the start of the
+// range being displayed provably holds nothing that range can show. On a COLD
+// start that is what makes a fast first paint honest — the deferred files are
+// not dropped, only sequenced behind the paint, and the background fill parses
+// them into the same per-file cache a full cold parse would have written.
+//
+// The margin is pure paranoia about mtimes that lie: a restored backup, a
+// machine whose clock jumped, an rsync that preserved a wrong stamp. It only
+// widens the set that gets parsed BEFORE the paint, so it can never lose data.
+export const FIRST_PAINT_MTIME_MARGIN_MS = 48 * 60 * 60 * 1000
+
+let firstPaintFloorMs: number | null = null
+// Files this scope deferred, as a SET of paths: one first paint runs several
+// parses (the scan, the plan window, the durable backfill) and each defers the
+// same old files, so a running count would report a multiple of the real work.
+let firstPaintDeferredPaths: Set<string> | null = null
+// Same count, but reset per runParse: a run that deferred NOTHING did exactly
+// what an unfloored run would have done, so it is allowed to mark the cache
+// complete and report full hydration.
+let firstPaintDeferredThisRun = 0
+
+/** Files parsed from source (not served from cache) since the process started.
+ *  The background-fill indicator reads it to show live N/M progress. */
+let filesParsedFromSource = 0
+export function filesParsedFromSourceCount(): number {
+  return filesParsedFromSource
+}
+
+/** What the most recent parse left behind, for consumers that must present
+ *  partiality honestly (#1110). `deferredForFirstPaint` is what separates a
+ *  progressive cold start from the read-only stale case: both leave
+ *  `complete` false, but only the latter is `stale` — a first paint is fresh
+ *  data over a smaller file set, and it converges on its own.
+ *  `indexedFiles` counts files parsed from source since this process started
+ *  and `pendingFiles` the files the active first-paint scope deferred; both are
+ *  progress numbers and only meaningful while `complete` is false. */
+export function sessionHydrationSnapshot(): {
+  complete: boolean
+  deferredForFirstPaint: boolean
+  indexedFiles: number
+  pendingFiles: number
+} {
+  return {
+    complete: sessionHydrationComplete,
+    deferredForFirstPaint: sessionFirstPaintDeferred,
+    indexedFiles: filesParsedFromSource,
+    pendingFiles: firstPaintDeferredPaths?.size ?? 0,
+  }
+}
+
+/** Restrict every parse inside `fn` to files that can hold in-range data for a
+ *  view starting at `rangeStart`, and report how many files were deferred.
+ *  Cold-start first paint only: the caller MUST follow up with an unscoped
+ *  parse (the background fill) before the run can be treated as hydrated. */
+export async function withColdFirstPaintFloor<T>(
+  rangeStart: Date,
+  fn: () => Promise<T>,
+): Promise<{ result: T; deferredFiles: number }> {
+  const outer = firstPaintFloorMs
+  const outerPaths = firstPaintDeferredPaths
+  firstPaintFloorMs = rangeStart.getTime() - FIRST_PAINT_MTIME_MARGIN_MS
+  firstPaintDeferredPaths = new Set()
+  try {
+    const result = await fn()
+    return { result, deferredFiles: firstPaintDeferredPaths.size }
+  } finally {
+    firstPaintFloorMs = outer
+    firstPaintDeferredPaths = outerPaths
+  }
+}
+
+/** True when this file's whole-file parse can be deferred to the background
+ *  fill. A file with a cache entry is never deferred: it has something to serve
+ *  and re-reading it is incremental, so deferring would only make the served
+ *  snapshot staler for no saving. */
+export function shouldDeferToBackgroundFill(
+  fp: { mtimeMs: number },
+  cached: unknown,
+  floorMs: number | null,
+): boolean {
+  return floorMs !== null && cached === undefined && fp.mtimeMs < floorMs
+}
+
+function deferToBackgroundFill(path: string, fp: { mtimeMs: number }, cached: unknown): boolean {
+  if (!shouldDeferToBackgroundFill(fp, cached, firstPaintFloorMs)) return false
+  firstPaintDeferredPaths?.add(path)
+  firstPaintDeferredThisRun++
+  return true
+}
+
 export function parseAllSessions(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
+  const scoped = singlePassParse(dateRange, providerFilter)
+  if (scoped) return scoped
   // Capture synchronously, before the first await. AsyncLocalStorage keeps all
   // Codex cache reads, dirty writes, and the final flush on this call-time
   // directory even if an embedding host changes the process env mid-parse.
@@ -4085,8 +5038,18 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
     const validation = parseReuseValidator?.(cached.validatedFrom) ?? 'unknown'
     if (
       validation !== 'dirty'
-      && (age < CACHE_TTL_MS || (validation === 'clean' && age <= VALIDATED_REUSE_CAP_MS))
-    ) return cached.data
+      // The validated-clean extension serves entries the watcher can vouch
+      // for — but an INCOMPLETE parse (a deferred source) promised a retry on
+      // the next refresh, so it rides only the short TTL before re-parsing.
+      && (age < CACHE_TTL_MS
+        || (validation === 'clean' && age <= VALIDATED_REUSE_CAP_MS && cached.hydrationComplete !== false))
+    ) {
+      // The hydration verdict travels with the entry (round-6 finding); both
+      // reuse regimes — the 180s TTL and the validated-clean extension — must
+      // restore the verdict this data was parsed under before serving it.
+      if (cached.hydrationComplete !== undefined) sessionHydrationComplete = cached.hydrationComplete
+      return cached.data
+    }
   }
   // The signature is the key minus the range: what must match for a burst
   // reuse (provider, config env, proxy hash) regardless of the now-anchor.
@@ -4133,7 +5096,18 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
   // Keep the snapshot loaded before acquisition: timeout/unavailable paths serve
   // exactly this complete snapshot and never mutate or invalidate the holder.
   const priorSnapshot = diskCache
-  const refresh = await acquireCacheRefreshLock()
+  // Heartbeat the WAIT too, not just the parse behind it. This is the one place
+  // a healthy process is deliberately idle for a long stretch, and the desktop
+  // and menubar watchdogs read silence as a dead child - which is how a waiter
+  // blocked on an abandoned lock got killed at 45s and minted the next stale
+  // lock (#1117). runParse arms its own keepalive; this covers the gap before it.
+  startProgressKeepalive()
+  let refresh: RefreshLockOutcome
+  try {
+    refresh = await acquireCacheRefreshLock()
+  } finally {
+    stopProgressKeepalive()
+  }
   if (refresh.outcome === 'timed-out' || refresh.outcome === 'unavailable') {
     return runParse(key, priorSnapshot, dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   }
@@ -4165,7 +5139,24 @@ type RunParseOptions = {
   parseStartedAt: number
 }
 
+/** Thin wrapper so every runParse call site heartbeats for its whole duration,
+ *  including the paths that throw. See {@link startProgressKeepalive}. */
 async function runParse(
+  key: string,
+  diskCache: SessionCache,
+  dateRange: DateRange | undefined,
+  providerFilter: string | undefined,
+  options: RunParseOptions,
+): Promise<ProjectSummary[]> {
+  startProgressKeepalive()
+  try {
+    return await runParseInner(key, diskCache, dateRange, providerFilter, options)
+  } finally {
+    stopProgressKeepalive()
+  }
+}
+
+async function runParseInner(
   key: string,
   diskCache: SessionCache,
   dateRange: DateRange | undefined,
@@ -4174,6 +5165,8 @@ async function runParse(
 ): Promise<ProjectSummary[]> {
   const { isCold = false, readOnly = false, refreshLock } = options
   readOnlyServedStale = false
+  deferredRetryableSource = false
+  firstPaintDeferredThisRun = 0
   const seenMsgIds = new Set<string>()
   const seenKeys = new Set<string>()
   const allSources = await discoverAllSessions(providerFilter)
@@ -4246,7 +5239,7 @@ async function runParse(
   for (const [providerName, sources] of providerGroups) {
     emitScanProgress({ kind: 'provider', provider: providerName, state: 'start' })
     try {
-      const projects = await parseProviderSources(providerName, sources, seenKeys, diskCache, dateRange, readOnly)
+      const projects = await parseProviderSources(providerName, sources, seenKeys, diskCache, dateRange, saveProgress, readOnly)
       emitScanProgress({ kind: 'provider', provider: providerName, state: 'done', files: sources.length })
       otherProjects.push(...projects)
     } catch (err) {
@@ -4275,7 +5268,7 @@ async function runParse(
     // constant — both checks are O(1) and avoid a getProvider() dynamic-import
     // round-trip for every unprocessed provider in the disk cache.
     if (!section.durable && !DURABLE_PROVIDER_NAMES.has(providerName)) continue
-    const projects = await parseProviderSources(providerName, [], seenKeys, diskCache, dateRange, readOnly)
+    const projects = await parseProviderSources(providerName, [], seenKeys, diskCache, dateRange, saveProgress, readOnly)
     otherProjects.push(...projects)
   }
 
@@ -4285,9 +5278,15 @@ async function runParse(
   // on every launch, and the completeness marker the daily backfill + splash rely
   // on is durable. A run killed before here never reaches this, so its throttled
   // partial saves keep `complete: false` and the next launch resumes cold.
+  // A first-paint run that deferred files never saw the whole corpus, so it may
+  // not stamp the cache complete — the next launch (or this run's own
+  // background fill) has to come back cold and finish the job. A floored run
+  // that deferred NOTHING parsed exactly what an unfloored run would have, so
+  // it keeps the normal stamp.
+  const deferredForFirstPaint = firstPaintDeferredThisRun > 0
   const wasComplete = isCacheComplete(diskCache)
-  if (!readOnly && !wasComplete) diskCache.complete = true
-  if (!readOnly && (isCacheDirty(diskCache) || !wasComplete)) {
+  if (!readOnly && !wasComplete && !deferredForFirstPaint) diskCache.complete = true
+  if (!readOnly && (isCacheDirty(diskCache) || (!wasComplete && !deferredForFirstPaint))) {
     try {
       const published = await saveCache(diskCache, refreshLock?.verifyStillOwner)
       if (!published) throw new RefreshFenceLostError()
@@ -4297,9 +5296,11 @@ async function runParse(
     }
   }
   // Assigned, not forced true: a read-only run that had to skip or stale real
-  // files reached the end of the scan without hydrating everything, and the
-  // daily backfill must not finalize history off it.
-  sessionHydrationComplete = !readOnly || !readOnlyServedStale
+  // files, or a write run that deferred a changed source on a retryable
+  // failure, reached the end of the scan without hydrating everything, and
+  // the daily backfill must not finalize history off it.
+  sessionHydrationComplete = (!readOnly || !readOnlyServedStale) && !deferredRetryableSource && !deferredForFirstPaint
+  sessionFirstPaintDeferred = deferredForFirstPaint
 
   // Merge across providers by normalised project path so the same repository
   // is not double-counted when it was worked on with more than one tool

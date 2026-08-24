@@ -347,4 +347,87 @@ describe('codeburn serve --stdio', () => {
 
     expect(naturalExit).toBe(true)
   }, 10_000)
+
+  it('answers an in-flight request in full when stdin closes on the same tick', async () => {
+    // The transport closing does not cancel work already accepted. Returning
+    // before the queue drains loses the response frame outright, and because
+    // runCaptured() monkeypatches process.exit into a thrown ExitSignal it also
+    // turns the clean exit into a failure.
+    const raceChild = spawn(process.execPath, ['--import', 'tsx', join(__dirname, '..', 'src', 'cli.ts'), 'serve', '--stdio'], {
+      stdio: ['pipe', 'pipe', 'ignore'],
+      env: { ...process.env },
+    })
+    let stdout = ''
+    const lines = (): Array<Record<string, unknown>> => stdout.split('\n')
+      .map(line => { try { return JSON.parse(line) as Record<string, unknown> } catch { return null } })
+      .filter((v): v is Record<string, unknown> => v !== null)
+
+    const becameReady = new Promise<void>((resolve, reject) => {
+      raceChild.once('error', reject)
+      raceChild.stdout!.setEncoding('utf8')
+      raceChild.stdout!.on('data', (chunk: string) => {
+        stdout += chunk
+        if (lines().some(msg => msg['ready'] === true)) resolve()
+      })
+      raceChild.once('exit', (code, signal) => reject(new Error(`serve exited before ready: ${code ?? signal}`)))
+    })
+    const exited = new Promise<number | null>(resolve => raceChild.once('exit', code => resolve(code)))
+
+    await becameReady
+    // Request and EOF in the same tick: the request is accepted, then the
+    // transport is gone before it can possibly have finished.
+    raceChild.stdin!.write(JSON.stringify({ id: 77, args: ['status', '--format', 'json'] }) + '\n')
+    raceChild.stdin!.end()
+
+    const code = await Promise.race([
+      exited,
+      new Promise<'hung'>(resolve => setTimeout(() => resolve('hung'), 15_000)),
+    ])
+    if (code === 'hung') { raceChild.kill('SIGKILL'); await exited }
+
+    expect(code).toBe(0)
+    const answer = lines().find(msg => msg['id'] === 77)
+    expect(answer).toBeDefined()
+    expect(answer!['ok']).toBe(true)
+    expect(typeof answer!['output']).toBe('string')
+    expect(() => JSON.parse(answer!['output'] as string)).not.toThrow()
+  }, 25_000)
+
+  it('gives up on an async-wedged request at the drain bound instead of lingering', async () => {
+    // The drain must not become the orphan it was added to prevent. A request
+    // that never settles releases the child at the bound (shortened here from
+    // its 45s default, which no legitimate request comes near).
+    const drainMs = 1_500
+    const wedgeChild = spawn(process.execPath, ['--import', 'tsx', join(__dirname, 'fixtures', 'serve-wedged-request.ts')], {
+      stdio: ['pipe', 'pipe', 'ignore'],
+      env: { ...process.env, CODEBURN_SERVE_DRAIN_MS: String(drainMs) },
+    })
+    let stdout = ''
+    const becameReady = new Promise<void>((resolve, reject) => {
+      wedgeChild.once('error', reject)
+      wedgeChild.stdout!.setEncoding('utf8')
+      wedgeChild.stdout!.on('data', (chunk: string) => {
+        stdout += chunk
+        if (stdout.includes('"ready"')) resolve()
+      })
+      wedgeChild.once('exit', () => reject(new Error('serve exited before ready')))
+    })
+    const exited = new Promise<number | null>(resolve => wedgeChild.once('exit', code => resolve(code)))
+
+    await becameReady
+    wedgeChild.stdin!.write(JSON.stringify({ id: 91, args: ['status', '--format', 'json'] }) + '\n')
+    wedgeChild.stdin!.end()
+
+    const began = Date.now()
+    const outcome = await Promise.race([
+      exited.then(() => 'exited' as const),
+      new Promise<'hung'>(resolve => setTimeout(() => resolve('hung'), drainMs + 12_000)),
+    ])
+    const elapsed = Date.now() - began
+    if (outcome === 'hung') { wedgeChild.kill('SIGKILL'); await exited }
+
+    expect(outcome).toBe('exited')
+    // It waited for the request (not an instant return) but did not wait forever.
+    expect(elapsed).toBeGreaterThanOrEqual(drainMs - 250)
+  }, 30_000)
 })

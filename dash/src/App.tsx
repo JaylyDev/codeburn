@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 
 import {
@@ -75,6 +75,20 @@ function Stat({ label: lbl, value }: { label: string; value: string }) {
 
 // One device's full dashboard. Remote devices arrive sanitized, so their
 // project and session detail is intentionally absent.
+/** Honest partiality: a payload from a producer that answers a cold start from
+ *  the files the period needs and indexes the rest behind it says so with
+ *  `hydration.complete: false`. Absent (every one-shot CLI output, and any
+ *  older CLI) means a full parse, so nothing is shown. */
+function IndexingNotice({ payload }: { payload?: Payload }) {
+  const hydration = payload?.hydration
+  if (!hydration || hydration.complete) return null
+  return (
+    <div role="status" className="mb-3 border-l-2 border-primary px-2.5 py-1 text-[12px] text-muted-foreground">
+      Indexing history · {Math.min(hydration.indexedFiles, hydration.totalFiles)}/{hydration.totalFiles} files · totals below cover what is indexed so far
+    </div>
+  )
+}
+
 function DeviceView({ payload, isRemote, unit }: { payload?: Payload; isRemote: boolean; unit: Unit }) {
   const c = payload?.current
   // Cache cards read the period-scoped `current` totals, matching Cost/Calls/
@@ -495,6 +509,17 @@ export function App() {
   const primary = viewing ?? local
   const c0 = primary?.payload?.current
 
+  // #1111: the dashboard opens on Today and falls back to 7 days once, when the
+  // first local payload shows today still has no sessions. Disarmed by the
+  // period picker, so it can never move a period the user chose.
+  const autoPeriod = useRef(true)
+  useEffect(() => {
+    const sessions = local?.payload?.current?.sessions
+    if (!autoPeriod.current || sessions === undefined) return
+    autoPeriod.current = false
+    if (period === 'today' && sessions === 0) setPeriod('week')
+  }, [local, period])
+
   const providerOptions = useMemo(
     () =>
       c0
@@ -589,7 +614,7 @@ export function App() {
                 <button
                   key={p.key}
                   type="button"
-                  onClick={() => setPeriod(p.key)}
+                  onClick={() => { autoPeriod.current = false; setPeriod(p.key) }}
                   className={cn(
                     'rounded-[5px] px-3 py-1 text-xs font-medium transition-colors max-md:inline-flex max-md:min-h-9 max-md:items-center max-md:justify-center',
                     period === p.key ? 'bg-active-primary text-foreground shadow-sm' : 'text-tertiary-foreground hover:text-foreground',
@@ -774,6 +799,8 @@ export function App() {
               <h1 className="font-display text-xl tracking-tight text-foreground">{page === 'context' ? 'Context' : viewTitle}</h1>
               <span className="text-xs text-tertiary-foreground">{page === 'usage' ? label : ''}</span>
             </div>
+
+            {page === 'usage' && <IndexingNotice payload={primary?.payload} />}
 
             {page === 'context' ? (
               <ContextExplorer />

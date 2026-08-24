@@ -2,7 +2,7 @@ import { isAbsolute } from 'path'
 import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
-import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setProxyPaths, normalizeProxyPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
+import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint, isSessionHydrationComplete } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
 import { getProvider } from './providers/index.js'
@@ -10,6 +10,8 @@ import { convertCost, formatCost } from './currency.js'
 import { renderStatusBar } from './format.js'
 import { toDateString } from './daily-cache.js'
 import { dateKey } from './day-aggregator.js'
+import { sessionModelBillableOutputTokens } from './session-output.js'
+import { isBehavioralCall } from './behavioral-weight.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import type { AppliedFix } from './act/types.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
@@ -144,10 +146,16 @@ type JsonPlanSummary = {
   daysUntilReset: number
   periodStart: string
   periodEnd: string
+  monthlyCredits?: number
+  spentCredits?: number
+  budgetCredits?: number
+  creditsIncomplete?: boolean
+  monthlyUsd?: number
+  spentApiEquivalentUsd?: number
 }
 
 function toJsonPlanSummary(planUsage: PlanUsage): JsonPlanSummary {
-  return {
+  const summary: JsonPlanSummary = {
     id: planUsage.plan.id,
     provider: planUsage.plan.provider,
     budget: convertCost(planUsage.budgetUsd),
@@ -159,6 +167,15 @@ function toJsonPlanSummary(planUsage: PlanUsage): JsonPlanSummary {
     periodStart: planUsage.periodStart.toISOString(),
     periodEnd: planUsage.periodEnd.toISOString(),
   }
+  if (planUsage.plan.provider === 'copilot') {
+    summary.monthlyCredits = planUsage.plan.monthlyCredits
+    summary.spentCredits = planUsage.spentCredits
+    summary.budgetCredits = planUsage.budgetCredits
+    summary.creditsIncomplete = planUsage.creditsIncomplete
+    summary.monthlyUsd = planUsage.plan.monthlyUsd
+    summary.spentApiEquivalentUsd = planUsage.spentApiEquivalentUsd
+  }
+  return summary
 }
 
 type JsonPlanSummaryMap = Partial<Record<PlanProvider, JsonPlanSummary>>
@@ -383,6 +400,7 @@ function toPlanDisplay(plan: Plan) {
   return {
     id: plan.id,
     monthlyUsd: plan.monthlyUsd,
+    ...(plan.monthlyCredits != null ? { monthlyCredits: plan.monthlyCredits } : {}),
     provider: plan.provider,
     resetDay: clampResetDay(plan.resetDay),
     setAt: plan.setAt || null,
@@ -466,6 +484,8 @@ program.hook('preAction', async (thisCommand) => {
   setModelAliases(config.modelAliases ?? {})
   setPriceOverrides(config.priceOverrides ?? {})
   setLocalModelSavings(config.localModelSavings ?? {})
+  setFlatRateModels(config.flatRateModels ?? [])
+  setFlatRateRemoved(config.flatRateModelsRemoved ?? [])
   setProxyPaths(config.proxyPaths ?? [])
   if (thisCommand.opts<{ verbose?: boolean }>().verbose) {
     process.env['CODEBURN_VERBOSE'] = '1'
@@ -473,7 +493,7 @@ program.hook('preAction', async (thisCommand) => {
   await loadCurrency()
 })
 
-function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: string, durable?: DurablePeriod) {
+function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: string, durable: DurablePeriod) {
   const sessions = projects.flatMap(p => p.sessions)
   const { code } = getCurrency()
 
@@ -481,67 +501,28 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
   // session files have expired still count), matching the menubar exactly. The
   // proxied/net split is a surviving-session concept (subscription attribution
   // isn't stored per day), so it stays live; net is taken off the durable total.
-  const totalCostUSD = durable ? durable.data.cost : projects.reduce((s, p) => s + p.totalCostUSD, 0)
-  const totalSavingsUSD = durable ? durable.data.savingsUSD : projects.reduce((s, p) => s + p.totalSavingsUSD, 0)
-  const totalEstimatedUSD = durable ? (durable.data.estimatedCostUSD ?? 0) : projects.reduce((s, p) => s + (p.totalEstimatedCostUSD ?? 0), 0)
+  const totalCostUSD = durable.data.cost
+  const totalSavingsUSD = durable.data.savingsUSD
+  const totalEstimatedUSD = durable.data.estimatedCostUSD ?? 0
   // Subscription-covered (proxied) portion of totalCostUSD, and the resulting
   // out-of-pocket figure. `cost` stays the full billable/would-be amount.
   const totalProxiedUSD = projects.reduce((s, p) => s + p.totalProxiedCostUSD, 0)
   const netCostUSD = totalCostUSD - totalProxiedUSD
-  const totalCalls = durable ? durable.data.calls : projects.reduce((s, p) => s + p.totalApiCalls, 0)
-  const totalSessions = durable ? durable.data.sessions : projects.reduce((s, p) => s + p.sessions.length, 0)
-  const totalInput = durable ? durable.data.inputTokens : sessions.reduce((s, sess) => s + sess.totalInputTokens, 0)
-  const totalOutput = durable ? durable.data.outputTokens : sessions.reduce((s, sess) => s + sess.totalOutputTokens, 0)
-  const totalCacheRead = durable ? durable.data.cacheReadTokens : sessions.reduce((s, sess) => s + sess.totalCacheReadTokens, 0)
-  const totalCacheWrite = durable ? durable.data.cacheWriteTokens : sessions.reduce((s, sess) => s + sess.totalCacheWriteTokens, 0)
+  const totalCalls = durable.data.calls
+  const totalSessions = durable.data.sessions
+  const totalInput = durable.data.inputTokens
+  const totalOutput = durable.data.outputTokens
+  const totalCacheRead = durable.data.cacheReadTokens
+  const totalCacheWrite = durable.data.cacheWriteTokens
   // Match src/menubar-json.ts:cacheHitPercent: reads over reads+fresh-input. cache_write
   // counts tokens being stored, not served, so it doesn't belong in the denominator.
   const cacheHitDenom = totalInput + totalCacheRead
   const cacheHitPercent = cacheHitDenom > 0 ? Math.round((totalCacheRead / cacheHitDenom) * 1000) / 10 : 0
 
-  // Per-day rollup. Mirrors parser.ts categoryBreakdown semantics so a
-  // consumer summing daily[].editTurns over a period gets the same total as
-  // sum(activities[].editTurns) for that period: every turn counts once for
-  // `turns`, edit turns count for `editTurns`, edit turns with zero retries
-  // count for `oneShotTurns`. Issue #279 — daily-resolution efficiency
-  // dashboards need this without re-deriving from activity-level rollups.
-  const dailyMap: Record<string, { cost: number; savings: number; calls: number; turns: number; editTurns: number; oneShotTurns: number }> = {}
-  for (const sess of sessions) {
-    for (const turn of sess.turns) {
-      // Prefer the user-message timestamp on the turn; fall back to the first
-      // assistant-call timestamp when the user line is missing (continuation
-      // sessions where the JSONL begins mid-conversation). Previously these
-      // turns dropped from daily but stayed in activities, breaking the
-      // sum(daily[].editTurns) === sum(activities[].editTurns) invariant.
-      const ts = turn.timestamp || turn.assistantCalls[0]?.timestamp
-      if (!ts) { continue }
-      const day = dateKey(ts)
-      if (!dailyMap[day]) { dailyMap[day] = { cost: 0, savings: 0, calls: 0, turns: 0, editTurns: 0, oneShotTurns: 0 } }
-      dailyMap[day].turns += 1
-      if (turn.hasEdits) {
-        dailyMap[day].editTurns += 1
-        if (turn.retries === 0) dailyMap[day].oneShotTurns += 1
-      }
-      for (const call of turn.assistantCalls) {
-        // Cost/savings/calls bucket under each call's OWN day — the same
-        // per-call rule as the durable day set (day-aggregator.ts), so this
-        // fallback and durable.days never diverge on a midnight-straddling
-        // turn (issue #852). Turn counts/edit stats stay anchored on the
-        // turn's day above. An unparseable call timestamp falls back to the
-        // turn's day rather than producing a garbage date key.
-        const callDay = Number.isNaN(new Date(call.timestamp).getTime()) ? day : dateKey(call.timestamp)
-        if (!dailyMap[callDay]) { dailyMap[callDay] = { cost: 0, savings: 0, calls: 0, turns: 0, editTurns: 0, oneShotTurns: 0 } }
-        dailyMap[callDay].cost += call.costUSD
-        dailyMap[callDay].savings += call.savingsUSD ?? 0
-        dailyMap[callDay].calls += 1
-      }
-    }
-  }
   // Daily rows come from the same durable day set as the headline so they sum
-  // to it, carried days included. The live per-turn rollup (dailyMap) is only
-  // the fallback for callers that pass no durable period.
-  const daily = durable
-    ? durable.days.map(d => {
+  // to it, carried days included. Both JSON call sites always pass durable
+  // (#1067); the live dailyMap fallback was unreachable and is gone.
+  const daily = durable.days.map(d => {
         const turns = Object.values(d.categories).reduce((s, c) => s + c.turns, 0)
         return {
           date: d.date,
@@ -556,21 +537,6 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
             : null,
         }
       })
-    : Object.entries(dailyMap).sort().map(([date, d]) => ({
-        date,
-        cost: convertCost(d.cost),
-        savings: convertCost(d.savings),
-        calls: d.calls,
-        turns: d.turns,
-        editTurns: d.editTurns,
-        oneShotTurns: d.oneShotTurns,
-        // Pre-computed convenience for dashboards that don't want to do the math.
-        // null when there are no edit turns (the rate is undefined, not zero —
-        // a day where the user only had Q&A turns shouldn't read as 0% one-shot).
-        oneShotRate: d.editTurns > 0
-          ? Math.round((d.oneShotTurns / d.editTurns) * 1000) / 10
-          : null,
-      }))
 
   const projectList = projects.map(p => ({
     name: p.project,
@@ -594,9 +560,16 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
       modelMap[model].savings += d.savingsUSD
       modelMap[model].estimatedCost += d.estimatedCostUSD ?? 0
       modelMap[model].inputTokens += d.tokens.inputTokens
-      modelMap[model].outputTokens += d.tokens.outputTokens
       modelMap[model].cacheReadTokens += d.tokens.cacheReadInputTokens
       modelMap[model].cacheWriteTokens += d.tokens.cacheCreationInputTokens
+    }
+    // Output must be billed per call while provider identity is still known.
+    // Join on the same key as parser modelBreakdown (getShortModelName), not raw call.model.
+    for (const [model, output] of Object.entries(sessionModelBillableOutputTokens(sess))) {
+      if (!modelMap[model]) {
+        modelMap[model] = { calls: 0, cost: 0, savings: 0, estimatedCost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, baselineModel: '' }
+      }
+      modelMap[model].outputTokens += output
     }
   }
   // Pull the active baseline model name out of the savings config so the
@@ -772,7 +745,7 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
 program
   .command('report', { isDefault: true })
   .description('Interactive usage dashboard')
-  .option('-p, --period <period>', 'Starting period: today, week, 30days, month, all, lifetime', 'week')
+  .option('-p, --period <period>', 'Starting period: today, week, 30days, month, all, lifetime (interactive default: today, or week when today is empty)', 'week')
   .option('--day <date>', 'Single day to review (YYYY-MM-DD, today, or yesterday). Overrides --period when set')
   .option('--from <date>', 'Start date (YYYY-MM-DD). Overrides --period when set')
   .option('--to <date>', 'End date (YYYY-MM-DD). Overrides --period when set')
@@ -781,7 +754,7 @@ program
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
   .option('--refresh <seconds>', 'Auto-refresh interval in seconds (minimum 60; 0 to disable)', parseInteger, 60)
-  .action(async (opts) => {
+  .action(async (opts, command) => {
     assertFormat(opts.format, ['tui', 'json'], 'report')
     assertProvider(opts.provider, 'report')
     let customRange: DateRange | null = null
@@ -813,7 +786,12 @@ program
       return
     }
     const customRangeLabel = customRange ? formatDateRangeLabel(opts.from, opts.to) : undefined
-    await renderDashboard(period, opts.provider, opts.refresh, opts.project, opts.exclude, customRange, customRangeLabel, daySelection?.day)
+    // #1111: no explicit period of any kind means the interactive dashboard
+    // picks its own — Today, or 7 days when today is still empty. Any source
+    // other than the option default (a flag, an env value) is the user's
+    // choice and is honored as given.
+    const autoPeriod = command.getOptionValueSource('period') === 'default' && !daySelection && !customRange
+    await renderDashboard(period, opts.provider, opts.refresh, opts.project, opts.exclude, customRange, customRangeLabel, daySelection?.day, autoPeriod)
   })
 
 program
@@ -1231,8 +1209,11 @@ program
         today: { cost: Math.round(todayData.cost * rate * 100) / 100, savings: Math.round(todayData.savingsUSD * rate * 100) / 100, calls: todayData.calls },
         month: { cost: Math.round(monthData.cost * rate * 100) / 100, savings: Math.round(monthData.savingsUSD * rate * 100) / 100, calls: monthData.calls },
       }
-      const savingsCallsToday = todayProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 ? 1 : 0), 0), 0), 0), 0)
-      const savingsCallsMonth = monthProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 ? 1 : 0), 0), 0), 0), 0)
+      // Savings DOLLARS keep every call, but these are request COUNTS: a
+      // supplementary accounting call (copilot rollup / paired store row) can
+      // carry configured model-savings too and must not count as a request.
+      const savingsCallsToday = todayProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 && isBehavioralCall(c) ? 1 : 0), 0), 0), 0), 0)
+      const savingsCallsMonth = monthProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 && isBehavioralCall(c) ? 1 : 0), 0), 0), 0), 0)
       if (todayData.savingsUSD > 0 || monthData.savingsUSD > 0) {
         payload.localModelSavings = {
           today: payload.today.savings,
@@ -1629,6 +1610,87 @@ program
   })
 
 program
+  .command('model-flat-rate [model]')
+  .description('Mark a model as subscription / flat-rate billed. $0 is the correct cost and the unpriced warning is silenced. Do not use model-alias for these — that maps them onto another model\'s per-token rate and invents spend (e.g. codeburn model-flat-rate auto-genius).')
+  .option('--remove <model>', 'Remove a flat-rate mark, including a built-in SKU')
+  .option('--list', 'List configured flat-rate models and built-in opt-outs')
+  .action(async (model?: string, opts?: { remove?: string; list?: boolean }) => {
+    const config = await readConfig()
+    const marked = [...(config.flatRateModels ?? [])]
+    const removed = [...(config.flatRateModelsRemoved ?? [])]
+
+    if (opts?.list || (!model && !opts?.remove)) {
+      if (marked.length === 0 && removed.length === 0) {
+        console.log('\n  No flat-rate models configured.')
+        console.log(`  Config: ${getConfigFilePath()}`)
+        console.log('  Add one with: codeburn model-flat-rate <model>\n')
+      } else {
+        if (marked.length > 0) {
+          console.log('\n  Flat-rate / subscription models:')
+          for (const name of marked) {
+            console.log(`    ${name}`)
+          }
+        }
+        if (removed.length > 0) {
+          console.log('\n  Built-in flat-rate opt-outs (unpriced warning fires again):')
+          for (const name of removed) {
+            console.log(`    ${name}`)
+          }
+        }
+        console.log(`  Config: ${getConfigFilePath()}\n`)
+      }
+      return
+    }
+
+    if (opts?.remove) {
+      const target = opts.remove
+      const idx = marked.indexOf(target)
+      const builtIn = isBuiltInFlatRateModel(target)
+      const alreadyOptedOut = removed.some(id => isSameFlatRateModel(id, target))
+      if (idx < 0 && (!builtIn || alreadyOptedOut)) {
+        console.error(`\n  No flat-rate mark found for: ${target}\n`)
+        process.exitCode = 1
+        return
+      }
+      if (idx >= 0) {
+        marked.splice(idx, 1)
+        config.flatRateModels = marked.length > 0 ? marked : undefined
+      }
+      if (builtIn && !alreadyOptedOut) {
+        removed.push(target)
+        config.flatRateModelsRemoved = removed
+      }
+      await saveConfig(config)
+      console.log(`\n  Removed flat-rate mark: ${target}`)
+      if (builtIn) {
+        console.log('  Built-in SKU opted out; the unpriced warning will fire again until you re-add it.')
+      }
+      console.log()
+      return
+    }
+
+    if (!model) {
+      console.error('\n  Usage: codeburn model-flat-rate <model>\n')
+      process.exitCode = 1
+      return
+    }
+
+    if (!marked.includes(model)) marked.push(model)
+    config.flatRateModels = marked
+    const remainingOptOuts = removed.filter(id => !isSameFlatRateModel(id, model))
+    config.flatRateModelsRemoved = remainingOptOuts.length > 0 ? remainingOptOuts : undefined
+    await saveConfig(config)
+
+    if (config.modelAliases && Object.hasOwn(config.modelAliases, model)) {
+      console.log(`\n  Note: ${model} is also in modelAliases (-> ${config.modelAliases[model]}).`)
+      console.log('  The alias still invents per-token spend. Remove it if $0 is the correct cost.')
+    }
+
+    console.log(`\n  Flat-rate mark saved: ${model}`)
+    console.log(`  Config: ${getConfigFilePath()}\n`)
+  })
+
+program
   .command('proxy-path [path]')
   .description('Mark a project directory as routed through a subscription-backed LLM proxy (e.g. Claude Code over GitHub Copilot). Sessions whose canonical path is under it keep their full API-rate cost as the "would-be" figure, but that amount is reported as subscription-covered so the report can show net out-of-pocket (e.g. codeburn proxy-path ~/work/copilot-repo). Actual API-key sessions elsewhere are untouched.')
   .option('--remove <path>', 'Remove a configured proxy path')
@@ -1707,14 +1769,15 @@ program
   .description('Show or configure a subscription plan for overage tracking')
   .option('--format <format>', 'Output format: text or json', 'text')
   .option('--monthly-usd <n>', 'Monthly plan price in USD (for custom)', parseNumber)
-  .option('--provider <name>', 'Provider scope: all, claude, codex, cursor')
+  .option('--credits <n>', 'Monthly AI credits (copilot custom plans)', parseNumber)
+  .option('--provider <name>', `Provider scope: ${PLAN_PROVIDERS.join(', ')}`)
   .option('--reset-day <n>', 'Day of month plan resets (1-28)', parseInteger, 1)
-  .action(async (action?: string, id?: string, opts?: { format?: string; monthlyUsd?: number; provider?: string; resetDay?: number }) => {
+  .action(async (action?: string, id?: string, opts?: { format?: string; monthlyUsd?: number; credits?: number; provider?: string; resetDay?: number }) => {
     assertFormat(opts?.format ?? 'text', ['text', 'json'], 'plan')
     const mode = action ?? 'show'
     const providerOption = opts?.provider
     if (providerOption !== undefined && !isPlanProvider(providerOption)) {
-      console.error(`\n  --provider must be one of: all, claude, codex, cursor; got "${providerOption}".\n`)
+      console.error(`\n  --provider must be one of: ${PLAN_PROVIDERS.join(', ')}; got "${providerOption}".\n`)
       process.exitCode = 1
       return
     }
@@ -1743,7 +1806,7 @@ program
       console.log(`\n  Plans: ${plans.length}`)
       for (const plan of plans) {
         console.log(`  ${plan.provider}: ${planLabel(plan)} (${plan.id})`)
-        console.log(`    Budget: $${plan.monthlyUsd}/month`)
+        console.log(`    Budget: ${plan.provider === 'copilot' && plan.monthlyCredits != null ? `${plan.monthlyCredits} AI Credits` : `$${plan.monthlyUsd}/month`}`)
         console.log(`    Reset day: ${clampResetDay(plan.resetDay)}`)
         if (plan.setAt) console.log(`    Set at: ${plan.setAt}`)
       }
@@ -1791,18 +1854,56 @@ program
     }
 
     if (id === 'custom') {
-      if (opts?.monthlyUsd === undefined) {
+      const credits = opts?.credits
+      const monthlyUsdOpt = opts?.monthlyUsd
+      const provider = providerOption ?? 'all'
+
+      if (credits !== undefined && provider !== 'copilot') {
+        console.error('\n  --credits is only valid with --provider copilot.\n')
+        process.exitCode = 1
+        return
+      }
+
+      if (provider === 'copilot') {
+        if (monthlyUsdOpt !== undefined) {
+          console.error('\n  Copilot custom plans take --credits, not --monthly-usd (units mixed).\n')
+          process.exitCode = 1
+          return
+        }
+        if (credits === undefined) {
+          console.error('\n  Custom copilot plans require --credits <positive number>.\n')
+          process.exitCode = 1
+          return
+        }
+        if (!Number.isFinite(credits) || credits <= 0) {
+          console.error(`\n  --credits must be a positive finite number; got ${credits}.\n`)
+          process.exitCode = 1
+          return
+        }
+        await savePlan({
+          id: 'custom',
+          monthlyCredits: credits,
+          monthlyUsd: credits * 0.01,
+          provider: 'copilot',
+          resetDay,
+          setAt: new Date().toISOString(),
+        })
+        console.log(`\n  Plan set to custom (${credits} AI Credits, copilot, reset day ${resetDay}).`)
+        console.log(`  Config saved to ${getConfigFilePath()}\n`)
+        return
+      }
+
+      if (monthlyUsdOpt === undefined) {
         console.error('\n  Custom plans require --monthly-usd <positive number>.\n')
         process.exitCode = 1
         return
       }
-      const monthlyUsd = opts.monthlyUsd
+      const monthlyUsd = monthlyUsdOpt
       if (!Number.isFinite(monthlyUsd) || monthlyUsd <= 0) {
-        console.error(`\n  --monthly-usd must be a positive number; got ${opts.monthlyUsd}.\n`)
+        console.error(`\n  --monthly-usd must be a positive number; got ${monthlyUsdOpt}.\n`)
         process.exitCode = 1
         return
       }
-      const provider = providerOption ?? 'all'
       await savePlan({
         id: 'custom',
         monthlyUsd,
@@ -2213,7 +2314,7 @@ program
       process.stdout.write(renderTable(renderRows, { byTask: !!opts.byTask, byAgent: !!opts.byAgent, showTotals: opts.totals !== false }) + '\n')
       // Never advise aliasing unconditionally: a subscription or flat-rate model
       // is correctly $0, and mapping it onto another model's rate invents spend.
-      if (opts.unpriced) process.stdout.write('If a model is billed per token, map it with: codeburn model-alias "<model>" <known-model>. Subscription or flat-rate models are correctly $0.\n')
+      if (opts.unpriced) process.stdout.write(unpricedModelHint() + '\n')
     } else {
       process.stderr.write(`codeburn: unknown --format "${opts.format}". Choose table, markdown, json, or csv.\n`)
       process.exit(1)
@@ -2454,7 +2555,16 @@ return program
 
 if (process.argv[2] === 'serve') {
   const { runStdioServe } = await import('./serve.js')
+  // Bind the REAL exit before serving. runCaptured() replaces process.exit with
+  // a throw for the duration of a request, and a request still in flight when
+  // the drain bound expires never restores it - so the exit below would throw
+  // instead of exiting, which is exactly the orphan this line prevents.
+  const hardExit = process.exit.bind(process)
   await runStdioServe(buildProgram)
+  // stdin closed, so the owning app is gone. Exit outright: any handle that
+  // outlives the transport (a watcher, a pending timer) would otherwise leave
+  // this child running as an orphan for as long as the machine is up.
+  hardExit(0)
 } else {
   buildProgram().parse()
 }

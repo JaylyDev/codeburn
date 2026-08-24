@@ -4,7 +4,9 @@ import { dirname, join, resolve } from 'path'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 import { getCurrency, convertCost, roundForActiveCurrency } from './currency.js'
 import { dateKey } from './day-aggregator.js'
+import { behavioralTurnCount, isBehavioralCall } from './behavioral-weight.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
+import { callBillableOutputTokens, sessionModelBillableOutputTokens } from './session-output.js'
 
 function escCsv(s: string): string {
   const sanitized = /^[\t\r=+\-@]/.test(s) ? `'${s}` : s
@@ -14,7 +16,7 @@ function escCsv(s: string): string {
   return sanitized
 }
 
-type Row = Record<string, string | number | undefined>
+type Row = Record<string, string | number | boolean | undefined>
 
 function rowsToCsv(rows: Row[]): string {
   if (rows.length === 0) return ''
@@ -59,9 +61,12 @@ function buildDailyRows(projects: ProjectSummary[], period: string): Row[] {
         for (const call of turn.assistantCalls) {
           daily[day].cost += call.costUSD
           daily[day].savings += call.savingsUSD ?? 0
-          daily[day].calls++
+          // Same weight rule as aggregateProjectsIntoDays: a supplementary
+          // accounting call carries cost/tokens but is not a distinct request,
+          // so daily.csv call counts must reconcile with summary.csv.
+          if (isBehavioralCall(call)) daily[day].calls++
           daily[day].input += call.usage.inputTokens
-          daily[day].output += call.usage.outputTokens
+          daily[day].output += callBillableOutputTokens(call)
           daily[day].cacheRead += call.usage.cacheReadInputTokens
           daily[day].cacheWrite += call.usage.cacheCreationInputTokens
         }
@@ -104,6 +109,12 @@ function buildRecordRows(projects: ProjectSummary[]): Row[] {
             cacheReadTokens: Math.max(call.usage.cacheReadInputTokens, call.usage.cachedInputTokens),
             cost: roundForActiveCurrency(convertCost(call.costUSD)),
             savings: roundForActiveCurrency(convertCost(call.savingsUSD ?? 0)),
+            // Records are the raw serve ledger and keep every supplementary
+            // accounting row; the marker is how a "one row per API call"
+            // consumer tells them apart. Key present on every row (undefined
+            // when false) so rowsToCsv, which reads headers off the first row,
+            // always emits the column; JSON drops the undefined ones.
+            supplementary: call.supplementaryAccounting ? true : undefined,
           })
         }
       }
@@ -139,17 +150,25 @@ function buildActivityRows(projects: ProjectSummary[], period: string): Row[] {
 function buildModelRows(projects: ProjectSummary[], period: string): Row[] {
   const modelTotals: Record<string, { calls: number; cost: number; savings: number; input: number; output: number; cacheRead: number; cacheWrite: number }> = {}
   const modelEfficiency = aggregateModelEfficiency(projects)
+  const ensure = (model: string) => {
+    if (!modelTotals[model]) modelTotals[model] = { calls: 0, cost: 0, savings: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+    return modelTotals[model]
+  }
   for (const project of projects) {
     for (const session of project.sessions) {
       for (const [model, d] of Object.entries(session.modelBreakdown)) {
-        if (!modelTotals[model]) modelTotals[model] = { calls: 0, cost: 0, savings: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-        modelTotals[model].calls += d.calls
-        modelTotals[model].cost += d.costUSD
-        modelTotals[model].savings += d.savingsUSD
-        modelTotals[model].input += d.tokens.inputTokens
-        modelTotals[model].output += d.tokens.outputTokens
-        modelTotals[model].cacheRead += d.tokens.cacheReadInputTokens ?? 0
-        modelTotals[model].cacheWrite += d.tokens.cacheCreationInputTokens ?? 0
+        const acc = ensure(model)
+        acc.calls += d.calls
+        acc.cost += d.costUSD
+        acc.savings += d.savingsUSD
+        acc.input += d.tokens.inputTokens
+        acc.cacheRead += d.tokens.cacheReadInputTokens ?? 0
+        acc.cacheWrite += d.tokens.cacheCreationInputTokens ?? 0
+      }
+      // Output must be billed per call while provider identity is still known.
+      // Join on the same key as parser modelBreakdown (getShortModelName), not raw call.model.
+      for (const [model, output] of Object.entries(sessionModelBillableOutputTokens(session))) {
+        ensure(model).output += output
       }
     }
   }
@@ -270,7 +289,7 @@ function buildSessionRows(projects: ProjectSummary[]): Row[] {
         [`Cost (${code})`]: roundForActiveCurrency(convertCost(s.totalCostUSD)),
         [`Saved (${code})`]: roundForActiveCurrency(convertCost(s.totalSavingsUSD)),
         'API Calls': s.apiCalls,
-        Turns: s.turns.length,
+        Turns: behavioralTurnCount(s.turns),
         subagentType: s.agentType?.trim() || undefined,
         model: models.size === 1 ? [...models][0] : undefined,
       })
@@ -320,7 +339,9 @@ function buildReadme(periods: PeriodExport[]): string {
     '  daily.csv             Day-by-day breakdown, Period column distinguishes the window.',
     '  activity.csv          Time spent per task category (Coding, Debugging, Exploration, etc.).',
     '  models.csv            Spend per model with token totals and cache usage.',
-    '  records.csv           One row per API call, including optional subagentType and model.',
+    '  records.csv           One row per served call, with optional subagentType and model.',
+    '                        supplementary marks accounting-only rows: recovered tokens/cost that',
+    '                        are not distinct requests.',
     '  projects.csv          Spend per project folder for the selected detail period.',
     '  sessions.csv          One row per session for the selected detail period.',
     '  tools.csv             Tool invocations and share for the selected detail period.',

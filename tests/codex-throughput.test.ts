@@ -21,8 +21,38 @@ describe('Codex throughput prototype', () => {
 
     const points = await readCodexThroughput(path)
     expect(points).toHaveLength(2)
-    expect(points[1]).toMatchObject({ generatedTokens: 50, elapsedSeconds: 5, generatedTokensPerSecond: 10, activeDurationSeconds: 7, activeGeneratedTokensPerSecond: 21.428571428571427, toolWaitSeconds: 3, model: 'gpt-5.6-sol' })
-    expect(renderCodexThroughput(points, path)).toContain('21.4 generated tokens/sec')
+    // Reasoning is a subset of output_tokens (#1075/#1078), not additive: the
+    // checkpoints report output 80/40 and reasoning 20/10, so the generated
+    // numerator is output alone (80, then 40), matching the cost path.
+    expect(points[1]).toMatchObject({ generatedTokens: 40, elapsedSeconds: 5, generatedTokensPerSecond: 8, activeDurationSeconds: 7, activeGeneratedTokensPerSecond: (80 + 40) / 7, toolWaitSeconds: 3, model: 'gpt-5.6-sol' })
+    expect(renderCodexThroughput(points, path)).toContain('17.1 generated tokens/sec')
+  })
+
+  it('REGRESSION (#1079): does not add reasoning tokens on top of output for Tok/s', async () => {
+    // Reasoning tokens are a SUBSET of output_tokens (#1075/#1078), not a
+    // separate bucket. A single checkpoint reporting output=60, reasoning=40
+    // must drive Tok/s off 60, not 100 -- summing them would double-count 40
+    // tokens that are already inside the 60. If this ever reverts to
+    // `outputTokens + reasoningTokens`, activeGeneratedTokensPerSecond becomes
+    // 10 (100 tokens / 10s) instead of 6 (60 tokens / 10s).
+    const dir = await mkdtemp(join(tmpdir(), 'codeburn-tps-regression-'))
+    const path = join(dir, 'rollout.jsonl')
+    await writeFile(path, [
+      JSON.stringify({ type: 'session_meta', timestamp: '2026-07-25T00:00:00.000Z', payload: { model: 'gpt-5.5' } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-07-25T00:00:00.000Z', payload: { type: 'task_started' } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-07-25T00:00:10.000Z', payload: { type: 'token_count', info: { last_token_usage: { output_tokens: 60, reasoning_output_tokens: 40 }, total_token_usage: { total_tokens: 100, output_tokens: 60, reasoning_output_tokens: 40 } } } }),
+      JSON.stringify({ type: 'event_msg', timestamp: '2026-07-25T00:00:10.000Z', payload: { type: 'task_complete', duration_ms: 10000 } }),
+    ].join('\n'))
+
+    const points = await readCodexThroughput(path)
+    expect(points).toHaveLength(1)
+    expect(points[0]).toMatchObject({
+      outputTokens: 60,
+      reasoningTokens: 40,
+      generatedTokens: 60,
+      taskGeneratedTokens: 60,
+      activeGeneratedTokensPerSecond: 6,
+    })
   })
 
   it('parses only appended complete lines while watching a growing rollout', async () => {
@@ -36,7 +66,9 @@ describe('Codex throughput prototype', () => {
     await appendFile(path, first.slice(40) + '\n' + second + '\n')
     const points = await reader.update(path)
     expect(points).toHaveLength(2)
-    expect(points[1]).toMatchObject({ generatedTokens: 5, generatedTokensPerSecond: 5 })
+    // second checkpoint: output 4 + reasoning 1 -> billable numerator is 4
+    // (reasoning already inside output_tokens), not the additive 5.
+    expect(points[1]).toMatchObject({ generatedTokens: 4, generatedTokensPerSecond: 4 })
   })
 
   it('ignores replayed pre-fork checkpoints before estimating new work', async () => {

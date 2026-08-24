@@ -1,6 +1,8 @@
 import { open, stat } from 'node:fs/promises'
 import { StringDecoder } from 'node:string_decoder'
 
+import { billableOutputTokens } from './models.js'
+
 export type CodexThroughputPoint = {
   timestamp: string
   model?: string
@@ -105,7 +107,12 @@ function durationMs(payload: RolloutLine['payload']): number | undefined {
   return undefined
 }
 
-function mergeToolIntervals(intervals: Array<[number, number]>, durationMs: number, taskStartedAt?: number, taskCompletedAt?: number): number {
+// Shared with src/providers/codex.ts (#1088 BUG-8): both clip a task's tool
+// intervals to its [taskStartedAt, taskStartedAt + durationMs] window, merge
+// overlaps, and cap the sum at durationMs. Was copy-pasted inline in
+// providers/codex.ts and had already drifted (duration parsing there accepted
+// only a plain `duration_ms` number); one copy now, called from both.
+export function mergeToolIntervals(intervals: Array<[number, number]>, durationMs: number, taskStartedAt?: number, taskCompletedAt?: number): number {
   const windowStart = taskStartedAt ?? (taskCompletedAt !== undefined ? taskCompletedAt - durationMs : undefined)
   const windowEnd = windowStart !== undefined ? windowStart + durationMs : undefined
   const clipped = intervals.map(([start, end]) => [
@@ -400,7 +407,9 @@ export class CodexThroughputReader {
       state.previousOutput = total?.output_tokens ?? state.previousOutput
       state.previousReasoning = total?.reasoning_output_tokens ?? state.previousReasoning
     }
-    const generatedTokens = outputTokens + reasoningTokens
+    // Reasoning is already inside output_tokens (#1075/#1078); same numerator
+    // as the cost path so live Tok/s can't drift from billed tokens (#1079).
+    const generatedTokens = billableOutputTokens('codex', outputTokens, reasoningTokens)
     if (generatedTokens <= 0) return
     const timestampMs = Date.parse(entry.timestamp)
     if (!Number.isFinite(timestampMs)) return

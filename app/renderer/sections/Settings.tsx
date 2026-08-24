@@ -15,11 +15,12 @@ import { formatConverted, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import { shortcutLabel } from '../lib/platform'
 import { motionClass } from '../lib/motion'
+import { PROVIDER_NAMES, QUOTA_PROVIDERS, readDisabledProviders, writeDisabledProviders } from '../lib/providers'
 import { REFRESH_OPTIONS, useRefreshCadence } from '../lib/refreshCadence'
 import { showToast } from '../lib/toast'
 import { ToastHost } from '../components/ToastHost'
 import { rateLimitedNote } from './Plans'
-import type { ActionResult, AliasRow, ClaudeConfigSelector, CliError, CombinedUsage, DeviceScanResult, Identity, JsonPlanSummary, MenubarPayload, Period, PlanId, PlanProvider, PriceOverrideList, PriceOverrideRow, PriceRates, QuotaProvider, Scope, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
+import type { ActionResult, AliasRow, ClaudeConfigSelector, CliError, CombinedUsage, DeviceScanResult, Identity, JsonPlanSummary, MenubarPayload, Period, PlanId, PlanProvider, PriceOverrideList, PriceOverrideRow, PriceRates, ProviderName, QuotaProvider, Scope, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
 
 export type SettingsPane = 'general' | 'providers' | 'aliases' | 'pricing' | 'plans' | 'devices' | 'export' | 'privacy'
 type Pane = SettingsPane
@@ -327,16 +328,18 @@ function planSummaries(status: StatusJson): JsonPlanSummary[] {
   return status.plan ? [status.plan] : []
 }
 
-function DetectedRow({ quota, onReconnect }: { quota: QuotaProvider; onReconnect: () => void }) {
-  const name = quota.provider === 'claude' ? 'Claude' : 'Codex'
+function DetectedRow({ quota, enabled, onToggle, onReconnect }: { quota: QuotaProvider; enabled: boolean; onToggle: () => void; onReconnect: () => void }) {
   return <div className="about-row">
     <ProviderLogo provider={quota.provider} />
-    <span className="tx">{name}</span>
-    {quota.connection === 'disconnected' || quota.connection === 'accessDenied'
+    <span className="tx">{PROVIDER_NAMES[quota.provider]}</span>
+    {!enabled
+      ? <span className="r set-status"><span className="set-cap">Off</span></span>
+      : quota.connection === 'disconnected' || quota.connection === 'accessDenied'
       ? <div className="r set-status"><ConnectAffordance provider={quota.provider} connection={quota.connection} onRefresh={onReconnect} /></div>
       : quota.rateLimited
       ? <span className="r set-status"><span className="set-dot" />{rateLimitedNote(quota.provider)}</span>
       : <span className="r set-status"><span className="set-dot ok" />{quota.planLabel ?? 'Connected'}</span>}
+    <button type="button" role="switch" aria-checked={enabled} aria-label={`${PROVIDER_NAMES[quota.provider]} live quota`} className={enabled ? 'switch on' : 'switch'} onClick={onToggle}><span className="switch-knob" /></button>
   </div>
 }
 
@@ -345,13 +348,14 @@ function PlansPane({ period, refreshToken, onNavigate, onConfigMutated }: { peri
   // Steady poll serves cached quota (force=false); the Connect affordance's
   // Refresh forces a keychain-allowed fetch via the same path as Plans.tsx.
   const [reconnectNonce, setReconnectNonce] = useState(0)
+  const [disabledProviders, setDisabledProviders] = useState<ProviderName[]>(() => readDisabledProviders())
   const lastForced = useRef(`${refreshToken}:${reconnectNonce}`)
   const quota = usePolled<QuotaProvider[]>(() => {
     const key = `${refreshToken}:${reconnectNonce}`
     const force = key !== lastForced.current
     lastForced.current = key
-    return codeburn.getQuota(force)
-  }, [refreshToken, reconnectNonce])
+    return codeburn.getQuota(force, disabledProviders)
+  }, [refreshToken, reconnectNonce, disabledProviders])
   const plans = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken, nonce])
   const [presetId, setPresetId] = useState(MANUAL_PLAN_PRESETS[0]!.id)
   const configured = plans.data ? planSummaries(plans.data) : []
@@ -363,6 +367,17 @@ function PlansPane({ period, refreshToken, onNavigate, onConfigMutated }: { peri
   const remove = (plan: JsonPlanSummary) => {
     void codeburn.resetPlan(plan.provider).then(finish)
   }
+  // Toggling a provider off stops polling it entirely (the main process never
+  // contacts its endpoints); toggling on forces a fresh fetch so the row
+  // repopulates immediately.
+  const toggleProvider = (provider: ProviderName) => {
+    const next = disabledProviders.includes(provider)
+      ? disabledProviders.filter(item => item !== provider)
+      : [...disabledProviders, provider]
+    writeDisabledProviders(next)
+    setDisabledProviders(next)
+    setReconnectNonce(value => value + 1)
+  }
   const add = () => {
     const preset = MANUAL_PLAN_PRESETS.find(item => item.id === presetId)!
     void codeburn.setPlan(preset.id, preset.provider).then(finish)
@@ -373,7 +388,17 @@ function PlansPane({ period, refreshToken, onNavigate, onConfigMutated }: { peri
     <div className="card">
       <div className="about-sec set-last-sec">
         <div className="about-sec-h">Detected subscriptions</div>
-        {quota.error && !quota.data ? <SettingsErrorText error={quota.error} /> : !quota.data ? <p className="set-cap">Detecting subscriptions…</p> : quota.data.length === 0 ? <p className="set-cap">No detectable subscriptions.</p> : quota.data.map(provider => <DetectedRow key={provider.provider} quota={provider} onReconnect={() => setReconnectNonce(value => value + 1)} />)}
+        {quota.error && !quota.data ? <SettingsErrorText error={quota.error} /> : QUOTA_PROVIDERS.map(provider => {
+          const row = quota.data?.find(item => item.provider === provider)
+          if (!row && !disabledProviders.includes(provider)) return null
+          return <DetectedRow
+            key={provider}
+            quota={row ?? { provider, connection: 'disconnected', primary: null, details: [], planLabel: null, footerLines: [] }}
+            enabled={!disabledProviders.includes(provider)}
+            onToggle={() => toggleProvider(provider)}
+            onReconnect={() => setReconnectNonce(value => value + 1)}
+          />
+        })}
       </div>
     </div>
     <div className="card">

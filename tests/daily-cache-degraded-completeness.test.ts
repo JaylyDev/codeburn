@@ -13,7 +13,9 @@ import {
   type ProviderDaySlice,
   currentTzKey,
   ensureCacheHydrated,
+  loadDailyCache,
   saveDailyCache,
+  toDateString,
 } from '../src/daily-cache.js'
 
 const TMP_CACHE_ROOT = join(tmpdir(), `codeburn-degraded-test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
@@ -181,6 +183,116 @@ describe('daily cache: a complete cache that outruns its own data is not trusted
       () => true,
     )
     expect(parses).toBe(0)
+    expect(out.lastComputedDate).toBe(daysAgoStr(1))
+    expect(out.complete).toBe(true)
+  })
+})
+
+/// A day whose only content is turn-anchored residue: one straddling turn's
+/// category counts, zero cost/calls/sessions/tokens (isTurnResidueOnly).
+function residueDay(date: string): DailyEntry {
+  return day(date, {}, {
+    categories: { conversation: { turns: 1, cost: 0, savingsUSD: 0, editTurns: 0, oneShotTurns: 0 } },
+  })
+}
+
+describe('daily cache: the gap path never shrinks a populated baseline day', () => {
+  // A populated baseline day inside the gap window (carried there by an older
+  // cache generation while the watermark sat behind it). The gap parse
+  // under-reads it: 5 calls / $5 where the baseline holds 500 / $50.
+  async function seedGapDay(): Promise<void> {
+    await seed({
+      days: [
+        VANISHED,
+        day(daysAgoStr(4), { claude: slice(120, 900) }),
+        day(daysAgoStr(2), { claude: slice(50, 500), grok: slice(9, 60) }),
+      ],
+    })
+  }
+
+  it('a partial gap parse only fills what the baseline lacks', async () => {
+    await seedGapDay()
+    const underRead = [day(daysAgoStr(2), { claude: slice(5, 10) })]
+    const out = await ensureCacheHydrated(noSessions, () => underRead, 'cfg-A', () => false)
+    const kept = out.days.find(d => d.date === daysAgoStr(2))!
+    // Baseline wins wholesale: the partial parse's undercount must not replace it.
+    expect(kept.cost).toBe(59)
+    expect(kept.calls).toBe(560)
+    expect(kept.providers['claude']).toMatchObject({ cost: 50, calls: 500 })
+    expect(kept.providers['grok']).toMatchObject({ cost: 9, calls: 60 })
+    // Watermark held and not finalized, so a later complete parse re-covers the gap.
+    expect(out.lastComputedDate).toBe(daysAgoStr(4))
+    expect(out.complete).toBe(false)
+    expectPreserved(out)
+  })
+
+  it('a complete gap parse still wins per (date, provider)', async () => {
+    await seedGapDay()
+    const fresh = [day(daysAgoStr(2), { claude: slice(75, 620) })]
+    const out = await ensureCacheHydrated(noSessions, () => fresh, 'cfg-A', () => true)
+    const rederived = out.days.find(d => d.date === daysAgoStr(2))!
+    // The fresh claude slice replaces the baseline one; the grok slice the
+    // parse did not produce is carried, not wiped.
+    expect(rederived.providers['claude']).toMatchObject({ cost: 75, calls: 620 })
+    expect(rederived.providers['grok']).toMatchObject({ cost: 9, calls: 60 })
+    expect(rederived.cost).toBe(84)
+    expect(rederived.calls).toBe(680)
+    expect(out.days.map(d => d.date)).toEqual([daysAgoStr(40), daysAgoStr(4), daysAgoStr(2)])
+    expect(out.lastComputedDate).toBe(daysAgoStr(1))
+    expect(out.complete).toBe(true)
+    expectPreserved(out)
+  })
+})
+
+describe('daily cache: a residue-only day is re-derived, not served', () => {
+  it('pulls the watermark back to just before the residue day so the gap parse re-derives it', async () => {
+    // The broken-cache shape issue #1127 leaves behind: complete and stamped,
+    // watermark at yesterday, and a residue-only day sealed behind it. The
+    // oldest-day exemption does not apply (an older populated day exists) and
+    // the residue day is inside the settle window.
+    await seed({
+      lastComputedDate: daysAgoStr(1),
+      watermarkTrusted: true,
+      days: [day(daysAgoStr(10), { claude: slice(80, 700) }), residueDay(daysAgoStr(3))],
+    })
+    const ranges: DateRange[] = []
+    const rederived = [day(daysAgoStr(3), { claude: slice(33, 210) })]
+    const out = await ensureCacheHydrated(
+      async (range) => { ranges.push(range); return [] },
+      () => rederived,
+      'cfg-A',
+      () => true,
+    )
+    // The watermark moved back to daysAgoStr(4), so the gap parse started on
+    // the residue day itself instead of skipping it forever.
+    expect(ranges).toHaveLength(1)
+    expect(toDateString(ranges[0]!.start)).toBe(daysAgoStr(3))
+    const healed = out.days.find(d => d.date === daysAgoStr(3))!
+    expect(healed.providers['claude']).toMatchObject({ cost: 33, calls: 210 })
+    expect(healed.cost).toBe(33)
+    expect(healed.calls).toBe(210)
+    expect(out.days.find(d => d.date === daysAgoStr(10))).toMatchObject({ cost: 80, calls: 700 })
+    expect(out.lastComputedDate).toBe(daysAgoStr(1))
+    expect(out.complete).toBe(true)
+  })
+})
+
+describe('daily cache: out-of-range residue days never reach the gap merge', () => {
+  it('a straddling turn anchored before the gap leaves the cached day untouched', async () => {
+    // Issue #1130: the gap range starts on D+1, but a turn anchored on day D
+    // survives range slicing whole, so the aggregator emits a residue day for
+    // D — outside the parsed range. Previously the merge guard had to defuse
+    // it; now the range filter drops it before the merge runs at all.
+    const populatedD = day(daysAgoStr(4), { claude: slice(120, 900) })
+    await seed({ days: [VANISHED, populatedD] })
+    const before = (await loadDailyCache()).days.find(d => d.date === daysAgoStr(4))!
+    const residue = residueDay(daysAgoStr(4))
+    const inRange = day(daysAgoStr(2), { claude: slice(30, 300) })
+    const out = await ensureCacheHydrated(noSessions, () => [residue, inRange], 'cfg-A', () => true)
+    // Day D persisted untouched: no residue categories leaked in.
+    const kept = out.days.find(d => d.date === daysAgoStr(4))!
+    expect(kept).toEqual(before)
+    expect(out.days.map(d => d.date)).toEqual([daysAgoStr(40), daysAgoStr(4), daysAgoStr(2)])
     expect(out.lastComputedDate).toBe(daysAgoStr(1))
     expect(out.complete).toBe(true)
   })

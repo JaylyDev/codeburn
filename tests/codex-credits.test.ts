@@ -17,6 +17,12 @@ describe('codexCreditRate', () => {
     expect(codexCreditRate('gpt-4o')).toBeNull()
     expect(codexCreditRate('claude-opus-4-8')).toBeNull()
   })
+
+  it('resolves the auto-review activity id to the same rate as GPT-5.5', () => {
+    expect(codexCreditRate('codex-auto-review')).toEqual(codexCreditRate('gpt-5.5'))
+    expect(codexCreditRate('codex-auto-review')).not.toBeNull()
+    expect(codexCreditRate('CODEX-AUTO-REVIEW')).toEqual(codexCreditRate('gpt-5.5'))
+  })
 })
 
 describe('codexCredits', () => {
@@ -32,11 +38,6 @@ describe('codexCredits', () => {
     expect(codexCredits('gpt-5.5', { inputTokens: 0, cachedReadTokens: 1_000_000, outputTokens: 0 })).toBe(12.5)
   })
 
-  it('folds reasoning tokens into the output rate', () => {
-    // 500k output + 500k reasoning = 1M output-billed => 750 credits.
-    expect(codexCredits('gpt-5.5', { inputTokens: 0, cachedReadTokens: 0, outputTokens: 500_000, reasoningTokens: 500_000 })).toBe(750)
-  })
-
   it('sums a mixed record (gpt-5.4)', () => {
     // 2M input (125) + 1M cached (6.25) + 0.5M output (187.5) = 318.75
     const credits = codexCredits('gpt-5.4', { inputTokens: 2_000_000, cachedReadTokens: 1_000_000, outputTokens: 500_000 })
@@ -49,5 +50,9 @@ describe('codexCredits', () => {
 
   it('returns null for an unknown model', () => {
     expect(codexCredits('gpt-4o', { inputTokens: 1_000_000, cachedReadTokens: 0, outputTokens: 0 })).toBeNull()
+  })
+
+  it('charges auto-review at the GPT-5.5 credit rate, not null', () => {
+    expect(codexCredits('codex-auto-review', { inputTokens: 1_000_000, cachedReadTokens: 0, outputTokens: 0 })).toBe(125)
   })
 })
