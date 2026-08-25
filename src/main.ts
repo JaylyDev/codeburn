@@ -1175,18 +1175,21 @@ program
         pricingGenerationKey: getPricingGenerationKey(),
       })
       // Optimize findings (the default; see --no-optimize) depend on mutable
-      // project/config/prompt/hook state — ~/.claude and project-level
-      // settings.json, CLAUDE.md, defined skills/agents/commands, MCP config
-      // — that computeCorpusFingerprint and queryKey never observe and that
-      // has no single enumerable fingerprint. Persisting THIS class of output
-      // would mean editing a hook or removing an unused skill leaves the
-      // menubar showing stale findings with no session change to ever
-      // invalidate them. Simplest correct fix: the optimize path never reads
-      // or writes the disk snapshot at all, it always recomputes fresh.
-      // (Computing scanAndDetect's findings requires the same parsed project
-      // data the snapshot exists to avoid recomputing, so skipping the
-      // snapshot loses no additional work versus fingerprinting these inputs
-      // — that path would still force a fresh parse to re-scan them.)
+      // project/config/prompt/hook state: ~/.claude and project-level
+      // settings.json, CLAUDE.md, defined skills/agents/commands, MCP config.
+      // computeCorpusFingerprint and queryKey never observe those inputs, and
+      // they have no single enumerable fingerprint. Persisting THAT class of
+      // output would leave an agent edit with no session change serving stale
+      // findings indefinitely. Caching only the base payload and re-deriving
+      // the findings on each hit (#1135 part 2) was tried on this branch and
+      // reverted in post-build review: scanAndDetect needs the parsed corpus,
+      // so the re-derivation pays the full parse the snapshot exists to avoid
+      // on exactly the cold processes the snapshot is for, and the resident
+      // serve child gains nothing either because its in-memory output memo
+      // already dedupes a repeated argv. Simplest correct stance: the
+      // optimize path never reads or writes the disk snapshot at all, it
+      // always recomputes fresh. One-shot and serve-child behavior are
+      // identical for both optimize values.
       const useSnapshot = !queryScope.optimize
       const corpus = useSnapshot ? await computeCorpusFingerprint(pf) : null
       const snapshot = corpus ? await loadStatusSnapshot(corpus.hash, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY) : null

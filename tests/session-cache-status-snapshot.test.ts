@@ -168,6 +168,36 @@ describe('concurrent writers (status snapshot)', () => {
   })
 })
 
+// Belt-and-braces mirror of the save gate in main.ts (#1135 fix round): a
+// payload marked degraded (`stale === true` or a `hydration` block) must
+// never have been persisted, so a record that somehow carries those markers
+// (older build, hand-edited file) loads as a miss and is recomputed.
+describe('load-time re-validation mirrors the save gate', () => {
+  it('treats a persisted payload carrying stale === true as a miss', async () => {
+    const queryKey = 'degraded-stale'
+    await saveStatusSnapshot('corpus-a', 1_000, 1_000, queryKey, SEMANTIC_KEY, { stale: true, p: 'degraded' })
+
+    expect(await loadStatusSnapshot('corpus-a', queryKey, SEMANTIC_KEY)).toBeNull()
+  })
+
+  it('treats a persisted payload carrying a hydration block as a miss', async () => {
+    const queryKey = 'degraded-hydration'
+    await saveStatusSnapshot('corpus-a', 1_000, 1_000, queryKey, SEMANTIC_KEY, {
+      hydration: { complete: false, indexedFiles: 1, totalFiles: 2 },
+      p: 'partial',
+    })
+
+    expect(await loadStatusSnapshot('corpus-a', queryKey, SEMANTIC_KEY)).toBeNull()
+  })
+
+  it('still serves a clean persisted payload (control)', async () => {
+    const queryKey = 'clean-control'
+    await saveStatusSnapshot('corpus-a', 1_000, 1_000, queryKey, SEMANTIC_KEY, { p: 'clean' })
+
+    expect(await loadStatusSnapshot('corpus-a', queryKey, SEMANTIC_KEY)).toEqual({ p: 'clean' })
+  })
+})
+
 // Post-merge review of PR #999: a `status --format menubar-json --no-optimize`
 // poll that runs while ANOTHER process holds `session-refresh.lock` parses
 // read-only and serves a degraded corpus (payload.stale === true), and a later
