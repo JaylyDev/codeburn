@@ -129,7 +129,10 @@ export function buildAssistantCall(opts: {
     .map((p) => p.state!.input!.subagent_type!)
     .filter(Boolean)
 
-  const model = data.modelID ?? data.model ?? 'unknown'
+  let model = data.modelID ?? data.model ?? 'unknown'
+  if (model.includes('/')) {
+    model = model.split('/').pop()!
+  }
   let costUSD = calculateCost(
     model,
     tokens.input,

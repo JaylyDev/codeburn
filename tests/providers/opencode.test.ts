@@ -130,6 +130,12 @@ skipUnlessSqlite('opencode provider - model display names', () => {
     expect(provider.modelDisplayName('openai/gpt-4o')).toBe('GPT-4o')
   })
 
+  it('handles cloudflare @cf provider prefix and maps GLM/Kimi display names', () => {
+    const provider = createOpenCodeProvider()
+    expect(provider.modelDisplayName('@cf/zai-org/glm-5.2')).toBe('GLM-5.2')
+    expect(provider.modelDisplayName('@cf/moonshotai/kimi-k2.7-code')).toBe('Kimi K2.7 Code')
+  })
+
   it('passes through models without prefix unchanged', () => {
     const provider = createOpenCodeProvider()
     expect(provider.modelDisplayName('gpt-4o')).toBe('GPT-4o')
@@ -484,7 +490,7 @@ skipUnlessSqlite('opencode provider - session parsing', () => {
 
     const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
     expect(calls).toHaveLength(1)
-    expect(calls[0]!.model).toBe('edenai/router-model')
+    expect(calls[0]!.model).toBe('router-model')
     expect(calls[0]!.inputTokens).toBe(0)
     expect(calls[0]!.outputTokens).toBe(0)
     expect(calls[0]!.costUSD).toBe(0)

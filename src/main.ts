@@ -2,7 +2,7 @@ import { isAbsolute } from 'path'
 import { Command, Option } from 'commander'
 import { installMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
-import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, getFlatRateModelsConfigHash, getPricingGenerationKey } from './models.js'
+import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setModelNames, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, getFlatRateModelsConfigHash, getPricingGenerationKey } from './models.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint, isSessionHydrationComplete } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
 import { getProvider } from './providers/index.js'
@@ -488,6 +488,7 @@ program.hook('preAction', async (thisCommand) => {
   }
   const config = await readConfig()
   setModelAliases(config.modelAliases ?? {})
+  setModelNames(config.modelNames ?? {})
   setPriceOverrides(config.priceOverrides ?? {})
   setLocalModelSavings(config.localModelSavings ?? {})
   setFlatRateModels(config.flatRateModels ?? [])

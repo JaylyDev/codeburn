@@ -1,6 +1,7 @@
 import { mkdtemp, mkdir, readFile, rm, stat, utimes, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { randomUUID } from 'crypto'
 import { createRequire } from 'node:module'
 import { describe, expect, it } from 'vitest'
 
@@ -8,6 +9,8 @@ import { isSqliteAvailable } from '../../src/sqlite.js'
 import {
   antigravityAppDataDirFromSourcePath,
   antigravityCascadeIdFromPath,
+  canonicalizeInternalModelId,
+  clearAntigravityTranscriptModelCache,
   createAntigravityProvider,
   discoverAntigravitySessionSources,
   extractAntigravityAppDataDirFromLine,
@@ -187,12 +190,53 @@ describe('antigravity provider helpers', () => {
     expect(extractAntigravityModelMap(null)).toEqual({})
   })
 
-  it('never leaks a raw MODEL_PLACEHOLDER id as the canonical model name', () => {
-    // The config key itself is still the unresolved placeholder (Antigravity
-    // hasn't shipped a friendly key/displayName for this model yet).
+  it('resolves known MODEL_PLACEHOLDER ids through the upstream fallback table', () => {
+    // STATIC_MODEL_NAME_FALLBACKS / activeModelSpecs (Antigravity Context
+    // Window Monitor models.ts@603e3ea): a placeholder the upstream table
+    // knows resolves to its priced machine id even when the server sent no
+    // displayName. M26's model_id is claude-opus-4-6.
     expect(extractAntigravityModelMap({
       models: { MODEL_PLACEHOLDER_M26: { model: 'MODEL_PLACEHOLDER_M26' } },
-    })).toEqual({ MODEL_PLACEHOLDER_M26: 'unknown' })
+    })).toEqual({ MODEL_PLACEHOLDER_M26: 'claude-opus-4-6' })
+    expect(extractAntigravityModelMap({
+      models: { MODEL_PLACEHOLDER_M35: { model: 'MODEL_PLACEHOLDER_M35' } },
+    })).toEqual({ MODEL_PLACEHOLDER_M35: 'claude-sonnet-4-6' })
+    expect(extractAntigravityModelMap({
+      models: { MODEL_PLACEHOLDER_M132: { model: 'MODEL_PLACEHOLDER_M132' } },
+    })).toEqual({ MODEL_PLACEHOLDER_M132: 'gemini-3.5-flash' })
+  })
+
+  it('never leaks an unknown MODEL_PLACEHOLDER id as the canonical model name', () => {
+    // Placeholders absent from the upstream table stay honest ('unknown')
+    // rather than guessing.
+    expect(extractAntigravityModelMap({
+      models: { MODEL_PLACEHOLDER_M999: { model: 'MODEL_PLACEHOLDER_M999' } },
+    })).toEqual({ MODEL_PLACEHOLDER_M999: 'unknown' })
+  })
+
+  it('canonicalizes server display labels for reasoning-mode Claude sessions', () => {
+    // '(Thinking)' labels are the placeholders' server display names; the
+    // activeModelSpecs model_id behind them is the plain API id.
+    expect(extractAntigravityModelMap({
+      models: { m35: { model: 'MODEL_PLACEHOLDER_M35', displayName: 'Claude Sonnet 4.6 (Thinking)' } },
+    })).toEqual({ MODEL_PLACEHOLDER_M35: 'claude-sonnet-4-6' })
+    expect(extractAntigravityModelMap({
+      models: { m26: { model: 'MODEL_PLACEHOLDER_M26', displayName: 'Claude Opus 4.6 (Thinking)' } },
+    })).toEqual({ MODEL_PLACEHOLDER_M26: 'claude-opus-4-6' })
+  })
+
+  it('maps Gemini 3.7 Flash display labels onto the priced base row', () => {
+    // Observed in real transcript Model Selection values; postdates the pinned
+    // upstream sources, so every tier folds onto gemini-3.7-flash directly.
+    expect(extractAntigravityModelMap({
+      models: {
+        m298: { model: 'gemini-3.7-flash', displayName: 'Gemini 3.7 Flash (High)' },
+        mXXX: { model: 'MODEL_PLACEHOLDER_MXXX', displayName: 'Gemini 3.7 Flash (Medium)' },
+      },
+    })).toEqual({
+      'gemini-3.7-flash': 'gemini-3.7-flash',
+      MODEL_PLACEHOLDER_MXXX: 'gemini-3.7-flash',
+    })
   })
 
   it('extracts generator metadata from wrapped and unwrapped RPC responses', () => {
@@ -728,5 +772,395 @@ describe('antigravity provider helpers', () => {
     expect(antigravityAppDataDirFromSourcePath(
       'C:\\Users\\Antigravity IDE\\.gemini\\antigravity\\conversations\\abc.db',
     )).toBe('antigravity')
+  })
+})
+
+// Minimal proto encoder for gen_metadata rows, matching the real on-disk
+// shape: GeneratorMetadata.chatModel(#1){ usage(#4){...}, #19 raw model id,
+// repeated #20 key/value attribute pairs, #21 displayName }.
+function encodeGenMetadataRow(options: {
+  inputTokens: number
+  totalOutputTokens: number
+  rawModel?: string
+  displayName?: string
+  modelEnum?: string
+}): string {
+  const varint = (n: number): number[] => {
+    const out: number[] = []
+    let v = n
+    while (v > 0x7f) { out.push((v & 0x7f) | 0x80); v = Math.floor(v / 128) }
+    out.push(v)
+    return out
+  }
+  const tag = (field: number, wire: number): number[] => varint(field * 8 + wire)
+  const varintField = (field: number, n: number): number[] => [...tag(field, 0), ...varint(n)]
+  const lenField = (field: number, bytes: number[]): number[] => [...tag(field, 2), ...varint(bytes.length), ...bytes]
+  const textField = (field: number, text: string): number[] => lenField(field, [...Buffer.from(text, 'utf-8')])
+  const attrPair = (key: string, value: string): number[] =>
+    lenField(20, [...textField(1, key), ...textField(2, value)])
+
+  const usage = lenField(4, [...varintField(2, options.inputTokens), ...varintField(3, options.totalOutputTokens)])
+  const chatModel = [
+    ...usage,
+    ...(options.rawModel ? textField(19, options.rawModel) : []),
+    ...(options.modelEnum ? attrPair('model_enum', options.modelEnum) : []),
+    ...(options.displayName ? textField(21, options.displayName) : []),
+  ]
+  return Buffer.from(lenField(1, chatModel)).toString('hex')
+}
+
+describe('antigravity internal model ids', () => {
+  it('maps MODEL_<VENDOR>_<NAME>_<EFFORT> ids onto priced catalog names', () => {
+    // Exact id observed in real gen_metadata payloads.
+    expect(canonicalizeInternalModelId('MODEL_OPENAI_GPT_OSS_120B_MEDIUM')).toBe('gpt-oss-120b')
+    expect(canonicalizeInternalModelId('MODEL_OPENAI_GPT_OSS_120B_HIGH')).toBe('gpt-oss-120b')
+    expect(canonicalizeInternalModelId('MODEL_OPENAI_GPT_OSS_120B')).toBe('gpt-oss-120b')
+  })
+
+  it('drops internal-id mappings without a priced catalog row instead of guessing', () => {
+    expect(canonicalizeInternalModelId('MODEL_ACME_MYSTERY_XL_9000')).toBeNull()
+    // Underscored version numbers resolve when the catalog covers them.
+    expect(canonicalizeInternalModelId('MODEL_GOOGLE_GEMINI_2_5_FLASH_LOW')).toBe('gemini-2-5-flash')
+    // Effort-only and placeholder-shaped ids carry no resolvable model name.
+    expect(canonicalizeInternalModelId('MODEL_OPENAI_MEDIUM')).toBeNull()
+    expect(canonicalizeInternalModelId('MODEL_PLACEHOLDER_M26')).toBeNull()
+    expect(canonicalizeInternalModelId('claude-sonnet-4-6')).toBeNull()
+  })
+})
+
+describe('antigravity sqlite model attribution from real-data shapes', () => {
+  async function withIsolatedAntigravityHome(fn: (tempHome: string) => Promise<void>): Promise<void> {
+    const tempHome = await mkdtemp(join(tmpdir(), 'codeburn-antigravity-attrib-'))
+    const previousCacheDir = process.env['CODEBURN_CACHE_DIR']
+    const previousHome = process.env['HOME']
+    const previousUserProfile = process.env['USERPROFILE']
+    // homedir() reads these at call time on either platform; overriding both
+    // keeps transcript fallback away from a developer machine's real brain/.
+    process.env['HOME'] = tempHome
+    process.env['USERPROFILE'] = tempHome
+    process.env['CODEBURN_CACHE_DIR'] = join(tempHome, 'cache')
+    clearAntigravityTranscriptModelCache()
+    try {
+      await fn(tempHome)
+    } finally {
+      if (previousCacheDir === undefined) delete process.env['CODEBURN_CACHE_DIR']
+      else process.env['CODEBURN_CACHE_DIR'] = previousCacheDir
+      if (previousHome === undefined) delete process.env['HOME']
+      else process.env['HOME'] = previousHome
+      if (previousUserProfile === undefined) delete process.env['USERPROFILE']
+      else process.env['USERPROFILE'] = previousUserProfile
+      clearAntigravityTranscriptModelCache()
+      await rm(tempHome, { recursive: true, force: true })
+    }
+  }
+
+  async function parseSingleRowDb(tempHome: string, hex: string): Promise<ParsedProviderCall> {
+    const cascadeId = randomUUID()
+    const conversationsDir = join(tempHome, '.gemini', 'antigravity-ide', 'conversations')
+    await mkdir(conversationsDir, { recursive: true })
+    createCurrentAntigravityCliDb(join(conversationsDir, `${cascadeId}.db`), {
+      conversationId: cascadeId,
+      rows: [{ idx: 0, hex }],
+    })
+
+    const calls = await collectAntigravityCalls({
+      path: join(conversationsDir, `${cascadeId}.db`),
+      project: 'antigravity-ide',
+      provider: 'antigravity',
+    })
+    expect(calls).toHaveLength(1)
+    return calls[0]!
+  }
+
+  it('attributes rows to the raw API model id when the live model map is unavailable', async () => {
+    if (!isSqliteAvailable()) return
+
+    await withIsolatedAntigravityHome(async (tempHome) => {
+      // Real-world shape: model_enum still holds MODEL_PLACEHOLDER_M20 while
+      // field #19 carries the id actually served. The old enum-first fallback
+      // reported these as 'unknown'.
+      const call = await parseSingleRowDb(tempHome, encodeGenMetadataRow({
+        inputTokens: 30265,
+        totalOutputTokens: 730,
+        rawModel: 'claude-sonnet-4-6',
+        modelEnum: 'MODEL_PLACEHOLDER_M20',
+      }))
+
+      expect(call.model).toBe('claude-sonnet-4-6')
+      expect(call.costUSD).toBeGreaterThan(0)
+    })
+  })
+
+  it('canonicalizes gpt-oss rows recorded with an internal enum id', async () => {
+    if (!isSqliteAvailable()) return
+
+    await withIsolatedAntigravityHome(async (tempHome) => {
+      // Real-world shape for GPT-OSS traffic: every field names the same model
+      // in its own dialect. The raw id plus effort-suffix stripping lands on
+      // the priced catalog name.
+      const call = await parseSingleRowDb(tempHome, encodeGenMetadataRow({
+        inputTokens: 100,
+        totalOutputTokens: 50,
+        rawModel: 'gpt-oss-120b-medium',
+        displayName: 'GPT-OSS 120B (Medium)',
+        modelEnum: 'MODEL_OPENAI_GPT_OSS_120B_MEDIUM',
+      }))
+
+      expect(call.model).toBe('gpt-oss-120b')
+      expect(call.costUSD).toBeGreaterThan(0)
+    })
+  })
+
+  it('resolves enum-style ids via the priced mapping when no raw id exists', async () => {
+    if (!isSqliteAvailable()) return
+
+    await withIsolatedAntigravityHome(async (tempHome) => {
+      const call = await parseSingleRowDb(tempHome, encodeGenMetadataRow({
+        inputTokens: 100,
+        totalOutputTokens: 50,
+        modelEnum: 'MODEL_OPENAI_GPT_OSS_120B_MEDIUM',
+      }))
+
+      expect(call.model).toBe('gpt-oss-120b')
+      expect(call.costUSD).toBeGreaterThan(0)
+    })
+  })
+
+  it('keeps genuinely signal-less rows as unknown rather than guessing', async () => {
+    if (!isSqliteAvailable()) return
+
+    await withIsolatedAntigravityHome(async (tempHome) => {
+      const call = await parseSingleRowDb(tempHome, encodeGenMetadataRow({
+        inputTokens: 100,
+        totalOutputTokens: 50,
+      }))
+
+      expect(call.model).toBe('unknown')
+    })
+  })
+
+  it('prices enum-only rows carrying a placeholder from the upstream fallback table', async () => {
+    if (!isSqliteAvailable()) return
+
+    await withIsolatedAntigravityHome(async (tempHome) => {
+      // Real-world shape observed offline: rawModel #19 absent, model_enum a
+      // bare MODEL_PLACEHOLDER_M35 with no displayName anywhere. The table
+      // resolves M35 to its machine id instead of leaking 'unknown'.
+      const call = await parseSingleRowDb(tempHome, encodeGenMetadataRow({
+        inputTokens: 100,
+        totalOutputTokens: 50,
+        modelEnum: 'MODEL_PLACEHOLDER_M35',
+      }))
+
+      expect(call.model).toBe('claude-sonnet-4-6')
+      expect(call.costUSD).toBeGreaterThan(0)
+    })
+  })
+
+  it('resolves opaque wire ids through model_enum ahead of the verbatim #19 name', async () => {
+    if (!isSqliteAvailable()) return
+
+    await withIsolatedAntigravityHome(async (tempHome) => {
+      // Real on-disk shapes: 'gemini-pro-a'/'gemini-pro-c' pair with
+      // MODEL_PLACEHOLDER_M16 (the Gemini 3.1 Pro family) and 'gemini-default'
+      // pairs with M20 (Gemini 3.5 Flash) on every observed row. These are
+      // opaque role names whose tier only the enum discloses, so the
+      // enum-mapped SKU must win over the literal wire id.
+      const proA = await parseSingleRowDb(tempHome, encodeGenMetadataRow({
+        inputTokens: 100,
+        totalOutputTokens: 50,
+        rawModel: 'gemini-pro-a',
+        modelEnum: 'MODEL_PLACEHOLDER_M16',
+      }))
+      expect(proA.model).toBe('gemini-3.1-pro')
+      expect(proA.costUSD).toBeGreaterThan(0)
+
+      const proC = await parseSingleRowDb(tempHome, encodeGenMetadataRow({
+        inputTokens: 100,
+        totalOutputTokens: 50,
+        rawModel: 'gemini-pro-c',
+        modelEnum: 'MODEL_PLACEHOLDER_M16',
+      }))
+      expect(proC.model).toBe('gemini-3.1-pro')
+      expect(proC.costUSD).toBeGreaterThan(0)
+
+      const flash = await parseSingleRowDb(tempHome, encodeGenMetadataRow({
+        inputTokens: 100,
+        totalOutputTokens: 50,
+        rawModel: 'gemini-default',
+        modelEnum: 'MODEL_PLACEHOLDER_M20',
+      }))
+      expect(flash.model).toBe('gemini-3.5-flash')
+      expect(flash.costUSD).toBeGreaterThan(0)
+    })
+  })
+
+  it('prices opaque wire ids without an enum via the builtin alias fallback', async () => {
+    if (!isSqliteAvailable()) return
+
+    await withIsolatedAntigravityHome(async (tempHome) => {
+      // Rows lacking model_enum keep the verbatim wire id as their model label
+      // but still price through the BUILTIN_ALIASES fallback layer.
+      const proA = await parseSingleRowDb(tempHome, encodeGenMetadataRow({
+        inputTokens: 100,
+        totalOutputTokens: 50,
+        rawModel: 'gemini-pro-a',
+      }))
+      expect(proA.model).toBe('gemini-pro-a')
+      expect(proA.costUSD).toBeGreaterThan(0)
+
+      const flash = await parseSingleRowDb(tempHome, encodeGenMetadataRow({
+        inputTokens: 100,
+        totalOutputTokens: 50,
+        rawModel: 'gemini-default',
+      }))
+      expect(flash.model).toBe('gemini-default')
+      expect(flash.costUSD).toBeGreaterThan(0)
+    })
+  })
+
+  it('still prefers the raw API model id over the enum for clean ids', async () => {
+    if (!isSqliteAvailable()) return
+
+    await withIsolatedAntigravityHome(async (tempHome) => {
+      // Regression guard for the opaque-wire-id override above:
+      // claude-sonnet-4-6 is a clean API id, not a role name, so #19 keeps
+      // precedence even when the accompanying placeholder enum would map
+      // elsewhere (M16 is the Gemini 3.1 Pro slot).
+      const call = await parseSingleRowDb(tempHome, encodeGenMetadataRow({
+        inputTokens: 30265,
+        totalOutputTokens: 730,
+        rawModel: 'claude-sonnet-4-6',
+        modelEnum: 'MODEL_PLACEHOLDER_M16',
+      }))
+
+      expect(call.model).toBe('claude-sonnet-4-6')
+      expect(call.costUSD).toBeGreaterThan(0)
+    })
+  })
+
+  it('canonicalizes Claude (Thinking) transcript labels to the plain API id', async () => {
+    if (!isSqliteAvailable()) return
+
+    await withIsolatedAntigravityHome(async (tempHome) => {
+      const cascadeId = randomUUID()
+      const conversationsDir = join(tempHome, '.gemini', 'antigravity-ide', 'conversations')
+      const logsDir = join(
+        tempHome,
+        '.gemini',
+        'antigravity-ide',
+        'brain',
+        cascadeId,
+        '.system_generated',
+        'logs',
+      )
+      await mkdir(conversationsDir, { recursive: true })
+      await mkdir(logsDir, { recursive: true })
+      await writeFile(join(logsDir, 'transcript.jsonl'), [
+        JSON.stringify({ step_index: 1, text: 'changed setting `Model Selection` from None to Claude Sonnet 4.6 (Thinking). No need to change it again.' }),
+        '',
+      ].join('\n'))
+
+      createCurrentAntigravityCliDb(join(conversationsDir, `${cascadeId}.db`), {
+        conversationId: cascadeId,
+        rows: [{
+          idx: 0,
+          hex: encodeGenMetadataRow({ inputTokens: 100, totalOutputTokens: 50 }),
+        }],
+      })
+
+      const calls = await collectAntigravityCalls({
+        path: join(conversationsDir, `${cascadeId}.db`),
+        project: 'antigravity-ide',
+        provider: 'antigravity',
+      })
+
+      expect(calls).toHaveLength(1)
+      expect(calls[0]!.model).toBe('claude-sonnet-4-6')
+      expect(calls[0]!.costUSD).toBeGreaterThan(0)
+    })
+  })
+
+  it('canonicalizes Gemini 3.7 Flash transcript labels onto the priced base row', async () => {
+    if (!isSqliteAvailable()) return
+
+    await withIsolatedAntigravityHome(async (tempHome) => {
+      const cascadeId = randomUUID()
+      const conversationsDir = join(tempHome, '.gemini', 'antigravity-ide', 'conversations')
+      const logsDir = join(
+        tempHome,
+        '.gemini',
+        'antigravity-ide',
+        'brain',
+        cascadeId,
+        '.system_generated',
+        'logs',
+      )
+      await mkdir(conversationsDir, { recursive: true })
+      await mkdir(logsDir, { recursive: true })
+      await writeFile(join(logsDir, 'transcript.jsonl'), [
+        JSON.stringify({ step_index: 1, text: 'changed setting `Model Selection` from None to Gemini 3.7 Flash (High). No need to change it again.' }),
+        '',
+      ].join('\n'))
+
+      createCurrentAntigravityCliDb(join(conversationsDir, `${cascadeId}.db`), {
+        conversationId: cascadeId,
+        rows: [{
+          idx: 0,
+          hex: encodeGenMetadataRow({ inputTokens: 100, totalOutputTokens: 50 }),
+        }],
+      })
+
+      const calls = await collectAntigravityCalls({
+        path: join(conversationsDir, `${cascadeId}.db`),
+        project: 'antigravity-ide',
+        provider: 'antigravity',
+      })
+
+      expect(calls).toHaveLength(1)
+      expect(calls[0]!.model).toBe('gemini-3.7-flash')
+      expect(calls[0]!.costUSD).toBeGreaterThan(0)
+    })
+  })
+
+  it('recovers the model from the brain transcript when no gen_metadata field has one', async () => {
+    if (!isSqliteAvailable()) return
+
+    await withIsolatedAntigravityHome(async (tempHome) => {
+      const cascadeId = randomUUID()
+      const conversationsDir = join(tempHome, '.gemini', 'antigravity-ide', 'conversations')
+      const logsDir = join(
+        tempHome,
+        '.gemini',
+        'antigravity-ide',
+        'brain',
+        cascadeId,
+        '.system_generated',
+        'logs',
+      )
+      await mkdir(conversationsDir, { recursive: true })
+      await mkdir(logsDir, { recursive: true })
+      await writeFile(join(logsDir, 'transcript.jsonl'), [
+        JSON.stringify({ step_index: 1, text: 'changed setting `Model Selection` from Gemini 3 Pro to Gemini 3.5 Flash (High). No need to change it again.' }),
+        '',
+      ].join('\n'))
+
+      createCurrentAntigravityCliDb(join(conversationsDir, `${cascadeId}.db`), {
+        conversationId: cascadeId,
+        rows: [{
+          idx: 0,
+          hex: encodeGenMetadataRow({ inputTokens: 100, totalOutputTokens: 50 }),
+        }],
+      })
+
+      const calls = await collectAntigravityCalls({
+        path: join(conversationsDir, `${cascadeId}.db`),
+        project: 'antigravity-ide',
+        provider: 'antigravity',
+      })
+
+      expect(calls).toHaveLength(1)
+      expect(calls[0]!.model).toBe('gemini-3.5-flash-high')
+    })
   })
 })

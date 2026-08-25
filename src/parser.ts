@@ -2509,6 +2509,10 @@ function providerCallToTurn(call: ParsedProviderCall): ParsedTurn {
     ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
   })
 
+  if (apiCall.costUSD < 0 && call.sessionId && process.env['CODEBURN_VERBOSE'] === '1') {
+    console.log(`[parser] Negative fresh-parse cost detected for session id: ${call.sessionId} (model: ${call.model}, costUSD: ${apiCall.costUSD})`)
+  }
+
   const prRefs = extractPrUrlsFromText(call.userMessage)
   return {
     userMessage: call.userMessage,
@@ -2679,7 +2683,7 @@ function providerCallsToCachedTurns(calls: ParsedProviderCall[]): CachedTurn[] {
   return turns
 }
 
-function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
+function cachedCallToApiCall(call: CachedCall, sessionId?: string): ParsedApiCall {
   const u = call.usage
   // Cache-rehydration twin of the fresh-parse pricing in
   // src/providers/codex.ts (and every other provider's parser): both go
@@ -2691,6 +2695,14 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
     u.cacheCreationInputTokens, u.cacheReadInputTokens,
     u.webSearchRequests, call.speed, u.cacheCreationOneHourTokens,
   )
+  // Honor whatever server-billed cost the write side stored (upstream
+  // semantics): the cache-write allowlist already gates which providers may
+  // persist costUSD, so the read side must not re-filter it — re-filtering
+  // dropped quickdesk/cline-cli costs and re-priced them from tokens.
+  const finalCost = call.costUSD ?? costUSD
+  if (finalCost < 0 && sessionId && process.env['CODEBURN_VERBOSE'] === '1') {
+    console.log(`[parser] Negative cached cost detected for session id: ${sessionId} (model: ${call.model}, stored: ${call.costUSD}, calculated: ${costUSD})`)
+  }
   return applyLocalModelSavings({
     provider: call.provider,
     model: call.model,
@@ -2703,7 +2715,7 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
       reasoningTokens: u.reasoningTokens,
       webSearchRequests: u.webSearchRequests,
     },
-    costUSD: call.costUSD ?? costUSD,
+    costUSD: finalCost,
     isEstimated: call.isEstimated,
     tools: call.tools,
     mcpTools: extractMcpTools(call.tools),
@@ -2737,7 +2749,7 @@ function cachedTurnToClassified(turn: CachedTurn, resolvedBranch?: string): Clas
   const prRefs = turn.prRefs?.length ? turn.prRefs : extractPrUrlsFromText(turn.userMessage)
   const parsed: ParsedTurn = {
     userMessage: turn.userMessage,
-    assistantCalls: turn.calls.map(cachedCallToApiCall),
+    assistantCalls: turn.calls.map(c => cachedCallToApiCall(c, turn.sessionId)),
     timestamp: turn.timestamp,
     sessionId: turn.sessionId,
     ...(branch ? { gitBranch: branch } : {}),
@@ -3181,9 +3193,11 @@ export function createScanProgress(label: string, total: number) {
 // Shared by the turn-range slicers below: which of a turn's calls actually
 // fall inside dateRange. Returns null when none do (the turn should be dropped
 // entirely, not kept with an empty call list).
-function callsInRange<T extends { timestamp: string }>(calls: T[], dateRange: DateRange): T[] | null {
+function callsInRange<T extends { timestamp: string }>(calls: T[], dateRange: DateRange, fallbackTs?: string): T[] | null {
   const inRange = calls.filter(c => {
-    const ts = new Date(c.timestamp)
+    const rawTs = c.timestamp || fallbackTs
+    if (!rawTs) return true
+    const ts = new Date(rawTs)
     return !Number.isNaN(ts.getTime()) && ts >= dateRange.start && ts <= dateRange.end
   })
   return inRange.length > 0 ? inRange : null
@@ -3198,10 +3212,10 @@ function callsInRange<T extends { timestamp: string }>(calls: T[], dateRange: Da
 // retained calls actually fall in, not the pre-slice turn's original
 // (possibly prior-day) start. Returns null when no call is in range.
 function turnSlicedToRange(turn: CachedTurn, dateRange: DateRange): CachedTurn | null {
-  const inRangeCalls = callsInRange(turn.calls, dateRange)
+  const inRangeCalls = callsInRange(turn.calls, dateRange, turn.timestamp)
   if (!inRangeCalls) return null
   if (inRangeCalls.length === turn.calls.length) return turn
-  return { ...turn, calls: inRangeCalls, timestamp: inRangeCalls[0]!.timestamp }
+  return { ...turn, calls: inRangeCalls, timestamp: inRangeCalls[0]!.timestamp || turn.timestamp }
 }
 
 // Same slice, applied post-classification (scanProjectDirs classifies each
@@ -3212,10 +3226,10 @@ function turnSlicedToRange(turn: CachedTurn, dateRange: DateRange): CachedTurn |
 // Those are turn-level judgments about the whole exchange, not a per-call
 // sum, so they aren't recomputed from the partial call list.
 function classifiedTurnSlicedToRange(turn: ClassifiedTurn, dateRange: DateRange): ClassifiedTurn | null {
-  const inRangeCalls = callsInRange(turn.assistantCalls, dateRange)
+  const inRangeCalls = callsInRange(turn.assistantCalls, dateRange, turn.timestamp)
   if (!inRangeCalls) return null
   if (inRangeCalls.length === turn.assistantCalls.length) return turn
-  return { ...turn, assistantCalls: inRangeCalls, timestamp: inRangeCalls[0]!.timestamp }
+  return { ...turn, assistantCalls: inRangeCalls, timestamp: inRangeCalls[0]!.timestamp || turn.timestamp }
 }
 
 // Day-set variant of classifiedTurnSlicedToRange for the menubar/history day
@@ -3223,12 +3237,14 @@ function classifiedTurnSlicedToRange(turn: ClassifiedTurn, dateRange: DateRange)
 // re-anchor `timestamp` to the first survivor — the same split rule.
 function classifiedTurnSlicedToDays(turn: ClassifiedTurn, days: Set<string>): ClassifiedTurn | null {
   const inRangeCalls = turn.assistantCalls.filter(c => {
-    const ts = new Date(c.timestamp)
-    return !Number.isNaN(ts.getTime()) && days.has(dateKey(c.timestamp))
+    const rawTs = c.timestamp || turn.timestamp
+    if (!rawTs) return true
+    const ts = new Date(rawTs)
+    return !Number.isNaN(ts.getTime()) && days.has(dateKey(rawTs))
   })
   if (inRangeCalls.length === 0) return null
   if (inRangeCalls.length === turn.assistantCalls.length) return turn
-  return { ...turn, assistantCalls: inRangeCalls, timestamp: inRangeCalls[0]!.timestamp }
+  return { ...turn, assistantCalls: inRangeCalls, timestamp: inRangeCalls[0]!.timestamp || turn.timestamp }
 }
 
 export async function parseProviderSources(

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url'
 import https from 'https'
 
 import { getCodeburnCacheDir, readExistingTextFile } from '../cache-dir.js'
-import { calculateCost } from '../models.js'
+import { calculateCost, getModelCosts } from '../models.js'
 import { isSqliteAvailable, isSqliteBusyError, openDatabase } from '../sqlite.js'
 import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
@@ -49,7 +49,7 @@ function conversationRoots(): readonly AntigravityConversationRoot[] {
     },
   ]
 }
-const CACHE_VERSION = 5
+const CACHE_VERSION = 6
 export const ANTIGRAVITY_CACHE_VERSION = CACHE_VERSION
 export const ANTIGRAVITY_LEGACY_CACHE_FILE = 'antigravity-results.json'
 export function antigravityCacheFileName(version = CACHE_VERSION): string {
@@ -146,6 +146,7 @@ type CachedCascade = {
 type AntigravityCache = {
   version: number
   cascades: Record<string, CachedCascade>
+  modelMap?: ModelMap
 }
 
 type ProtoField = {
@@ -295,9 +296,106 @@ function dropPlaceholderModelId(model: string): string {
   return MODEL_PLACEHOLDER_PATTERN.test(model) ? 'unknown' : model
 }
 
+// Antigravity also records non-placeholder internal ids in enum style:
+// MODEL_<VENDOR>_<MODELNAME>[_<EFFORT>], all-caps with underscores (observed in
+// real gen_metadata payloads: MODEL_OPENAI_GPT_OSS_120B_MEDIUM). Leaking one of
+// these into a report shows a raw internal id as a model name.
+const INTERNAL_MODEL_ID_PATTERN = /^MODEL_[A-Z0-9_]+$/
+const INTERNAL_MODEL_EFFORT_SUFFIXES = new Set(['MEDIUM', 'HIGH', 'LOW'])
+
+// MODEL_PLACEHOLDER_* enums observed in GetAvailableModels / gen_metadata
+// payloads, resolved via the upstream STATIC_MODEL_NAME_FALLBACKS and
+// activeModelSpecs tables (Antigravity Context Window Monitor models.ts@603e3ea;
+// fetch response shape confirmed by Antigravity Manager quota.rs@dfe8765).
+// Every tier spelling collapses onto its priced base SKU here exactly like
+// BUILTIN_ALIASES does elsewhere — note M20's wire id says "low" while its
+// server label reads "(Medium)", and M187 is the true "(Low)": pricing-wise
+// both land on gemini-3.5-flash, so the distinction is preserved in this table
+// rather than in invented per-tier rates. Unlisted placeholders keep falling
+// through to 'unknown' (dropPlaceholderModelId) instead of guessing.
+const PLACEHOLDER_MODEL_IDS: Record<string, string> = {
+  MODEL_PLACEHOLDER_M16:  'gemini-3.1-pro',
+  MODEL_PLACEHOLDER_M18:  'gemini-3-flash-preview',
+  MODEL_PLACEHOLDER_M20:  'gemini-3.5-flash',
+  MODEL_PLACEHOLDER_M26:  'claude-opus-4-6',
+  MODEL_PLACEHOLDER_M35:  'claude-sonnet-4-6',
+  MODEL_PLACEHOLDER_M36:  'gemini-3.1-pro',
+  MODEL_PLACEHOLDER_M37:  'gemini-3.1-pro',
+  MODEL_PLACEHOLDER_M47:  'gemini-3-flash-preview',
+  MODEL_PLACEHOLDER_M84:  'gemini-3-flash-preview',
+  MODEL_PLACEHOLDER_M132: 'gemini-3.5-flash',
+  MODEL_PLACEHOLDER_M133: 'gemini-3.5-flash',
+  MODEL_PLACEHOLDER_M187: 'gemini-3.5-flash',
+}
+
+// Wire ids (#19 rawModel) that are opaque role names rather than API model
+// ids: their actual tier is only determined by the model_enum attribute
+// carried alongside them. Observed on real on-disk rows: 'gemini-pro-a' and
+// 'gemini-pro-c' pair with MODEL_PLACEHOLDER_M16 (the Gemini 3.1 Pro family)
+// while 'gemini-default' pairs with MODEL_PLACEHOLDER_M20 (Gemini 3.5 Flash)
+// on every row — never M84. (Antigravity Context Window Monitor
+// models.ts@603e3ea; fetch/quota shape confirmed by Antigravity Manager
+// quota.rs@dfe8765.) For these names the enum-mapped SKU wins over the
+// verbatim wire id; every other #19 value keeps its existing precedence.
+const OPAQUE_WIRE_MODEL_IDS: ReadonlySet<string> = new Set([
+  'gemini-default',
+  'gemini-pro-a',
+  'gemini-pro-b',
+  'gemini-pro-c',
+])
+
+// Resolve an internal MODEL_* id to the pricing-catalog name it denotes, or
+// null when it isn't internal-style or the derived name has no priced row.
+// The derivation is generic — strip the leading MODEL_<VENDOR>_ wrapper and any
+// trailing reasoning-effort segment, then join the rest with dashes — but a
+// derived name is only returned when the pricing catalog actually covers it,
+// so an unmapped vendor/model combination falls through to the caller's next
+// signal instead of inventing an unpriced model name.
+export function canonicalizeInternalModelId(model: string): string | null {
+  if (!INTERNAL_MODEL_ID_PATTERN.test(model) || MODEL_PLACEHOLDER_PATTERN.test(model)) return null
+  const segments = model.slice('MODEL_'.length).split('_').slice(1)
+  while (segments.length > 0 && INTERNAL_MODEL_EFFORT_SUFFIXES.has(segments[segments.length - 1]!)) {
+    segments.pop()
+  }
+  if (segments.length === 0) return null
+  const candidate = segments.join('-').toLowerCase()
+  return getModelCosts(candidate) !== null ? candidate : null
+}
+
 function getCanonicalModelId(key: string, displayName?: string): string {
   if (displayName) {
     const lower = displayName.toLowerCase()
+    if (lower.includes('nano banana') || lower.includes('nanobanana')) {
+      if (lower.includes('pro')) return 'gemini-3-pro-image'
+      if (lower.includes('lite')) return 'gemini-3.1-flash-image'
+      return 'gemini-3.1-flash-image'
+    }
+    if (lower.includes('imagen')) {
+      return 'imagen-3'
+    }
+    if (lower.includes('veo')) {
+      if (lower.includes('3')) return 'veo-3'
+      return 'veo-2'
+    }
+    // Reasoning-mode Claude labels are the placeholders' server display names
+    // (STATIC_MODEL_NAME_FALLBACKS, Antigravity Context Window Monitor
+    // models.ts@603e3ea): '(Thinking)' describes the session's reasoning mode,
+    // while activeModelSpecs serves the plain API id returned below. Observed
+    // in real gen_metadata displayName fields and Model Selection transcript
+    // values.
+    if (lower.includes('claude sonnet 4.6')) {
+      return 'claude-sonnet-4-6'
+    }
+    if (lower.includes('claude opus 4.6')) {
+      return 'claude-opus-4-6'
+    }
+    // 'Gemini 3.7 Flash (High)' postdates the pinned sources above (no machine
+    // id for it there), so it is handled purely as a display label; every tier
+    // folds onto the priced base row per repo precedent. Observed in real
+    // transcript Model Selection values.
+    if (lower.includes('3.7 flash')) {
+      return 'gemini-3.7-flash'
+    }
     if (lower.includes('3.5 flash')) {
       if (lower.includes('high')) return 'gemini-3.5-flash-high'
       if (lower.includes('medium')) return 'gemini-3.5-flash-medium'
@@ -305,6 +403,7 @@ function getCanonicalModelId(key: string, displayName?: string): string {
       return 'gemini-3.5-flash'
     }
     if (lower.includes('3.1 pro')) {
+      if (lower.includes('image')) return 'gemini-3-pro-image'
       if (lower.includes('high')) return 'gemini-3.1-pro-high'
       if (lower.includes('low')) return 'gemini-3.1-pro-low'
       return 'gemini-3.1-pro'
@@ -314,14 +413,35 @@ function getCanonicalModelId(key: string, displayName?: string): string {
       if (lower.includes('lite')) return 'gemini-3.1-flash-lite'
       return 'gemini-3.1-flash'
     }
-    if (lower.includes('3 flash')) {
-      return 'gemini-3-flash'
-    }
     if (lower.includes('3 pro')) {
+      if (lower.includes('image')) return 'gemini-3-pro-image'
       return 'gemini-3-pro'
     }
+    if (lower.includes('3 flash')) {
+      if (lower.includes('image')) return 'gemini-3.1-flash-image'
+      return 'gemini-3-flash'
+    }
+    if (lower.includes('2.5 flash') || lower.includes('2-5 flash')) {
+      if (lower.includes('image')) return 'gemini-2.5-flash-image'
+      return 'gemini-2.5-flash'
+    }
   }
-  return dropPlaceholderModelId(key)
+
+  const lowerKey = key.toLowerCase()
+  if (lowerKey.includes('nano-banana') || lowerKey.includes('nanobanana')) {
+    if (lowerKey.includes('pro')) return 'gemini-3-pro-image'
+    return 'gemini-3.1-flash-image'
+  }
+
+  let canonical = key
+  const placeholderTarget = PLACEHOLDER_MODEL_IDS[key]
+  if (placeholderTarget) {
+    canonical = placeholderTarget
+  } else if (key.startsWith('MODEL_PLACEHOLDER_') && displayName) {
+    canonical = displayName.toLowerCase().replace(/\s+/g, '-').replace(/[()]/g, '')
+  }
+  canonical = canonical.replace(/-(high|low|medium|extra-low|extra-high)$/i, '')
+  return dropPlaceholderModelId(canonical)
 }
 
 export function extractAntigravityModelMap(resp: unknown): ModelMap {
@@ -332,7 +452,12 @@ export function extractAntigravityModelMap(resp: unknown): ModelMap {
   if (!models) return {}
   for (const [key, info] of Object.entries(models)) {
     if (info && typeof info === 'object' && typeof info.model === 'string') {
-      const canonicalKey = getCanonicalModelId(key, info.displayName)
+      let canonicalKey = key;
+      if (info.model.startsWith('MODEL_PLACEHOLDER_') && info.displayName) {
+        canonicalKey = getCanonicalModelId(info.model, info.displayName)
+      } else {
+        canonicalKey = getCanonicalModelId(key, info.displayName)
+      }
       map.set(info.model, canonicalKey)
     }
   }
@@ -455,7 +580,7 @@ async function resolveEphemeralPort(csrfToken: string, appDataDir?: 'antigravity
         "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -like '*language_server*' -and $_.CommandLine -like '*antigravity*' } | ForEach-Object { @{ PID = $_.ProcessId; Cmd = $_.CommandLine } | ConvertTo-Json -Compress }"
       ].join('; ')
       const output = await execFileText('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], 5000)
-      
+
       let targetPid = 0
       for (const line of output.split(/\r?\n/)) {
         if (!line.trim()) continue
@@ -470,15 +595,15 @@ async function resolveEphemeralPort(csrfToken: string, appDataDir?: 'antigravity
           }
         } catch { /* skip invalid parse */ }
       }
-      
+
       if (targetPid === 0) return null
-      
+
       const portScript = `Get-NetTCPConnection -State Listen -OwningProcess ${targetPid} | Select-Object -ExpandProperty LocalPort`
       const portOutput = await execFileText('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', portScript], 5000)
       const ports = portOutput.split(/\r?\n/)
         .map(p => Number(p.trim()))
         .filter(p => Number.isInteger(p) && p > 0)
-      
+
       for (const port of ports) {
         try {
           await new Promise((resolve, reject) => {
@@ -752,15 +877,53 @@ function antigravitySqliteMetadataAttributes(chatFields: readonly ProtoField[]):
   return attributes
 }
 
-function antigravitySqliteModel(chatFields: readonly ProtoField[]): string {
+function antigravitySqliteModel(chatFields: readonly ProtoField[], modelMap?: ModelMap): string {
   const attributes = antigravitySqliteMetadataAttributes(chatFields)
   const displayName = protoFieldText(firstProtoField(chatFields, 21))
   const rawModel = protoFieldText(firstProtoField(chatFields, 19))
-    ?? attributes.get('model_enum')
-    ?? displayName
-    ?? 'unknown'
+  const modelEnum = attributes.get('model_enum')
 
-  return getCanonicalModelId(rawModel, displayName)
+  const mappedModel = modelMap && modelEnum ? modelMap[modelEnum] : undefined
+
+  // Real gen_metadata rows carry the API-facing model id actually served for
+  // the turn in field #19 ('claude-sonnet-4-6', 'gpt-oss-120b-medium'), while
+  // model_enum carries an internal identifier that is only meaningful once
+  // translated. The old enum-first fallback attributed whole sessions to
+  // 'unknown' (MODEL_PLACEHOLDER_*) or a raw internal id (MODEL_OPENAI_*)
+  // whenever the live GetAvailableModels map couldn't translate the enum —
+  // e.g. every parse run while Antigravity is closed. Prefer the raw id;
+  // consult the enum only after resolving it to a priced catalog name.
+  let finalModel: string | undefined = mappedModel
+  if (!finalModel && modelEnum && !INTERNAL_MODEL_ID_PATTERN.test(modelEnum)) {
+    finalModel = modelEnum
+  }
+  // Opaque wire ids are role names whose tier only the enum discloses, so a
+  // known placeholder enum outranks the verbatim #19 string: attributing
+  // 'gemini-pro-a' + MODEL_PLACEHOLDER_M16 to a literal wire name would price
+  // Gemini 3.1 Pro traffic under an unpriced id (and 'gemini-default' +
+  // M20 likewise). Clean API ids ('claude-sonnet-4-6') are not in the set and
+  // keep winning over the enum below.
+  if (!finalModel && rawModel && modelEnum && OPAQUE_WIRE_MODEL_IDS.has(rawModel)
+    && PLACEHOLDER_MODEL_IDS[modelEnum]) {
+    finalModel = PLACEHOLDER_MODEL_IDS[modelEnum]
+  }
+  if (!finalModel && rawModel && !INTERNAL_MODEL_ID_PATTERN.test(rawModel)) {
+    finalModel = rawModel
+  }
+  if (!finalModel && modelEnum) {
+    // Known MODEL_PLACEHOLDER_* enums resolve straight to their priced SKU
+    // (PLACEHOLDER_MODEL_IDS); any other internal id goes through the generic
+    // derivation, which still returns null unless the catalog covers it.
+    finalModel = PLACEHOLDER_MODEL_IDS[modelEnum] ?? canonicalizeInternalModelId(modelEnum) ?? undefined
+  }
+  if (!finalModel && rawModel) {
+    finalModel = canonicalizeInternalModelId(rawModel) ?? undefined
+  }
+  if (!finalModel) {
+    finalModel = displayName
+  }
+
+  return getCanonicalModelId(finalModel ?? 'unknown', displayName)
 }
 
 // Decode a proto field that carries a time into an ISO-8601 string. Antigravity
@@ -797,7 +960,46 @@ function antigravitySqliteCreatedAt(chatFields: readonly ProtoField[]): string {
   return protoTimestampToIso(firstProtoField(parseProtoFields(metadataBytes), 4))
 }
 
-function buildCallFromSqliteGenMetadataRow(cascadeId: string, row: AntigravityGenMetadataRow): ParsedProviderCall | null {
+const transcriptModelCache = new Map<string, string | null>()
+
+export function clearAntigravityTranscriptModelCache(): void {
+  transcriptModelCache.clear()
+}
+
+export async function inferAntigravityTranscriptModel(cascadeId: string): Promise<string | null> {
+  if (transcriptModelCache.has(cascadeId)) return transcriptModelCache.get(cascadeId)!
+  const home = homedir()
+  const candidatePaths = [
+    join(home, '.gemini', 'antigravity', 'brain', cascadeId, '.system_generated', 'logs', 'transcript.jsonl'),
+    join(home, '.gemini', 'antigravity', 'brain', cascadeId, '.system_generated', 'logs', 'transcript_full.jsonl'),
+    join(home, '.gemini', 'antigravity-cli', 'brain', cascadeId, '.system_generated', 'logs', 'transcript.jsonl'),
+    join(home, '.gemini', 'antigravity-cli', 'brain', cascadeId, '.system_generated', 'logs', 'transcript_full.jsonl'),
+    join(home, '.gemini', 'antigravity-ide', 'brain', cascadeId, '.system_generated', 'logs', 'transcript.jsonl'),
+    join(home, '.gemini', 'antigravity-ide', 'brain', cascadeId, '.system_generated', 'logs', 'transcript_full.jsonl'),
+  ]
+
+  for (const p of candidatePaths) {
+    try {
+      const fileRes = await readExistingTextFile(p)
+      if (fileRes.status !== 'ok' || !fileRes.text) continue
+      const match = fileRes.text.match(/changed setting [`']Model Selection[`'] from .*? to (.*?)(?:\. No need|\.\s|\.$|\r?\n|<)/i)
+      if (match && match[1]) {
+        const canonical = getCanonicalModelId(match[1].trim(), match[1].trim())
+        if (canonical && canonical !== 'unknown') {
+          transcriptModelCache.set(cascadeId, canonical)
+          return canonical
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  transcriptModelCache.set(cascadeId, null)
+  return null
+}
+
+async function buildCallFromSqliteGenMetadataRow(cascadeId: string, row: AntigravityGenMetadataRow, modelMap?: ModelMap): Promise<ParsedProviderCall | null> {
   const rootFields = parseProtoFields(genMetadataDataBytes(row.data))
   const chatFields = parseProtoFields(protoFieldBytes(firstProtoField(rootFields, 1)) ?? new Uint8Array())
   const usageFields = parseProtoFields(protoFieldBytes(firstProtoField(chatFields, 4)) ?? new Uint8Array())
@@ -819,7 +1021,11 @@ function buildCallFromSqliteGenMetadataRow(cascadeId: string, row: AntigravityGe
   if (inputTokens === 0 && totalOutputTokens === 0) return null
 
   const responseId = antigravitySqliteResponseId(usageFields, String(row.idx))
-  const model = antigravitySqliteModel(chatFields)
+  let model = antigravitySqliteModel(chatFields, modelMap)
+  if (model === 'unknown') {
+    const inferred = await inferAntigravityTranscriptModel(cascadeId)
+    if (inferred) model = inferred
+  }
   const pricingModel = normalizePricingModel(model)
   const costUSD = calculateCost(pricingModel, inputTokens, responseTokens + thinkingTokens, 0, 0, 0)
 
@@ -844,12 +1050,12 @@ function buildCallFromSqliteGenMetadataRow(cascadeId: string, row: AntigravityGe
   }
 }
 
-function buildCallsFromSqliteGenMetadata(cascadeId: string, rows: AntigravityGenMetadataRow[]): ParsedProviderCall[] {
+async function buildCallsFromSqliteGenMetadata(cascadeId: string, rows: AntigravityGenMetadataRow[], modelMap?: ModelMap): Promise<ParsedProviderCall[]> {
   const calls: ParsedProviderCall[] = []
   const seenResponseIds = new Set<string>()
 
   for (const row of rows) {
-    const call = buildCallFromSqliteGenMetadataRow(cascadeId, row)
+    const call = await buildCallFromSqliteGenMetadataRow(cascadeId, row, modelMap)
     if (!call) continue
     if (seenResponseIds.has(call.deduplicationKey)) continue
     seenResponseIds.add(call.deduplicationKey)
@@ -859,7 +1065,7 @@ function buildCallsFromSqliteGenMetadata(cascadeId: string, rows: AntigravityGen
   return calls
 }
 
-async function parseSqliteGenMetadataCalls(filePath: string, cascadeId: string): Promise<ParsedProviderCall[]> {
+async function parseSqliteGenMetadataCalls(filePath: string, cascadeId: string, modelMap?: ModelMap): Promise<ParsedProviderCall[]> {
   if (!filePath.toLowerCase().endsWith('.db')) return []
   if (!isSqliteAvailable()) return []
 
@@ -867,7 +1073,7 @@ async function parseSqliteGenMetadataCalls(filePath: string, cascadeId: string):
   try {
     db = openDatabase(filePath)
     const rows = db.query<AntigravityGenMetadataRow>('SELECT idx, data FROM gen_metadata ORDER BY idx')
-    return buildCallsFromSqliteGenMetadata(cascadeId, rows)
+    return buildCallsFromSqliteGenMetadata(cascadeId, rows, modelMap)
   } catch (err) {
     // Let a transient lock propagate so the run retries this file on the next
     // refresh instead of treating it as empty (see parser.ts busy handling).
@@ -876,6 +1082,80 @@ async function parseSqliteGenMetadataCalls(filePath: string, cascadeId: string):
   } finally {
     db?.close()
   }
+}
+
+export async function parseAntigravityImageToolCalls(cascadeId: string): Promise<ParsedProviderCall[]> {
+  const home = homedir()
+  const candidatePaths = [
+    join(home, '.gemini', 'antigravity', 'brain', cascadeId, '.system_generated', 'logs', 'transcript.jsonl'),
+    join(home, '.gemini', 'antigravity', 'brain', cascadeId, '.system_generated', 'logs', 'transcript_full.jsonl'),
+    join(home, '.gemini', 'antigravity-cli', 'brain', cascadeId, '.system_generated', 'logs', 'transcript.jsonl'),
+    join(home, '.gemini', 'antigravity-cli', 'brain', cascadeId, '.system_generated', 'logs', 'transcript_full.jsonl'),
+    join(home, '.gemini', 'antigravity-ide', 'brain', cascadeId, '.system_generated', 'logs', 'transcript.jsonl'),
+    join(home, '.gemini', 'antigravity-ide', 'brain', cascadeId, '.system_generated', 'logs', 'transcript_full.jsonl'),
+  ]
+
+  for (const logPath of candidatePaths) {
+    try {
+      const fileRes = await readExistingTextFile(logPath)
+      if (fileRes.status !== 'ok' || !fileRes.text.includes('generate_image')) continue
+      const lines = fileRes.text.split(/\r?\n/)
+      const calls: ParsedProviderCall[] = []
+      for (const line of lines) {
+        if (!line.includes('generate_image')) continue
+        try {
+          const step = JSON.parse(line) as {
+            step_index?: number
+            created_at?: string
+            tool_calls?: Array<{ name?: string; args?: Record<string, unknown> }>
+          }
+          if (!Array.isArray(step.tool_calls)) continue
+          let toolIndex = 0
+          for (const tc of step.tool_calls) {
+            if (tc.name === 'generate_image' && tc.args) {
+              const rawPrompt = typeof tc.args['Prompt'] === 'string' ? tc.args['Prompt'] : ''
+              const prompt = rawPrompt.replace(/^"|"$/g, '')
+              const imageName = typeof tc.args['ImageName'] === 'string' ? tc.args['ImageName'].replace(/^"|"$/g, '') : ''
+              const promptTokens = Math.max(1, Math.round(prompt.length / 4))
+              const inputTokens = promptTokens + (tc.args['ImagePaths'] ? 1024 : 0)
+              const outputTokens = 1024
+              const isPro = prompt.toLowerCase().includes('pro') || imageName.toLowerCase().includes('pro')
+              const model = isPro ? 'nano-banana-pro' : 'nano-banana'
+              const pricingModel = normalizePricingModel(model)
+              const costUSD = calculateCost(pricingModel, inputTokens, outputTokens, 0, 0, 0) || 0.03
+
+              calls.push({
+                provider: 'antigravity',
+                model,
+                inputTokens,
+                outputTokens,
+                cacheCreationInputTokens: 0,
+                cacheReadInputTokens: 0,
+                cachedInputTokens: 0,
+                reasoningTokens: 0,
+                webSearchRequests: 0,
+                costUSD,
+                tools: ['generate_image'],
+                bashCommands: [],
+                timestamp: step.created_at || '',
+                speed: 'standard',
+                deduplicationKey: `antigravity:${cascadeId}:generate_image:${step.step_index ?? 0}:${toolIndex}`,
+                userMessage: prompt.slice(0, 200),
+                sessionId: cascadeId,
+              })
+              toolIndex++
+            }
+          }
+        } catch {
+          // ignore single line error
+        }
+      }
+      if (calls.length > 0) return calls
+    } catch {
+      // ignore
+    }
+  }
+  return []
 }
 
 function parseFiniteToken(value: unknown): number {
@@ -948,7 +1228,10 @@ function buildCallsFromGeneratorMetadata(
     const responseId = usage.responseId || String(i)
     const dedupKey = `antigravity:${cascadeId}:${responseId}`
 
-    const model = dropPlaceholderModelId(modelMap[usage.model] ?? usage.model)
+    const mappedModel = modelMap[usage.model]
+    const model = (mappedModel
+      ? dropPlaceholderModelId(mappedModel)
+      : canonicalizeInternalModelId(usage.model) ?? dropPlaceholderModelId(usage.model))
     const pricingModel = normalizePricingModel(model)
     const timestamp = entry.chatModel?.chatStartMetadata?.createdAt ?? ''
     const costUSD = calculateCost(pricingModel, inputTokens, responseTokens + thinkingTokens, 0, 0, 0)
@@ -1367,6 +1650,12 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       const projectPath = await extractWorkspacePath(source.path)
       const fallbackTimestamp = new Date(s.mtimeMs).toISOString()
 
+      const server = await detectServer(antigravityAppDataDirFromSourcePath(source.path))
+      let modelMap: ModelMap = {}
+      if (server) {
+        modelMap = await getModelMap(server)
+      }
+
       const cached = cache.cascades[cascadeId]
       if (cached && cached.mtimeMs === s.mtimeMs && cached.sizeBytes === s.size && cached.calls.length > 0) {
         for (const call of cached.calls) {
@@ -1378,21 +1667,23 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         return
       }
 
-      const sqliteResults = await parseSqliteGenMetadataCalls(source.path, cascadeId)
-      if (sqliteResults.length > 0) {
-        assignStableTimestamps(sqliteResults, cached?.calls, fallbackTimestamp)
-        for (const call of sqliteResults) {
+      const sqliteResults = await parseSqliteGenMetadataCalls(source.path, cascadeId, cache.modelMap)
+      const imageCalls = await parseAntigravityImageToolCalls(cascadeId)
+      const combinedResults = [...sqliteResults, ...imageCalls]
+      if (combinedResults.length > 0) {
+        assignStableTimestamps(combinedResults, cached?.calls, fallbackTimestamp)
+        for (const call of combinedResults) {
           applyAntigravityProject(call, source, projectPath)
         }
 
         cache.cascades[cascadeId] = {
           mtimeMs: s.mtimeMs,
           sizeBytes: s.size,
-          calls: sqliteResults,
+          calls: combinedResults,
         }
         state.dirty = true
 
-        for (const call of sqliteResults) {
+        for (const call of combinedResults) {
           if (seenKeys.has(call.deduplicationKey)) continue
           seenKeys.add(call.deduplicationKey)
           yield call
@@ -1400,7 +1691,6 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         return
       }
 
-      const server = await detectServer(antigravityAppDataDirFromSourcePath(source.path))
       if (!server) {
         if (cached) {
           for (const call of cached.calls) {
@@ -1412,8 +1702,6 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         }
         return
       }
-
-      const modelMap = await getModelMap(server)
 
       let metadata: GeneratorMetadata[]
       try {
@@ -1432,7 +1720,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         return
       }
 
-      const results = buildCallsFromGeneratorMetadata(cascadeId, metadata, modelMap)
+      const results = [...buildCallsFromGeneratorMetadata(cascadeId, metadata, modelMap), ...imageCalls]
       assignStableTimestamps(results, cached?.calls, fallbackTimestamp)
       for (const call of results) {
         applyAntigravityProject(call, source, projectPath)
@@ -1457,6 +1745,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 const modelDisplayNames: Record<string, string> = {
   'gemini-pro-agent': 'Gemini Pro',
   'gemini-3-pro': 'Gemini 3 Pro',
+  'gemini-3-pro-image': 'Gemini 3 Pro Image',
   'gemini-3.1-pro-high': 'Gemini 3.1 Pro',
   'gemini-3.1-pro-low': 'Gemini 3.1 Pro (Low)',
   'gemini-3-flash': 'Gemini 3 Flash',
@@ -1468,8 +1757,15 @@ const modelDisplayNames: Record<string, string> = {
   'Gemini 3.5 Flash (High)': 'Gemini 3.5 Flash',
   'Gemini 3.5 Flash (Medium)': 'Gemini 3.5 Flash',
   'Gemini 3.5 Flash (Low)': 'Gemini 3.5 Flash',
-  'gemini-3.1-flash-image': 'Gemini 3.1 Flash',
+  'gemini-3.1-flash-image': 'Gemini 3.1 Flash Image',
   'gemini-3.1-flash-lite': 'Gemini 3.1 Flash Lite',
+  'gemini-2.5-flash-image': 'Gemini 2.5 Flash Image',
+  'nano-banana': 'Nano Banana',
+  'nano-banana-2': 'Nano Banana 2',
+  'nano-banana-pro': 'Nano Banana Pro',
+  'imagen-3': 'Imagen 3',
+  'veo-2': 'Veo 2',
+  'veo-3': 'Veo 3',
   'claude-opus-4-6-thinking': 'Opus 4.6',
   'claude-sonnet-4-6': 'Sonnet 4.6',
 }
@@ -1480,7 +1776,16 @@ export function createAntigravityProvider(): Provider {
     displayName: 'Antigravity',
 
     modelDisplayName(model: string): string {
-      return modelDisplayNames[model] ?? model
+      if (modelDisplayNames[model]) return modelDisplayNames[model]
+      return model
+        .replace(/\s*\((high|low|medium|extra-low|extra-high|thinking)\)/i, '')
+        .replace(/-(high|low|medium|agent|extra-low|extra-high|thinking)$/i, '')
+        .replace(/[-_]/g, ' ')
+        .replace(/\b\w/g, c => c.toUpperCase())
+        .replace(/\bGpt\b/i, 'GPT')
+        .replace(/\bOss\b/i, 'OSS')
+        .replace('Claude ', '')
+        .replace(/(\d+)([a-z]+)/gi, (m, d, l) => d + l.toUpperCase())
     },
 
     toolDisplayName(rawTool: string): string {
@@ -1509,3 +1814,4 @@ export async function flushAntigravityCache(liveCascadeIds?: Set<string>, cacheD
 }
 
 export const antigravity = createAntigravityProvider()
+

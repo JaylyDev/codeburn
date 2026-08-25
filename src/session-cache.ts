@@ -1560,7 +1560,7 @@ export async function cleanupOrphanedTempFiles(): Promise<void> {
       if (!envelope || referenced.has(entry)) continue
       await unlinkIfOlderThan(join(dir, entry), UNREFERENCED_SHARD_MAX_AGE_MS, now)
     }
-  } catch {}
+  } catch { }
 }
 
 // ── Hydration Lock ─────────────────────────────────────────────────────
@@ -1581,7 +1581,7 @@ const LOCK_POLL_MS = 250
 type LockRecord = { pid: number; at: number }
 export type HydrationHandle = { waited: boolean; release: () => Promise<void> }
 
-const NOOP_HANDLE: HydrationHandle = { waited: false, release: async () => {} }
+const NOOP_HANDLE: HydrationHandle = { waited: false, release: async () => { } }
 
 function lockPath(): string {
   return join(getCodeburnCacheDir(), HYDRATION_LOCK_FILE)
@@ -1692,7 +1692,7 @@ export async function beginColdHydration(isCold: boolean): Promise<HydrationHand
         try { await unlink(lockPath()) } catch { /* another process may have; fine */ }
         if (await writeOurLock()) { armSignalCleanup(); return releaseHandle }
       }
-      return { waited: true, release: async () => {} }
+      return { waited: true, release: async () => { } }
     }
     // Stale, dead-pid, or unreadable lock: replace it and take over.
     try { await unlink(lockPath()) } catch { /* another process may have; fine */ }

@@ -95,9 +95,10 @@ describe('getModelCosts', () => {
     // Directly checks the bundled snapshot data (not just the resolved lookup),
     // so this fails if the litellm-snapshot.json entries are ever reverted even
     // though getModelCosts would still resolve both ids via the `gpt-5.6` prefix
-    // fallback - explicit rows are still correct and match every other Codex
-    // generation LiteLLM ships (gpt-5-codex, gpt-5.1-codex, gpt-5.1-codex-max,
-    // gpt-5.2-codex, gpt-5.3-codex all carry their base model's exact rate).
+    // fallback. LiteLLM used to give the Codex SKUs the base gpt-5.6 rate but
+    // now prices them above it; they must stay explicit rows that agree with
+    // each other (matching how every other Codex generation ships explicit
+    // rows: gpt-5-codex through gpt-5.3-codex).
     const snapshot = snapshotData as Record<string, unknown>
     // 2026-08-24: OpenAI cut the gpt-5.6 base rate ($5/$30 to $4/$20) and
     // LiteLLM updated the base row before the codex SKUs, so codex-equals-base
@@ -453,6 +454,172 @@ describe('codex Kimi context-tag normalization (kimi/k3[1m])', () => {
     expect(getShortModelName('gpt-5.5')).toBe('GPT-5.5')
     expect(getModelCosts('gpt-5.5')).toEqual(getModelCosts('gpt-5.5'))
     expect(calculateCost('gpt-5.5', 1_000_000, 100_000, 0, 0, 0)).toBeCloseTo(8, 5)
+  })
+})
+
+// OpenCode's free tier serves otherwise-priced SKUs under a terminal `-free`
+// suffix. Only a TERMINAL segment is stripped; routing namespaces that merely
+// contain "free" (cline-free/) must keep peeling through ROUTER_PREFIXES.
+describe('terminal -free suffix normalization (OpenCode free tier)', () => {
+  it('x-preview-f-free canonicalizes to x-preview-f and stays unpriced', () => {
+    expect(resolveCanonicalModelId('x-preview-f-free')).toBe('x-preview-f')
+    expect(getModelCosts('x-preview-f-free')).toBeNull()
+  })
+
+  it('mimo-v2.5-free prices as the existing xiaomi/mimo-v2.5 row', () => {
+    expect(resolveCanonicalModelId('mimo-v2.5-free')).toBe('xiaomi/mimo-v2.5')
+    expect(calculateCost('mimo-v2.5-free', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('nemotron-3-ultra-free prices via the existing 550b-a55b alias', () => {
+    expect(resolveCanonicalModelId('nemotron-3-ultra-free')).toBe('nemotron-3-ultra-550b-a55b')
+    expect(calculateCost('nemotron-3-ultra-free', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('nemotron-3.5-lightning-free prices via the nvidia catalog row', () => {
+    expect(resolveCanonicalModelId('nemotron-3.5-lightning-free')).toBe('nvidia/nemotron-3.5-lightning')
+    expect(calculateCost('nemotron-3.5-lightning-free', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('keeps mid-name free segments intact (cline-free/ router prefix)', () => {
+    expect(resolveCanonicalModelId('cline-free/gpt-5')).toBe('gpt-5')
+    expect(getModelCosts('cline-free/gpt-5')).not.toBeNull()
+  })
+})
+
+// Antigravity reports reasoning-mode Claude sessions with dot-version
+// spellings plus a -thinking tag; the SKU priced is the base model either way.
+describe('Antigravity claude-*-thinking variants resolve to pricing', () => {
+  it('claude-sonnet-4.6-thinking prices as claude-sonnet-4-6', () => {
+    expect(resolveCanonicalModelId('claude-sonnet-4.6-thinking')).toBe('claude-sonnet-4-6')
+    expect(getModelCosts('claude-sonnet-4.6-thinking')).toEqual(getModelCosts('claude-sonnet-4-6'))
+    expect(calculateCost('claude-sonnet-4.6-thinking', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('claude-opus-4.6-thinking prices as claude-opus-4-6', () => {
+    expect(resolveCanonicalModelId('claude-opus-4.6-thinking')).toBe('claude-opus-4-6')
+    expect(getModelCosts('claude-opus-4.6-thinking')).toEqual(getModelCosts('claude-opus-4-6'))
+    expect(calculateCost('claude-opus-4.6-thinking', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('dash-spelled claude-sonnet-4-6-thinking prices as claude-sonnet-4-6', () => {
+    expect(resolveCanonicalModelId('claude-sonnet-4-6-thinking')).toBe('claude-sonnet-4-6')
+    expect(getModelCosts('claude-sonnet-4-6-thinking')).toEqual(getModelCosts('claude-sonnet-4-6'))
+    expect(calculateCost('claude-sonnet-4-6-thinking', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('dash-spelled claude-opus-4-6-thinking prices as claude-opus-4-6', () => {
+    // Wire id observed verbatim in real gen_metadata #19 payloads.
+    expect(resolveCanonicalModelId('claude-opus-4-6-thinking')).toBe('claude-opus-4-6')
+    expect(getModelCosts('claude-opus-4-6-thinking')).toEqual(getModelCosts('claude-opus-4-6'))
+    expect(calculateCost('claude-opus-4-6-thinking', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+})
+
+// Antigravity wire ids resolved against upstream responseModelAliases /
+// activeModelSpecs (Antigravity Context Window Monitor models.ts@603e3ea).
+// gemini-3-flash-a/-b/-agent are the 3.5 Flash HIGH slots (M132/M133), NOT the
+// retired gemini-3-flash family; gemini-pro-default/-agent are the Gemini
+// 3.1 Pro slot (M16). Effort tiers collapse onto the priced base row.
+describe('Antigravity machine-id aliases resolve to priced rows', () => {
+  it('gemini-3-flash-a prices as gemini-3.5-flash (counterintuitive: not the 3-flash family)', () => {
+    expect(resolveCanonicalModelId('gemini-3-flash-a')).toBe('gemini-3.5-flash')
+    expect(getModelCosts('gemini-3-flash-a')).toEqual(getModelCosts('gemini-3.5-flash'))
+    expect(calculateCost('gemini-3-flash-a', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('gemini-3-flash-b prices as gemini-3.5-flash', () => {
+    expect(resolveCanonicalModelId('gemini-3-flash-b')).toBe('gemini-3.5-flash')
+    expect(getModelCosts('gemini-3-flash-b')).toEqual(getModelCosts('gemini-3.5-flash'))
+    expect(calculateCost('gemini-3-flash-b', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('gemini-3-flash-agent prices as gemini-3.5-flash (retargeted from gemini-3-flash-preview)', () => {
+    expect(resolveCanonicalModelId('gemini-3-flash-agent')).toBe('gemini-3.5-flash')
+    expect(getModelCosts('gemini-3-flash-agent')).toEqual(getModelCosts('gemini-3.5-flash'))
+    expect(calculateCost('gemini-3-flash-agent', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('bare gemini-3-flash stays on the retired preview family', () => {
+    expect(resolveCanonicalModelId('gemini-3-flash')).toBe('gemini-3-flash-preview')
+    expect(calculateCost('gemini-3-flash', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('gemini-pro-default and gemini-pro-agent price as Gemini 3.1 Pro', () => {
+    // The catalog prices Gemini 3.1 Pro under its -preview spelling, so the
+    // alias targets that priced row (same collapse as gemini-3.1-pro-high/-low)
+    // instead of the intermediate 'gemini-3.1-pro' alias.
+    expect(resolveCanonicalModelId('gemini-pro-default')).toBe('gemini-3.1-pro-preview')
+    expect(resolveCanonicalModelId('gemini-pro-agent')).toBe('gemini-3.1-pro-preview')
+    expect(getModelCosts('gemini-pro-default')).toEqual(getModelCosts('gemini-3.1-pro-preview'))
+    expect(getModelCosts('gemini-pro-agent')).toEqual(getModelCosts('gemini-3.1-pro-preview'))
+    expect(calculateCost('gemini-pro-default', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+    expect(calculateCost('gemini-pro-agent', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('opaque Antigravity wire ids resolve through their fallback aliases', () => {
+    // gemini-pro-a/-c and gemini-default are opaque role names whose tier is
+    // only disclosed by the gen_metadata model_enum attribute (M16 → Gemini
+    // 3.1 Pro; M20 → Gemini 3.5 Flash). Without an enum these aliases are what
+    // keeps the rows priced instead of unattributed $0.
+    expect(resolveCanonicalModelId('gemini-pro-a')).toBe('gemini-3.1-pro-preview')
+    expect(resolveCanonicalModelId('gemini-pro-c')).toBe('gemini-3.1-pro-preview')
+    expect(resolveCanonicalModelId('gemini-default')).toBe('gemini-3.5-flash')
+    expect(getModelCosts('gemini-pro-a')).toEqual(getModelCosts('gemini-3.1-pro-preview'))
+    expect(getModelCosts('gemini-pro-c')).toEqual(getModelCosts('gemini-3.1-pro-preview'))
+    expect(getModelCosts('gemini-default')).toEqual(getModelCosts('gemini-3.5-flash'))
+    expect(calculateCost('gemini-pro-a', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+    expect(calculateCost('gemini-pro-c', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+    expect(calculateCost('gemini-default', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+})
+
+// Copilot capacity pods wrap the upstream dated snapshot id in a
+// capi-<site>-ptuc-<hw>-ib- envelope. Exact aliases only — no peel regex —
+// so unknown envelope shapes stay unpriced instead of guessing.
+describe('Copilot capacity pod ids (capi-…-ib- envelope)', () => {
+  it('resolves both observed envelopes onto the priced gpt-5-mini dated row', () => {
+    expect(resolveCanonicalModelId('capi-noe-ptuc-h200-ib-gpt-5-mini-2025-08-07')).toBe('gpt-5-mini-2025-08-07')
+    expect(resolveCanonicalModelId('capi-cus-ptuc-h100-ib-gpt-5-mini-2025-08-07')).toBe('gpt-5-mini-2025-08-07')
+    expect(calculateCost('capi-noe-ptuc-h200-ib-gpt-5-mini-2025-08-07', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+    expect(calculateCost('capi-cus-ptuc-h100-ib-gpt-5-mini-2025-08-07', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('does not swallow unobserved capi shapes', () => {
+    expect(resolveCanonicalModelId('capi-other-ptuc-h100-ib-gpt-5-mini-2025-08-07')).toBe('capi-other-ptuc-h100-ib-gpt-5-mini-2025-08-07')
+  })
+})
+
+// Local GGUF runners record raw filenames. Canonicalization drops the .gguf
+// extension plus a trailing quantization tag and folds case, mapping an export
+// onto the cloud row it was quantized from — without inventing rates for rows
+// that do not exist.
+describe('local GGUF filename canonicalization', () => {
+  it('folds Qwen3.6-35B-A3B GGUF exports onto the priced row', () => {
+    // The issue text says "qwen-3.6-35b-a3b", but no catalog row carries that
+    // spelling; the priced spelling (bare and qwen/-namespaced) is
+    // qwen3.6-35b-a3b, so that is what we canonicalize to.
+    expect(resolveCanonicalModelId('Qwen3.6-35B-A3B-Q4_K_M.gguf')).toBe('qwen3.6-35b-a3b')
+    expect(calculateCost('Qwen3.6-35B-A3B-Q4_K_M.gguf', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('normalizes Qwen3.8-9B GGUF exports without inventing a rate', () => {
+    expect(resolveCanonicalModelId('Qwen3.8-9B-Q4_K_M.gguf')).toBe('qwen3.8-9b')
+    expect(getModelCosts('Qwen3.8-9B-Q4_K_M.gguf')).toBeNull()
+  })
+
+  it('aliases Ornith-1.5-35B GGUF exports to the priced a3b release', () => {
+    expect(resolveCanonicalModelId('Ornith-1.5-35B-Q4_K_M.gguf')).toBe('ornith-1.5-35b-a3b')
+    expect(calculateCost('Ornith-1.5-35B-Q4_K_M.gguf', 1_000_000, 100_000, 0, 0, 0)).toBeGreaterThan(0)
+  })
+
+  it('leaves ollama colon-tags untouched so local rows stay unpriced (#968)', () => {
+    expect(resolveCanonicalModelId('ollama/my-finetune:Q4_K_M')).toBe('my-finetune:Q4_K_M')
+    expect(getModelCosts('ollama/my-finetune:Q4_K_M')).toBeNull()
+  })
+
+  it('does not strip quant-like tokens from the middle of an id', () => {
+    expect(resolveCanonicalModelId('Qwen3.6-27B-FP8')).toBe('Qwen3.6-27B-FP8')
   })
 })
 

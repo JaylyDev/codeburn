@@ -54,6 +54,12 @@ const MANUAL_ENTRIES = {
   // exact gpt-5.6 tuple (Sol-tier: $5/$30 per million, 1.25x cache-write).
   'gpt-5.6-codex':          [5e-6, 3e-5, 6.25e-6, 5e-7],
   'gpt-5.6-codex-max':      [5e-6, 3e-5, 6.25e-6, 5e-7],
+  // Ornith launch pricing (issue-sourced); not yet in LiteLLM or the
+  // models.dev/OpenRouter gap-fill. No cache-write rate is published, so
+  // cacheWrite stays null rather than fabricating the usual 1.25x input.
+  'ornith-1.0-35b':         [1e-7, 7.5e-7, null, null],
+  // The a3b variant additionally publishes a $0.01/M cache-read rate.
+  'ornith-1.5-35b-a3b':     [1e-7, 4e-7, null, 1e-8],
 }
 
 const snapshot = {}

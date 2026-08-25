@@ -54,6 +54,8 @@ const KNOWN_NAMES = [
   'kimi-for-coding',
   'kimi-k2-thinking-turbo',
   'kimi-k2.6',
+  'kimi-k2.7-code',
+  'glm-5.2',
   'o3',
   'o4-mini',
   'deepseek-coder',

@@ -3,6 +3,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 import { randomBytes } from 'crypto'
 import { PLAN_PROVIDERS } from './plans.js'
+import type { LiteLLMEntry } from './models.js'
 
 export type PlanId = 'claude-pro' | 'claude-max' | 'claude-max-5x' | 'cursor-pro' | 'supergrok' | 'supergrok-heavy' | 'copilot-pro' | 'copilot-pro-plus' | 'copilot-max' | 'custom' | 'none'
 export type PlanProvider = 'claude' | 'codex' | 'cursor' | 'grok' | 'copilot' | 'all'
@@ -47,6 +48,8 @@ export type CodeburnConfig = {
   // can show "saved $X by running locally". Distinct from modelAliases which
   // rewrites actual spend.
   localModelSavings?: Record<string, string>
+  localModelPricing?: Record<string, LiteLLMEntry>
+  modelNames?: Record<string, string>
   // Model ids whose $0 cost is correct because they are billed as a
   // subscription / flat-rate product, not missing LiteLLM rows. Distinct from
   // modelAliases (which invent per-token spend) and localModelSavings
