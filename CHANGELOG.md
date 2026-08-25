@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.9.22 - 2026-08-25
+
+### Added
+- **`codeburn status --format menubar-json` can serve from a disk-persisted snapshot.** A background poll whose corpus has not changed since the last computation is answered from a per-query snapshot keyed on a corpus fingerprint (ordered source topology, per-provider env fingerprints, five config hashes, currency, pricing generation, cache and package versions - any mismatch is a miss), eliminating the per-poll re-parse on idle machines. A snapshot is only ever written for a complete, non-degraded parse: the save gate requires the payload's own captured markers (`stale !== true`, no `hydration` block), so a poll that went read-only under a held refresh lock can never pin its under-reported totals to disk - a regression holds the refresh lock and asserts no snapshot file is written. Serve-side and one-shot outputs are unchanged; the optimization currently engages for `--no-optimize` polls (the menubar background refresh). Thanks @dgabehar, hardening @ozymandiashh. (#999)
+- **The parser captures provider-recorded session lineage instead of discarding it.** Claude agent transcripts carry a provider-written parent session reference (and the parent side records the spawned agent id when compaction has not dropped it); Kimi Code subagent sessions live inside their parent session's own directory. Both now populate an optional `lineage` field on the parsed session model - `parentSessionId`, a root/child role, and `evidence: 'provider-recorded'` - persisted through the session cache, with claude and kimicode parse versions bumped for the one-time re-derive. Strictly provider-recorded evidence only: no inference from time adjacency or shared projects, and a session with no evidence carries no lineage field at all. Purely additive metadata: a pinning test asserts every report total is byte-identical with the field present or absent. Groundwork for spend attribution across delegated-agent families (a measured 5.1% of sessions carry direct lineage but 76% of 90-day spend). (#1140)
+
 ### Fixed (macOS)
 
 - **CodeBurnMenubar now launches mise-installed CodeBurn correctly from Spotlight.** Spotlight gives GUI apps a minimal PATH, so a persisted `mise use -g npm:codeburn` launcher could be found but then fail with exit 127 when its shell wrapper tried to resolve `node`. The menubar child environment now includes mise's stable shim directory (including a custom `MISE_DATA_DIR` when available), matching the existing Volta/asdf/nvm handling without invoking a shell. (#1124)
