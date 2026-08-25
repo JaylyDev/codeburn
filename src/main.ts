@@ -1199,8 +1199,13 @@ program
       // result. Persisting it under the CURRENT (already-advanced) corpus
       // fingerprint would make that degraded answer look authoritative to
       // every future poll that matches this fingerprint — never checkpoint a
-      // partial hydration as if it were a real, complete parse.
-      if (useSnapshot && corpus && !snapshot && isSessionHydrationComplete()) {
+      // partial hydration as if it were a real, complete parse. Gate on the
+      // payload's own markers, captured at the one safe read point inside
+      // buildMenubarPayloadForRange: the hydration global is reassigned by
+      // every later parse (this function's own history re-parse included),
+      // so re-reading it here can bless a payload whose stale flag says
+      // degraded and pin its under-reported totals until the corpus changes.
+      if (useSnapshot && corpus && !snapshot && payload.stale !== true && payload.hydration === undefined && isSessionHydrationComplete()) {
         await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, corpus.observedAtMs, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY, payload)
       }
       if (opts.scope === 'combined') {

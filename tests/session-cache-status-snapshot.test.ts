@@ -9,13 +9,15 @@
 // exercises the locked publication fix for finding B-G1 directly: a slower,
 // older-corpus write must not clobber a faster, newer one, and two distinct queryKeys
 // must not evict each other.
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { chmod, mkdir, readdir, readFile, rm } from 'fs/promises'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'fs/promises'
 import { existsSync } from 'fs'
 import { createHash } from 'crypto'
+import { spawn, spawnSync } from 'child_process'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { delimiter, join } from 'path'
 
+import { acquireCacheRefreshLock } from '../src/cache-refresh-lock.js'
 import { loadStatusSnapshot, saveStatusSnapshot } from '../src/session-cache.js'
 
 let TMP_DIR: string
@@ -163,5 +165,210 @@ describe('concurrent writers (status snapshot)', () => {
     await saveStatusSnapshot('same-corpus', 1_000, 1_000, queryKey, 'render-v1', { p: 'old-shape' })
 
     expect(await loadStatusSnapshot('same-corpus', queryKey, 'render-v2')).toBeNull()
+  })
+})
+
+// Post-merge review of PR #999: a `status --format menubar-json --no-optimize`
+// poll that runs while ANOTHER process holds `session-refresh.lock` parses
+// read-only and serves a degraded corpus (payload.stale === true), and a later
+// in-process parse — the payload builder's own history re-parse, running after
+// the holder releases — flips the module-level hydration global back to
+// complete before the save point. A save gate consulting only that global
+// persists the under-reported payload under the CURRENT corpus fingerprint,
+// poisoning every future poll. These cases spawn the real CLI; each one does
+// genuine parse work plus a lock-hold window, so they get the same generous
+// timeout as the CLI-spawning suites.
+vi.setConfig({ testTimeout: 120_000 })
+
+const SNAPSHOT_FILE_RE = /^status-snapshot\.[0-9a-f]+\.json$/
+async function snapshotFileNames(cacheDir: string): Promise<string[]> {
+  if (!existsSync(cacheDir)) return []
+  return (await readdir(cacheDir)).filter(f => SNAPSHOT_FILE_RE.test(f))
+}
+
+function cliEnv(home: string, extraEnv: Record<string, string> = {}): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    CLAUDE_CONFIG_DIR: join(home, '.claude'),
+    CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'),
+    HOME: home,
+    TZ: 'UTC',
+    ...extraEnv,
+  }
+}
+
+function runCli(args: string[], home: string, extraEnv: Record<string, string> = {}): { status: number | null, stdout: string, stderr: string } {
+  const result = spawnSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', ...args], {
+    cwd: process.cwd(),
+    env: cliEnv(home, extraEnv),
+    encoding: 'utf-8',
+    timeout: 60_000,
+  })
+  return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }
+}
+
+function runCliAsync(args: string[], home: string, extraEnv: Record<string, string> = {}): Promise<{ status: number | null, stdout: string, stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--import', 'tsx', 'src/cli.ts', ...args], {
+      cwd: process.cwd(),
+      env: cliEnv(home, extraEnv),
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf-8') })
+    child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf-8') })
+    child.once('error', reject)
+    child.once('close', status => { resolve({ status, stdout, stderr }) })
+  })
+}
+
+function userLine(sessionId: string, timestamp: string): string {
+  return JSON.stringify({
+    type: 'user',
+    sessionId,
+    timestamp,
+    message: { role: 'user', content: 'do the thing' },
+  })
+}
+
+function assistantLine(sessionId: string, timestamp: string, messageId: string): string {
+  return JSON.stringify({
+    type: 'assistant',
+    sessionId,
+    timestamp,
+    message: {
+      id: messageId,
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-4-5',
+      content: [{ type: 'text', text: 'done' }],
+      usage: { input_tokens: 500, output_tokens: 50 },
+    },
+  })
+}
+
+const delay = (ms: number): Promise<void> => new Promise(resolve => { setTimeout(resolve, ms) })
+
+describe('degraded read-only parse is never persisted as a status snapshot', () => {
+  it('writes no snapshot for a lock-degraded poll, then resumes persisting on the clean pass', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-snapshot-degraded-'))
+    const cacheDir = join(home, '.cache', 'codeburn')
+    try {
+      // Two Claude config roots: the query below is scoped to one of them via
+      // --claude-config-source. The scoped path is what makes the PR #999
+      // sequence reachable in a one-shot process: the payload builder captures
+      // the hydration verdict right after the (degraded) primary parse, then
+      // runs its OWN history re-parse over a wider range — a second, real
+      // parse that re-acquires the lock once the holder releases and flips the
+      // module-level hydration global back to complete before the save point.
+      const work = join(home, 'claude-work')
+      const personal = join(home, 'claude-personal')
+      await mkdir(join(work, 'projects', 'app'), { recursive: true })
+      await mkdir(join(personal, 'projects', 'app'), { recursive: true })
+
+      // Two hours back, clamped inside the current UTC day (cliEnv pins
+      // TZ=UTC), so every session falls inside the 'today' query.
+      const now = new Date()
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
+      const ts = (offset: number) => new Date(base.getTime() + offset).toISOString().replace(/\.\d+Z$/, 'Z')
+
+      await writeFile(
+        join(work, 'projects', 'app', 'w1.jsonl'),
+        [userLine('w1', ts(0)), assistantLine('w1', ts(60_000), 'msg-w1')].join('\n') + '\n',
+      )
+      await writeFile(
+        join(personal, 'projects', 'app', 'p1.jsonl'),
+        [userLine('p1', ts(30_000)), assistantLine('p1', ts(90_000), 'msg-p1')].join('\n') + '\n',
+      )
+      const env = { CLAUDE_CONFIG_DIRS: [work, personal].join(delimiter) }
+
+      // Warm the session cache through the DEFAULT optimize path: it parses
+      // and persists the corpus but never reads or writes the status snapshot
+      // (main.ts: useSnapshot = !optimize). Also discovers the config-source
+      // id the scoped queries below select.
+      const warmStart = Date.now()
+      const warm = runCli(['status', '--format', 'menubar-json', '--period', 'today', '--provider', 'all'], home, env)
+      const warmElapsedMs = Date.now() - warmStart
+      expect(warm.status, `stderr: ${warm.stderr}`).toBe(0)
+      const warmPayload = JSON.parse(warm.stdout) as {
+        current: { calls: number }
+        claudeConfigs: { options: Array<{ id: string, label: string }> }
+      }
+      expect(warmPayload.current.calls).toBe(2)
+      const workSourceId = warmPayload.claudeConfigs.options.find(o => o.label === 'claude-work')?.id
+      expect(workSourceId).toBeTruthy()
+      expect(await snapshotFileNames(cacheDir)).toEqual([])
+
+      // New activity in the SELECTED root that the warm cache has never seen.
+      // A read-only parse has no cache entry for it and must skip it,
+      // under-reporting the totals.
+      await writeFile(
+        join(work, 'projects', 'app', 'w2.jsonl'),
+        [userLine('w2', ts(120_000)), assistantLine('w2', ts(180_000), 'msg-w2')].join('\n') + '\n',
+      )
+
+      const args = [
+        'status', '--format', 'menubar-json', '--period', 'today', '--provider', 'all',
+        '--claude-config-source', workSourceId!,
+        '--no-optimize',
+      ]
+
+      // A live, heartbeating owner holding the refresh lock, exactly as in
+      // cache-refresh-lock.test.ts: the pid answers signal 0 and the mtime
+      // stays fresh, so the child's primary parse can neither acquire nor
+      // take over — it parks in the wait loop.
+      const held = await acquireCacheRefreshLock({ cacheDir })
+      expect(held.outcome).toBe('acquired')
+      if (held.outcome !== 'acquired') return
+
+      let degraded
+      try {
+        const running = runCliAsync(args, home, env)
+        // Release only once the child is certainly parked in its lock wait:
+        // the warm run just did the same startup (tsx boot, pricing load,
+        // corpus fingerprint) the child repeats before it ever touches the
+        // lock, so its acquire attempt lands well inside this window.
+        // Releasing earlier would let that FIRST acquire succeed and turn
+        // this into a clean run; releasing is what reports
+        // 'completed-by-other' and sends the primary parse down the read-only
+        // path while leaving the lock free for the payload builder's later
+        // history re-parse — the exact PR #999 sequence.
+        await delay(warmElapsedMs + 1_500)
+        await held.handle.release()
+        degraded = await running
+      } finally {
+        await held.handle.release()
+      }
+
+      expect(degraded.status, `stderr: ${degraded.stderr}`).toBe(0)
+      const degradedPayload = JSON.parse(degraded.stdout) as { stale?: boolean, current: { calls: number } }
+      // The primary parse went read-only behind the held lock and served the
+      // warm cache: w2 is missing from the totals and the payload says so.
+      expect(degradedPayload.stale).toBe(true)
+      expect(degradedPayload.current.calls).toBe(1)
+      // The gate: no snapshot may be persisted from this degraded payload,
+      // even though the history re-parse after the release flipped the
+      // hydration global back to complete before the save point.
+      expect(await snapshotFileNames(cacheDir)).toEqual([])
+
+      // The gate reopens: the identical query on a clean pass recomputes and
+      // persists a complete snapshot.
+      const clean = runCli(args, home, env)
+      expect(clean.status, `stderr: ${clean.stderr}`).toBe(0)
+      const cleanPayload = JSON.parse(clean.stdout) as { stale?: boolean, current: { calls: number } }
+      expect(cleanPayload.stale).toBeUndefined()
+      expect(cleanPayload.current.calls).toBe(2)
+
+      const snapshots = await snapshotFileNames(cacheDir)
+      expect(snapshots).toHaveLength(1)
+      const record = JSON.parse(await readFile(join(cacheDir, snapshots[0]!), 'utf-8')) as {
+        payload: { stale?: boolean, current: { calls: number } }
+      }
+      expect(record.payload.stale).toBeUndefined()
+      expect(record.payload.current.calls).toBe(2)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
   })
 })
