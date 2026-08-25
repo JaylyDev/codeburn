@@ -322,26 +322,38 @@ const PLACEHOLDER_MODEL_IDS: Record<string, string> = {
   MODEL_PLACEHOLDER_M36:  'gemini-3.1-pro',
   MODEL_PLACEHOLDER_M37:  'gemini-3.1-pro',
   MODEL_PLACEHOLDER_M47:  'gemini-3-flash-preview',
+  MODEL_PLACEHOLDER_M50:  'gemini-3.1-flash-lite',
+  MODEL_PLACEHOLDER_M71:  'gemini-3.6-flash',
+  MODEL_PLACEHOLDER_M72:  'gemini-3.6-flash',
   MODEL_PLACEHOLDER_M84:  'gemini-3-flash-preview',
   MODEL_PLACEHOLDER_M132: 'gemini-3.5-flash',
   MODEL_PLACEHOLDER_M133: 'gemini-3.5-flash',
   MODEL_PLACEHOLDER_M187: 'gemini-3.5-flash',
+  MODEL_PLACEHOLDER_M196: 'gemini-3.6-flash-tiered',
+  MODEL_PLACEHOLDER_M264: 'gemini-3.6-flash',
+  MODEL_PLACEHOLDER_M265: 'gemini-3.6-flash',
+  MODEL_PLACEHOLDER_M266: 'gemini-3.6-flash',
+  MODEL_PLACEHOLDER_M298: 'gemini-3.7-flash',
+  MODEL_PLACEHOLDER_M301: 'gemini-3.7-flash-tiered',
 }
 
 // Wire ids (#19 rawModel) that are opaque role names rather than API model
 // ids: their actual tier is only determined by the model_enum attribute
 // carried alongside them. Observed on real on-disk rows: 'gemini-pro-a' and
 // 'gemini-pro-c' pair with MODEL_PLACEHOLDER_M16 (the Gemini 3.1 Pro family)
-// while 'gemini-default' pairs with MODEL_PLACEHOLDER_M20 (Gemini 3.5 Flash)
-// on every row — never M84. (Antigravity Context Window Monitor
-// models.ts@603e3ea; fetch/quota shape confirmed by Antigravity Manager
-// quota.rs@dfe8765.) For these names the enum-mapped SKU wins over the
-// verbatim wire id; every other #19 value keeps its existing precedence.
+// while 'gemini-default', 'gemini-3-flash-a', and 'gemini-3-flash-b' pair
+// with M20/M132/M133 (Gemini 3.5 Flash). For these names the enum-mapped SKU
+// wins over the verbatim wire id; every other #19 value keeps its existing precedence.
 const OPAQUE_WIRE_MODEL_IDS: ReadonlySet<string> = new Set([
   'gemini-default',
   'gemini-pro-a',
   'gemini-pro-b',
   'gemini-pro-c',
+  'gemini-pro-default',
+  'gemini-pro-agent',
+  'gemini-3-flash-a',
+  'gemini-3-flash-b',
+  'gemini-3-flash-agent',
 ])
 
 // Resolve an internal MODEL_* id to the pricing-catalog name it denotes, or
@@ -395,6 +407,9 @@ function getCanonicalModelId(key: string, displayName?: string): string {
     // transcript Model Selection values.
     if (lower.includes('3.7 flash')) {
       return 'gemini-3.7-flash'
+    }
+    if (lower.includes('3.6 flash')) {
+      return 'gemini-3.6-flash'
     }
     if (lower.includes('3.5 flash')) {
       if (lower.includes('high')) return 'gemini-3.5-flash-high'
@@ -753,6 +768,11 @@ async function getModelMap(server: ServerInfo): Promise<ModelMap> {
 // Strip Antigravity-specific suffixes so the pricing DB can match
 const PRICING_ALIASES: Record<string, string> = {
   'gemini-pro': 'gemini-3.1-pro',
+  'gemini-3-flash-a': 'gemini-3.5-flash',
+  'gemini-3-flash-b': 'gemini-3.5-flash',
+  'gemini-3-flash-agent': 'gemini-3.5-flash',
+  'gemini-pro-default': 'gemini-3.1-pro',
+  'gemini-pro-agent': 'gemini-3.1-pro',
 }
 
 function normalizePricingModel(model: string): string {
@@ -1743,13 +1763,21 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 }
 
 const modelDisplayNames: Record<string, string> = {
-  'gemini-pro-agent': 'Gemini Pro',
+  'gemini-pro-agent': 'Gemini 3.1 Pro',
+  'gemini-pro-default': 'Gemini 3.1 Pro',
+  'gemini-pro-a': 'Gemini 3.1 Pro',
+  'gemini-pro-b': 'Gemini 3.1 Pro',
+  'gemini-pro-c': 'Gemini 3.1 Pro',
+  'gemini-default': 'Gemini 3.5 Flash',
   'gemini-3-pro': 'Gemini 3 Pro',
   'gemini-3-pro-image': 'Gemini 3 Pro Image',
+  'gemini-3.1-pro': 'Gemini 3.1 Pro',
   'gemini-3.1-pro-high': 'Gemini 3.1 Pro',
   'gemini-3.1-pro-low': 'Gemini 3.1 Pro (Low)',
   'gemini-3-flash': 'Gemini 3 Flash',
-  'gemini-3-flash-agent': 'Gemini 3 Flash',
+  'gemini-3-flash-a': 'Gemini 3.5 Flash',
+  'gemini-3-flash-b': 'Gemini 3.5 Flash',
+  'gemini-3-flash-agent': 'Gemini 3.5 Flash',
   'gemini-3.5-flash': 'Gemini 3.5 Flash',
   'gemini-3.5-flash-high': 'Gemini 3.5 Flash',
   'gemini-3.5-flash-medium': 'Gemini 3.5 Flash',
@@ -1757,6 +1785,11 @@ const modelDisplayNames: Record<string, string> = {
   'Gemini 3.5 Flash (High)': 'Gemini 3.5 Flash',
   'Gemini 3.5 Flash (Medium)': 'Gemini 3.5 Flash',
   'Gemini 3.5 Flash (Low)': 'Gemini 3.5 Flash',
+  'gemini-3.6-flash': 'Gemini 3.6 Flash',
+  'gemini-3.6-flash-tiered': 'Gemini 3.6 Flash Tiered',
+  'gemini-3.7-flash': 'Gemini 3.7 Flash',
+  'gemini-3.7-flash-control': 'Gemini 3.7 Flash Control',
+  'gemini-3.7-flash-tiered': 'Gemini 3.7 Flash Tiered',
   'gemini-3.1-flash-image': 'Gemini 3.1 Flash Image',
   'gemini-3.1-flash-lite': 'Gemini 3.1 Flash Lite',
   'gemini-2.5-flash-image': 'Gemini 2.5 Flash Image',

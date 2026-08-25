@@ -992,6 +992,33 @@ describe('antigravity sqlite model attribution from real-data shapes', () => {
       }))
       expect(flash.model).toBe('gemini-3.5-flash')
       expect(flash.costUSD).toBeGreaterThan(0)
+
+      const flashA = await parseSingleRowDb(tempHome, encodeGenMetadataRow({
+        inputTokens: 100,
+        totalOutputTokens: 50,
+        rawModel: 'gemini-3-flash-a',
+        modelEnum: 'MODEL_PLACEHOLDER_M132',
+      }))
+      expect(flashA.model).toBe('gemini-3.5-flash')
+      expect(flashA.costUSD).toBeGreaterThan(0)
+
+      const flashB = await parseSingleRowDb(tempHome, encodeGenMetadataRow({
+        inputTokens: 100,
+        totalOutputTokens: 50,
+        rawModel: 'gemini-3-flash-b',
+        modelEnum: 'MODEL_PLACEHOLDER_M133',
+      }))
+      expect(flashB.model).toBe('gemini-3.5-flash')
+      expect(flashB.costUSD).toBeGreaterThan(0)
+
+      const proDefault = await parseSingleRowDb(tempHome, encodeGenMetadataRow({
+        inputTokens: 100,
+        totalOutputTokens: 50,
+        rawModel: 'gemini-pro-default',
+        modelEnum: 'MODEL_PLACEHOLDER_M16',
+      }))
+      expect(proDefault.model).toBe('gemini-3.1-pro')
+      expect(proDefault.costUSD).toBeGreaterThan(0)
     })
   })
 
