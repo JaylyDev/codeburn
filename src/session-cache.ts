@@ -113,6 +113,10 @@ export type CachedFile = {
   // the `agentType` from its sibling `.meta.json` (e.g. `workflow-subagent`,
   // `Explore`, `general-purpose`). Drives the Claude-scoped agent-type breakdown.
   agentType?: string
+  // OMP nested agent transcripts retain their file-stem identity and session
+  // header timestamp for the menubar's per-agent activity rows.
+  agentName?: string
+  agentStartedAt?: string
   // Negative-result marker: this file threw while parsing at the recorded
   // fingerprint. Cached so we don't re-read + re-throw it on every refresh; it
   // is re-parsed only when the file changes (fingerprint differs). Carries no
@@ -378,6 +382,10 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // the git repo. Cached entries from before the bump lack projectPath and
   // would serve attribution-blind sessions forever without a re-parse.
   kiro: 'ide-parsing-v1-est-cost-project-path-v1',
+  // nested-agent-v1: OMP writes crewmate transcripts one directory below each
+  // parent session. reported-cost-v2 persists those measured costs through the
+  // cache, including the explicit zero on xai-oauth turns.
+  omp: 'nested-agent-v1-reported-cost-v2',
   opencode: 'session-model-v1',
   quickdesk: 'emf-sqlite-v2-est-cost',
   // session-lineage-capture-v1: SessionLineage (CB-1, slice 1) is now carried
@@ -697,6 +705,8 @@ function validateCachedFile(f: unknown): f is CachedFile {
     && (o['prLinks'] === undefined || isStringArray(o['prLinks']))
     && isOptionalBool(o['isSidechain'])
     && isOptionalString(o['agentType'])
+    && isOptionalString(o['agentName'])
+    && isOptionalString(o['agentStartedAt'])
     && isOptionalBool(o['failed'])
     && isOptionalString(o['parentSessionId'])
     && isOptionalStringRecord(o['agentSpawnLinks'])
