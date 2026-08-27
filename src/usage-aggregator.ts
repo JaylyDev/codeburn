@@ -5,6 +5,7 @@ import { type PeriodData, type ProviderCost, type BreakdownArrays, type MenubarP
 import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, isSessionHydrationComplete, sessionHydrationSnapshot } from './parser.js'
 import { findUnpricedModels, getFlatRateModelsConfigHash, getLocalModelSavingsConfigHash, getPriceOverridesConfigHash, getShortModelName, isExpectedFreeModel } from './models.js'
 import { getAllProviders, safeDiscoverSessions } from './providers/index.js'
+import { loadPlugins, pluginPayloadSections } from './plugins/loader.js'
 import { claude, getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { stat } from 'node:fs/promises'
 import { aggregateProjectsIntoDays, buildPeriodDataFromDays, dateKeyInTz } from './day-aggregator.js'
@@ -979,5 +980,10 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   // instead, so the two are never conflated.
   const partialFirstPaint = hydration?.deferredForFirstPaint === true
   const stale = hydration?.complete === false && !partialFirstPaint ? true : undefined
-  return buildMenubarPayload(currentData, providers, optimize, dailyHistory, retryTax, routingWaste, breakdowns, claudeConfigs, granularHistory, stale, hydrationStateFor(hydration))
+  const payload = buildMenubarPayload(currentData, providers, optimize, dailyHistory, retryTax, routingWaste, breakdowns, claudeConfigs, granularHistory, stale, hydrationStateFor(hydration))
+  // Plugin socket: add-only sections from loaded plugins (empty socket by
+  // default, so the payload is byte-identical without plugins installed).
+  const pluginSections = await pluginPayloadSections(await loadPlugins())
+  if (Object.keys(pluginSections).length > 0) payload.plugins = pluginSections
+  return payload
 }

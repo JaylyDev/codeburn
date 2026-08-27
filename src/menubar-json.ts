@@ -203,6 +203,11 @@ export type MenubarPayload = {
   /// a converged one. Distinct from `stale`: a first paint is fresh but
   /// partial, a stale payload is complete but old.
   hydration?: HydrationState
+  /// Add-only plugin socket sections (teams issue #3), keyed
+  /// `<plugin>.<section>`. Present only when a loaded plugin declared the
+  /// section AND its command wrote it. Surfaces render what they recognize
+  /// and ignore the rest; absence always means "no plugin output today".
+  plugins?: Record<string, unknown>
   current: {
     label: string
     cost: number

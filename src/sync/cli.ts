@@ -24,6 +24,7 @@ import { createCredentialStore } from './credentials.js'
 import { readSyncConfig, writeSyncConfig, deleteSyncConfig, updateLastSync } from './config.js'
 import { collectUnsentCalls, collectUnsentAttribution, sendBatches, sendAttributionBatches, batchCalls, MAX_PER_PUSH, MAX_ATTRIBUTION_PER_PUSH, type PushResult } from './push.js'
 import { batchAttributionItems, wireProjectName } from './otlp.js'
+import { loadPlugins, declaredSyncAttributes, type PluginLoad } from '../plugins/loader.js'
 
 export function registerSyncCommands(program: Command): void {
   const sync = program
@@ -291,6 +292,14 @@ export function registerSyncCommands(program: Command): void {
         // Flatten + filter against sent-ledger
         const { allCalls, unsent, held, frozen } = collectUnsentCalls(projects, Date.now(), { plans })
 
+        // Plugin socket: load declared sync attribute keys once for the dry-run
+        // disclosure and the real-push wire guard. Loader is directory-stat only
+        // when no plugins are installed, so the no-plugin case is byte-identical
+        // to before the socket shipped.
+        const pluginLoads: PluginLoad[] = await loadPlugins()
+        const pluginKeys = declaredSyncAttributes(pluginLoads)
+        const pluginAttributeKeys: ReadonlySet<string> = new Set(pluginKeys.keys())
+
         // Attribution records (opt-in): session→commit correlation computed
         // locally from the same parsed projects. Reuses the yield engine.
         let attributionUnsent: Awaited<ReturnType<typeof collectUnsentAttribution>>['unsent'] = []
@@ -322,6 +331,25 @@ export function registerSyncCommands(program: Command): void {
           const covered = toPushList.filter(c => c.session?.subscriptionCovered === true).length
           const uncovered = toPushList.filter(c => c.session?.subscriptionCovered === false).length
           process.stderr.write(`[dry-run] Fields: ${withLineage}/${toPushCount} spans carry lineage (ai.work_unit_id/session_role/lineage_evidence), ${withCacheTokens} carry cache tokens, ai.subscription_covered true on ${covered} / false on ${uncovered} / omitted on ${toPushCount - covered - uncovered}; codeburn.coverage_through: ${coverageThrough ?? 'unavailable'}\n`)
+
+          // Plugin socket disclosure (teams issue #3): a member sees every
+          // loaded plugin and every declared sync attribute, so a plugin
+          // cannot widen the wire silently. Empty socket => line is omitted.
+          const loadedPlugins = pluginLoads.filter(l => l.status === 'loaded')
+          const rejectedPlugins = pluginLoads.filter(l => l.status === 'rejected')
+          if (loadedPlugins.length > 0 || rejectedPlugins.length > 0) {
+            const loadedSummary = loadedPlugins.map(l => {
+              const attrs = l.manifest.capabilities.syncAttributes
+              return attrs.length > 0
+                ? `${l.manifest.name}@${l.manifest.version} [${attrs.map(a => `${a.key} - ${a.disclosure}`).join('; ')}]`
+                : `${l.manifest.name}@${l.manifest.version} (no sync attributes declared)`
+            }).join(' | ')
+            process.stderr.write(`[dry-run] Plugins loaded: ${loadedPlugins.length} (${loadedSummary})\n`)
+            if (rejectedPlugins.length > 0) {
+              const rejectedSummary = rejectedPlugins.map(l => `${l.name} (${l.reason})`).join('; ')
+              process.stderr.write(`[dry-run] Plugins rejected: ${rejectedPlugins.length} (${rejectedSummary})\n`)
+            }
+          }
           if (unsent.length > MAX_PER_PUSH) {
             process.stderr.write(`[dry-run] ${unsent.length - MAX_PER_PUSH} more calls exceed the ${MAX_PER_PUSH} safety limit — a second push would be needed\n`)
           }
@@ -367,6 +395,10 @@ export function registerSyncCommands(program: Command): void {
             accessToken: tokens.access_token,
             batches,
             ...(coverageThrough ? { coverageThrough } : {}),
+            // Empty values array is the no-plugin-runtime case: the wire guard
+            // in otlp.ts drops everything when `values` is empty, so the wire
+            // is byte-identical until a real plugin supplies attrs.
+            pluginAttributes: { keys: pluginAttributeKeys, values: [] },
             log: msg => process.stderr.write(`${msg}\n`),
           })
         }

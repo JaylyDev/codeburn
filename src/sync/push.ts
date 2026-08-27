@@ -345,6 +345,14 @@ export interface SendBatchesOptions {
   log?: (msg: string) => void
   /** ISO date stamped as codeburn.coverage_through on every batch. Omit when unproven. */
   coverageThrough?: string
+  /**
+   * Plugin-socket extension point (teams issue #3): the set of attribute keys
+   * loaded plugins have DECLARED on their manifests, plus the runtime-supplied
+   * attribute values to attach to every span. The wire guard in otlp.ts drops
+   * anything not in the declared set, so an empty values array (the common
+   * case with no plugin runtime yet) keeps every batch byte-identical.
+   */
+  pluginAttributes?: { keys: ReadonlySet<string>; values: import('./otlp.js').OtlpAttribute[] }
   /** Injectable sleep for tests. Defaults to real setTimeout. */
   sleep?: (ms: number) => Promise<void>
   /** Max wait per 429 (caps Retry-After). Default 120s. */
@@ -378,7 +386,12 @@ export function parseRetryAfterMs(value: string | null): number | null {
 export async function sendBatches(opts: SendBatchesOptions): Promise<PushResult> {
   return sendBatchesCore({
     ...opts,
-    buildPayload: batch => buildOtlpPayload(batch, opts.coverageThrough ? { coverageThrough: opts.coverageThrough } : undefined),
+    buildPayload: batch => buildOtlpPayload(batch, {
+      ...(opts.coverageThrough ? { coverageThrough: opts.coverageThrough } : {}),
+      ...(opts.pluginAttributes
+        ? { pluginAttributes: opts.pluginAttributes.values, pluginAttributeKeys: opts.pluginAttributes.keys }
+        : {}),
+    }),
     toOutbound: c => ({ key: c.call.deduplicationKey, ts: c.call.timestamp, costUSD: c.call.costUSD }),
   })
 }
