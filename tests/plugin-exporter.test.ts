@@ -1,0 +1,378 @@
+/**
+ * Tests for the plugin sync exporter seam (socket phase 2, slice B).
+ *
+ * Covers: per-call attribute enrichment, extra span generation, guards,
+ * isolation, crash handling, and byte-identical baseline.
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { mkdtemp, rm, mkdir, writeFile } from 'fs/promises'
+import { join } from 'path'
+import { tmpdir } from 'os'
+import type { CallWithSession, OtlpAttribute } from '../src/sync/otlp.js'
+import { buildOtlpPayload } from '../src/sync/otlp.js'
+import { collectPluginEnrichment } from '../src/plugins/exporter.js'
+import type { PluginLoad } from '../src/plugins/loader.js'
+
+function validManifest(name = 'sample') {
+  return {
+    name,
+    version: '0.1.0',
+    cliCompat: '>=0.9.22',
+    capabilities: {
+      commands: [],
+      syncAttributes: [{ key: 'sample.score', disclosure: 'numeric score 0..1' }],
+      payloadSections: [],
+      spanKinds: ['sample.span'],
+    },
+  }
+}
+
+function sampleCall(deduplicationKey: string): CallWithSession {
+  return {
+    call: {
+      deduplicationKey,
+      provider: 'claude',
+      model: 'claude-3-sonnet',
+      timestamp: '2026-01-01T00:00:00Z',
+      usage: { inputTokens: 10, outputTokens: 20, cacheReadInputTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0, reasoningTokens: 0 },
+      costUSD: 0.001,
+      speed: 'average',
+      tools: [],
+    },
+    sessionId: 'session-1',
+    workingDirectory: '/tmp',
+  }
+}
+
+let tmpDir: string
+beforeEach(async () => {
+  tmpDir = await mkdtemp(join(tmpdir(), 'plugin-exporter-'))
+})
+afterEach(async () => {
+  await rm(tmpDir, { recursive: true, force: true })
+})
+
+describe('plugin sync exporter seam', () => {
+  it('happy path: exporter returns declared perCall attr and extra span', async () => {
+    const pluginDir = join(tmpDir, 'exporter-plugin')
+    const exportersDir = join(pluginDir, 'exporters')
+    await mkdir(exportersDir, { recursive: true })
+
+    // Write exporter script
+    const traceId = '0'.repeat(32)
+    const spanId = '0'.repeat(16)
+    await writeFile(
+      join(exportersDir, 'sync.mjs'),
+      `
+import * as readline from 'readline';
+const rl = readline.createInterface({ input: process.stdin });
+let input = '';
+for await (const line of rl) {
+  input += line;
+}
+const data = JSON.parse(input);
+const output = {
+  perCall: {
+    [data.calls[0].key]: [{ key: 'sample.score', value: { doubleValue: 0.75 } }]
+  },
+  spans: [{
+    kind: 'sample.span',
+    traceId: '${traceId}',
+    spanId: '${spanId}',
+    name: 'exporter span',
+    startNano: '1000000000',
+    endNano: '2000000000',
+    attributes: []
+  }]
+};
+process.stdout.write(JSON.stringify(output));
+`
+    )
+
+    const loads: PluginLoad[] = [
+      { status: 'loaded', manifest: validManifest('exporter-plugin'), dir: pluginDir },
+    ]
+    const calls = [sampleCall('key-1')]
+
+    const enrichment = await collectPluginEnrichment(loads, calls, 5000)
+
+    // Should have perCall attr and extra span
+    expect(enrichment.perCall.has('key-1')).toBe(true)
+    expect(enrichment.extraSpans.length).toBe(1)
+    expect(enrichment.extraSpans[0].attributes.some(a => a.key === 'codeburn.span_kind')).toBe(true)
+  })
+
+  it('undeclared attribute key is dropped', async () => {
+    const pluginDir = join(tmpDir, 'undeclared-attr-plugin')
+    const exportersDir = join(pluginDir, 'exporters')
+    await mkdir(exportersDir, { recursive: true })
+
+    // Exporter returns undeclared key
+    await writeFile(
+      join(exportersDir, 'sync.mjs'),
+      `
+import * as readline from 'readline';
+const rl = readline.createInterface({ input: process.stdin });
+let input = '';
+for await (const line of rl) {
+  input += line;
+}
+const data = JSON.parse(input);
+process.stdout.write(JSON.stringify({
+  perCall: {
+    [data.calls[0].key]: [{ key: 'undeclared.key', value: { stringValue: 'test' } }]
+  },
+  spans: []
+}));
+`
+    )
+
+    const manifest = { ...validManifest('plugin'), capabilities: { ...validManifest('plugin').capabilities, syncAttributes: [] } }
+    const loads: PluginLoad[] = [
+      { status: 'loaded', manifest, dir: pluginDir },
+    ]
+    const calls = [sampleCall('key-1')]
+
+    const enrichment = await collectPluginEnrichment(loads, calls, 5000)
+
+    // Undeclared key should be filtered out - either missing or empty
+    const attrs = enrichment.perCall.get('key-1') ?? []
+    expect(attrs.filter(a => a.key === 'undeclared.key').length).toBe(0)
+  })
+
+  it('exporter crash produces stderr notice, no enrichment', async () => {
+    const pluginDir = join(tmpDir, 'crash-plugin')
+    const exportersDir = join(pluginDir, 'exporters')
+    await mkdir(exportersDir, { recursive: true })
+
+    // Exporter that crashes
+    await writeFile(join(exportersDir, 'sync.mjs'), 'process.exit(1);')
+
+    const loads: PluginLoad[] = [
+      { status: 'loaded', manifest: validManifest('crash-plugin'), dir: pluginDir },
+    ]
+    const calls = [sampleCall('key-1')]
+
+    const savedStderr = process.stderr.write
+    let stderrOutput = ''
+    process.stderr.write = (chunk: string | Uint8Array | Buffer): boolean => {
+      stderrOutput += chunk.toString()
+      return true
+    }
+
+    try {
+      const enrichment = await collectPluginEnrichment(loads, calls, 5000)
+
+      // Should have no enrichment
+      expect(enrichment.perCall.size).toBe(0)
+      expect(enrichment.extraSpans.length).toBe(0)
+      expect(stderrOutput).toContain('sync exporter failed')
+    } finally {
+      process.stderr.write = savedStderr
+    }
+  })
+
+  it('timeout produces stderr notice, no enrichment', async () => {
+    const pluginDir = join(tmpDir, 'timeout-plugin')
+    const exportersDir = join(pluginDir, 'exporters')
+    await mkdir(exportersDir, { recursive: true })
+
+    // Exporter that hangs
+    await writeFile(
+      join(exportersDir, 'sync.mjs'),
+      'setTimeout(() => {}, 60000);'
+    )
+
+    const loads: PluginLoad[] = [
+      { status: 'loaded', manifest: validManifest('timeout-plugin'), dir: pluginDir },
+    ]
+    const calls = [sampleCall('key-1')]
+
+    const savedStderr = process.stderr.write
+    let stderrOutput = ''
+    process.stderr.write = (chunk: string | Uint8Array | Buffer): boolean => {
+      stderrOutput += chunk.toString()
+      return true
+    }
+
+    try {
+      const enrichment = await collectPluginEnrichment(loads, calls, 100) // 100ms timeout
+
+      expect(enrichment.perCall.size).toBe(0)
+      expect(enrichment.extraSpans.length).toBe(0)
+      expect(stderrOutput).toContain('timeout')
+    } finally {
+      process.stderr.write = savedStderr
+    }
+  })
+
+  it('no exporter file is skipped (byte-identical baseline)', async () => {
+    const pluginDir = join(tmpDir, 'no-exporter-plugin')
+    await mkdir(pluginDir, { recursive: true })
+
+    const loads: PluginLoad[] = [
+      { status: 'loaded', manifest: validManifest('no-exporter-plugin'), dir: pluginDir },
+    ]
+    const calls = [sampleCall('key-1')]
+
+    const enrichment = await collectPluginEnrichment(loads, calls)
+
+    // Should have no enrichment (no exporter file)
+    expect(enrichment.perCall.size).toBe(0)
+    expect(enrichment.extraSpans.length).toBe(0)
+
+    // Verify payload is byte-identical
+    const payload1 = buildOtlpPayload(calls)
+    const payload2 = buildOtlpPayload(calls, { pluginEnrichment: enrichment })
+    expect(JSON.stringify(payload1)).toBe(JSON.stringify(payload2))
+  })
+
+  it('extra span caps: max 2x calls.length', async () => {
+    const pluginDir = join(tmpDir, 'span-cap-plugin')
+    const exportersDir = join(pluginDir, 'exporters')
+    await mkdir(exportersDir, { recursive: true })
+
+    // Exporter that tries to return too many spans
+    await writeFile(
+      join(exportersDir, 'sync.mjs'),
+      `
+import * as readline from 'readline';
+const rl = readline.createInterface({ input: process.stdin });
+let input = '';
+for await (const line of rl) {
+  input += line;
+}
+const data = JSON.parse(input);
+const spans = [];
+for (let i = 0; i < 10; i++) {
+  spans.push({
+    kind: 'sample.span',
+    traceId: '0'.repeat(32),
+    spanId: i.toString().padStart(16, '0'),
+    name: 'span ' + i,
+    startNano: '1000000000',
+    endNano: '2000000000',
+    attributes: []
+  });
+}
+process.stdout.write(JSON.stringify({ perCall: {}, spans }));
+`
+    )
+
+    const loads: PluginLoad[] = [
+      { status: 'loaded', manifest: validManifest('span-cap-plugin'), dir: pluginDir },
+    ]
+    const calls = [sampleCall('key-1'), sampleCall('key-2')] // 2 calls = max 4 spans
+
+    const enrichment = await collectPluginEnrichment(loads, calls, 5000)
+
+    // Should cap at 2x calls.length = 4
+    expect(enrichment.extraSpans.length).toBeLessThanOrEqual(4)
+  })
+
+  it('oversized span (>64KB) is dropped', async () => {
+    const pluginDir = join(tmpDir, 'oversized-span-plugin')
+    const exportersDir = join(pluginDir, 'exporters')
+    await mkdir(exportersDir, { recursive: true })
+
+    // Exporter that returns oversized span with a declared attribute
+    await writeFile(
+      join(exportersDir, 'sync.mjs'),
+      `
+import * as readline from 'readline';
+const rl = readline.createInterface({ input: process.stdin });
+let input = '';
+for await (const line of rl) {
+  input += line;
+}
+const bigScore = 'x'.repeat(70 * 1024);
+process.stdout.write(JSON.stringify({
+  perCall: {},
+  spans: [{
+    kind: 'sample.span',
+    traceId: '0'.repeat(32),
+    spanId: '0'.repeat(16),
+    name: 'big span',
+    startNano: '1000000000',
+    endNano: '2000000000',
+    attributes: [{ key: 'sample.score', value: { stringValue: bigScore } }]
+  }]
+}));
+`
+    )
+
+    const loads: PluginLoad[] = [
+      { status: 'loaded', manifest: validManifest('oversized-span-plugin'), dir: pluginDir },
+    ]
+    const calls = [sampleCall('key-1')]
+
+    const enrichment = await collectPluginEnrichment(loads, calls, 5000)
+
+    // Oversized span should be dropped
+    expect(enrichment.extraSpans.length).toBe(0)
+  })
+
+  it('rejected plugins are skipped', async () => {
+    const pluginDir = join(tmpDir, 'rejected-plugin')
+    await mkdir(pluginDir, { recursive: true })
+
+    const loads: PluginLoad[] = [
+      { status: 'rejected', name: 'rejected-plugin', dir: pluginDir, reason: 'unsigned' },
+    ]
+    const calls = [sampleCall('key-1')]
+
+    const enrichment = await collectPluginEnrichment(loads, calls)
+
+    // Rejected plugin should contribute nothing
+    expect(enrichment.perCall.size).toBe(0)
+    expect(enrichment.extraSpans.length).toBe(0)
+  })
+
+  it('cross-plugin isolation: plugin A cannot emit attrs declared only by B', async () => {
+    const pluginADir = join(tmpDir, 'plugin-a')
+    const pluginBDir = join(tmpDir, 'plugin-b')
+    const exportersA = join(pluginADir, 'exporters')
+    const exportersB = join(pluginBDir, 'exporters')
+    await mkdir(exportersA, { recursive: true })
+    await mkdir(exportersB, { recursive: true })
+
+    // Plugin A tries to emit attr declared only by B
+    await writeFile(
+      join(exportersA, 'sync.mjs'),
+      `
+import * as readline from 'readline';
+const rl = readline.createInterface({ input: process.stdin });
+let input = '';
+for await (const line of rl) {
+  input += line;
+}
+const data = JSON.parse(input);
+process.stdout.write(JSON.stringify({
+  perCall: {
+    [data.calls[0].key]: [{ key: 'plugin-b.attr', value: { stringValue: 'stolen' } }]
+  },
+  spans: []
+}));
+`
+    )
+
+    // Plugin B declares plugin-b.attr
+    await writeFile(join(exportersB, 'sync.mjs'), 'process.stdout.write(JSON.stringify({perCall:{},spans:[]}));')
+
+    const manifestA = { ...validManifest('plugin-a'), capabilities: { ...validManifest('plugin-a').capabilities, syncAttributes: [] } }
+    const manifestB = { ...validManifest('plugin-b'), capabilities: { ...validManifest('plugin-b').capabilities, syncAttributes: [{ key: 'plugin-b.attr', disclosure: 'test' }] } }
+
+    const loads: PluginLoad[] = [
+      { status: 'loaded', manifest: manifestA, dir: pluginADir },
+      { status: 'loaded', manifest: manifestB, dir: pluginBDir },
+    ]
+    const calls = [sampleCall('key-1')]
+
+    const enrichment = await collectPluginEnrichment(loads, calls, 5000)
+
+    // Plugin A's attempt to emit plugin-b.attr should be dropped
+    const aAttrs = enrichment.perCall.get('key-1') ?? []
+    expect(aAttrs.some(a => a.key === 'plugin-b.attr')).toBe(false)
+  })
+})

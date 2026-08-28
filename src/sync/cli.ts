@@ -25,6 +25,7 @@ import { readSyncConfig, writeSyncConfig, deleteSyncConfig, updateLastSync, rece
 import { collectUnsentCalls, collectUnsentAttribution, sendBatches, sendAttributionBatches, batchCalls, MAX_PER_PUSH, MAX_ATTRIBUTION_PER_PUSH, type PushResult } from './push.js'
 import { batchAttributionItems, wireProjectName, CORE_SYNC_ATTRIBUTE_KEYS } from './otlp.js'
 import { loadPlugins, declaredSyncAttributes, type PluginLoad } from '../plugins/loader.js'
+import { collectPluginEnrichment } from '../plugins/exporter.js'
 import {
   computeAcceptanceFingerprint,
   buildDisclosure,
@@ -431,6 +432,28 @@ export function registerSyncCommands(program: Command): void {
               process.stderr.write(`[dry-run] Plugins rejected: ${rejectedPlugins.length} (${rejectedSummary})\n`)
             }
           }
+
+          // Plugin exporter disclosure: show which loaded plugins have exporters
+          // and what they would contribute
+          const pluginEnrichmentDry = await collectPluginEnrichment(pluginLoads, toPushList)
+          const { stat: statFn } = await import('fs/promises')
+          const exporterPlugins: Array<PluginLoad & { status: 'loaded' }> = []
+          for (const l of loadedPlugins) {
+            try {
+              await statFn(`${l.dir}/exporters/sync.mjs`)
+              exporterPlugins.push(l as PluginLoad & { status: 'loaded' })
+            } catch {
+              // no exporter
+            }
+          }
+          if (exporterPlugins.length > 0) {
+            const exporterSummary = exporterPlugins.map(l => {
+              const callCount = pluginEnrichmentDry.perCall.size
+              const spanCount = pluginEnrichmentDry.extraSpans.length
+              return `${l.manifest.name} would contribute attributes for ${callCount} calls and ${spanCount} extra spans`
+            }).join('; ')
+            process.stderr.write(`[dry-run] Plugin exporters: ${exporterSummary}\n`)
+          }
           if (unsent.length > MAX_PER_PUSH) {
             process.stderr.write(`[dry-run] ${unsent.length - MAX_PER_PUSH} more calls exceed the ${MAX_PER_PUSH} safety limit — a second push would be needed\n`)
           }
@@ -471,6 +494,10 @@ export function registerSyncCommands(program: Command): void {
         let result: PushResult = { outcome: 'complete', totalSent: 0, totalRejected: 0, totalCostSent: 0 }
         if (toPush.length > 0) {
           const batches = batchCalls(toPush, discoveryDoc.max_batch_size)
+
+          // Collect per-call attributes and extra spans from plugin exporters
+          const pluginEnrichment = await collectPluginEnrichment(pluginLoads, toPush)
+
           result = await sendBatches({
             endpoint,
             accessToken: tokens.access_token,
@@ -480,6 +507,7 @@ export function registerSyncCommands(program: Command): void {
             // in otlp.ts drops everything when `values` is empty, so the wire
             // is byte-identical until a real plugin supplies attrs.
             pluginAttributes: { keys: pluginAttributeKeys, values: [] },
+            ...(pluginEnrichment.perCall.size > 0 || pluginEnrichment.extraSpans.length > 0 ? { pluginEnrichment } : {}),
             log: msg => process.stderr.write(`${msg}\n`),
           })
         }
