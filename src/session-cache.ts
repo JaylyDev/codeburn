@@ -4,7 +4,7 @@ import { createHash, randomBytes } from 'crypto'
 import { join } from 'path'
 
 import { getCodeburnCacheDir } from './cache-dir.js'
-import { acquireCacheRefreshLock } from './cache-refresh-lock.js'
+import { acquireCacheRefreshLock, releaseOwnedRefreshLocksForExit } from './cache-refresh-lock.js'
 import type { ToolCall } from './types.js'
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -1695,6 +1695,15 @@ function removeOurLockSync(): void {
     const parsed = JSON.parse(readFileSync(lockPath(), 'utf-8')) as Partial<LockRecord>
     if (parsed?.pid === process.pid) unlinkSync(lockPath())
   } catch { /* best-effort; nothing to clean or already gone */ }
+}
+
+/** Terminate an interactive CLI after synchronously releasing both cache-lock
+ * families it can own. The process cannot wait for background parsing to drain,
+ * but a direct exit must not make the next launch recover a stale live-pid lock. */
+export function exitAfterCacheCleanup(exitCode: number): never {
+  releaseOwnedRefreshLocksForExit()
+  removeOurLockSync()
+  process.exit(exitCode)
 }
 
 // Arm once, only while we hold the lock: on a catchable termination (Ctrl-C, or a

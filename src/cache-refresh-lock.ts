@@ -89,6 +89,13 @@ function removeOurLockSync(): void {
   }
 }
 
+/** Release every warm-refresh lock owned by this process before a caller uses
+ * `process.exit()`. Signal handlers already cover SIGINT/SIGTERM; the TUI's q
+ * path exits directly after restoring the terminal and needs the same cleanup. */
+export function releaseOwnedRefreshLocksForExit(): void {
+  removeOurLockSync()
+}
+
 // Arm once, only while we hold the lock: on a catchable termination (Ctrl-C, or
 // the menubar/desktop watchdog's SIGTERM) clean our lock before dying so a
 // killed refresh leaves no leftover. SIGKILL can't be caught, so that path still

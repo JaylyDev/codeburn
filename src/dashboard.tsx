@@ -11,6 +11,7 @@ import { findUnpricedModels, isExpectedFreeModel, loadPricing } from './models.j
 import { aggregateModelTotals } from './model-breakdown.js'
 import { buildDurableOverviewFromNormalizedIndex, buildDurablePeriod, hydrateDailyCacheFromNormalizedProjects } from './usage-aggregator.js'
 import { loadDailyCache, type DailyCache } from './daily-cache.js'
+import { exitAfterCacheCleanup } from './session-cache.js'
 import { getAllProviders } from './providers/index.js'
 import { classHeaderLine, classTotals, findingBasis, findingClass, scanAndDetect, type FindingClass, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
 import { appliedFixGlyph, formatAppliedFix, type AppliedFix } from './act/types.js'
@@ -1562,7 +1563,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   autoFallbackFromEmptyToday?: boolean
   /// CLI-only hard stop after Ink has been asked to restore the terminal.
   /// Component tests and embedders omit it and receive ordinary Ink exit.
-  terminateProcess?: () => void
+  terminateProcess?: (exitCode: number) => void
 }) {
   const { exit } = useApp()
   const [period, setPeriod] = useState<Period>(initialPeriod)
@@ -1958,14 +1959,14 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   }, [switchDay])
 
   useInput((input, key) => {
-    const quitNow = (): void => {
+    const quitNow = (exitCode: number): void => {
       exit()
-      terminateProcess?.()
+      terminateProcess?.(exitCode)
     }
     // #1143: Ctrl+C always exits immediately, regardless of fill state. The
     // #1109 abrupt path is kill-safe (nothing marked seen without being
     // parsed, resume converges), so this is the unconditional escape hatch.
-    if (key.ctrl && input === 'c') { quitNow(); return }
+    if (key.ctrl && input === 'c') { quitNow(130); return }
     // First q during an active fill: arm confirmation, do not exit. The fill
     // keeps running so the next launch starts warm. A second q takes the
     // abrupt path; q with no fill active exits immediately (no flicker).
@@ -1973,12 +1974,12 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
       if (indexing) {
         // A ref makes two q bytes decisive even when the background scan keeps
         // React from committing the confirmation state between them.
-        if (quitArmedRef.current) { quitNow(); return }
+        if (quitArmedRef.current) { quitNow(0); return }
         quitArmedRef.current = true
         setQuitArmed(true)
         return
       }
-      quitNow()
+      quitNow(0)
       return
     }
     if (input === 'o' && view === 'dashboard' && optimizeAvailable) { void loadOptimizeResult(); return }
@@ -2438,16 +2439,16 @@ export async function renderDashboard(period: Period = 'week', provider: string 
     const hardQuitGuard = (chunk: string | Buffer): void => {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
       for (const byte of bytes) {
-        if (byte === 3) setImmediate(() => process.exit(0))
+        if (byte === 3) setImmediate(() => exitAfterCacheCleanup(130))
         if (byte !== 113) continue
         const now = Date.now()
-        if (now - lastQuitByteAt <= 2000) setImmediate(() => process.exit(0))
+        if (now - lastQuitByteAt <= 2000) setImmediate(() => exitAfterCacheCleanup(0))
         lastQuitByteAt = now
       }
     }
     process.stdin.on('data', hardQuitGuard)
     const app = renderDebouncedInteractive(process.stdout, ({ columns }) => (
-      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={opened} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={columns} initialIndexPendingFiles={paint.deferredFiles} initialHistoryIndexing={progressive} initialCacheWasCold={cacheWasCold} autoFallbackFromEmptyToday={auto} terminateProcess={() => { setImmediate(() => process.exit(0)) }} />
+      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={opened} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={columns} initialIndexPendingFiles={paint.deferredFiles} initialHistoryIndexing={progressive} initialCacheWasCold={cacheWasCold} autoFallbackFromEmptyToday={auto} terminateProcess={exitCode => { setImmediate(() => exitAfterCacheCleanup(exitCode)) }} />
     ))
     try {
       await app.waitUntilExit()
