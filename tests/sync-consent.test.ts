@@ -566,6 +566,20 @@ describe('Damaged acceptance record', () => {
     }) as never)
 
     const { registerSyncCommands } = await import('../src/sync/cli.js')
+    const program = new Command()
+    program.exitOverride()
+    registerSyncCommands(program)
+
+    await expect(
+      program.parseAsync(['node', 'codeburn', 'sync', 'auto', 'status']),
+    ).rejects.toThrow('__exit__')
+
+    const stdout = stdoutChunks.join('')
+    expect(stdout).toContain('Automatic sync acceptance record is damaged.')
+    expect(stdout).not.toContain('undefined')
+  })
+})
+
 describe('sync auto status --json', () => {
   let testDir: string
   beforeEach(async () => {
@@ -608,13 +622,6 @@ describe('sync auto status --json', () => {
     program.exitOverride()
     registerSyncCommands(program)
 
-    await expect(
-      program.parseAsync(['node', 'codeburn', 'sync', 'auto', 'status']),
-    ).rejects.toThrow('__exit__')
-
-    const stdout = stdoutChunks.join('')
-    expect(stdout).toContain('Automatic sync acceptance record is damaged.')
-    expect(stdout).not.toContain('undefined')
     const savedStdout = process.stdout.write
     let stdout = ''
     process.stdout.write = (chunk: string | Uint8Array | Buffer): boolean => {
