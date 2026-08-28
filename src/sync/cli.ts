@@ -35,6 +35,59 @@ import {
 } from './consent.js'
 import { installSchedule, removeSchedule } from './schedule-installer.js'
 
+// Helper for executing the push after data collection
+interface ExecutePushInput {
+  config: NonNullable<Awaited<ReturnType<typeof readSyncConfig>>>
+  unsent: Awaited<ReturnType<typeof collectUnsentCalls>>['unsent']
+  attributionUnsent: Awaited<ReturnType<typeof collectUnsentAttribution>>['unsent']
+  pluginAttributeKeys: ReadonlySet<string>
+  coverageThrough?: string
+  tokens: { access_token: string }
+  silent?: boolean
+}
+
+async function executePush(input: ExecutePushInput): Promise<{ result: PushResult; attrResult: PushResult | null; attrFacts: number }> {
+  const { config, unsent, attributionUnsent, pluginAttributeKeys, coverageThrough, tokens, silent } = input
+  const log = silent ? () => {} : (msg: string) => process.stderr.write(`${msg}\n`)
+
+  const discoveryDoc = await fetchDiscoveryDoc(config.baseUrl)
+  const endpoint = `${config.baseUrl}${config.tracesPath}`
+
+  let result: PushResult = { outcome: 'complete', totalSent: 0, totalRejected: 0, totalCostSent: 0 }
+  if (unsent.length > 0) {
+    const toPush = unsent.slice(0, MAX_PER_PUSH)
+    const batches = batchCalls(toPush, discoveryDoc.max_batch_size)
+    result = await sendBatches({
+      endpoint,
+      accessToken: tokens.access_token,
+      batches,
+      ...(coverageThrough ? { coverageThrough } : {}),
+      pluginAttributes: { keys: pluginAttributeKeys, values: [] },
+      log,
+    })
+  }
+
+  let attrResult: PushResult | null = null
+  let attrFacts = 0
+  if (attributionUnsent.length > 0 && result.outcome === 'complete') {
+    const attrToPush = attributionUnsent.slice(0, MAX_ATTRIBUTION_PER_PUSH)
+    const attrBatches = batchAttributionItems(attrToPush, discoveryDoc.max_batch_size)
+    attrResult = await sendAttributionBatches({
+      endpoint,
+      accessToken: tokens.access_token,
+      batches: attrBatches,
+      log,
+    })
+    attrFacts = attrResult.outcome === 'complete' ? attrResult.totalSent : 0
+  }
+
+  if (result.outcome === 'complete') {
+    updateLastSync()
+  }
+
+  return { result, attrResult, attrFacts }
+}
+
 export function registerSyncCommands(program: Command): void {
   const sync = program
     .command('sync')
@@ -495,8 +548,9 @@ export function registerSyncCommands(program: Command): void {
     .command('enable')
     .description('Enable automatic scheduled pushes (requires --accept to proceed)')
     .option('--cadence <cadence>', 'Schedule frequency: daily or hourly', 'daily')
+    .option('--attribution', 'Also send work-matching data (session-to-commit links)')
     .option('--accept', 'Accept the disclosure and enable automatic sync')
-    .action(async (opts: { cadence?: string; accept?: boolean }) => {
+    .action(async (opts: { cadence?: string; attribution?: boolean; accept?: boolean }) => {
       const config = readSyncConfig()
       if (!config) {
         process.stderr.write('Sync not configured. Run `codeburn sync setup <url>` first.\n')
@@ -521,12 +575,13 @@ export function registerSyncCommands(program: Command): void {
           return { key, disclosure: plugin?.disclosure ?? '' }
         })
 
+        const workMatching = opts.attribution ?? false
         const fingerprintInput: FingerprintInput = {
           org: config.clientId,
           destination: config.baseUrl,
           outboundFields: allKeys,
-          workMatching: true,
-          scopeSinceDays: null,
+          workMatching,
+          scopeSinceDays: 7,
           cadence,
         }
 
@@ -537,8 +592,8 @@ export function registerSyncCommands(program: Command): void {
           destinationUrl: config.baseUrl,
           cadence,
           outboundFields: fieldList,
-          workMatching: true,
-          scopeSinceDays: null,
+          workMatching,
+          scopeSinceDays: 7,
         }
 
         const disclosure = buildDisclosure(disclosureInput)
@@ -555,6 +610,7 @@ export function registerSyncCommands(program: Command): void {
             acceptedAt: new Date().toISOString(),
             cadence,
             disclosure,
+            attribution: workMatching,
           },
           killed: false,
         }
@@ -693,8 +749,8 @@ export function registerSyncCommands(program: Command): void {
           org: config.clientId,
           destination: config.baseUrl,
           outboundFields: allKeys,
-          workMatching: true,
-          scopeSinceDays: null,
+          workMatching: accepted.attribution,
+          scopeSinceDays: 7,
           cadence: accepted.cadence,
         }
 
@@ -715,7 +771,8 @@ export function registerSyncCommands(program: Command): void {
           return
         }
 
-        // Run the same push path as sync push
+        // Collect data - 7 day window. Sent-ledger prevents duplicates across runs,
+        // so daily/hourly rescans don't lose anything.
         const { parseAllSessions } = await import('../parser.js')
         const { getDateRange } = await import('../cli-date.js')
 
@@ -732,7 +789,7 @@ export function registerSyncCommands(program: Command): void {
           ? dailyCache.lastComputedDate
           : undefined
 
-        const { allCalls, unsent } = collectUnsentCalls(projects, Date.now(), { plans })
+        const { unsent } = collectUnsentCalls(projects, Date.now(), { plans })
 
         if (unsent.length === 0) {
           appendReceipt(buildReceipt(at, currentFingerprint, { result: 'pushed', spans: 0 }))
@@ -753,25 +810,33 @@ export function registerSyncCommands(program: Command): void {
           store.store(tokens.refresh_token)
         }
 
-        const discoveryDoc = await fetchDiscoveryDoc(config.baseUrl)
-        const endpoint = `${config.baseUrl}${config.tracesPath}`
+        // Collect attribution if enabled
+        let attributionUnsent: Awaited<ReturnType<typeof collectUnsentAttribution>>['unsent'] = []
+        if (accepted.attribution) {
+          const { computeAttributionRecords } = await import('../yield.js')
+          const records = computeAttributionRecords(projects, range, process.cwd())
+          const collected = collectUnsentAttribution(records)
+          attributionUnsent = collected.unsent
+        }
 
-        const toPush = unsent.slice(0, MAX_PER_PUSH)
-        const batches = batchCalls(toPush, discoveryDoc.max_batch_size)
-
+        // Use shared push helper
         const pluginAttributeKeys: ReadonlySet<string> = new Set(pluginKeys.keys())
-        const result: PushResult = await sendBatches({
-          endpoint,
-          accessToken: tokens.access_token,
-          batches,
-          ...(coverageThrough ? { coverageThrough } : {}),
-          pluginAttributes: { keys: pluginAttributeKeys, values: [] },
-          log: () => {}, // Silent mode
+        const { result, attrFacts } = await executePush({
+          config,
+          unsent,
+          attributionUnsent,
+          pluginAttributeKeys,
+          coverageThrough,
+          tokens,
+          silent: true,
         })
 
         if (result.outcome === 'complete') {
-          updateLastSync()
-          appendReceipt(buildReceipt(at, currentFingerprint, { result: 'pushed', spans: result.totalSent }))
+          const receipt: Record<string, unknown> = { result: 'pushed', spans: result.totalSent }
+          if (attrFacts > 0) {
+            receipt.attributionFacts = attrFacts
+          }
+          appendReceipt(buildReceipt(at, currentFingerprint, receipt as any))
         } else {
           appendReceipt(buildReceipt(at, currentFingerprint, { result: 'error', reason: result.outcome }))
         }

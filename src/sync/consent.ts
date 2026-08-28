@@ -1,5 +1,5 @@
 /**
- * codeburn sync — consent-once auto-sync with fingerprint and receipts.
+ * codeburn sync - consent-once auto-sync with fingerprint and receipts.
  *
  * Manages acceptance fingerprints, disclosure building, and receipt tracking
  * for automatic scheduled pushes.
@@ -79,6 +79,7 @@ export interface AcceptanceRecord {
   acceptedAt: string
   cadence: 'daily' | 'hourly'
   disclosure: string
+  attribution: boolean
 }
 
 export interface AutoSyncConfig {

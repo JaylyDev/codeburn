@@ -219,7 +219,7 @@ describe('Config with auto block', () => {
     await rm(tmpDir, { recursive: true, force: true })
   })
 
-  it('round-trips auto block through config', async () => {
+  it('round-trips auto block through config with attribution', async () => {
     const configDir = join(tmpDir, '.config', 'codeburn')
     await mkdir(configDir, { recursive: true })
 
@@ -234,6 +234,7 @@ describe('Config with auto block', () => {
           acceptedAt: new Date().toISOString(),
           cadence: 'daily' as const,
           disclosure: 'Test disclosure',
+          attribution: true,
         },
         killed: false,
       },
@@ -244,6 +245,7 @@ describe('Config with auto block', () => {
 
     expect(loaded?.auto?.accepted?.fingerprint).toBe('abc123')
     expect(loaded?.auto?.accepted?.cadence).toBe('daily')
+    expect(loaded?.auto?.accepted?.attribution).toBe(true)
     expect(loaded?.auto?.killed).toBe(false)
   })
 
@@ -310,5 +312,17 @@ describe('Receipts', () => {
   it('returns empty array when receipts file does not exist', () => {
     const receipts = readReceipts()
     expect(receipts).toEqual([])
+  })
+
+  it('creates directory if missing when appending receipt', () => {
+    // Don't pre-create configDir - test that appendReceipt creates it
+    process.env.HOME = tmpDir
+
+    const receipt = { at: '2024-01-01T00:00:00Z', result: 'pushed', spans: 5 }
+    appendReceipt(receipt)
+
+    const receipts = readReceipts()
+    expect(receipts).toHaveLength(1)
+    expect(receipts[0]?.result).toBe('pushed')
   })
 })

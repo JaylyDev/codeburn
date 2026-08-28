@@ -1,5 +1,5 @@
 /**
- * codeburn sync — schedule installer for automatic pushes.
+ * codeburn sync - schedule installer for automatic pushes.
  *
  * Manages LaunchAgent plist on macOS for scheduled sync auto runs.
  * On other platforms, prints the crontab line to add manually.

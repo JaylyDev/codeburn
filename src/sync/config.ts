@@ -92,6 +92,8 @@ export function appendReceipt(receipt: Record<string, unknown>): void {
   const dir = configDir()
   mkdirSync(dir, { recursive: true })
   const path = receiptsPath()
+  // Ensure directory exists immediately before write (handles race conditions)
+  mkdirSync(dir, { recursive: true })
   const line = JSON.stringify(receipt) + '\n'
   writeFileSync(path, line, { flag: 'a' })
 }
