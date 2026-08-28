@@ -353,6 +353,15 @@ export interface SendBatchesOptions {
    * case with no plugin runtime yet) keeps every batch byte-identical.
    */
   pluginAttributes?: { keys: ReadonlySet<string>; values: import('./otlp.js').OtlpAttribute[] }
+  /**
+   * Per-call attributes and extra spans from plugin exporters (sync exporter
+   * seam, teams issue #3 phase 2). Attached to matching calls and appended to
+   * the span list across all batches.
+   */
+  pluginEnrichment?: {
+    perCall: Map<string, import('./otlp.js').OtlpAttribute[]>
+    extraSpans: import('./otlp.js').OtlpSpan[]
+  }
   /** Injectable sleep for tests. Defaults to real setTimeout. */
   sleep?: (ms: number) => Promise<void>
   /** Max wait per 429 (caps Retry-After). Default 120s. */
@@ -391,6 +400,7 @@ export async function sendBatches(opts: SendBatchesOptions): Promise<PushResult>
       ...(opts.pluginAttributes
         ? { pluginAttributes: opts.pluginAttributes.values, pluginAttributeKeys: opts.pluginAttributes.keys }
         : {}),
+      ...(opts.pluginEnrichment ? { pluginEnrichment: opts.pluginEnrichment } : {}),
     }),
     toOutbound: c => ({ key: c.call.deduplicationKey, ts: c.call.timestamp, costUSD: c.call.costUSD }),
   })

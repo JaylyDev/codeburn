@@ -11,12 +11,18 @@
  */
 
 import type { Command } from 'commander'
-import { stat, mkdir, readFile, writeFile, rm, readdir } from 'fs/promises'
+import { stat, mkdir, readFile, writeFile, rm, readdir, copyFile, mkdtemp } from 'fs/promises'
 import { join } from 'path'
 import { homedir } from 'os'
+import { spawn } from 'child_process'
+import { createHash } from 'crypto'
+import { tmpdir } from 'os'
 
-import { defaultPluginsDir, loadPlugins, currentCliVersion, verifyPlugin, readPluginManifestRaw } from './loader.js'
+import { defaultPluginsDir, loadPlugins, currentCliVersion, verifyPlugin, readPluginManifestRaw, type PluginLoad } from './loader.js'
 import { parsePluginManifest, type PluginManifest } from './manifest.js'
+import { readSyncConfig } from '../sync/config.js'
+import { createCredentialStore } from '../sync/credentials.js'
+import { fetchOidcConfig, refreshToken } from '../sync/auth.js'
 
 export function registerPluginCommands(program: Command): void {
   const plugin = program
@@ -67,9 +73,13 @@ export function registerPluginCommands(program: Command): void {
       }
       const rejected = loads.find((l): l is Extract<typeof l, { status: 'rejected' }> => l.status === 'rejected' && l.name === name)
       if (rejected) {
-        throw new Error(`Plugin "${name}" is not loaded: ${rejected.reason}`)
+        process.stderr.write(`Error: Plugin "${name}" is not loaded: ${rejected.reason}\n`)
+        process.exitCode = 1
+        return
       }
-      throw new Error(`Plugin "${name}" not found in ${opts.dir ?? defaultPluginsDir()}.`)
+      process.stderr.write(`Error: Plugin "${name}" not found in ${opts.dir ?? defaultPluginsDir()}.\n`)
+      process.exitCode = 1
+      return
     })
 
   plugin
@@ -80,52 +90,46 @@ export function registerPluginCommands(program: Command): void {
       const dir = join(opts.dir ?? defaultPluginsDir(), name)
       const manifest = await readManifestForVerify(dir, name)
       if (!manifest) {
-        throw new Error(`Plugin "${name}" could not be loaded for verify.`)
+        process.stderr.write(`Error: Plugin "${name}" could not be loaded for verify.\n`)
+        process.exitCode = 1
+        return
       }
       const result = await verifyPlugin(dir, manifest, process.env)
       if (result.ok) {
         process.stdout.write(`verified  ${name}@${manifest.version}\n`)
       } else {
-        throw new Error(`unverified  ${name}@${manifest.version}  ${result.reason ?? 'verification failed'}`)
+        process.stderr.write(`Error: unverified  ${name}@${manifest.version}  ${result.reason ?? 'verification failed'}\n`)
+        process.exitCode = 1
+        return
       }
     })
 
   plugin
-    .command('add <path>')
-    .description('Install a plugin from a source directory')
+    .command('add <source>')
+    .description('Install a plugin from a local path or the org receiver')
     .option('--dir <path>', 'Override the plugins directory')
-    .action(async (sourcePath: string, opts: { dir?: string }) => {
+    .action(async (source: string, opts: { dir?: string }) => {
       const pluginsDir = opts.dir ?? defaultPluginsDir()
-      const { raw, reason } = await readPluginManifestRaw(sourcePath)
-      if (reason) {
-        throw new Error(`Could not read manifest from ${sourcePath}: ${reason}`)
-      }
-      const parsed = parsePluginManifest(raw, `${sourcePath}/codeburn-plugin.json`)
-      if (!parsed.ok) {
-        throw new Error(`Invalid manifest: ${parsed.reason}`)
-      }
-      const manifest = parsed.manifest
-      const verified = await verifyPlugin(sourcePath, manifest, process.env)
-      if (!verified.ok) {
-        throw new Error(`Plugin verification failed: ${verified.reason ?? 'unknown reason'}`)
-      }
-      const destDir = join(pluginsDir, manifest.name)
+
       try {
-        await stat(destDir)
-        throw new Error(`Plugin "${manifest.name}" already installed at ${destDir}`)
-      } catch (err: unknown) {
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+        // Dispatch: if source looks like a path or exists as directory, use local flow; otherwise remote
+        const isLocal = source.includes('/') || source.includes('.') ||
+          (await stat(source).then(() => true).catch(() => false))
+
+        if (isLocal) {
+          await addLocal(source, pluginsDir)
+        } else {
+          // Validate plugin name
+          if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(source)) {
+            throw new Error(`Invalid plugin name "${source}". Must match [a-z0-9]([a-z0-9-]*[a-z0-9])?`)
+          }
+          await addRemote(source, pluginsDir)
+        }
+      } catch (err) {
+        process.stderr.write(`Error: ${(err as Error).message}\n`)
+        process.exitCode = 1
+        return
       }
-      await mkdir(destDir, { recursive: true })
-      const entries = await readdir(sourcePath, { withFileTypes: true })
-      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-        if (!entry.isFile()) continue
-        const srcFile = join(sourcePath, entry.name)
-        const destFile = join(destDir, entry.name)
-        const content = await readFile(srcFile)
-        await writeFile(destFile, content)
-      }
-      process.stdout.write(`Plugin "${manifest.name}@${manifest.version}" installed to ${destDir}\n`)
     })
 
   plugin
@@ -137,8 +141,9 @@ export function registerPluginCommands(program: Command): void {
       const pluginsDir = opts.dir ?? defaultPluginsDir()
       const destDir = join(pluginsDir, name)
       if (!opts.confirm) {
-        process.stdout.write(`Would remove plugin directory: ${destDir}\nUse --confirm to proceed.\n`)
-        process.exit(1)
+        process.stderr.write(`Error: Use --confirm to proceed with removal of ${destDir}\n`)
+        process.exitCode = 1
+        return
       }
       await rm(destDir, { recursive: true, force: true })
       process.stdout.write(`Plugin "${name}" removed.\n`)
@@ -173,5 +178,328 @@ async function listOnDiskSections(dir: string, m: PluginManifest): Promise<strin
   return out
 }
 
+/// Verify and install a plugin from an extracted/verified root directory.
+/// Both local and remote flows call this after prep.
+async function verifyAndInstall(
+  sourceDir: string,
+  pluginsDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
+  const { raw, reason } = await readPluginManifestRaw(sourceDir)
+  if (reason) {
+    throw new Error(`Could not read manifest from ${sourceDir}: ${reason}`)
+  }
+  const parsed = parsePluginManifest(raw, `${sourceDir}/codeburn-plugin.json`)
+  if (!parsed.ok) {
+    throw new Error(`Invalid manifest: ${parsed.reason}`)
+  }
+  const manifest = parsed.manifest
+  const verified = await verifyPlugin(sourceDir, manifest, env)
+  if (!verified.ok) {
+    throw new Error(`Plugin verification failed: ${verified.reason ?? 'unknown reason'}`)
+  }
+  const destDir = join(pluginsDir, manifest.name)
+  try {
+    await stat(destDir)
+    throw new Error(`Plugin "${manifest.name}" already installed at ${destDir}`)
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+  }
+  await mkdir(destDir, { recursive: true })
+  await copyPluginTree(sourceDir, destDir)
+  process.stdout.write(`Plugin "${manifest.name}@${manifest.version}" installed to ${destDir}\n`)
+  return destDir
+}
+
+/// Recursively copy plugin files from source to destination, excluding sections/
+/// (sections/ is runtime-mutable plugin output and not copied on install).
+async function copyPluginTree(sourceDir: string, destDir: string): Promise<void> {
+  async function walk(src: string, dest: string) {
+    const entries = await readdir(src, { withFileTypes: true })
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      // Exclude sections directory (runtime-mutable plugin output)
+      if (entry.name === 'sections') continue
+
+      const srcPath = join(src, entry.name)
+      const destPath = join(dest, entry.name)
+
+      if (entry.isFile()) {
+        await copyFile(srcPath, destPath)
+      } else if (entry.isDirectory()) {
+        await mkdir(destPath, { recursive: true })
+        await walk(srcPath, destPath)
+      }
+    }
+  }
+
+  await walk(sourceDir, destDir)
+}
+
+/// Validate tarball entries to prevent directory traversal attacks.
+/// Lists all entries and rejects if any: starts with /, contains .., starts with ~, or contains \.
+export async function validateTarEntries(tarFile: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let output = ''
+    const child = spawn('tar', ['-tzf', tarFile])
+    child.on('error', reject)
+    if (child.stdout) {
+      child.stdout.on('data', chunk => {
+        output += chunk.toString('utf8')
+      })
+    }
+    child.on('exit', (code) => {
+      if (code !== 0) {
+        reject(new Error(`Failed to list tarball contents (exit code ${code})`))
+        return
+      }
+      const entries = output.trim().split('\n').filter(Boolean)
+      for (const entry of entries) {
+        // Reject absolute paths
+        if (entry.startsWith('/')) {
+          reject(new Error(`Tarball contains absolute path: ${entry}`))
+          return
+        }
+        // Reject .. path traversal
+        if (entry.includes('..')) {
+          reject(new Error(`Tarball contains directory traversal: ${entry}`))
+          return
+        }
+        // Reject home directory expansion
+        if (entry.startsWith('~')) {
+          reject(new Error(`Tarball contains home directory reference: ${entry}`))
+          return
+        }
+        // Reject backslashes (path separator on Windows, escape char)
+        if (entry.includes('\\')) {
+          reject(new Error(`Tarball contains backslash in entry name: ${entry}`))
+          return
+        }
+      }
+      // Name checks above are blind to entry TYPE: `tar -tzf` prints a symlink
+      // as a bare name, hiding its "-> target". A symlink (or hardlink, device,
+      // fifo) can escape the extraction dir before verifyPlugin's post-extract
+      // symlink check runs, on platforms whose tar follows links mid-archive.
+      // Reject by type flag, which every tar puts at column 0 of a verbose list.
+      const verbose = spawn('tar', ['-tvzf', tarFile])
+      let vout = ''
+      verbose.on('error', reject)
+      if (verbose.stdout) verbose.stdout.on('data', c => { vout += c.toString('utf8') })
+      verbose.on('exit', vcode => {
+        if (vcode !== 0) { reject(new Error(`Failed to list tarball types (exit code ${vcode})`)); return }
+        for (const line of vout.trim().split('\n').filter(Boolean)) {
+          const typeFlag = line[0]
+          if (typeFlag !== '-' && typeFlag !== 'd') {
+            reject(new Error(`Tarball contains a non-regular entry (type "${typeFlag}"); only files and directories are allowed`))
+            return
+          }
+        }
+        resolve()
+      })
+    })
+  })
+}
+
+/// Install from a local path (existing flow).
+async function addLocal(sourcePath: string, pluginsDir: string): Promise<void> {
+  await verifyAndInstall(sourcePath, pluginsDir)
+}
+
+/// Install from the org receiver (remote flow).
+async function addRemote(name: string, pluginsDir: string): Promise<void> {
+  // Read sync config
+  const config = readSyncConfig()
+  if (!config) {
+    throw new Error('Sync not configured. Run `codeburn sync setup <url>` first.')
+  }
+
+  // Refresh token
+  const store = createCredentialStore()
+  const rt = store.retrieve()
+  if (!rt) {
+    throw new Error('No auth token found. Run `codeburn sync setup` to authenticate.')
+  }
+
+  const oidc = await fetchOidcConfig(config.issuer)
+  const tokens = await refreshToken(oidc.token_endpoint, rt, config.clientId)
+
+  // Store rotated token
+  if (tokens.refresh_token && tokens.refresh_token !== rt) {
+    store.store(tokens.refresh_token)
+  }
+
+  // Fetch manifest
+  const manifestUrl = `${config.baseUrl}/plugin/${name}/manifest`
+  const manifestResp = await fetch(manifestUrl, {
+    headers: { 'Authorization': `Bearer ${tokens.access_token}` },
+  })
+
+  if (!manifestResp.ok) {
+    let msg = `HTTP ${manifestResp.status}`
+    try {
+      const body = await manifestResp.text()
+      const json = JSON.parse(body)
+      msg = json.error ?? json.message ?? msg
+    } catch {}
+    throw new Error(`Failed to fetch plugin manifest: ${msg}`)
+  }
+
+  // A manifest is a few hundred bytes; cap the read so a misbehaving server
+  // cannot balloon memory before parsing.
+  const manifestText = await manifestResp.text()
+  if (manifestText.length > 64 * 1024) {
+    throw new Error('Plugin manifest response exceeds 64 KB; refusing')
+  }
+  const manifestData = JSON.parse(manifestText) as Record<string, unknown>
+  const manifestSha = typeof manifestData.sha256 === 'string' ? manifestData.sha256 : ''
+  const manifestSize = typeof manifestData.size === 'number' ? manifestData.size : 0
+
+  if (!manifestSha) {
+    throw new Error('Manifest missing sha256')
+  }
+
+  // Download tarball
+  const downloadUrl = `${config.baseUrl}/plugin/${name}/download`
+  const downloadResp = await fetch(downloadUrl, {
+    headers: { 'Authorization': `Bearer ${tokens.access_token}` },
+  })
+
+  if (!downloadResp.ok) {
+    throw new Error(`Failed to download plugin: HTTP ${downloadResp.status}`)
+  }
+
+  // Check content-length
+  const contentLength = downloadResp.headers.get('content-length')
+  const size = contentLength ? parseInt(contentLength, 10) : 0
+  if (size > 50 * 1024 * 1024) {
+    throw new Error(`Plugin tarball exceeds 50 MB limit (${size} bytes)`)
+  }
+
+  // Download and hash
+  const buffer = await downloadResp.arrayBuffer()
+  const bytes = new Uint8Array(buffer)
+
+  if (bytes.length > 50 * 1024 * 1024) {
+    throw new Error(`Plugin tarball exceeds 50 MB limit (${bytes.length} bytes)`)
+  }
+
+  // Verify sha256
+  const headerSha = downloadResp.headers.get('x-codeburn-sha256') || ''
+  const computed = createHash('sha256').update(bytes).digest('hex')
+  if (computed !== manifestSha || computed !== headerSha) {
+    throw new Error(`Plugin tarball integrity check failed (sha256 mismatch)`)
+  }
+
+  // Extract to temp dir
+  const tempDir = await mkdtemp(join(tmpdir(), 'codeburn-plugin-'))
+  try {
+    const tarFile = join(tempDir, 'plugin.tar.gz')
+    await writeFile(tarFile, bytes)
+
+    // Validate tarball entries before extraction (prevent directory traversal)
+    await validateTarEntries(tarFile)
+
+    // Extract tar
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn('tar', ['-xzf', tarFile, '-C', tempDir])
+      child.on('error', reject)
+      child.on('exit', (code) => {
+        if (code === 0) resolve()
+        else reject(new Error(`tar extraction failed with exit code ${code}`))
+      })
+    })
+
+    // Determine plugin root: if single top-level dir, use that; else use tempDir
+    const extracted = await readdir(tempDir)
+    const dirs = extracted.filter(f => f !== 'plugin.tar.gz')
+
+    let pluginRoot: string
+    if (dirs.length === 1) {
+      const stat_ = await stat(join(tempDir, dirs[0]))
+      if (stat_.isDirectory()) {
+        pluginRoot = join(tempDir, dirs[0])
+      } else {
+        throw new Error('Tarball must contain either a single top-level directory or files at root')
+      }
+    } else if (dirs.length > 1) {
+      // Files or multiple dirs at root
+      const allFiles = await readdir(tempDir)
+      if (allFiles.some(f => f.startsWith('codeburn-plugin'))) {
+        pluginRoot = tempDir
+      } else {
+        throw new Error('Tarball must contain either a single top-level directory or files at root')
+      }
+    } else {
+      throw new Error('Tarball is empty')
+    }
+
+    // Verify manifest name matches requested name
+    const { raw, reason } = await readPluginManifestRaw(pluginRoot)
+    if (reason) {
+      throw new Error(`Could not read plugin manifest: ${reason}`)
+    }
+    const parsed = parsePluginManifest(raw, 'codeburn-plugin.json')
+    if (!parsed.ok) {
+      throw new Error(`Invalid plugin manifest: ${parsed.reason}`)
+    }
+    if (parsed.manifest.name !== name) {
+      throw new Error(`Plugin name mismatch: expected "${name}", got "${parsed.manifest.name}"`)
+    }
+
+    // Install
+    await verifyAndInstall(pluginRoot, pluginsDir)
+  } finally {
+    await rm(tempDir, { recursive: true, force: true })
+  }
+}
+
 // Re-export so consumers can pin the version pinned by the socket itself.
 export { defaultPluginsDir, currentCliVersion }
+
+export async function registerLoadedPluginCommands(program: Command, loads?: PluginLoad[]): Promise<void> {
+  const pluginLoads = loads ?? await loadPlugins()
+
+  for (const load of pluginLoads) {
+    if (load.status !== 'loaded') continue
+    const manifest = load.manifest
+    const pluginDir = load.dir
+
+    for (const commandName of manifest.capabilities.commands) {
+      // Collision check: skip if command already exists (built-ins win)
+      if (program.commands.some(c => c.name() === commandName)) {
+        process.stderr.write(`plugin "${manifest.name}": command "${commandName}" conflicts with a built-in and was not registered\n`)
+        continue
+      }
+
+      program
+        .command(commandName)
+        .description(`Plugin command from ${manifest.name}@${manifest.version}`)
+        .allowUnknownOption(true)
+        .argument('[args...]')
+        .action(async (args: string[]) => {
+          const entryFile = join(pluginDir, 'commands', commandName + '.mjs')
+          try {
+            await stat(entryFile)
+          } catch {
+            process.stderr.write(`plugin "${manifest.name}": missing commands/${commandName}.mjs\n`)
+            process.exitCode = 1
+            return
+          }
+
+          const env = { ...process.env, CODEBURN_PLUGIN_DIR: pluginDir }
+          const child = spawn(process.execPath, [entryFile, ...args], {
+            stdio: 'inherit',
+            env,
+          })
+
+          await new Promise<void>((resolve) => {
+            child.on('exit', (code) => {
+              if (code !== null && code !== 0) {
+                process.exitCode = code
+              }
+              resolve()
+            })
+          })
+        })
+    }
+  }
+}

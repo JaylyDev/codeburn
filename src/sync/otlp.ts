@@ -216,6 +216,16 @@ export interface BuildOtlpOptions {
    */
   pluginAttributes?: OtlpAttribute[]
   pluginAttributeKeys?: ReadonlySet<string>
+  /**
+   * Per-call attributes and extra spans from plugin exporters (sync exporter
+   * seam, teams issue #3 phase 2). Already guarded upstream; perCall attrs
+   * are attached to the span whose deduplicationKey matches, and extra spans
+   * are appended to the span list.
+   */
+  pluginEnrichment?: {
+    perCall: Map<string, OtlpAttribute[]>
+    extraSpans: OtlpSpan[]
+  }
 }
 
 /// Attribute keys the core emitter writes. Plugins add fields; they never
@@ -255,6 +265,7 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
     : []
 
   const spans: OtlpSpan[] = calls.map(({ call, sessionId, workingDirectory, session }) => {
+    const perCallEnrichment = opts?.pluginEnrichment?.perCall.get(call.deduplicationKey) ?? []
     const startNano = toUnixNano(call.timestamp)
     // End time = start + 1ms (we don't have real duration, but OTLP requires both)
     const endNano = (BigInt(startNano) + 1_000_000n).toString()
@@ -331,6 +342,9 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
     // filterPluginAttributes). No plugins => no change to any byte.
     attributes.push(...guardedPluginAttributes)
 
+    // Per-call enrichment from sync exporters
+    attributes.push(...perCallEnrichment)
+
     return {
       traceId: deriveTraceId(sessionId),
       spanId: deriveSpanId(call.deduplicationKey),
@@ -347,6 +361,11 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
   const coverageThrough = opts?.coverageThrough ? sanitizeIdentifier(opts.coverageThrough, 32) : undefined
   if (coverageThrough) {
     resourceAttributes.push({ key: 'codeburn.coverage_through', value: { stringValue: coverageThrough } })
+  }
+
+  // Append extra spans from plugin exporters
+  if (opts?.pluginEnrichment?.extraSpans) {
+    spans.push(...opts.pluginEnrichment.extraSpans)
   }
 
   return {

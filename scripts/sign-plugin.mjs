@@ -109,20 +109,44 @@ async function handleSign() {
   console.log(`Signed ${pluginDir}`)
 }
 
+// Codepoint order, never locale order: this list feeds the signed digest,
+// so canonicalization must be identical on every machine and ICU build.
 async function getFilesList(dir) {
   const files = []
-  const entries = await readdir(dir, { withFileTypes: true })
-  for (const entry of entries) {
-    if (entry.isFile() && entry.name !== 'codeburn-plugin.sig') {
-      const fullPath = join(dir, entry.name)
-      const stat_info = await stat(fullPath)
-      if (!stat_info.isFile()) continue
-      const content = await readFile(fullPath)
-      const sha256 = await hashSha256(content)
-      files.push({ path: entry.name, sha256 })
+
+  async function walk(baseDir, relativePath) {
+    try {
+      const entries = await readdir(baseDir, { withFileTypes: true })
+      for (const entry of entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
+        // Exclude signature file and sections directory (runtime-mutable plugin output)
+        if (entry.name === 'codeburn-plugin.sig') continue
+        if (entry.name === 'sections') continue
+
+        const fullPath = join(baseDir, entry.name)
+        const relPosixPath = relativePath ? `${relativePath}/${entry.name}` : entry.name
+
+        if (entry.isFile()) {
+          let content
+          try {
+            content = await readFile(fullPath)
+          } catch (err) {
+            // Signing over an incomplete file list would produce a valid
+            // signature for a broken plugin. Fail loudly instead.
+            throw new Error(`cannot read ${relPosixPath} while signing: ${err.message}`)
+          }
+          const sha256 = await hashSha256(content)
+          files.push({ path: relPosixPath, sha256 })
+        } else if (entry.isDirectory()) {
+          await walk(fullPath, relPosixPath)
+        }
+      }
+    } catch (err) {
+      throw new Error(`cannot read directory while signing: ${err.message}`)
     }
   }
-  files.sort((a, b) => a.path.localeCompare(b.path))
+
+  await walk(dir, '')
+  files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
   return files
 }
 
