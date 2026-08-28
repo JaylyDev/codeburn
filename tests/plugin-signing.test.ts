@@ -204,11 +204,22 @@ describe('plugin add/remove commands (9b)', () => {
     const env = { ...process.env }
     delete env.CODEBURN_PLUGIN_DEV
 
+    const savedStderr = process.stderr.write
+    const savedExitCode = process.exitCode
+    let stderr = ''
+    process.stderr.write = (chunk: string | Uint8Array | Buffer): boolean => {
+      stderr += chunk.toString()
+      return true
+    }
+    process.exitCode = undefined
+
     try {
-      await expect(
-        program.parseAsync(['node', 'codeburn', 'plugin', 'add', sourceDir, '--dir', pluginDir]),
-      ).rejects.toThrow()
+      await program.parseAsync(['node', 'codeburn', 'plugin', 'add', sourceDir, '--dir', pluginDir])
+      expect(process.exitCode).toBe(1)
+      expect(stderr).toContain('signature')
     } finally {
+      process.stderr.write = savedStderr
+      process.exitCode = savedExitCode
       await rm(pluginDir, { recursive: true, force: true })
     }
   })
@@ -277,11 +288,22 @@ describe('plugin add/remove commands (9b)', () => {
     program.exitOverride()
     registerPluginCommands(program)
 
+    const savedStderr = process.stderr.write
+    const savedExitCode = process.exitCode
+    let stderr = ''
+    process.stderr.write = (chunk: string | Uint8Array | Buffer): boolean => {
+      stderr += chunk.toString()
+      return true
+    }
+    process.exitCode = undefined
+
     try {
-      await expect(
-        program.parseAsync(['node', 'codeburn', 'plugin', 'add', sourceDir, '--dir', pluginDir]),
-      ).rejects.toThrow()
+      await program.parseAsync(['node', 'codeburn', 'plugin', 'add', sourceDir, '--dir', pluginDir])
+      expect(process.exitCode).toBe(1)
+      expect(stderr).toContain('already installed')
     } finally {
+      process.stderr.write = savedStderr
+      process.exitCode = savedExitCode
       RELEASE_PUBLIC_KEYS.clear()
       for (const [k, v] of originalKeys) {
         ;(RELEASE_PUBLIC_KEYS as any).set(k, v)
@@ -302,11 +324,22 @@ describe('plugin add/remove commands (9b)', () => {
     program.exitOverride()
     registerPluginCommands(program)
 
+    const savedStderr = process.stderr.write
+    const savedExitCode = process.exitCode
+    let stderr = ''
+    process.stderr.write = (chunk: string | Uint8Array | Buffer): boolean => {
+      stderr += chunk.toString()
+      return true
+    }
+    process.exitCode = undefined
+
     try {
-      await expect(
-        program.parseAsync(['node', 'codeburn', 'plugin', 'remove', 'test-plugin', '--dir', pluginDir]),
-      ).rejects.toThrow()
+      await program.parseAsync(['node', 'codeburn', 'plugin', 'remove', 'test-plugin', '--dir', pluginDir])
+      expect(process.exitCode).toBe(1)
+      expect(stderr).toContain('--confirm')
     } finally {
+      process.stderr.write = savedStderr
+      process.exitCode = savedExitCode
       await rm(pluginDir, { recursive: true, force: true })
     }
   })
