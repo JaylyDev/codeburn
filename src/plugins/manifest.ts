@@ -49,6 +49,7 @@ export function parsePluginManifest(raw: unknown, source: string): ParseResult {
 
 /// Minimal semver-ish compare: dot-separated numeric segments, missing = 0.
 /// Enough for the ">=x.y.z <a.b.c" ranges manifests declare; no dependency.
+/// Note: prerelease suffixes compare as extra numeric segments, so "1.0.0-canary" > "1.0.0".
 export function compareVersions(a: string, b: string): number {
   const pa = a.split('.').map(s => parseInt(s, 10) || 0)
   const pb = b.split('.').map(s => parseInt(s, 10) || 0)

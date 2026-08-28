@@ -196,9 +196,24 @@ describe('plugin CLI: codeburn plugin list|info|verify', () => {
     const emptyDir = await mkdtemp(join(tmpdir(), 'empty-info-'))
     try {
       const program = makeProgram()
-      await expect(
-        program.parseAsync(['node', 'codeburn', 'plugin', 'info', 'nope', '--dir', emptyDir]),
-      ).rejects.toThrow()
+      const savedStderr = process.stderr.write
+      const savedExitCode = process.exitCode
+      let stderrOutput = ''
+      process.stderr.write = (chunk: string | Uint8Array | Buffer): boolean => {
+        stderrOutput += chunk.toString()
+        return true
+      }
+      process.exitCode = undefined
+
+      try {
+        await program.parseAsync(['node', 'codeburn', 'plugin', 'info', 'nope', '--dir', emptyDir])
+        expect(stderrOutput).toContain('Error:')
+        expect(stderrOutput).toContain('nope')
+        expect(process.exitCode).toBe(1)
+      } finally {
+        process.stderr.write = savedStderr
+        process.exitCode = savedExitCode
+      }
     } finally {
       await rm(emptyDir, { recursive: true, force: true })
     }
@@ -224,9 +239,23 @@ describe('plugin CLI: codeburn plugin list|info|verify', () => {
     await mkdir(pluginDir, { recursive: true })
     await writeFile(join(pluginDir, 'codeburn-plugin.json'), '{ not json')
     const program = makeProgram()
-    await expect(
-      program.parseAsync(['node', 'codeburn', 'plugin', 'verify', 'broken', '--dir', tmpDir]),
-    ).rejects.toThrow()
+    const savedStderr = process.stderr.write
+    const savedExitCode = process.exitCode
+    let stderrOutput = ''
+    process.stderr.write = (chunk: string | Uint8Array | Buffer): boolean => {
+      stderrOutput += chunk.toString()
+      return true
+    }
+    process.exitCode = undefined
+
+    try {
+      await program.parseAsync(['node', 'codeburn', 'plugin', 'verify', 'broken', '--dir', tmpDir])
+      expect(stderrOutput).toContain('Error:')
+      expect(process.exitCode).toBe(1)
+    } finally {
+      process.stderr.write = savedStderr
+      process.exitCode = savedExitCode
+    }
   })
 })
 

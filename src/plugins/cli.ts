@@ -73,9 +73,13 @@ export function registerPluginCommands(program: Command): void {
       }
       const rejected = loads.find((l): l is Extract<typeof l, { status: 'rejected' }> => l.status === 'rejected' && l.name === name)
       if (rejected) {
-        throw new Error(`Plugin "${name}" is not loaded: ${rejected.reason}`)
+        process.stderr.write(`Error: Plugin "${name}" is not loaded: ${rejected.reason}\n`)
+        process.exitCode = 1
+        return
       }
-      throw new Error(`Plugin "${name}" not found in ${opts.dir ?? defaultPluginsDir()}.`)
+      process.stderr.write(`Error: Plugin "${name}" not found in ${opts.dir ?? defaultPluginsDir()}.\n`)
+      process.exitCode = 1
+      return
     })
 
   plugin
@@ -86,13 +90,17 @@ export function registerPluginCommands(program: Command): void {
       const dir = join(opts.dir ?? defaultPluginsDir(), name)
       const manifest = await readManifestForVerify(dir, name)
       if (!manifest) {
-        throw new Error(`Plugin "${name}" could not be loaded for verify.`)
+        process.stderr.write(`Error: Plugin "${name}" could not be loaded for verify.\n`)
+        process.exitCode = 1
+        return
       }
       const result = await verifyPlugin(dir, manifest, process.env)
       if (result.ok) {
         process.stdout.write(`verified  ${name}@${manifest.version}\n`)
       } else {
-        throw new Error(`unverified  ${name}@${manifest.version}  ${result.reason ?? 'verification failed'}`)
+        process.stderr.write(`Error: unverified  ${name}@${manifest.version}  ${result.reason ?? 'verification failed'}\n`)
+        process.exitCode = 1
+        return
       }
     })
 
@@ -103,18 +111,24 @@ export function registerPluginCommands(program: Command): void {
     .action(async (source: string, opts: { dir?: string }) => {
       const pluginsDir = opts.dir ?? defaultPluginsDir()
 
-      // Dispatch: if source looks like a path or exists as directory, use local flow; otherwise remote
-      const isLocal = source.includes('/') || source.includes('.') ||
-        (await stat(source).then(() => true).catch(() => false))
+      try {
+        // Dispatch: if source looks like a path or exists as directory, use local flow; otherwise remote
+        const isLocal = source.includes('/') || source.includes('.') ||
+          (await stat(source).then(() => true).catch(() => false))
 
-      if (isLocal) {
-        await addLocal(source, pluginsDir)
-      } else {
-        // Validate plugin name
-        if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(source)) {
-          throw new Error(`Invalid plugin name "${source}". Must match [a-z0-9]([a-z0-9-]*[a-z0-9])?`)
+        if (isLocal) {
+          await addLocal(source, pluginsDir)
+        } else {
+          // Validate plugin name
+          if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(source)) {
+            throw new Error(`Invalid plugin name "${source}". Must match [a-z0-9]([a-z0-9-]*[a-z0-9])?`)
+          }
+          await addRemote(source, pluginsDir)
         }
-        await addRemote(source, pluginsDir)
+      } catch (err) {
+        process.stderr.write(`Error: ${(err as Error).message}\n`)
+        process.exitCode = 1
+        return
       }
     })
 
@@ -127,8 +141,9 @@ export function registerPluginCommands(program: Command): void {
       const pluginsDir = opts.dir ?? defaultPluginsDir()
       const destDir = join(pluginsDir, name)
       if (!opts.confirm) {
-        process.stdout.write(`Would remove plugin directory: ${destDir}\nUse --confirm to proceed.\n`)
-        process.exit(1)
+        process.stderr.write(`Error: Use --confirm to proceed with removal of ${destDir}\n`)
+        process.exitCode = 1
+        return
       }
       await rm(destDir, { recursive: true, force: true })
       process.stdout.write(`Plugin "${name}" removed.\n`)
