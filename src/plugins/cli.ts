@@ -33,8 +33,37 @@ export function registerPluginCommands(program: Command): void {
     .command('list')
     .description('List every plugin the loader found, with status (loaded | rejected) and reason for rejections')
     .option('--dir <path>', 'Override the plugins directory (defaults to ~/.config/codeburn/plugins)')
-    .action(async (opts: { dir?: string }) => {
+    .option('--json', 'Output as machine-readable JSON')
+    .action(async (opts: { dir?: string; json?: boolean }) => {
       const loads = await loadPlugins(opts.dir)
+
+      if (opts.json) {
+        const result = loads.map(load => {
+          if (load.status === 'loaded') {
+            const m = load.manifest
+            return {
+              name: m.name,
+              version: m.version,
+              status: 'loaded' as const,
+              capabilities: {
+                commands: m.capabilities.commands,
+                syncAttributes: m.capabilities.syncAttributes,
+                payloadSections: m.capabilities.payloadSections,
+                spanKinds: m.capabilities.spanKinds,
+              }
+            }
+          } else {
+            return {
+              name: load.name,
+              status: 'rejected' as const,
+              reason: load.reason,
+            }
+          }
+        })
+        process.stdout.write(JSON.stringify(result, null, 0) + '\n')
+        return
+      }
+
       if (loads.length === 0) {
         process.stdout.write(`No plugins found in ${opts.dir ?? defaultPluginsDir()}.\n`)
         return
@@ -57,13 +86,23 @@ export function registerPluginCommands(program: Command): void {
     .command('info <name>')
     .description('Print the full manifest of a loaded plugin plus on-disk payload sections')
     .option('--dir <path>', 'Override the plugins directory')
-    .action(async (name: string, opts: { dir?: string }) => {
+    .option('--json', 'Output as machine-readable JSON')
+    .action(async (name: string, opts: { dir?: string; json?: boolean }) => {
       const loads = await loadPlugins(opts.dir)
       const loaded = loads.find((l): l is Extract<typeof l, { status: 'loaded' }> => l.status === 'loaded' && l.manifest.name === name)
       if (loaded) {
         const m = loaded.manifest
-        process.stdout.write(JSON.stringify(m, null, 2) + '\n')
         const sections = await listOnDiskSections(loaded.dir, m)
+        if (opts.json) {
+          const result = {
+            ...m,
+            dir: loaded.dir,
+            onDiskSections: sections,
+          }
+          process.stdout.write(JSON.stringify(result, null, 0) + '\n')
+          return
+        }
+        process.stdout.write(JSON.stringify(m, null, 2) + '\n')
         if (sections.length > 0) {
           process.stdout.write(`\non-disk payload sections: ${sections.join(', ')}\n`)
         } else {

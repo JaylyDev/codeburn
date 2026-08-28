@@ -257,6 +257,68 @@ describe('plugin CLI: codeburn plugin list|info|verify', () => {
       process.exitCode = savedExitCode
     }
   })
+
+  it('plugin list --json returns array of plugin objects', async () => {
+    const pluginDir = join(tmpDir, 'test-plugin')
+    await mkdir(pluginDir, { recursive: true })
+    const manifest = validManifest('test-plugin')
+    await writeFile(join(pluginDir, 'codeburn-plugin.json'), JSON.stringify(manifest))
+
+    const program = makeProgram()
+    const savedStdout = process.stdout.write
+    let stdout = ''
+    process.stdout.write = (chunk: string | Uint8Array | Buffer): boolean => {
+      stdout += chunk.toString()
+      return true
+    }
+
+    const prev = process.env.CODEBURN_PLUGIN_DEV
+    process.env.CODEBURN_PLUGIN_DEV = '1'
+    try {
+      await program.parseAsync(['node', 'codeburn', 'plugin', 'list', '--json', '--dir', tmpDir])
+      const result = JSON.parse(stdout)
+      expect(Array.isArray(result)).toBe(true)
+      expect(result.length).toBe(1)
+      expect(result[0].status).toBe('loaded')
+      expect(result[0].name).toBe('test-plugin')
+      expect(result[0].version).toBe('0.1.0')
+      expect(result[0].capabilities).toBeDefined()
+    } finally {
+      process.stdout.write = savedStdout
+      if (prev === undefined) delete process.env.CODEBURN_PLUGIN_DEV
+      else process.env.CODEBURN_PLUGIN_DEV = prev
+    }
+  })
+
+  it('plugin info --json returns manifest with dir and onDiskSections', async () => {
+    const pluginDir = join(tmpDir, 'info-plugin')
+    await mkdir(pluginDir, { recursive: true })
+    const manifest = validManifest('info-plugin')
+    await writeFile(join(pluginDir, 'codeburn-plugin.json'), JSON.stringify(manifest))
+
+    const program = makeProgram()
+    const savedStdout = process.stdout.write
+    let stdout = ''
+    process.stdout.write = (chunk: string | Uint8Array | Buffer): boolean => {
+      stdout += chunk.toString()
+      return true
+    }
+
+    const prev = process.env.CODEBURN_PLUGIN_DEV
+    process.env.CODEBURN_PLUGIN_DEV = '1'
+    try {
+      await program.parseAsync(['node', 'codeburn', 'plugin', 'info', 'info-plugin', '--json', '--dir', tmpDir])
+      const result = JSON.parse(stdout)
+      expect(result.name).toBe('info-plugin')
+      expect(result.version).toBe('0.1.0')
+      expect(result.dir).toBe(pluginDir)
+      expect(Array.isArray(result.onDiskSections)).toBe(true)
+    } finally {
+      process.stdout.write = savedStdout
+      if (prev === undefined) delete process.env.CODEBURN_PLUGIN_DEV
+      else process.env.CODEBURN_PLUGIN_DEV = prev
+    }
+  })
 })
 
 // ── 5. Plugin command registration ────────────────────────────────────

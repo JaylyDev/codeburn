@@ -29,6 +29,7 @@ import { Compare } from './sections/Compare'
 import { Plans } from './sections/Plans'
 import { Settings, type SettingsPane } from './sections/Settings'
 import { SpendContent } from './sections/Spend'
+import { PluginsSection } from './sections/Plugins'
 import type { DateRange, MenubarPayload, ModelReportRow, Period, Scope, TelemetryStatus } from './lib/types'
 
 // Bucket raw dollar amounts before they leave the machine: telemetry carries
@@ -116,6 +117,7 @@ const SECTION_TITLES: Record<Section, string> = {
   compare: 'Compare',
   plans: 'Plans',
   settings: 'Settings',
+  plugins: 'Plugins',
 }
 
 const STANDARD_PERIODS: Period[] = ['today', 'week', '30days', 'month', 'all', 'lifetime']
@@ -537,6 +539,8 @@ function AppMain() {
           <Plans period={period} refreshToken={refreshToken} onNavigate={navigate} ready={ready} />
         ) : section === 'settings' ? (
           <Settings period={period} refreshToken={refreshToken} onNavigate={navigate} initialPane={settingsPane} claudeConfigs={claudeConfigs} claudeConfigSource={claudeConfigSource} onConfigMutated={onConfigMutated} scope={scope} onScopeChange={onScopeChange} />
+        ) : section === 'plugins' ? (
+          <PluginsSection />
         ) : (
           <>
             <TopBar

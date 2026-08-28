@@ -70,6 +70,14 @@ const CHANNELS = [
   'codeburn:telemetryOnboarded',
   'codeburn:telemetryTrack',
   'codeburn:getUpdateStatus',
+  'codeburn:pluginList',
+  'codeburn:pluginInfo',
+  'codeburn:pluginAdd',
+  'codeburn:pluginRemove',
+  'codeburn:pluginVerify',
+  'codeburn:syncAutoStatus',
+  'codeburn:syncAutoEnable',
+  'codeburn:syncAutoDisable',
 ] as const
 
 const ARGV_CASES: Array<{ channel: string; args: unknown[]; argv: string[] }> = [
@@ -120,6 +128,20 @@ const ARGV_CASES: Array<{ channel: string; args: unknown[]; argv: string[] }> = 
   { channel: 'codeburn:setPlan', args: ['claude-max', 'claude'], argv: ['plan', 'set', 'claude-max', '--provider', 'claude'] },
   { channel: 'codeburn:resetPlan', args: ['cursor'], argv: ['plan', 'reset', '--provider', 'cursor'] },
   { channel: 'codeburn:exportData', args: ['json', 'all', '/tmp/codeburn-export'], argv: ['export', '-f', 'json', '-o', '/tmp/codeburn-export', '--provider', 'all'] },
+  // Plugin management
+  { channel: 'codeburn:pluginList', args: [], argv: ['plugin', 'list', '--json'] },
+  { channel: 'codeburn:pluginInfo', args: ['test-plugin'], argv: ['plugin', 'info', 'test-plugin', '--json'] },
+  { channel: 'codeburn:pluginAdd', args: ['/path/to/plugin'], argv: ['plugin', 'add', '/path/to/plugin'] },
+  { channel: 'codeburn:pluginAdd', args: ['teams'], argv: ['plugin', 'add', 'teams'] },
+  { channel: 'codeburn:pluginRemove', args: ['test-plugin'], argv: ['plugin', 'remove', 'test-plugin', '--confirm'] },
+  { channel: 'codeburn:pluginVerify', args: ['test-plugin'], argv: ['plugin', 'verify', 'test-plugin'] },
+  // Sync auto
+  { channel: 'codeburn:syncAutoStatus', args: [], argv: ['sync', 'auto', 'status', '--json'] },
+  { channel: 'codeburn:syncAutoEnable', args: ['daily', false, false], argv: ['sync', 'auto', 'enable', '--cadence', 'daily'] },
+  { channel: 'codeburn:syncAutoEnable', args: ['hourly', true, false], argv: ['sync', 'auto', 'enable', '--cadence', 'hourly', '--attribution'] },
+  { channel: 'codeburn:syncAutoEnable', args: ['daily', false, true], argv: ['sync', 'auto', 'enable', '--cadence', 'daily', '--accept'] },
+  { channel: 'codeburn:syncAutoEnable', args: ['hourly', true, true], argv: ['sync', 'auto', 'enable', '--cadence', 'hourly', '--attribution', '--accept'] },
+  { channel: 'codeburn:syncAutoDisable', args: [], argv: ['sync', 'auto', 'disable'] },
 ]
 
 function flattenMenuItems(items: any[]): any[] {

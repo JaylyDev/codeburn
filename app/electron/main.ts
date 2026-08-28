@@ -415,6 +415,33 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     // One-shot read of the cached update-availability status. The check itself
     // runs in the background (launch + 24h); this returns whatever is known.
     'codeburn:getUpdateStatus': async () => ({ ok: true, value: deps.getUpdateStatus ? await deps.getUpdateStatus() : NO_UPDATE_STATUS }),
+    // Plugin management reads (all return parsed JSON)
+    'codeburn:pluginList': run(() => ['plugin', 'list', '--json']),
+    'codeburn:pluginInfo': run((name: string) => ['plugin', 'info', vToken(name), '--json']),
+    'codeburn:syncAutoStatus': run(() => ['sync', 'auto', 'status', '--json']),
+    // Plugin management mutations
+    'codeburn:pluginAdd': runAction((source: string) => ['plugin', 'add', vToken(source)]),
+    'codeburn:pluginRemove': runAction((name: string) => ['plugin', 'remove', vToken(name), '--confirm']),
+    'codeburn:pluginVerify': runAction((name: string) => ['plugin', 'verify', vToken(name)]),
+    // Sync auto enable: special case - when accept=false, capture disclosure text from stdout
+    'codeburn:syncAutoEnable': async (cadence?: string, attribution?: boolean, accept?: boolean) => {
+      try {
+        const args = ['sync', 'auto', 'enable', '--cadence', cadence === 'hourly' ? 'hourly' : 'daily']
+        if (attribution) args.push('--attribution')
+        if (accept) args.push('--accept')
+
+        const result = await deps.spawnCliAction(args)
+        // When accept=false, the disclosure text is in stdout, we return it for display
+        // When accept=true, it succeeds with no special output needed
+        if (!accept && result.stdout) {
+          return { ok: true, value: { ok: true, disclosure: result.stdout, code: result.code } }
+        }
+        return { ok: true, value: { ...result, stderr: sanitizeError(result.stderr) } }
+      } catch (err) {
+        return { ok: false, error: toEnvelopeError(err) }
+      }
+    },
+    'codeburn:syncAutoDisable': runAction(() => ['sync', 'auto', 'disable']),
   }
 }
 

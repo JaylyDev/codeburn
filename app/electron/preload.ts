@@ -69,6 +69,16 @@ const bridge = {
     ipcRenderer.on('codeburn:update', listener)
     return () => { ipcRenderer.removeListener('codeburn:update', listener) }
   },
+  // Plugin management
+  pluginList: () => invoke('codeburn:pluginList'),
+  pluginInfo: (name: string) => invoke('codeburn:pluginInfo', name),
+  pluginAdd: (source: string) => invoke('codeburn:pluginAdd', source),
+  pluginRemove: (name: string) => invoke('codeburn:pluginRemove', name),
+  pluginVerify: (name: string) => invoke('codeburn:pluginVerify', name),
+  // Sync auto
+  syncAutoStatus: () => invoke('codeburn:syncAutoStatus'),
+  syncAutoEnable: (cadence: string, attribution: boolean, accept: boolean) => invoke('codeburn:syncAutoEnable', cadence, attribution, accept),
+  syncAutoDisable: () => invoke('codeburn:syncAutoDisable'),
   platform: process.platform,
   arch: process.arch,
 }
