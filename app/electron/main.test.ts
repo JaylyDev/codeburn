@@ -473,6 +473,30 @@ describe('createBridgeHandlers (cold-start warmup)', () => {
     expect(opts[2]?.priority).toBe('background')
   })
 
+  it('classifies every first-click report warm as background without leaking the scheduler flag into argv', async () => {
+    const calls: Array<{ args: string[]; opts?: Record<string, unknown> }> = []
+    const spawnCli = vi.fn(async (args: string[], opts?: Record<string, unknown>) => {
+      calls.push({ args, opts })
+      return []
+    })
+    const handlers = createBridgeHandlers(base({ spawnCli }))
+    const cases: Array<[string, unknown[]]> = [
+      ['codeburn:getPlans', ['today', true]],
+      ['codeburn:getModels', ['today', 'all', false, undefined, true]],
+      ['codeburn:getSessions', ['today', 'all', undefined, true]],
+      ['codeburn:getCompareModels', ['today', 'all', true]],
+      ['codeburn:getYield', ['today', 'all', undefined, true]],
+      ['codeburn:getSpendFlow', ['today', 'all', undefined, true]],
+      ['codeburn:getOptimizeReport', ['today', 'all', undefined, true]],
+    ]
+
+    for (const [channel, args] of cases) await handlers[channel]!(...args)
+
+    expect(calls).toHaveLength(cases.length)
+    expect(calls.every(call => call.opts?.priority === 'background')).toBe(true)
+    expect(calls.every(call => !call.args.includes('true'))).toBe(true)
+  })
+
   it('re-arms the long timeout when the first overview fails (cache is still cold)', async () => {
     const opts: Array<{ timeoutMs?: number } | undefined> = []
     let n = 0

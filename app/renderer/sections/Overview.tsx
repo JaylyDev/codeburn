@@ -13,6 +13,7 @@ import { type Polled, usePolled } from '../hooks/usePolled'
 import { formatCompact, formatUsd, formatUsdWithCurrency } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import { contiguousDailyWindow, dataStartKey, formatChartDate, localDateKey, sliceDailyToPeriod, sliceDailyToRange } from '../lib/period'
+import { reportMemoKey } from '../lib/reportMemoKey'
 import type {
   ActReportJson,
   CombinedUsage,
@@ -723,7 +724,7 @@ export function OverviewContent({
   }, [overview.data, overview.error?.kind])
   const detailsReady = ready && !timeoutBlocked && overview.error?.kind !== 'timeout'
   const actReport = usePolled<ActReportJson>(() => codeburn.getActReport(), [], { enabled: detailsReady, memoKey: 'overview-act' })
-  const yieldReport = usePolled<YieldJsonReport>(() => codeburn.getYield(period, provider), [period, provider], { enabled: detailsReady, memoKey: `overview-yield|${period}|${provider}` })
+  const yieldReport = usePolled<YieldJsonReport>(() => codeburn.getYield(period, provider), [period, provider], { enabled: detailsReady, memoKey: reportMemoKey('yield', period, provider) })
   const modelIndex = useMemo(() => data ? buildModelIndex(data) : new Map<string, string>(), [data])
 
   if (!data) {

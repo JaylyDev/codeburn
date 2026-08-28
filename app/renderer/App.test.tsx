@@ -2,7 +2,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { App, overviewMemoKey, topCategoryByModel, usageSnapshotProps } from './App'
+import { App, overviewMemoKey, refreshedLabel, selectedReportMemoKeys, topCategoryByModel, usageSnapshotProps } from './App'
 import { sanitizeProps } from '../electron/telemetry'
 import { __resetPolledMemo, hasPolledMemo, primePolledMemo } from './hooks/usePolled'
 import { setActiveCurrency } from './lib/format'
@@ -14,14 +14,16 @@ vi.stubGlobal('localStorage', {
   getItem: (key: string) => stored.get(key) ?? null,
   setItem: (key: string, value: string) => stored.set(key, value),
   removeItem: (key: string) => stored.delete(key),
+  key: (index: number) => [...stored.keys()][index] ?? null,
+  get length() { return stored.size },
   clear: () => stored.clear(),
 })
 
 const mocks = vi.hoisted(() => ({
   getOverview: vi.fn<(period: string, provider: string, range?: DateRange, configSource?: string | null, background?: boolean, scope?: string) => Promise<MenubarPayload>>(),
-  getSpendFlow: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<SpendFlow>>(),
+  getSpendFlow: vi.fn<(period: string, provider: string, range?: DateRange, background?: boolean) => Promise<SpendFlow>>(),
   getTimeline: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<MenubarPayload>>(),
-  getOptimizeReport: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<OptimizeJsonReport>>(),
+  getOptimizeReport: vi.fn<(period: string, provider: string, range?: DateRange, background?: boolean) => Promise<OptimizeJsonReport>>(),
   getModels: vi.fn(),
   getSessions: vi.fn(),
   getCompareModels: vi.fn(),
@@ -233,6 +235,29 @@ describe('App shortcuts', () => {
     expect(mocks.getActReport).not.toHaveBeenCalled()
   })
 
+  it('labels a stale source snapshot honestly instead of claiming 29226/29226 files are still indexing', async () => {
+    const payload = overviewPayload()
+    payload.stale = true
+    payload.hydration = { complete: false, indexedFiles: 29_226, totalFiles: 29_226 }
+    mocks.getOverview.mockResolvedValue(payload)
+
+    render(<App />)
+
+    expect(await screen.findByText('Some sources could not be refreshed. Showing indexed data; recent activity may be missing.')).toBeInTheDocument()
+    expect(screen.queryByText(/29226\/29226/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/totals below cover what is indexed so far/)).not.toBeInTheDocument()
+  })
+
+  it('shows file progress only for a genuinely partial progressive index', async () => {
+    const payload = overviewPayload()
+    payload.hydration = { complete: false, indexedFiles: 24, totalFiles: 100 }
+    mocks.getOverview.mockResolvedValue(payload)
+
+    render(<App />)
+
+    expect(await screen.findByText('Indexing history · 24/100 files · You can keep using CodeBurn; totals update as indexing completes.')).toBeInTheDocument()
+  })
+
   it('never persists the previous period headline under a newly selected period', async () => {
     const thirtyDays = overviewPayload()
     thirtyDays.current = { ...thirtyDays.current, label: 'Last 30 Days', cost: 30 }
@@ -263,6 +288,26 @@ describe('App shortcuts', () => {
       .toBe(overviewMemoKey('all', 'month', null, null, 'local', aug29))
     expect(overviewMemoKey('all', 'month', null, null, 'local', aug29))
       .not.toBe(overviewMemoKey('all', 'month', null, null, 'local', sep1))
+  })
+
+  it('maps the footer to the selected report instead of reusing Overview freshness', () => {
+    expect(selectedReportMemoKeys('sessions', 'week', 'claude', null, 'overview-key'))
+      .toEqual(['sessions|week|claude|-||'])
+    expect(selectedReportMemoKeys('spend', 'week', 'claude', null, 'overview-key'))
+      .toEqual(['overview-key', 'spendflow|week|claude|-||'])
+    expect(selectedReportMemoKeys('optimize', 'week', 'claude', null, 'overview-key'))
+      .toEqual(['overview-key', 'optimize|week|claude|-||', 'yield|week|claude|-||'])
+    expect(selectedReportMemoKeys('models', 'week', 'claude', null, 'overview-key'))
+      .toEqual(['models|week|claude|-|false|'])
+    expect(selectedReportMemoKeys('compare', 'week', 'claude', null, 'overview-key'))
+      .toEqual(['comparemodels|week|claude|-||'])
+    expect(selectedReportMemoKeys('plans', 'week', 'claude', null, 'overview-key', new Set(['kimi', 'codex'])))
+      .toEqual(['quota|codex,kimi', 'plans|week|all|-||'])
+  })
+
+  it('uses readable hour and day units for restored report freshness', () => {
+    expect(refreshedLabel(0, false, 2 * 60 * 60 * 1000)).toBe('refreshed 2h ago')
+    expect(refreshedLabel(0, false, 3 * 24 * 60 * 60 * 1000)).toBe('refreshed 3d ago')
   })
 
   it('releases the sections when the overview fails for a real reason', async () => {
@@ -732,7 +777,7 @@ describe('overview idle warming', () => {
       // should warm the remaining horizons in product priority order, then
       // retain current main's provider-switch warming contract.
       await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
-      await act(async () => { await vi.advanceTimersByTimeAsync(20_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(240_000) })
 
       const backgroundSpawns = mocks.getOverview.mock.calls.filter(call => call[4] === true)
       expect(backgroundSpawns.slice(0, 5).map(call => [call[0], call[1]])).toEqual([
@@ -744,6 +789,47 @@ describe('overview idle warming', () => {
       ])
 
       expect(backgroundSpawns[5]?.slice(0, 2)).toEqual(['30days', 'claude'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('warms the first-click reports for each period behind the overview', async () => {
+    vi.useFakeTimers()
+    try {
+      render(<App />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+
+      expect(mocks.getSessions.mock.calls.some(call => call[0] === 'today' && call[3] === true)).toBe(true)
+      expect(mocks.getSpendFlow.mock.calls.some(call => call[0] === 'today' && call[3] === true)).toBe(true)
+      expect(mocks.getModels.mock.calls.some(call => call[0] === 'today' && call[4] === true)).toBe(true)
+      expect(mocks.getCompareModels.mock.calls.some(call => call[0] === 'today' && call[2] === true)).toBe(true)
+      expect(mocks.getOptimizeReport.mock.calls.some(call => call[0] === 'today' && call[3] === true)).toBe(true)
+      expect(mocks.getYield.mock.calls.some(call => call[0] === 'today' && call[3] === true)).toBe(true)
+      expect(mocks.getPlans.mock.calls.some(call => call[0] === 'today' && call[1] === true)).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('finishes Today first-click reports before starting the 7D horizon', async () => {
+    vi.useFakeTimers()
+    try {
+      render(<App />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+
+      const todaySessions = mocks.getSessions.mock.calls.findIndex(call => call[0] === 'today' && call[3] === true)
+      const todayPlans = mocks.getPlans.mock.calls.findIndex(call => call[0] === 'today' && call[1] === true)
+      const weekOverview = mocks.getOverview.mock.calls.findIndex(call => call[0] === 'week' && call[4] === true)
+      expect(todaySessions).toBeGreaterThanOrEqual(0)
+      expect(todayPlans).toBeGreaterThanOrEqual(0)
+      expect(weekOverview).toBeGreaterThanOrEqual(0)
+      expect(mocks.getSessions.mock.invocationCallOrder[todaySessions]!)
+        .toBeLessThan(mocks.getOverview.mock.invocationCallOrder[weekOverview]!)
+      expect(mocks.getPlans.mock.invocationCallOrder[todayPlans]!)
+        .toBeLessThan(mocks.getOverview.mock.invocationCallOrder[weekOverview]!)
     } finally {
       vi.useRealTimers()
     }
@@ -793,21 +879,27 @@ describe('overview idle warming', () => {
   it('prefetches each provider variant once across 3 poll cycles', async () => {
     vi.useFakeTimers()
     try {
+      // Give the serial idle queue a clean runway. Once it is warm, the long
+      // cadence soak below proves completed provider keys are not respawned.
+      localStorage.setItem('codeburn.refreshInterval', '10m')
       render(<App />)
       // Let the mount overview resolve so `ready` flips and the prefetch arms.
       await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
-      // Three full 30s poll cycles plus the period-warming queue are long enough
-      // to warm every provider. The once-per-key guard must prevent poll cycles
-      // from spawning the queue again.
-      await act(async () => { await vi.advanceTimersByTimeAsync(30_000 * 3 + 12_000) })
+      fireEvent.click(screen.getByRole('button', { name: 'Providers' }))
+      expect(screen.getByRole('option', { name: 'Codewhale' })).toBeInTheDocument()
+      expect(screen.getByRole('option', { name: 'Openrouter' })).toBeInTheDocument()
+      fireEvent.keyDown(document, { key: 'Escape' })
+      // The all-destination queue intentionally leaves a five-second cooling
+      // window between heavy report reads. Let that queue finish before the first
+      // cadence tick, then soak three ten-minute polling cycles.
+      await act(async () => { await vi.advanceTimersByTimeAsync(300_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(30 * 60_000) })
 
-      for (const id of PROVIDERS) {
-        const spawns = mocks.getOverview.mock.calls.filter(
-          // Prefetch warms carry the background-priority flag (5th arg).
-          c => c[0] === '30days' && c[1] === id && c[2] === undefined && c[3] === undefined && c[4] === true,
-        )
-        expect(spawns.length, `prefetch spawns for ${id}`).toBe(1)
-      }
+      const warmedProviders = mocks.getOverview.mock.calls
+        // Prefetch warms carry the background-priority flag (5th arg).
+        .filter(c => c[0] === '30days' && c[1] !== 'all' && c[2] === undefined && c[3] === undefined && c[4] === true)
+        .map(c => c[1])
+      expect(warmedProviders).toEqual(PROVIDERS)
 
       // Sanity: the active 'all' view was polled every cycle (not prefetch-gated).
       const allPolls = mocks.getOverview.mock.calls.filter(c => c[1] === 'all')
@@ -820,7 +912,7 @@ describe('overview idle warming', () => {
   })
 })
 
-describe('energy: hidden-window polling', () => {
+describe('freshness: hidden-window polling', () => {
   beforeEach(() => {
     installDefaultMocks()
     localStorage.clear()
@@ -828,11 +920,8 @@ describe('energy: hidden-window polling', () => {
     __resetPolledMemo()
   })
 
-  // The whole app's data flows through usePolled, which is the ONLY driver of CLI
-  // spawns (each codeburn.getX → IPC → spawnCli). This measures that a hidden
-  // window issues ZERO new interval spawns, and that visibility resumes them —
-  // the unit-level stand-in for the packaged visible-vs-hidden sample.
-  it('issues zero new interval spawns while hidden and resumes when visible', async () => {
+  // An open-but-occluded app still owes the configured freshness contract.
+  it('keeps interval refreshes running while hidden without a duplicate catch-up', async () => {
     vi.useFakeTimers()
     try {
       setVisibility('visible')
@@ -844,20 +933,22 @@ describe('energy: hidden-window polling', () => {
       const visibleYield = mocks.getYield.mock.calls.length
       expect(visibleYield).toBeGreaterThan(1) // polling while visible
 
-      // Hidden for five cadences: not a single new spawn on any poller.
+      // Hidden for five cadences: data polling continues.
       setVisibility('hidden')
       const atHideYield = mocks.getYield.mock.calls.length
       const atHideOverview = mocks.getOverview.mock.calls.length
       await act(async () => { await vi.advanceTimersByTimeAsync(30_000 * 5) })
-      expect(mocks.getYield.mock.calls.length).toBe(atHideYield)
-      expect(mocks.getOverview.mock.calls.length).toBe(atHideOverview)
+      expect(mocks.getYield.mock.calls.length).toBeGreaterThan(atHideYield)
+      expect(mocks.getOverview.mock.calls.length).toBeGreaterThan(atHideOverview)
 
-      // Back to visible: the stale-by-a-cadence polls catch up immediately.
+      // Back to visible: no extra catch-up is needed inside one cadence.
+      const beforeVisibleYield = mocks.getYield.mock.calls.length
+      const beforeVisibleOverview = mocks.getOverview.mock.calls.length
       setVisibility('visible')
       await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
-      expect(mocks.getYield.mock.calls.length).toBeGreaterThan(atHideYield)
-      expect(mocks.getOverview.mock.calls.length).toBeGreaterThan(atHideOverview)
+      expect(mocks.getYield.mock.calls.length).toBe(beforeVisibleYield)
+      expect(mocks.getOverview.mock.calls.length).toBe(beforeVisibleOverview)
     } finally {
       setVisibility('visible')
       vi.useRealTimers()

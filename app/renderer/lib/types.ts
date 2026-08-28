@@ -689,19 +689,19 @@ export interface CodeburnBridge {
   // aggregate ('combined'); optional so an older preload degrades to local.
   getOverview(period: Period, provider: string, range?: DateRange, configSource?: string | null, background?: boolean, scope?: string): Promise<MenubarPayload>
   getTimeline(period: Period, provider: string, range?: DateRange): Promise<MenubarPayload>
-  getPlans(period: Period): Promise<StatusJson>
+  getPlans(period: Period, background?: boolean): Promise<StatusJson>
   getActReport(): Promise<ActReportJson>
   readonly platform: string
   /** Node process.arch of the host ('arm64', 'x64', ...). Absent on preloads
    *  that predate the direct-download update link. */
   readonly arch?: string
-  getModels(period: Period, provider: string, byTask: boolean, range?: DateRange): Promise<ModelReportRow[]>
-  getSessions(period: Period, provider: string, range?: DateRange): Promise<SessionRow[]>
-  getCompareModels(period: Period, provider: string): Promise<ModelStats[]>
+  getModels(period: Period, provider: string, byTask: boolean, range?: DateRange, background?: boolean): Promise<ModelReportRow[]>
+  getSessions(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<SessionRow[]>
+  getCompareModels(period: Period, provider: string, background?: boolean): Promise<ModelStats[]>
   getCompare(period: Period, provider: string, modelA: string, modelB: string): Promise<CompareJsonReport>
-  getYield(period: Period, provider: string, range?: DateRange): Promise<YieldJsonReport>
-  getSpendFlow(period: Period, provider: string, range?: DateRange): Promise<SpendFlow>
-  getOptimizeReport(period: Period, provider: string, range?: DateRange): Promise<OptimizeJsonReport>
+  getYield(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<YieldJsonReport>
+  getSpendFlow(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<SpendFlow>
+  getOptimizeReport(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<OptimizeJsonReport>
   getDevices(period: Period): Promise<CombinedUsage>
   getDevicesScan(): Promise<DeviceScanResult>
   getShareStatus(): Promise<ShareStatus>

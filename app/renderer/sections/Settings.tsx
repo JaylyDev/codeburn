@@ -7,7 +7,7 @@ import { Dropdown } from '../components/Dropdown'
 import { Panel } from '../components/Panel'
 import { ProviderLogo } from '../components/ProviderLogo'
 import type { Section } from '../components/Sidebar'
-import { usePolled } from '../hooks/usePolled'
+import { clearPolledMemo, usePolled } from '../hooks/usePolled'
 import { updateDownloadUrl, useUpdateStatus } from '../hooks/useUpdateStatus'
 import { version as appVersion } from '../../package.json'
 import { readDailyBudget } from '../lib/budget'
@@ -15,8 +15,10 @@ import { formatConverted, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import { shortcutLabel } from '../lib/platform'
 import { motionClass } from '../lib/motion'
+import { clearOverviewHeadlines } from '../lib/overviewSnapshot'
 import { PROVIDER_NAMES, QUOTA_PROVIDERS, readDisabledProviders, writeDisabledProviders } from '../lib/providers'
 import { REFRESH_OPTIONS, useRefreshCadence } from '../lib/refreshCadence'
+import { reportMemoKey } from '../lib/reportMemoKey'
 import { showToast } from '../lib/toast'
 import { ToastHost } from '../components/ToastHost'
 import { rateLimitedNote } from './Plans'
@@ -135,7 +137,9 @@ export function Settings({ period, refreshToken = 0, onNavigate, initialPane, cl
 
 function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, onConfigMutated, scope = 'local', onScopeChange }: { period: Period; refreshToken: number; claudeConfigs?: ClaudeConfigSelector; claudeConfigSource: string | null; onConfigMutated?: () => void; scope?: Scope; onScopeChange?: (scope: string) => void }) {
   const [currencyNonce, setCurrencyNonce] = useState(0)
-  const plans = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken, currencyNonce])
+  const plans = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken, currencyNonce], {
+    memoKey: reportMemoKey('plans', period),
+  })
   const [theme, setTheme] = useState<Theme>(() => {
     const saved = readSetting('codeburn.theme')
     return saved === 'light' || saved === 'dark' ? saved : 'system'
@@ -208,7 +212,7 @@ function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, 
           </span></div>
           <div className="about-row"><label className="tx" htmlFor="settings-period">Default period<small>Applied on next launch.</small></label><span className="r"><Dropdown id="settings-period" ariaLabel="Default period" value={defaultPeriod} options={[{ value: 'today', label: 'Today' }, { value: 'week', label: '7d' }, { value: '30days', label: '30d' }, { value: 'month', label: 'Month' }, { value: 'all', label: 'All' }]} onChange={value => { setDefaultPeriod(value); writeSetting('codeburn.defaultPeriod', value) }} width={92} /></span></div>
           <div className="about-row"><label className="tx" htmlFor="settings-scope">Scope<small>Combined aggregates usage across every paired device, like the menubar. Local shows this device only.</small></label><span className="r"><Dropdown id="settings-scope" ariaLabel="Scope" value={scope} options={[{ value: 'local', label: 'Local' }, { value: 'combined', label: 'Combined' }]} onChange={value => onScopeChange?.(value)} width={110} /></span></div>
-          <div className="about-row"><label className="tx" htmlFor="settings-refresh">Refresh every<small>How often data auto-refreshes. Manual updates only on {shortcutLabel('R')}.</small></label><span className="r"><Dropdown id="settings-refresh" ariaLabel="Refresh every" value={cadence.value} options={REFRESH_OPTIONS.map(option => ({ value: option.value, label: option.label }))} onChange={cadence.setValue} width={124} /></span></div>
+          <div className="about-row"><label className="tx" htmlFor="settings-refresh">Refresh every<small>Runs automatically at this interval. Press {shortcutLabel('R')} to refresh sooner.</small></label><span className="r"><Dropdown id="settings-refresh" ariaLabel="Refresh every" value={cadence.value} options={REFRESH_OPTIONS.map(option => ({ value: option.value, label: option.label }))} onChange={cadence.setValue} width={124} /></span></div>
           <div className="about-row"><label className="tx" htmlFor="settings-budget">Daily budget<small>Warns at 80%, alerts at 100%.</small></label><span className="r"><Dropdown id="settings-budget" ariaLabel="Daily budget" value={budgetKind} options={[{ value: 'off', label: 'Off' }, { value: 'usd', label: 'USD amount' }, { value: 'tokens', label: 'Tokens' }]} onChange={value => { const kind = value as 'off' | 'usd' | 'tokens'; setBudgetKind(kind); persistBudget(kind, budgetInput) }} width={120} />{budgetKind !== 'off' && <input className="set-input" type="text" inputMode="decimal" aria-label="Daily budget amount" placeholder={budgetKind === 'usd' ? 'USD' : 'tokens'} value={budgetInput} onChange={event => { setBudgetInput(event.target.value); persistBudget(budgetKind, event.target.value) }} style={{ width: 90 }} />}</span></div>
           {budgetError && <p className="set-action-msg error">{budgetError}</p>}
         </div>
@@ -361,7 +365,9 @@ function PlansPane({ period, refreshToken, onNavigate, onConfigMutated }: { peri
     lastForced.current = key
     return codeburn.getQuota(force, disabledProviders)
   }, [refreshToken, reconnectNonce, disabledProviders])
-  const plans = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken, nonce])
+  const plans = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken, nonce], {
+    memoKey: reportMemoKey('plans', period),
+  })
   const [presetId, setPresetId] = useState(MANUAL_PLAN_PRESETS[0]!.id)
   const configured = plans.data ? planSummaries(plans.data) : []
 
@@ -467,9 +473,15 @@ function DevicesPane({ period, refreshToken }: { period: Period; refreshToken: n
 }
 
 function PrivacyPane() {
+  const clearSnapshots = () => {
+    clearPolledMemo()
+    clearOverviewHeadlines()
+    showToast('Cached report snapshots cleared', 'ok')
+  }
   return <section className="set-p on"><div><h3 className="set-h">Privacy &amp; data</h3><p className="set-sub">What codeburn does, and does not do, with your data.</p></div><div className="card">
     <PrivacyClaim title="Local-only" detail="Everything runs on your machine. Data is read from local session files." icon={<><rect x="4.5" y="10" width="15" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></>} />
     <PrivacyClaim title="No API keys" detail="Usage is detected from local files; no provider API keys are required." icon={<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z" />} />
+    <div className="set-claim"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M6 7l1 14h10l1-14M9 7V4h6v3" /></svg><div style={{ flex: 1 }}><div className="set-claim-t">Local report snapshots</div><div className="set-claim-d">Calculated usage and cost reports are compressed and kept on this Mac so screens open immediately after restart. Credentials are never included.</div></div><button type="button" className="btnp" onClick={clearSnapshots}>Clear snapshots</button></div>
     <TelemetryClaim />
   </div></section>
 }

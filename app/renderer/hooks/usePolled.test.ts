@@ -4,7 +4,7 @@ import { afterEach, describe, it, expect, vi } from 'vitest'
 import { render, renderHook, act } from '@testing-library/react'
 
 import { RefreshCadenceContext, type RefreshCadence } from '../lib/refreshCadence'
-import { clearPolledMemo, hasPolledMemo, primePolledMemo, usePolled } from './usePolled'
+import { __resetPolledMemo, clearPolledMemo, hasPolledMemo, primePolledMemo, usePolled } from './usePolled'
 
 function cadenceWrapper(intervalMs: number | null) {
   const value: RefreshCadence = { value: 'x', intervalMs, setValue: () => {} }
@@ -20,6 +20,8 @@ function setVisibility(state: 'visible' | 'hidden') {
 afterEach(() => {
   delete (document as unknown as { visibilityState?: unknown }).visibilityState
   delete (document as unknown as { hidden?: unknown }).hidden
+  localStorage.clear()
+  clearPolledMemo()
 })
 
 describe('usePolled', () => {
@@ -201,6 +203,100 @@ describe('usePolled', () => {
     expect(hasPolledMemo('key-96')).toBe(true)
   })
 
+  it('bounds the instant-switch memo by serialized weight, not only entry count', () => {
+    primePolledMemo('large', { text: 'x'.repeat(12_000_001) })
+    expect(hasPolledMemo('large')).toBe(true)
+
+    // The newest entry wins; adding it evicts the older oversized graph rather
+    // than retaining both merely because the count is below 96.
+    primePolledMemo('newest', { total: 42 })
+    expect(hasPolledMemo('large')).toBe(false)
+    expect(hasPolledMemo('newest')).toBe(true)
+  })
+
+  it('restores the last successful keyed payload after a renderer restart, then refreshes behind it', async () => {
+    const firstFetcher = vi.fn().mockResolvedValue({ total: 42 })
+    const first = renderHook(() => usePolled(firstFetcher, [], { memoKey: 'sessions|today|all', intervalMs: null }))
+    await act(async () => {})
+    expect(first.result.current.data).toEqual({ total: 42 })
+    first.unmount()
+
+    // A renderer restart loses module memory but preserves the app origin's
+    // durable local snapshot. The next mount must paint it synchronously.
+    __resetPolledMemo()
+    const secondFetcher = vi.fn(() => new Promise<{ total: number }>(() => {}))
+    const second = renderHook(() => usePolled(secondFetcher, [], { memoKey: 'sessions|today|all', intervalMs: null }))
+
+    expect(second.result.current.data).toEqual({ total: 42 })
+    expect(second.result.current.switching).toBe(true)
+    expect(secondFetcher).toHaveBeenCalledTimes(1)
+  })
+
+  it('compresses a heavy report snapshot before placing it in renderer storage', async () => {
+    const repeated = Array.from({ length: 2_000 }, (_, index) => ({
+      id: index,
+      project: 'Documents/Codeburn/long-repeated-project-name',
+      summary: 'A deliberately repetitive heavy-corpus session summary',
+    }))
+    const first = renderHook(() => usePolled(
+      vi.fn().mockResolvedValue(repeated),
+      [],
+      { memoKey: 'sessions|lifetime|all', intervalMs: null },
+    ))
+    await act(async () => {})
+    first.unmount()
+
+    const stored = Object.keys(localStorage)
+      .map(key => localStorage.getItem(key) ?? '')
+      .find(value => value.includes('lz-utf16'))
+    expect(stored).toBeDefined()
+    expect(stored).not.toContain('long-repeated-project-name')
+
+    __resetPolledMemo()
+    const second = renderHook(() => usePolled(
+      vi.fn(() => new Promise<typeof repeated>(() => {})),
+      [],
+      { memoKey: 'sessions|lifetime|all', intervalMs: null },
+    ))
+    expect(second.result.current.data).toEqual(repeated)
+  })
+
+  it('does not recompress or rewrite an unchanged durable report', () => {
+    const setItem = vi.spyOn(Storage.prototype, 'setItem')
+    primePolledMemo('unchanged|week|all', { total: 42, rows: [1, 2, 3] })
+    expect(setItem).toHaveBeenCalledTimes(1)
+
+    primePolledMemo('unchanged|week|all', { total: 42, rows: [1, 2, 3] })
+    expect(setItem).toHaveBeenCalledTimes(1)
+    setItem.mockRestore()
+  })
+
+  it('keeps oversized, stale, and partial reports out of restart persistence', () => {
+    primePolledMemo('oversized', { text: 'x'.repeat(300_001) })
+    primePolledMemo('stale', { stale: true, total: 42 })
+    primePolledMemo('partial', { hydration: { complete: false }, total: 42 })
+
+    expect(localStorage.getItem('codeburn.reportSnapshot.v1.oversized')).toBeNull()
+    expect(localStorage.getItem('codeburn.reportSnapshot.v1.stale')).toBeNull()
+    expect(localStorage.getItem('codeburn.reportSnapshot.v1.partial')).toBeNull()
+    __resetPolledMemo()
+    expect(hasPolledMemo('oversized')).toBe(false)
+    expect(hasPolledMemo('stale')).toBe(false)
+    expect(hasPolledMemo('partial')).toBe(false)
+  })
+
+  it('discards an old-config fetch that resolves after cache invalidation', async () => {
+    let resolve!: (value: { total: number }) => void
+    const fetcher = vi.fn(() => new Promise<{ total: number }>(done => { resolve = done }))
+    const { result } = renderHook(() => usePolled(fetcher, [], { memoKey: 'old-config', intervalMs: null }))
+
+    clearPolledMemo()
+    await act(async () => { resolve({ total: 42 }) })
+
+    expect(result.current.data).toBeNull()
+    expect(hasPolledMemo('old-config')).toBe(false)
+  })
+
   it('clears stale data on a switch to an unmemoized key (skeleton, never the prior filter)', async () => {
     const resolvers: Array<(v: string) => void> = []
     const fetcher = vi.fn(() => new Promise<string>(resolve => { resolvers.push(resolve) }))
@@ -281,7 +377,7 @@ describe('usePolled', () => {
     }
   })
 
-  it('skips interval polls while the document is hidden, then catches up on return to visible', async () => {
+  it('continues data refreshes while the document is hidden', async () => {
     vi.useFakeTimers()
     try {
       setVisibility('visible')
@@ -291,16 +387,17 @@ describe('usePolled', () => {
       // Let the mount fetch resolve so lastSuccess is recorded.
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
 
-      // Hidden (minimized/occluded): five interval ticks must spawn NOTHING.
+      // Hidden/minimized is still an open product. Data refreshes continue so a
+      // return hours later never exposes an arbitrarily stale snapshot.
       setVisibility('hidden')
       await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
-      expect(fetcher).toHaveBeenCalledTimes(1)
+      expect(fetcher).toHaveBeenCalledTimes(6)
 
-      // Back to visible with the last success now older than a full cadence:
-      // exactly one immediate catch-up fetch, not a wait for the next tick.
+      // Returning visible does not duplicate a refresh because the latest hidden
+      // interval already succeeded inside one cadence.
       setVisibility('visible')
       await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
-      expect(fetcher).toHaveBeenCalledTimes(2)
+      expect(fetcher).toHaveBeenCalledTimes(6)
     } finally {
       vi.useRealTimers()
     }
