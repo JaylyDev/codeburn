@@ -11,13 +11,18 @@
  */
 
 import type { Command } from 'commander'
-import { stat, mkdir, readFile, writeFile, rm, readdir, copyFile } from 'fs/promises'
+import { stat, mkdir, readFile, writeFile, rm, readdir, copyFile, mkdtemp } from 'fs/promises'
 import { join } from 'path'
 import { homedir } from 'os'
 import { spawn } from 'child_process'
+import { createHash } from 'crypto'
+import { tmpdir } from 'os'
 
 import { defaultPluginsDir, loadPlugins, currentCliVersion, verifyPlugin, readPluginManifestRaw, type PluginLoad } from './loader.js'
 import { parsePluginManifest, type PluginManifest } from './manifest.js'
+import { readSyncConfig } from '../sync/config.js'
+import { createCredentialStore } from '../sync/credentials.js'
+import { fetchOidcConfig, refreshToken } from '../sync/auth.js'
 
 export function registerPluginCommands(program: Command): void {
   const plugin = program
@@ -92,34 +97,25 @@ export function registerPluginCommands(program: Command): void {
     })
 
   plugin
-    .command('add <path>')
-    .description('Install a plugin from a source directory')
+    .command('add <source>')
+    .description('Install a plugin from a local path or the org receiver')
     .option('--dir <path>', 'Override the plugins directory')
-    .action(async (sourcePath: string, opts: { dir?: string }) => {
+    .action(async (source: string, opts: { dir?: string }) => {
       const pluginsDir = opts.dir ?? defaultPluginsDir()
-      const { raw, reason } = await readPluginManifestRaw(sourcePath)
-      if (reason) {
-        throw new Error(`Could not read manifest from ${sourcePath}: ${reason}`)
+
+      // Dispatch: if source looks like a path or exists as directory, use local flow; otherwise remote
+      const isLocal = source.includes('/') || source.includes('.') ||
+        (await stat(source).then(() => true).catch(() => false))
+
+      if (isLocal) {
+        await addLocal(source, pluginsDir)
+      } else {
+        // Validate plugin name
+        if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(source)) {
+          throw new Error(`Invalid plugin name "${source}". Must match [a-z0-9]([a-z0-9-]*[a-z0-9])?`)
+        }
+        await addRemote(source, pluginsDir)
       }
-      const parsed = parsePluginManifest(raw, `${sourcePath}/codeburn-plugin.json`)
-      if (!parsed.ok) {
-        throw new Error(`Invalid manifest: ${parsed.reason}`)
-      }
-      const manifest = parsed.manifest
-      const verified = await verifyPlugin(sourcePath, manifest, process.env)
-      if (!verified.ok) {
-        throw new Error(`Plugin verification failed: ${verified.reason ?? 'unknown reason'}`)
-      }
-      const destDir = join(pluginsDir, manifest.name)
-      try {
-        await stat(destDir)
-        throw new Error(`Plugin "${manifest.name}" already installed at ${destDir}`)
-      } catch (err: unknown) {
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
-      }
-      await mkdir(destDir, { recursive: true })
-      await copyPluginTree(sourcePath, destDir)
-      process.stdout.write(`Plugin "${manifest.name}@${manifest.version}" installed to ${destDir}\n`)
     })
 
   plugin
@@ -167,6 +163,39 @@ async function listOnDiskSections(dir: string, m: PluginManifest): Promise<strin
   return out
 }
 
+/// Verify and install a plugin from an extracted/verified root directory.
+/// Both local and remote flows call this after prep.
+async function verifyAndInstall(
+  sourceDir: string,
+  pluginsDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
+  const { raw, reason } = await readPluginManifestRaw(sourceDir)
+  if (reason) {
+    throw new Error(`Could not read manifest from ${sourceDir}: ${reason}`)
+  }
+  const parsed = parsePluginManifest(raw, `${sourceDir}/codeburn-plugin.json`)
+  if (!parsed.ok) {
+    throw new Error(`Invalid manifest: ${parsed.reason}`)
+  }
+  const manifest = parsed.manifest
+  const verified = await verifyPlugin(sourceDir, manifest, env)
+  if (!verified.ok) {
+    throw new Error(`Plugin verification failed: ${verified.reason ?? 'unknown reason'}`)
+  }
+  const destDir = join(pluginsDir, manifest.name)
+  try {
+    await stat(destDir)
+    throw new Error(`Plugin "${manifest.name}" already installed at ${destDir}`)
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+  }
+  await mkdir(destDir, { recursive: true })
+  await copyPluginTree(sourceDir, destDir)
+  process.stdout.write(`Plugin "${manifest.name}@${manifest.version}" installed to ${destDir}\n`)
+  return destDir
+}
+
 /// Recursively copy plugin files from source to destination, excluding sections/
 /// (sections/ is runtime-mutable plugin output and not copied on install).
 async function copyPluginTree(sourceDir: string, destDir: string): Promise<void> {
@@ -189,6 +218,150 @@ async function copyPluginTree(sourceDir: string, destDir: string): Promise<void>
   }
 
   await walk(sourceDir, destDir)
+}
+
+/// Install from a local path (existing flow).
+async function addLocal(sourcePath: string, pluginsDir: string): Promise<void> {
+  await verifyAndInstall(sourcePath, pluginsDir)
+}
+
+/// Install from the org receiver (remote flow).
+async function addRemote(name: string, pluginsDir: string): Promise<void> {
+  // Read sync config
+  const config = readSyncConfig()
+  if (!config) {
+    throw new Error('Sync not configured. Run `codeburn sync setup <url>` first.')
+  }
+
+  // Refresh token
+  const store = createCredentialStore()
+  const rt = store.retrieve()
+  if (!rt) {
+    throw new Error('No auth token found. Run `codeburn sync setup` to authenticate.')
+  }
+
+  const oidc = await fetchOidcConfig(config.issuer)
+  const tokens = await refreshToken(oidc.token_endpoint, rt, config.clientId)
+
+  // Store rotated token
+  if (tokens.refresh_token && tokens.refresh_token !== rt) {
+    store.store(tokens.refresh_token)
+  }
+
+  // Fetch manifest
+  const manifestUrl = `${config.baseUrl}/plugin/${name}/manifest`
+  const manifestResp = await fetch(manifestUrl, {
+    headers: { 'Authorization': `Bearer ${tokens.access_token}` },
+  })
+
+  if (!manifestResp.ok) {
+    let msg = `HTTP ${manifestResp.status}`
+    try {
+      const body = await manifestResp.text()
+      const json = JSON.parse(body)
+      msg = json.error ?? json.message ?? msg
+    } catch {}
+    throw new Error(`Failed to fetch plugin manifest: ${msg}`)
+  }
+
+  const manifestData = await manifestResp.json() as Record<string, unknown>
+  const manifestSha = typeof manifestData.sha256 === 'string' ? manifestData.sha256 : ''
+  const manifestSize = typeof manifestData.size === 'number' ? manifestData.size : 0
+
+  if (!manifestSha) {
+    throw new Error('Manifest missing sha256')
+  }
+
+  // Download tarball
+  const downloadUrl = `${config.baseUrl}/plugin/${name}/download`
+  const downloadResp = await fetch(downloadUrl, {
+    headers: { 'Authorization': `Bearer ${tokens.access_token}` },
+  })
+
+  if (!downloadResp.ok) {
+    throw new Error(`Failed to download plugin: HTTP ${downloadResp.status}`)
+  }
+
+  // Check content-length
+  const contentLength = downloadResp.headers.get('content-length')
+  const size = contentLength ? parseInt(contentLength, 10) : 0
+  if (size > 50 * 1024 * 1024) {
+    throw new Error(`Plugin tarball exceeds 50 MB limit (${size} bytes)`)
+  }
+
+  // Download and hash
+  const buffer = await downloadResp.arrayBuffer()
+  const bytes = new Uint8Array(buffer)
+
+  if (bytes.length > 50 * 1024 * 1024) {
+    throw new Error(`Plugin tarball exceeds 50 MB limit (${bytes.length} bytes)`)
+  }
+
+  // Verify sha256
+  const headerSha = downloadResp.headers.get('x-codeburn-sha256') || ''
+  const computed = createHash('sha256').update(bytes).digest('hex')
+  if (computed !== manifestSha || computed !== headerSha) {
+    throw new Error(`Plugin tarball integrity check failed (sha256 mismatch)`)
+  }
+
+  // Extract to temp dir
+  const tempDir = await mkdtemp(join(tmpdir(), 'codeburn-plugin-'))
+  try {
+    const tarFile = join(tempDir, 'plugin.tar.gz')
+    await writeFile(tarFile, bytes)
+
+    // Extract tar
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn('tar', ['-xzf', tarFile, '-C', tempDir])
+      child.on('error', reject)
+      child.on('exit', (code) => {
+        if (code === 0) resolve()
+        else reject(new Error(`tar extraction failed with exit code ${code}`))
+      })
+    })
+
+    // Determine plugin root: if single top-level dir, use that; else use tempDir
+    const extracted = await readdir(tempDir)
+    const dirs = extracted.filter(f => f !== 'plugin.tar.gz')
+
+    let pluginRoot: string
+    if (dirs.length === 1) {
+      const stat_ = await stat(join(tempDir, dirs[0]))
+      if (stat_.isDirectory()) {
+        pluginRoot = join(tempDir, dirs[0])
+      } else {
+        throw new Error('Tarball must contain either a single top-level directory or files at root')
+      }
+    } else if (dirs.length > 1) {
+      // Files or multiple dirs at root
+      const allFiles = await readdir(tempDir)
+      if (allFiles.some(f => f.startsWith('codeburn-plugin'))) {
+        pluginRoot = tempDir
+      } else {
+        throw new Error('Tarball must contain either a single top-level directory or files at root')
+      }
+    } else {
+      throw new Error('Tarball is empty')
+    }
+
+    // Verify manifest name matches requested name
+    const { raw, reason } = await readPluginManifestRaw(pluginRoot)
+    if (reason) {
+      throw new Error(`Could not read plugin manifest: ${reason}`)
+    }
+    const parsed = parsePluginManifest(raw, 'codeburn-plugin.json')
+    if (!parsed.ok) {
+      throw new Error(`Invalid plugin manifest: ${parsed.reason}`)
+    }
+    if (parsed.manifest.name !== name) {
+      throw new Error(`Plugin name mismatch: expected "${name}", got "${parsed.manifest.name}"`)
+    }
+
+    // Install
+    await verifyAndInstall(pluginRoot, pluginsDir)
+  } finally {
+    await rm(tempDir, { recursive: true, force: true })
+  }
 }
 
 // Re-export so consumers can pin the version pinned by the socket itself.
