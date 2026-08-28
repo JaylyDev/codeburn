@@ -659,7 +659,7 @@ export function registerSyncCommands(program: Command): void {
         writeSyncConfig(config)
 
         try {
-          await installSchedule(cadence, process.argv[1])
+          await installSchedule(cadence, process.execPath, process.argv[1])
           process.stdout.write(`Automatic sync enabled (${cadence}). Fingerprint: ${fingerprint}\n`)
         } catch (schedErr) {
           process.stderr.write(`Warning: ${(schedErr as Error).message}\n`)
@@ -714,6 +714,12 @@ export function registerSyncCommands(program: Command): void {
       }
 
       const accepted = config.auto.accepted
+      if (typeof accepted.fingerprint !== 'string' || typeof accepted.acceptedAt !== 'string') {
+        process.stdout.write('Automatic sync acceptance record is damaged. Run: codeburn sync auto enable --cadence <daily|hourly> --accept\n')
+        process.exit(1)
+        return
+      }
+
       process.stdout.write(`Accepted fingerprint: ${accepted.fingerprint}\n`)
       process.stdout.write(`Accepted at: ${accepted.acceptedAt}\n`)
       process.stdout.write(`Cadence: ${accepted.cadence}\n`)

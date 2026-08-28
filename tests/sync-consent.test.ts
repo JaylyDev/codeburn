@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtemp, rm, writeFile, readFile, mkdir } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
+import { Command } from 'commander'
 
 import {
   computeAcceptanceFingerprint,
@@ -13,6 +14,7 @@ import {
 } from '../src/sync/consent.js'
 import { readSyncConfig, writeSyncConfig, readReceipts, appendReceipt } from '../src/sync/config.js'
 import { CORE_SYNC_ATTRIBUTE_KEYS } from '../src/sync/otlp.js'
+import { buildLaunchAgentPlist } from '../src/sync/schedule-installer.js'
 
 describe('Fingerprint', () => {
   it('is deterministic - same input produces same hash', () => {
@@ -441,5 +443,139 @@ describe('Receipts', () => {
     const receipts = readReceipts()
     expect(receipts).toHaveLength(1)
     expect(receipts[0]?.result).toBe('pushed')
+  })
+})
+
+describe('LaunchAgent plist', () => {
+  it('emits runtimePath and scriptPath as separate ProgramArguments strings', () => {
+    const plist = buildLaunchAgentPlist('daily', '/usr/local/bin/node', '/Users/me/code/codeburn/dist/cli.js')
+    const argsBlock = plist.slice(
+      plist.indexOf('<key>ProgramArguments</key>'),
+      plist.indexOf('</array>', plist.indexOf('<key>ProgramArguments</key>')) + '</array>'.length,
+    )
+    expect(argsBlock).toContain('<string>/usr/local/bin/node</string>')
+    expect(argsBlock).toContain('<string>/Users/me/code/codeburn/dist/cli.js</string>')
+    expect(argsBlock).toContain('<string>sync</string>')
+    expect(argsBlock).toContain('<string>auto</string>')
+    expect(argsBlock).toContain('<string>run</string>')
+  })
+
+  it('includes the ELECTRON_RUN_AS_NODE environment block', () => {
+    const plist = buildLaunchAgentPlist('hourly', '/Applications/codeburn.app/Contents/MacOS/codeburn', '/Applications/codeburn.app/Contents/Resources/app/dist/cli.js')
+    expect(plist).toContain('<key>EnvironmentVariables</key>')
+    expect(plist).toContain('<key>ELECTRON_RUN_AS_NODE</key>')
+    expect(plist).toContain('<string>1</string>')
+  })
+
+  it('XML-escapes ampersand, less-than, and greater-than in both paths', () => {
+    const runtime = '/Users/jane & joe/Contents/MacOS/codeburn'
+    const script = '/Applications/codeburn <beta>/dist/cli.js'
+    const plist = buildLaunchAgentPlist('daily', runtime, script)
+    expect(plist).toContain('&amp; joe')
+    expect(plist).toContain('&lt;beta&gt;')
+    expect(plist).not.toContain('& joe/Contents')
+    expect(plist).not.toContain('<beta>')
+  })
+})
+
+describe('Damaged acceptance record', () => {
+  let tmpDir: string
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'codeburn-test-'))
+    process.env.HOME = tmpDir
+  })
+
+  afterEach(async () => {
+    vi.restoreAllMocks()
+    process.exitCode = 0
+    await rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('status prints the damaged-record message and never "undefined" when fingerprint is missing', async () => {
+    const configDir = join(tmpDir, '.config', 'codeburn')
+    await mkdir(configDir, { recursive: true })
+    writeSyncConfig({
+      baseUrl: 'https://endpoint.example.com',
+      clientId: 'test-client',
+      tracesPath: '/v1/traces',
+      issuer: 'https://issuer.example.com',
+      auto: {
+        // accepted present but fingerprint is missing
+        accepted: {
+          acceptedAt: new Date().toISOString(),
+          cadence: 'daily',
+          disclosure: 'd',
+          attribution: false,
+        } as any,
+        killed: false,
+      },
+    })
+
+    const stdoutChunks: string[] = []
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any) => {
+      stdoutChunks.push(String(chunk))
+      return true
+    })
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('__exit__')
+    }) as never)
+
+    const { registerSyncCommands } = await import('../src/sync/cli.js')
+    const program = new Command()
+    program.exitOverride()
+    registerSyncCommands(program)
+
+    await expect(
+      program.parseAsync(['node', 'codeburn', 'sync', 'auto', 'status']),
+    ).rejects.toThrow('__exit__')
+
+    expect(exitSpy).toHaveBeenCalledWith(1)
+    const stdout = stdoutChunks.join('')
+    expect(stdout).toContain('Automatic sync acceptance record is damaged.')
+    expect(stdout).toContain('codeburn sync auto enable --cadence <daily|hourly> --accept')
+    expect(stdout).not.toContain('undefined')
+  })
+
+  it('status prints the damaged-record message when acceptedAt is missing', async () => {
+    const configDir = join(tmpDir, '.config', 'codeburn')
+    await mkdir(configDir, { recursive: true })
+    writeSyncConfig({
+      baseUrl: 'https://endpoint.example.com',
+      clientId: 'test-client',
+      tracesPath: '/v1/traces',
+      issuer: 'https://issuer.example.com',
+      auto: {
+        accepted: {
+          fingerprint: 'abc123',
+          cadence: 'daily',
+          disclosure: 'd',
+          attribution: false,
+        } as any,
+        killed: false,
+      },
+    })
+
+    const stdoutChunks: string[] = []
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any) => {
+      stdoutChunks.push(String(chunk))
+      return true
+    })
+    vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('__exit__')
+    }) as never)
+
+    const { registerSyncCommands } = await import('../src/sync/cli.js')
+    const program = new Command()
+    program.exitOverride()
+    registerSyncCommands(program)
+
+    await expect(
+      program.parseAsync(['node', 'codeburn', 'sync', 'auto', 'status']),
+    ).rejects.toThrow('__exit__')
+
+    const stdout = stdoutChunks.join('')
+    expect(stdout).toContain('Automatic sync acceptance record is damaged.')
+    expect(stdout).not.toContain('undefined')
   })
 })

@@ -23,11 +23,21 @@ function launchAgentPath(): string {
   return join(launchAgentDir(), `${SCHEDULE_AGENT_NAME}.plist`)
 }
 
-function buildLaunchAgentPlist(
+function xmlEscape(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+export function buildLaunchAgentPlist(
   cadence: 'daily' | 'hourly',
-  codeburn_path: string,
+  runtimePath: string,
+  scriptPath: string,
 ): string {
   const interval = cadence === 'daily' ? SCHEDULE_INTERVAL_DAILY : SCHEDULE_INTERVAL_HOURLY
+  const safeRuntime = xmlEscape(runtimePath)
+  const safeScript = xmlEscape(scriptPath)
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -36,11 +46,17 @@ function buildLaunchAgentPlist(
   <string>${SCHEDULE_AGENT_NAME}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${codeburn_path}</string>
+    <string>${safeRuntime}</string>
+    <string>${safeScript}</string>
     <string>sync</string>
     <string>auto</string>
     <string>run</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ELECTRON_RUN_AS_NODE</key>
+    <string>1</string>
+  </dict>
   <key>StartInterval</key>
   <integer>${interval}</integer>
   <key>StandardErrorPath</key>
@@ -54,18 +70,19 @@ function buildLaunchAgentPlist(
 
 export async function installSchedule(
   cadence: 'daily' | 'hourly',
-  codeburnPath: string,
+  runtimePath: string,
+  scriptPath: string,
 ): Promise<void> {
   if (platform() !== 'darwin') {
     const cronExpression = cadence === 'daily'
       ? '0 0 * * *'
       : '0 * * * *'
     process.stderr.write(`macOS is not detected. To schedule automatic syncs, add to crontab:\n`)
-    process.stderr.write(`  ${cronExpression} ${codeburnPath} sync auto run\n`)
+    process.stderr.write(`  ${cronExpression} ${runtimePath} ${scriptPath} sync auto run\n`)
     return
   }
 
-  const plistContent = buildLaunchAgentPlist(cadence, codeburnPath)
+  const plistContent = buildLaunchAgentPlist(cadence, runtimePath, scriptPath)
   const plistPath = launchAgentPath()
   const agentDir = launchAgentDir()
 
