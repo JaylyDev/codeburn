@@ -52,9 +52,11 @@ export async function collectPluginEnrichment(
 
     // Process per-call attributes
     for (const [key, attrs] of Object.entries(result.perCall)) {
-      const guarded = attrs.filter(a => declaredAttrs.has(a.key) && !CORE_SYNC_ATTRIBUTE_KEYS.has(a.key))
+      const guarded = filterPluginAttributes(attrs, declaredAttrs)
       if (guarded.length > 0) {
-        perCall.set(key, guarded)
+        // Merge with existing attrs for this key (multiple plugins may contribute)
+        const existing = perCall.get(key) ?? []
+        perCall.set(key, [...existing, ...guarded])
       }
     }
 
@@ -69,9 +71,8 @@ export async function collectPluginEnrichment(
       // Cap extra spans: max 2x calls.length per plugin
       if (extraSpans.length >= calls.length * 2) break
 
-      // Filter attributes and add span_kind
-      const attrs = span.attributes.filter(a =>
-        declaredAttrs.has(a.key) && !CORE_SYNC_ATTRIBUTE_KEYS.has(a.key))
+      // Filter attributes (uses wire-guard sanitizer) and add span_kind
+      const attrs = filterPluginAttributes(span.attributes, declaredAttrs)
       attrs.push({ key: 'codeburn.span_kind', value: { stringValue: span.kind } })
 
       // Check size: drop if >64KB

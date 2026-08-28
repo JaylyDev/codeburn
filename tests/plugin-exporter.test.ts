@@ -276,7 +276,7 @@ process.stdout.write(JSON.stringify({ perCall: {}, spans }));
     const exportersDir = join(pluginDir, 'exporters')
     await mkdir(exportersDir, { recursive: true })
 
-    // Exporter that returns oversized span with a declared attribute
+    // Exporter that returns oversized span with large name (survives filtering)
     await writeFile(
       join(exportersDir, 'sync.mjs'),
       `
@@ -286,17 +286,17 @@ let input = '';
 for await (const line of rl) {
   input += line;
 }
-const bigScore = 'x'.repeat(70 * 1024);
+const bigName = 'x'.repeat(70 * 1024);
 process.stdout.write(JSON.stringify({
   perCall: {},
   spans: [{
     kind: 'sample.span',
     traceId: '0'.repeat(32),
     spanId: '0'.repeat(16),
-    name: 'big span',
+    name: bigName,
     startNano: '1000000000',
     endNano: '2000000000',
-    attributes: [{ key: 'sample.score', value: { stringValue: bigScore } }]
+    attributes: [{ key: 'sample.score', value: { stringValue: 'small' } }]
   }]
 }));
 `
@@ -374,5 +374,149 @@ process.stdout.write(JSON.stringify({
     // Plugin A's attempt to emit plugin-b.attr should be dropped
     const aAttrs = enrichment.perCall.get('key-1') ?? []
     expect(aAttrs.some(a => a.key === 'plugin-b.attr')).toBe(false)
+  })
+
+  it('path-like stringValue in declared key is sanitized and never appears raw', async () => {
+    const pluginDir = join(tmpDir, 'path-plugin')
+    const exportersDir = join(pluginDir, 'exporters')
+    await mkdir(exportersDir, { recursive: true })
+
+    // Exporter returns attr with path-like value
+    await writeFile(
+      join(exportersDir, 'sync.mjs'),
+      `
+import * as readline from 'readline';
+const rl = readline.createInterface({ input: process.stdin });
+let input = '';
+for await (const line of rl) {
+  input += line;
+}
+const data = JSON.parse(input);
+process.stdout.write(JSON.stringify({
+  perCall: {
+    [data.calls[0].key]: [{ key: 'sample.score', value: { stringValue: '/Users/secret/key.pem' } }]
+  },
+  spans: []
+}));
+`
+    )
+
+    const loads: PluginLoad[] = [
+      { status: 'loaded', manifest: validManifest('path-plugin'), dir: pluginDir },
+    ]
+    const calls = [sampleCall('key-1')]
+
+    const enrichment = await collectPluginEnrichment(loads, calls, 5000)
+
+    // Path-like value should be dropped or sanitized (not appear raw)
+    const attrs = enrichment.perCall.get('key-1') ?? []
+    for (const attr of attrs) {
+      if (attr.key === 'sample.score' && 'stringValue' in attr.value) {
+        expect(attr.value.stringValue).not.toContain('/Users/secret')
+      }
+    }
+  })
+
+  it('arrayValue attr on declared key is dropped', async () => {
+    const pluginDir = join(tmpDir, 'array-plugin')
+    const exportersDir = join(pluginDir, 'exporters')
+    await mkdir(exportersDir, { recursive: true })
+
+    // Exporter returns attr with arrayValue (should be dropped)
+    await writeFile(
+      join(exportersDir, 'sync.mjs'),
+      `
+import * as readline from 'readline';
+const rl = readline.createInterface({ input: process.stdin });
+let input = '';
+for await (const line of rl) {
+  input += line;
+}
+const data = JSON.parse(input);
+process.stdout.write(JSON.stringify({
+  perCall: {
+    [data.calls[0].key]: [{ key: 'sample.score', value: { arrayValue: { values: [{ stringValue: 'item' }] } } }]
+  },
+  spans: []
+}));
+`
+    )
+
+    const loads: PluginLoad[] = [
+      { status: 'loaded', manifest: validManifest('array-plugin'), dir: pluginDir },
+    ]
+    const calls = [sampleCall('key-1')]
+
+    const enrichment = await collectPluginEnrichment(loads, calls, 5000)
+
+    // arrayValue should be dropped
+    const attrs = enrichment.perCall.get('key-1') ?? []
+    expect(attrs.some(a => a.key === 'sample.score' && 'arrayValue' in a.value)).toBe(false)
+  })
+
+  it('two plugins with different declared keys enriching same call both survive', async () => {
+    const pluginADir = join(tmpDir, 'merge-a')
+    const pluginBDir = join(tmpDir, 'merge-b')
+    const exportersA = join(pluginADir, 'exporters')
+    const exportersB = join(pluginBDir, 'exporters')
+    await mkdir(exportersA, { recursive: true })
+    await mkdir(exportersB, { recursive: true })
+
+    // Plugin A contributes attr-a
+    await writeFile(
+      join(exportersA, 'sync.mjs'),
+      `
+import * as readline from 'readline';
+const rl = readline.createInterface({ input: process.stdin });
+let input = '';
+for await (const line of rl) {
+  input += line;
+}
+const data = JSON.parse(input);
+process.stdout.write(JSON.stringify({
+  perCall: {
+    [data.calls[0].key]: [{ key: 'attr.a', value: { stringValue: 'from-a' } }]
+  },
+  spans: []
+}));
+`
+    )
+
+    // Plugin B contributes attr-b
+    await writeFile(
+      join(exportersB, 'sync.mjs'),
+      `
+import * as readline from 'readline';
+const rl = readline.createInterface({ input: process.stdin });
+let input = '';
+for await (const line of rl) {
+  input += line;
+}
+const data = JSON.parse(input);
+process.stdout.write(JSON.stringify({
+  perCall: {
+    [data.calls[0].key]: [{ key: 'attr.b', value: { stringValue: 'from-b' } }]
+  },
+  spans: []
+}));
+`
+    )
+
+    const manifestA = { ...validManifest('merge-a'), capabilities: { ...validManifest('merge-a').capabilities, syncAttributes: [{ key: 'attr.a', disclosure: 'test' }] } }
+    const manifestB = { ...validManifest('merge-b'), capabilities: { ...validManifest('merge-b').capabilities, syncAttributes: [{ key: 'attr.b', disclosure: 'test' }] } }
+
+    const loads: PluginLoad[] = [
+      { status: 'loaded', manifest: manifestA, dir: pluginADir },
+      { status: 'loaded', manifest: manifestB, dir: pluginBDir },
+    ]
+    const calls = [sampleCall('key-1')]
+
+    const enrichment = await collectPluginEnrichment(loads, calls, 5000)
+
+    // Both attrs should be present
+    const attrs = enrichment.perCall.get('key-1') ?? []
+    expect(attrs.some(a => a.key === 'attr.a')).toBe(true)
+    expect(attrs.some(a => a.key === 'attr.b')).toBe(true)
+    expect(attrs.length).toBeGreaterThanOrEqual(2)
   })
 })
