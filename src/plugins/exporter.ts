@@ -191,6 +191,8 @@ async function runPluginExporter(
     const timer = setTimeout(() => {
       timedOut = true
       child.kill()
+      // A child that ignores SIGTERM must not outlive the push.
+      setTimeout(() => { try { child.kill('SIGKILL') } catch { /* already gone */ } }, 2000).unref()
     }, timeoutMs)
 
     if (child.stdout) {
@@ -204,7 +206,8 @@ async function runPluginExporter(
 
     if (child.stderr) {
       child.stderr.on('data', chunk => {
-        stderr += chunk.toString('utf8')
+        // Keep only the first 256KB: enough to diagnose, bounded in memory.
+        if (stderr.length < 256 * 1024) stderr += chunk.toString('utf8')
       })
     }
 
