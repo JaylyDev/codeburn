@@ -28,6 +28,7 @@ import { loadPlugins, declaredSyncAttributes, type PluginLoad } from '../plugins
 import {
   computeAcceptanceFingerprint,
   buildDisclosure,
+  CORE_SYNC_FIELD_MEANINGS,
   type FingerprintInput,
   type DisclosureInput,
   type Receipt,
@@ -589,7 +590,8 @@ export function registerSyncCommands(program: Command): void {
 
         const fieldList = allKeys.map(key => {
           const plugin = pluginKeys.get(key)
-          return { key, disclosure: plugin?.disclosure ?? '' }
+          const disclosure = plugin?.disclosure ?? CORE_SYNC_FIELD_MEANINGS.get(key) ?? '(no description)'
+          return { key, disclosure }
         })
 
         const workMatching = opts.attribution ?? false

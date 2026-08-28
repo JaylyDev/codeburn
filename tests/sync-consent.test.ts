@@ -6,10 +6,12 @@ import { tmpdir } from 'os'
 import {
   computeAcceptanceFingerprint,
   buildDisclosure,
+  CORE_SYNC_FIELD_MEANINGS,
   type FingerprintInput,
   type DisclosureInput,
 } from '../src/sync/consent.js'
 import { readSyncConfig, writeSyncConfig, readReceipts, appendReceipt } from '../src/sync/config.js'
+import { CORE_SYNC_ATTRIBUTE_KEYS } from '../src/sync/otlp.js'
 
 describe('Fingerprint', () => {
   it('is deterministic - same input produces same hash', () => {
@@ -204,6 +206,38 @@ describe('Disclosure', () => {
 
     const disclosure = buildDisclosure(input)
     expect(disclosure).toContain('last 7 days')
+  })
+
+  it('core field meanings map contains all core attribute keys', () => {
+    const meaningsKeys = new Set(CORE_SYNC_FIELD_MEANINGS.keys())
+    for (const key of CORE_SYNC_ATTRIBUTE_KEYS) {
+      expect(meaningsKeys.has(key)).toBe(true)
+    }
+  })
+
+  it('disclosure contains no empty field meanings', () => {
+    const input: DisclosureInput = {
+      destination: 'test-org',
+      destinationUrl: 'https://endpoint.example.com',
+      cadence: 'daily',
+      outboundFields: [
+        { key: 'ai.cost_usd', disclosure: 'the cost of the call in US dollars' },
+        { key: 'ai.model', disclosure: 'which AI model handled the call' },
+        { key: 'custom.field', disclosure: 'custom plugin field' },
+      ],
+      workMatching: false,
+      scopeSinceDays: 7,
+    }
+
+    const disclosure = buildDisclosure(input)
+    // Check that no field line (starting with spaces) ends with ":" and nothing after
+    const lines = disclosure.split('\n')
+    for (const line of lines) {
+      if (line.startsWith('  ') && line.includes(':')) {
+        // Field line: should have content after the colon
+        expect(line).not.toMatch(/:\s*$/)
+      }
+    }
   })
 })
 

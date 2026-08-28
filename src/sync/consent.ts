@@ -9,6 +9,35 @@ import { createHash } from 'crypto'
 
 export const WIRE_CONTRACT_VERSION = 'v2'
 
+export const CORE_SYNC_FIELD_MEANINGS: ReadonlyMap<string, string> = new Map([
+  ['ai.provider', 'which AI service handled the call'],
+  ['ai.model', 'which AI model handled the call'],
+  ['ai.input_tokens', 'tokens sent to the model'],
+  ['ai.output_tokens', 'tokens returned by the model'],
+  ['ai.cost_usd', 'the cost of the call in US dollars'],
+  ['ai.speed', 'how many output tokens per second'],
+  ['ai.project', 'directory name of the project'],
+  ['ai.tools', 'tools available to the model'],
+  ['ai.cost_estimated', 'whether cost was estimated or billed'],
+  ['ai.work_unit_id', 'internal task identifier (only when work matching is on)'],
+  ['ai.session_role', 'type of usage (development, production, etc.)'],
+  ['ai.lineage_evidence', 'evidence linking the session to a task (only when work matching is on)'],
+  ['ai.cache_read_tokens', 'tokens read from cache'],
+  ['ai.cache_write_tokens', 'tokens written to cache'],
+  ['ai.call_count', 'how many API requests in the session'],
+  ['ai.session_duration_ms', 'how long the session lasted in milliseconds'],
+  ['ai.subscription_covered', 'whether usage is covered by subscription'],
+  ['codeburn.device_id', 'a stable random identifier for this device'],
+  ['codeburn.coverage_through', 'date through which usage has been analyzed'],
+  ['codeburn.attribution_methodology', 'how session-to-task links were inferred'],
+  ['git.repo', 'repository name (only when work matching is on)'],
+  ['git.sha', 'commit hash (only when work matching is on)'],
+  ['git.commit_count', 'number of commits in the session (only when work matching is on)'],
+  ['git.in_main', 'whether commits were to the main branch (only when work matching is on)'],
+  ['git.was_reverted', 'whether work was reverted (only when work matching is on)'],
+  ['git.pr_links', 'pull request URLs (only when work matching is on)'],
+])
+
 export interface FingerprintInput {
   org: string
   destination: string
