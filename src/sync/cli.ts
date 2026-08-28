@@ -21,10 +21,19 @@ import {
   CALLBACK_PORTS,
 } from './auth.js'
 import { createCredentialStore } from './credentials.js'
-import { readSyncConfig, writeSyncConfig, deleteSyncConfig, updateLastSync } from './config.js'
+import { readSyncConfig, writeSyncConfig, deleteSyncConfig, updateLastSync, receiptsPath, readReceipts, appendReceipt } from './config.js'
 import { collectUnsentCalls, collectUnsentAttribution, sendBatches, sendAttributionBatches, batchCalls, MAX_PER_PUSH, MAX_ATTRIBUTION_PER_PUSH, type PushResult } from './push.js'
-import { batchAttributionItems, wireProjectName } from './otlp.js'
+import { batchAttributionItems, wireProjectName, CORE_SYNC_ATTRIBUTE_KEYS } from './otlp.js'
 import { loadPlugins, declaredSyncAttributes, type PluginLoad } from '../plugins/loader.js'
+import {
+  computeAcceptanceFingerprint,
+  buildDisclosure,
+  type FingerprintInput,
+  type DisclosureInput,
+  type Receipt,
+  buildReceipt,
+} from './consent.js'
+import { installSchedule, removeSchedule } from './schedule-installer.js'
 
 export function registerSyncCommands(program: Command): void {
   const sync = program
@@ -473,6 +482,305 @@ export function registerSyncCommands(program: Command): void {
       } catch (err) {
         process.stderr.write(`${(err as Error).message}\n`)
         process.exit(1)
+      }
+    })
+
+  // --- auto (parent) ---
+  const auto = sync
+    .command('auto')
+    .description('Manage automatic scheduled pushes')
+
+  // --- auto enable ---
+  auto
+    .command('enable')
+    .description('Enable automatic scheduled pushes (requires --accept to proceed)')
+    .option('--cadence <cadence>', 'Schedule frequency: daily or hourly', 'daily')
+    .option('--accept', 'Accept the disclosure and enable automatic sync')
+    .action(async (opts: { cadence?: string; accept?: boolean }) => {
+      const config = readSyncConfig()
+      if (!config) {
+        process.stderr.write('Sync not configured. Run `codeburn sync setup <url>` first.\n')
+        process.exit(1)
+      }
+
+      const cadence = opts.cadence as 'daily' | 'hourly'
+      if (cadence !== 'daily' && cadence !== 'hourly') {
+        process.stderr.write('Invalid --cadence. Use: daily or hourly\n')
+        process.exit(1)
+      }
+
+      try {
+        const pluginLoads: PluginLoad[] = await loadPlugins()
+        const pluginKeys = declaredSyncAttributes(pluginLoads)
+        const allKeys = Array.from(CORE_SYNC_ATTRIBUTE_KEYS)
+          .concat(Array.from(pluginKeys.keys()))
+          .sort()
+
+        const fieldList = allKeys.map(key => {
+          const plugin = pluginKeys.get(key)
+          return { key, disclosure: plugin?.disclosure ?? '' }
+        })
+
+        const fingerprintInput: FingerprintInput = {
+          org: config.clientId,
+          destination: config.baseUrl,
+          outboundFields: allKeys,
+          workMatching: true,
+          scopeSinceDays: null,
+          cadence,
+        }
+
+        const fingerprint = computeAcceptanceFingerprint(fingerprintInput)
+
+        const disclosureInput: DisclosureInput = {
+          destination: config.clientId,
+          destinationUrl: config.baseUrl,
+          cadence,
+          outboundFields: fieldList,
+          workMatching: true,
+          scopeSinceDays: null,
+        }
+
+        const disclosure = buildDisclosure(disclosureInput)
+        process.stdout.write(disclosure + '\n\n')
+
+        if (!opts.accept) {
+          process.stderr.write('Re-run with --accept to consent to exactly this.\n')
+          process.exit(1)
+        }
+
+        config.auto = {
+          accepted: {
+            fingerprint,
+            acceptedAt: new Date().toISOString(),
+            cadence,
+            disclosure,
+          },
+          killed: false,
+        }
+        delete config.auto.killed
+        writeSyncConfig(config)
+
+        await installSchedule(cadence, process.argv[1])
+
+        process.stdout.write(`Automatic sync enabled (${cadence}). Fingerprint: ${fingerprint}\n`)
+      } catch (err) {
+        process.stderr.write(`${(err as Error).message}\n`)
+        process.exit(1)
+      }
+    })
+
+  // --- auto disable ---
+  auto
+    .command('disable')
+    .description('Disable automatic scheduled pushes (kill switch)')
+    .action(async () => {
+      const config = readSyncConfig()
+      if (!config) {
+        process.stderr.write('Sync not configured.\n')
+        return
+      }
+
+      if (!config.auto?.accepted) {
+        process.stdout.write('Automatic sync was not enabled.\n')
+        return
+      }
+
+      config.auto.killed = true
+      writeSyncConfig(config)
+
+      try {
+        await removeSchedule()
+      } catch {
+        // Best effort
+      }
+
+      process.stdout.write('Automatic sync disabled.\n')
+    })
+
+  // --- auto status ---
+  auto
+    .command('status')
+    .description('Show automatic sync status and recent receipts')
+    .action(async () => {
+      const config = readSyncConfig()
+      if (!config?.auto?.accepted) {
+        process.stdout.write('Automatic sync is not configured.\n')
+        return
+      }
+
+      const accepted = config.auto.accepted
+      process.stdout.write(`Accepted fingerprint: ${accepted.fingerprint}\n`)
+      process.stdout.write(`Accepted at: ${accepted.acceptedAt}\n`)
+      process.stdout.write(`Cadence: ${accepted.cadence}\n`)
+
+      // Recompute fingerprint to check for changes
+      try {
+        const pluginLoads: PluginLoad[] = await loadPlugins()
+        const pluginKeys = declaredSyncAttributes(pluginLoads)
+        const allKeys = Array.from(CORE_SYNC_ATTRIBUTE_KEYS)
+          .concat(Array.from(pluginKeys.keys()))
+          .sort()
+
+        const fingerprintInput: FingerprintInput = {
+          org: config.clientId,
+          destination: config.baseUrl,
+          outboundFields: allKeys,
+          workMatching: true,
+          scopeSinceDays: null,
+          cadence: accepted.cadence,
+        }
+
+        const currentFingerprint = computeAcceptanceFingerprint(fingerprintInput)
+        if (currentFingerprint === accepted.fingerprint) {
+          process.stdout.write('Current fingerprint: MATCHES\n')
+        } else {
+          // Detect what changed
+          const changed: string[] = []
+          const coreCount = Array.from(CORE_SYNC_ATTRIBUTE_KEYS).length
+          if (allKeys.length !== coreCount + pluginKeys.size) {
+            changed.push('field set')
+          }
+          if (config.baseUrl !== config.baseUrl) {
+            changed.push('destination')
+          }
+          process.stdout.write(`Current fingerprint: DIFFERS (${changed.join(', ')})\n`)
+        }
+      } catch {
+        process.stdout.write('Current fingerprint: unable to recompute\n')
+      }
+
+      process.stdout.write(`Killed: ${config.auto.killed ? 'yes' : 'no'}\n`)
+
+      const receipts = readReceipts(5)
+      if (receipts.length > 0) {
+        process.stdout.write('\nLast 5 receipts:\n')
+        for (const r of receipts) {
+          process.stdout.write(`  ${r.at} - ${r.result}\n`)
+        }
+      }
+    })
+
+  // --- auto run ---
+  auto
+    .command('run')
+    .description('Run automatic push (invoked by scheduler)')
+    .action(async () => {
+      const config = readSyncConfig()
+      const at = new Date().toISOString()
+
+      if (config?.auto?.killed) {
+        appendReceipt(buildReceipt(at, undefined, { result: 'killed' }))
+        return
+      }
+
+      if (!config?.auto?.accepted) {
+        appendReceipt(buildReceipt(at, undefined, { result: 'not-accepted' }))
+        return
+      }
+
+      const accepted = config.auto.accepted
+
+      try {
+        // Recompute fingerprint
+        const pluginLoads: PluginLoad[] = await loadPlugins()
+        const pluginKeys = declaredSyncAttributes(pluginLoads)
+        const allKeys = Array.from(CORE_SYNC_ATTRIBUTE_KEYS)
+          .concat(Array.from(pluginKeys.keys()))
+          .sort()
+
+        const fingerprintInput: FingerprintInput = {
+          org: config.clientId,
+          destination: config.baseUrl,
+          outboundFields: allKeys,
+          workMatching: true,
+          scopeSinceDays: null,
+          cadence: accepted.cadence,
+        }
+
+        const currentFingerprint = computeAcceptanceFingerprint(fingerprintInput)
+
+        if (currentFingerprint !== accepted.fingerprint) {
+          // Detect what changed
+          const changed: string[] = []
+          const baseCoreKeys = Array.from(CORE_SYNC_ATTRIBUTE_KEYS).sort()
+          if (JSON.stringify(allKeys) !== JSON.stringify(baseCoreKeys)) {
+            changed.push('field set')
+          }
+          appendReceipt(buildReceipt(
+            at,
+            currentFingerprint,
+            { result: 'acceptance-required', changed: changed.length > 0 ? changed : ['unknown'] }
+          ))
+          return
+        }
+
+        // Run the same push path as sync push
+        const { parseAllSessions } = await import('../parser.js')
+        const { getDateRange } = await import('../cli-date.js')
+
+        const range = getDateRange('week').range
+        const projects = (await parseAllSessions(range))
+          .map(p => ({ ...p, project: wireProjectName(p.projectPath, p.project) }))
+
+        const { readPlans } = await import('../config.js')
+        const plans = await readPlans()
+
+        const { loadDailyCache } = await import('../daily-cache.js')
+        const dailyCache = await loadDailyCache()
+        const coverageThrough = dailyCache.complete === true && dailyCache.watermarkTrusted === true && dailyCache.lastComputedDate
+          ? dailyCache.lastComputedDate
+          : undefined
+
+        const { allCalls, unsent } = collectUnsentCalls(projects, Date.now(), { plans })
+
+        if (unsent.length === 0) {
+          appendReceipt(buildReceipt(at, currentFingerprint, { result: 'pushed', spans: 0 }))
+          return
+        }
+
+        const store = createCredentialStore()
+        const rt = store.retrieve()
+        if (!rt) {
+          appendReceipt(buildReceipt(at, currentFingerprint, { result: 'error', reason: 'no auth token' }))
+          return
+        }
+
+        const oidc = await fetchOidcConfig(config.issuer)
+        const tokens = await refreshToken(oidc.token_endpoint, rt, config.clientId)
+
+        if (tokens.refresh_token && tokens.refresh_token !== rt) {
+          store.store(tokens.refresh_token)
+        }
+
+        const discoveryDoc = await fetchDiscoveryDoc(config.baseUrl)
+        const endpoint = `${config.baseUrl}${config.tracesPath}`
+
+        const toPush = unsent.slice(0, MAX_PER_PUSH)
+        const batches = batchCalls(toPush, discoveryDoc.max_batch_size)
+
+        const pluginAttributeKeys: ReadonlySet<string> = new Set(pluginKeys.keys())
+        const result: PushResult = await sendBatches({
+          endpoint,
+          accessToken: tokens.access_token,
+          batches,
+          ...(coverageThrough ? { coverageThrough } : {}),
+          pluginAttributes: { keys: pluginAttributeKeys, values: [] },
+          log: () => {}, // Silent mode
+        })
+
+        if (result.outcome === 'complete') {
+          updateLastSync()
+          appendReceipt(buildReceipt(at, currentFingerprint, { result: 'pushed', spans: result.totalSent }))
+        } else {
+          appendReceipt(buildReceipt(at, currentFingerprint, { result: 'error', reason: result.outcome }))
+        }
+      } catch (err) {
+        appendReceipt(buildReceipt(
+          at,
+          undefined,
+          { result: 'error', reason: err instanceof Error ? err.message : String(err) }
+        ))
       }
     })
 }
