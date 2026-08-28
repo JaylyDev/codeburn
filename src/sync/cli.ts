@@ -88,6 +88,23 @@ async function executePush(input: ExecutePushInput): Promise<{ result: PushResul
   return { result, attrResult, attrFacts }
 }
 
+// Helper to build FingerprintInput for acceptance checking
+function buildAcceptanceFingerprintInput(
+  config: NonNullable<Awaited<ReturnType<typeof readSyncConfig>>>,
+  allKeys: string[],
+  workMatching: boolean,
+  cadence: 'daily' | 'hourly',
+): FingerprintInput {
+  return {
+    org: config.clientId,
+    destination: config.baseUrl,
+    outboundFields: allKeys,
+    workMatching,
+    scopeSinceDays: 7,
+    cadence,
+  }
+}
+
 export function registerSyncCommands(program: Command): void {
   const sync = program
     .command('sync')
@@ -576,15 +593,7 @@ export function registerSyncCommands(program: Command): void {
         })
 
         const workMatching = opts.attribution ?? false
-        const fingerprintInput: FingerprintInput = {
-          org: config.clientId,
-          destination: config.baseUrl,
-          outboundFields: allKeys,
-          workMatching,
-          scopeSinceDays: 7,
-          cadence,
-        }
-
+        const fingerprintInput = buildAcceptanceFingerprintInput(config, allKeys, workMatching, cadence)
         const fingerprint = computeAcceptanceFingerprint(fingerprintInput)
 
         const disclosureInput: DisclosureInput = {
@@ -678,27 +687,16 @@ export function registerSyncCommands(program: Command): void {
           .concat(Array.from(pluginKeys.keys()))
           .sort()
 
-        const fingerprintInput: FingerprintInput = {
-          org: config.clientId,
-          destination: config.baseUrl,
-          outboundFields: allKeys,
-          workMatching: true,
-          scopeSinceDays: null,
-          cadence: accepted.cadence,
-        }
-
+        const fingerprintInput = buildAcceptanceFingerprintInput(config, allKeys, accepted.attribution, accepted.cadence)
         const currentFingerprint = computeAcceptanceFingerprint(fingerprintInput)
         if (currentFingerprint === accepted.fingerprint) {
           process.stdout.write('Current fingerprint: MATCHES\n')
         } else {
           // Detect what changed
           const changed: string[] = []
-          const coreCount = Array.from(CORE_SYNC_ATTRIBUTE_KEYS).length
-          if (allKeys.length !== coreCount + pluginKeys.size) {
+          const baseCoreKeys = Array.from(CORE_SYNC_ATTRIBUTE_KEYS).sort()
+          if (JSON.stringify(allKeys) !== JSON.stringify(baseCoreKeys)) {
             changed.push('field set')
-          }
-          if (config.baseUrl !== config.baseUrl) {
-            changed.push('destination')
           }
           process.stdout.write(`Current fingerprint: DIFFERS (${changed.join(', ')})\n`)
         }
@@ -745,15 +743,7 @@ export function registerSyncCommands(program: Command): void {
           .concat(Array.from(pluginKeys.keys()))
           .sort()
 
-        const fingerprintInput: FingerprintInput = {
-          org: config.clientId,
-          destination: config.baseUrl,
-          outboundFields: allKeys,
-          workMatching: accepted.attribution,
-          scopeSinceDays: 7,
-          cadence: accepted.cadence,
-        }
-
+        const fingerprintInput = buildAcceptanceFingerprintInput(config, allKeys, accepted.attribution, accepted.cadence)
         const currentFingerprint = computeAcceptanceFingerprint(fingerprintInput)
 
         if (currentFingerprint !== accepted.fingerprint) {

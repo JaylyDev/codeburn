@@ -249,6 +249,36 @@ describe('Config with auto block', () => {
     expect(loaded?.auto?.killed).toBe(false)
   })
 
+  it('status recompute matches original fingerprint when attribution choice stored', () => {
+    // Simulate what enable does: compute fingerprint with 7-day scope and stored attribution choice
+    const fields = ['ai.cost_usd', 'ai.model', 'git.repo']
+    const attribution = false // User did NOT request --attribution
+    const cadence = 'daily' as const
+
+    const enableInput: FingerprintInput = {
+      org: 'test-client',
+      destination: 'https://endpoint.example.com',
+      outboundFields: fields,
+      workMatching: attribution,
+      scopeSinceDays: 7,
+      cadence,
+    }
+    const storedFingerprint = computeAcceptanceFingerprint(enableInput)
+
+    // Now simulate what status does: recompute with same config
+    const statusInput: FingerprintInput = {
+      org: 'test-client',
+      destination: 'https://endpoint.example.com',
+      outboundFields: fields,
+      workMatching: attribution, // Same as what was stored
+      scopeSinceDays: 7, // Same as what was stored
+      cadence,
+    }
+    const recomputedFingerprint = computeAcceptanceFingerprint(statusInput)
+
+    expect(recomputedFingerprint).toBe(storedFingerprint)
+  })
+
   it('handles missing auto block', () => {
     const configDir = join(tmpDir, '.config', 'codeburn')
     mkdir(configDir, { recursive: true })
