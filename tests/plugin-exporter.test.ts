@@ -656,3 +656,49 @@ process.stdout.write(JSON.stringify({ perCall: {}, spans: [] }));
     expect(stats).toBe(true)
   })
 })
+
+// Regression probes from the deep review: a plugin must never kill the push.
+describe('exporter hostility: the push always survives', () => {
+  it('survives an exporter that exits before reading stdin (EPIPE path)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'hostile-'))
+    try {
+      const plug = join(dir, 'evil')
+      await mkdir(join(plug, 'exporters'), { recursive: true })
+      await writeFile(join(plug, 'codeburn-plugin.json'), JSON.stringify({
+        name: 'evil', version: '0.1.0', cliCompat: '>=0.9.22',
+        capabilities: { commands: [], syncAttributes: [{ key: 'evil.f', disclosure: 'probe field for tests' }], payloadSections: [], spanKinds: [] },
+      }))
+      await writeFile(join(plug, 'exporters', 'sync.mjs'), 'process.stdin.destroy()\nprocess.exit(1)\n')
+      const loads = await loadPlugins(dir, '0.9.22', { ...process.env, CODEBURN_PLUGIN_DEV: '1' })
+      const calls = Array.from({ length: 200 }, (_, i) => ({
+        call: { timestamp: '2026-08-28T10:00:00.000Z', deduplicationKey: `k${i}`, padding: 'x'.repeat(2000) },
+        sessionId: 's', workingDirectory: '/w', session: null,
+      })) as never[]
+      const enrichment = await collectPluginEnrichment(loads, calls, 10_000)
+      expect(enrichment.extraSpans).toEqual([])
+      expect(enrichment.perCall.size).toBe(0)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('survives an exporter emitting a bare string, and calls without tools', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'hostile2-'))
+    try {
+      const plug = join(dir, 'weird')
+      await mkdir(join(plug, 'exporters'), { recursive: true })
+      await writeFile(join(plug, 'codeburn-plugin.json'), JSON.stringify({
+        name: 'weird', version: '0.1.0', cliCompat: '>=0.9.22',
+        capabilities: { commands: [], syncAttributes: [{ key: 'weird.f', disclosure: 'probe field for tests' }], payloadSections: [], spanKinds: [] },
+      }))
+      await writeFile(join(plug, 'exporters', 'sync.mjs'),
+        'process.stdout.write(JSON.stringify("hello"))\nprocess.stdin.resume()\nprocess.stdin.on("end", () => process.exit(0))\n')
+      const loads = await loadPlugins(dir, '0.9.22', { ...process.env, CODEBURN_PLUGIN_DEV: '1' })
+      const calls = [{ call: { timestamp: '2026-08-28T10:00:00.000Z', deduplicationKey: 'k1' }, sessionId: 's', workingDirectory: '/w', session: null }] as never[]
+      const enrichment = await collectPluginEnrichment(loads, calls, 10_000)
+      expect(enrichment.extraSpans).toEqual([])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})

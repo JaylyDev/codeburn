@@ -72,7 +72,7 @@ function buildTurnContextMap(calls: CallWithSession[]): Map<string, TurnContext>
     const retries = Math.max(0, assistantCalls.length - 1)
 
     // Check for edits
-    const hasEdits = assistantCalls.some(c => c.tools.some(t => EDIT_TOOLS.has(t)))
+    const hasEdits = assistantCalls.some(c => (c.tools ?? []).some((t: string) => EDIT_TOOLS.has(t)))
 
     // Check for one-shot (retries == 0 and hasEdits)
     const oneShot = retries === 0 && hasEdits
@@ -102,7 +102,13 @@ export async function collectPluginEnrichment(
 
   for (const load of loads) {
     if (load.status !== 'loaded') continue
-    const result = await runPluginExporter(load, calls, timeoutMs)
+    let result: ExporterResult | null
+    try {
+      result = await runPluginExporter(load, calls, timeoutMs)
+    } catch (err) {
+      process.stderr.write(`plugin "${load.manifest.name}": sync exporter failed (${err instanceof Error ? err.message : 'internal error'}); pushing without it\n`)
+      continue
+    }
     if (!result) continue
 
     const manifest = load.manifest
@@ -233,16 +239,31 @@ async function runPluginExporter(
       }
 
       try {
-        const result = JSON.parse(stdout) as ExporterResult
-        resolve(result)
+        const parsed: unknown = JSON.parse(stdout)
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+          || typeof (parsed as ExporterResult).perCall !== 'object' || (parsed as ExporterResult).perCall === null
+          || !Array.isArray((parsed as ExporterResult).spans)) {
+          throw new Error('exporter output shape invalid')
+        }
+        resolve(parsed as ExporterResult)
       } catch {
         process.stderr.write(`plugin "${load.manifest.name}": sync exporter failed (bad JSON); pushing without it\n`)
         resolve(null)
       }
     })
 
-    // Build turn context map
-    const turnContextMap = buildTurnContextMap(calls)
+    // An exporter that dies before reading stdin makes our write emit EPIPE;
+    // without a handler that uncaught stream error would kill the whole push.
+    child.stdin?.on('error', () => { /* exit handler reports the failure */ })
+
+    // Build turn context map; any surprise in call shapes must cost only the
+    // context, never the push.
+    let turnContextMap: ReturnType<typeof buildTurnContextMap>
+    try {
+      turnContextMap = buildTurnContextMap(calls)
+    } catch {
+      turnContextMap = new Map()
+    }
 
     // Send input with turn context for each call
     const input = {

@@ -324,7 +324,13 @@ async function addRemote(name: string, pluginsDir: string): Promise<void> {
     throw new Error(`Failed to fetch plugin manifest: ${msg}`)
   }
 
-  const manifestData = await manifestResp.json() as Record<string, unknown>
+  // A manifest is a few hundred bytes; cap the read so a misbehaving server
+  // cannot balloon memory before parsing.
+  const manifestText = await manifestResp.text()
+  if (manifestText.length > 64 * 1024) {
+    throw new Error('Plugin manifest response exceeds 64 KB; refusing')
+  }
+  const manifestData = JSON.parse(manifestText) as Record<string, unknown>
   const manifestSha = typeof manifestData.sha256 === 'string' ? manifestData.sha256 : ''
   const manifestSize = typeof manifestData.size === 'number' ? manifestData.size : 0
 
