@@ -14,8 +14,9 @@ import type { Command } from 'commander'
 import { stat, mkdir, readFile, writeFile, rm, readdir } from 'fs/promises'
 import { join } from 'path'
 import { homedir } from 'os'
+import { spawn } from 'child_process'
 
-import { defaultPluginsDir, loadPlugins, currentCliVersion, verifyPlugin, readPluginManifestRaw } from './loader.js'
+import { defaultPluginsDir, loadPlugins, currentCliVersion, verifyPlugin, readPluginManifestRaw, type PluginLoad } from './loader.js'
 import { parsePluginManifest, type PluginManifest } from './manifest.js'
 
 export function registerPluginCommands(program: Command): void {
@@ -175,3 +176,52 @@ async function listOnDiskSections(dir: string, m: PluginManifest): Promise<strin
 
 // Re-export so consumers can pin the version pinned by the socket itself.
 export { defaultPluginsDir, currentCliVersion }
+
+export async function registerLoadedPluginCommands(program: Command, loads?: PluginLoad[]): Promise<void> {
+  const pluginLoads = loads ?? await loadPlugins()
+
+  for (const load of pluginLoads) {
+    if (load.status !== 'loaded') continue
+    const manifest = load.manifest
+    const pluginDir = load.dir
+
+    for (const commandName of manifest.capabilities.commands) {
+      // Collision check: skip if command already exists (built-ins win)
+      if (program.commands.some(c => c.name() === commandName)) {
+        process.stderr.write(`plugin "${manifest.name}": command "${commandName}" conflicts with a built-in and was not registered\n`)
+        continue
+      }
+
+      program
+        .command(commandName)
+        .description(`Plugin command from ${manifest.name}@${manifest.version}`)
+        .allowUnknownOption(true)
+        .argument('[args...]')
+        .action(async (args: string[]) => {
+          const entryFile = join(pluginDir, 'commands', commandName + '.mjs')
+          try {
+            await stat(entryFile)
+          } catch {
+            process.stderr.write(`plugin "${manifest.name}": missing commands/${commandName}.mjs\n`)
+            process.exitCode = 1
+            return
+          }
+
+          const env = { ...process.env, CODEBURN_PLUGIN_DIR: pluginDir }
+          const child = spawn(process.execPath, [entryFile, ...args], {
+            stdio: 'inherit',
+            env,
+          })
+
+          await new Promise<void>((resolve) => {
+            child.on('exit', (code) => {
+              if (code !== null && code !== 0) {
+                process.exitCode = code
+              }
+              resolve()
+            })
+          })
+        })
+    }
+  }
+}

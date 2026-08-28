@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, rm, mkdir, writeFile } from 'fs/promises'
+import { mkdtemp, rm, mkdir, writeFile, stat } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
@@ -223,5 +223,184 @@ describe('plugin CLI: codeburn plugin list|info|verify', () => {
     await expect(
       program.parseAsync(['node', 'codeburn', 'plugin', 'verify', 'broken', '--dir', tmpDir]),
     ).rejects.toThrow()
+  })
+})
+
+// ── 5. Plugin command registration ────────────────────────────────────
+
+describe('plugin command registration: registerLoadedPluginCommands', () => {
+  let registerLoadedPluginCommands: typeof import('../src/plugins/cli.js').registerLoadedPluginCommands
+  beforeEach(async () => {
+    const mod = await import('../src/plugins/cli.js')
+    registerLoadedPluginCommands = mod.registerLoadedPluginCommands
+  })
+
+  function makeProgram() {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { Command } = require('commander')
+    const p = new Command()
+    p.exitOverride()
+    return p
+  }
+
+  it('a plugin declaring commands:["hello"] with commands/hello.mjs registers and runs', async () => {
+    const pluginDir = join(tmpDir, 'hello-plugin')
+    const commandsDir = join(pluginDir, 'commands')
+    await mkdir(commandsDir, { recursive: true })
+
+    const testFile = join(tmpDir, 'hello-ran.txt')
+    const helloScript = `import { writeFileSync } from 'fs';
+process.stdout.write('hello ' + process.argv.slice(2).join(' ') + '\\n');
+writeFileSync(${JSON.stringify(testFile)}, 'yes');
+`
+    await writeFile(join(commandsDir, 'hello.mjs'), helloScript)
+
+    const manifest = { ...validManifest('hello-plugin'), capabilities: { ...validManifest('hello-plugin').capabilities, commands: ['hello'] } }
+    const loads = [
+      {
+        status: 'loaded' as const,
+        manifest,
+        dir: pluginDir,
+      },
+    ]
+
+    const program = makeProgram()
+    await registerLoadedPluginCommands(program, loads)
+
+    const cmd = program.commands.find(c => c.name() === 'hello')
+    expect(cmd).toBeDefined()
+    expect(cmd?.description()).toContain('hello-plugin@0.1.0')
+
+    const savedCode = process.exitCode
+    process.exitCode = undefined
+    try {
+      await program.parseAsync(['node', 'codeburn', 'hello', 'world'])
+      const info = await stat(testFile)
+      expect(info.isFile()).toBe(true)
+    } finally {
+      process.exitCode = savedCode
+    }
+  })
+
+  it('child process exit code 3 propagates to process.exitCode', async () => {
+    const pluginDir = join(tmpDir, 'exit3-plugin')
+    const commandsDir = join(pluginDir, 'commands')
+    await mkdir(commandsDir, { recursive: true })
+
+    await writeFile(join(commandsDir, 'fail.mjs'), 'process.exit(3);')
+
+    const baseMfst = validManifest('exit3-plugin')
+    const manifest = { ...baseMfst, capabilities: { ...baseMfst.capabilities, commands: ['fail'] } }
+    const loads = [
+      {
+        status: 'loaded' as const,
+        manifest,
+        dir: pluginDir,
+      },
+    ]
+
+    const program = makeProgram()
+    await registerLoadedPluginCommands(program, loads)
+
+    const savedCode = process.exitCode
+    process.exitCode = undefined
+    try {
+      await program.parseAsync(['node', 'codeburn', 'fail'])
+      expect(process.exitCode).toBe(3)
+    } finally {
+      process.exitCode = savedCode
+    }
+  })
+
+  it('missing commands/hello.mjs writes stderr and sets exit code 1', async () => {
+    const pluginDir = join(tmpDir, 'missing-plugin')
+    await mkdir(pluginDir, { recursive: true })
+
+    const baseMfst = validManifest('missing-plugin')
+    const manifest = { ...baseMfst, capabilities: { ...baseMfst.capabilities, commands: ['hello'] } }
+    const loads = [
+      {
+        status: 'loaded' as const,
+        manifest,
+        dir: pluginDir,
+      },
+    ]
+
+    const program = makeProgram()
+    await registerLoadedPluginCommands(program, loads)
+
+    const savedCode = process.exitCode
+    const savedStderr = process.stderr.write
+    let stderrOutput = ''
+    process.stderr.write = (chunk: string | Uint8Array | Buffer): boolean => {
+      stderrOutput += chunk.toString()
+      return true
+    }
+    process.exitCode = undefined
+
+    try {
+      await program.parseAsync(['node', 'codeburn', 'hello'])
+      expect(stderrOutput).toContain('missing commands/hello.mjs')
+      expect(process.exitCode).toBe(1)
+    } finally {
+      process.stderr.write = savedStderr
+      process.exitCode = savedCode
+    }
+  })
+
+  it('command collision with built-in skips registration and writes stderr', async () => {
+    const pluginDir = join(tmpDir, 'collision-plugin')
+    const commandsDir = join(pluginDir, 'commands')
+    await mkdir(commandsDir, { recursive: true })
+    await writeFile(join(commandsDir, 'help.mjs'), 'process.stdout.write("plugin help");')
+
+    const baseMfst = validManifest('collision-plugin')
+    const manifest = { ...baseMfst, capabilities: { ...baseMfst.capabilities, commands: ['help'] } }
+    const loads = [
+      {
+        status: 'loaded' as const,
+        manifest,
+        dir: pluginDir,
+      },
+    ]
+
+    const program = makeProgram()
+    program.command('help').description('Built-in help')
+
+    const savedStderr = process.stderr.write
+    let stderrOutput = ''
+    process.stderr.write = (chunk: string | Uint8Array | Buffer): boolean => {
+      stderrOutput += chunk.toString()
+      return true
+    }
+
+    try {
+      await registerLoadedPluginCommands(program, loads)
+      expect(stderrOutput).toContain('conflicts with a built-in')
+      const helpCmd = program.commands.find(c => c.name() === 'help')
+      expect(helpCmd?.description()).toBe('Built-in help')
+    } finally {
+      process.stderr.write = savedStderr
+    }
+  })
+
+  it('rejected plugin commands are not registered', async () => {
+    const pluginDir = join(tmpDir, 'rejected-plugin')
+    await mkdir(pluginDir, { recursive: true })
+
+    const loads = [
+      {
+        status: 'rejected' as const,
+        name: 'rejected-plugin',
+        dir: pluginDir,
+        reason: 'unsigned',
+      },
+    ]
+
+    const program = makeProgram()
+    await registerLoadedPluginCommands(program, loads)
+
+    const rejectedCmd = program.commands.find(c => c.name() === 'hello')
+    expect(rejectedCmd).toBeUndefined()
   })
 })
