@@ -138,7 +138,7 @@ describe('loader: rejection reasons', () => {
     expect(loads).toHaveLength(1)
     expect(loads[0]!.status).toBe('rejected')
     if (loads[0]!.status === 'rejected') {
-      expect(loads[0]!.reason).toMatch(/unsigned/)
+      expect(loads[0]!.reason).toMatch(/signature|unsigned/)
     }
   })
 

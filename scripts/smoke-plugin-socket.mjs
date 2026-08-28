@@ -104,6 +104,47 @@ async function main() {
     await rm(pluginDir, { recursive: true, force: true })
   }
 
+  // 7) add/remove flow with CODEBURN_PLUGIN_DEV=1
+  const addRemoveDir = await mkdtemp(join(tmpdir(), 'smoke-add-remove-'))
+  try {
+    const sourceDir = join(addRemoveDir, 'source')
+    const installDir = join(addRemoveDir, 'installed')
+    await mkdir(sourceDir, { recursive: true })
+    await mkdir(installDir, { recursive: true })
+    await writeFile(join(sourceDir, 'codeburn-plugin.json'), JSON.stringify({
+      name: 'dev-plugin', version: '0.1.0', cliCompat: '>=0.9.22',
+      capabilities: { commands: [], syncAttributes: [], payloadSections: [], spanKinds: [] },
+    }))
+    await writeFile(join(sourceDir, 'test.txt'), 'test content')
+
+    // Add plugin with dev flag (unsigned)
+    const addResult = await run(['plugin', 'add', sourceDir, '--dir', installDir], { env: { CODEBURN_PLUGIN_DEV: '1' } })
+    assertEq(addResult.code, 0, '`plugin add` succeeds with CODEBURN_PLUGIN_DEV=1')
+    assertContains(addResult.stdout, 'dev-plugin@0.1.0', '`plugin add` confirms installation')
+
+    // List should show the added plugin
+    const listAfterAdd = await run(['plugin', 'list', '--dir', installDir], { env: { CODEBURN_PLUGIN_DEV: '1' } })
+    assertEq(listAfterAdd.code, 0, '`plugin list` after add exits 0')
+    assertContains(listAfterAdd.stdout, 'loaded   dev-plugin@0.1.0', '`plugin list` shows added plugin')
+
+    // Remove without --confirm should fail
+    const removeNoConfirm = await run(['plugin', 'remove', 'dev-plugin', '--dir', installDir])
+    assertEq(removeNoConfirm.code, 1, '`plugin remove` without --confirm exits 1')
+    assertContains(removeNoConfirm.stdout, 'Would remove', '`plugin remove` prints confirmation prompt')
+
+    // Remove with --confirm should succeed
+    const removeConfirm = await run(['plugin', 'remove', 'dev-plugin', '--confirm', '--dir', installDir])
+    assertEq(removeConfirm.code, 0, '`plugin remove --confirm` succeeds')
+    assertContains(removeConfirm.stdout, 'removed', '`plugin remove` confirms removal')
+
+    // List should be empty after removal
+    const listAfterRemove = await run(['plugin', 'list', '--dir', installDir])
+    assertEq(listAfterRemove.code, 0, '`plugin list` after remove exits 0')
+    assertContains(listAfterRemove.stdout, 'No plugins', '`plugin list` shows empty')
+  } finally {
+    await rm(addRemoveDir, { recursive: true, force: true })
+  }
+
   if (process.exitCode === 1) {
     console.error('\nSMOKE FAILED')
   } else {

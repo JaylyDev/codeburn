@@ -11,8 +11,9 @@
  */
 
 import type { Command } from 'commander'
-import { stat } from 'fs/promises'
+import { stat, mkdir, readFile, writeFile, rm, readdir } from 'fs/promises'
 import { join } from 'path'
+import { homedir } from 'os'
 
 import { defaultPluginsDir, loadPlugins, currentCliVersion, verifyPlugin, readPluginManifestRaw } from './loader.js'
 import { parsePluginManifest, type PluginManifest } from './manifest.js'
@@ -87,6 +88,60 @@ export function registerPluginCommands(program: Command): void {
       } else {
         throw new Error(`unverified  ${name}@${manifest.version}  ${result.reason ?? 'verification failed'}`)
       }
+    })
+
+  plugin
+    .command('add <path>')
+    .description('Install a plugin from a source directory')
+    .option('--dir <path>', 'Override the plugins directory')
+    .action(async (sourcePath: string, opts: { dir?: string }) => {
+      const pluginsDir = opts.dir ?? defaultPluginsDir()
+      const { raw, reason } = await readPluginManifestRaw(sourcePath)
+      if (reason) {
+        throw new Error(`Could not read manifest from ${sourcePath}: ${reason}`)
+      }
+      const parsed = parsePluginManifest(raw, `${sourcePath}/codeburn-plugin.json`)
+      if (!parsed.ok) {
+        throw new Error(`Invalid manifest: ${parsed.reason}`)
+      }
+      const manifest = parsed.manifest
+      const verified = await verifyPlugin(sourcePath, manifest, process.env)
+      if (!verified.ok) {
+        throw new Error(`Plugin verification failed: ${verified.reason ?? 'unknown reason'}`)
+      }
+      const destDir = join(pluginsDir, manifest.name)
+      try {
+        await stat(destDir)
+        throw new Error(`Plugin "${manifest.name}" already installed at ${destDir}`)
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+      }
+      await mkdir(destDir, { recursive: true })
+      const entries = await readdir(sourcePath, { withFileTypes: true })
+      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+        if (!entry.isFile()) continue
+        const srcFile = join(sourcePath, entry.name)
+        const destFile = join(destDir, entry.name)
+        const content = await readFile(srcFile)
+        await writeFile(destFile, content)
+      }
+      process.stdout.write(`Plugin "${manifest.name}@${manifest.version}" installed to ${destDir}\n`)
+    })
+
+  plugin
+    .command('remove <name>')
+    .description('Remove an installed plugin')
+    .option('--dir <path>', 'Override the plugins directory')
+    .option('--confirm', 'Confirm removal')
+    .action(async (name: string, opts: { dir?: string, confirm?: boolean }) => {
+      const pluginsDir = opts.dir ?? defaultPluginsDir()
+      const destDir = join(pluginsDir, name)
+      if (!opts.confirm) {
+        process.stdout.write(`Would remove plugin directory: ${destDir}\nUse --confirm to proceed.\n`)
+        process.exit(1)
+      }
+      await rm(destDir, { recursive: true, force: true })
+      process.stdout.write(`Plugin "${name}" removed.\n`)
     })
 }
 
