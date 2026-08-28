@@ -417,7 +417,7 @@ describe('getRefreshIntervalMs', () => {
 
 describe('interactive terminal rendering', () => {
   it('isolates resize reflow from stale primary-screen frames', () => {
-    expect(INTERACTIVE_RENDER_OPTIONS).toMatchObject({ alternateScreen: true })
+    expect(INTERACTIVE_RENDER_OPTIONS).toMatchObject({ alternateScreen: true, interactive: true })
   })
 
   it.each([

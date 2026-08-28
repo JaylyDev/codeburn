@@ -2,7 +2,7 @@ import { homedir } from 'node:os'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory, type DateRange } from './types.js'
 import { isBehavioralCall } from './behavioral-weight.js'
 import { type PeriodData, type ProviderCost, type BreakdownArrays, type MenubarPayload, type ClaudeConfigSelector, type HydrationState, buildMenubarPayload } from './menubar-json.js'
-import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, isSessionHydrationComplete, sessionHydrationSnapshot } from './parser.js'
+import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, filterProjectsByDateRange, isSessionHydrationComplete, sessionHydrationSnapshot } from './parser.js'
 import { findUnpricedModels, getFlatRateModelsConfigHash, getLocalModelSavingsConfigHash, getPriceOverridesConfigHash, getShortModelName, isExpectedFreeModel } from './models.js'
 import { getAllProviders, safeDiscoverSessions } from './providers/index.js'
 import { loadPlugins, pluginPayloadSections } from './plugins/loader.js'
@@ -116,6 +116,21 @@ async function hydrateCache(): Promise<DailyCache> {
     )
     return emptyCache()
   }
+}
+
+/**
+ * Finish the existing durable day cache from an already-normalized lifetime
+ * session index. The parser callback is only a range projection of `projects`:
+ * no source discovery, transcript read, or session-cache parse is repeated.
+ */
+export async function hydrateDailyCacheFromNormalizedProjects(projects: ProjectSummary[], complete = true): Promise<DailyCache> {
+  return ensureCacheHydrated(
+    (range) => Promise.resolve(filterProjectsByDateRange(projects, range)),
+    aggregateProjectsIntoDays,
+    getDailyCacheConfigHash(),
+    () => complete,
+    (rangeProjects, tz) => aggregateProjectsIntoDays(rangeProjects, (iso) => dateKeyInTz(iso, tz)),
+  )
 }
 
 /// The `hydration` block is emitted ONLY inside the resident serve child, which
@@ -383,6 +398,102 @@ function unionDaysForPeriod(
   const todayInRange = todayAllDays.filter(d => d.date >= rangeStartStr && d.date <= rangeEndStr)
   const unfiltered = [...historicalDays, ...todayInRange].sort((a, b) => a.date.localeCompare(b.date))
   return daysSelection ? unfiltered.filter(d => daysSelection.has(d.date)) : unfiltered
+}
+
+export type IndexedDurableOverview = {
+  cost: number
+  savingsUSD: number
+  calls: number
+  sessions: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  carriedCostUSD: number
+}
+
+/**
+ * Project a dashboard headline from one normalized lifetime index. Existing
+ * durable cache days remain authoritative (so expired transcripts do not
+ * disappear); normalized days fill only dates the durable cache does not yet
+ * contain, which is the cold first-index case. Today always comes from the
+ * live normalized index. No parser is called here.
+ */
+export function buildDurableOverviewFromNormalizedIndex(
+  periodInfo: PeriodInfo,
+  normalizedProjects: ProjectSummary[],
+  cache: DailyCache,
+  opts: AggregateOpts = {},
+): IndexedDurableOverview {
+  const pf = opts.provider ?? 'all'
+  const include = (opts.project ?? []).map(value => value.toLowerCase())
+  const exclude = (opts.exclude ?? []).map(value => value.toLowerCase())
+  const hasProjectFilter = include.length > 0 || exclude.length > 0
+  const filteredProjects = filterProjectsByName(normalizedProjects, opts.project ?? [], opts.exclude ?? [])
+  const scanProjects = filterProjectsByDateRange(filteredProjects, periodInfo.range)
+  const now = new Date()
+  const todayStr = toDateString(now)
+  const normalizedDays = aggregateProjectsIntoDays(filteredProjects)
+  const todayDays = normalizedDays
+    .filter(day => day.date === todayStr)
+  const historicalSlice = hasProjectFilter
+    ? (day: DailyEntry): DailyEntry => sliceDayToProject(day, include, exclude)
+    : undefined
+  const cachedAllDays = unionDaysForPeriod(cache, todayDays, periodInfo, null, historicalSlice)
+  const cachedDates = new Set(cache.days.map(day => day.date))
+  const rangeStartStr = toDateString(periodInfo.range.start)
+  const rangeEndStr = toDateString(periodInfo.range.end)
+  // A provider-scoped index deliberately does not rewrite the shared all-
+  // provider durable cache. When that cache has no row for a surviving
+  // historical source, fill the missing date from this same normalized index;
+  // existing durable rows stay authoritative so expired history is preserved.
+  const canFillMissingDates = cache.complete !== true || cache.days.length === 0
+  const normalizedHistoricalDays = canFillMissingDates
+    ? normalizedDays.filter(day =>
+        day.date !== todayStr
+        && day.date >= rangeStartStr
+        && day.date <= rangeEndStr
+        && !cachedDates.has(day.date)
+      )
+    : []
+  const allDays = [...cachedAllDays, ...normalizedHistoricalDays].sort((a, b) => a.date.localeCompare(b.date))
+  const normalizedByDate = new Map(normalizedDays.map(day => [day.date, day]))
+  const days = pf === 'all' ? allDays : allDays.map(day => {
+    if (Object.hasOwn(day.providers, pf)) return sliceDayToProvider(day, pf)
+    const normalized = normalizedByDate.get(day.date)
+    // The shared cache can be complete for a date while lacking this selected
+    // provider's slice (for example, Claude was cached before Codex appeared).
+    // Fill only that absent slice from the provider-scoped normalized index.
+    // An existing slice remains authoritative, retaining carried/expired money
+    // and preventing the surviving source from being counted twice.
+    return normalized && Object.hasOwn(normalized.providers, pf)
+      ? sliceDayToProvider(normalized, pf)
+      : sliceDayToProvider(day, pf)
+  })
+  const data = buildPeriodDataFromDays(days, periodInfo.label)
+
+  // Fields whose durable day rows cannot project under a project filter come
+  // from the same normalized period slice that feeds the visible detail panels.
+  const scan = buildPeriodData(periodInfo.label, scanProjects)
+  data.sessions = Math.max(data.sessions, scan.sessions)
+  if (hasProjectFilter) {
+    data.inputTokens = scan.inputTokens
+    data.outputTokens = scan.outputTokens
+    data.cacheReadTokens = scan.cacheReadTokens
+    data.cacheWriteTokens = scan.cacheWriteTokens
+  }
+
+  return {
+    cost: data.cost,
+    savingsUSD: data.savingsUSD,
+    calls: data.calls,
+    sessions: data.sessions,
+    inputTokens: data.inputTokens,
+    outputTokens: data.outputTokens,
+    cacheReadTokens: data.cacheReadTokens,
+    cacheWriteTokens: data.cacheWriteTokens,
+    carriedCostUSD: days.reduce((sum, day) => sum + (day.carried ? day.cost : 0), 0),
+  }
 }
 
 /// The single durable-totals builder every CLI/TUI surface and the menubar share.

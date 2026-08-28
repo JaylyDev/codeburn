@@ -6,11 +6,11 @@ import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, typ
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost, formatTokens, markEstimated, carriedCostNote } from './format.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
-import { parseAllSessions, filterProjectsByDateRange, filterProjectsByName, setInteractiveScanUI, withSinglePassParse, withColdFirstPaintFloor, filesParsedFromSourceCount } from './parser.js'
-import { isColdCacheOnDisk } from './session-cache.js'
+import { parseAllSessions, filterProjectsByDateRange, filterProjectsByName, setInteractiveScanUI, withSinglePassParse, withColdFirstPaintFloor, filesParsedFromSourceCount, isCompleteSessionSnapshotAvailable } from './parser.js'
 import { findUnpricedModels, isExpectedFreeModel, loadPricing } from './models.js'
 import { aggregateModelTotals } from './model-breakdown.js'
-import { buildDurablePeriod } from './usage-aggregator.js'
+import { buildDurableOverviewFromNormalizedIndex, buildDurablePeriod, hydrateDailyCacheFromNormalizedProjects } from './usage-aggregator.js'
+import { loadDailyCache, type DailyCache } from './daily-cache.js'
 import { getAllProviders } from './providers/index.js'
 import { classHeaderLine, classTotals, findingBasis, findingClass, scanAndDetect, type FindingClass, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
 import { appliedFixGlyph, formatAppliedFix, type AppliedFix } from './act/types.js'
@@ -32,9 +32,13 @@ export type DailyActivityRow = {
   calls: number
 }
 
+type DashboardIndexPhase = Period | 'cached' | 'refreshing'
+
 export const DAILY_ACTIVITY_PAGE_SIZE = 10
 export const INDEX_PROGRESS_TICK_MS = 1000
-export const INTERACTIVE_RENDER_OPTIONS = { alternateScreen: true } as const
+export const BACKGROUND_INDEX_INPUT_GRACE_MS = 2000
+export const LARGE_HISTORY_FILE_THRESHOLD = 1000
+export const INTERACTIVE_RENDER_OPTIONS = { alternateScreen: true, interactive: true } as const
 export const RESIZE_DEBOUNCE_MS = 150
 const CLEAR_ALTERNATE_SCREEN = '\u001B[2J\u001B[H'
 
@@ -1535,7 +1539,7 @@ function ScrollableViewport({ children, width, lineScroll = true }: { children: 
   )
 }
 
-export function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, initialPeriod, initialProvider, initialPlanUsages, initialDurable, refreshSeconds, projectFilter, excludeFilter, customRange, customRangeLabel, initialDay, windowColumns, initialIndexPendingFiles }: {
+export function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, initialPeriod, initialProvider, initialPlanUsages, initialDurable, refreshSeconds, projectFilter, excludeFilter, customRange, customRangeLabel, initialDay, windowColumns, initialIndexPendingFiles, initialHistoryIndexing = false, initialCacheWasCold = false, initialHistoryIndex, autoFallbackFromEmptyToday = false, terminateProcess }: {
   initialProjects: ProjectSummary[]
   initialDailyHistoryProjects?: ProjectSummary[]
   initialPeriod: Period
@@ -1549,9 +1553,16 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   customRangeLabel?: string
   initialDay?: string
   windowColumns: number
-  /// Files the cold first paint deferred (#1107). Non-zero means the numbers on
-  /// screen cover only what is indexed so far, and a background fill is owed.
+  /// Files the Today-first paint deferred. Non-zero means older periods still
+  /// need the background index before they can be selected truthfully.
   initialIndexPendingFiles?: number
+  initialHistoryIndexing?: boolean
+  initialCacheWasCold?: boolean
+  initialHistoryIndex?: DashboardHistoryIndex
+  autoFallbackFromEmptyToday?: boolean
+  /// CLI-only hard stop after Ink has been asked to restore the terminal.
+  /// Component tests and embedders omit it and receive ordinary Ink exit.
+  terminateProcess?: () => void
 }) {
   const { exit } = useApp()
   const [period, setPeriod] = useState<Period>(initialPeriod)
@@ -1577,8 +1588,16 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   // whole set rotates through without demanding attention.
   const [noteTick, setNoteTick] = useState(0)
   const indexPendingFiles = initialIndexPendingFiles ?? 0
-  const [indexing, setIndexing] = useState(indexPendingFiles > 0)
+  const [indexing, setIndexing] = useState(
+    (initialHistoryIndexing || indexPendingFiles > 0)
+    && (initialHistoryIndex == null || !dashboardIndexSupportsPeriod(initialHistoryIndex, 'lifetime')),
+  )
   const [indexedFiles, setIndexedFiles] = useState(0)
+  const [indexCold, setIndexCold] = useState(initialCacheWasCold)
+  const [indexPhase, setIndexPhase] = useState<DashboardIndexPhase>(initialCacheWasCold ? 'week' : 'cached')
+  const historyIndexRef = useRef<DashboardHistoryIndex | null>(initialHistoryIndex ?? null)
+  const autoFallbackAppliedRef = useRef(false)
+  const quitArmedRef = useRef(false)
   // #1143: first q during the cold-start fill arms a confirmation so the user
   // sees feedback instead of a silent ~16.5s drain. The second q (or any
   // Ctrl+C) takes the abrupt path; #1109 already made abrupt exit kill-safe.
@@ -1610,6 +1629,12 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   const compareAvailable = modelCount >= 2
   const viewRef = useRef(view)
   viewRef.current = view
+  const periodRef = useRef(period)
+  periodRef.current = period
+  const providerRef = useRef(activeProvider)
+  providerRef.current = activeProvider
+  const dayRef = useRef(dayDate)
+  dayRef.current = dayDate
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const reloadGenerationRef = useRef(0)
   const reloadInFlightRef = useRef(false)
@@ -1625,6 +1650,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   }, [coachingNotes.length])
 
   useEffect(() => {
+    if (indexing) return
     let cancelled = false
     async function detect() {
       const found: string[] = []
@@ -1633,7 +1659,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
     }
     detect()
     return () => { cancelled = true }
-  }, [])
+  }, [indexing])
 
   useEffect(() => {
     let cancelled = false
@@ -1745,38 +1771,144 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
     }
   }, [optimizeAvailable, projects, currentRange, optimizeLoading, optimizeResult, activeProvider])
 
+  // Warm launch: load the complete normalized snapshot once, make every tab
+  // available, then reconcile sources exactly once and atomically replace it.
+  // Cold launch: widen through the user-visible readiness order; cached files
+  // from an earlier phase are never parsed from source again.
+  useEffect(() => {
+    if (!initialHistoryIndexing || initialHistoryIndex || isCustomRange || isDayMode) return
+    let cancelled = false
+    const provider = activeProvider
+    const parsedBefore = filesParsedFromSourceCount()
+    const progressId = setInterval(() => setIndexedFiles(filesParsedFromSourceCount() - parsedBefore), INDEX_PROGRESS_TICK_MS)
+
+    const publish = async (index: DashboardHistoryIndex): Promise<void> => {
+      if (cancelled || providerRef.current !== index.provider) return
+      historyIndexRef.current = index
+      setDailyHistoryProjects(filterProjectsByName(index.normalizedProjects, projectFilter, excludeFilter))
+      let target = periodRef.current
+      if (shouldAutoFallbackToWeek(
+        autoFallbackFromEmptyToday,
+        autoFallbackAppliedRef.current,
+        target,
+        index,
+        initialProjects,
+      )) {
+        autoFallbackAppliedRef.current = true
+        target = 'week'
+        setPeriod('week')
+      }
+      if (dayRef.current == null && dashboardIndexSupportsPeriod(index, target)) {
+        const selected = selectDashboardHistoryIndex(index, target)
+        setProjects(selected.projects)
+        setDurable(selected.durable)
+        setLoading(false)
+      }
+      if (index.planUsages.length > 0) setPlanUsages(index.planUsages)
+      await nextTick()
+    }
+
+    const run = async (): Promise<void> => {
+      // Let Ink flush the truthful Today frame before any cache expansion or
+      // provider discovery can compete for the event loop, and leave a short
+      // window for immediate q/q input before synchronous provider discovery.
+      await nextTick()
+      await new Promise<void>(resolve => setTimeout(resolve, BACKGROUND_INDEX_INPUT_GRACE_MS))
+      if (cancelled) return
+      const snapshotAvailable = await isCompleteSessionSnapshotAvailable(getPeriodRange('today'), provider)
+      if (cancelled) return
+      setIndexCold(!snapshotAvailable)
+      setIndexing(true)
+      setIndexedFiles(0)
+
+      if (snapshotAvailable) {
+        setIndexPhase('cached')
+        await publish(await buildDashboardHistoryIndex(provider, projectFilter, excludeFilter, {
+          readyThrough: 'lifetime',
+          preferCompleteSnapshot: true,
+        }))
+        if (cancelled) return
+        setIndexPhase('refreshing')
+        await publish(await buildDashboardHistoryIndex(provider, projectFilter, excludeFilter))
+      } else {
+        for (const readyThrough of DASHBOARD_COLD_INDEX_PHASES) {
+          if (cancelled) return
+          setIndexPhase(readyThrough)
+          await publish(await buildDashboardHistoryIndex(provider, projectFilter, excludeFilter, {
+            readyThrough,
+            progressiveSource: true,
+          }))
+        }
+      }
+    }
+
+    void run().catch(error => {
+      if (!cancelled) console.error(error)
+    }).finally(() => {
+      clearInterval(progressId)
+      if (!cancelled) setIndexing(false)
+    })
+    return () => {
+      cancelled = true
+      clearInterval(progressId)
+    }
+  }, [activeProvider, autoFallbackFromEmptyToday, customRange, excludeFilter, initialHistoryIndex, initialHistoryIndexing, initialProjects, isCustomRange, isDayMode, projectFilter])
+
   useEffect(() => {
     const refreshIntervalMs = getRefreshIntervalMs(refreshSeconds ?? 0)
-    if (refreshIntervalMs === 0) return
+    if (refreshIntervalMs === 0 || indexing) return
     if (view !== 'dashboard') return
     if (!dayDate && isHeavyPeriod(period)) return
-    const id = setInterval(() => { void reloadData(period, activeProvider, dayDate, true) }, refreshIntervalMs)
+    const id = setInterval(() => {
+      const index = historyIndexRef.current
+      if (!dayDate && index?.provider === activeProvider && dashboardIndexSupportsPeriod(index, 'lifetime')) {
+        void buildDashboardHistoryIndex(activeProvider, projectFilter, excludeFilter).then(refreshed => {
+          if (providerRef.current !== refreshed.provider || dayRef.current != null) return
+          historyIndexRef.current = refreshed
+          const selected = selectDashboardHistoryIndex(refreshed, periodRef.current)
+          setDailyHistoryProjects(filterProjectsByName(refreshed.normalizedProjects, projectFilter, excludeFilter))
+          setProjects(selected.projects)
+          setDurable(selected.durable)
+          setPlanUsages(refreshed.planUsages)
+          setOptimizeResult(null)
+        }).catch(console.error)
+        return
+      }
+      void reloadData(period, activeProvider, dayDate, true)
+    }, refreshIntervalMs)
     return () => clearInterval(id)
-  }, [refreshSeconds, period, activeProvider, dayDate, reloadData, view])
-
-  // Background fill for the progressive cold start. The first paint deliberately
-  // skipped every file too old to show in the selected period; this is the pass
-  // that indexes them, and it is an ordinary unscoped reload, so what it writes
-  // to the caches — and what it puts back on screen — is exactly what a full
-  // cold parse would have produced. Mount-only: one fill per launch.
-  useEffect(() => {
-    if (indexPendingFiles === 0) return
-    const parsedBefore = filesParsedFromSourceCount()
-    const id = setInterval(() => setIndexedFiles(filesParsedFromSourceCount() - parsedBefore), INDEX_PROGRESS_TICK_MS)
-    void reloadData(initialPeriod, initialProvider, initialDay ?? null, true).finally(() => {
-      clearInterval(id)
-      setIndexing(false)
-    })
-    return () => clearInterval(id)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [refreshSeconds, indexing, view, dayDate, period, activeProvider, projectFilter, excludeFilter, reloadData])
 
   useEffect(() => {
-    if (!indexing && quitArmed) setQuitArmed(false)
+    if (!indexing && quitArmed) {
+      quitArmedRef.current = false
+      setQuitArmed(false)
+    }
   }, [indexing, quitArmed])
+
+  const selectIndexedPeriod = useCallback((np: Period): boolean => {
+    const index = historyIndexRef.current
+    if (!index || index.provider !== activeProvider || !dashboardIndexSupportsPeriod(index, np)) return false
+    // Indexed selection publishes synchronously, so it must also supersede any
+    // async day/period reload already in flight. Otherwise that older request
+    // can pass its generation checks later and paint day-only data under this
+    // newly selected period label.
+    reloadGenerationRef.current++
+    pendingReloadRef.current = null
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    const selected = selectDashboardHistoryIndex(index, np)
+    setPeriod(np)
+    setDailyHistoryCursor(0)
+    setDayDate(null)
+    setProjects(selected.projects)
+    setDurable(selected.durable)
+    setLoading(false)
+    return true
+  }, [activeProvider])
 
   const switchPeriod = useCallback((np: Period) => {
     if (np === period && !dayDate) return
+    if (selectIndexedPeriod(np)) return
     // Clear projects + flip loading synchronously so the dashboard never
     // renders the new period label over the old period's numbers between
     // setPeriod() and the reloadData() promise resolving. Without this,
@@ -1786,21 +1918,26 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
     setDailyHistoryCursor(0)
     setDayDate(null)
     setProjects([])
+    setDurable(undefined)
     setLoading(true)
     if (debounceRef.current) clearTimeout(debounceRef.current)
+    if (indexing) return
     debounceRef.current = setTimeout(() => { reloadData(np, activeProvider, null) }, 600)
-  }, [period, activeProvider, dayDate, reloadData])
+  }, [period, activeProvider, dayDate, reloadData, selectIndexedPeriod, indexing])
 
   const switchPeriodImmediate = useCallback(async (np: Period) => {
     if (np === period && !dayDate) return
+    if (selectIndexedPeriod(np)) return
     setPeriod(np)
     setDailyHistoryCursor(0)
     setDayDate(null)
     setProjects([])
+    setDurable(undefined)
     setLoading(true)
     if (debounceRef.current) clearTimeout(debounceRef.current)
+    if (indexing) return
     await reloadData(np, activeProvider, null)
-  }, [period, activeProvider, dayDate, reloadData])
+  }, [period, activeProvider, dayDate, reloadData, selectIndexedPeriod, indexing])
 
   const switchDay = useCallback(async (nextDay: string) => {
     const today = parseDayFlag('today')!.day
@@ -1821,20 +1958,27 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   }, [switchDay])
 
   useInput((input, key) => {
+    const quitNow = (): void => {
+      exit()
+      terminateProcess?.()
+    }
     // #1143: Ctrl+C always exits immediately, regardless of fill state. The
     // #1109 abrupt path is kill-safe (nothing marked seen without being
     // parsed, resume converges), so this is the unconditional escape hatch.
-    if (key.ctrl && input === 'c') { exit(); return }
+    if (key.ctrl && input === 'c') { quitNow(); return }
     // First q during an active fill: arm confirmation, do not exit. The fill
     // keeps running so the next launch starts warm. A second q takes the
     // abrupt path; q with no fill active exits immediately (no flicker).
     if (input === 'q') {
       if (indexing) {
-        if (quitArmed) { exit(); return }
+        // A ref makes two q bytes decisive even when the background scan keeps
+        // React from committing the confirmation state between them.
+        if (quitArmedRef.current) { quitNow(); return }
+        quitArmedRef.current = true
         setQuitArmed(true)
         return
       }
-      exit()
+      quitNow()
       return
     }
     if (input === 'o' && view === 'dashboard' && optimizeAvailable) { void loadOptimizeResult(); return }
@@ -1860,8 +2004,16 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
       const opts = ['all', ...detectedProviders]; const next = opts[(opts.indexOf(activeProvider) + 1) % opts.length]
       setActiveProvider(next); setView('dashboard')
       setDailyHistoryCursor(0)
+      historyIndexRef.current = null
+      setProjects([])
+      setDurable(undefined)
+      setLoading(true)
       if (debounceRef.current) clearTimeout(debounceRef.current)
-      reloadData(period, next, dayDate); return
+      // Custom ranges and day views do not run the progressive history effect,
+      // so provider cycling must always own and finish its reload. Setting the
+      // global indexing flag here stranded --from/--to on a permanent skeleton.
+      void reloadData(period, next, dayDate)
+      return
     }
     // Period switches reload the underlying data. Disable them while the
     // compare view is mounted; the compare view re-aggregates from
@@ -1916,7 +2068,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
         {!isCustomRange && !isDayMode && <PeriodTabs active={period} providerName={activeProvider} showProvider={view !== 'compare' && multipleProviders} />}
         {isDayMode && <DayBanner label={headerLabel} width={dashWidth} />}
         {isCustomRange && <CustomRangeBanner label={headerLabel} width={dashWidth} />}
-        {indexing && <IndexingBanner width={dashWidth} done={indexedFiles} total={indexPendingFiles} />}
+        {indexing && <IndexingBanner width={dashWidth} done={indexedFiles} total={indexPendingFiles} cold={indexCold} phase={indexPhase} visiblePeriod={period} />}
         {view === 'compare'
           ? <Box flexDirection="column" paddingX={2} paddingY={1}>
               <Box flexDirection="column" borderStyle="round" borderColor={ORANGE} paddingX={1}>
@@ -1937,7 +2089,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
         {!isCustomRange && !isDayMode && <PeriodTabs active={period} providerName={activeProvider} showProvider={multipleProviders && view !== 'compare'} />}
         {isDayMode && <DayBanner label={headerLabel} width={dashWidth} />}
         {isCustomRange && <CustomRangeBanner label={headerLabel} width={dashWidth} />}
-        {indexing && <IndexingBanner width={dashWidth} done={indexedFiles} total={indexPendingFiles} />}
+        {indexing && <IndexingBanner width={dashWidth} done={indexedFiles} total={indexPendingFiles} cold={indexCold} phase={indexPhase} visiblePeriod={period} />}
         {view === 'compare'
           ? <CompareView projects={projects} onBack={() => setView('dashboard')} />
           : view === 'optimize' && optimizeResult
@@ -1964,16 +2116,30 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   )
 }
 
-/// Honest partial state while the background fill runs: the panels below show
-/// only what is indexed so far, and every period the fill has not reached yet
-/// (month, 6 months, lifetime) reads short until it lands.
-function IndexingBanner({ width, done, total }: { width: number; done: number; total: number }) {
+/// Honest phase and file-count state while the selected period remains usable
+/// and the shared normalized index widens in the background.
+function IndexingBanner({ width, done, total, cold, phase, visiblePeriod }: { width: number; done: number; total: number; cold: boolean; phase: DashboardIndexPhase; visiblePeriod: Period }) {
+  const largeFirstIndex = cold && total >= LARGE_HISTORY_FILE_THRESHOLD
+  const sharedIndexLabel = phase === 'cached'
+    ? 'loading normalized cache; source refresh pending'
+    : phase === 'refreshing'
+      ? 'cached periods ready; refreshing changed source files'
+      : phase === 'week'
+        ? 'Today ready; loading 7 Days'
+        : `${PERIOD_LABELS[DASHBOARD_COLD_INDEX_PHASES[Math.max(0, DASHBOARD_COLD_INDEX_PHASES.indexOf(phase) - 1)]!]} ready; loading ${PERIOD_LABELS[phase]}`
+  const readyLabel = `${PERIOD_LABELS[visiblePeriod]} visible · shared index: ${sharedIndexLabel}`
+  const count = cold && total > 0
+    ? ` · ${Math.min(done, total)} source files parsed · ${total} deferred at first paint`
+    : ''
   return (
-    <Box width={width} paddingX={1}>
+    <Box width={width} paddingX={1} flexDirection="column">
       <Text wrap="truncate-end">
-        <Text color={ORANGE} bold>indexing </Text>
-        <Text dimColor>history · {Math.min(done, total)}/{total} files · totals below cover what is indexed so far</Text>
+        <Text color={ORANGE} bold>{phase === 'refreshing' ? 'refreshing ' : phase === 'cached' ? 'cached ' : 'indexing '}</Text>
+        <Text dimColor>
+          {readyLabel}{count}
+        </Text>
       </Text>
+      {largeFirstIndex && <Text color={ORANGE}>large first index · may take a few minutes</Text>}
     </Box>
   )
 }
@@ -2043,6 +2209,7 @@ export async function assembleDashboardData(
   initialDay: string | null,
   scrollableDailyHistory: boolean,
   autoFallback = false,
+  includePlanUsages = true,
 ): Promise<{ period: Period; scannedProjects: ProjectSummary[]; filteredProjects: ProjectSummary[]; planUsages: PlanUsage[]; initialDurable: DurableOverview }> {
   const range = getDashboardScanRange(period, customRange, initialDay, scrollableDailyHistory)
   // With the fallback armed the scope must cover the period it can land on too,
@@ -2063,13 +2230,163 @@ export async function assembleDashboardData(
       ? AUTO_FALLBACK_PERIOD
       : period
     const filteredProjects = selectDashboardPeriodProjects(scannedProjects, opened, scrollableDailyHistory)
-    const planUsages = await getPlanUsages()
+    // A Today-scoped progressive pass cannot truthfully compute a monthly plan
+    // window. Keep that panel absent until the lifetime background index lands.
+    const planUsages = includePlanUsages ? await getPlanUsages() : []
     // Durable headline totals for the initial paint (carry-forward cache + today),
     // matching the menubar/report. The interactive tree recomputes this on every
     // period/provider/refresh change; the static one-shot render uses just this.
     const initialDurable = await computeDurableOverview(opened, provider, projectFilter, excludeFilter, customRange, initialDay)
     return { period: opened, scannedProjects, filteredProjects, planUsages, initialDurable }
   })
+}
+
+export type DashboardHistoryIndex = {
+  provider: string
+  normalizedProjects: ProjectSummary[]
+  cache: DailyCache
+  planUsages: PlanUsage[]
+  readyThrough?: Period
+  projectFilter?: string[]
+  excludeFilter?: string[]
+}
+
+export const DASHBOARD_COLD_INDEX_PHASES: Period[] = ['week', '30days', 'month', 'all', 'lifetime']
+
+function dashboardIndexScanRange(readyThrough: Period): DateRange {
+  const range = getPeriodRange(readyThrough)
+  if (readyThrough !== 'month') return range
+  const thirtyDays = getPeriodRange('30days')
+  return {
+    start: new Date(Math.min(range.start.getTime(), thirtyDays.start.getTime())),
+    end: new Date(Math.max(range.end.getTime(), thirtyDays.end.getTime())),
+  }
+}
+
+export function dashboardIndexSupportsPeriod(index: DashboardHistoryIndex, period: Period): boolean {
+  const readyThrough = index.readyThrough ?? 'lifetime'
+  return PERIODS.indexOf(period) <= PERIODS.indexOf(readyThrough)
+}
+
+/** The unset interactive default moves to 7D only when Today is truly all-zero.
+ * A warm lifetime index follows the same rule as a week-ready cold index. */
+export function shouldAutoFallbackToWeek(
+  enabled: boolean,
+  alreadyApplied: boolean,
+  visiblePeriod: Period,
+  index: DashboardHistoryIndex,
+  todayProjects: ProjectSummary[],
+): boolean {
+  const todayHasUsage = todayProjects.some(project => (
+    project.totalApiCalls > 0
+    || project.totalCostUSD !== 0
+    || (project.totalSavingsUSD ?? 0) !== 0
+    || project.sessions.some(session => (
+      session.apiCalls > 0
+      || session.totalCostUSD !== 0
+      || session.totalInputTokens > 0
+      || session.totalOutputTokens > 0
+      || session.totalCacheReadTokens > 0
+      || session.totalCacheWriteTokens > 0
+    ))
+  ))
+  return enabled
+    && !alreadyApplied
+    && visiblePeriod === 'today'
+    && dashboardIndexSupportsPeriod(index, 'week')
+    && !todayHasUsage
+}
+
+type DashboardHistoryIndexBuildOptions = {
+  readyThrough?: Period
+  preferCompleteSnapshot?: boolean
+  progressiveSource?: boolean
+}
+
+/** Build one widening normalized index; cached files are never source-parsed twice. */
+export async function buildDashboardHistoryIndex(
+  provider: string,
+  projectFilter: string[] | undefined,
+  excludeFilter: string[] | undefined,
+  options: DashboardHistoryIndexBuildOptions = {},
+): Promise<DashboardHistoryIndex> {
+  const readyThrough = options.readyThrough ?? 'lifetime'
+  const range = dashboardIndexScanRange(readyThrough)
+  const parse = () => parseAllSessions(range, provider)
+  const normalizedProjects = options.preferCompleteSnapshot || options.progressiveSource
+    ? (await withColdFirstPaintFloor(
+        range.start,
+        parse,
+        false,
+        options.preferCompleteSnapshot === true,
+      )).result
+    : await parse()
+  // The durable cache is all-provider state. Only an all-provider normalized
+  // index can safely advance it; a provider-scoped index reads but never
+  // rewrites that shared history.
+  const cache = provider === 'all'
+    ? await hydrateDailyCacheFromNormalizedProjects(normalizedProjects, readyThrough === 'lifetime')
+    : await loadDailyCache()
+  const planUsages = readyThrough === 'lifetime' && !options.preferCompleteSnapshot ? await getPlanUsages() : []
+  return { provider, normalizedProjects, cache, planUsages, readyThrough, projectFilter, excludeFilter }
+}
+
+/** Pure period projection: no discovery, transcript reads, or parser calls. */
+export function selectDashboardHistoryIndex(
+  index: DashboardHistoryIndex,
+  period: Period,
+): { projects: ProjectSummary[]; durable: DurableOverview } {
+  const filtered = filterProjectsByName(index.normalizedProjects, index.projectFilter, index.excludeFilter)
+  const projects = filterProjectsByDateRange(filtered, getPeriodRange(period))
+  const durable = buildDurableOverviewFromNormalizedIndex(
+    { range: getPeriodRange(period), label: PERIOD_LABELS[period] },
+    index.normalizedProjects,
+    index.cache,
+    { provider: index.provider, project: index.projectFilter, exclude: index.excludeFilter },
+  )
+  return { projects, durable }
+}
+
+/**
+ * Assemble the first interactive frame from only the period it is about to
+ * label. This is intentionally independent of cache coldness: a complete
+ * sharded cache can still contain years of normalized sessions, and loading
+ * that lifetime result before Ink starts is the warm-start regression this
+ * seam prevents.
+ *
+ * The returned deferred count is passed to the mounted dashboard, which owns
+ * the one lifetime background index. If the unset default falls back from an
+ * empty Today to 7 Days, repaint under the wider floor before anything is
+ * shown so the fallback is truthful too.
+ */
+export async function assembleDashboardFirstPaint(
+  period: Period,
+  provider: string,
+  projectFilter: string[] | undefined,
+  excludeFilter: string[] | undefined,
+  customRange: DateRange | null | undefined,
+  initialDay: string | null,
+  autoFallback = false,
+): Promise<{ result: Awaited<ReturnType<typeof assembleDashboardData>>; deferredFiles: number }> {
+  const run = (p: Period, fallback: boolean) => withColdFirstPaintFloor(
+    getPeriodRange(p).start,
+    () => assembleDashboardData(
+      p,
+      provider,
+      projectFilter,
+      excludeFilter,
+      customRange,
+      initialDay,
+      false,
+      fallback,
+      false,
+    ),
+    true,
+    true,
+  )
+  let paint = await run(period, autoFallback)
+  if (paint.result.period !== period) paint = await run(paint.result.period, false)
+  return paint
 }
 
 /// Where the unset interactive default lands when today has no sessions yet (#1111).
@@ -2081,49 +2398,61 @@ export async function renderDashboard(period: Period = 'week', provider: string 
   // lifetime (initial scan and every enabled auto-refresh, including the
   // getPlanUsages → parseAllSessions path). Plain CLI commands are unaffected.
   setInteractiveScanUI()
+  const startupStarted = performance.now()
   await loadPricing()
+  if (process.env['CODEBURN_VERBOSE'] === '1') process.stderr.write(`codeburn: startup timing pricing=${(performance.now() - startupStarted).toFixed(1)}ms\n`)
   const dayRange = initialDay ? getDayRange(initialDay) : null
   const isTTY = Boolean(process.stdin.isTTY && process.stdout.isTTY)
   const scrollableDailyHistory = isTTY && dayRange == null && customRange == null
-  const range = getDashboardScanRange(period, customRange, initialDay ?? null, scrollableDailyHistory)
-  // Progressive cold start (#1107): the first paint of the standard dated view
-  // only needs the files that can hold data the selected period displays, so on
-  // a cold cache it parses those first and hands the rest to a background fill
-  // once the dashboard is on screen. Interactive only — every one-shot output
+  // Progressive interactive start: the first paint of the standard dated view
+  // only needs the selected period, regardless of whether the normalized cache
+  // is cold or complete. Older history is handed to one background index once
+  // the dashboard is on screen. Interactive only — every one-shot output
   // (json/csv/markdown, report, sessions, the app and menubar payloads) keeps
   // the full parse and can never return a partial total.
-  const progressive = isTTY && dayRange == null && customRange == null && await isColdCacheOnDisk()
+  const progressive = isTTY && dayRange == null && customRange == null
+  const snapshotAvailable = progressive
+    ? await isCompleteSessionSnapshotAvailable(getPeriodRange('today'), provider)
+    : false
+  const cacheWasCold = progressive && !snapshotAvailable
   // #1111: with no explicit period the interactive dashboard opens on Today and
   // falls back to 7 days only when today holds nothing yet. Explicit -p/--day/
   // --from/--to and the non-interactive render keep the 7-day default.
   const auto = autoPeriod && isTTY && dayRange == null && customRange == null
   const openPeriod: Period = auto ? 'today' : period
-  const runPaint = async (p: Period, fallback: boolean) => {
-    const assemble = () =>
-      assembleDashboardData(p, provider, projectFilter, excludeFilter, customRange, initialDay ?? null, scrollableDailyHistory, fallback)
-    return progressive
-      ? await withColdFirstPaintFloor(getPeriodRange(p).start, assemble)
-      : { result: await assemble(), deferredFiles: 0 }
-  }
-  let paint = await runPaint(openPeriod, auto)
-  // A cold first paint is floored to the files its period needs, so a fallback
-  // decided under the Today floor would paint 7 days off today's files alone.
-  // Repaint it on the 7-day floor instead — pass one's files are in the cache
-  // it just wrote, so they are served rather than parsed again.
-  if (progressive && paint.result.period !== openPeriod) paint = await runPaint(paint.result.period, false)
+  const paint = progressive
+    ? await assembleDashboardFirstPaint(openPeriod, provider, projectFilter, excludeFilter, customRange, initialDay ?? null, false)
+    : {
+        result: await assembleDashboardData(openPeriod, provider, projectFilter, excludeFilter, customRange, initialDay ?? null, scrollableDailyHistory, auto),
+        deferredFiles: 0,
+      }
   if (process.env['CODEBURN_VERBOSE'] === '1') {
-    process.stderr.write(`codeburn: progressive cold start ${progressive ? 'on' : 'off'}, ${paint.deferredFiles} files deferred to the background fill\n`)
+    process.stderr.write(`codeburn: startup timing pre-ink=${(performance.now() - startupStarted).toFixed(1)}ms\n`)
+    process.stderr.write(`codeburn: progressive startup ${progressive ? 'on' : 'off'}, ${paint.deferredFiles} files deferred to the background index\n`)
   }
   const { period: opened, scannedProjects, filteredProjects, planUsages, initialDurable } = paint.result
   const label = initialDay ? formatDayRangeLabel(initialDay) : customRangeLabel
   patchStdoutForWindows()
   if (isTTY) {
+    let lastQuitByteAt = 0
+    const hardQuitGuard = (chunk: string | Buffer): void => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      for (const byte of bytes) {
+        if (byte === 3) setImmediate(() => process.exit(0))
+        if (byte !== 113) continue
+        const now = Date.now()
+        if (now - lastQuitByteAt <= 2000) setImmediate(() => process.exit(0))
+        lastQuitByteAt = now
+      }
+    }
+    process.stdin.on('data', hardQuitGuard)
     const app = renderDebouncedInteractive(process.stdout, ({ columns }) => (
-      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={opened} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={columns} initialIndexPendingFiles={paint.deferredFiles} />
+      <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={opened} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={columns} initialIndexPendingFiles={paint.deferredFiles} initialHistoryIndexing={progressive} initialCacheWasCold={cacheWasCold} autoFallbackFromEmptyToday={auto} terminateProcess={() => { setImmediate(() => process.exit(0)) }} />
     ))
     try {
       await app.waitUntilExit()
     } finally {
+      process.stdin.off('data', hardQuitGuard)
       app.dispose()
     }
   } else {

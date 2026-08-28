@@ -1448,7 +1448,13 @@ async function fingerprintSqliteFile(dbPath: string): Promise<FileFingerprint | 
   }
 }
 
+let fingerprintCalls = 0
+export function fingerprintFileCount(): number {
+  return fingerprintCalls
+}
+
 export async function fingerprintFile(filePath: string): Promise<FileFingerprint | null> {
+  fingerprintCalls++
   try {
     const s = await stat(filePath)
     // A source path that IS a SQLite database (copilot OTel's agent-traces.db)
