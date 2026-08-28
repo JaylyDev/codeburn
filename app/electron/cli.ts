@@ -542,6 +542,15 @@ class ServeClient {
     const onGone = () => this.onDeath(child)
     child.on('exit', onGone)
     child.on('error', onGone)
+    // A serve process can outlive its stdin (for example across an app upgrade
+    // or an interrupted shutdown). Writing to that closed pipe emits `EPIPE`
+    // on the stdin stream; without a listener Node promotes it to an uncaught
+    // main-process exception before the write callback can reject the request.
+    child.stdin!.on('error', () => {
+      if (this.child !== child) return
+      this.onDeath(child)
+      killGracefully(child)
+    })
   }
 
   private onData(child: ReturnType<typeof spawn>, chunk: string): void {

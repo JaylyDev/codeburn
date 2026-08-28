@@ -728,6 +728,35 @@ describe('resident serve single-flight', () => {
     expect(readMaybe(oneShotsFile)).toBe('o')
   })
 
+  it('falls back instead of crashing when a live resident closes its stdin', async () => {
+    const stdinClosedFile = join(dir, 'resident-stdin-closed')
+    fakeBin(
+      'closes-stdin-resident.js',
+      `const fs = require('node:fs'); const readline = require('node:readline');
+       if (process.argv[2] === 'serve') {
+         const rl = readline.createInterface({ input: process.stdin });
+         rl.once('line', line => {
+           const request = JSON.parse(line);
+           process.stdout.write(JSON.stringify({ id: request.id, ok: true, output: JSON.stringify({ via: 'serve' }) }) + '\\n', () => {
+             rl.close();
+             fs.closeSync(0);
+             fs.writeFileSync(${JSON.stringify(stdinClosedFile)}, 'closed');
+           });
+         });
+         setInterval(() => {}, 1000);
+       } else {
+         process.stdout.write(JSON.stringify({ via: 'spawn' }));
+       }`,
+    )
+    startServe()
+
+    await expect(spawnCli(['status', '--warm'], { timeoutMs: 5_000 }))
+      .resolves.toEqual({ via: 'serve' })
+    await waitFor(() => readMaybe(stdinClosedFile) === 'closed')
+    await expect(spawnCli(['models', '--after-stdin-close'], { timeoutMs: 5_000 }))
+      .resolves.toEqual({ via: 'spawn' })
+  })
+
   it('gives the first resident status request the power-user cold timeout floor', async () => {
     fakeBin(
       'slow-cold-resident.js',
