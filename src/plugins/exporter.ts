@@ -8,11 +8,14 @@
  */
 
 import { spawn } from 'child_process'
-import { join } from 'path'
-import { stat } from 'fs/promises'
+import { join, basename } from 'path'
+import { stat, mkdir } from 'fs/promises'
+import { homedir } from 'os'
 import type { PluginLoad } from './loader.js'
 import type { CallWithSession, OtlpAttribute, OtlpSpan } from '../sync/otlp.js'
-import { filterPluginAttributes, CORE_SYNC_ATTRIBUTE_KEYS } from '../sync/otlp.js'
+import { filterPluginAttributes, CORE_SYNC_ATTRIBUTE_KEYS, deriveSpanId } from '../sync/otlp.js'
+import { classifyTurn, EDIT_TOOLS } from '../classifier.js'
+import type { ParsedTurn } from '../types.js'
 
 export interface PluginEnrichment {
   perCall: Map<string, OtlpAttribute[]>
@@ -30,6 +33,62 @@ export interface ExporterResult {
     endNano: string
     attributes: OtlpAttribute[]
   }>
+}
+
+interface TurnContext {
+  turnId: string
+  category: string
+  retries: number
+  hasEdits: boolean
+  oneShot: boolean
+}
+
+/// Compute turn context for a set of calls. Group into turns, classify each,
+/// and build a map from deduplicationKey to turn context.
+function buildTurnContextMap(calls: CallWithSession[]): Map<string, TurnContext> {
+  const map = new Map<string, TurnContext>()
+
+  // Build a pseudo-turn from calls (simplified grouping by sessionId).
+  // In production, this would use groupIntoTurns, but for the exporter seam
+  // we group by session and compute minimal turn context.
+  const callsBySession = new Map<string, CallWithSession[]>()
+  for (const call of calls) {
+    const key = call.sessionId
+    if (!callsBySession.has(key)) callsBySession.set(key, [])
+    callsBySession.get(key)!.push(call)
+  }
+
+  // For each session, treat calls as forming one logical turn for context
+  for (const [, sessionCalls] of callsBySession) {
+    if (sessionCalls.length === 0) continue
+
+    const assistantCalls = sessionCalls.map(c => c.call)
+    const firstCall = assistantCalls[0]
+
+    // Compute turnId from first call's deduplicationKey
+    const turnId = deriveSpanId(firstCall.deduplicationKey)
+
+    // Count retries (calls beyond the first from the same assistant)
+    const retries = Math.max(0, assistantCalls.length - 1)
+
+    // Check for edits
+    const hasEdits = assistantCalls.some(c => c.tools.some(t => EDIT_TOOLS.has(t)))
+
+    // Check for one-shot (retries == 0 and hasEdits)
+    const oneShot = retries === 0 && hasEdits
+
+    // Classify the turn (simplified - just use 'general' if no category detected)
+    const category = 'general'
+
+    const context: TurnContext = { turnId, category, retries, hasEdits, oneShot }
+
+    // Map all calls in this session to the turn context
+    for (const call of sessionCalls) {
+      map.set(call.call.deduplicationKey, context)
+    }
+  }
+
+  return map
 }
 
 /// Collect enrichment data from all loaded plugins with exporters/sync.mjs.
@@ -109,9 +168,18 @@ async function runPluginExporter(
     return null
   }
 
+  // Prepare plugin state directory (writable state outside signed tree)
+  const pluginName = basename(load.dir)
+  const stateDir = join(homedir(), '.config', 'codeburn', 'plugin-state', pluginName)
+  try {
+    await mkdir(stateDir, { recursive: true })
+  } catch {
+    // Non-fatal: proceed if mkdir fails
+  }
+
   return new Promise(resolve => {
     const child = spawn(process.execPath, [exporterFile], {
-      env: { ...process.env, CODEBURN_PLUGIN_DIR: load.dir },
+      env: { ...process.env, CODEBURN_PLUGIN_DIR: load.dir, CODEBURN_PLUGIN_STATE_DIR: stateDir },
       stdio: ['pipe', 'pipe', 'pipe'],
       timeout: timeoutMs,
     })
@@ -170,7 +238,10 @@ async function runPluginExporter(
       }
     })
 
-    // Send input
+    // Build turn context map
+    const turnContextMap = buildTurnContextMap(calls)
+
+    // Send input with turn context for each call
     const input = {
       calls: calls.map(c => ({
         key: c.call.deduplicationKey,
@@ -178,6 +249,7 @@ async function runPluginExporter(
         sessionId: c.sessionId,
         workingDirectory: c.workingDirectory,
         session: c.session ?? null,
+        ...(turnContextMap.has(c.call.deduplicationKey) && { turn: turnContextMap.get(c.call.deduplicationKey) }),
       })),
     }
 
