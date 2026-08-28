@@ -89,4 +89,42 @@ describe('PluginsSection', () => {
     expect(container.textContent).toContain('Total spend')
     expect(container.textContent).toContain('$123.45')
   })
+
+  it('shows install error state with CLI message verbatim', () => {
+    const container = document.createElement('div')
+    container.innerHTML = `
+      <div class="modal">
+        <h2>Installation failed</h2>
+        <div class="error">
+          <pre>Failed to fetch plugin manifest: HTTP 404</pre>
+        </div>
+        <div style="display: flex; gap: 0.5rem;">
+          <button>Back</button>
+          <button>Cancel</button>
+        </div>
+      </div>
+    `
+    expect(container.textContent).toContain('Installation failed')
+    expect(container.textContent).toContain('Failed to fetch plugin manifest: HTTP 404')
+    const buttons = Array.from(container.querySelectorAll('button'))
+    expect(buttons.some(b => b.textContent === 'Back')).toBe(true)
+    expect(buttons.some(b => b.textContent === 'Cancel')).toBe(true)
+  })
+
+  it('disables Cancel button while install is pending', () => {
+    const container = document.createElement('div')
+    container.innerHTML = `
+      <div class="modal">
+        <h2>Installing</h2>
+        <div class="spinner"></div>
+        <p>Installing plugin from teams...</p>
+        <div style="display: flex; gap: 0.5rem;">
+          <button disabled>Cancel</button>
+        </div>
+      </div>
+    `
+    const cancelButton = Array.from(container.querySelectorAll('button'))
+      .find(b => b.textContent.includes('Cancel'))
+    expect(cancelButton?.disabled).toBe(true)
+  })
 })

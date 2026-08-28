@@ -51,25 +51,30 @@ export function InstallFlowModal({ onClose, onSuccess }: InstallFlowProps) {
     try {
       const pluginSource = source === 'org' ? orgInput.trim() : folderPath!
       const result = await codeburn.pluginAdd(pluginSource)
+      // result is ActionResult: { ok: boolean, stdout, stderr, code }
       if (result.ok) {
         const match = result.stdout.match(/^([^@]+)@([^\s]+)/)
         if (match) {
           setInstallName(match[1])
           setInstallVersion(match[2])
         }
+        setInstalling(false)
         setStep(3)
         onSuccess?.()
       } else {
+        // CLI failed: display stderr verbatim
         const stderr = result.stderr || 'Plugin installation failed'
         if (stderr.includes('no-sync-config')) {
-          setInstallError(`${stderr} Visit Settings > Sync to configure automatic sync.`)
+          setInstallError(`${stderr}\n\nHint: Visit Settings > Sync to configure.`)
         } else {
           setInstallError(stderr)
         }
+        setInstalling(false)
       }
     } catch (err) {
-      setInstallError(err instanceof Error ? err.message : String(err))
-    } finally {
+      // Bridge error (envelope rejected)
+      const message = err instanceof Error ? err.message : String(err)
+      setInstallError(message)
       setInstalling(false)
     }
   }
@@ -154,41 +159,51 @@ export function InstallFlowModal({ onClose, onSuccess }: InstallFlowProps) {
 
           {step === 2 && (
             <>
-              <h2>Installing</h2>
-              <div style={{ marginTop: '2rem', textAlign: 'center' }}>
-                <div style={{ marginBottom: '1.5rem' }}>
-                  <div className={styles.spinner} />
-                </div>
-                <p>Installing plugin from {source === 'org' ? orgInput : folderPath}...</p>
-              </div>
-              {installError && (
-                <div className={styles.error} style={{ marginTop: '1rem' }}>
-                  <strong>Installation error:</strong>
-                  <p>{installError}</p>
+              <h2>{installError ? 'Installation failed' : 'Installing'}</h2>
+              {!installError && (
+                <div style={{ marginTop: '2rem', textAlign: 'center' }}>
+                  <div style={{ marginBottom: '1.5rem' }}>
+                    <div className={styles.spinner} />
+                  </div>
+                  <p>Installing plugin from {source === 'org' ? orgInput : folderPath}...</p>
                 </div>
               )}
-              {!installError && (
-                <div style={{ marginTop: '2rem', display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
-                  <button className="btnp" onClick={onClose} disabled={installing}>
-                    {installing ? 'Installing...' : 'Cancel'}
-                  </button>
-                  {!installing && (
+              {installError && (
+                <div style={{ marginTop: '1.5rem' }}>
+                  <div className={styles.error}>
+                    <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: '0.875rem' }}>
+                      {installError}
+                    </pre>
+                  </div>
+                </div>
+              )}
+              <div style={{ marginTop: '2rem', display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
+                {!installError && !installing && (
+                  <>
+                    <button className="btnp" onClick={onClose}>
+                      Cancel
+                    </button>
                     <button className="btnp btnp-primary" onClick={() => void performInstall()}>
                       Install
                     </button>
-                  )}
-                </div>
-              )}
-              {installError && (
-                <div style={{ marginTop: '2rem', display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
-                  <button className="btnp" onClick={() => setStep(1)}>
-                    Back
+                  </>
+                )}
+                {installing && !installError && (
+                  <button className="btnp" onClick={onClose} disabled>
+                    Cancel
                   </button>
-                  <button className="btnp" onClick={onClose}>
-                    Close
-                  </button>
-                </div>
-              )}
+                )}
+                {installError && (
+                  <>
+                    <button className="btnp" onClick={() => { setStep(1); setInstallError(null) }}>
+                      Back
+                    </button>
+                    <button className="btnp" onClick={onClose}>
+                      Cancel
+                    </button>
+                  </>
+                )}
+              </div>
             </>
           )}
 
