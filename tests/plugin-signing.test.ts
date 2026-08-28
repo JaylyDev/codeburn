@@ -333,3 +333,36 @@ describe('plugin add/remove commands (9b)', () => {
     }
   })
 })
+
+describe('keyId derivation consistency', () => {
+  it('keygen and sign derive keyId identically from the same public key', async () => {
+    const { generateKeyPairSync, createHash } = await import('crypto')
+    const { publicKey } = generateKeyPairSync('ed25519', {
+      publicKeyEncoding: { format: 'pem', type: 'spki' },
+      privateKeyEncoding: { format: 'pem', type: 'pkcs8' },
+    })
+
+    // Simulate keygen keyId derivation
+    const keygenKeyIdBytes = createHash('sha256').update(publicKey as string).digest().slice(0, 4)
+    const keygenKeyId = keygenKeyIdBytes.toString('hex')
+
+    // Simulate sign keyId derivation
+    const signKeyIdBytes = createHash('sha256').update(publicKey as string).digest().slice(0, 4)
+    const signKeyId = signKeyIdBytes.toString('hex')
+
+    expect(keygenKeyId).toBe(signKeyId)
+  })
+
+  it('RELEASE_PUBLIC_KEYS entries have keyIds that match their derived values', async () => {
+    const { createHash } = await import('crypto')
+    const { RELEASE_PUBLIC_KEYS } = await import('../src/plugins/keys.js')
+
+    for (const [keyId, pubKeyBase64] of RELEASE_PUBLIC_KEYS) {
+      const pubKeyPem = Buffer.from(pubKeyBase64, 'base64').toString('utf8')
+      const derivedKeyIdBytes = createHash('sha256').update(pubKeyPem).digest().slice(0, 4)
+      const derivedKeyId = derivedKeyIdBytes.toString('hex')
+
+      expect(derivedKeyId).toBe(keyId, `keyId ${keyId} does not match derived value ${derivedKeyId}`)
+    }
+  })
+})

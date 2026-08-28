@@ -42,9 +42,10 @@ async function handleKeygen() {
   // Base64 encode the PEM public key for storage
   const pubKeyBase64 = Buffer.from(publicKeyPem).toString('base64')
 
-  // Generate keyId as 8 hex chars from random bytes
-  const keyIdBytes = randomBytes(4)
-  const keyId = keyIdBytes.toString('hex').substring(0, 8)
+  // Derive keyId the same way sign does: sha256 of PEM, first 4 bytes hex
+  const { createHash } = await import('crypto')
+  const keyIdBytes = createHash('sha256').update(publicKeyPem).digest().slice(0, 4)
+  const keyId = keyIdBytes.toString('hex')
 
   // Write private key PEM to file
   await writeFile(outFile, privateKeyPem, 'utf8')
