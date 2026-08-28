@@ -115,8 +115,14 @@ export async function collectPluginEnrichment(
     const declaredAttrs = new Set(manifest.capabilities.syncAttributes.map(a => a.key))
     const declaredKinds = new Set(manifest.capabilities.spanKinds)
 
-    // Process per-call attributes
-    for (const [key, attrs] of Object.entries(result.perCall)) {
+    // Bounded already by the 8MB stdout cap, but do not iterate a perCall
+    // object far larger than the batch: attributes for keys that match no call
+    // are dropped anyway (attached only to matching spans downstream).
+    const perCallEntries = Object.entries(result.perCall)
+    if (perCallEntries.length > calls.length * 4 + 16) {
+      process.stderr.write(`plugin "${load.manifest.name}": exporter returned more per-call entries than calls; ignoring the surplus\n`)
+    }
+    for (const [key, attrs] of perCallEntries.slice(0, calls.length * 4 + 16)) {
       const guarded = filterPluginAttributes(attrs, declaredAttrs)
       if (guarded.length > 0) {
         // Merge with existing attrs for this key (multiple plugins may contribute)

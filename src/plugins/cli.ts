@@ -237,7 +237,7 @@ async function copyPluginTree(sourceDir: string, destDir: string): Promise<void>
 
 /// Validate tarball entries to prevent directory traversal attacks.
 /// Lists all entries and rejects if any: starts with /, contains .., starts with ~, or contains \.
-async function validateTarEntries(tarFile: string): Promise<void> {
+export async function validateTarEntries(tarFile: string): Promise<void> {
   return new Promise((resolve, reject) => {
     let output = ''
     const child = spawn('tar', ['-tzf', tarFile])
@@ -275,7 +275,26 @@ async function validateTarEntries(tarFile: string): Promise<void> {
           return
         }
       }
-      resolve()
+      // Name checks above are blind to entry TYPE: `tar -tzf` prints a symlink
+      // as a bare name, hiding its "-> target". A symlink (or hardlink, device,
+      // fifo) can escape the extraction dir before verifyPlugin's post-extract
+      // symlink check runs, on platforms whose tar follows links mid-archive.
+      // Reject by type flag, which every tar puts at column 0 of a verbose list.
+      const verbose = spawn('tar', ['-tvzf', tarFile])
+      let vout = ''
+      verbose.on('error', reject)
+      if (verbose.stdout) verbose.stdout.on('data', c => { vout += c.toString('utf8') })
+      verbose.on('exit', vcode => {
+        if (vcode !== 0) { reject(new Error(`Failed to list tarball types (exit code ${vcode})`)); return }
+        for (const line of vout.trim().split('\n').filter(Boolean)) {
+          const typeFlag = line[0]
+          if (typeFlag !== '-' && typeFlag !== 'd') {
+            reject(new Error(`Tarball contains a non-regular entry (type "${typeFlag}"); only files and directories are allowed`))
+            return
+          }
+        }
+        resolve()
+      })
     })
   })
 }
