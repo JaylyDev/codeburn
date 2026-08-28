@@ -22,7 +22,7 @@ import { CompareView } from './compare.js'
 import { getPlanUsages, type PlanUsage } from './plan-usage.js'
 import { planDisplayName } from './plans.js'
 import { formatDayRangeLabel, getDateRange, parseDayFlag, PERIODS, PERIOD_LABELS, shiftDay, type Period } from './cli-date.js'
-import { patchStdoutForWindows } from './ink-win.js'
+import { BSU, patchStdoutForWindows } from './ink-win.js'
 
 type View = 'dashboard' | 'optimize' | 'compare'
 
@@ -36,11 +36,16 @@ export const DAILY_ACTIVITY_PAGE_SIZE = 10
 export const INDEX_PROGRESS_TICK_MS = 1000
 export const INTERACTIVE_RENDER_OPTIONS = { alternateScreen: true } as const
 export const RESIZE_DEBOUNCE_MS = 150
+const CLEAR_ALTERNATE_SCREEN = '\u001B[2J\u001B[H'
 
 export type TerminalSize = { columns: number; rows: number }
+type AlternateScreenClearHandle = {
+  cancel(): void
+}
 export type DebouncedResizeStream = NodeJS.WriteStream & {
   dispose(): void
   onSettledResize(listener: (size: TerminalSize) => void): () => void
+  armAlternateScreenClear(): AlternateScreenClearHandle
 }
 
 function normalizeTerminalDimension(value: number | undefined, fallback: number): number {
@@ -62,6 +67,7 @@ export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs:
   let resizeTimer: ReturnType<typeof setTimeout> | undefined
   let disposed = false
   let { columns, rows } = terminalSizeOf(source)
+  let alternateScreenClear: { token: symbol } | undefined
   const resizeEvents = new EventEmitter()
   const settledResizeListeners = new Set<(size: TerminalSize) => void>()
 
@@ -77,7 +83,7 @@ export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs:
       rows = next.rows
       if (!changed) return
       // Rerender first so the settled view owns the first paint at the new
-      // size; then notify Ink/useWindowSize. Writes are never intercepted, so
+      // size; then notify Ink/useWindowSize. Writes are never suppressed, so
       // a mid-burst state update still reaches the terminal even when net
       // size is unchanged.
       for (const listener of [...settledResizeListeners]) listener(next)
@@ -94,6 +100,7 @@ export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs:
     resizeTimer = undefined
     resizeEvents.removeAllListeners()
     settledResizeListeners.clear()
+    alternateScreenClear = undefined
   }
 
   const stream = new Proxy(source as DebouncedResizeStream, {
@@ -106,8 +113,32 @@ export function createDebouncedResizeStream(source: NodeJS.WriteStream, delayMs:
           return () => settledResizeListeners.delete(listener)
         }
       }
+      if (property === 'armAlternateScreenClear') {
+        return () => {
+          const token = Symbol('alternate-screen-clear')
+          alternateScreenClear = { token }
+          const cancel = () => {
+            if (alternateScreenClear?.token === token) alternateScreenClear = undefined
+          }
+          return { cancel }
+        }
+      }
       if (property === 'columns') return columns
       if (property === 'rows') return rows
+      if (property === 'write') {
+        return (chunk: unknown, ...args: unknown[]) => {
+          const write = Reflect.get(target, property, target) as (...values: unknown[]) => boolean
+          if (typeof chunk === 'string' && chunk.startsWith(BSU) && alternateScreenClear) {
+            // Ink owns the complete synchronized-output lifecycle. Decorating
+            // every synchronized write until the resize flush settles means an
+            // incidental Ink/console frame cannot steal the reset from the
+            // resized frame. Unsynchronized writes pass through unchanged.
+            const decorated = `${BSU}${CLEAR_ALTERNATE_SCREEN}${chunk.slice(BSU.length)}`
+            return Reflect.apply(write, target, [decorated, ...args])
+          }
+          return Reflect.apply(write, target, [chunk, ...args])
+        }
+      }
       if (RESIZE_LISTENER_METHODS.has(property)) {
         return (event: string | symbol, ...args: unknown[]) => {
           if (event === 'resize') {
@@ -143,6 +174,11 @@ export function renderDebouncedInteractive(
   options: Omit<RenderOptions, 'stdout'> = INTERACTIVE_RENDER_OPTIONS,
 ): DebouncedInteractiveInstance {
   const stdout = createDebouncedResizeStream(source, RESIZE_DEBOUNCE_MS)
+  const isScreenReaderEnabled = options.isScreenReaderEnabled
+    ?? process.env['INK_SCREEN_READER'] === 'true'
+  const clearsAlternateScreenOnResize = options.alternateScreen === true
+    && options.interactive !== false
+    && !isScreenReaderEnabled
   let size = { columns: stdout.columns, rows: stdout.rows }
   let unsubscribe = () => {}
   let disposed = false
@@ -162,8 +198,29 @@ export function renderDebouncedInteractive(
   }
   unsubscribe = stdout.onSettledResize(nextSize => {
     if (disposed) return
+    // A narrow/short frame can scroll or reflow inside the alternate buffer.
+    // Once the terminal grows again, Ink's line-count erase no longer knows
+    // where every physical row from that old frame ended up. Reset the visible
+    // alternate screen during the settled repaint, then let the new frame
+    // paint from a known top-left origin. Screen-reader output intentionally
+    // skips this path because Ink can emit synchronized markers without frame
+    // bytes for an unchanged view; clearing that block would blank the screen.
+    // This keeps #977's single settled rerender while preventing persistent
+    // ghost panels after ordinary alternate-screen reflow.
+    const redraw = clearsAlternateScreenOnResize
+      ? stdout.armAlternateScreenClear()
+      : undefined
     size = nextSize
     app.rerender(dashboard())
+    if (redraw) {
+      // If the output is byte-identical (for example, resizing farther beyond
+      // the dashboard's max width), Ink opens no synchronized repaint and the
+      // clear is cancelled without ever blanking the screen. Ink also owns the
+      // matching ESU for every decorated synchronized write.
+      void app.waitUntilRenderFlush().finally(() => {
+        redraw.cancel()
+      })
+    }
   })
   return Object.assign(app, { dispose, stdout })
 }
