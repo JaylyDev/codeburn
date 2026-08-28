@@ -55,7 +55,7 @@ async function signPlugin(pluginDir: string, keyPem: string, keyId: string) {
     const hash = createHash('sha256').update(content).digest('hex')
     files.push({ path: entry.name, sha256: hash })
   }
-  files.sort((a, b) => a.path.localeCompare(b.path))
+  files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
 
   const canonical = JSON.stringify({ name, version, files })
   const privKey = createPrivateKey(keyPem)
@@ -396,6 +396,45 @@ describe('keyId derivation consistency', () => {
       const derivedKeyId = derivedKeyIdBytes.toString('hex')
 
       expect(derivedKeyId).toBe(keyId, `keyId ${keyId} does not match derived value ${derivedKeyId}`)
+    }
+  })
+})
+
+// Canonicalization portability: the digest must order paths by codepoint,
+// identically on every machine, including mixed-case and non-ASCII names.
+// Drives the REAL sign script so test and production canonicalization can
+// never silently diverge.
+describe('signature canonicalization ordering', () => {
+  it('round-trips a tree with mixed-case and non-ASCII filenames via the real sign script', async () => {
+    const { execFile } = await import('child_process')
+    const { promisify } = await import('util')
+    const { createHash } = await import('crypto')
+    const run = promisify(execFile)
+    const dir = await mkdtemp(join(tmpdir(), 'canon-'))
+    const keyDir = await mkdtemp(join(tmpdir(), 'canon-key-'))
+    try {
+      await writeFile(join(dir, 'codeburn-plugin.json'), JSON.stringify({
+        name: 'canon', version: '0.1.0', cliCompat: '>=0.9.22',
+        capabilities: { commands: [], syncAttributes: [], payloadSections: [], spanKinds: [] },
+      }))
+      await writeFile(join(dir, 'README.md'), 'mixed case name')
+      await writeFile(join(dir, 'caf\u00e9.txt'), 'non ascii name')
+      await mkdir(join(dir, 'commands'), { recursive: true })
+      await writeFile(join(dir, 'commands', 'Zeta.mjs'), 'console.log(1)')
+      const { publicKeyBase64, privateKeyPem } = await generateTestKeyPair()
+      const keyPath = join(keyDir, 'key.pem')
+      await writeFile(keyPath, privateKeyPem)
+      await run(process.execPath, ['scripts/sign-plugin.mjs', 'sign', dir], {
+        env: { ...process.env, CODEBURN_SIGNING_KEY: keyPath },
+      })
+      const publicKeyPem = Buffer.from(publicKeyBase64, 'base64').toString('utf8')
+      const keyId = createHash('sha256').update(publicKeyPem).digest().subarray(0, 4).toString('hex')
+      const manifest = JSON.parse(await readFile(join(dir, 'codeburn-plugin.json'), 'utf8'))
+      const result = await verifyPlugin(dir, manifest, {}, new Map([[keyId, publicKeyBase64]]))
+      expect(result.ok).toBe(true)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+      await rm(keyDir, { recursive: true, force: true })
     }
   })
 })

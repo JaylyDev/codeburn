@@ -133,6 +133,11 @@ async function checkForSymlinks(dir: string): Promise<boolean> {
   return false
 }
 
+/// Codepoint order, never locale order: this list feeds the signed digest,
+/// so canonicalization must be identical on every machine and ICU build.
+/// Loader-side unreadable entries are skipped: the resulting digest mismatch
+/// rejects the plugin, which is the fail-closed direction (the SIGN side
+/// must fail loudly instead - see scripts/sign-plugin.mjs).
 async function getPluginFilesList(
   dir: string,
 ): Promise<Array<{ path: string, sha256: string }>> {
@@ -142,7 +147,7 @@ async function getPluginFilesList(
   async function walk(baseDir: string, relativePath: string) {
     try {
       const entries = await readdir(baseDir, { withFileTypes: true })
-      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      for (const entry of entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
         // Exclude signature file and sections directory (runtime-mutable plugin output)
         if (entry.name === 'codeburn-plugin.sig') continue
         if (entry.name === 'sections') continue
@@ -172,7 +177,7 @@ async function getPluginFilesList(
   } catch {
     return []
   }
-  files.sort((a, b) => a.path.localeCompare(b.path))
+  files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
   return files
 }
 

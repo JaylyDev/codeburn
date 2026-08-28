@@ -109,13 +109,15 @@ async function handleSign() {
   console.log(`Signed ${pluginDir}`)
 }
 
+// Codepoint order, never locale order: this list feeds the signed digest,
+// so canonicalization must be identical on every machine and ICU build.
 async function getFilesList(dir) {
   const files = []
 
   async function walk(baseDir, relativePath) {
     try {
       const entries = await readdir(baseDir, { withFileTypes: true })
-      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      for (const entry of entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
         // Exclude signature file and sections directory (runtime-mutable plugin output)
         if (entry.name === 'codeburn-plugin.sig') continue
         if (entry.name === 'sections') continue
@@ -124,24 +126,27 @@ async function getFilesList(dir) {
         const relPosixPath = relativePath ? `${relativePath}/${entry.name}` : entry.name
 
         if (entry.isFile()) {
+          let content
           try {
-            const content = await readFile(fullPath)
-            const sha256 = await hashSha256(content)
-            files.push({ path: relPosixPath, sha256 })
-          } catch {
-            continue
+            content = await readFile(fullPath)
+          } catch (err) {
+            // Signing over an incomplete file list would produce a valid
+            // signature for a broken plugin. Fail loudly instead.
+            throw new Error(`cannot read ${relPosixPath} while signing: ${err.message}`)
           }
+          const sha256 = await hashSha256(content)
+          files.push({ path: relPosixPath, sha256 })
         } else if (entry.isDirectory()) {
           await walk(fullPath, relPosixPath)
         }
       }
-    } catch {
-      // Silently skip unreadable directories
+    } catch (err) {
+      throw new Error(`cannot read directory while signing: ${err.message}`)
     }
   }
 
   await walk(dir, '')
-  files.sort((a, b) => a.path.localeCompare(b.path))
+  files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
   return files
 }
 
