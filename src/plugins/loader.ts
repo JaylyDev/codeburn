@@ -15,8 +15,10 @@ import { readdir, readFile, stat } from 'fs/promises'
 import { join } from 'path'
 import { homedir } from 'os'
 import { createRequire } from 'module'
+import { verify as cryptoVerify } from 'crypto'
 
 import { checkCliCompat, parsePluginManifest, type PluginManifest } from './manifest.js'
+import { RELEASE_PUBLIC_KEYS } from './keys.js'
 
 /// Resolves from BOTH layouts: src/plugins/loader.ts during tests/tsx and
 /// the flattened dist/main.ts bundle at runtime (tsup keeps one file).
@@ -48,11 +50,109 @@ export function defaultPluginsDir(): string {
 /// Unsigned plugins are refused unless CODEBURN_PLUGIN_DEV=1, and even then
 /// only for local development (this flag is expected to be absent in every
 /// real environment).
-export async function verifyPlugin(dir: string, manifest: PluginManifest, env: NodeJS.ProcessEnv): Promise<{ ok: boolean, reason?: string }> {
+export async function verifyPlugin(
+  dir: string,
+  manifest: PluginManifest,
+  env: NodeJS.ProcessEnv,
+  knownKeys?: ReadonlyMap<string, string>,
+): Promise<{ ok: boolean, reason?: string }> {
   if (env.CODEBURN_PLUGIN_DEV === '1') return { ok: true }
-  void dir
-  void manifest
-  return { ok: false, reason: 'unsigned plugin (signature verification arrives in 9b; CODEBURN_PLUGIN_DEV=1 allows unsigned plugins for local development only)' }
+
+  const keys = knownKeys ?? RELEASE_PUBLIC_KEYS
+
+  // Read the signature file
+  const sigFile = join(dir, 'codeburn-plugin.sig')
+  let sigData: { alg?: string, keyId?: string, signature?: string }
+  try {
+    const content = await readFile(sigFile, 'utf8')
+    sigData = JSON.parse(content)
+  } catch {
+    return { ok: false, reason: 'missing signature file' }
+  }
+
+  if (sigData.alg !== 'ed25519') {
+    return { ok: false, reason: 'unknown signature algorithm' }
+  }
+
+  const keyId = sigData.keyId
+  if (!keyId || typeof keyId !== 'string') {
+    return { ok: false, reason: 'missing key id' }
+  }
+
+  if (!keys.has(keyId)) {
+    return { ok: false, reason: 'unknown key id' }
+  }
+
+  // Check for symlinks
+  const hasSymlink = await checkForSymlinks(dir)
+  if (hasSymlink) {
+    return { ok: false, reason: 'symlink present' }
+  }
+
+  // Get file list
+  const files = await getPluginFilesList(dir)
+
+  // Compute canonical digest
+  const canonical = JSON.stringify({
+    name: manifest.name,
+    version: manifest.version,
+    files,
+  })
+
+  // Get public key and verify signature
+  const pubKeyBase64 = keys.get(keyId)!
+  const pubKeyPem = Buffer.from(pubKeyBase64, 'base64').toString('utf8')
+
+  const signatureBuffer = Buffer.from(sigData.signature ?? '', 'base64')
+  try {
+    const isValid = cryptoVerify(null, Buffer.from(canonical), pubKeyPem, signatureBuffer)
+    if (!isValid) {
+      return { ok: false, reason: 'bad signature' }
+    }
+  } catch {
+    return { ok: false, reason: 'bad signature' }
+  }
+
+  return { ok: true }
+}
+
+async function checkForSymlinks(dir: string): Promise<boolean> {
+  try {
+    const entries = await readdir(dir, { withFileTypes: true })
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name)
+      if (entry.isSymbolicLink()) return true
+    }
+  } catch {
+    return true
+  }
+  return false
+}
+
+async function getPluginFilesList(
+  dir: string,
+): Promise<Array<{ path: string, sha256: string }>> {
+  const { createHash } = await import('crypto')
+  const files: Array<{ path: string, sha256: string }> = []
+  try {
+    const entries = await readdir(dir, { withFileTypes: true })
+    for (const entry of entries) {
+      if (entry.name === 'codeburn-plugin.sig') continue
+      if (!entry.isFile()) continue
+      const fullPath = join(dir, entry.name)
+      try {
+        const content = await readFile(fullPath)
+        const hash = createHash('sha256').update(content).digest('hex')
+        files.push({ path: entry.name, sha256: hash })
+      } catch {
+        continue
+      }
+    }
+  } catch {
+    return []
+  }
+  files.sort((a, b) => a.path.localeCompare(b.path))
+  return files
 }
 
 async function readManifest(dir: string): Promise<{ raw?: unknown, reason?: string }> {
