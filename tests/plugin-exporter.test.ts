@@ -12,6 +12,7 @@ import { tmpdir, homedir } from 'os'
 import type { CallWithSession, OtlpAttribute } from '../src/sync/otlp.js'
 import { buildOtlpPayload, deriveSpanId } from '../src/sync/otlp.js'
 import { collectPluginEnrichment } from '../src/plugins/exporter.js'
+import { loadPlugins } from '../src/plugins/loader.js'
 import type { PluginLoad } from '../src/plugins/loader.js'
 
 function validManifest(name = 'sample') {
