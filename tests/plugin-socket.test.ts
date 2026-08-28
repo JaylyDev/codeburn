@@ -128,6 +128,20 @@ describe('loader: rejection reasons', () => {
     }
   })
 
+  it('rejects a valid but unsigned manifest when CODEBURN_PLUGIN_DEV is absent (deny-by-default)', async () => {
+    const pluginDir = join(tmpDir, 'unsigned')
+    await mkdir(pluginDir, { recursive: true })
+    await writeFile(join(pluginDir, 'codeburn-plugin.json'), JSON.stringify(validManifest('unsigned')))
+    const env = { ...process.env }
+    delete env.CODEBURN_PLUGIN_DEV
+    const loads = await loadPlugins(tmpDir, '0.9.22', env)
+    expect(loads).toHaveLength(1)
+    expect(loads[0]!.status).toBe('rejected')
+    if (loads[0]!.status === 'rejected') {
+      expect(loads[0]!.reason).toMatch(/unsigned/)
+    }
+  })
+
   it('loads a valid manifest with status:"loaded" and parsed shape', async () => {
     const pluginDir = join(tmpDir, 'good')
     await mkdir(pluginDir, { recursive: true })
