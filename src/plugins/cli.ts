@@ -220,6 +220,51 @@ async function copyPluginTree(sourceDir: string, destDir: string): Promise<void>
   await walk(sourceDir, destDir)
 }
 
+/// Validate tarball entries to prevent directory traversal attacks.
+/// Lists all entries and rejects if any: starts with /, contains .., starts with ~, or contains \.
+async function validateTarEntries(tarFile: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let output = ''
+    const child = spawn('tar', ['-tzf', tarFile])
+    child.on('error', reject)
+    if (child.stdout) {
+      child.stdout.on('data', chunk => {
+        output += chunk.toString('utf8')
+      })
+    }
+    child.on('exit', (code) => {
+      if (code !== 0) {
+        reject(new Error(`Failed to list tarball contents (exit code ${code})`))
+        return
+      }
+      const entries = output.trim().split('\n').filter(Boolean)
+      for (const entry of entries) {
+        // Reject absolute paths
+        if (entry.startsWith('/')) {
+          reject(new Error(`Tarball contains absolute path: ${entry}`))
+          return
+        }
+        // Reject .. path traversal
+        if (entry.includes('..')) {
+          reject(new Error(`Tarball contains directory traversal: ${entry}`))
+          return
+        }
+        // Reject home directory expansion
+        if (entry.startsWith('~')) {
+          reject(new Error(`Tarball contains home directory reference: ${entry}`))
+          return
+        }
+        // Reject backslashes (path separator on Windows, escape char)
+        if (entry.includes('\\')) {
+          reject(new Error(`Tarball contains backslash in entry name: ${entry}`))
+          return
+        }
+      }
+      resolve()
+    })
+  })
+}
+
 /// Install from a local path (existing flow).
 async function addLocal(sourcePath: string, pluginsDir: string): Promise<void> {
   await verifyAndInstall(sourcePath, pluginsDir)
@@ -309,6 +354,9 @@ async function addRemote(name: string, pluginsDir: string): Promise<void> {
   try {
     const tarFile = join(tempDir, 'plugin.tar.gz')
     await writeFile(tarFile, bytes)
+
+    // Validate tarball entries before extraction (prevent directory traversal)
+    await validateTarEntries(tarFile)
 
     // Extract tar
     await new Promise<void>((resolve, reject) => {
