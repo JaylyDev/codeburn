@@ -10,7 +10,7 @@ import { SectionSkeleton } from '../components/Skeleton'
 import { StaleBanner } from '../components/StaleBanner'
 import { motionEnabled, useBarGrowIn } from '../lib/motion'
 import { type Polled, usePolled } from '../hooks/usePolled'
-import { formatCompact, formatUsd } from '../lib/format'
+import { formatCompact, formatUsd, formatUsdWithCurrency } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import { contiguousDailyWindow, dataStartKey, formatChartDate, localDateKey, sliceDailyToPeriod, sliceDailyToRange } from '../lib/period'
 import type {
@@ -23,6 +23,7 @@ import type {
   Scope,
   YieldJsonReport,
 } from '../lib/types'
+import type { OverviewHeadlineSnapshot } from '../lib/overviewSnapshot'
 
 export { localDateKey } from '../lib/period'
 
@@ -427,7 +428,7 @@ function streakDays(daily: DailyHistoryEntry[], now: Date): number {
  * changes (a user action), but never on the 30s poll: a value that arrives
  * under the same `animateKey` snaps in place instead of re-animating.
  */
-function CountUp({ value, animateKey }: { value: number; animateKey: string }) {
+function CountUp({ value, animateKey, animate = true }: { value: number; animateKey: string; animate?: boolean }) {
   const ref = useRef<HTMLDivElement>(null)
   const keyRef = useRef<string | null>(null)
 
@@ -436,7 +437,7 @@ function CountUp({ value, animateKey }: { value: number; animateKey: string }) {
     if (!element) return
     const keyChanged = keyRef.current !== animateKey
     keyRef.current = animateKey
-    if (!keyChanged || !motionEnabled()) {
+    if (!animate || !keyChanged || !motionEnabled()) {
       element.textContent = formatUsd(value)
       return
     }
@@ -448,9 +449,9 @@ function CountUp({ value, animateKey }: { value: number; animateKey: string }) {
       onUpdate: () => { element.textContent = formatUsd(counter.n) },
     })
     return () => { tween.kill() }
-  }, [value, animateKey])
+  }, [value, animateKey, animate])
 
-  return <div ref={ref} className="ov-hero-num" data-countup={value}>{formatUsd(value)}</div>
+  return <div ref={ref} className="ov-hero-num" data-countup={value} data-countup-animation={animate ? 'enabled' : 'suppressed'}>{formatUsd(value)}</div>
 }
 
 function formatShortDay(date: string): string {
@@ -534,7 +535,12 @@ function DailyChart({ daily, dataStart = null, animateKey = '' }: { daily: Daily
   const peak = daily[peakIndex]
   const yesterday = daily.at(-2)
   const average = mean(daily.map(day => day.cost))
-  const ticks = daily.filter((_, index) => index % 7 === 0)
+  // Weekly labels work for 30 days, but become unreadable at 6M/Life (26-53
+  // labels). Long ranges use five even intervals plus the newest day.
+  const tickStride = daily.length <= 45 ? 7 : Math.ceil((daily.length - 1) / 5)
+  const tickIndexes = daily.map((_, index) => index).filter(index => index % tickStride === 0)
+  if (daily.length > 45 && tickIndexes.at(-1) !== daily.length - 1) tickIndexes.push(daily.length - 1)
+  const ticks = tickIndexes.map(index => daily[index])
   const [tip, setTip] = useState<{ day: DailyHistoryEntry; x: number; y: number } | null>(null)
   const [tipPosition, setTipPosition] = useState<{ left: number; top: number } | null>(null)
   const tipRef = useRef<HTMLDivElement>(null)
@@ -677,6 +683,7 @@ export function OverviewContent({
   onNavigate,
   ready = true,
   scope = 'local',
+  headlineSnapshot = null,
 }: {
   period: Period
   provider?: string
@@ -685,17 +692,67 @@ export function OverviewContent({
   onNavigate?: (section: 'optimize' | 'sessions') => void
   ready?: boolean
   scope?: Scope
+  headlineSnapshot?: OverviewHeadlineSnapshot | null
 }) {
+  const { data, error } = overview
+  const heroSelectionKey = `${period}|${provider}|${range?.from ?? ''}|${range?.to ?? ''}|${scope}`
+  // Suppress only the single persisted-headline -> live-data handoff. A stored
+  // headline remains available after that handoff, so testing the snapshot prop
+  // directly would disable every later user-triggered period/provider animation.
+  const pendingSnapshotHandoffRef = useRef<string | null>(null)
+  const suppressHeroReplay = pendingSnapshotHandoffRef.current === heroSelectionKey
+  useLayoutEffect(() => {
+    if (!data && headlineSnapshot) {
+      pendingSnapshotHandoffRef.current = heroSelectionKey
+    } else if (data && pendingSnapshotHandoffRef.current === heroSelectionKey) {
+      pendingSnapshotHandoffRef.current = null
+    }
+  }, [data, headlineSnapshot, heroSelectionKey])
   // Gate secondary spawns on the app-level readiness (first overview resolved),
   // so the cold hydration runs once (via overview) rather than 3 parses at once
   // on boot. Defaults true so standalone renders/tests poll normally.
-  const actReport = usePolled<ActReportJson>(() => codeburn.getActReport(), [], { enabled: ready, memoKey: 'overview-act' })
-  const yieldReport = usePolled<YieldJsonReport>(() => codeburn.getYield(period, provider), [period, provider], { enabled: ready, memoKey: `overview-yield|${period}|${provider}` })
-  const { data, error } = overview
+  // A bounded Overview timeout is not permission to fan out more expensive
+  // analysis. On a real heavy corpus the timeout released act/yield, and a user
+  // Refresh then ran another status parse beside yield. Latch that timeout until
+  // real Overview data arrives: refresh() clears the current error while its new
+  // request is pending, which must not accidentally re-open the secondary gate.
+  const [timeoutBlocked, setTimeoutBlocked] = useState(false)
+  useEffect(() => {
+    if (overview.error?.kind === 'timeout') setTimeoutBlocked(true)
+    else if (overview.data != null) setTimeoutBlocked(false)
+  }, [overview.data, overview.error?.kind])
+  const detailsReady = ready && !timeoutBlocked && overview.error?.kind !== 'timeout'
+  const actReport = usePolled<ActReportJson>(() => codeburn.getActReport(), [], { enabled: detailsReady, memoKey: 'overview-act' })
+  const yieldReport = usePolled<YieldJsonReport>(() => codeburn.getYield(period, provider), [period, provider], { enabled: detailsReady, memoKey: `overview-yield|${period}|${provider}` })
   const modelIndex = useMemo(() => data ? buildModelIndex(data) : new Map<string, string>(), [data])
 
   if (!data) {
     if (error) return <CliErrorPanel error={error} subject="your usage" />
+    if (headlineSnapshot) {
+      const generated = new Date(headlineSnapshot.generated)
+      const captured = Number.isNaN(generated.getTime()) ? new Date(headlineSnapshot.capturedAt) : generated
+      const capturedLabel = Number.isNaN(captured.getTime())
+        ? 'earlier'
+        : localDateKey(captured) === localDateKey(new Date())
+          ? `at ${captured.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+          : `${captured.toLocaleDateString([], { month: 'short', day: 'numeric' })} at ${captured.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+      const headlineCost = headlineSnapshot.currency
+        ? formatUsdWithCurrency(headlineSnapshot.cost, headlineSnapshot.currency)
+        : formatUsd(headlineSnapshot.cost)
+      return (
+        <div className="ov-dashboard" aria-label="Cached usage summary">
+          <div className="ov-card ov-hero-split snapshot-hero">
+            <div className="ov-hero-main">
+              <div className="ov-hero-top"><span className="ov-label">{headlineSnapshot.label}</span><span className="ov-streak">exact {capturedLabel}</span></div>
+              <div className="ov-hero-num" data-countup={headlineSnapshot.cost}>{headlineCost}</div>
+              <div className="ov-hero-sub">{headlineSnapshot.calls.toLocaleString('en-US')} calls · sessions updating</div>
+              <p className="ov-widget-caption">Current totals, charts, sessions, and efficiency are refreshing in the background.</p>
+            </div>
+          </div>
+          <SectionSkeleton label="Updating detailed drill-downs…" rows={3} chart />
+        </div>
+      )
+    }
     return <SectionSkeleton label="Scanning sessions…" rows={3} chart />
   }
 
@@ -708,7 +765,7 @@ export function OverviewContent({
   const heroCost = combined ? combined.combined.cost : data.current.cost
   const heroCalls = combined ? combined.combined.calls : data.current.calls
   const heroSessions = combined ? combined.combined.sessions : data.current.sessions
-  const animateKey = `${period}|${provider}|${range?.from ?? ''}|${range?.to ?? ''}|${scope}`
+  const animateKey = heroSelectionKey
   const stats = deriveStats(data, now)
   const periodDaily = sliceDailyToPeriod(data.history.daily, period, now)
   // Daily chart: contiguous zero-filled calendar window. A custom range spans
@@ -744,7 +801,10 @@ export function OverviewContent({
       <div className="ov-card ov-hero-split" aria-label="Key performance indicators">
         <div className="ov-hero-main">
           <div className="ov-hero-top"><span className="ov-label">{combined ? `Combined · ${data.current.label}` : data.current.label}</span><span className="ov-streak"><b>{streakDays(data.history.daily, now)}</b>-day streak</span></div>
-          <CountUp value={heroCost} animateKey={animateKey} />
+          {/* A returning launch already showed a truthful persisted headline.
+              Replaying the live hero from $0 on handoff makes that exact value
+              appear to collapse and recover; snap to the revalidated total. */}
+          <CountUp value={heroCost} animateKey={animateKey} animate={!suppressHeroReplay} />
           <div className="ov-hero-sub">{heroCalls.toLocaleString('en-US')} calls · {heroSessions.toLocaleString('en-US')} sessions</div>
           {combined
             ? <CombinedDevices usage={combined} />

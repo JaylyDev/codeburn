@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { createElement, type ReactNode } from 'react'
 import { afterEach, describe, it, expect, vi } from 'vitest'
-import { renderHook, act } from '@testing-library/react'
+import { render, renderHook, act } from '@testing-library/react'
 
 import { RefreshCadenceContext, type RefreshCadence } from '../lib/refreshCadence'
 import { clearPolledMemo, hasPolledMemo, primePolledMemo, usePolled } from './usePolled'
@@ -187,20 +187,18 @@ describe('usePolled', () => {
     }
   })
 
-  it('keeps a payload for the whole session, however many other keys are visited', async () => {
-    const fetcher = vi.fn().mockResolvedValue('x')
-    const { rerender } = renderHook(
-      ({ k }: { k: string }) => usePolled(fetcher, [k], { memoKey: k, intervalMs: null }),
-      { initialProps: { k: 'first' } },
-    )
-    await act(async () => {})
-    for (let i = 0; i < 40; i++) {
-      rerender({ k: `other-${i}` })
-      await act(async () => {})
-    }
-    // No LRU cap: the very first key is still memoized, so returning to it paints
-    // instantly instead of re-running its aggregation.
-    expect(hasPolledMemo('first')).toBe(true)
+  it('bounds the instant-switch memo and retains recently-used keys', () => {
+    clearPolledMemo()
+    for (let i = 0; i < 96; i++) primePolledMemo(`key-${i}`, i)
+
+    // Re-seeding the oldest key makes it recent before the next insertion.
+    expect(hasPolledMemo('key-0')).toBe(true)
+    primePolledMemo('key-0', 0)
+    primePolledMemo('key-96', 96)
+
+    expect(hasPolledMemo('key-0')).toBe(true)
+    expect(hasPolledMemo('key-1')).toBe(false)
+    expect(hasPolledMemo('key-96')).toBe(true)
   })
 
   it('clears stale data on a switch to an unmemoized key (skeleton, never the prior filter)', async () => {
@@ -229,6 +227,43 @@ describe('usePolled', () => {
     // showing data — the clear-on-miss must never blank a plain refresh.
     act(() => { result.current.refresh() })
     expect(result.current.data).toBe('B0')
+  })
+
+  it('never exposes a prior keyed payload even for the render before switch effects run', async () => {
+    const resolvers: Array<(v: string) => void> = []
+    const fetcher = vi.fn(() => new Promise<string>(resolve => { resolvers.push(resolve) }))
+    const observed: Array<{ key: string; data: string | null }> = []
+    function Probe({ memoKey }: { memoKey: string }) {
+      const polled = usePolled(fetcher, [memoKey], { memoKey, intervalMs: null })
+      observed.push({ key: memoKey, data: polled.data })
+      return null
+    }
+
+    const view = render(createElement(Probe, { memoKey: 'frame-A' }))
+    await act(async () => { resolvers[0]!('A0') })
+    observed.length = 0
+
+    view.rerender(createElement(Probe, { memoKey: 'frame-B' }))
+    expect(observed[0]).toEqual({ key: 'frame-B', data: null })
+  })
+
+  it('never exposes a prior keyed error during the render before switch effects run', async () => {
+    const calls: Array<{ resolve: (value: string) => void; reject: (error: unknown) => void }> = []
+    const fetcher = vi.fn(() => new Promise<string>((resolve, reject) => { calls.push({ resolve, reject }) }))
+    const observed: Array<{ key: string; error: unknown }> = []
+    function Probe({ memoKey }: { memoKey: string }) {
+      const polled = usePolled(fetcher, [memoKey], { memoKey, intervalMs: null })
+      observed.push({ key: memoKey, error: polled.error })
+      return null
+    }
+    const view = render(createElement(Probe, { memoKey: 'error-A' }))
+    await act(async () => { calls[0]!.reject({ kind: 'nonzero', message: 'A failed' }) })
+    expect(observed.at(-1)?.error).toMatchObject({ message: 'A failed' })
+    observed.length = 0
+
+    view.rerender(createElement(Probe, { memoKey: 'error-B' }))
+
+    expect(observed[0]).toEqual({ key: 'error-B', error: null })
   })
 
   it('manual cadence (null interval) polls only on mount + refresh, never on a timer', async () => {

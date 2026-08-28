@@ -6,6 +6,7 @@ import { App, overviewMemoKey, topCategoryByModel, usageSnapshotProps } from './
 import { sanitizeProps } from '../electron/telemetry'
 import { __resetPolledMemo, hasPolledMemo, primePolledMemo } from './hooks/usePolled'
 import { setActiveCurrency } from './lib/format'
+import { readOverviewHeadline, writeOverviewHeadline } from './lib/overviewSnapshot'
 import type { DateRange, MenubarPayload, ModelReportRow, OptimizeJsonReport, SpendFlow } from './lib/types'
 
 const stored = new Map<string, string>()
@@ -203,6 +204,7 @@ describe('App shortcuts', () => {
 
   afterEach(() => {
     clearPlatform()
+    vi.useRealTimers()
   })
 
   it('keeps sections gated (and the splash up) while a cold hydration times out', async () => {
@@ -216,10 +218,78 @@ describe('App shortcuts', () => {
     expect(screen.queryByText("Couldn't read data")).not.toBeInTheDocument()
   })
 
+  it('paints the last exact headline immediately while authoritative details load', async () => {
+    const key = overviewMemoKey('all', '30days', null, null)
+    writeOverviewHeadline(key, overviewPayload(), Date.now() - 1_000)
+    mocks.getOverview.mockReturnValue(new Promise<MenubarPayload>(() => {}))
+
+    render(<App />)
+
+    expect(await screen.findByLabelText('Cached usage summary')).toBeInTheDocument()
+    expect(screen.getAllByText('$12.34').length).toBeGreaterThan(0)
+    expect(screen.getByText(/sessions updating/)).toBeInTheDocument()
+    expect(screen.getByText('Updating detailed drill-downs…')).toBeInTheDocument()
+    expect(screen.getByText('Refreshing selected view…')).toBeInTheDocument()
+    expect(mocks.getActReport).not.toHaveBeenCalled()
+  })
+
+  it('never persists the previous period headline under a newly selected period', async () => {
+    const thirtyDays = overviewPayload()
+    thirtyDays.current = { ...thirtyDays.current, label: 'Last 30 Days', cost: 30 }
+    const pendingWeek = new Promise<MenubarPayload>(() => {})
+    mocks.getOverview.mockImplementation((period: string) =>
+      period === 'week' ? pendingWeek : Promise.resolve(thirtyDays))
+
+    render(<App />)
+    expect(await screen.findByText('$30.00')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('tab', { name: '7D' }))
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('week', 'all'))
+
+    // The selected key has not resolved yet. A 30-day result must never be
+    // written beneath it and then shown as the seven-day headline on a later
+    // switch or app launch.
+    expect(readOverviewHeadline(overviewMemoKey('all', 'week', null, null))).toBeNull()
+  })
+
+  it('rolls Today and Month cache identities at their local calendar boundaries', () => {
+    const aug28 = new Date(2026, 7, 28, 23, 59)
+    const aug29 = new Date(2026, 7, 29, 0, 1)
+    const sep1 = new Date(2026, 8, 1, 0, 1)
+
+    expect(overviewMemoKey('all', 'today', null, null, 'local', aug28))
+      .not.toBe(overviewMemoKey('all', 'today', null, null, 'local', aug29))
+    expect(overviewMemoKey('all', 'month', null, null, 'local', aug28))
+      .toBe(overviewMemoKey('all', 'month', null, null, 'local', aug29))
+    expect(overviewMemoKey('all', 'month', null, null, 'local', aug29))
+      .not.toBe(overviewMemoKey('all', 'month', null, null, 'local', sep1))
+  })
+
   it('releases the sections when the overview fails for a real reason', async () => {
     mocks.getOverview.mockRejectedValue({ kind: 'nonzero', message: 'permission denied' })
     render(<App />)
     await waitFor(() => expect(mocks.getActReport).toHaveBeenCalled())
+  })
+
+  it('does not fan out secondary analysis after the bounded overview timeout', async () => {
+    // A real installed heavy-corpus run reached the 600s no-output boundary.
+    // Marking that timeout as generally ready mounted Overview's act/yield polls;
+    // a user Refresh then ran another status parse beside yield, multiplying the
+    // retry's memory pressure instead of helping it recover.
+    mocks.getOverview
+      .mockRejectedValueOnce({ kind: 'timeout', message: 'no output for 600000ms' })
+      .mockReturnValue(new Promise<MenubarPayload>(() => {}))
+
+    render(<App />)
+
+    expect(await screen.findByText("Couldn't read data")).toBeInTheDocument()
+    expect(mocks.getActReport).not.toHaveBeenCalled()
+    expect(mocks.getYield).not.toHaveBeenCalled()
+
+    fireEvent.keyDown(document, { key: 'r', metaKey: true })
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledTimes(2))
+    expect(mocks.getActReport).not.toHaveBeenCalled()
+    expect(mocks.getYield).not.toHaveBeenCalled()
   })
 
   it('applies the persisted theme on app boot before Settings mounts', async () => {
@@ -584,6 +654,7 @@ describe('win32 shortcut chords', () => {
 
   afterEach(() => {
     clearPlatform()
+    vi.useRealTimers()
   })
 
   it('navigates with Ctrl+2 and refreshes with Ctrl+R', async () => {
@@ -615,7 +686,7 @@ describe('win32 shortcut chords', () => {
   })
 })
 
-describe('provider prefetch storm', () => {
+describe('overview idle warming', () => {
   const PROVIDERS = [
     'claude', 'codex', 'gemini', 'grok', 'copilot', 'droid',
     'hermes', 'zcode', 'cursor', 'kiro', 'codewhale', 'openrouter',
@@ -653,19 +724,81 @@ describe('provider prefetch storm', () => {
     __resetPolledMemo()
   })
 
-  // With MEMO_MAX too small (< providers + base keys) the base overview key
-  // LRU-evicts between polls, blanking the overview and re-arming the prefetch
-  // every 30s cycle: 12 redundant full-history parses forever. This asserts the
-  // fix — each provider is prefetched EXACTLY ONCE total across three cycles.
-  it('prefetches each detected provider exactly once across 3 poll cycles', async () => {
+  it('warms other time horizons before provider variants', async () => {
+    vi.useFakeTimers()
+    try {
+      render(<App />)
+      // Boot is pinned to 30D in beforeEach. Once it resolves, the idle queue
+      // should warm the remaining horizons in product priority order, then
+      // retain current main's provider-switch warming contract.
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(20_000) })
+
+      const backgroundSpawns = mocks.getOverview.mock.calls.filter(call => call[4] === true)
+      expect(backgroundSpawns.slice(0, 5).map(call => [call[0], call[1]])).toEqual([
+        ['today', 'all'],
+        ['week', 'all'],
+        ['month', 'all'],
+        ['all', 'all'],
+        ['lifetime', 'all'],
+      ])
+
+      expect(backgroundSpawns[5]?.slice(0, 2)).toEqual(['30days', 'claude'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('retries a period warm that was cancelled by a user period switch', async () => {
+    vi.useFakeTimers()
+    try {
+      let resolveFirstToday!: (payload: MenubarPayload) => void
+      const firstToday = new Promise<MenubarPayload>(resolve => { resolveFirstToday = resolve })
+      let todayWarmCalls = 0
+      mocks.getOverview.mockImplementation((period: string, _provider: string, _range, _config, background) => {
+        if (period === 'today' && background === true) {
+          todayWarmCalls++
+          if (todayWarmCalls === 1) return firstToday
+        }
+        const payload = manyProviderPayload()
+        payload.current = {
+          ...payload.current,
+          label: period === 'week' ? 'Last 7 Days' : payload.current.label,
+        }
+        return Promise.resolve(payload)
+      })
+
+      render(<App />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+      expect(todayWarmCalls).toBe(1)
+
+      // The user takes priority while the first background warm is pending.
+      fireEvent.click(screen.getByRole('tab', { name: '7D' }))
+      await act(async () => { await Promise.resolve() })
+      expect(mocks.getOverview).toHaveBeenCalledWith('week', 'all')
+
+      // The cancelled result must not poison the session-lifetime retry guard.
+      await act(async () => {
+        resolveFirstToday(manyProviderPayload())
+        await Promise.resolve()
+      })
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      expect(todayWarmCalls).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('prefetches each provider variant once across 3 poll cycles', async () => {
     vi.useFakeTimers()
     try {
       render(<App />)
       // Let the mount overview resolve so `ready` flips and the prefetch arms.
       await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
-      // Three full 30s poll cycles plus the prefetch start delay and staggered
-      // per-provider warms (12 × 400ms). A re-arming storm would re-spawn some
-      // providers on cycles 2 and 3; the once-per-key guard must prevent it.
+      // Three full 30s poll cycles plus the period-warming queue are long enough
+      // to warm every provider. The once-per-key guard must prevent poll cycles
+      // from spawning the queue again.
       await act(async () => { await vi.advanceTimersByTimeAsync(30_000 * 3 + 12_000) })
 
       for (const id of PROVIDERS) {
@@ -680,13 +813,7 @@ describe('provider prefetch storm', () => {
       const allPolls = mocks.getOverview.mock.calls.filter(c => c[1] === 'all')
       expect(allPolls.length).toBeGreaterThanOrEqual(3)
 
-      // The memo must be sized to hold every warmed provider so none LRU-evict
-      // between polls — the eviction that (in the real app) blanked the base
-      // overview key and re-armed the prefetch. Under the old fixed cap of 8,
-      // 7 of these 12 keys would have been evicted by soak's end.
-      for (const id of PROVIDERS) {
-        expect(hasPolledMemo(overviewMemoKey(id, '30days', null, null)), `warm key ${id}`).toBe(true)
-      }
+      for (const id of PROVIDERS) expect(hasPolledMemo(overviewMemoKey(id, '30days', null, null))).toBe(true)
     } finally {
       vi.useRealTimers()
     }
@@ -757,6 +884,7 @@ describe('currency correctness', () => {
 
   afterEach(() => {
     clearPlatform()
+    vi.useRealTimers()
   })
 
   it('never regresses the applied currency to a memo-served (stale) payload during a switch', async () => {
@@ -795,6 +923,7 @@ describe('currency correctness', () => {
     // A warmed entry (as the prefetcher would leave one) that must be purged so a
     // later switch can't repaint a payload computed under the old currency.
     primePolledMemo('sentinel-warmed-key', { stale: true })
+    writeOverviewHeadline(overviewMemoKey('all', 'week', null, null), overviewPayload())
     expect(hasPolledMemo('sentinel-warmed-key')).toBe(true)
 
     fireEvent.keyDown(document, { key: ',', metaKey: true })
@@ -805,6 +934,55 @@ describe('currency correctness', () => {
     // Memo purged and the active view force-refreshed so the new currency lands fast.
     await waitFor(() => expect(mocks.getOverview.mock.calls.length).toBeGreaterThan(overviewCalls))
     expect(hasPolledMemo('sentinel-warmed-key')).toBe(false)
+    expect(readOverviewHeadline(overviewMemoKey('all', 'week', null, null))).toBeNull()
+  })
+
+  it('does not resurrect the live cached headline after a settings invalidation', async () => {
+    const eur = { ...overviewPayload(), currency: EUR }
+    const key = overviewMemoKey('all', '30days', null, null)
+    writeOverviewHeadline(key, eur)
+    mocks.getOverview.mockReturnValue(new Promise<MenubarPayload>(() => {}))
+
+    render(<App />)
+    expect(await screen.findByLabelText('Cached usage summary')).toBeInTheDocument()
+
+    fireEvent.keyDown(document, { key: ',', metaKey: true })
+    fireEvent.click(await screen.findByRole('button', { name: 'Reset to USD' }))
+    await waitFor(() => expect(mocks.resetCurrency).toHaveBeenCalled())
+    fireEvent.keyDown(document, { key: '1', metaKey: true })
+
+    expect(screen.queryByLabelText('Cached usage summary')).not.toBeInTheDocument()
+    expect(readOverviewHeadline(key)).toBeNull()
+  })
+
+  it('rejects an old in-flight background warm after a settings invalidation', async () => {
+    vi.useFakeTimers()
+    let resolveOldWarm!: (payload: MenubarPayload) => void
+    const oldWarm = new Promise<MenubarPayload>(resolve => { resolveOldWarm = resolve })
+    const usd = { ...overviewPayload(), currency: USD }
+    mocks.getOverview.mockImplementation((period: string, _provider: string, _range, _config, background) => {
+      if (period === 'today' && background === true) return oldWarm
+      return Promise.resolve(usd)
+    })
+
+    render(<App />)
+    await act(async () => { await Promise.resolve() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+    expect(mocks.getOverview).toHaveBeenCalledWith('today', 'all', undefined, undefined, true)
+
+    fireEvent.keyDown(document, { key: ',', metaKey: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Reset to USD' }))
+    await act(async () => { await Promise.resolve() })
+    expect(mocks.resetCurrency).toHaveBeenCalled()
+
+    await act(async () => {
+      resolveOldWarm(usd)
+      await Promise.resolve()
+    })
+
+    const todayKey = overviewMemoKey('all', 'today', null, null)
+    expect(hasPolledMemo(todayKey)).toBe(false)
+    expect(readOverviewHeadline(todayKey)).toBeNull()
   })
 })
 

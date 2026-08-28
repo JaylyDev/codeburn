@@ -79,10 +79,59 @@ function buildHeatmapDays(daily: DailyHistoryEntry[], now: Date): HeatmapDay[] {
 
 export function ActivityHeatmap({ daily, bare = false }: { daily: DailyHistoryEntry[]; bare?: boolean }) {
   const days = useMemo(() => buildHeatmapDays(daily, new Date()), [daily])
+  const monthMarkers = useMemo(() => {
+    const markers: Array<{ key: string; label: string; week: number }> = []
+    const seen = new Set<string>()
+    for (let index = 0; index < days.length; index++) {
+      const date = dateFromKey(days[index]!.date)
+      if (index !== 0 && date.getDate() !== 1) continue
+      const key = `${date.getFullYear()}-${date.getMonth()}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      markers.push({
+        key,
+        label: date.toLocaleString('en-US', { month: 'short' }),
+        week: Math.floor(index / 7),
+      })
+    }
+    return markers
+  }, [days])
   const activeDays = days.filter(day => !day.isFuture && day.cost > 0).length
   const [tip, setTip] = useState<{ day: HeatmapDay; x: number; y: number } | null>(null)
   const [tipPosition, setTipPosition] = useState<{ left: number; top: number } | null>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
   const tipRef = useRef<HTMLDivElement>(null)
+  const stickToNewestRef = useRef(true)
+
+  // The fixed 26-week grid is wider than the compact hero slot. Start at the
+  // newest weeks, then leave the user's scroll position alone.
+  useLayoutEffect(() => {
+    const scroller = scrollRef.current
+    if (!scroller) return
+
+    const alignNewest = (): void => {
+      if (!stickToNewestRef.current) return
+      const newestOffset = Math.max(0, scroller.scrollWidth - scroller.clientWidth)
+      scroller.scrollLeft = newestOffset
+    }
+
+    alignNewest()
+
+    // Electron can mount this card while its parent still has the wider
+    // skeleton measurement, then compact it before first paint. Keep observing
+    // later resizes too while the user remains pinned to newest; once they
+    // deliberately scroll away, their position is left alone.
+    const observer = typeof ResizeObserver === 'undefined'
+      ? null
+      : new ResizeObserver(alignNewest)
+    observer?.observe(scroller)
+    const frame = window.requestAnimationFrame(alignNewest)
+
+    return () => {
+      window.cancelAnimationFrame(frame)
+      observer?.disconnect()
+    }
+  }, [])
 
   useLayoutEffect(() => {
     if (!tip) {
@@ -109,29 +158,49 @@ export function ActivityHeatmap({ daily, bare = false }: { daily: DailyHistoryEn
     </div>
   )
   const grid = (
-    <div className="ov-heatmap-scroll">
-      <div className="ov-heatmap" role="grid" aria-label="Daily activity contribution heatmap">
-        <div className="ov-heatmap-labels" aria-hidden="true">
-          {WEEKDAYS.map((weekday, index) => (
-            <span key={weekday}>{index === 1 || index === 3 || index === 5 ? weekday : ''}</span>
-          ))}
-        </div>
-        <div className="ov-heatmap-cells">
-          {days.map(day => (
-            <button
-              type="button"
-              role="gridcell"
-              key={day.date}
-              className={`ov-heat-cell heat-level-${day.level}${day.isFuture ? ' future' : ''}${day.noData ? ' nodata' : ''}`}
-              aria-label={`${formatDate(day.date)}: ${day.noData ? 'no data recorded' : day.isFuture ? 'future day' : `${formatUsd(day.cost)}, ${day.calls} calls`}`}
-              data-date={day.date}
-              data-cost={day.cost}
-              data-active={!day.isFuture && !day.noData && day.cost > 0 ? 'true' : 'false'}
-              onMouseEnter={event => setTip({ day, x: event.clientX, y: event.clientY })}
-              onMouseMove={event => setTip({ day, x: event.clientX, y: event.clientY })}
-              onMouseLeave={() => setTip(null)}
-            />
-          ))}
+    <div className="ov-heatmap-frame">
+      <div className="ov-heatmap-corner" aria-hidden="true" />
+      <div className="ov-heatmap-labels" aria-label="Weekday labels">
+        {WEEKDAYS.map((weekday, index) => (
+          <span key={weekday}>{index === 1 || index === 3 || index === 5 ? weekday : ''}</span>
+        ))}
+      </div>
+      <div
+        className="ov-heatmap-scroll"
+        ref={scrollRef}
+        role="region"
+        aria-label="Scrollable daily activity timeline"
+        tabIndex={0}
+        onScroll={() => {
+          const scroller = scrollRef.current
+          if (!scroller) return
+          const newestOffset = Math.max(0, scroller.scrollWidth - scroller.clientWidth)
+          stickToNewestRef.current = Math.abs(scroller.scrollLeft - newestOffset) <= 1
+        }}
+      >
+        <div className="ov-heatmap-track">
+          <div className="ov-heatmap-months" aria-label="Month labels">
+            {monthMarkers.map(marker => (
+              <span key={marker.key} style={{ gridColumnStart: marker.week + 1 }}>{marker.label}</span>
+            ))}
+          </div>
+          <div className="ov-heatmap-cells" role="grid" aria-label="Daily activity contribution heatmap">
+            {days.map(day => (
+              <button
+                type="button"
+                role="gridcell"
+                key={day.date}
+                className={`ov-heat-cell heat-level-${day.level}${day.isFuture ? ' future' : ''}${day.noData ? ' nodata' : ''}`}
+                aria-label={`${formatDate(day.date)}: ${day.noData ? 'no data recorded' : day.isFuture ? 'future day' : `${formatUsd(day.cost)}, ${day.calls} calls`}`}
+                data-date={day.date}
+                data-cost={day.cost}
+                data-active={!day.isFuture && !day.noData && day.cost > 0 ? 'true' : 'false'}
+                onMouseEnter={event => setTip({ day, x: event.clientX, y: event.clientY })}
+                onMouseMove={event => setTip({ day, x: event.clientX, y: event.clientY })}
+                onMouseLeave={() => setTip(null)}
+              />
+            ))}
+          </div>
         </div>
       </div>
     </div>

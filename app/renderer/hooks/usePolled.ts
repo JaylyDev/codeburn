@@ -6,6 +6,10 @@ import type { CliError } from '../lib/types'
 
 export type Polled<T> = {
   data: T | null
+  /** Memo key that produced `data`. During a dependency change React may render
+   *  once with the previous result before the load effect clears or replaces it;
+   *  consumers that persist data under the active key must compare this first. */
+  dataKey?: string | null
   error: CliError | null
   loading: boolean
   /** True while a fresh fetch runs behind instantly-served memoized data (a
@@ -17,12 +21,11 @@ export type Polled<T> = {
   refresh: () => void
 }
 
-// Module-level store of the LAST successful result per memoKey, kept for the
-// whole app session — one payload per key, replaced on each success, never
-// evicted. A section that switches deps to a previously-seen key (a period or
-// provider switch, or a switch-back) paints the cached result in the same frame:
-// no blank, no skeleton, no stale-freeze. Keys are bounded by
-// (section × period × provider × range), so the map cannot grow without limit.
+// Module-level LRU store of the last successful result per memoKey. A section
+// that switches deps to a recently-seen key (a period or provider switch, or a
+// switch-back) paints the cached result in the same frame: no blank, no skeleton,
+// no stale-freeze. Today and Month keys deliberately include a date boundary,
+// so a fixed cap prevents a long-running app from retaining old payloads forever.
 //
 // Entries carry the wall-clock of the fetch that produced them. When the memoKey
 // CHANGES (a period/provider/scope switch) a cached entry younger than
@@ -32,15 +35,27 @@ export type Polled<T> = {
 // visibility catch-up, refresh() — always fetches, so the poll cadence and the
 // manual refresh are unaffected.
 const POLLED_FRESH_MS = 30_000
+const MAX_MEMO_ENTRIES = 96
 type MemoEntry = { value: unknown; at: number }
 const memoStore = new Map<string, MemoEntry>()
 
 function memoGet<T>(key: string): { value: T; at: number } | undefined {
-  return memoStore.get(key) as { value: T; at: number } | undefined
+  const entry = memoStore.get(key)
+  if (entry === undefined) return undefined
+  // Map iteration order is the eviction order. A cache hit becomes most recent.
+  memoStore.delete(key)
+  memoStore.set(key, entry)
+  return entry as { value: T; at: number }
 }
 
 function memoSet(key: string, value: unknown): void {
+  memoStore.delete(key)
   memoStore.set(key, { value, at: Date.now() })
+  while (memoStore.size > MAX_MEMO_ENTRIES) {
+    const oldest = memoStore.keys().next().value as string | undefined
+    if (oldest === undefined) break
+    memoStore.delete(oldest)
+  }
 }
 
 /** Test-only: clear the module-level memo between renders so cached results from
@@ -98,7 +113,10 @@ export function usePolled<T>(
   const enabled = opts.enabled ?? true
   const memoKey = opts.memoKey
   const [data, setData] = useState<T | null>(() => (memoKey ? memoGet<T>(memoKey)?.value ?? null : null))
+  const [dataKey, setDataKey] = useState<string | null>(() =>
+    memoKey && memoGet<T>(memoKey) !== undefined ? memoKey : null)
   const [error, setError] = useState<CliError | null>(null)
+  const [errorKey, setErrorKey] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [switching, setSwitching] = useState(false)
   const [lastSuccessAt, setLastSuccessAt] = useState<number | null>(null)
@@ -131,6 +149,7 @@ export function usePolled<T>(
       const cached = memoGet<T>(memoKey)
       if (cached !== undefined) {
         setData(cached.value)
+        setDataKey(memoKey)
         servedCached = true
         // The footer's "refreshed Ns ago" must describe the payload on screen,
         // not this hook instance's last fetch of some other key.
@@ -140,22 +159,29 @@ export function usePolled<T>(
         // the painted answer is good enough, so skip the CLI spawn entirely.
         if (keyChanged && Date.now() - cached.at < POLLED_FRESH_MS) {
           setError(null)
+          setErrorKey(null)
           setLoading(false)
           setSwitching(false)
           return
         }
-      } else setData(null)
+      } else {
+        setData(null)
+        setDataKey(null)
+      }
     }
     setLoading(true)
     setSwitching(servedCached)
     // Clear any prior error at the start of each attempt so a fresh poll never
     // shows a stale banner while it is still in flight; last-good `data` stays.
     setError(null)
+    setErrorKey(null)
     fetcher()
       .then(result => {
         if (epochRef.current !== epoch) return
         setData(result)
+        setDataKey(memoKey ?? null)
         setError(null)
+        setErrorKey(null)
         const at = Date.now()
         setLastSuccessAt(at)
         lastSuccessRef.current = at
@@ -164,6 +190,7 @@ export function usePolled<T>(
       .catch(err => {
         if (epochRef.current !== epoch) return
         setError(normalizeCliError(err))
+        setErrorKey(memoKey ?? null)
       })
       .finally(() => {
         if (epochRef.current !== epoch) return
@@ -212,5 +239,27 @@ export function usePolled<T>(
     load()
   }, [load])
 
-  return { data, error, loading, switching, lastSuccessAt, refresh }
+  // A dependency/key change renders before the effect above can swap state.
+  // Mask the previous key synchronously in that render; if the new key is
+  // already memoized, expose that matching value immediately instead. This
+  // keeps the selected filter and every visible number consistent per frame,
+  // not merely after effects have run.
+  const renderMemo = memoKey ? memoGet<T>(memoKey) : undefined
+  const keyMismatch = memoKey !== undefined && dataKey !== memoKey
+  const renderedData = keyMismatch ? renderMemo?.value ?? null : data
+  const renderedDataKey = keyMismatch ? (renderMemo ? memoKey : null) : dataKey
+  const renderedLastSuccessAt = keyMismatch && renderMemo ? renderMemo.at : lastSuccessAt
+  const renderedLoading = keyMismatch ? true : loading
+  const renderedSwitching = keyMismatch ? renderMemo !== undefined : switching
+  const renderedError = memoKey !== undefined && errorKey !== memoKey ? null : error
+
+  return {
+    data: renderedData,
+    dataKey: renderedDataKey,
+    error: renderedError,
+    loading: renderedLoading,
+    switching: renderedSwitching,
+    lastSuccessAt: renderedLastSuccessAt,
+    refresh,
+  }
 }
