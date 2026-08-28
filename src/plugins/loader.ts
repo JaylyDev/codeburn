@@ -122,6 +122,10 @@ async function checkForSymlinks(dir: string): Promise<boolean> {
     for (const entry of entries) {
       const fullPath = join(dir, entry.name)
       if (entry.isSymbolicLink()) return true
+      if (entry.isDirectory()) {
+        // Recurse into subdirectories
+        if (await checkForSymlinks(fullPath)) return true
+      }
     }
   } catch {
     return true
@@ -134,20 +138,37 @@ async function getPluginFilesList(
 ): Promise<Array<{ path: string, sha256: string }>> {
   const { createHash } = await import('crypto')
   const files: Array<{ path: string, sha256: string }> = []
-  try {
-    const entries = await readdir(dir, { withFileTypes: true })
-    for (const entry of entries) {
-      if (entry.name === 'codeburn-plugin.sig') continue
-      if (!entry.isFile()) continue
-      const fullPath = join(dir, entry.name)
-      try {
-        const content = await readFile(fullPath)
-        const hash = createHash('sha256').update(content).digest('hex')
-        files.push({ path: entry.name, sha256: hash })
-      } catch {
-        continue
+
+  async function walk(baseDir: string, relativePath: string) {
+    try {
+      const entries = await readdir(baseDir, { withFileTypes: true })
+      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+        // Exclude signature file and sections directory (runtime-mutable plugin output)
+        if (entry.name === 'codeburn-plugin.sig') continue
+        if (entry.name === 'sections') continue
+
+        const fullPath = join(baseDir, entry.name)
+        const relPosixPath = relativePath ? `${relativePath}/${entry.name}` : entry.name
+
+        if (entry.isFile()) {
+          try {
+            const content = await readFile(fullPath)
+            const hash = createHash('sha256').update(content).digest('hex')
+            files.push({ path: relPosixPath, sha256: hash })
+          } catch {
+            continue
+          }
+        } else if (entry.isDirectory()) {
+          await walk(fullPath, relPosixPath)
+        }
       }
+    } catch {
+      // Silently skip unreadable directories
     }
+  }
+
+  try {
+    await walk(dir, '')
   } catch {
     return []
   }

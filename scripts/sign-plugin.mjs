@@ -111,17 +111,36 @@ async function handleSign() {
 
 async function getFilesList(dir) {
   const files = []
-  const entries = await readdir(dir, { withFileTypes: true })
-  for (const entry of entries) {
-    if (entry.isFile() && entry.name !== 'codeburn-plugin.sig') {
-      const fullPath = join(dir, entry.name)
-      const stat_info = await stat(fullPath)
-      if (!stat_info.isFile()) continue
-      const content = await readFile(fullPath)
-      const sha256 = await hashSha256(content)
-      files.push({ path: entry.name, sha256 })
+
+  async function walk(baseDir, relativePath) {
+    try {
+      const entries = await readdir(baseDir, { withFileTypes: true })
+      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+        // Exclude signature file and sections directory (runtime-mutable plugin output)
+        if (entry.name === 'codeburn-plugin.sig') continue
+        if (entry.name === 'sections') continue
+
+        const fullPath = join(baseDir, entry.name)
+        const relPosixPath = relativePath ? `${relativePath}/${entry.name}` : entry.name
+
+        if (entry.isFile()) {
+          try {
+            const content = await readFile(fullPath)
+            const sha256 = await hashSha256(content)
+            files.push({ path: relPosixPath, sha256 })
+          } catch {
+            continue
+          }
+        } else if (entry.isDirectory()) {
+          await walk(fullPath, relPosixPath)
+        }
+      }
+    } catch {
+      // Silently skip unreadable directories
     }
   }
+
+  await walk(dir, '')
   files.sort((a, b) => a.path.localeCompare(b.path))
   return files
 }

@@ -11,7 +11,7 @@
  */
 
 import type { Command } from 'commander'
-import { stat, mkdir, readFile, writeFile, rm, readdir } from 'fs/promises'
+import { stat, mkdir, readFile, writeFile, rm, readdir, copyFile } from 'fs/promises'
 import { join } from 'path'
 import { homedir } from 'os'
 import { spawn } from 'child_process'
@@ -118,14 +118,7 @@ export function registerPluginCommands(program: Command): void {
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
       }
       await mkdir(destDir, { recursive: true })
-      const entries = await readdir(sourcePath, { withFileTypes: true })
-      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-        if (!entry.isFile()) continue
-        const srcFile = join(sourcePath, entry.name)
-        const destFile = join(destDir, entry.name)
-        const content = await readFile(srcFile)
-        await writeFile(destFile, content)
-      }
+      await copyPluginTree(sourcePath, destDir)
       process.stdout.write(`Plugin "${manifest.name}@${manifest.version}" installed to ${destDir}\n`)
     })
 
@@ -172,6 +165,30 @@ async function listOnDiskSections(dir: string, m: PluginManifest): Promise<strin
     } catch { /* missing is fine, sections are optional */ }
   }
   return out
+}
+
+/// Recursively copy plugin files from source to destination, excluding sections/
+/// (sections/ is runtime-mutable plugin output and not copied on install).
+async function copyPluginTree(sourceDir: string, destDir: string): Promise<void> {
+  async function walk(src: string, dest: string) {
+    const entries = await readdir(src, { withFileTypes: true })
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      // Exclude sections directory (runtime-mutable plugin output)
+      if (entry.name === 'sections') continue
+
+      const srcPath = join(src, entry.name)
+      const destPath = join(dest, entry.name)
+
+      if (entry.isFile()) {
+        await copyFile(srcPath, destPath)
+      } else if (entry.isDirectory()) {
+        await mkdir(destPath, { recursive: true })
+        await walk(srcPath, destPath)
+      }
+    }
+  }
+
+  await walk(sourceDir, destDir)
 }
 
 // Re-export so consumers can pin the version pinned by the socket itself.
