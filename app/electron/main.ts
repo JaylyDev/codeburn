@@ -18,7 +18,7 @@ type QuitTelemetry = Pick<Telemetry, 'trackClose' | 'flush'>
 type BeforeQuitEvent = { preventDefault: () => void }
 type BeforeQuitDeps = {
   getTelemetry: () => QuitTelemetry | null
-  killAll: () => void
+  killAll: () => void | Promise<void>
   quit: () => void
   timeoutMs?: number
 }
@@ -40,7 +40,8 @@ export function createBeforeQuitHandler(deps: BeforeQuitDeps): (event: BeforeQui
     void (async () => {
       let timer: ReturnType<typeof setTimeout> | undefined
       try {
-        try { deps.killAll() } catch { /* child cleanup must not wedge quit */ }
+        let childCleanup: Promise<unknown> = Promise.resolve()
+        try { childCleanup = Promise.resolve(deps.killAll()).catch(() => undefined) } catch { /* child cleanup must not wedge quit */ }
 
         let telemetry: QuitTelemetry | null = null
         try { telemetry = deps.getTelemetry() } catch { /* telemetry lookup is best-effort */ }
@@ -57,7 +58,10 @@ export function createBeforeQuitHandler(deps: BeforeQuitDeps): (event: BeforeQui
         const timeout = new Promise<void>(resolve => {
           timer = setTimeout(resolve, deps.timeoutMs ?? QUIT_FLUSH_TIMEOUT_MS)
         })
-        await Promise.race([flush.catch(() => false), timeout])
+        await Promise.race([
+          Promise.all([flush.catch(() => false), childCleanup]),
+          timeout,
+        ])
       } finally {
         if (timer !== undefined) clearTimeout(timer)
         allowQuit = true

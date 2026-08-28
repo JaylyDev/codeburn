@@ -379,6 +379,24 @@ describe('createBeforeQuitHandler', () => {
     }
   })
 
+  it('waits for asynchronous child cleanup before the final exit', async () => {
+    let releaseCleanup: (() => void) | undefined
+    const cleanup = new Promise<void>(resolve => { releaseCleanup = resolve })
+    const quit = vi.fn()
+    const handler = createBeforeQuitHandler({
+      getTelemetry: () => null,
+      killAll: () => cleanup,
+      quit,
+    })
+
+    handler({ preventDefault: vi.fn() })
+    await Promise.resolve()
+    expect(quit).not.toHaveBeenCalled()
+
+    releaseCleanup?.()
+    await vi.waitFor(() => expect(quit).toHaveBeenCalledOnce())
+  })
+
   it('still flushes and quits when trackClose throws synchronously', async () => {
     const trackClose = vi.fn(() => { throw new Error('track close failed') })
     const flush = vi.fn(async () => true)

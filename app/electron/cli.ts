@@ -72,6 +72,11 @@ const MAX_RUNTIME_MS = 15 * 60_000
 // dead pid — self-healing, but via the stale-takeover path rather than a clean
 // release. Neither signal publishes a partial parse; nothing does.
 const KILL_GRACE_MS = 5_000
+// Quit has a stricter user-visible budget than ordinary request timeouts. Give
+// the CLI enough time to catch SIGTERM and release its cache locks, then reap
+// every remaining process-group member before Electron exits.
+export const SHUTDOWN_TERM_GRACE_MS = 750
+const SHUTDOWN_FORCE_WAIT_MS = 250
 /** Wire marker for CLI scan-progress lines (src/parser.ts: PROGRESS_LINE_PREFIX). */
 export const PROGRESS_LINE_PREFIX = 'CODEBURN_PROGRESS '
 // A runaway CLI (or a compromised binary) must not exhaust main-process memory.
@@ -97,6 +102,36 @@ let running = 0
 const interactiveQueue: SlotWaiter[] = []
 const backgroundQueue: SlotWaiter[] = []
 let shuttingDown = false
+let shutdownPromise: Promise<void> | null = null
+
+function ownsProcessGroup(): boolean {
+  return platform() !== 'win32'
+}
+
+/** Signal the CLI and every subprocess it created. POSIX children are spawned
+ * as process-group leaders; Windows keeps the direct-child behavior here and
+ * relies on its existing orphan-reap path after a crash. */
+function signalOwnedTree(child: ChildProcess, signal: NodeJS.Signals): boolean {
+  if (ownsProcessGroup() && child.pid) {
+    try { process.kill(-child.pid, signal); return true } catch { /* already gone or no group */ }
+  }
+  try { return child.kill(signal) } catch { return false }
+}
+
+function ownedTreeAlive(child: ChildProcess): boolean {
+  if (ownsProcessGroup() && child.pid) {
+    try { process.kill(-child.pid, 0); return true }
+    catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM' }
+  }
+  return child.exitCode === null && child.signalCode === null
+}
+
+async function waitForOwnedTreesToExit(children: ChildProcess[], timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (children.some(ownedTreeAlive) && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+}
 
 /** Grant free slots to queued waiters, interactive first, up to the cap. */
 function pumpSlots(): void {
@@ -122,15 +157,12 @@ function releaseSlot(): void {
   pumpSlots()
 }
 
-/** Reap every child and cancel anything still queued for a slot. */
-function reapAll(): void {
-  serveClient?.destroy()
+/** Detach every owned child and cancel anything still queued for a slot. */
+function takeAllChildren(): ChildProcess[] {
+  const children = new Set(activeChildren)
+  const resident = serveClient?.destroy()
+  if (resident) children.add(resident)
   serveClient = null
-  // Deliberately harder than every other kill path: quit has a 1.5s flush budget,
-  // shorter than the SIGTERM grace, so waiting one out would just wedge the quit.
-  // A lock left behind here still self-heals via the next parse's stale-pid
-  // takeover; a quit that hangs does not.
-  for (const child of activeChildren) child.kill('SIGKILL')
   activeChildren.clear()
   // A queued waiter has no child to reap, so releaseSlot never fires for it;
   // reject it explicitly so its caller settles instead of hanging past quit.
@@ -139,19 +171,34 @@ function reapAll(): void {
   backgroundQueue.length = 0
   running = 0
   for (const waiter of waiting) waiter.reject(new CliError('nonzero', 'codeburn cancelled'))
+  return [...children]
 }
 
 /** Test/dev cleanup that permits a later fresh start in this same process. */
 export function killAll(): void {
   shuttingDown = false
-  reapAll()
+  shutdownPromise = null
+  for (const child of takeAllChildren()) signalOwnedTree(child, 'SIGKILL')
 }
 
 /** Terminal app shutdown: reap current work and reject any IPC race that arrives
  * while Electron is still flushing telemetry before the final quit pass. */
-export function shutdownAll(): void {
+export function shutdownAll(): Promise<void> {
   shuttingDown = true
-  reapAll()
+  if (shutdownPromise) return shutdownPromise
+  const children = takeAllChildren()
+  for (const child of children) signalOwnedTree(child, 'SIGTERM')
+  shutdownPromise = (async () => {
+    await waitForOwnedTreesToExit(children, SHUTDOWN_TERM_GRACE_MS)
+    // Signal every still-live group, not only direct children. A cooperative
+    // CLI can exit before a stubborn provider subprocess; the group remains
+    // addressable by the original leader pid and must still be reaped.
+    for (const child of children) {
+      if (ownedTreeAlive(child)) signalOwnedTree(child, 'SIGKILL')
+    }
+    await waitForOwnedTreesToExit(children, SHUTDOWN_FORCE_WAIT_MS)
+  })()
+  return shutdownPromise
 }
 
 // Homebrew + common Node version managers, mirroring mac/CodeburnCLI.swift so a
@@ -359,9 +406,9 @@ function killGracefully(child: ChildProcess): void {
   activeChildren.add(child)
   let grace: NodeJS.Timeout | undefined
   const settle = () => { activeChildren.delete(child); if (grace) clearTimeout(grace) }
-  child.once('exit', settle)
-  try { child.kill('SIGTERM') } catch { settle(); return }
-  grace = setTimeout(() => { try { child.kill('SIGKILL') } catch { /* already gone */ } settle() }, KILL_GRACE_MS)
+  child.once('exit', () => { if (!ownedTreeAlive(child)) settle() })
+  if (!signalOwnedTree(child, 'SIGTERM')) { settle(); return }
+  grace = setTimeout(() => { signalOwnedTree(child, 'SIGKILL'); settle() }, KILL_GRACE_MS)
   grace.unref?.()
 }
 
@@ -373,7 +420,7 @@ function withoutProgressLines(stderr: string): string {
 
 function runCli(spec: SpawnSpec, cmdLabel: string, timeoutMs: number, onStderr?: (chunk: string) => void): Promise<unknown> {
   return new Promise<unknown>((resolve, reject) => {
-    const child = spawn(spec.bin, spec.args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'], env: spec.env })
+    const child = spawn(spec.bin, spec.args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'], env: spec.env, detached: ownsProcessGroup() })
     activeChildren.add(child)
     let stdout = ''
     let stderr = ''
@@ -413,7 +460,7 @@ function runCli(spec: SpawnSpec, cmdLabel: string, timeoutMs: number, onStderr?:
       total += n
       if (total > MAX_OUTPUT_BYTES) {
         finish(() => {
-          child.kill('SIGKILL')
+          signalOwnedTree(child, 'SIGKILL')
           reject(new CliError('too-large', `codeburn ${cmdLabel} produced more than ${MAX_OUTPUT_BYTES} bytes`))
         })
       }
@@ -527,10 +574,10 @@ class ServeClient {
 
   start(): void {
     if (this.child || this.disabled() || this.destroyed) return
-    const child = spawn(this.spec.bin, [...this.spec.args], { shell: false, stdio: ['pipe', 'pipe', 'ignore'], env: this.spec.env })
+    const child = spawn(this.spec.bin, [...this.spec.args], { shell: false, stdio: ['pipe', 'pipe', 'ignore'], env: this.spec.env, detached: ownsProcessGroup() })
     this.child = child
     if (this.pidFile && child.pid) {
-      const record = JSON.stringify({ pid: child.pid, cmd: [this.spec.bin, ...this.spec.args].join(' ') })
+      const record = JSON.stringify({ pid: child.pid, cmd: [this.spec.bin, ...this.spec.args].join(' '), processGroup: ownsProcessGroup() })
       try { writeFileSync(this.pidFile, record) } catch { /* reaping is best-effort */ }
     }
     child.stdout!.setEncoding('utf8')
@@ -629,7 +676,7 @@ class ServeClient {
       waiter.reject(error)
     }
     this.pending.clear()
-    child.kill('SIGKILL')
+    signalOwnedTree(child, 'SIGKILL')
   }
 
   private onDeath(child: ReturnType<typeof spawn>, countsTowardBudget = true): void {
@@ -713,13 +760,13 @@ class ServeClient {
     })
   }
 
-  destroy(): void {
+  destroy(): ChildProcess | null {
     this.destroyed = true
     this.deaths = SERVE_MAX_RESTARTS
     const child = this.child
-    if (!child) return
+    if (!child) return null
     this.onDeath(child, false)
-    killGracefully(child)
+    return child
   }
 }
 
@@ -795,7 +842,7 @@ export function serveCommandMatches(recorded: string, observed: string | null): 
 }
 
 export function reapOrphanServe(pidFile: string): void {
-  let record: { pid?: unknown; cmd?: unknown }
+  let record: { pid?: unknown; cmd?: unknown; processGroup?: unknown }
   try { record = JSON.parse(readFileSync(pidFile, 'utf-8')) } catch { return }
   try { unlinkSync(pidFile) } catch { /* stale file is harmless */ }
   const pid = record.pid
@@ -803,6 +850,9 @@ export function reapOrphanServe(pidFile: string): void {
   if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 1 || pid === process.pid) return
   if (typeof cmd !== 'string' || !cmd) return
   if (!serveCommandMatches(cmd, processCommandLine(pid))) return
+  if (record.processGroup === true && platform() !== 'win32') {
+    try { process.kill(-pid, 'SIGTERM'); return } catch { /* fall back for a pre-group child */ }
+  }
   try { process.kill(pid, 'SIGTERM') } catch { /* already gone */ }
 }
 
@@ -925,7 +975,7 @@ export function spawnCliAction(args: string[], opts: { timeoutMs?: number } = {}
 // no long silent stretch for a watchdog to misread.
 function runAction(spec: SpawnSpec, args: string[], timeoutMs: number): Promise<ActionResult> {
   return new Promise<ActionResult>(resolve => {
-    const child = spawn(spec.bin, spec.args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'], env: spec.env })
+    const child = spawn(spec.bin, spec.args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'], env: spec.env, detached: ownsProcessGroup() })
     activeChildren.add(child)
     let stdout = ''
     let stderr = ''
@@ -947,7 +997,7 @@ function runAction(spec: SpawnSpec, args: string[], timeoutMs: number): Promise<
     }
 
     const timer = setTimeout(() => {
-      child.kill('SIGKILL')
+      signalOwnedTree(child, 'SIGKILL')
       finish({ ok: false, stdout, stderr: `codeburn ${args[0] ?? ''} timed out after ${timeoutMs}ms`, code: null })
     }, timeoutMs)
 
