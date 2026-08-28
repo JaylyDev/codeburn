@@ -566,6 +566,44 @@ describe('Damaged acceptance record', () => {
     }) as never)
 
     const { registerSyncCommands } = await import('../src/sync/cli.js')
+describe('sync auto status --json', () => {
+  let testDir: string
+  beforeEach(async () => {
+    testDir = await mkdtemp(join(tmpdir(), 'sync-auto-'))
+    process.env.HOME = testDir
+  })
+
+  afterEach(async () => {
+    await rm(testDir, { recursive: true, force: true })
+  })
+
+  it('outputs JSON when --json flag is set', async () => {
+    await mkdir(join(testDir, '.config', 'codeburn'), { recursive: true })
+
+    const config = {
+      issuer: 'https://issuer.example.com',
+      clientId: 'test-client',
+      baseUrl: 'https://receiver.example.com',
+      auto: {
+        accepted: {
+          fingerprint: 'abc123',
+          acceptedAt: '2024-01-01T00:00:00Z',
+          cadence: 'daily' as const,
+          disclosure: 'test disclosure',
+          attribution: false,
+        },
+        killed: false,
+      },
+    }
+    writeSyncConfig(config)
+
+    appendReceipt({ at: '2024-01-01T12:00:00Z', fingerprint: 'abc123', result: 'pushed', spans: 5 })
+    appendReceipt({ at: '2024-01-01T13:00:00Z', fingerprint: 'abc123', result: 'pushed', spans: 3 })
+
+    // Import and setup CLI
+    const { registerSyncCommands } = await import('../src/sync/cli.js')
+    const { Command } = await import('commander')
+
     const program = new Command()
     program.exitOverride()
     registerSyncCommands(program)
@@ -577,5 +615,26 @@ describe('Damaged acceptance record', () => {
     const stdout = stdoutChunks.join('')
     expect(stdout).toContain('Automatic sync acceptance record is damaged.')
     expect(stdout).not.toContain('undefined')
+    const savedStdout = process.stdout.write
+    let stdout = ''
+    process.stdout.write = (chunk: string | Uint8Array | Buffer): boolean => {
+      stdout += chunk.toString()
+      return true
+    }
+
+    try {
+      await program.parseAsync(['node', 'codeburn', 'sync', 'auto', 'status', '--json'])
+      const result = JSON.parse(stdout)
+      expect(result.configured).toBe(true)
+      expect(result.accepted).toBeDefined()
+      expect(result.accepted.fingerprint).toBe('abc123')
+      expect(result.accepted.cadence).toBe('daily')
+      expect(result.accepted.attribution).toBe(false)
+      expect(result.killed).toBe(false)
+      expect(Array.isArray(result.receipts)).toBe(true)
+      expect(result.receipts.length).toBeGreaterThan(0)
+    } finally {
+      process.stdout.write = savedStdout
+    }
   })
 })

@@ -706,14 +706,67 @@ export function registerSyncCommands(program: Command): void {
   auto
     .command('status')
     .description('Show automatic sync status and recent receipts')
-    .action(async () => {
+    .option('--json', 'Output as machine-readable JSON')
+    .action(async (opts: { json?: boolean }) => {
       const config = readSyncConfig()
+
+      let currentMatches: boolean | undefined
+      let changed: string[] = []
+      const accepted = config?.auto?.accepted
+
+      // Recompute fingerprint to check for changes
+      if (accepted) {
+        try {
+          const pluginLoads: PluginLoad[] = await loadPlugins()
+          const pluginKeys = declaredSyncAttributes(pluginLoads)
+          const allKeys = Array.from(CORE_SYNC_ATTRIBUTE_KEYS)
+            .concat(Array.from(pluginKeys.keys()))
+            .sort()
+
+          const fingerprintInput = buildAcceptanceFingerprintInput(config, allKeys, accepted.attribution, accepted.cadence)
+          const currentFingerprint = computeAcceptanceFingerprint(fingerprintInput)
+          currentMatches = currentFingerprint === accepted.fingerprint
+          if (!currentMatches) {
+            changed = detectFingerprintChanges(accepted.input, fingerprintInput)
+          }
+        } catch {
+          currentMatches = undefined
+        }
+      }
+
+      if (opts.json) {
+        const result: Record<string, unknown> = {
+          configured: !!accepted,
+          killed: config?.auto?.killed ?? false,
+        }
+
+        if (accepted) {
+          result.accepted = {
+            fingerprint: accepted.fingerprint,
+            acceptedAt: accepted.acceptedAt,
+            cadence: accepted.cadence,
+            attribution: accepted.attribution,
+          }
+          if (currentMatches !== undefined) {
+            result.currentMatches = currentMatches
+            if (!currentMatches) {
+              result.changed = changed
+            }
+          }
+        }
+
+        const receipts = readReceipts(5)
+        result.receipts = receipts
+
+        process.stdout.write(JSON.stringify(result, null, 0) + '\n')
+        return
+      }
+
       if (!config?.auto?.accepted) {
         process.stdout.write('Automatic sync is not configured.\n')
         return
       }
 
-      const accepted = config.auto.accepted
       if (typeof accepted.fingerprint !== 'string' || typeof accepted.acceptedAt !== 'string') {
         process.stdout.write('Automatic sync acceptance record is damaged. Run: codeburn sync auto enable --cadence <daily|hourly> --accept\n')
         process.exit(1)
@@ -724,23 +777,11 @@ export function registerSyncCommands(program: Command): void {
       process.stdout.write(`Accepted at: ${accepted.acceptedAt}\n`)
       process.stdout.write(`Cadence: ${accepted.cadence}\n`)
 
-      // Recompute fingerprint to check for changes
-      try {
-        const pluginLoads: PluginLoad[] = await loadPlugins()
-        const pluginKeys = declaredSyncAttributes(pluginLoads)
-        const allKeys = Array.from(CORE_SYNC_ATTRIBUTE_KEYS)
-          .concat(Array.from(pluginKeys.keys()))
-          .sort()
-
-        const fingerprintInput = buildAcceptanceFingerprintInput(config, allKeys, accepted.attribution, accepted.cadence)
-        const currentFingerprint = computeAcceptanceFingerprint(fingerprintInput)
-        if (currentFingerprint === accepted.fingerprint) {
-          process.stdout.write('Current fingerprint: MATCHES\n')
-        } else {
-          const changed = detectFingerprintChanges(accepted.input, fingerprintInput)
-          process.stdout.write(`Current fingerprint: DIFFERS (${changed.join(', ')})\n`)
-        }
-      } catch {
+      if (currentMatches === true) {
+        process.stdout.write('Current fingerprint: MATCHES\n')
+      } else if (currentMatches === false) {
+        process.stdout.write(`Current fingerprint: DIFFERS (${changed.join(', ')})\n`)
+      } else {
         process.stdout.write('Current fingerprint: unable to recompute\n')
       }
 

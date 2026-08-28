@@ -727,4 +727,14 @@ export interface CodeburnBridge {
   completeOnboarding(enabled: boolean): Promise<TelemetryStatus | null>
   telemetryTrack(name: string, props?: Record<string, unknown>): Promise<boolean>
   openExternal(url: string): Promise<void>
+  // Plugin management
+  pluginList(): Promise<unknown>
+  pluginInfo(name: string): Promise<unknown>
+  pluginAdd(source: string): Promise<ActionResult>
+  pluginRemove(name: string): Promise<ActionResult>
+  pluginVerify(name: string): Promise<ActionResult>
+  // Sync auto
+  syncAutoStatus(): Promise<unknown>
+  syncAutoEnable(cadence: string, attribution: boolean, accept: boolean): Promise<unknown>
+  syncAutoDisable(): Promise<ActionResult>
 }

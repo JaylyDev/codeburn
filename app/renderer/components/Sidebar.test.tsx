@@ -16,12 +16,12 @@ describe('Sidebar', () => {
   it.each([
     ['darwin', '⌘'],
     ['win32', 'Ctrl+'],
-  ] as const)('renders all nine nav items in the desktop order with %s keycaps', (platform, mod) => {
+  ] as const)('renders all nav items in the desktop order with %s keycaps', (platform, mod) => {
     setPlatform(platform)
     render(<Sidebar active="overview" onNavigate={() => {}} />)
     const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const labels = screen.getAllByRole('button').map(item => item.textContent?.replace(/(⌘|Ctrl\+)[\d,]/, ''))
-    expect(labels).toEqual(['Overview', 'Sessions', 'Pull requests', 'Spend', 'Optimize', 'Models', 'Compare', 'Plans', 'Settings'])
+    const labels = screen.getAllByRole('button').map(item => item.textContent?.replace(/(⌘|Ctrl\+)[\d,.]/, ''))
+    expect(labels).toEqual(['Overview', 'Sessions', 'Pull requests', 'Spend', 'Optimize', 'Models', 'Compare', 'Plans', 'Settings', 'Plugins'])
     expect(screen.getByRole('button', { name: new RegExp(`Sessions.*${esc(mod)}2`) })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: new RegExp(`Pull requests.*${esc(mod)}3`) })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: new RegExp(`Compare.*${esc(mod)}7`) })).toBeInTheDocument()
