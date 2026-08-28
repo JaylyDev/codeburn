@@ -29,6 +29,7 @@ import {
   computeAcceptanceFingerprint,
   buildDisclosure,
   CORE_SYNC_FIELD_MEANINGS,
+  detectFingerprintChanges,
   type FingerprintInput,
   type DisclosureInput,
   type Receipt,
@@ -622,15 +623,23 @@ export function registerSyncCommands(program: Command): void {
             cadence,
             disclosure,
             attribution: workMatching,
+            input: fingerprintInput,
           },
           killed: false,
         }
         delete config.auto.killed
         writeSyncConfig(config)
 
-        await installSchedule(cadence, process.argv[1])
-
-        process.stdout.write(`Automatic sync enabled (${cadence}). Fingerprint: ${fingerprint}\n`)
+        try {
+          await installSchedule(cadence, process.argv[1])
+          process.stdout.write(`Automatic sync enabled (${cadence}). Fingerprint: ${fingerprint}\n`)
+        } catch (schedErr) {
+          process.stderr.write(`Warning: ${(schedErr as Error).message}\n`)
+          process.stderr.write(`Acceptance was stored and will take effect, but the schedule could not be installed.\n`)
+          process.stderr.write(`Run: codeburn sync auto enable --cadence ${cadence} --attribution${opts.attribution ? '' : ''}\n`)
+          process.stderr.write(`Or install manually: launchctl load ~/Library/LaunchAgents/com.codeburn.sync-auto.plist\n`)
+          process.exit(1)
+        }
       } catch (err) {
         process.stderr.write(`${(err as Error).message}\n`)
         process.exit(1)
@@ -694,12 +703,7 @@ export function registerSyncCommands(program: Command): void {
         if (currentFingerprint === accepted.fingerprint) {
           process.stdout.write('Current fingerprint: MATCHES\n')
         } else {
-          // Detect what changed
-          const changed: string[] = []
-          const baseCoreKeys = Array.from(CORE_SYNC_ATTRIBUTE_KEYS).sort()
-          if (JSON.stringify(allKeys) !== JSON.stringify(baseCoreKeys)) {
-            changed.push('field set')
-          }
+          const changed = detectFingerprintChanges(accepted.input, fingerprintInput)
           process.stdout.write(`Current fingerprint: DIFFERS (${changed.join(', ')})\n`)
         }
       } catch {
@@ -749,16 +753,11 @@ export function registerSyncCommands(program: Command): void {
         const currentFingerprint = computeAcceptanceFingerprint(fingerprintInput)
 
         if (currentFingerprint !== accepted.fingerprint) {
-          // Detect what changed
-          const changed: string[] = []
-          const baseCoreKeys = Array.from(CORE_SYNC_ATTRIBUTE_KEYS).sort()
-          if (JSON.stringify(allKeys) !== JSON.stringify(baseCoreKeys)) {
-            changed.push('field set')
-          }
+          const changed = detectFingerprintChanges(accepted.input, fingerprintInput)
           appendReceipt(buildReceipt(
             at,
             currentFingerprint,
-            { result: 'acceptance-required', changed: changed.length > 0 ? changed : ['unknown'] }
+            { result: 'acceptance-required', changed }
           ))
           return
         }

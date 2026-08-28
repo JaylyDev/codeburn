@@ -7,6 +7,7 @@ import {
   computeAcceptanceFingerprint,
   buildDisclosure,
   CORE_SYNC_FIELD_MEANINGS,
+  detectFingerprintChanges,
   type FingerprintInput,
   type DisclosureInput,
 } from '../src/sync/consent.js'
@@ -238,6 +239,58 @@ describe('Disclosure', () => {
         expect(line).not.toMatch(/:\s*$/)
       }
     }
+  })
+
+  it('includes work-matching line when enabled', () => {
+    const input: DisclosureInput = {
+      destination: 'test-org',
+      destinationUrl: 'https://endpoint.example.com',
+      cadence: 'daily',
+      outboundFields: [],
+      workMatching: true,
+      scopeSinceDays: 7,
+    }
+
+    const disclosure = buildDisclosure(input)
+    expect(disclosure).toContain('Work matching: on - session-to-commit links are sent')
+  })
+
+  it('includes work-matching line when disabled', () => {
+    const input: DisclosureInput = {
+      destination: 'test-org',
+      destinationUrl: 'https://endpoint.example.com',
+      cadence: 'daily',
+      outboundFields: [],
+      workMatching: false,
+      scopeSinceDays: 7,
+    }
+
+    const disclosure = buildDisclosure(input)
+    expect(disclosure).toContain('Work matching: off')
+  })
+
+  it('detects removed field set changes', () => {
+    const storedInput: FingerprintInput = {
+      org: 'test-org',
+      destination: 'https://endpoint.example.com',
+      outboundFields: ['ai.cost_usd', 'ai.model', 'plugin.custom'],
+      workMatching: false,
+      scopeSinceDays: 7,
+      cadence: 'daily',
+    }
+
+    const currentInput: FingerprintInput = {
+      org: 'test-org',
+      destination: 'https://endpoint.example.com',
+      outboundFields: ['ai.cost_usd', 'ai.model'],
+      workMatching: false,
+      scopeSinceDays: 7,
+      cadence: 'daily',
+    }
+
+    const changes = detectFingerprintChanges(storedInput, currentInput)
+    expect(changes[0]).toContain('field set')
+    expect(changes[0]).toContain('removed: plugin.custom')
   })
 })
 

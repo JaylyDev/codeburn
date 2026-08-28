@@ -77,6 +77,9 @@ export function buildDisclosure(input: DisclosureInput): string {
     : input.scopeSinceDays === 0
       ? 'today only'
       : `last ${input.scopeSinceDays} days`
+  const workMatchingText = input.workMatching
+    ? 'on - session-to-commit links are sent'
+    : 'off'
 
   const fieldsList = input.outboundFields.length > 0
     ? input.outboundFields
@@ -89,6 +92,7 @@ export function buildDisclosure(input: DisclosureInput): string {
     `URL: ${input.destinationUrl}`,
     `Cadence: ${cadenceText}`,
     `Scope: ${scopeText}`,
+    `Work matching: ${workMatchingText}`,
     '',
     'Data sent to the endpoint:',
     fieldsList,
@@ -109,6 +113,7 @@ export interface AcceptanceRecord {
   cadence: 'daily' | 'hourly'
   disclosure: string
   attribution: boolean
+  input?: FingerprintInput
 }
 
 export interface AutoSyncConfig {
@@ -140,4 +145,40 @@ export function buildReceipt(at: string, fingerprint: string | undefined, data: 
     ...(fingerprint && { fingerprint }),
     ...data,
   }
+}
+
+export function detectFingerprintChanges(stored: FingerprintInput | undefined, current: FingerprintInput): string[] {
+  if (!stored) return ['unknown']
+
+  const changes: string[] = []
+
+  if (stored.destination !== current.destination) {
+    changes.push('destination')
+  }
+
+  if (stored.cadence !== current.cadence) {
+    changes.push('cadence')
+  }
+
+  if (stored.scopeSinceDays !== current.scopeSinceDays) {
+    changes.push('scope')
+  }
+
+  if (stored.workMatching !== current.workMatching) {
+    changes.push('work matching')
+  }
+
+  const storedFields = new Set(stored.outboundFields)
+  const currentFields = new Set(current.outboundFields)
+  const added = Array.from(currentFields).filter(f => !storedFields.has(f)).sort()
+  const removed = Array.from(storedFields).filter(f => !currentFields.has(f)).sort()
+
+  if (added.length > 0 || removed.length > 0) {
+    const parts: string[] = []
+    if (added.length > 0) parts.push(`added: ${added.join(', ')}`)
+    if (removed.length > 0) parts.push(`removed: ${removed.join(', ')}`)
+    changes.push(`field set (${parts.join(' / ')})`)
+  }
+
+  return changes.length > 0 ? changes : ['unknown']
 }

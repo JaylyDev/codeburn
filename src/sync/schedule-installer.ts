@@ -8,7 +8,7 @@
 import { platform } from 'os'
 import { homedir } from 'os'
 import { join } from 'path'
-import { writeFileSync, unlinkSync, existsSync } from 'fs'
+import { writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs'
 import { spawn } from 'child_process'
 
 const SCHEDULE_AGENT_NAME = 'com.codeburn.sync-auto'
@@ -67,8 +67,12 @@ export async function installSchedule(
 
   const plistContent = buildLaunchAgentPlist(cadence, codeburnPath)
   const plistPath = launchAgentPath()
+  const agentDir = launchAgentDir()
 
   try {
+    // Ensure LaunchAgents directory exists
+    mkdirSync(agentDir, { recursive: true })
+
     // Write the plist
     writeFileSync(plistPath, plistContent, { mode: 0o644 })
 
