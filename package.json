@@ -25,7 +25,6 @@
     "perf:fixture": "node scripts/perf/gen-fixture.mjs",
     "perf:metric": "node scripts/perf/run-metric.mjs",
     "perf:all": "node scripts/perf/run-metric.mjs --metric all",
-    "perf:pin": "node scripts/perf/pin-baselines.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

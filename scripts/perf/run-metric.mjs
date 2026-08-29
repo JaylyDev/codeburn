@@ -6,6 +6,7 @@
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { parseArgs as parseArgvOptions } from 'node:util'
 import { performance } from 'node:perf_hooks'
 import {
   DESKTOP_OVERVIEW_ARGS,
@@ -38,17 +39,26 @@ const METRICS = new Set([
 ])
 
 function parseArgs(argv) {
-  const result = { metric: '', home: '', output: '', trialsCold: 3, trialsWarm: 5, idleMs: 0 }
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i]
-    if (arg === '--metric') result.metric = argv[++i] ?? ''
-    else if (arg === '--home') result.home = argv[++i] ?? ''
-    else if (arg === '--output') result.output = argv[++i] ?? ''
-    else if (arg === '--trials-cold') result.trialsCold = Number(argv[++i])
-    else if (arg === '--trials-warm') result.trialsWarm = Number(argv[++i])
-    else if (arg === '--idle-ms') result.idleMs = Number(argv[++i])
-    else if (arg === '--help' || arg === '-h') result.help = true
-    else throw new Error('Unknown argument: ' + arg)
+  const { values } = parseArgvOptions({
+    args: argv,
+    options: {
+      metric: { type: 'string', default: '' },
+      home: { type: 'string', default: '' },
+      output: { type: 'string', default: '' },
+      'trials-cold': { type: 'string', default: '3' },
+      'trials-warm': { type: 'string', default: '5' },
+      'idle-ms': { type: 'string', default: '0' },
+      help: { type: 'boolean', short: 'h', default: false },
+    },
+  })
+  const result = {
+    metric: values.metric,
+    home: values.home,
+    output: values.output,
+    trialsCold: Number(values['trials-cold']),
+    trialsWarm: Number(values['trials-warm']),
+    idleMs: Number(values['idle-ms']),
+    help: values.help,
   }
   if (result.help) return result
   if (!METRICS.has(result.metric)) throw new Error('Invalid --metric. Expected one of: ' + [...METRICS].join(', '))
@@ -255,16 +265,13 @@ async function runDockTuiProxy(ctx) {
   const client = new ServeClient(env)
   await client.start()
   await client.request(1, MENUBAR_STATUS_ARGS)
-  const hover = []
   const refresh = []
   const view = []
   const rows = []
   let id = 2
+  // No hover proxy: Capacity Dock hover is native quota UI and never spawns
+  // this argv, so a number for it here would be theater.
   for (let trial = 1; trial <= trialsWarm; trial++) {
-    const h = await client.request(id++, MENUBAR_STATUS_ARGS)
-    hover.push(h.completeMs)
-    rows.push(rowBase(runId, 'PERF-DOCK-HOVER-PROXY', 'serve', 'resident-warm-full', trial, 'warm', performance.now(), h.completeMs, summarizePayload(h.output),
-      'PROXY ONLY: Capacity Dock hover is native quota UI, not menubar-json. This is badge-payload reuse latency.'))
     const r = await client.request(id++, DESKTOP_OVERVIEW_ARGS)
     refresh.push(r.completeMs)
     rows.push(rowBase(runId, 'PERF-REFRESH-PROXY', 'serve', 'resident-warm-full', trial, 'warm', performance.now(), r.completeMs, summarizePayload(r.output),
@@ -277,7 +284,6 @@ async function runDockTuiProxy(ctx) {
   await client.close()
   const payload = {
     metric: 'dock-tui-proxy',
-    hover_proxy_ms: stats(hover),
     refresh_ms: stats(refresh),
     view_switch_ms: stats(view),
     note: 'Hover/view-switch UI remains computer-use. TUI period keys require a TTY Ink harness, not this runner.',

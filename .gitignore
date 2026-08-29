@@ -35,9 +35,8 @@ npm-debug.log*
 .cache/
 *.sqlite
 
-# Performance harness local outputs (synthetic HOME copies + run receipts)
+# Performance harness local outputs (run receipts)
 perf/results/
-perf/fixtures/generated/
 
 # Build artifacts
 *.tsbuildinfo

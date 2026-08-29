@@ -27,13 +27,7 @@ These rows are wait-path measurements through isolated HOME + CLI/serve. They ar
 | refresh proxy (ms p95) | scripts/perf/gen-fixture.mjs --target-mb 30 (isolated HOME) | node scripts/perf/run-metric.mjs --metric dock-tui-proxy --home <HOME> | Mac15,14, arm64, v22.22.3, sha 93b7b9a7 | 211.4 | hover is native dock; this is payload reuse |
 | view-switch proxy (ms p95) | scripts/perf/gen-fixture.mjs --target-mb 30 (isolated HOME) | same | Mac15,14, arm64, v22.22.3, sha 93b7b9a7 | 121.3 | period week request; sidebar paint NOT VERIFIED |
 | memory RSS after cold load (bytes) | scripts/perf/gen-fixture.mjs --target-mb 30 (isolated HOME) | node scripts/perf/run-metric.mjs --metric memory --home <HOME> | Mac15,14, arm64, v22.22.3, sha 93b7b9a7 | 366460928 | 1h idle not run in this invocation. Pass --idle-ms 3600000 for the leak check. |
-| memory RSS after idle (bytes) | scripts/perf/gen-fixture.mjs --target-mb 30 (isolated HOME) | same --idle-ms 3600000 | Mac15,14, arm64, v22.22.3, sha 93b7b9a7 | 366460928 | 1h leak check only if idle_ms=3600000 |
 
 ## Reproduction
 
-```bash
-HOME_DIR=$(mktemp -d /tmp/codeburn-perf-XXXX)
-node scripts/perf/gen-fixture.mjs --home "$HOME_DIR" --target-mb 30
-node scripts/perf/run-metric.mjs --metric all --home "$HOME_DIR"
-node scripts/perf/pin-baselines.mjs --summary perf/results/<run>/summary.json
-```
+See [perf/README.md](./README.md) — same two commands, then compare against this table.

@@ -5,15 +5,14 @@
 
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, writeFileSync, statSync, readdirSync } from 'node:fs'
-import { homedir, userInfo } from 'node:os'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { cpus, homedir, loadavg, release, totalmem, userInfo } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { performance } from 'node:perf_hooks'
 
 export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 export const PERF_DIR = join(REPO, 'perf')
 export const RESULTS_DIR = join(PERF_DIR, 'results')
-export const GENERATED_FIXTURE_DIR = join(PERF_DIR, 'fixtures', 'generated')
 
 export const TIMINGS_HEADER = [
   'run_id', 'case_id', 'surface', 'persona', 'operation', 'trial', 'cache_state',
@@ -126,23 +125,19 @@ export async function machineSnapshot() {
   const sha = await capture('git', ['rev-parse', 'HEAD'], { cwd: REPO }).catch(() => 'unknown')
   const branch = await capture('git', ['branch', '--show-current'], { cwd: REPO }).catch(() => '')
   const dirty = await capture('git', ['status', '--porcelain=v1'], { cwd: REPO }).catch(() => '')
-  const os = await capture('sw_vers', [], { cwd: REPO }).catch(() => String(process.platform))
-  const arch = await capture('uname', ['-m'], { cwd: REPO }).catch(() => process.arch)
+  // hw.model has no node:os equivalent; everything else does.
   const hardware = await capture('sysctl', ['-n', 'hw.model'], { cwd: REPO }).catch(() => 'unknown')
-  const memoryBytes = Number(await capture('sysctl', ['-n', 'hw.memsize'], { cwd: REPO }).catch(() => '0'))
-  const loadavg = await capture('sysctl', ['-n', 'vm.loadavg'], { cwd: REPO }).catch(() => '')
-  const ncpu = Number(await capture('sysctl', ['-n', 'hw.ncpu'], { cwd: REPO }).catch(() => '0'))
   return {
     captured_at: new Date().toISOString(),
     sha,
     branch,
     dirty: Boolean(dirty),
-    os: os.replaceAll('\n', ' | '),
-    arch,
+    os: process.platform + ' ' + release(),
+    arch: process.arch,
     hardware,
-    memory_bytes: memoryBytes,
-    ncpu,
-    loadavg,
+    memory_bytes: totalmem(),
+    ncpu: cpus().length,
+    loadavg: loadavg().map(n => n.toFixed(2)).join(' '),
     node: process.version,
     cli: cliEntry().label,
     cwd: REPO,
@@ -317,16 +312,6 @@ export class ServeClient {
       new Promise(resolve => setTimeout(() => { this.child.kill('SIGKILL'); resolve() }, 5_000)),
     ])
   }
-}
-
-export function ensureDir(path) {
-  mkdirSync(path, { recursive: true, mode: 0o700 })
-  return path
-}
-
-export function assertAbsolute(path, label) {
-  if (!isAbsolute(path)) throw new Error(label + ' must be an absolute path')
-  return path
 }
 
 export function assertIsolatedHome(home) {

@@ -7,21 +7,23 @@
 // Layout matches provider default paths under HOME so the harness only has to
 // set HOME + CODEBURN_CACHE_DIR (same isolation as scripts/upgrade-path).
 
-import { mkdirSync, writeFileSync, existsSync, rmSync, readdirSync, statSync } from 'node:fs'
+import { mkdirSync, writeFileSync, existsSync, rmSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { parseArgs as parseArgvOptions } from 'node:util'
 import { assertIsolatedHome, fixtureBytes } from './lib.mjs'
 
 function parseArgs(argv) {
-  const result = { home: '', targetMb: 30, seed: 0x9e3779b9, force: false }
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i]
-    if (arg === '--home') result.home = argv[++i] ?? ''
-    else if (arg === '--target-mb') result.targetMb = Number(argv[++i])
-    else if (arg === '--seed') result.seed = Number(argv[++i])
-    else if (arg === '--force') result.force = true
-    else if (arg === '--help' || arg === '-h') result.help = true
-    else throw new Error('Unknown argument: ' + arg)
-  }
+  const { values } = parseArgvOptions({
+    args: argv,
+    options: {
+      home: { type: 'string', default: '' },
+      'target-mb': { type: 'string', default: '30' },
+      seed: { type: 'string', default: String(0x9e3779b9) },
+      force: { type: 'boolean', default: false },
+      help: { type: 'boolean', short: 'h', default: false },
+    },
+  })
+  const result = { home: values.home, targetMb: Number(values['target-mb']), seed: Number(values.seed), force: values.force, help: values.help }
   if (result.help) return result
   if (!result.home) throw new Error('--home is required')
   if (!Number.isFinite(result.targetMb) || result.targetMb < 1) throw new Error('--target-mb must be >= 1')
@@ -41,11 +43,9 @@ function mulberry(seed) {
 
 function writeLines(path, lines) {
   mkdirSync(join(path, '..'), { recursive: true })
-  writeFileSync(path, lines.join('\n') + '\n')
-}
-
-function walkBytes(root) {
-  return fixtureBytes(root)
+  const body = lines.join('\n') + '\n'
+  writeFileSync(path, body)
+  return Buffer.byteLength(body)
 }
 
 function main() {
@@ -103,9 +103,10 @@ function main() {
   const targetBytes = options.targetMb * 1024 * 1024
   let files = 0
   let sessions = 0
+  let claudeBytes = 0
   const projectsDir = join(HOME, '.claude', 'projects')
   let i = 0
-  while (walkBytes(join(HOME, '.claude')) < targetBytes * 0.88) {
+  while (claudeBytes < targetBytes * 0.88) {
     const cwd = PROJECTS[i % PROJECTS.length]
     const day = (i * 3) % SPAN_DAYS
     const sid = 'perf-' + String(i).padStart(5, '0')
@@ -127,7 +128,7 @@ function main() {
         cache_creation_input_tokens: between(0, 3000),
       }, content))
     }
-    writeLines(join(projectsDir, dirName, sid + '.jsonl'), lines)
+    claudeBytes += writeLines(join(projectsDir, dirName, sid + '.jsonl'), lines)
     files++
     sessions++
     i++
@@ -162,7 +163,7 @@ function main() {
     sessions++
   }
 
-  const bytes = walkBytes(HOME)
+  const bytes = fixtureBytes(HOME)
   const manifest = {
     kind: 'codeburn-perf-fixture',
     version: 1,
