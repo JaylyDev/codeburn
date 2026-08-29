@@ -91,3 +91,9 @@ SOFTWARE.
 Provider names and logos remain the property of their respective owners. They
 are displayed only to identify supported services; inclusion does not imply
 endorsement, sponsorship, or affiliation.
+
+---
+
+## CodexBar
+
+The Capacity Dock's provider usage tracking — the set of provider endpoints and response shapes CodeBurn reads to show per-provider quota — was informed by CodexBar (https://github.com/steipete/CodexBar) by Peter Steinberger, an MIT-licensed macOS menubar app for tracking AI provider usage. CodeBurn's adapters are an independent implementation written for the Capacity Dock; CodexBar is credited here as prior art for the approach.
