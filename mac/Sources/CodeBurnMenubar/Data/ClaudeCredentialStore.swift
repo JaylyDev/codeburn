@@ -249,6 +249,10 @@ enum ClaudeCredentialStore {
 
     private static func readClaudeSourceSilently() -> CredentialRecord? {
         if let fromFile = try? readClaudeFile() { return fromFile }
+        // An overridden home is an isolation boundary (tests and explicit
+        // sandboxed probes). Falling through here would read the operator's
+        // login Keychain when the isolated fixture has no Claude file.
+        guard homeDirectoryOverride == nil else { return nil }
         if let fromKeychain = try? readClaudeKeychain(allowUI: false) { return fromKeychain }
         return nil
     }
@@ -261,6 +265,7 @@ enum ClaudeCredentialStore {
 
     private static func readClaudeSource() throws -> CredentialRecord {
         if let silent = readClaudeSourceSilently() { return silent }
+        guard homeDirectoryOverride == nil else { throw StoreError.bootstrapNoSource }
         if let fromKeychain = try readClaudeKeychain(allowUI: true) { return fromKeychain }
         throw StoreError.bootstrapNoSource
     }
