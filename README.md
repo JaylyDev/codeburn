@@ -58,9 +58,16 @@
       <a href="https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.23"><img src="https://img.shields.io/badge/Windows-Tray_app_(.msi)-F97316?logo=windows&logoColor=white" alt="Download the CodeBurn Windows menubar" /></a>
     </td>
   </tr>
+  <tr>
+    <td align="center" colspan="2">
+      <strong>Capacity Dock</strong> <em>&middot; native macOS menubar</em><br/>
+      <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/capacity-dock.jpg" alt="CodeBurn Capacity Dock showing live provider usage rings on the screen edge" width="66%" /><br/>
+      <code>codeburn menubar</code>
+    </td>
+  </tr>
 </table>
 
-<p align="center"><em>Four surfaces, one source of truth: everything reads the session files already on your disk.</em></p>
+<p align="center"><em>One source of truth: every surface reads the session files already on your disk.</em></p>
 
 **CodeBurn is a free, open-source, local-first tool that tracks AI coding token usage and cost across 41 tools and agents (Claude Code, Cursor, Codex, Gemini, Grok and more), broken down by model, project, and task.**
 
