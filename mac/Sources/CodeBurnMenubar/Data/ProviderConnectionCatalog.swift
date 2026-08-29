@@ -55,7 +55,7 @@ enum ProviderConnectionCatalog {
         entry("claude", "Claude", [.automatic, .api, .web, .cli, .oauth],
               [.localAppOrCLI, .oauth, .apiTokenOrCloudCredentials, .cookieOrWebSession], live: true),
         entry("clinepass", "ClinePass", [.automatic, .api], [.apiTokenOrCloudCredentials], live: true),
-        entry("cursor", "Cursor", [.automatic, .cli, .web], [.localAppOrCLI, .cookieOrWebSession]),
+        entry("cursor", "Cursor", [.automatic, .cli, .web], [.localAppOrCLI, .cookieOrWebSession], live: true),
         entry("opencode", "OpenCode", [.automatic, .web], [.cookieOrWebSession]),
         entry("opencodego", "OpenCode Go", [.automatic, .api, .web],
               [.localAppOrCLI, .apiTokenOrCloudCredentials, .cookieOrWebSession, .none]),
@@ -221,4 +221,3 @@ enum ProviderConnectionSubmissionPolicy {
         return .connect
     }
 }
-

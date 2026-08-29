@@ -17,11 +17,18 @@ enum CapacityDockProviderRefreshInteraction {
 @MainActor
 final class CapacityDockProviderQuotaService {
     struct Dependencies: Sendable {
+        // No defaults here: only `.live` may reach the real adapters, so a
+        // test can never silently read the local Cursor session or hit the
+        // network by omitting a field.
         var refreshClinePass: @Sendable (String) async throws -> QuotaSummary
+        var refreshCursor: @Sendable () async throws -> QuotaSummary
 
         static let live = Dependencies(
             refreshClinePass: { apiKey in
                 try await ClinePassSubscriptionService.refresh(apiKey: apiKey)
+            },
+            refreshCursor: {
+                try await CursorSubscriptionService.refresh()
             }
         )
     }
@@ -39,6 +46,14 @@ final class CapacityDockProviderQuotaService {
         credential: CapacityDockProviderCredential
     ) async throws -> QuotaSummary {
         switch provider.id {
+        case "cursor":
+            do {
+                return try await dependencies.refreshCursor()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw CapacityDockProviderFetchFailure(error: error)
+            }
         case "clinepass":
             guard let apiKey = credential.sanitizedOverride.apiKey else {
                 throw CapacityDockProviderFetchFailure(
@@ -91,6 +106,14 @@ struct CapacityDockProviderFetchFailure: LocalizedError, Equatable, Sendable {
             return failure.disposition
         }
         if let error = error as? ClinePassSubscriptionService.FetchError {
+            switch error.classification {
+            case .terminalAuth:
+                return .terminal
+            case .transient, .parseFailure:
+                return .transient
+            }
+        }
+        if let error = error as? CursorSubscriptionService.FetchError {
             switch error.classification {
             case .terminalAuth:
                 return .terminal
