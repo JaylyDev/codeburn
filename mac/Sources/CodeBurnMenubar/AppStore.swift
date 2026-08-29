@@ -189,6 +189,10 @@ final class AppStore {
         @Sendable (String) async throws -> Void = {
             try await CapacityDockProviderCredentialStore.removeAsync(for: $0)
         }
+    @ObservationIgnored var capacityDockProviderDeselector:
+        (CapacityDockProvider) -> Void = {
+            CapacityDockPreferences.removeProvider($0)
+        }
 
     /// Generation tokens for the in-flight refresh tasks. Incremented on every
     /// disconnect / reset so a fetch that started before the disconnect cannot
@@ -1772,6 +1776,11 @@ final class AppStore {
         capacityDockProviderErrors[provider.id] = nil
         capacityDockProvidersLoading.remove(provider.id)
         capacityDockProviderTransientFailures.remove(provider.id)
+        // Drop the provider from the persisted dock selection too. A
+        // credential-less adapter (Cursor) still selected there would be
+        // silently reconnected by the next scheduled refresh, undoing the
+        // user's explicit disconnect.
+        capacityDockProviderDeselector(provider)
     }
 
     func connectCapacityDockProvider(_ provider: CapacityDockProvider) async {

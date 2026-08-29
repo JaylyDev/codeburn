@@ -5,6 +5,13 @@ import Testing
 @Suite("Capacity Dock provider quota registry")
 @MainActor
 struct CapacityDockProviderQuotaServiceTests {
+    /// Dependencies has no live defaults, so every test names each adapter.
+    /// Adapters the test does not exercise fail loudly if dispatched.
+    nonisolated private static let unusedCursor: @Sendable () async throws -> QuotaSummary = {
+        Issue.record("Wrong adapter dispatched")
+        return Self.summary()
+    }
+
     @Test("ClinePass dispatches with only its provider-scoped API key")
     func dispatchesClinePass() async throws {
         let capture = SecretCapture()
@@ -13,7 +20,8 @@ struct CapacityDockProviderQuotaServiceTests {
             refreshClinePass: { apiKey in
                 await capture.record(apiKey)
                 return expected
-            }
+            },
+            refreshCursor: Self.unusedCursor
         ))
         let provider = try #require(CapacityDockProvider(rawValue: "clinepass"))
         let credential = CapacityDockProviderCredential(
@@ -54,7 +62,8 @@ struct CapacityDockProviderQuotaServiceTests {
             refreshClinePass: { _ in
                 Issue.record("Adapter must not run without a key")
                 return Self.summary()
-            }
+            },
+            refreshCursor: Self.unusedCursor
         ))
         let provider = try #require(CapacityDockProvider(rawValue: "clinepass"))
 
@@ -83,7 +92,8 @@ struct CapacityDockProviderQuotaServiceTests {
             refreshClinePass: { _ in
                 Issue.record("Wrong adapter dispatched")
                 return Self.summary()
-            }
+            },
+            refreshCursor: Self.unusedCursor
         ))
         let provider = try #require(CapacityDockProvider(rawValue: "openrouter"))
 
@@ -103,7 +113,8 @@ struct CapacityDockProviderQuotaServiceTests {
     @Test("adapter authentication failures are terminal")
     func classifiesAuthenticationFailure() async throws {
         let service = CapacityDockProviderQuotaService(dependencies: .init(
-            refreshClinePass: { _ in throw ClinePassSubscriptionService.FetchError.authenticationRejected }
+            refreshClinePass: { _ in throw ClinePassSubscriptionService.FetchError.authenticationRejected },
+            refreshCursor: Self.unusedCursor
         ))
         let provider = try #require(CapacityDockProvider(rawValue: "clinepass"))
 
@@ -126,7 +137,8 @@ struct CapacityDockProviderQuotaServiceTests {
 
         for error in errors {
             let service = CapacityDockProviderQuotaService(dependencies: .init(
-                refreshClinePass: { _ in throw error }
+                refreshClinePass: { _ in throw error },
+                refreshCursor: Self.unusedCursor
             ))
             do {
                 _ = try await service.fetch(
@@ -153,11 +165,13 @@ struct CapacityDockProviderQuotaServiceTests {
             CapacityDockProviderCredential(sourceMode: "api", apiKey: "synthetic")
         }
         store.capacityDockCredentialRemover = { _ in }
+        store.capacityDockProviderDeselector = { _ in }
         store.capacityDockProviderQuotaService = CapacityDockProviderQuotaService(dependencies: .init(
             refreshClinePass: { _ in
                 await gate.pause()
                 return Self.summary(percent: 0.73)
-            }
+            },
+            refreshCursor: Self.unusedCursor
         ))
 
         let refresh = Task { await store.refreshCapacityDockProvider(provider) }
@@ -177,6 +191,9 @@ struct CapacityDockProviderQuotaServiceTests {
         let known = Self.summary(percent: 0.42)
         store.capacityDockProviderSummaries[provider.id] = known
         store.capacityDockCredentialRemover = { _ in throw SyntheticDeleteFailure() }
+        store.capacityDockProviderDeselector = { _ in
+            Issue.record("A failed disconnect must not edit the dock selection")
+        }
 
         await #expect(throws: SyntheticDeleteFailure.self) {
             try await store.disconnectCapacityDockProvider(provider)
@@ -184,6 +201,40 @@ struct CapacityDockProviderQuotaServiceTests {
 
         #expect(store.capacityDockProviderSummaries[provider.id] == known)
         #expect(!store.capacityDockProvidersLoading.contains(provider.id))
+    }
+
+    @Test("disconnect removes the provider from the persisted dock selection")
+    func disconnectDeselectsFromDock() async throws {
+        let provider = try #require(CapacityDockProvider(rawValue: "cursor"))
+        let store = AppStore()
+        store.capacityDockCredentialRemover = { _ in }
+        var deselected: [CapacityDockProvider] = []
+        store.capacityDockProviderDeselector = { deselected.append($0) }
+
+        try await store.disconnectCapacityDockProvider(provider)
+
+        #expect(deselected == [provider])
+    }
+
+    @Test("removeProvider drops only the target and keeps manual selection unlatched")
+    func removeProviderPersistence() throws {
+        let defaults = try #require(UserDefaults(
+            suiteName: "CodeBurnMenubarTests.CapacityDockRemove.\(UUID().uuidString)"
+        ))
+        let cursor = try #require(CapacityDockProvider(rawValue: "cursor"))
+        defaults.set(["codex", "cursor"], forKey: CapacityDockPreferences.selectedProvidersKey)
+        defaults.set("cursor", forKey: CapacityDockPreferences.preferredProviderKey)
+
+        CapacityDockPreferences.removeProvider(cursor, defaults: defaults)
+
+        let snapshot = CapacityDockPreferences.load(defaults: defaults)
+        #expect(snapshot.selectedProviders == [.codex])
+        #expect(snapshot.preferredProvider == .codex)
+        #expect(!defaults.bool(forKey: CapacityDockPreferences.manualSelectionKey))
+
+        // Removing a provider that is not selected must not rewrite anything.
+        CapacityDockPreferences.removeProvider(cursor, defaults: defaults)
+        #expect(CapacityDockPreferences.load(defaults: defaults).selectedProviders == [.codex])
     }
 
     private actor SecretCapture {

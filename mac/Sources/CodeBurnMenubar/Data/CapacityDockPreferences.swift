@@ -257,6 +257,26 @@ enum CapacityDockPreferences {
         notifyChanged()
     }
 
+    /// Drops one provider from the persisted dock selection without latching
+    /// manual-selection mode. Disconnect needs this: a credential-less
+    /// adapter (Cursor) left in the selection would silently reconnect on the
+    /// next scheduled refresh.
+    static func removeProvider(
+        _ provider: CapacityDockProvider,
+        defaults: UserDefaults = .standard
+    ) {
+        let stored = defaults.stringArray(forKey: selectedProvidersKey) ?? []
+        let remaining = stored.filter { $0 != provider.rawValue }
+        guard remaining.count != stored.count else { return }
+        defaults.set(remaining, forKey: selectedProvidersKey)
+        let preferred = normalizedPreferred(
+            defaults.string(forKey: preferredProviderKey).flatMap(CapacityDockProvider.init(rawValue:)),
+            selected: normalizedProviders(rawIdentifiers: remaining)
+        )
+        defaults.set(preferred.rawValue, forKey: preferredProviderKey)
+        notifyChanged()
+    }
+
     /// Until the user manually edits the dock set, mirror the connected
     /// subscriptions (capped) so a fresh install shows what's actually active.
     /// No-ops once `manualSelectionKey` latches or the set already matches.
