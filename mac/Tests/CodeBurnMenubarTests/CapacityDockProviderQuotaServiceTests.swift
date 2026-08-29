@@ -28,6 +28,26 @@ struct CapacityDockProviderQuotaServiceTests {
         #expect(capturedKeys == ["synthetic-clinepass-key"])
     }
 
+    @Test("Cursor dispatches through passive local-session discovery")
+    func dispatchesCursor() async throws {
+        let expected = Self.summary(percent: 0.37)
+        let service = CapacityDockProviderQuotaService(dependencies: .init(
+            refreshClinePass: { _ in
+                Issue.record("Wrong adapter dispatched")
+                return Self.summary()
+            },
+            refreshCursor: { expected }
+        ))
+        let provider = try #require(CapacityDockProvider(rawValue: "cursor"))
+
+        let result = try await service.fetch(
+            provider: provider,
+            credential: CapacityDockProviderCredential()
+        )
+
+        #expect(result == expected)
+    }
+
     @Test("ClinePass requires its own saved API key")
     func requiresClinePassKey() async throws {
         let service = CapacityDockProviderQuotaService(dependencies: .init(

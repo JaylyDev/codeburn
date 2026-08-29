@@ -18,10 +18,24 @@ enum CapacityDockProviderRefreshInteraction {
 final class CapacityDockProviderQuotaService {
     struct Dependencies: Sendable {
         var refreshClinePass: @Sendable (String) async throws -> QuotaSummary
+        var refreshCursor: @Sendable () async throws -> QuotaSummary
+
+        init(
+            refreshClinePass: @escaping @Sendable (String) async throws -> QuotaSummary,
+            refreshCursor: @escaping @Sendable () async throws -> QuotaSummary = {
+                try await CursorSubscriptionService.refresh()
+            }
+        ) {
+            self.refreshClinePass = refreshClinePass
+            self.refreshCursor = refreshCursor
+        }
 
         static let live = Dependencies(
             refreshClinePass: { apiKey in
                 try await ClinePassSubscriptionService.refresh(apiKey: apiKey)
+            },
+            refreshCursor: {
+                try await CursorSubscriptionService.refresh()
             }
         )
     }
@@ -39,6 +53,14 @@ final class CapacityDockProviderQuotaService {
         credential: CapacityDockProviderCredential
     ) async throws -> QuotaSummary {
         switch provider.id {
+        case "cursor":
+            do {
+                return try await dependencies.refreshCursor()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw CapacityDockProviderFetchFailure(error: error)
+            }
         case "clinepass":
             guard let apiKey = credential.sanitizedOverride.apiKey else {
                 throw CapacityDockProviderFetchFailure(
@@ -91,6 +113,14 @@ struct CapacityDockProviderFetchFailure: LocalizedError, Equatable, Sendable {
             return failure.disposition
         }
         if let error = error as? ClinePassSubscriptionService.FetchError {
+            switch error.classification {
+            case .terminalAuth:
+                return .terminal
+            case .transient, .parseFailure:
+                return .transient
+            }
+        }
+        if let error = error as? CursorSubscriptionService.FetchError {
             switch error.classification {
             case .terminalAuth:
                 return .terminal
