@@ -12,6 +12,7 @@ enum CursorSubscriptionService {
         case noCredentials
         case expiredSession
         case authenticationRejected
+        case appDataUnreadable
         case rateLimited
         case providerUnavailable
         case parseFailure
@@ -27,7 +28,7 @@ enum CursorSubscriptionService {
             switch self {
             case .noCredentials, .expiredSession, .authenticationRejected:
                 return .terminalAuth
-            case .rateLimited, .providerUnavailable, .network:
+            case .appDataUnreadable, .rateLimited, .providerUnavailable, .network:
                 return .transient
             case .parseFailure:
                 return .parseFailure
@@ -42,6 +43,8 @@ enum CursorSubscriptionService {
                 return "The Cursor app session is expired or invalid. Sign in again, then click Retry."
             case .authenticationRejected:
                 return "Cursor rejected the current app session. Sign in again, then click Retry."
+            case .appDataUnreadable:
+                return "Could not read the Cursor app's local session data. Quit and reopen Cursor, then click Retry."
             case .rateLimited:
                 return "Cursor rate-limited the quota request."
             case .providerUnavailable:
@@ -81,7 +84,12 @@ enum CursorSubscriptionService {
     static func refresh(deps: Deps = .live) async throws -> QuotaSummary {
         let accessToken: String
         do {
-            guard let loaded = try deps.loadAccessToken()?.trimmingCharacters(in: .whitespacesAndNewlines),
+            // The store read is synchronous SQLite with a 250ms busy timeout;
+            // keep it off the main actor so a lock held by Cursor cannot
+            // stall the UI.
+            let loadAccessToken = deps.loadAccessToken
+            let raw = try await Task.detached { try loadAccessToken() }.value
+            guard let loaded = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !loaded.isEmpty else {
                 throw FetchError.noCredentials
             }
@@ -89,7 +97,7 @@ enum CursorSubscriptionService {
         } catch let error as FetchError {
             throw error
         } catch {
-            throw FetchError.network
+            throw FetchError.appDataUnreadable
         }
 
         let session = try session(from: accessToken)
@@ -141,7 +149,9 @@ enum CursorSubscriptionService {
 
         let monthlyPercent: Double? = {
             if let total = normalizedProviderPercent(plan?.totalPercentUsed) { return total }
-            if let autoPercent, let apiPercent { return (autoPercent + apiPercent) / 2 }
+            // A capacity gauge must surface the pool that is about to run
+            // out; averaging would hide an exhausted pool behind an idle one.
+            if let autoPercent, let apiPercent { return max(autoPercent, apiPercent) }
             if let apiPercent { return apiPercent }
             if let autoPercent { return autoPercent }
             if let ratio = ratio(used: plan?.used, limit: plan?.limit) { return ratio }

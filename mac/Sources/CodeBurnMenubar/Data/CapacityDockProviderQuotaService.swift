@@ -17,18 +17,11 @@ enum CapacityDockProviderRefreshInteraction {
 @MainActor
 final class CapacityDockProviderQuotaService {
     struct Dependencies: Sendable {
+        // No defaults here: only `.live` may reach the real adapters, so a
+        // test can never silently read the local Cursor session or hit the
+        // network by omitting a field.
         var refreshClinePass: @Sendable (String) async throws -> QuotaSummary
         var refreshCursor: @Sendable () async throws -> QuotaSummary
-
-        init(
-            refreshClinePass: @escaping @Sendable (String) async throws -> QuotaSummary,
-            refreshCursor: @escaping @Sendable () async throws -> QuotaSummary = {
-                try await CursorSubscriptionService.refresh()
-            }
-        ) {
-            self.refreshClinePass = refreshClinePass
-            self.refreshCursor = refreshCursor
-        }
 
         static let live = Dependencies(
             refreshClinePass: { apiKey in

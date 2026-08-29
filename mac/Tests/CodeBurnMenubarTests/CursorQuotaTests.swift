@@ -102,6 +102,33 @@ final class CursorQuotaTests: XCTestCase {
         await assertFetchError(.expiredSession, deps: expired)
     }
 
+    func testUnreadableLocalStoreIsReportedHonestlyWithoutNetwork() async throws {
+        struct SyntheticStoreFailure: Error {}
+        let deps = CursorSubscriptionService.Deps(
+            loadAccessToken: { throw SyntheticStoreFailure() },
+            fetch: { request in
+                XCTFail("Network must not run when the local store is unreadable")
+                return (Data(), Self.httpResponse(request, status: 500))
+            }
+        )
+        await assertFetchError(.appDataUnreadable, deps: deps)
+    }
+
+    func testMonthlyFallbackSurfacesTheTighterPool() throws {
+        let body = """
+        {
+          "membershipType": "pro",
+          "individualUsage": {
+            "plan": { "autoPercentUsed": 20, "apiPercentUsed": 65 }
+          }
+        }
+        """
+
+        let summary = try CursorSubscriptionService.decode(Data(body.utf8))
+
+        XCTAssertEqual(summary.primary?.percent ?? -1, 0.65, accuracy: 0.0001)
+    }
+
     func testCursorAuthenticationResponsesAreTerminal() async throws {
         for status in [401, 403] {
             let deps = CursorSubscriptionService.Deps(
