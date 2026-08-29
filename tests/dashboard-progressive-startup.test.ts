@@ -1,4 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { PassThrough } from 'node:stream'
+
+import React from 'react'
+import { render } from 'ink'
+import stripAnsi from 'strip-ansi'
+import { afterEach, beforeEach, describe, expect, it, onTestFinished } from 'vitest'
 import { appendFile, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -8,6 +13,7 @@ import {
   buildDashboardHistoryIndex,
   DASHBOARD_COLD_INDEX_PHASES,
   dashboardIndexSupportsPeriod,
+  InteractiveDashboard,
   selectDashboardHistoryIndex,
   shouldAutoFallbackToWeek,
 } from '../src/dashboard.js'
@@ -83,7 +89,91 @@ async function appendSessionCall(name: string, outputTokens: number): Promise<vo
   })}\n`)
 }
 
+async function renderAutoPeriodDashboard(initialProjects: ProjectSummary[], initialDurable: Awaited<ReturnType<typeof assembleDashboardFirstPaint>>['result']['initialDurable']) {
+  const stdin = new PassThrough() as PassThrough & NodeJS.ReadStream
+  const stdout = new PassThrough() as PassThrough & NodeJS.WriteStream
+  stdin.isTTY = true
+  stdin.setRawMode = () => stdin
+  stdin.ref = () => stdin
+  stdin.unref = () => stdin
+  stdout.isTTY = true
+  stdout.columns = 120
+  stdout.rows = 50
+  const frames: string[] = []
+  stdout.on('data', chunk => frames.push(stripAnsi(String(chunk))))
+  const app = render(React.createElement(InteractiveDashboard, {
+    initialProjects,
+    initialPeriod: 'today',
+    initialProvider: 'all',
+    initialDurable,
+    refreshSeconds: 0,
+    windowColumns: 120,
+    initialHistoryIndexing: true,
+    initialCacheWasCold: true,
+    autoFallbackFromEmptyToday: true,
+  }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
+  onTestFinished(() => app.unmount())
+  return { app, frames }
+}
+
+async function waitForFrame(app: ReturnType<typeof render>, frames: string[], predicate: (frame: string) => boolean): Promise<string> {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    await app.waitUntilRenderFlush()
+    const frame = frames.filter(value => value.trim()).at(-1) ?? ''
+    if (predicate(frame)) return frame
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  return frames.filter(value => value.trim()).at(-1) ?? ''
+}
+
 describe('interactive dashboard progressive startup', () => {
+  it('selects and loads 7 Days in the rendered TUI when Today has exactly zero usage', async () => {
+    await writeSession('older', 3)
+    const paint = await assembleDashboardFirstPaint(
+      'today', 'all', undefined, undefined, null, null, false,
+    )
+    expect(paint.result.filteredProjects).toEqual([])
+
+    const { app, frames } = await renderAutoPeriodDashboard(
+      paint.result.filteredProjects,
+      paint.result.initialDurable,
+    )
+    await app.waitUntilRenderFlush()
+    expect(frames.filter(value => value.trim()).at(-1)).toContain('[ Today ]')
+    const frame = await waitForFrame(
+      app,
+      frames,
+      value => value.includes('[ 7 Days ]') && !value.includes('indexing'),
+    )
+
+    expect(frame).toContain('[ 7 Days ]')
+    expect(frame).toContain('proj')
+  })
+
+  it('preserves Today in the rendered TUI when Today has any usage', async () => {
+    await writeSession('today', 0)
+    await writeSession('older', 3)
+    const paint = await assembleDashboardFirstPaint(
+      'today', 'all', undefined, undefined, null, null, false,
+    )
+    expect(paint.result.filteredProjects).toHaveLength(1)
+
+    const { app, frames } = await renderAutoPeriodDashboard(
+      paint.result.filteredProjects,
+      paint.result.initialDurable,
+    )
+    await app.waitUntilRenderFlush()
+    expect(frames.filter(value => value.trim()).at(-1)).toContain('[ Today ]')
+    const frame = await waitForFrame(
+      app,
+      frames,
+      value => value.includes('[ Today ]') && !value.includes('indexing'),
+    )
+
+    expect(frame).toContain('[ Today ]')
+    expect(frame).not.toContain('[ 7 Days ]')
+  })
+
   it('falls back from an all-zero Today on cold and warm indexes, but keeps real usage on Today', () => {
     const cache = { version: 29, savingsConfigHash: '', lastComputedDate: null, days: [], complete: true } as const
     const coldWeek = { provider: 'all', normalizedProjects: [], cache, planUsages: [], readyThrough: 'week' as const }
