@@ -36,6 +36,10 @@ RA-PERF-003,performance,A,Desktop,Visible and settled launch,shell+computer-use,
 RA-PERF-004,performance,A,Web,First useful paint and warm actions,browser,manual,timings.csv,flag feedback over 250ms or navigation over 1s,no,performance
 RA-PERF-005,performance,B,Desktop,Heavy cold first useful complete peak CPU RSS,shell+computer-use,manual,timings.csv,progress plus product SLA,yes,performance
 RA-PERF-006,performance,B,all,Warm navigation and detail actions,computer-use,manual,timings.csv,flag warm action over 1s,no,performance
+RA-PERF-007,performance,B,CLI,Synthetic fixture session-parse cold three trials,script,full,timings.csv,identical totals and baseline comparison,yes,performance
+RA-PERF-008,performance,B,CLI,Append-only incremental reparse,script,full,timings.csv,same-inode delta cheaper than cold parse,yes,performance
+RA-PERF-009,performance,B,serve,Warm 7D/30D period switch wait-path five trials,script,full,timings.csv,p50/p95 recorded against 250ms target,yes,performance
+RA-PERF-010,performance,B,CLI,Desktop and Menu Bar wait-path cold start,script,full,timings.csv,wait-path only; UI remains computer-use,no,performance
 RA-ACC-001,accuracy,A,all,Golden calls sessions and token families,independent-calculation,partial,accuracy.csv,exact equality,yes,correctness
 RA-ACC-002,accuracy,A,all,Golden cost priced unpriced estimated,independent-calculation,partial,accuracy.csv,exact sub-cent semantics,yes,correctness
 RA-ACC-003,accuracy,A,all,UTC local boundaries custom dates,independent-calculation,partial,accuracy.csv,exact documented boundary,yes,correctness

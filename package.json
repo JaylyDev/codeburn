@@ -22,6 +22,10 @@
     "test:locks": "vitest run tests/cache-refresh-lock.test.ts tests/cache-refresh-lock-corrupt-body.test.ts tests/cache-refresh-lock-process.test.ts tests/cache-refresh-lock-status-snapshot.test.ts --poolOptions.forks.singleFork=true",
     "test:watch": "vitest tests --exclude \"tests/cache-refresh-lock*\"",
     "verify:upgrade": "node scripts/upgrade-path/run.mjs",
+    "perf:fixture": "node scripts/perf/gen-fixture.mjs",
+    "perf:metric": "node scripts/perf/run-metric.mjs",
+    "perf:all": "node scripts/perf/run-metric.mjs --metric all",
+    "perf:pin": "node scripts/perf/pin-baselines.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
