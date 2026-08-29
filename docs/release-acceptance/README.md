@@ -76,6 +76,8 @@ Correctness requires independently calculated calls, input/output/cache/reasonin
 - `templates/`: timing, click-through, accuracy, finding, and residue headers.
 - `scripts/release-acceptance/run.mjs`: provenance, automated tests, package identity, checksums, logs, and dirty-worktree detection.
 
+Wait-path performance numbers for session parse, incremental re-parse, period switch, and CLI cold start live in [`scripts/perf/`](../../scripts/perf/) and [`perf/README.md`](../../perf/README.md). That harness emits the `timings.csv` template; it does not replace this runner or claim installed Desktop/Menu Bar UI.
+
 ## Ownership
 
 Agents can autonomously run deterministic tests, package locally, calculate fixture truth, profile, collect screenshots, test recovery on copies, and draft findings. Humans own product semantics, SLA choices, Apple credentials/signing, unexpected security prompts, real-account consent, and affected-machine validation. No agent should merge, publish a release, or transmit data merely because the automated ledger is green.
