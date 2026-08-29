@@ -23,7 +23,7 @@ struct CopilotUsage: Sendable, Equatable {
 }
 
 /// Live GitHub Copilot quota via the editor plugins' internal usage endpoint
-/// (prior art: steipete/CodexBar docs/copilot.md):
+/// (derived from observed GitHub Copilot client traffic):
 ///
 /// - GET https://api.github.com/copilot_internal/user → plan + quota snapshots
 ///

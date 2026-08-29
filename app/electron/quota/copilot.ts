@@ -1,9 +1,8 @@
 // Live GitHub Copilot quota via the editor plugins' internal usage endpoint.
 //
 // - GET https://api.github.com/copilot_internal/user
-//     Headers mirror the VS Code Copilot Chat plugin (Editor-Version /
-//     Editor-Plugin-Version / X-Github-Api-Version, prior art:
-//     steipete/CodexBar docs/copilot.md). This is an INTERNAL, UNDOCUMENTED
+//     Headers mirror observed GitHub Copilot client traffic (Editor-Version /
+//     Editor-Plugin-Version / X-Github-Api-Version). This is an INTERNAL, UNDOCUMENTED
 //     API that may drift without notice; every failure must degrade to the
 //     normal connection states and never crash the panel.
 //

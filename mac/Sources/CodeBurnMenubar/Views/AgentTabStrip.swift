@@ -221,37 +221,39 @@ private struct AgentTab: View {
     }
 
     var body: some View {
-        VStack(spacing: 3) {
-            HStack(spacing: 5) {
-                Text(filter.rawValue)
-                    .font(.system(size: 11.5, weight: .medium))
-                    .tracking(-0.05)
-                if let cost, cost > 0 {
-                    Text(cost.asCompactCurrency())
-                        .font(.codeMono(size: 10.5, weight: .medium))
-                        .foregroundStyle(isActive ? AnyShapeStyle(.white.opacity(0.8)) : AnyShapeStyle(.secondary))
-                        .tracking(-0.2)
-                }
-            }
-            if quota != nil {
-                AgentTabQuotaBar(quota: quota, isActive: isActive)
-                    .frame(height: 3)
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 4)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(isActive ? AnyShapeStyle(Theme.brandAccent) : AnyShapeStyle(Color.secondary.opacity(0.08)))
-        )
-        .foregroundStyle(isActive ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
-        .contentShape(Rectangle())
-        .onTapGesture {
+        Button {
             hoverPopoverShown = false
             hoverEnterTask?.cancel()
             clickDismissed = true
             onTap()
+        } label: {
+            VStack(spacing: 3) {
+                HStack(spacing: 5) {
+                    Text(filter.rawValue)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .tracking(-0.05)
+                    if let cost, cost > 0 {
+                        Text(cost.asCompactCurrency())
+                            .font(.codeMono(size: 10.5, weight: .medium))
+                            .foregroundStyle(isActive ? AnyShapeStyle(.white.opacity(0.8)) : AnyShapeStyle(.secondary))
+                            .tracking(-0.2)
+                    }
+                }
+                if quota != nil {
+                    AgentTabQuotaBar(quota: quota, isActive: isActive)
+                        .frame(height: 3)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isActive ? AnyShapeStyle(Theme.brandAccent) : AnyShapeStyle(Color.secondary.opacity(0.08)))
+            )
+            .foregroundStyle(isActive ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .onHover { hovering in
             hoverEnterTask?.cancel()
             hoverExitTask?.cancel()

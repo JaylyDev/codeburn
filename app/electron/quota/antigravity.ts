@@ -1,6 +1,6 @@
 // Live Antigravity quota from LOCAL surfaces only — the Antigravity app's own
-// language server or a signed-in `agy` CLI's embedded server (prior art:
-// steipete/CodexBar docs/antigravity.md, which marks this protocol internal and
+// language server or a signed-in `agy` CLI's embedded server. The local
+// Antigravity language-server protocol is undocumented and
 // experimental). No Google OAuth fallback in v1: when no local server answers,
 // the provider reports disconnected and the UI shows its Connect affordance.
 //
@@ -9,7 +9,7 @@
 //     (preferred; falls back to)
 // - POST https://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/GetUserStatus
 //
-// Discovery mirrors CodexBar: `ps` finds candidate processes (app language
+// Discovery uses `ps` to find candidate processes (app language
 // servers need their `--csrf_token`; the `agy` CLI needs none), then `lsof`
 // lists each pid's listening TCP ports. Local HTTPS uses a self-signed cert,
 // so TLS verification is relaxed ONLY for the 127.0.0.1 loopback probes.
@@ -76,7 +76,7 @@ function empty(connection: QuotaProvider['connection']): QuotaProvider {
   return { provider: 'antigravity', connection, primary: null, details: [], planLabel: null, footerLines: [] }
 }
 
-// Process kinds, mirroring CodexBar's classification. The app language server
+// Process kinds distinguish the app language server from standalone processes.
 // carries richer quota data than the IDE variant, so IDE matches are skipped;
 // a CLI (`agy`) match is accepted because its tokenless server exposes the
 // same summary payload.

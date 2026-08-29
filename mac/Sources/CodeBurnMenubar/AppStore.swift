@@ -136,7 +136,9 @@ final class AppStore {
 
     var codexUsage: CodexUsage?
     var codexError: String?
-    var codexLoadState: SubscriptionLoadState = CodexCredentialStore.isBootstrapCompleted ? .dormant : .notBootstrapped
+    var codexLoadState: SubscriptionLoadState = (
+        CodexCredentialStore.isBootstrapCompleted || CodexCredentialStore.hasCredentialSource
+    ) ? .dormant : .notBootstrapped
 
     var kimiUsage: KimiUsage?
     var kimiError: String?
@@ -165,6 +167,28 @@ final class AppStore {
     // app's local language server, which is prompt-free, so we start dormant
     // and auto-activate (probe) on the first refresh tick.
     var antigravityLoadState: SubscriptionLoadState = .dormant
+
+    /// Runtime state for providers that do not use one of the original native
+    /// bespoke CodeBurn adapter. Keys are stable provider IDs from
+    /// `ProviderConnectionCatalog`.
+    var capacityDockProviderSummaries: [String: QuotaSummary] = [:]
+    var capacityDockProviderErrors: [String: String] = [:]
+    var capacityDockProvidersLoading: Set<String> = []
+    var capacityDockProviderTransientFailures: Set<String> = []
+    private var capacityDockProviderRefreshGenerations: [String: UInt64] = [:]
+    @ObservationIgnored var capacityDockProviderQuotaService = CapacityDockProviderQuotaService.shared
+    @ObservationIgnored var capacityDockCredentialLoader:
+        @Sendable (String) async throws -> CapacityDockProviderCredential = {
+            try await CapacityDockProviderCredentialStore.loadAsync(for: $0)
+        }
+    @ObservationIgnored var capacityDockCredentialSaver:
+        @Sendable (CapacityDockProviderCredential, String) async throws -> Void = {
+            try await CapacityDockProviderCredentialStore.saveAsync($0, for: $1)
+        }
+    @ObservationIgnored var capacityDockCredentialRemover:
+        @Sendable (String) async throws -> Void = {
+            try await CapacityDockProviderCredentialStore.removeAsync(for: $0)
+        }
 
     /// Generation tokens for the in-flight refresh tasks. Incremented on every
     /// disconnect / reset so a fetch that started before the disconnect cannot
@@ -544,9 +568,9 @@ final class AppStore {
         }
     }
 
-    /// Switch to a provider filter. Cancels any in-flight switch so rapid tab tapping only
-    /// runs the CLI for the final selection. Fetches provider-specific and all-provider data
-    /// in parallel so the tab strip costs stay in sync with the hero.
+    /// Switch to a provider filter immediately, then refresh stale data quietly.
+    /// Existing content stays mounted while the background fetch runs, so a tab
+    /// click never becomes a loading gate or resets unrelated in-flight work.
     func switchTo(provider: ProviderFilter) {
         selectedProvider = provider
         // A Claude config scope only applies to All/Claude views; picking any
@@ -582,7 +606,6 @@ final class AppStore {
 
     private func startInteractiveSelectionRefresh() {
         switchTask?.cancel()
-        resetLoadingState()
 #if DEBUG
         if refreshSuppressedForTesting { return }
 #endif
@@ -595,11 +618,10 @@ final class AppStore {
         let key = PayloadCacheKey(scope: scope, period: period, provider: provider, day: day, days: days, claudeConfigSourceId: claudeConfigSourceId)
         let localKey = PayloadCacheKey(scope: .local, period: period, provider: provider, day: day, days: days, claudeConfigSourceId: claudeConfigSourceId)
         let allKey = PayloadCacheKey(scope: .local, period: period, provider: .all, day: day, days: days, claudeConfigSourceId: claudeConfigSourceId)
-        lastErrorByKey[key] = nil
         switchTask = Task {
             if scope == .combined {
                 async let local = refresh(key: localKey, includeOptimize: false, force: false, showLoading: false)
-                async let combined = refresh(key: key, includeOptimize: false, force: true, showLoading: true)
+                async let combined = refresh(key: key, includeOptimize: false, force: false, showLoading: false)
                 if provider == .all {
                     _ = await (local, combined)
                 } else {
@@ -607,9 +629,9 @@ final class AppStore {
                     _ = await (local, combined, all)
                 }
             } else if provider == .all {
-                await refresh(key: key, includeOptimize: false, force: true, showLoading: true)
+                await refresh(key: key, includeOptimize: false, force: false, showLoading: false)
             } else {
-                async let main = refresh(key: key, includeOptimize: false, force: true, showLoading: true)
+                async let main = refresh(key: key, includeOptimize: false, force: false, showLoading: false)
                 async let all = refreshQuietly(key: allKey, includeOptimize: false, force: false)
                 _ = await (main, all)
             }
@@ -1010,7 +1032,8 @@ final class AppStore {
         return true
     }
 
-    /// User-initiated. Reads Claude's source (this is what triggers the macOS keychain
+    /// User-initiated. Reuses Claude's source credential; only the source-owned
+    /// Keychain access may ask for consent, and only on this explicit action.
     func activateClaudeFromDormant() async {
         guard case .dormant = subscriptionLoadState else { return }
         await bootstrapSubscription()
@@ -1037,8 +1060,8 @@ final class AppStore {
         }
     }
 
-    /// Background refresh. No-op if the user has not yet connected. Never triggers
-    /// a keychain prompt — uses our own keychain item exclusively.
+    /// Background refresh. No-op if the user has not yet connected. Source reads
+    /// are prompt-suppressed and any historical CodeBurn cache is fallback-only.
     func refreshSubscription() async {
         _ = await refreshSubscriptionReportingSuccess()
     }
@@ -1048,7 +1071,6 @@ final class AppStore {
     /// rather than every attempt.
     @discardableResult
     func refreshSubscriptionReportingSuccess() async -> Bool {
-        if case .dormant = subscriptionLoadState { return false }
         guard ClaudeCredentialStore.isBootstrapCompleted else {
             if subscriptionLoadState != .notBootstrapped {
                 subscriptionLoadState = .notBootstrapped
@@ -1083,7 +1105,8 @@ final class AppStore {
         }
     }
 
-    /// User-initiated disconnect — clears our keychain item and bootstrap flag,
+    /// User-initiated disconnect — clears CodeBurn continuity state, any legacy
+    /// private cache, and the bootstrap flag,
     /// plus all derived state so a reconnect (potentially under a different
     /// account or tier) starts clean. capacityEstimates and the snapshot store
     /// would otherwise contaminate "Based on last cycle" projections.
@@ -1133,7 +1156,10 @@ final class AppStore {
 
     @discardableResult
     func refreshCodexReportingSuccess() async -> Bool {
-        if case .dormant = codexLoadState { return false }
+        if case .dormant = codexLoadState, !CodexCredentialStore.isBootstrapCompleted {
+            await bootstrapCodex()
+            return codexLoadState == .loaded
+        }
         guard CodexCredentialStore.isBootstrapCompleted else {
             if codexLoadState != .notBootstrapped { codexLoadState = .notBootstrapped }
             return false
@@ -1571,7 +1597,7 @@ final class AppStore {
 
     /// Snapshot of live quota state for a given provider. Returns nil when the user
     /// has not connected yet — the bar slot stays empty so we never trigger a
-    /// keychain prompt at startup. Once bootstrapped, the bar persists across all
+    /// source-owned Keychain prompt at startup. Once bootstrapped, the bar persists across all
     /// subsequent states (loading / stale / transient failure / terminal failure)
     /// so it doesn't flicker on every refresh tick.
     /// Aggregate quota status across all connected providers, used by the menu
@@ -1639,6 +1665,187 @@ final class AppStore {
         case .copilot: return copilotQuotaSummary(filter: filter)
         case .antigravity: return antigravityQuotaSummary(filter: filter)
         default:      return nil
+        }
+    }
+
+    func capacityDockQuotaSummary(for provider: CapacityDockProvider) -> QuotaSummary? {
+        if let filter = provider.legacyFilter {
+            return quotaSummary(for: filter)
+        }
+        if let summary = capacityDockProviderSummaries[provider.id] {
+            if capacityDockProvidersLoading.contains(provider.id)
+                || capacityDockProviderTransientFailures.contains(provider.id)
+            {
+                return QuotaSummary(
+                    providerFilter: .all,
+                    connection: .stale,
+                    primary: summary.primary,
+                    details: summary.details,
+                    planLabel: summary.planLabel,
+                    footerLines: summary.footerLines + (
+                        capacityDockProviderErrors[provider.id]
+                            .map { ["Refresh failed: \($0)"] } ?? []
+                    )
+                )
+            }
+            return summary
+        }
+        if capacityDockProvidersLoading.contains(provider.id) {
+            return QuotaSummary(
+                providerFilter: .all,
+                connection: .loading,
+                primary: nil,
+                details: [],
+                planLabel: nil,
+                footerLines: []
+            )
+        }
+        if let error = capacityDockProviderErrors[provider.id] {
+            return QuotaSummary(
+                providerFilter: .all,
+                connection: capacityDockProviderTransientFailures.contains(provider.id)
+                    ? .transientFailure
+                    : .terminalFailure(reason: error),
+                primary: nil,
+                details: [],
+                planLabel: nil,
+                footerLines: [error]
+            )
+        }
+        return nil
+    }
+
+    func capacityDockProviderIsConnected(_ provider: CapacityDockProvider) -> Bool {
+        guard let connection = capacityDockQuotaSummary(for: provider)?.connection else { return false }
+        return connection == .connected || connection == .stale
+    }
+
+    func capacityDockProviderIsDockEligible(_ provider: CapacityDockProvider) -> Bool {
+        CapacityDockProviderSelection.isDockEligible(
+            provider,
+            isConnected: capacityDockProviderIsConnected(provider),
+            hasSavedCredential: CapacityDockProviderCredentialPresence.contains(provider.id)
+        )
+    }
+
+    func capacityDockCredential(for provider: CapacityDockProvider) async -> CapacityDockProviderCredential {
+        (try? await capacityDockCredentialLoader(provider.id))
+            ?? CapacityDockProviderCredential()
+    }
+
+    func saveCapacityDockCredential(
+        _ credential: CapacityDockProviderCredential,
+        for provider: CapacityDockProvider
+    ) async throws {
+        try await capacityDockCredentialSaver(credential, provider.id)
+        capacityDockProviderRefreshGenerations[provider.id, default: 0] &+= 1
+        capacityDockProviderSummaries[provider.id] = nil
+        capacityDockProviderErrors[provider.id] = nil
+        capacityDockProvidersLoading.remove(provider.id)
+        capacityDockProviderTransientFailures.remove(provider.id)
+    }
+
+    func disconnectCapacityDockProvider(_ provider: CapacityDockProvider) async throws {
+        if let filter = provider.legacyFilter {
+            switch filter {
+            case .claude: disconnectSubscription()
+            case .codex: disconnectCodex()
+            case .kimiCode: disconnectKimi()
+            case .gemini: disconnectGemini()
+            case .copilot: disconnectCopilot()
+            case .antigravity: disconnectAntigravity()
+            default: break
+            }
+            return
+        }
+        capacityDockProviderRefreshGenerations[provider.id, default: 0] &+= 1
+        do {
+            try await capacityDockCredentialRemover(provider.id)
+        } catch {
+            // The generation invalidates any read that began before the user's
+            // disconnect. If deletion itself fails, keep the last-known summary
+            // and credential, but never leave the row permanently loading.
+            capacityDockProvidersLoading.remove(provider.id)
+            throw error
+        }
+        capacityDockProviderSummaries[provider.id] = nil
+        capacityDockProviderErrors[provider.id] = nil
+        capacityDockProvidersLoading.remove(provider.id)
+        capacityDockProviderTransientFailures.remove(provider.id)
+    }
+
+    func connectCapacityDockProvider(_ provider: CapacityDockProvider) async {
+        if let filter = provider.legacyFilter {
+            await connectQuotaProvider(filter)
+            return
+        }
+        await CapacityDockProviderRefreshInteraction.userInitiated {
+            await refreshCapacityDockProvider(provider)
+        }
+    }
+
+    func refreshCapacityDockProvider(_ provider: CapacityDockProvider) async {
+        guard provider.legacyFilter == nil,
+              provider.catalogEntry.hasLiveCodeBurnQuotaAdapter,
+              !capacityDockProvidersLoading.contains(provider.id) else { return }
+        let generation = capacityDockProviderRefreshGenerations[provider.id, default: 0]
+        capacityDockProvidersLoading.insert(provider.id)
+        defer {
+            if capacityDockProviderRefreshGenerations[provider.id, default: 0] == generation {
+                capacityDockProvidersLoading.remove(provider.id)
+            }
+        }
+
+        do {
+            let credential = try await capacityDockCredentialLoader(provider.id)
+            let summary = try await capacityDockProviderQuotaService.fetch(
+                provider: provider,
+                credential: credential
+            )
+            guard capacityDockProviderRefreshGenerations[provider.id, default: 0] == generation else {
+                return
+            }
+            capacityDockProviderSummaries[provider.id] = summary
+            capacityDockProviderErrors[provider.id] = nil
+            capacityDockProviderTransientFailures.remove(provider.id)
+        } catch {
+            guard capacityDockProviderRefreshGenerations[provider.id, default: 0] == generation else {
+                return
+            }
+            capacityDockProviderErrors[provider.id] = sanitizeForUI(error.localizedDescription)
+            if let failure = error as? CapacityDockProviderFetchFailure,
+               failure.disposition == .transient {
+                capacityDockProviderTransientFailures.insert(provider.id)
+            } else {
+                capacityDockProviderTransientFailures.remove(provider.id)
+                capacityDockProviderSummaries[provider.id] = nil
+            }
+        }
+    }
+
+    /// Refreshes selected generic providers sequentially. Browser-cookie and
+    /// local CLI probes can touch shared system state, so serial execution is
+    /// deliberately calmer than fanning 60+ connection attempts out at once.
+    func refreshSelectedCapacityDockProviders() async {
+        let selected = CapacityDockPreferences.load().selectedProviders
+        for provider in selected
+        where provider.legacyFilter == nil && provider.catalogEntry.hasLiveCodeBurnQuotaAdapter {
+            await refreshCapacityDockProvider(provider)
+        }
+    }
+
+    /// Shared direct-connect path used by Settings, Plan, and Capacity Dock.
+    /// Providers whose credentials live in local files or localhost services
+    /// perform passive discovery; Claude alone may request Keychain consent.
+    func connectQuotaProvider(_ filter: ProviderFilter) async {
+        switch filter {
+        case .claude: await bootstrapSubscription()
+        case .codex: await bootstrapCodex()
+        case .kimiCode: await bootstrapKimi()
+        case .gemini: await bootstrapGemini()
+        case .copilot: await bootstrapCopilot()
+        case .antigravity: await bootstrapAntigravity()
+        default: break
         }
     }
 
@@ -2080,9 +2287,9 @@ extension Notification.Name {
 }
 
 enum SubscriptionLoadState: Sendable, Equatable {
-    case notBootstrapped  // no Keychain access yet — waiting for user to click Connect
-    case dormant          // previously bootstrapped; keychain not yet accessed this session
-    case bootstrapping    // user clicked Connect; reading Claude's keychain (PROMPTS)
+    case notBootstrapped  // no usable source discovered yet — waiting for Connect
+    case dormant          // source exists; prompt-free background activation is available
+    case bootstrapping    // user clicked Connect; source-owned auth may request consent
     case loading          // background fetch in progress (subscription may already be populated)
     case loaded           // success; subscription is populated
     case noCredentials    // bootstrap tried; user has no Claude credentials at all

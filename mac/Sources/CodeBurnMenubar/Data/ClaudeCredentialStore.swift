@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-/// Owns the lifecycle of Claude OAuth credentials, mirroring CodexBar's pattern:
+/// Owns the lifecycle of Claude OAuth credentials:
 ///
 ///   1. **Bootstrap is user-initiated.** The first read of Claude's keychain
 ///      entry — which triggers a macOS keychain prompt — only happens when
@@ -16,9 +16,10 @@ import Security
 ///      the refresh endpoint. If the CLI hasn't rotated yet we report a
 ///      transient staleness (`sourceTokenStale`) and recover on its next use.
 ///
-///   3. **In-memory + Keychain cache** so back-to-back reads in the same refresh
-///      cycle don't re-hit the source, and we keep serving the last good token
-///      across launches without a plaintext Application Support file.
+///   3. **Source-first + in-memory cache.** Background reads prefer Claude's
+///      current file / Apple-signed `security` path, so CodeBurn does not create
+///      another Keychain item or ask to unlock one per provider. The historical
+///      CodeBurn Keychain item remains a read-only continuity fallback.
 enum ClaudeCredentialStore {
     private static let bootstrapCompletedKey = "codeburn.claude.bootstrapCompleted"
     private static let inMemoryTTL: TimeInterval = 5 * 60
@@ -166,7 +167,6 @@ enum ClaudeCredentialStore {
     @discardableResult
     static func bootstrap() throws -> CredentialRecord {
         let record = try readClaudeSource()
-        try writeOurCache(record: record)
         isBootstrapCompleted = true
         cacheInMemory(record)
         return record
@@ -181,6 +181,13 @@ enum ClaudeCredentialStore {
         // on disk. Re-read the file when the cache passes the TTL.
         if let cached = lock.withLock({ memoryCache }), cached.isFresh {
             return cached.record
+        }
+        // Claude's own store is authoritative and the silent reader is the
+        // prompt-free path. Prefer it before touching the
+        // historical CodeBurn-owned Keychain cache.
+        if let live = readClaudeSourceSilently() {
+            cacheInMemory(live)
+            return live
         }
         let fetched: CredentialRecord?
         do {
@@ -237,7 +244,6 @@ enum ClaudeCredentialStore {
             return nil
         }
         cacheInMemory(live)
-        try? writeOurCache(record: live)
         return live
     }
 
@@ -254,7 +260,7 @@ enum ClaudeCredentialStore {
     // MARK: - Bootstrap source
 
     private static func readClaudeSource() throws -> CredentialRecord {
-        if let fromFile = try? readClaudeFile() { return fromFile }
+        if let silent = readClaudeSourceSilently() { return silent }
         if let fromKeychain = try readClaudeKeychain(allowUI: true) { return fromKeychain }
         throw StoreError.bootstrapNoSource
     }

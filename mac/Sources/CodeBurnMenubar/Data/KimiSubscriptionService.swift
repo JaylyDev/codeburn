@@ -2,7 +2,7 @@ import Foundation
 
 /// Live quota snapshot for a Kimi Code subscription, returned by
 /// GET https://api.kimi.com/coding/v1/usages. Shape mirrors what
-/// steipete/CodexBar consumes: a top-level `usage` envelope plus a
+/// the Kimi Code client consumes: a top-level `usage` envelope plus a
 /// `limits` array of additional rate-limit windows. Numeric fields are
 /// decoded leniently (String or Int/Double) because the API has shipped
 /// both.
@@ -149,7 +149,7 @@ enum KimiSubscriptionService {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("CodeBurn", forHTTPHeaderField: "User-Agent")
-        // Kimi server expects these platform headers (same as CodexBar sends).
+        // Kimi server expects these platform headers.
         request.setValue("kimi_code_cli", forHTTPHeaderField: "X-Msh-Platform")
         if let deviceId = deviceId() {
             request.setValue(deviceId, forHTTPHeaderField: "X-Msh-Device-Id")

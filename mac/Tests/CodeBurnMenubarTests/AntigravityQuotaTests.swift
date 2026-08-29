@@ -109,6 +109,53 @@ final class AntigravityQuotaTests: XCTestCase {
         XCTAssertEqual(windows[2].usedPercent, 0, accuracy: 0.001)
     }
 
+    func testDecodeSummaryRewritesRemainingQuotaCopyToUsedPercent() {
+        let body: [String: Any] = [
+            "groups": [
+                [
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        [
+                            "displayName": "Weekly quota remaining",
+                            "remaining": ["remainingFraction": 1],
+                        ] as [String: Any],
+                    ],
+                ] as [String: Any],
+            ],
+        ]
+
+        let windows = AntigravitySubscriptionService.decodeSummary(body)
+
+        XCTAssertEqual(windows.map(\.label), ["Gemini Models · Weekly quota used"])
+        XCTAssertEqual(windows.first?.usedPercent ?? -1, 0, accuracy: 0.001)
+    }
+
+    func testDecodeSummaryAcceptsCurrentConnectResponseShape() {
+        let body: [String: Any] = [
+            "response": [
+                "groups": [
+                    [
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            [
+                                "bucketId": "gemini-weekly",
+                                "displayName": "Weekly Limit",
+                                "remainingFraction": 0.958,
+                                "resetTime": "2026-09-04T12:05:10Z",
+                            ] as [String: Any],
+                        ],
+                    ] as [String: Any],
+                ],
+            ] as [String: Any],
+        ]
+
+        let windows = AntigravitySubscriptionService.decodeSummary(body)
+
+        XCTAssertEqual(windows.map(\.label), ["Gemini Models · Weekly Limit"])
+        XCTAssertEqual(windows.first?.usedPercent ?? -1, 4.2, accuracy: 0.001)
+        XCTAssertNotNil(windows.first?.resetsAt)
+    }
+
     func testDecodeStatusReadsLegacyRowsWithResetTimes() {
         let body: [String: Any] = [
             "userStatus": [
@@ -128,6 +175,33 @@ final class AntigravityQuotaTests: XCTestCase {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime]
         XCTAssertEqual(windows[1].resetsAt, iso.date(from: "2026-07-12T00:00:00Z"))
+    }
+
+    func testDecodeStatusAcceptsCurrentModelAndPlanShape() {
+        let body: [String: Any] = [
+            "userStatus": [
+                "userTier": ["name": "Google AI Pro"],
+                "cascadeModelConfigData": [
+                    "clientModelConfigs": [
+                        [
+                            "label": "Gemini 3.6 Flash (Medium)",
+                            "modelId": "gemini-3.6-flash-medium",
+                            "modelOrAlias": ["model": "gemini-3.6-flash"],
+                            "quotaInfo": [
+                                "remainingFraction": 0.76,
+                                "resetTime": "2026-09-04T12:05:10Z",
+                            ] as [String: Any],
+                        ] as [String: Any],
+                    ],
+                ] as [String: Any],
+            ] as [String: Any],
+        ]
+
+        let windows = AntigravitySubscriptionService.decodeStatus(body)
+
+        XCTAssertEqual(windows.map(\.label), ["Gemini 3.6 Flash (Medium)"])
+        XCTAssertEqual(windows.first?.usedPercent ?? -1, 24, accuracy: 0.001)
+        XCTAssertEqual(AntigravitySubscriptionService.planFromStatus(body), "Google AI Pro")
     }
 
     func testDecodeGarbagePayloadsYieldsNoWindows() {

@@ -22,22 +22,28 @@ struct SettingsView: View {
     private static let mainPaneIDs: Set<String> = ["general", "about"]
 
     private var providers: [ProviderPane] {
-        [
-            ProviderPane(id: "claude", name: "Claude", icon: "claude",
-                         isConnected: store.subscriptionLoadState == .loaded),
-            ProviderPane(id: "codex", name: "Codex", icon: "openai",
-                         isConnected: store.codexLoadState == .loaded),
-            ProviderPane(id: "kimi", name: "Kimi Code", icon: "kimi",
-                         isConnected: store.kimiLoadState == .loaded),
-            ProviderPane(id: "devin", name: "Devin", icon: "devin",
-                         isConnected: CLIDevinConfig.loadAcuUsdRate() != nil),
-            ProviderPane(id: "gemini", name: "Gemini", icon: "googlegemini",
-                         isConnected: store.geminiLoadState == .loaded),
-            ProviderPane(id: "copilot", name: "Copilot", icon: "githubcopilot",
-                         isConnected: store.copilotLoadState == .loaded),
-            ProviderPane(id: "antigravity", name: "Antigravity", icon: "antigravity",
-                         isConnected: store.antigravityLoadState == .loaded),
-        ]
+        CapacityDockPreferences.supportedProviders.map { provider in
+            ProviderPane(
+                id: provider.id,
+                name: provider.displayName,
+                icon: provider.iconName,
+                isConnected: providerIsConnected(provider)
+            )
+        }
+    }
+
+    private func providerIsConnected(_ provider: CapacityDockProvider) -> Bool {
+        switch provider.id {
+        case CapacityDockProvider.claude.id: store.subscriptionLoadState == .loaded
+        case CapacityDockProvider.codex.id: store.codexLoadState == .loaded
+        case CapacityDockProvider.kimiCode.id: store.kimiLoadState == .loaded
+        case CapacityDockProvider.gemini.id: store.geminiLoadState == .loaded
+        case CapacityDockProvider.copilot.id: store.copilotLoadState == .loaded
+        case CapacityDockProvider.antigravity.id: store.antigravityLoadState == .loaded
+        case "devin":
+            store.capacityDockProviderIsConnected(provider) || CLIDevinConfig.loadAcuUsdRate() != nil
+        default: store.capacityDockProviderIsConnected(provider)
+        }
     }
 
     // Search narrows the provider list only; General/About stay put.
@@ -65,9 +71,8 @@ struct SettingsView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            // Layout modeled on CodexBar (MIT, steipete/CodexBar): a fixed-width
-            // sidebar (search, General/About, per-provider rows) over an
-            // edge-to-edge sidebar material, hairline divider, then the detail pane.
+            // Fixed-width provider sidebar over an edge-to-edge system material,
+            // followed by a hairline divider and the selected detail pane.
             sidebar
                 .frame(width: Self.sidebarWidth)
                 .background {
@@ -142,36 +147,17 @@ struct SettingsView: View {
         case "copilot": CopilotSettingsTab()
         case "antigravity": AntigravitySettingsTab()
         case "about": AboutSettingsTab()
-        default: GeneralSettingsTab()
+        default:
+            if let provider = CapacityDockProvider(rawValue: selection.wrappedValue) {
+                GenericProviderSettingsTab(provider: provider)
+            } else {
+                GeneralSettingsTab()
+            }
         }
     }
 }
 
 // MARK: - Sidebar support
-
-/// PNG decode is too expensive to redo on every body evaluation, so loaded
-/// template images are kept for the life of the process.
-@MainActor
-private enum ProviderIconCache {
-    private static var images: [String: NSImage] = [:]
-
-    /// Loads one of the bundled 512px black-glyph PNGs (Resources/ProviderIcons)
-    /// as a template NSImage so `foregroundStyle` fully controls the color.
-    static func image(named name: String) -> NSImage? {
-        if let cached = images[name] { return cached }
-        // SwiftPM keeps the folder hierarchy for .process'd directories, but
-        // tolerate a flattened layout too so the lookup survives a rule change.
-        for subdirectory in ["Resources/ProviderIcons", "ProviderIcons", nil] {
-            if let url = Bundle.module.url(forResource: name, withExtension: "png", subdirectory: subdirectory),
-               let image = NSImage(contentsOf: url) {
-                image.isTemplate = true
-                images[name] = image
-                return image
-            }
-        }
-        return nil
-    }
-}
 
 /// Colored rounded-square symbol used for app panes in the settings sidebar,
 /// mirroring the System Settings sidebar style.
@@ -214,19 +200,8 @@ private struct SettingsSidebarPaneRow: View {
 private struct SettingsSidebarAboutRow: View {
     var body: some View {
         HStack(spacing: 8) {
-            // Bare brand mark, no chip container — the binary flame reads
-            // better at this size than the boxed app icon.
-            Group {
-                if let flame = ProviderIconCache.image(named: "flame-solid") {
-                    Image(nsImage: flame)
-                        .resizable()
-                        .scaledToFit()
-                } else {
-                    SettingsIconChip(systemImage: "info.circle.fill", color: .gray)
-                }
-            }
-            .frame(width: SettingsIconChip.side, height: SettingsIconChip.side)
-            .accessibilityHidden(true)
+            // Standard info glyph in a chip, matching the General row's style.
+            SettingsIconChip(systemImage: "info.circle.fill", color: .gray)
             Text("About")
         }
         .tag("about")
@@ -484,6 +459,8 @@ private struct GeneralSettingsTab: View {
                 }
             }
 
+            CapacityDockSettingsSection()
+
             Section("Usage Refresh") {
                 Picker("Update every", selection: Binding(
                     get: { UsageRefreshCadence(rawValue: usageRefreshSeconds) ?? .default },
@@ -609,6 +586,153 @@ private struct GeneralSettingsTab: View {
             CurrencyState.shared.apply(code: code, rate: fresh ?? cached, symbol: symbol)
         }
         CLICurrencyConfig.persist(code: code)
+    }
+}
+
+private struct CapacityDockSettingsSection: View {
+    @Environment(AppStore.self) private var store
+    @State private var snapshot = CapacityDockPreferences.load()
+
+    private var manageableProviders: [CapacityDockProvider] {
+        CapacityDockProviderSelection.manageableProviders(
+            selected: snapshot.selectedProviders,
+            isConnected: store.capacityDockProviderIsDockEligible
+        )
+    }
+
+    private var enabledEligibleProviders: [CapacityDockProvider] {
+        manageableProviders.filter {
+            snapshot.selectedProviders.contains($0)
+                && store.capacityDockProviderIsDockEligible($0)
+        }
+    }
+
+    var body: some View {
+        Section("Capacity Dock") {
+            Toggle("Show Capacity Dock", isOn: Binding(
+                get: { snapshot.isEnabled },
+                set: { CapacityDockPreferences.setEnabled($0) }
+            ))
+
+            if !enabledEligibleProviders.isEmpty {
+                Picker("Resting provider", selection: Binding(
+                    get: {
+                        enabledEligibleProviders.contains(snapshot.preferredProvider)
+                            ? snapshot.preferredProvider
+                            : enabledEligibleProviders[0]
+                    },
+                    set: { CapacityDockPreferences.setPreferredProvider($0) }
+                )) {
+                    ForEach(enabledEligibleProviders) { provider in
+                        Text(provider.displayName).tag(provider)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+
+            HStack(spacing: 10) {
+                Text("Size")
+                Slider(
+                    value: Binding(
+                        get: { snapshot.scale },
+                        set: { CapacityDockPreferences.setScale($0) }
+                    ),
+                    in: CapacityDockPreferences.scaleRange,
+                    step: 0.05
+                )
+                .accessibilityLabel("Capacity Dock size")
+                Text("\(Int((snapshot.scale * 100).rounded()))%")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 38, alignment: .trailing)
+            }
+
+            Picker("Appearance", selection: Binding(
+                get: { snapshot.theme },
+                set: { CapacityDockPreferences.setTheme($0) }
+            )) {
+                ForEach(CapacityDockTheme.allCases, id: \.self) { theme in
+                    Text(theme.displayName).tag(theme)
+                }
+            }
+            .pickerStyle(.menu)
+
+            Picker("Gauge shape", selection: Binding(
+                get: { snapshot.gaugeShape },
+                set: { CapacityDockPreferences.setGaugeShape($0) }
+            )) {
+                ForEach(CapacityDockGaugeShape.allCases, id: \.self) { shape in
+                    Text(shape.displayName).tag(shape)
+                }
+            }
+            .pickerStyle(.menu)
+
+            Text("Dock providers")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.top, 4)
+
+            if manageableProviders.isEmpty {
+                Text("Connect a provider from its sidebar page to make it available here.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
+            ForEach(manageableProviders) { provider in
+                Toggle(isOn: Binding(
+                    get: { snapshot.selectedProviders.contains(provider) },
+                    set: { setProvider(provider, selected: $0) }
+                )) {
+                    HStack(spacing: 7) {
+                        if let image = ProviderIconCache.image(named: provider.iconName) {
+                            Image(nsImage: image)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: 15, height: 15)
+                                .foregroundStyle(.primary)
+                        }
+                        Text(provider.displayName)
+                        if !store.capacityDockProviderIsConnected(provider) {
+                            Text("Needs attention")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.red)
+                        }
+                    }
+                }
+                .toggleStyle(.switch)
+                .disabled(!CapacityDockProviderSelection.canDeselect(
+                    provider,
+                    selected: snapshot.selectedProviders,
+                    isConnected: store.capacityDockProviderIsDockEligible
+                ))
+            }
+
+            Text("Connected providers and anything already shown in the dock appear here, so a provider can always be removed even if its connection later fails.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .onAppear(perform: reload)
+        .onReceive(NotificationCenter.default.publisher(for: .capacityDockPreferencesDidChange)) { _ in
+            reload()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .capacityDockCredentialPresenceDidChange)) { _ in
+            reload()
+        }
+    }
+
+    private func setProvider(_ provider: CapacityDockProvider, selected: Bool) {
+        var providers = snapshot.selectedProviders
+        if selected {
+            providers.append(provider)
+        } else {
+            providers.removeAll { $0 == provider }
+        }
+        CapacityDockPreferences.setSelectedProviders(providers)
+    }
+
+    private func reload() {
+        snapshot = CapacityDockPreferences.load()
     }
 }
 
@@ -746,7 +870,7 @@ private struct ClaudeConnectionRow: View {
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("CodeBurn will stop tracking quota and delete its local copy of your Claude credentials. Your Claude Code keychain entry is untouched. Claude Code keeps working.")
+                    Text("CodeBurn will stop tracking quota and clear its connection state plus any legacy credential cache. Your Claude Code credential is untouched. Claude Code keeps working.")
                 }
         case .terminalFailure, .noCredentials, .failed:
             Button("Reconnect") { Task { await store.bootstrapSubscription() } }
@@ -849,11 +973,11 @@ private struct CodexSettingsTab: View {
 
     var body: some View {
         Form {
-            Section("Connection") {
+            Section {
                 CodexConnectionRow()
             }
             Section {
-                Text("Codex live-quota tracking reads `~/.codex/auth.json` once on Connect, then keeps a CodeBurn-owned copy in your login Keychain instead of a world-readable file, so subsequent quota fetches don't re-read the original. The item is reachable by programs running as you, the same as any login-Keychain entry. Only ChatGPT-mode auth (Plus / Pro / Team / Business / Edu / Enterprise) is supported. API-key users are billed per request and have a different reporting surface. Credit-metered workspaces report no rate-limit windows, so their monthly credit allowance is shown instead.")
+                Text("Codex live-quota tracking follows the authoritative `~/.codex/auth.json` session directly and does not create a second Keychain copy. A legacy CodeBurn Keychain item, when present, is read only as a migration fallback. Only ChatGPT-mode auth (Plus / Pro / Team / Business / Edu / Enterprise) is supported. API-key users are billed per request and have a different reporting surface. Credit-metered workspaces report no rate-limit windows, so their monthly credit allowance is shown instead.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             } header: {
@@ -961,7 +1085,7 @@ private struct CodexConnectionRow: View {
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("CodeBurn will stop tracking quota and delete its local copy of your Codex credentials. Your ~/.codex/auth.json is untouched. Codex CLI keeps working.")
+                    Text("CodeBurn will stop tracking quota and clear its connection state plus any legacy credential cache. Your ~/.codex/auth.json is untouched. Codex CLI keeps working.")
                 }
         case .terminalFailure, .noCredentials, .failed:
             Button("Reconnect") { Task { await store.bootstrapCodex() } }
@@ -1489,6 +1613,391 @@ private struct AntigravityConnectionRow: View {
     }
 }
 
+// MARK: - Catalog providers
+
+/// Draft connection-override fields shown in Settings. Persistence stays
+/// account-keyed; this value is only the in-memory editor and must be
+/// rebuilt whenever the selected provider identity changes.
+struct ProviderSettingsEditorState: Equatable {
+    var providerID: String
+    var credential: CapacityDockProviderCredential
+    var savedCredential: CapacityDockProviderCredential
+    var localError: String?
+
+    static func load(
+        providerID: String,
+        stored: CapacityDockProviderCredential
+    ) -> ProviderSettingsEditorState {
+        ProviderSettingsEditorState(
+            providerID: providerID,
+            credential: stored,
+            savedCredential: stored,
+            localError: nil
+        )
+    }
+
+    mutating func applyProviderChange(
+        to providerID: String,
+        stored: CapacityDockProviderCredential
+    ) {
+        guard self.providerID != providerID else { return }
+        self = .load(providerID: providerID, stored: stored)
+    }
+
+    mutating func beginLoading(providerID: String) {
+        guard self.providerID != providerID else { return }
+        self = .load(providerID: providerID, stored: CapacityDockProviderCredential())
+    }
+
+    /// A Keychain read can finish after the user has selected another row.
+    /// Ignore that stale result so one provider's secret can never appear in
+    /// another provider's editor, even for a single rendered frame.
+    mutating func applyLoadedCredential(
+        _ stored: CapacityDockProviderCredential,
+        for providerID: String
+    ) {
+        guard self.providerID == providerID else { return }
+        self = .load(providerID: providerID, stored: stored)
+    }
+}
+
+private struct GenericProviderSettingsTab: View {
+    let provider: CapacityDockProvider
+
+    var body: some View {
+        Form {
+            GenericProviderConnectionSections(provider: provider)
+                .id(provider.id)
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
+}
+
+private struct GenericProviderConnectionSections: View {
+    @Environment(AppStore.self) private var store
+
+    let provider: CapacityDockProvider
+    @State private var editor = ProviderSettingsEditorState.load(
+        providerID: "",
+        stored: CapacityDockProviderCredential()
+    )
+    @State private var credentialIsLoading = false
+
+    private var summary: QuotaSummary? {
+        store.capacityDockQuotaSummary(for: provider)
+    }
+
+    private var isLoading: Bool {
+        store.capacityDockProvidersLoading.contains(provider.id)
+    }
+
+    private var isConnected: Bool {
+        guard let connection = summary?.connection else { return false }
+        return connection == .connected || connection == .stale
+    }
+
+    private var hasLiveAdapter: Bool {
+        provider.catalogEntry.hasLiveCodeBurnQuotaAdapter
+    }
+
+    private var sourceModes: [ProviderReferenceSourceMode] {
+        ProviderReferenceSourceMode.allCases.filter(provider.catalogEntry.sourceModes.contains)
+    }
+
+    private var authMethods: [ProviderAuthMethod] {
+        ProviderAuthMethod.allCases.filter(provider.catalogEntry.authMethods.contains)
+    }
+
+    private var supportsAPIKey: Bool {
+        provider.catalogEntry.authMethods.contains(.apiTokenOrCloudCredentials)
+    }
+
+    var body: some View {
+        Group {
+            Section {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: connectionIcon)
+                        .font(.system(size: 18))
+                        .foregroundStyle(connectionTint)
+                        .frame(width: 22)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(connectionTitle)
+                            .font(.system(size: 12, weight: .semibold))
+                        Text(connectionDetail)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    if !hasLiveAdapter {
+                        Text("Not yet supported")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    } else if isLoading {
+                        ProgressView().controlSize(.small)
+                    } else if isConnected {
+                        Button("Disconnect", role: .destructive) {
+                            Task {
+                                do {
+                                    try await store.disconnectCapacityDockProvider(provider)
+                                    editor = .load(
+                                        providerID: provider.id,
+                                        stored: CapacityDockProviderCredential()
+                                    )
+                                } catch {
+                                    editor.localError = error.localizedDescription
+                                }
+                            }
+                        }
+                    } else {
+                        Button(primaryConnectionButtonTitle, action: connect)
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+                .padding(.vertical, 4)
+            } header: {
+                Text("Connection")
+            } footer: {
+                Text(hasLiveAdapter
+                    ? "Automatic connection uses the provider's existing app, CLI, OAuth, browser session, or environment credentials first. CodeBurn does not copy those source credentials into its Keychain."
+                    : "Authentication methods are listed for reference. A native CodeBurn quota adapter is required before this provider can connect to Capacity Dock.")
+                    .font(.system(size: 11))
+            }
+
+            Section("Authentication methods") {
+                ForEach(authMethods, id: \.self) { method in
+                    Label(method.title, systemImage: authIcon(method))
+                        .font(.system(size: 11.5))
+                }
+            }
+
+            if hasLiveAdapter {
+                Section {
+                Picker("Source", selection: $editor.credential.sourceMode) {
+                    ForEach(sourceModes, id: \.self) { source in
+                        Text(sourceTitle(source)).tag(source.rawValue)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                if supportsAPIKey {
+                    SecureField("API key or token", text: $editor.credential.apiKey)
+                }
+
+                HStack {
+                    Button("Save & Connect") { saveAndConnect() }
+                        .buttonStyle(.borderedProminent)
+                    Button("Clear Override") {
+                        Task {
+                            do {
+                                try await store.disconnectCapacityDockProvider(provider)
+                                editor = .load(
+                                    providerID: provider.id,
+                                    stored: CapacityDockProviderCredential()
+                                )
+                            } catch {
+                                editor.localError = error.localizedDescription
+                            }
+                        }
+                    }
+                    .disabled(editor.savedCredential.isEmpty || credentialIsLoading)
+
+                    if credentialIsLoading {
+                        ProgressView()
+                            .controlSize(.small)
+                            .accessibilityLabel("Loading saved provider credential")
+                    }
+                }
+
+                if let localError = editor.localError {
+                    Text(localError)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.red)
+                }
+            } header: {
+                Text("Connection override")
+            } footer: {
+                Text("Overrides are optional and are saved only when you press Save & Connect. Secret values use one CodeBurn-owned Keychain item for this provider; background reads suppress authentication UI.")
+                    .font(.system(size: 11))
+            }
+            .disabled(credentialIsLoading)
+            } else if CapacityDockProviderCredentialPresence.contains(provider.id) {
+                Section {
+                    Button("Remove saved override", role: .destructive) {
+                        Task {
+                            do {
+                                try await store.disconnectCapacityDockProvider(provider)
+                                editor = .load(
+                                    providerID: provider.id,
+                                    stored: CapacityDockProviderCredential()
+                                )
+                            } catch {
+                                editor.localError = error.localizedDescription
+                            }
+                        }
+                    }
+                    if let localError = editor.localError {
+                        Text(localError)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.red)
+                    }
+                } header: {
+                    Text("Saved data")
+                } footer: {
+                    Text("This credential predates a live CodeBurn quota adapter and is not treated as a connection.")
+                        .font(.system(size: 11))
+                }
+            }
+        }
+        .task(id: provider.id) {
+            await reloadEditor()
+        }
+    }
+
+    private var connectionTitle: String {
+        guard hasLiveAdapter else { return "Quota adapter not available" }
+        if isLoading { return "Connecting…" }
+        guard let summary else { return "Not connected" }
+        switch summary.connection {
+        case .connected: return "Connected"
+        case .loading: return "Connecting…"
+        case .stale: return "Refreshing…"
+        case .transientFailure: return "Retrying"
+        case .terminalFailure: return "Reconnect required"
+        case .disconnected: return "Not connected"
+        }
+    }
+
+    private var connectionDetail: String {
+        guard hasLiveAdapter else {
+            return "\(provider.displayName) is catalogued, but CodeBurn cannot fetch its live quota yet."
+        }
+        if let error = store.capacityDockProviderErrors[provider.id], !error.isEmpty {
+            return "\(error) \(ProviderConnectionGuidance.instruction(for: provider))"
+        }
+        guard let summary else {
+            return ProviderConnectionGuidance.instruction(for: provider)
+        }
+        if case let .terminalFailure(reason) = summary.connection {
+            let instruction = ProviderConnectionGuidance.instruction(for: provider)
+            guard let reason, !reason.isEmpty else { return instruction }
+            return "\(reason) \(instruction)"
+        }
+        if let source = summary.footerLines.first(where: { $0.hasPrefix("Source:") }) {
+            return source
+        }
+        return isConnected ? "Live quota is available to Capacity Dock." : "Waiting for quota data."
+    }
+
+    private var connectionIcon: String {
+        if isLoading { return "ellipsis.circle" }
+        return isConnected ? "checkmark.circle.fill" : "link.circle"
+    }
+
+    private var connectionTint: Color {
+        if isConnected { return .green }
+        if case .terminalFailure = summary?.connection { return .red }
+        return .secondary
+    }
+
+    private var requiresExplicitCredential: Bool {
+        // A provider whose only authentication path is an API credential cannot
+        // be connected from an empty "Automatic" draft: its live adapter still
+        // needs this provider-scoped key. Mixed-auth providers may legitimately
+        // discover an existing app, CLI, OAuth, or browser session instead.
+        provider.catalogEntry.authMethods == [.apiTokenOrCloudCredentials]
+    }
+
+    private var submissionAction: ProviderConnectionSubmissionPolicy.Action {
+        ProviderConnectionSubmissionPolicy.resolve(
+            credential: editor.credential,
+            savedCredential: editor.savedCredential,
+            requiresExplicitCredential: requiresExplicitCredential
+        )
+    }
+
+    private var primaryConnectionButtonTitle: String {
+        switch submissionAction {
+        case .saveAndConnect: return "Save & Connect"
+        case .connect, .requiresCredential: return summary == nil ? "Connect" : "Retry"
+        }
+    }
+
+    private func saveAndConnect() {
+        if requiresExplicitCredential,
+           editor.credential.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            editor.localError = ProviderConnectionGuidance.instruction(for: provider)
+            return
+        }
+        let credential = editor.credential
+        Task {
+            do {
+                try await store.saveCapacityDockCredential(credential, for: provider)
+                editor.savedCredential = credential
+                editor.localError = nil
+                await store.connectCapacityDockProvider(provider)
+            } catch {
+                editor.localError = error.localizedDescription
+            }
+        }
+    }
+
+    private func authIcon(_ method: ProviderAuthMethod) -> String {
+        switch method {
+        case .localAppOrCLI: "terminal"
+        case .oauth: "person.badge.key"
+        case .apiTokenOrCloudCredentials: "key"
+        case .cookieOrWebSession: "globe"
+        case .localhost: "network"
+        case .none: "checkmark.seal"
+        }
+    }
+
+    private func sourceTitle(_ source: ProviderReferenceSourceMode) -> String {
+        switch source {
+        case .automatic: "Automatic"
+        case .web: "Browser session"
+        case .cli: "CLI"
+        case .oauth: "OAuth"
+        case .api: "API"
+        }
+    }
+
+    private func connect() {
+        switch submissionAction {
+        case .requiresCredential:
+            editor.localError = ProviderConnectionGuidance.instruction(for: provider)
+        case .saveAndConnect:
+            saveAndConnect()
+        case .connect:
+            editor.localError = nil
+            Task { await store.connectCapacityDockProvider(provider) }
+        }
+    }
+
+    private func reloadEditor() async {
+        let providerID = provider.id
+        editor.beginLoading(providerID: providerID)
+        credentialIsLoading = true
+        defer {
+            if editor.providerID == providerID {
+                credentialIsLoading = false
+            }
+        }
+
+        do {
+            let stored = try await CapacityDockProviderCredentialStore.loadAsync(for: providerID)
+            guard !Task.isCancelled else { return }
+            editor.applyLoadedCredential(stored, for: providerID)
+        } catch {
+            guard !Task.isCancelled, editor.providerID == providerID else { return }
+            editor.localError = error.localizedDescription
+        }
+    }
+
+}
+
 // MARK: - Devin
 
 private struct DevinSettingsTab: View {
@@ -1503,6 +2012,8 @@ private struct DevinSettingsTab: View {
 
     var body: some View {
         Form {
+            GenericProviderConnectionSections(provider: CapacityDockProvider(rawValue: "devin")!)
+
             Section("ACU Conversion") {
                 HStack(alignment: .center, spacing: 10) {
                     Text("USD per ACU")
@@ -1702,4 +2213,3 @@ enum AboutFlameImage {
         return nil
     }
 }
-
