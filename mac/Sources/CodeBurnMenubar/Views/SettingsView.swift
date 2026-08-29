@@ -22,14 +22,19 @@ struct SettingsView: View {
     private static let mainPaneIDs: Set<String> = ["general", "about"]
 
     private var providers: [ProviderPane] {
-        CapacityDockPreferences.supportedProviders.map { provider in
-            ProviderPane(
-                id: provider.id,
-                name: provider.displayName,
-                icon: provider.iconName,
-                isConnected: providerIsConnected(provider)
-            )
-        }
+        // Only surface providers CodeBurn actually has a live quota adapter for;
+        // the rest of the catalog would just read "coming soon" and clutter the
+        // list, so they stay hidden until their adapter ships.
+        CapacityDockPreferences.supportedProviders
+            .filter { $0.catalogEntry.hasLiveCodeBurnQuotaAdapter }
+            .map { provider in
+                ProviderPane(
+                    id: provider.id,
+                    name: provider.displayName,
+                    icon: provider.iconName,
+                    isConnected: providerIsConnected(provider)
+                )
+            }
     }
 
     private func providerIsConnected(_ provider: CapacityDockProvider) -> Bool {
