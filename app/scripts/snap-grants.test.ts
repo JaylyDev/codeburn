@@ -17,10 +17,16 @@ const ROOT_GRANTS_WITH_NO_NARROWER_FORM = new Set([
 
 const XDG_PARENTS = ['.config', '.local']
 
-function readGrants(): string[] {
+function readPlug(name: string): Record<string, unknown> {
   const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'))
-  const plug = pkg.build.snap.plugs.find((p: unknown) => typeof p === 'object')
-  return plug['ai-agent-session-logs'].read
+  const plug = pkg.build.snap.plugs.find(
+    (p: unknown) => typeof p === 'object' && p !== null && name in (p as object),
+  )
+  return (plug as Record<string, Record<string, unknown>>)[name]
+}
+
+function readGrants(): string[] {
+  return readPlug('ai-agent-session-logs').read as string[]
 }
 
 describe('snap personal-files declaration', () => {
@@ -35,11 +41,20 @@ describe('snap personal-files declaration', () => {
     expect(bare).toEqual([])
   })
 
-  it('requests read only, and one credential file explicitly', () => {
-    const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'))
-    const plug = pkg.build.snap.plugs.find((p: unknown) => typeof p === 'object')['ai-agent-session-logs']
+  it('requests read only and never a credential file', () => {
+    // Snap Store review (forum topic 52615): credentials must not ride along
+    // with the auto-connected session-log plug.
+    const plug = readPlug('ai-agent-session-logs')
     expect(Object.keys(plug).sort()).toEqual(['interface', 'read'])
     expect(readGrants().filter(e => e.includes('credential') || e.includes('auth.json')))
-      .toEqual(['$HOME/.claude/.credentials.json'])
+      .toEqual([])
+  })
+
+  it('keeps the Claude credential file in its own manually-connected plug', () => {
+    const plug = readPlug('claude-quota-credentials')
+    expect(plug).toBeDefined()
+    expect(Object.keys(plug).sort()).toEqual(['interface', 'read'])
+    expect(plug.interface).toBe('personal-files')
+    expect(plug.read).toEqual(['$HOME/.claude/.credentials.json'])
   })
 })
