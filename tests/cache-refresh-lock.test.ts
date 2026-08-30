@@ -280,6 +280,28 @@ describe('warm session-cache refresh lock', () => {
     }
   })
 
+  it('never exposes a torn lock body to a plain reader while heartbeating', async () => {
+    // Regression for #904: the heartbeat used to rewrite the body in place
+    // (truncate then write), so a concurrent reader could observe an empty or
+    // partial file. The rewrite is now an atomic rename, so every read below
+    // must parse, whichever side of a heartbeat it lands on.
+    const dir = await tempDir()
+    const clock = fakeClock(10_000)
+    const result = await acquireCacheRefreshLock({ cacheDir: dir, clock, heartbeatMs: 1 })
+    expect(result.outcome).toBe('acquired')
+    if (result.outcome !== 'acquired') return
+    try {
+      for (let i = 0; i < 400; i++) {
+        if (i % 20 === 0) clock.advance(100)
+        const record = JSON.parse(await readFile(lockPath(dir), 'utf-8'))
+        expect(record.token).toBe(result.handle.token)
+        if (i % 50 === 0) await new Promise(resolve => { setTimeout(resolve, 2) })
+      }
+    } finally {
+      await result.handle.release()
+    }
+  })
+
   it('takes over only after re-verifying a stale token and mtime', async () => {
     const dir = await tempDir()
     const clock = fakeClock(100_000)
