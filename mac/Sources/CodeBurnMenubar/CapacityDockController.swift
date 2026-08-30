@@ -14,6 +14,8 @@ final class CapacityDockController {
     private var wakeObserver: NSObjectProtocol?
     private var localEventMonitor: Any?
     private var globalMouseMonitor: Any?
+    private var hoverPollTimer: Timer?
+    private var lastPolledPointer: CGPoint?
 
     private var expansionWork: DispatchWorkItem?
     private var collapseWork: DispatchWorkItem?
@@ -271,6 +273,24 @@ final class CapacityDockController {
 
     private func startEventMonitoring() {
         guard localEventMonitor == nil, globalMouseMonitor == nil else { return }
+        // Global .mouseMoved monitors only deliver while the frontmost app
+        // itself requests mouse-moved events (Chrome does, Finder and Terminal
+        // don't), so the monitors alone leave hover dead over most apps. Poll
+        // the pointer as the activation-independent fallback; the diff guard
+        // makes idle ticks free.
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let point = NSEvent.mouseLocation
+                if point == self.lastPolledPointer { return }
+                self.lastPolledPointer = point
+                self.updateMouseEventPassthrough(at: point)
+                self.syncPointerHover(at: point)
+            }
+        }
+        timer.tolerance = 0.05
+        RunLoop.main.add(timer, forMode: .common)
+        hoverPollTimer = timer
         localEventMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown, .keyDown, .mouseMoved]
         ) { [weak self] event in
@@ -308,6 +328,9 @@ final class CapacityDockController {
     private func stopEventMonitoring() {
         railPanel?.ignoresMouseEvents = false
         detailPanel?.ignoresMouseEvents = false
+        hoverPollTimer?.invalidate()
+        hoverPollTimer = nil
+        lastPolledPointer = nil
         if let localEventMonitor {
             NSEvent.removeMonitor(localEventMonitor)
             self.localEventMonitor = nil
