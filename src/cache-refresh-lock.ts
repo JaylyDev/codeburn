@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'crypto'
 import { existsSync, readFileSync, unlinkSync } from 'fs'
-import { mkdir, open, readFile, stat, unlink, utimes, writeFile } from 'fs/promises'
+import { mkdir, open, readFile, rename, stat, unlink, utimes, writeFile } from 'fs/promises'
 import { join } from 'path'
 
 import { getCodeburnCacheDir } from './cache-dir.js'
@@ -180,8 +180,10 @@ type ObservationResult = Observation | 'missing' | 'changing' | 'unavailable'
 
 async function observe(path: string): Promise<ObservationResult> {
   // Exclusive create exposes the directory entry just before its small body is
-  // written, and heartbeat rewrites briefly truncate it. Treat that bounded
-  // transition as contention, not broken infrastructure.
+  // written, and heartbeats of OLDER codeburn versions sharing this cache dir
+  // still rewrite the body in place (truncating it briefly); this version's
+  // heartbeat replaces atomically. Treat that bounded transition as
+  // contention, not broken infrastructure.
   let sawChange = false
   let corrupt: Observation | null = null
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -393,7 +395,24 @@ export async function acquireCacheRefreshLock(options: RefreshLockOptions = {}):
           // recovers the lock one staleMs later through the age gate. Losing a
           // parse is the correct price for never having two owners.
           if (current.record === null || current.record.token !== token) return
-          await writeFile(lockPath, body(), { encoding: 'utf-8' })
+          // Atomic replace: a truncate-in-place rewrite here exposed every
+          // reader to an empty or partial body for the width of the write
+          // (#904). rename() swaps the directory entry whole, so a reader sees
+          // either the previous body or the next one, never a torn one. The
+          // temp name is deterministic per lock: there is one owner at a time,
+          // so a crash's leftover is simply overwritten by the next tick.
+          const nextPath = lockPath + '.hb-next'
+          await writeFile(nextPath, body(), { encoding: 'utf-8', mode: 0o600 })
+          try {
+            await rename(nextPath, lockPath)
+          } catch (err) {
+            // Windows can refuse the replace while an unrelated open handle
+            // lingers. Skipping the tick is safe: the mtime simply does not
+            // advance this round, and staleMs is nine heartbeats wide.
+            await unlink(nextPath).catch(() => {})
+            if (!isBusyError(err)) throw err
+            return
+          }
           const now = new Date(clock.wallNow())
           await utimes(lockPath, now, now)
         } catch { /* verify/release will turn displacement or I/O failure into a closed gate */ }
