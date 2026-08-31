@@ -1368,8 +1368,9 @@ private struct CopilotSettingsTab: View {
             Section("Connection") {
                 CopilotConnectionRow()
             }
+            CopilotTokenSection()
             Section {
-                Text("Copilot live-quota tracking reads the GitHub Copilot editor sign-in token from `~/.config/github-copilot` read-only. Nothing is copied or stored. Sign in via an editor's Copilot plugin (VS Code, Xcode, etc.) first; if the connection shows as expired, sign in there again, then click Reconnect.")
+                Text("Copilot live-quota tracking reads a GitHub token that is already on this Mac, read-only. Nothing is copied or stored. CodeBurn looks at the editor plugin files in `~/.config/github-copilot`, the Copilot CLI's `~/.copilot` files, the COPILOT_GITHUB_TOKEN, GH_TOKEN and GITHUB_TOKEN variables, `gh auth token`, and finally a token you paste below. Usage tracking works without any of this; only the live quota bars need a token.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             } header: {
@@ -1378,6 +1379,60 @@ private struct CopilotSettingsTab: View {
         }
         .formStyle(.grouped)
         .padding()
+    }
+}
+
+/// Last rung of the credential chain: a token the user pastes here. Stored in
+/// CodeBurn's own provider-scoped Keychain item, the same one ClinePass uses.
+private struct CopilotTokenSection: View {
+    @Environment(AppStore.self) private var store
+    @State private var token = ""
+    @State private var isSaving = false
+    @State private var errorText: String?
+
+    var body: some View {
+        Section {
+            SecureField("GitHub token", text: $token)
+            HStack {
+                Button("Save & Connect") { save(token) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isSaving || token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Clear Token") { save("") }
+                    .disabled(isSaving)
+                if isSaving {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            if let errorText {
+                Text(errorText)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+            }
+        } header: {
+            Text("Paste a token")
+        } footer: {
+            Text("Optional, and only needed when nothing else on this Mac is signed in. A fine-grained personal access token with the \"Plan: Read-only\" permission is enough. The token is saved in CodeBurn's own Keychain item and is used only to read your Copilot quota.")
+                .font(.system(size: 11))
+        }
+    }
+
+    private func save(_ raw: String) {
+        isSaving = true
+        errorText = nil
+        Task {
+            defer { isSaving = false }
+            do {
+                try await CapacityDockProviderCredentialStore.saveAsync(
+                    CapacityDockProviderCredential(apiKey: raw),
+                    for: CopilotSubscriptionService.providerID
+                )
+                token = ""
+                CopilotSubscriptionService.resetProbeCache()
+                await store.bootstrapCopilot()
+            } catch {
+                errorText = error.localizedDescription
+            }
+        }
     }
 }
 
@@ -1446,13 +1501,13 @@ private struct CopilotConnectionRow: View {
             }
             return "Live quota tracked from api.github.com."
         case .terminalFailure:
-            return "Sign in via an editor's Copilot plugin to refresh your login, then click Reconnect."
+            return "Sign in again with the Copilot CLI, an editor's Copilot plugin, or gh auth login, then click Reconnect."
         case .transientFailure: return store.copilotError ?? "GitHub rate-limited; auto-retrying."
-        case .bootstrapping: return "Reading ~/.config/github-copilot credentials."
+        case .bootstrapping: return "Looking for a GitHub token on this Mac."
         case .loading: return "Background refresh in progress."
         case .dormant: return "Tap Load Quota to fetch live usage from api.github.com."
         case .notBootstrapped, .noCredentials:
-            return "Sign in via an editor's Copilot plugin first, then click Connect."
+            return "Usage tracking still works. For live quota, sign in with the Copilot CLI or gh auth login, or paste a token below, then click Connect."
         case .failed: return store.copilotError ?? ""
         }
     }
@@ -1471,7 +1526,7 @@ private struct CopilotConnectionRow: View {
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("CodeBurn will stop tracking Copilot quota. Your ~/.config/github-copilot credentials are untouched. Your editor's Copilot plugin keeps working.")
+                    Text("CodeBurn will stop tracking Copilot quota. Every credential it read stays untouched, and your Copilot clients keep working.")
                 }
         case .terminalFailure, .noCredentials, .failed:
             Button("Reconnect") { Task { await store.bootstrapCopilot() } }

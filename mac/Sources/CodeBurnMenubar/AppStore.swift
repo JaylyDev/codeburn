@@ -157,7 +157,7 @@ final class AppStore {
     var copilotUsage: CopilotUsage?
     var copilotError: String?
     // Same file-based activation as Kimi/Gemini — reading
-    // ~/.config/github-copilot is prompt-free, so we start dormant and
+    // Copilot discovery never raises a keychain prompt, so we start dormant and
     // auto-activate on the first refresh tick.
     var copilotLoadState: SubscriptionLoadState = CopilotSubscriptionService.hasCredential ? .dormant : .notBootstrapped
 
@@ -1393,9 +1393,8 @@ final class AppStore {
 
     // MARK: - Copilot
 
-    /// Same prompt-free activation as Kimi/Gemini: reading the editor plugins'
-    /// credential files needs no keychain, so the first refresh tick activates
-    /// dormant state.
+    /// Same prompt-free activation as Kimi/Gemini: the whole Copilot discovery
+    /// chain is prompt-free, so the first refresh tick activates dormant state.
     func bootstrapCopilot() async {
         // Capture the generation before the await so a disconnect that lands
         // mid-fetch cannot be resurrected into .loaded when the fetch returns.

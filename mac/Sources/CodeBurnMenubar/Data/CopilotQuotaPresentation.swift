@@ -2,9 +2,9 @@ import Foundation
 
 /// Pure display-decision helpers for the Copilot quota surfaces.
 ///
-/// Copilot tokens are read straight from the editor plugins' on-disk files
-/// with no refresh path, so a revoked token sits in `.terminalFailure` until
-/// the user signs in via an editor's Copilot plugin again. Like Kimi and
+/// Copilot tokens are read straight from whichever signed-in client already
+/// holds one, with no refresh path, so a revoked token sits in
+/// `.terminalFailure` until the user signs in again. Like Kimi and
 /// Gemini, the always-visible surfaces keep showing the last good snapshot
 /// with a quiet caption instead of flapping to a reconnect screen; the
 /// reconnect screen is reserved for the no-data case, where there is
