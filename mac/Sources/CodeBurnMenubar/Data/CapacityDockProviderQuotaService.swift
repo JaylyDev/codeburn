@@ -22,6 +22,7 @@ final class CapacityDockProviderQuotaService {
         // network by omitting a field.
         var refreshClinePass: @Sendable (String) async throws -> QuotaSummary
         var refreshCursor: @Sendable () async throws -> QuotaSummary
+        var refreshZai: @Sendable (String?) async throws -> QuotaSummary
 
         static let live = Dependencies(
             refreshClinePass: { apiKey in
@@ -29,6 +30,9 @@ final class CapacityDockProviderQuotaService {
             },
             refreshCursor: {
                 try await CursorSubscriptionService.refresh()
+            },
+            refreshZai: { apiKey in
+                try await ZaiSubscriptionService.refresh(apiKey: apiKey)
             }
         )
     }
@@ -63,6 +67,14 @@ final class CapacityDockProviderQuotaService {
             }
             do {
                 return try await dependencies.refreshClinePass(apiKey)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw CapacityDockProviderFetchFailure(error: error)
+            }
+        case "zai":
+            do {
+                return try await dependencies.refreshZai(credential.sanitizedOverride.apiKey)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -114,6 +126,14 @@ struct CapacityDockProviderFetchFailure: LocalizedError, Equatable, Sendable {
             }
         }
         if let error = error as? CursorSubscriptionService.FetchError {
+            switch error.classification {
+            case .terminalAuth:
+                return .terminal
+            case .transient, .parseFailure:
+                return .transient
+            }
+        }
+        if let error = error as? ZaiSubscriptionService.FetchError {
             switch error.classification {
             case .terminalAuth:
                 return .terminal

@@ -46,7 +46,7 @@ struct ProviderConnectionCatalogTests {
             .filter(\.hasLiveCodeBurnQuotaAdapter)
             .map(\.id)
             .sorted()
-        #expect(live == ["antigravity", "claude", "clinepass", "codex", "copilot", "cursor", "gemini", "kimi"])
+        #expect(live == ["antigravity", "claude", "clinepass", "codex", "copilot", "cursor", "gemini", "kimi", "zai"])
     }
 
 }
