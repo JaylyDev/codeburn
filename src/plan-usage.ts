@@ -152,7 +152,7 @@ export function copilotCreditsNote(rated: number, unrated: number): string {
   if (unrated === 0) {
     return `All ${rated} Copilot requests in this period carry GitHub's exact credit figure, so spentCredits is complete.`
   }
-  return `${rated} of ${rated + unrated} Copilot requests carry GitHub's exact credit figure (Copilot CLI session-store rows are the only local source that has it). spentCredits counts only those; estimatedCredits adds the rest priced from tokens at listed API rates, which is a floor because request multipliers and cached-token pricing are not modelled. percentUsed still tracks spentCredits.`
+  return `${rated} of ${rated + unrated} Copilot requests carry GitHub's exact credit figure (Copilot CLI session-store rows are the only local source that has it). spentCredits counts only those; estimatedCredits adds the rest priced from tokens at listed API rates, which is a floor because request multipliers and cached-token pricing are not modelled. percentUsed tracks estimatedCredits while any request is unrated.`
 }
 
 export function projectMonthEnd(
@@ -203,7 +203,11 @@ export function getPlanUsageFromProjects(plan: Plan, projects: ProjectSummary[],
   if (isCopilotCreditsPlan(plan)) {
     const { spentCredits, estimatedCredits, creditRatedCalls, creditUnratedCalls, creditsIncomplete } = copilotCreditSpend(projects)
     const budgetCredits = plan.monthlyCredits ?? 0
-    const percentUsed = budgetCredits > 0 ? (spentCredits / budgetCredits) * 100 : 0
+    // The bar follows the estimate once any request lacks an exact figure:
+    // a bar at 0% beside a 19k real bill is the misleading picture #1199
+    // reported, and the estimate is a floor, so it under-alerts, never over.
+    const barCredits = creditUnratedCalls > 0 ? estimatedCredits : spentCredits
+    const percentUsed = budgetCredits > 0 ? (barCredits / budgetCredits) * 100 : 0
     const spent = creditsToUsd(spentCredits)
     const status: PlanStatus = percentUsed > 100 ? 'over' : percentUsed >= PLAN_NEAR_THRESHOLD_PCT ? 'near' : 'under'
     const projectedMonthUsd = projectMonthEnd(projects, periodStart, periodEnd, today, spent, call => planCallSpend(plan, call))

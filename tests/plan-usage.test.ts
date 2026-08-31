@@ -504,7 +504,7 @@ describe('copilot AI credit plan math', () => {
     expect(usage.status).toBe('under')
   })
 
-  it('does not fill the credits bar from token costUSD when nanoAiu is missing', () => {
+  it('fills the credits bar from the token estimate when nanoAiu is missing', () => {
     const usage = getPlanUsageFromProjects(copilotPro, [
       usageProject([
         usageCall({
@@ -517,7 +517,9 @@ describe('copilot AI credit plan math', () => {
 
     expect(usage.spentCredits).toBe(0)
     expect(usage.creditsIncomplete).toBe(true)
-    expect(usage.percentUsed).toBe(0)
+    // 42 USD at 0.01 USD per credit against the 1500-credit Pro budget.
+    expect(usage.percentUsed).toBe(280)
+    expect(usage.status).toBe('over')
     expect(usage.spentApiEquivalentUsd).toBe(0)
   })
 
@@ -618,7 +620,7 @@ describe('copilot AI credit plan math', () => {
     expect(spend.creditsIncomplete).toBe(true)
   })
 
-  it('leaves the bar and percentUsed on the exact figure while exposing the estimate', () => {
+  it('moves the bar and percentUsed onto the estimate while exposing the exact figure', () => {
     const usage = getPlanUsageFromProjects(copilotPro, [
       usageProject([
         usageCall({ provider: 'copilot', costUSD: 0.42, timestamp: '2026-08-05T12:00:00.000Z' }),
@@ -626,7 +628,7 @@ describe('copilot AI credit plan math', () => {
     ], today)
 
     expect(usage.spentCredits).toBe(0)
-    expect(usage.percentUsed).toBe(0)
+    expect(usage.percentUsed).toBeCloseTo(2.8, 10)
     expect(usage.estimatedCredits).toBeCloseTo(42, 10)
     expect(usage.creditUnratedCalls).toBe(1)
   })

@@ -557,9 +557,9 @@ export function planBudgetHeadline(planUsage: PlanUsage): string {
     if (unrated > 0) {
       const rated = planUsage.creditRatedCalls ?? 0
       const estimated = planUsage.estimatedCredits ?? spent
-      // Tenths, not the exact-figure precision: the bulk of this number is
-      // priced from tokens, so more digits would claim accuracy it lacks.
-      const shown = formatCredits(Math.round(estimated * 10) / 10)
+      // Whole credits only: the bulk of this number is priced from tokens,
+      // so decimals would claim accuracy it lacks.
+      const shown = formatCredits(Math.round(estimated))
       return `${planLabel(planUsage)}: ~${shown} / ${formatCredits(budget)} AI Credits (estimated; ${rated} of ${rated + unrated} requests carry GitHub's exact figure)`
     }
     return `${planLabel(planUsage)}: ${formatCredits(spent)} / ${formatCredits(budget)} AI Credits`

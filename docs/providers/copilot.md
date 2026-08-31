@@ -160,7 +160,8 @@ see the #927 ruling in `src/session-cache.ts`).
   figure)`), and `codeburn status --format json | jq .plans.copilot` carries
   `spentCredits` (exact only), `estimatedCredits` (exact plus estimate),
   `creditRatedCalls` / `creditUnratedCalls`, `creditsIncomplete` and a plain
-  `creditsNote`. The bar and `percentUsed` deliberately stay on the exact figure.
+  `creditsNote`. The bar and `percentUsed` follow `estimatedCredits` while any
+  request is unrated, and the exact figure once every request carries one.
   For the live authoritative number, use the menubar's GitHub quota endpoint
   (separate system, PR #1200).
 - **Sync.** `codeburn sync push` holds a copilot session until it has been

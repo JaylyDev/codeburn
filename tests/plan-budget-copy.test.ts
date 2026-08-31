@@ -102,7 +102,7 @@ describe('plan budget copy', () => {
       creditUnratedCalls: 469,
     })
     expect(planBudgetHeadline(copilot))
-      .toBe("Copilot Max: ~9800.4 / 20000 AI Credits (estimated; 4 of 473 requests carry GitHub's exact figure)")
+      .toBe("Copilot Max: ~9800 / 20000 AI Credits (estimated; 4 of 473 requests carry GitHub's exact figure)")
     expect(planBudgetHeadline(copilot)).not.toContain('—')
   })
 
