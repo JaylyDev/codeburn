@@ -149,11 +149,17 @@ see the #927 ruling in `src/session-cache.ts`).
   `agent-traces.db`, JetBrains stores and the CLI session-state JSONL never do,
   so on a typical machine most requests have no exact figure at all (#1199).
   Everything unrated is estimated instead: the request's tokens priced at the
-  model's listed API rate, converted at 1 credit = $0.01. Read it as a **floor**:
-  GitHub's per-model request multipliers and its cached-token pricing are not
-  modelled, and the numbers in #1199 suggest the gap can be roughly 2x. A
-  session that carries any exact figure is never estimated on top of, because
-  `total_nano_aiu` already bills that request's whole token set.
+  model's listed API rate, converted at 1 credit = $0.01. That is exactly how
+  GitHub bills credits, verified against real session-store rows: list rate
+  with the cache-read and cache-write split applied, and `request_multiplier`
+  (the legacy premium-request weight) never touches the credit figure. So the
+  estimate's accuracy hinges on the source: on Copilot CLI events, which carry
+  the cache split, CodeBurn's token pricing landed within about 15% of the
+  exact bill; VS Code chat sessions record prompt and output tokens only, so
+  their estimate can land either side of the bill, and the numbers in #1199
+  show the gap can reach roughly 2x. A session that carries any exact figure
+  is never estimated on top of, because `total_nano_aiu` already bills that
+  request's whole token set.
 
   `codeburn plan` says so on the headline whenever anything is estimated
   (`~9800 / 20000 AI Credits (estimated; 4 of 473 requests carry GitHub's exact

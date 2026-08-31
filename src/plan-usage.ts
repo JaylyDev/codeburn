@@ -132,7 +132,11 @@ export function copilotCreditSpend(projects: ProjectSummary[]): CopilotCreditSpe
     // A rated row's total_nano_aiu is the whole request's bill, twin tokens
     // included, so a session that carries any exact figure gets no estimate
     // stacked on top of it. Everything else is priced from tokens at listed
-    // API rates: a floor, since request multipliers are not modelled.
+    // API rates. GitHub bills credits as exactly that (list rate with the
+    // cache-read/write split; request_multiplier is the legacy premium
+    // request weight and does not touch credits), verified against real
+    // session-store rows, so accuracy hinges on how completely the source
+    // recorded tokens and their cache split.
     if (primaryNano.length === 0 && suppNano.length === 0) {
       for (const call of unrated) estimatedUsd += call.costUSD
     }
@@ -152,7 +156,7 @@ export function copilotCreditsNote(rated: number, unrated: number): string {
   if (unrated === 0) {
     return `All ${rated} Copilot requests in this period carry GitHub's exact credit figure, so spentCredits is complete.`
   }
-  return `${rated} of ${rated + unrated} Copilot requests carry GitHub's exact credit figure (Copilot CLI session-store rows are the only local source that has it). spentCredits counts only those; estimatedCredits adds the rest priced from tokens at listed API rates, which is a floor because request multipliers and cached-token pricing are not modelled. percentUsed tracks estimatedCredits while any request is unrated.`
+  return `${rated} of ${rated + unrated} Copilot requests carry GitHub's exact credit figure (Copilot CLI session-store rows are the only local source that has it). spentCredits counts only those; estimatedCredits adds the rest priced from tokens at listed API rates, which matched GitHub within about 15% on real Copilot CLI events; VS Code chat sessions record no cache split, so their estimate can land either side of the bill. percentUsed tracks estimatedCredits while any request is unrated.`
 }
 
 export function projectMonthEnd(
@@ -205,7 +209,7 @@ export function getPlanUsageFromProjects(plan: Plan, projects: ProjectSummary[],
     const budgetCredits = plan.monthlyCredits ?? 0
     // The bar follows the estimate once any request lacks an exact figure:
     // a bar at 0% beside a 19k real bill is the misleading picture #1199
-    // reported, and the estimate is a floor, so it under-alerts, never over.
+    // reported, and a labelled estimate beats a confidently wrong zero.
     const barCredits = creditUnratedCalls > 0 ? estimatedCredits : spentCredits
     const percentUsed = budgetCredits > 0 ? (barCredits / budgetCredits) * 100 : 0
     const spent = creditsToUsd(spentCredits)

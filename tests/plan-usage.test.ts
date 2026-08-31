@@ -700,7 +700,7 @@ describe('copilot AI credit plan math', () => {
     const note = copilotCreditsNote(4, 469)
     expect(note).toContain("4 of 473 Copilot requests carry GitHub's exact credit figure")
     expect(note).toContain('estimatedCredits')
-    expect(note).toContain('floor')
+    expect(note).toContain('cache split')
     expect(note).not.toContain('—')
   })
 
