@@ -143,6 +143,33 @@ see the #927 ruling in `src/session-cache.ts`).
   stores parse identically without). Plan math sums finite `nanoAiu` into
   Copilot AI credits (`codeburn plan set copilot-pro`). Billing-grade cost
   rewrite of every report is still upstream #890.
+
+  These CLI session-store rows are the **only** local source that carries an
+  exact credit figure. VS Code chat sessions and transcripts, the OTel
+  `agent-traces.db`, JetBrains stores and the CLI session-state JSONL never do,
+  so on a typical machine most requests have no exact figure at all (#1199).
+  Everything unrated is estimated instead: the request's tokens priced at the
+  model's listed API rate, converted at 1 credit = $0.01. That is exactly how
+  GitHub bills credits, verified against real session-store rows: list rate
+  with the cache-read and cache-write split applied, and `request_multiplier`
+  (the legacy premium-request weight) never touches the credit figure. So the
+  estimate's accuracy hinges on the source: on Copilot CLI events, which carry
+  the cache split, CodeBurn's token pricing landed within about 15% of the
+  exact bill; VS Code chat sessions record prompt and output tokens only, so
+  their estimate can land either side of the bill, and the numbers in #1199
+  show the gap can reach roughly 2x. A session that carries any exact figure
+  is never estimated on top of, because `total_nano_aiu` already bills that
+  request's whole token set.
+
+  `codeburn plan` says so on the headline whenever anything is estimated
+  (`~9800 / 20000 AI Credits (estimated; 4 of 473 requests carry GitHub's exact
+  figure)`), and `codeburn status --format json | jq .plans.copilot` carries
+  `spentCredits` (exact only), `estimatedCredits` (exact plus estimate),
+  `creditRatedCalls` / `creditUnratedCalls`, `creditsIncomplete` and a plain
+  `creditsNote`. The bar and `percentUsed` follow `estimatedCredits` while any
+  request is unrated, and the exact figure once every request carries one.
+  For the live authoritative number, use the menubar's GitHub quota endpoint
+  (separate system, PR #1200).
 - **Sync.** `codeburn sync push` holds a copilot session until it has been
   quiet for 24 hours. The reconciliation output is mutable (a residual shrinks
   as rows land, a rollup is dropped once rows cover its leg, a row's pairing

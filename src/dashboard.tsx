@@ -553,6 +553,15 @@ export function planBudgetHeadline(planUsage: PlanUsage): string {
   if (planUsage.plan.provider === 'copilot') {
     const spent = planUsage.spentCredits ?? 0
     const budget = planUsage.budgetCredits ?? planUsage.plan.monthlyCredits ?? 0
+    const unrated = planUsage.creditUnratedCalls ?? 0
+    if (unrated > 0) {
+      const rated = planUsage.creditRatedCalls ?? 0
+      const estimated = planUsage.estimatedCredits ?? spent
+      // Whole credits only: the bulk of this number is priced from tokens,
+      // so decimals would claim accuracy it lacks.
+      const shown = formatCredits(Math.round(estimated))
+      return `${planLabel(planUsage)}: ~${shown} / ${formatCredits(budget)} AI Credits (estimated; ${rated} of ${rated + unrated} requests carry GitHub's exact figure)`
+    }
     return `${planLabel(planUsage)}: ${formatCredits(spent)} / ${formatCredits(budget)} AI Credits`
   }
   return `${planLabel(planUsage)}: ${formatCost(planUsage.spentApiEquivalentUsd)} API-equivalent / ${formatCost(planUsage.budgetUsd)} budget`

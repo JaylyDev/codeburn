@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 import { savePlan, type Plan } from '../src/config.js'
-import { activePlansFromMap, computePeriodFromResetDay, copilotCreditSpend, getPlanScopedProjects, getPlanUsage, getPlanUsageFromProjects, getPlanUsages } from '../src/plan-usage.js'
+import { activePlansFromMap, computePeriodFromResetDay, copilotCreditSpend, copilotCreditsNote, getPlanScopedProjects, getPlanUsage, getPlanUsageFromProjects, getPlanUsages } from '../src/plan-usage.js'
 import type { ProjectSummary } from '../src/types.js'
 
 const { parseAllSessionsMock } = vi.hoisted(() => ({
@@ -504,7 +504,7 @@ describe('copilot AI credit plan math', () => {
     expect(usage.status).toBe('under')
   })
 
-  it('does not fill the credits bar from token costUSD when nanoAiu is missing', () => {
+  it('fills the credits bar from the token estimate when nanoAiu is missing', () => {
     const usage = getPlanUsageFromProjects(copilotPro, [
       usageProject([
         usageCall({
@@ -517,7 +517,9 @@ describe('copilot AI credit plan math', () => {
 
     expect(usage.spentCredits).toBe(0)
     expect(usage.creditsIncomplete).toBe(true)
-    expect(usage.percentUsed).toBe(0)
+    // 42 USD at 0.01 USD per credit against the 1500-credit Pro budget.
+    expect(usage.percentUsed).toBe(280)
+    expect(usage.status).toBe('over')
     expect(usage.spentApiEquivalentUsd).toBe(0)
   })
 
@@ -599,6 +601,107 @@ describe('copilot AI credit plan math', () => {
     const usage = getPlanUsageFromProjects(copilotPro, projects, today)
     expect(usage.spentCredits).toBe(1.5)
     expect(usage.creditsIncomplete).toBe(false)
+  })
+
+  // #1199: only CLI session-store rows carry total_nano_aiu, so a typical user
+  // has hundreds of unrated requests and a confident, wrong credit total.
+  it('estimates credits from token cost for requests with no exact figure', () => {
+    const spend = copilotCreditSpend([
+      usageProject([
+        usageCall({ provider: 'copilot', costUSD: 0.42, timestamp: '2026-08-05T12:00:00.000Z' }),
+        usageCall({ provider: 'copilot', costUSD: 0.08, timestamp: '2026-08-05T12:00:01.000Z' }),
+      ]),
+    ])
+
+    expect(spend.spentCredits).toBe(0)
+    expect(spend.estimatedCredits).toBeCloseTo(50, 10)
+    expect(spend.creditRatedCalls).toBe(0)
+    expect(spend.creditUnratedCalls).toBe(2)
+    expect(spend.creditsIncomplete).toBe(true)
+  })
+
+  it('moves the bar and percentUsed onto the estimate while exposing the exact figure', () => {
+    const usage = getPlanUsageFromProjects(copilotPro, [
+      usageProject([
+        usageCall({ provider: 'copilot', costUSD: 0.42, timestamp: '2026-08-05T12:00:00.000Z' }),
+      ]),
+    ], today)
+
+    expect(usage.spentCredits).toBe(0)
+    expect(usage.percentUsed).toBeCloseTo(2.8, 10)
+    expect(usage.estimatedCredits).toBeCloseTo(42, 10)
+    expect(usage.creditUnratedCalls).toBe(1)
+  })
+
+  it('does not estimate on top of a rated supplementary twin', () => {
+    // The store row's total_nano_aiu bills the whole request, so its unrated
+    // JSONL twin must add nothing on top of the exact 1.5 credits.
+    const spend = copilotCreditSpend([
+      usageProject([
+        usageCall({
+          provider: 'copilot',
+          costUSD: 0.001605,
+          timestamp: '2026-08-05T12:00:00.000Z',
+          nanoAiu: 1_500_000_000,
+          supplementaryAccounting: true,
+        }),
+        usageCall({ provider: 'copilot', costUSD: 0.5, timestamp: '2026-08-05T12:00:01.000Z' }),
+      ]),
+    ])
+
+    expect(spend.spentCredits).toBe(1.5)
+    expect(spend.estimatedCredits).toBe(1.5)
+    expect(spend.creditRatedCalls).toBe(1)
+    expect(spend.creditUnratedCalls).toBe(1)
+  })
+
+  it('estimates only the sessions that carry no exact figure at all', () => {
+    const spend = copilotCreditSpend([
+      usageProjectFromTurns([
+        [usageCall({
+          provider: 'copilot',
+          costUSD: 0.001605,
+          timestamp: '2026-08-05T12:00:00.000Z',
+          nanoAiu: 1_500_000_000,
+          supplementaryAccounting: true,
+        })],
+      ]),
+      usageProject([
+        usageCall({ provider: 'copilot', costUSD: 0.25, timestamp: '2026-08-06T12:00:00.000Z' }),
+      ]),
+    ])
+
+    expect(spend.spentCredits).toBe(1.5)
+    expect(spend.estimatedCredits).toBeCloseTo(26.5, 10)
+    expect(spend.creditRatedCalls).toBe(1)
+    expect(spend.creditUnratedCalls).toBe(1)
+  })
+
+  it('reports the estimate as the exact total when every request is rated', () => {
+    const spend = copilotCreditSpend([
+      usageProject([
+        usageCall({
+          provider: 'copilot',
+          costUSD: 42,
+          timestamp: '2026-08-05T12:00:00.000Z',
+          nanoAiu: 1_500_000_000,
+        }),
+      ]),
+    ])
+
+    expect(spend.estimatedCredits).toBe(spend.spentCredits)
+    expect(spend.creditUnratedCalls).toBe(0)
+    expect(spend.creditsIncomplete).toBe(false)
+    expect(copilotCreditsNote(spend.creditRatedCalls, spend.creditUnratedCalls))
+      .toBe("All 1 Copilot requests in this period carry GitHub's exact credit figure, so spentCredits is complete.")
+  })
+
+  it('says how much of the credit total is estimated', () => {
+    const note = copilotCreditsNote(4, 469)
+    expect(note).toContain("4 of 473 Copilot requests carry GitHub's exact credit figure")
+    expect(note).toContain('estimatedCredits')
+    expect(note).toContain('cache split')
+    expect(note).not.toContain('—')
   })
 
   it('keeps a $0 nanoAiu-only session on copilot plans and drops it on USD plans', () => {
