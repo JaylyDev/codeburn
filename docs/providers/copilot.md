@@ -275,6 +275,48 @@ surfaces, add a reader with a captured fixture.)
   `chat-agent-sessions`.
 - **Override the root** with `CODEBURN_COPILOT_JETBRAINS_DIR`.
 
+## Live quota (Copilot subscription)
+
+Separate from the log parser above: the macOS menubar reads live quota from
+`GET https://api.github.com/copilot_internal/user` with a GitHub token. Usage
+tracking never needs this token; only the quota bars do.
+
+`mac/Sources/CodeBurnMenubar/Data/CopilotSubscriptionService.swift` walks an
+ordered, read-only chain and takes the first token it finds. Every rung
+tolerates an absent, locked, or malformed source and falls through:
+
+1. `~/.config/github-copilot/hosts.json` (`github.com` preferred), then
+   `apps.json`. Written only by the older editor plugins; modern VS Code keeps
+   its GitHub login in encrypted secret storage, which CodeBurn deliberately
+   does not touch.
+2. The GitHub Copilot CLI 1.0 keychain item, generic password service
+   `copilot-cli`. Read through `/usr/bin/security` (never the Security
+   framework) so a background read cannot raise the partition-list prompt. The
+   account name is not published, so the lookup is service-only, and a locked
+   keychain or a refused ACL reads as absent.
+3. `~/.copilot/config.json`, then `~/.copilot/settings.json` (the CLI moved
+   settings there in 1.0.35). The key holding the token is not documented and
+   has moved between releases, so instead of guessing key names the parser
+   takes the first string value carrying a GitHub access-token prefix
+   (`gho_`, `ghu_`, `ghp_`, `ghs_`, `github_pat_`). `ghr_` refresh tokens are
+   skipped: the usage endpoint rejects them.
+4. `COPILOT_GITHUB_TOKEN`, then `GH_TOKEN`, then `GITHUB_TOKEN`, matching the
+   Copilot CLI's own order. A GUI-launched app rarely inherits these.
+5. `gh auth token`, which resolves keyring vs `~/.config/gh/hosts.yml` itself.
+   The binary is located the same way `CodeburnCLI` locates codeburn.
+6. A token the user pastes into Settings, stored in CodeBurn's own
+   provider-scoped keychain item. A fine-grained personal access token with the
+   `Plan: Read-only` permission is enough.
+
+Rungs 2 and 5 each cost a process spawn, so their answers are cached for
+`probeCacheTTL` (5 minutes) and dropped on disconnect and before the one 401
+re-read. `hasCredential` is the cheap eligibility answer and never spawns: it
+approximates rung 2 with the existence of `~/.copilot` and rung 5 with an
+installed `gh` binary.
+
+The Electron surface (`app/electron/quota/copilot.ts`) still implements only
+rung 1.
+
 ## Caching
 
 None for the JSONL sources. The OTel and session-store sources use the durable cache (see above).
