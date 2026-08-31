@@ -123,10 +123,28 @@ struct ZaiQuotaTests {
         }
     }
 
+    @Test("HTTP 200 body authentication failures are terminal")
+    func bodyAuthenticationFailure() async throws {
+        for code in [401, 403] {
+            let recorder = RequestRecorder()
+            let body = #"{"code":\#(code),"msg":"token expired or incorrect","success":false}"#
+            do {
+                _ = try await ZaiSubscriptionService.refresh(
+                    apiKey: Self.syntheticKey,
+                    deps: Self.deps(recorder: recorder, body: body)
+                )
+                Issue.record("Expected body code \(code) to reject authentication")
+            } catch let error as ZaiSubscriptionService.FetchError {
+                #expect(error == .authenticationRejected)
+            }
+        }
+    }
+
     @Test("malformed or empty quota fails")
     func malformedQuota() throws {
         for body in [
             "not json",
+            #"{"code":500,"success":false}"#,
             #"{"data":{}}"#,
             #"{"data":{"limits":[]}}"#,
             #"{"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5}]}}"#,

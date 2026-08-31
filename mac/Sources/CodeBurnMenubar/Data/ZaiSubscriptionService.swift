@@ -110,6 +110,10 @@ enum ZaiSubscriptionService {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw FetchError.parseFailure
         }
+        let bodyCode = jsonNumber(root["code"]).map(Int.init)
+        if bodyCode == 401 || bodyCode == 403 { throw FetchError.authenticationRejected }
+        if root["success"] as? Bool == false { throw FetchError.parseFailure }
+
         let payload = (root["data"] as? [String: Any]) ?? root
         guard let limits = payload["limits"] as? [Any] else { throw FetchError.parseFailure }
 
