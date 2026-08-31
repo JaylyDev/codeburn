@@ -46,7 +46,6 @@ final class CopilotQuotaTests: XCTestCase {
         apps: String? = nil,
         config: String? = nil,
         settings: String? = nil,
-        keychain: String? = nil,
         environment: [String: String] = [:],
         ghToken: String? = nil,
         savedToken: String? = nil,
@@ -73,7 +72,6 @@ final class CopilotQuotaTests: XCTestCase {
             hostsURL: URL(fileURLWithPath: "/tmp/codeburn-tests/.config/github-copilot/hosts.json"),
             appsURL: URL(fileURLWithPath: "/tmp/codeburn-tests/.config/github-copilot/apps.json"),
             copilotDirURL: URL(fileURLWithPath: "/tmp/codeburn-tests/.copilot"),
-            keychainBlob: { keychain?.data(using: .utf8) },
             environment: { environment[$0] },
             ghAuthToken: {
                 onGhProbe?()
@@ -86,7 +84,7 @@ final class CopilotQuotaTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        // The `security` / `gh` answers are cached process-wide.
+        // The `gh` answer is cached process-wide.
         CopilotSubscriptionService.resetProbeCache()
     }
 
@@ -329,36 +327,13 @@ final class CopilotQuotaTests: XCTestCase {
 
     // MARK: - Discovery chain (issue #1198)
 
-    func testKeychainRawTokenIsUsedWhenLegacyFilesAreAbsent() async throws {
-        let recorder = RequestRecorder()
-        let deps = Self.makeDeps(hosts: nil, keychain: "  gho_keychain-raw\n", recorder: recorder) { request in
-            Self.okJson(request, Self.usageBody)
-        }
-        _ = try await CopilotSubscriptionService.refresh(deps: deps)
-        XCTAssertEqual(authorization(recorder), "token gho_keychain-raw")
-    }
 
-    /// The Copilot CLI's keychain payload is undocumented, so a JSON envelope
-    /// has to work as well as a bare token, whatever the field is called.
-    func testKeychainJSONEnvelopeYieldsTheToken() async throws {
-        let recorder = RequestRecorder()
-        let deps = Self.makeDeps(
-            hosts: nil,
-            keychain: #"{"user":"octocat","nested":{"someFutureName":"ghu_keychain-json"}}"#,
-            recorder: recorder
-        ) { request in
-            Self.okJson(request, Self.usageBody)
-        }
-        _ = try await CopilotSubscriptionService.refresh(deps: deps)
-        XCTAssertEqual(authorization(recorder), "token ghu_keychain-json")
-    }
 
-    func testMalformedKeychainBlobFallsThroughToTheNextRung() async throws {
+    func testCopilotCLIConfigJSONIsUsedWhenLegacyFilesAreAbsent() async throws {
         let recorder = RequestRecorder()
         let deps = Self.makeDeps(
             hosts: nil,
             config: #"{"loggedInUsers":["octocat"],"github_token":"ghp_config-token"}"#,
-            keychain: "not json { and not a token",
             recorder: recorder
         ) { request in
             Self.okJson(request, Self.usageBody)
@@ -454,7 +429,6 @@ final class CopilotQuotaTests: XCTestCase {
             hosts: nil,
             config: "{}",
             settings: "not json {",
-            keychain: "",
             recorder: recorder
         ) { request in
             Self.okJson(request, Self.usageBody)
@@ -464,13 +438,12 @@ final class CopilotQuotaTests: XCTestCase {
     }
 
     /// Precedence over the whole chain: with every rung populated, the legacy
-    /// plugin file still wins, then keychain, then ~/.copilot, then env, then
-    /// gh, then the pasted token.
+    /// plugin file still wins, then ~/.copilot, then env, then gh, then the
+    /// pasted token.
     func testDiscoveryPrecedenceOrder() async throws {
         let rungs: [(String, [String: String])] = [
             ("gho_hosts", [:]),
-            ("gho_keychain", ["drop": "hosts"]),
-            ("gho_config", ["drop": "keychain"]),
+            ("gho_config", ["drop": "hosts"]),
             ("gho_settings", ["drop": "config"]),
             ("gho_env", ["drop": "settings"]),
             ("gho_gh", ["drop": "env"]),
@@ -485,7 +458,6 @@ final class CopilotQuotaTests: XCTestCase {
                 hosts: dropped.contains("hosts") ? nil : #"{"github.com":{"oauth_token":"gho_hosts"}}"#,
                 config: dropped.contains("config") ? nil : #"{"token":"gho_config"}"#,
                 settings: dropped.contains("settings") ? nil : #"{"token":"gho_settings"}"#,
-                keychain: dropped.contains("keychain") ? nil : "gho_keychain",
                 environment: dropped.contains("env") ? [:] : ["COPILOT_GITHUB_TOKEN": "gho_env"],
                 ghToken: dropped.contains("gh") ? nil : "gho_gh",
                 savedToken: "gho_saved",

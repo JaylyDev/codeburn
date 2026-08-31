@@ -42,10 +42,6 @@ enum CopilotSubscriptionService {
     private static let usageBlockedUntilKey = "codeburn.copilot.usage.blockedUntil"
     /// Capacity Dock provider id, used for the pasted-token rung.
     static let providerID = "copilot"
-    /// Generic-password service the GitHub Copilot CLI 1.0 writes its OAuth
-    /// token under. The account name is not published, so lookups are
-    /// service-only.
-    static let copilotCLIKeychainService = "copilot-cli"
     /// Honoured in the same order the Copilot CLI honours them.
     static let environmentTokenNames = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
 
@@ -108,11 +104,9 @@ enum CopilotSubscriptionService {
         var appsURL: URL
         /// The Copilot CLI's config directory (~/.copilot).
         var copilotDirURL: URL
-        /// Raw payload of the Copilot CLI's Keychain item. Uncached: the
-        /// service owns the caching so tests can drive the probe directly.
-        var keychainBlob: @Sendable () -> Data?
         var environment: @Sendable (String) -> String?
-        /// `gh auth token`. Uncached, for the same reason as `keychainBlob`.
+        /// `gh auth token`. Uncached: the service owns the caching so tests can
+        /// drive the probe directly.
         var ghAuthToken: @Sendable () -> String?
         /// Token the user pasted into CodeBurn's own Copilot settings.
         var savedToken: @Sendable () -> String?
@@ -130,7 +124,6 @@ enum CopilotSubscriptionService {
             hostsURL: URL(fileURLWithPath: NSHomeDirectory() + "/.config/github-copilot/hosts.json"),
             appsURL: URL(fileURLWithPath: NSHomeDirectory() + "/.config/github-copilot/apps.json"),
             copilotDirURL: URL(fileURLWithPath: NSHomeDirectory() + "/.copilot"),
-            keychainBlob: { readCopilotCLIKeychain() },
             environment: { ProcessInfo.processInfo.environment[$0] },
             ghAuthToken: { runGhAuthToken() },
             savedToken: { savedCopilotToken() },
@@ -141,11 +134,10 @@ enum CopilotSubscriptionService {
     // MARK: - Credential discovery
 
     /// Cheap eligibility answer for the dock and the initial load state. It
-    /// must never spawn a subprocess, so the two subprocess rungs are
-    /// approximated: an existing ~/.copilot directory stands in for the
-    /// Copilot CLI, and an installed `gh` binary stands in for a `gh` login.
-    /// A false positive costs one probe inside `refresh`; a false negative
-    /// would silently never try at all.
+    /// must never spawn a subprocess, so the `gh` rung is approximated by an
+    /// installed `gh` binary rather than an actual login probe. A false
+    /// positive costs one probe inside `refresh`; a false negative would
+    /// silently never try at all.
     static var hasCredential: Bool {
         let deps = Deps.live
         let manager = FileManager.default
@@ -162,28 +154,28 @@ enum CopilotSubscriptionService {
     /// wins and every rung tolerates absent or malformed data:
     ///
     /// 1. legacy editor-plugin files: `hosts.json` then `apps.json`
-    /// 2. the Copilot CLI's Keychain item (service `copilot-cli`)
-    /// 3. `~/.copilot/config.json` then `~/.copilot/settings.json`
-    /// 4. `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`
-    /// 5. `gh auth token`
-    /// 6. a token pasted into CodeBurn's Copilot settings
+    /// 2. `~/.copilot/config.json` then `~/.copilot/settings.json`
+    /// 3. `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`
+    /// 4. `gh auth token`
+    /// 5. a token pasted into CodeBurn's Copilot settings
+    ///
+    /// The Copilot CLI's own Keychain item (service `copilot-cli`) is
+    /// deliberately not read: it is written by a Node keyring library, so
+    /// `/usr/bin/security` is not in its partition list and every read would
+    /// raise the "allow access?" dialog. `gh auth token` reaches the same
+    /// users, because the Copilot CLI itself falls back to gh.
     private static func readToken(deps: Deps) -> String? {
         for url in [deps.hostsURL, deps.appsURL] {
             if let data = deps.readFile(url), let token = tokenFromMap(data) { return token }
         }
-        if let token = cachedProbe("keychain", deps: deps, probe: {
-            deps.keychainBlob().flatMap(tokenFromBlob)
-        }) { return token }
         for name in ["config.json", "settings.json"] {
             if let data = deps.readFile(deps.copilotDirURL.appendingPathComponent(name)),
-               let token = tokenFromBlob(data) { return token }
+               let token = tokenFromCopilotCLIJSON(data) { return token }
         }
         for name in environmentTokenNames {
             if let token = nonEmpty(deps.environment(name)) { return token }
         }
-        if let token = cachedProbe("gh", deps: deps, probe: {
-            nonEmpty(deps.ghAuthToken())
-        }) { return token }
+        if let token = cachedGhToken(deps: deps) { return token }
         return nonEmpty(deps.savedToken())
     }
 
@@ -205,15 +197,10 @@ enum CopilotSubscriptionService {
         tokenPrefixes.contains { value.hasPrefix($0) && value.count > $0.count }
     }
 
-    /// The Copilot CLI's Keychain payload and its ~/.copilot JSON are both
-    /// undocumented: the Keychain value may be the bare token or a JSON
-    /// envelope, and the JSON key holding the token has moved between
-    /// releases. Rather than guess key names, take the first value carrying a
-    /// GitHub access-token prefix.
-    private static func tokenFromBlob(_ data: Data) -> String? {
-        if let text = nonEmpty(String(data: data, encoding: .utf8)), looksLikeGitHubToken(text) {
-            return text
-        }
+    /// The ~/.copilot schema is undocumented and the key holding the token has
+    /// moved between releases, so rather than guess key names take the first
+    /// value carrying a GitHub access-token prefix.
+    private static func tokenFromCopilotCLIJSON(_ data: Data) -> String? {
         guard let json = try? JSONSerialization.jsonObject(with: data) else { return nil }
         return firstGitHubToken(in: json)
     }
@@ -242,44 +229,37 @@ enum CopilotSubscriptionService {
 
     // MARK: - Subprocess probes
 
-    /// `security` and `gh` each cost a process spawn, and the panel re-checks
-    /// eligibility and refreshes far more often than a login changes, so both
-    /// answers are reused for this long.
+    /// `gh auth token` costs a process spawn, and the panel refreshes far more
+    /// often than a login changes, so its answer is reused for this long.
     static let probeCacheTTL: TimeInterval = 5 * 60
 
     private final class ProbeCache: @unchecked Sendable {
         private let lock = NSLock()
-        private var entries: [String: (value: String?, at: Date)] = [:]
+        private var entry: (value: String?, at: Date)?
 
-        func value(_ key: String, now: Date, ttl: TimeInterval, probe: () -> String?) -> String? {
+        func value(now: Date, ttl: TimeInterval, probe: () -> String?) -> String? {
             lock.lock()
             defer { lock.unlock() }
-            if let entry = entries[key], now.timeIntervalSince(entry.at) < ttl {
-                return entry.value
-            }
+            if let entry, now.timeIntervalSince(entry.at) < ttl { return entry.value }
             let value = probe()
-            entries[key] = (value, now)
+            entry = (value, now)
             return value
         }
 
         func reset() {
             lock.lock()
             defer { lock.unlock() }
-            entries.removeAll()
+            entry = nil
         }
     }
 
     private static let probeCache = ProbeCache()
 
-    private static func cachedProbe(
-        _ key: String,
-        deps: Deps,
-        probe: () -> String?
-    ) -> String? {
-        probeCache.value(key, now: deps.now(), ttl: probeCacheTTL, probe: probe)
+    private static func cachedGhToken(deps: Deps) -> String? {
+        probeCache.value(now: deps.now(), ttl: probeCacheTTL) { nonEmpty(deps.ghAuthToken()) }
     }
 
-    /// Drops the cached `security` / `gh` answers so the next read re-probes.
+    /// Drops the cached `gh` answer so the next read re-probes.
     static func resetProbeCache() {
         probeCache.reset()
     }
@@ -321,18 +301,6 @@ enum CopilotSubscriptionService {
         watchdog.cancel()
         guard process.terminationStatus == 0 else { return nil }
         return nonEmpty(output)
-    }
-
-    /// Reads through `/usr/bin/security` for the same reason
-    /// `ClaudeCredentialStore` does: the Apple-signed binary sits in the item's
-    /// `apple-tool:` partition, so a background read never raises the
-    /// partition-list prompt. A locked keychain or a refused ACL yields nil,
-    /// which is indistinguishable from "not signed in" and falls through.
-    private static func readCopilotCLIKeychain() -> Data? {
-        runCapturingStdout(
-            URL(fileURLWithPath: "/usr/bin/security"),
-            ["find-generic-password", "-s", copilotCLIKeychainService, "-w"]
-        )?.data(using: .utf8)
     }
 
     /// `gh auth token` resolves keyring vs ~/.config/gh/hosts.yml itself, so we
