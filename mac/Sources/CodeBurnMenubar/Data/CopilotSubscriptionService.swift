@@ -167,7 +167,7 @@ enum CopilotSubscriptionService {
     /// 4. `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`
     /// 5. `gh auth token`
     /// 6. a token pasted into CodeBurn's Copilot settings
-    static func readToken(deps: Deps) -> String? {
+    private static func readToken(deps: Deps) -> String? {
         for url in [deps.hostsURL, deps.appsURL] {
             if let data = deps.readFile(url), let token = tokenFromMap(data) { return token }
         }
