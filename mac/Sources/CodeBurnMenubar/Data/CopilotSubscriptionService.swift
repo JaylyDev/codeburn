@@ -417,6 +417,11 @@ enum CopilotSubscriptionService {
     private static func window(label: String, snapshot: Any?) -> CopilotUsage.Window? {
         guard let row = snapshot as? [String: Any],
               let remaining = fraction(row["percent_remaining"] ?? row["percentRemaining"]) else { return nil }
+        // A plan without this quota reports entitlement 0 and 0% remaining,
+        // which would render as a full 100% used; unlimited windows have no
+        // meaningful percent either. Neither is a window to show.
+        if let entitlement = row["entitlement"] as? NSNumber, entitlement.doubleValue == 0 { return nil }
+        if let unlimited = row["unlimited"] as? Bool, unlimited { return nil }
         // Round away float dust from the 1-remaining subtraction
         // (1-0.7 != 0.3), mirroring the desktop decoder's toFixed(6) before
         // scaling to 0..100.

@@ -74,6 +74,9 @@ function windowOf(label: string, snapshot: unknown): QuotaWindow | null {
   const rawRemaining = row.percent_remaining ?? row.percentRemaining
   const remaining = fraction(typeof rawRemaining === 'number' ? rawRemaining : NaN)
   if (remaining === null) return null
+  // A plan without this quota reports entitlement 0 and 0% remaining, which
+  // would render as 100% used; unlimited windows have no meaningful percent.
+  if (row.entitlement === 0 || row.unlimited === true) return null
   // Round away float dust from the 1-remaining subtraction (1-0.7 !== 0.3).
   return { label, percent: Number((1 - remaining).toFixed(6)), resetsAt: null }
 }

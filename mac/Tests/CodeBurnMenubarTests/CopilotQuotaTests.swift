@@ -131,6 +131,17 @@ final class CopilotQuotaTests: XCTestCase {
         XCTAssertEqual(usage.primary?.usedPercent ?? -1, 45, accuracy: 0.001)
     }
 
+    func testDecodeSkipsZeroEntitlementAndUnlimitedWindows() throws {
+        // A Free/Individual plan reports premium_interactions with entitlement
+        // 0 and 0% remaining, which must not render as 100% used.
+        let body = #"{"copilot_plan":"individual","quota_snapshots":{"premium_interactions":{"entitlement":0,"remaining":0,"percent_remaining":0.0,"unlimited":false},"chat":{"entitlement":200,"remaining":190,"percent_remaining":95.0,"unlimited":false},"completions":{"entitlement":2000,"remaining":2000,"percent_remaining":100.0,"unlimited":true}}}"#
+        let usage = try CopilotSubscriptionService.decodeUsage(
+            data: body.data(using: .utf8)!, now: Self.now)
+        XCTAssertEqual(usage.details.map(\.label), ["Chat"])
+        XCTAssertEqual(usage.primary?.label, "Chat")
+        XCTAssertEqual(usage.primary?.usedPercent ?? -1, 5, accuracy: 0.001)
+    }
+
     func testDecodeSurvivesMalformedSnapshots() throws {
         let body = #"{"quota_snapshots":{"chat":"garbage"},"extra":true}"#
         let usage = try CopilotSubscriptionService.decodeUsage(
