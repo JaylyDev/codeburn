@@ -22,7 +22,7 @@ struct CapacityDockPreferencesTests {
         #expect(snapshot.attachmentEdge == .right)
         #expect(snapshot.normalizedHorizontalOffset == nil)
         #expect(snapshot.normalizedVerticalOffset == nil)
-        #expect(snapshot.scale == 0.85)
+        #expect(snapshot.scale == 0.6)
         #expect(snapshot.theme == .graphite)
         #expect(snapshot.gaugeShape == .squircle)
     }
@@ -150,7 +150,7 @@ struct CapacityDockPreferencesTests {
         #expect(CapacityDockPreferences.load(defaults: defaults).scale == 1.2)
 
         CapacityDockPreferences.setScale(0.2, defaults: defaults)
-        #expect(CapacityDockPreferences.load(defaults: defaults).scale == 0.7)
+        #expect(CapacityDockPreferences.load(defaults: defaults).scale == 0.6)
 
         CapacityDockPreferences.setScale(0.8, defaults: defaults)
         #expect(CapacityDockPreferences.load(defaults: defaults).scale == 0.8)

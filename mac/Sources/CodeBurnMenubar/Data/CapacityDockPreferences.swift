@@ -160,8 +160,8 @@ enum CapacityDockPreferences {
     static let defaultProvider: CapacityDockProvider = .codex
     static let supportedProviders = CapacityDockProvider.allCases
     static let maxAutoProviders = 5
-    static let defaultScale = 0.85
-    static let scaleRange = 0.7 ... 1.2
+    static let defaultScale = 0.6
+    static let scaleRange = 0.6 ... 1.2
 
     struct Snapshot: Equatable, Sendable {
         let isEnabled: Bool
