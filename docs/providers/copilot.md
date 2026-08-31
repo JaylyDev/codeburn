@@ -143,6 +143,26 @@ see the #927 ruling in `src/session-cache.ts`).
   stores parse identically without). Plan math sums finite `nanoAiu` into
   Copilot AI credits (`codeburn plan set copilot-pro`). Billing-grade cost
   rewrite of every report is still upstream #890.
+
+  These CLI session-store rows are the **only** local source that carries an
+  exact credit figure. VS Code chat sessions and transcripts, the OTel
+  `agent-traces.db`, JetBrains stores and the CLI session-state JSONL never do,
+  so on a typical machine most requests have no exact figure at all (#1199).
+  Everything unrated is estimated instead: the request's tokens priced at the
+  model's listed API rate, converted at 1 credit = $0.01. Read it as a **floor**:
+  GitHub's per-model request multipliers and its cached-token pricing are not
+  modelled, and the numbers in #1199 suggest the gap can be roughly 2x. A
+  session that carries any exact figure is never estimated on top of, because
+  `total_nano_aiu` already bills that request's whole token set.
+
+  `codeburn plan` says so on the headline whenever anything is estimated
+  (`~9800 / 20000 AI Credits (estimated; 4 of 473 requests carry GitHub's exact
+  figure)`), and `codeburn status --format json | jq .plans.copilot` carries
+  `spentCredits` (exact only), `estimatedCredits` (exact plus estimate),
+  `creditRatedCalls` / `creditUnratedCalls`, `creditsIncomplete` and a plain
+  `creditsNote`. The bar and `percentUsed` deliberately stay on the exact figure.
+  For the live authoritative number, use the menubar's GitHub quota endpoint
+  (separate system, PR #1200).
 - **Sync.** `codeburn sync push` holds a copilot session until it has been
   quiet for 24 hours. The reconciliation output is mutable (a residual shrinks
   as rows land, a rollup is dropped once rows cover its leg, a row's pairing

@@ -46,7 +46,7 @@ import {
   uninstallAntigravityStatusLineHook,
 } from './antigravity-statusline.js'
 import { clearPlan, readConfig, readPlan, readPlans, saveConfig, savePlan, getConfigFilePath, type CodeburnConfig, type Plan, type PlanId, type PlanProvider } from './config.js'
-import { clampResetDay, getPlanUsageOrNull, getPlanUsages, type PlanUsage } from './plan-usage.js'
+import { clampResetDay, copilotCreditsNote, getPlanUsageOrNull, getPlanUsages, type PlanUsage } from './plan-usage.js'
 import { getPresetPlan, isPlanId, isPlanProvider, PLAN_IDS, PLAN_PROVIDERS, planDisplayName } from './plans.js'
 import { createRequire } from 'node:module'
 
@@ -157,6 +157,10 @@ type JsonPlanSummary = {
   spentCredits?: number
   budgetCredits?: number
   creditsIncomplete?: boolean
+  estimatedCredits?: number
+  creditRatedCalls?: number
+  creditUnratedCalls?: number
+  creditsNote?: string
   monthlyUsd?: number
   spentApiEquivalentUsd?: number
 }
@@ -179,6 +183,10 @@ function toJsonPlanSummary(planUsage: PlanUsage): JsonPlanSummary {
     summary.spentCredits = planUsage.spentCredits
     summary.budgetCredits = planUsage.budgetCredits
     summary.creditsIncomplete = planUsage.creditsIncomplete
+    summary.estimatedCredits = planUsage.estimatedCredits
+    summary.creditRatedCalls = planUsage.creditRatedCalls
+    summary.creditUnratedCalls = planUsage.creditUnratedCalls
+    summary.creditsNote = copilotCreditsNote(planUsage.creditRatedCalls ?? 0, planUsage.creditUnratedCalls ?? 0)
     summary.monthlyUsd = planUsage.plan.monthlyUsd
     summary.spentApiEquivalentUsd = planUsage.spentApiEquivalentUsd
   }

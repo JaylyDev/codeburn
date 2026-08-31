@@ -198,4 +198,29 @@ describe('codeburn plan command', () => {
       await rm(home, { recursive: true, force: true })
     }
   }, CLI_PLAN_TIMEOUT_MS)
+
+  // #1199: the JSON plan block must say how complete the credit total is, not
+  // just carry a bare creditsIncomplete boolean.
+  it('emits the credit completeness fields in status JSON', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-cli-plan-'))
+
+    try {
+      expect(runCli(['plan', 'set', 'copilot-pro'], home).status).toBe(0)
+      const status = runCli(['status', '--provider', 'copilot', '--format', 'json', '--period', 'month', '--no-optimize', '--no-timeline'], home)
+      expect(status.status).toBe(0)
+      const copilot = (JSON.parse(status.stdout) as {
+        plans?: { copilot?: Record<string, unknown> }
+      }).plans?.copilot
+      expect(copilot).toMatchObject({
+        spentCredits: 0,
+        estimatedCredits: 0,
+        creditRatedCalls: 0,
+        creditUnratedCalls: 0,
+        creditsIncomplete: false,
+        creditsNote: 'No Copilot requests in this period.',
+      })
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  }, CLI_PLAN_TIMEOUT_MS * 3)
 })
