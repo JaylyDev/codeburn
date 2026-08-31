@@ -150,7 +150,7 @@ struct CapacityDockPreferencesTests {
         #expect(CapacityDockPreferences.load(defaults: defaults).scale == 1.2)
 
         CapacityDockPreferences.setScale(0.2, defaults: defaults)
-        #expect(CapacityDockPreferences.load(defaults: defaults).scale == 0.7)
+        #expect(CapacityDockPreferences.load(defaults: defaults).scale == 0.6)
 
         CapacityDockPreferences.setScale(0.8, defaults: defaults)
         #expect(CapacityDockPreferences.load(defaults: defaults).scale == 0.8)
