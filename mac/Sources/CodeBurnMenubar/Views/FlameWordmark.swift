@@ -3,6 +3,7 @@ import SwiftUI
 /// The "CodeBurn" wordmark filled with the website's animated flame gradient.
 struct FlameWordmark: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(AppStore.self) private var store
     @State private var sweeping = false
 
     // CSS parity: the site's `.flame-text` uses background-size: 300% with
@@ -38,13 +39,21 @@ struct FlameWordmark: View {
                     .frame(width: geo.size.width * 3, height: geo.size.height)
                     .offset(x: sweeping ? -geo.size.width * 2 : 0)
                     .animation(
-                        reduceMotion ? nil : .easeInOut(duration: 1.5).repeatForever(autoreverses: true),
+                        reduceMotion || !store.menuPopoverVisible
+                            ? nil
+                            : .easeInOut(duration: 1.5).repeatForever(autoreverses: true),
                         value: sweeping
                     )
                 }
                 .mask(wordmark)
             }
-            .onAppear { sweeping = true }
+            .onAppear { sweeping = store.menuPopoverVisible }
+            // The hosting view outlives every popover appearance, so the sweep
+            // starts and stops with visibility instead of running forever in a
+            // closed popover (5 to 7 percent idle CPU before this gate).
+            .onChange(of: store.menuPopoverVisible) { _, visible in
+                sweeping = visible
+            }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("CodeBurn")
     }

@@ -49,6 +49,10 @@ final class AppStore {
     var selectedScope: MenubarScope = MenubarScope.savedMenubarScope()
     var selectedClaudeConfigSourceId: String?
     var selectedDays: Set<String> = []
+    /// True while the status-item popover is on screen. The popover's hosting
+    /// view is created once and lives forever, so repeat-forever animations
+    /// must gate on this or they render at display cadence around the clock.
+    var menuPopoverVisible = false
     var activeScope: MenubarScope { effectiveSelectedScope }
 
     private var effectiveSelectedScope: MenubarScope {

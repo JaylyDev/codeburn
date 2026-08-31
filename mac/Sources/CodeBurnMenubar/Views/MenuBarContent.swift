@@ -302,6 +302,7 @@ private struct FetchErrorOverlay: View {
 /// yellow→orange→red, looping.
 private struct BurnLoadingOverlay: View {
     let periodLabel: String
+    @Environment(AppStore.self) private var store
     @State private var fillProgress: CGFloat = 0
     @State private var glowing: Bool = false
 
@@ -320,13 +321,27 @@ private struct BurnLoadingOverlay: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .onAppear {
-            withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
-                fillProgress = 1.0
+        .onAppear { setPulsing(store.menuPopoverVisible) }
+        .onChange(of: store.menuPopoverVisible) { _, visible in
+            setPulsing(visible)
+        }
+    }
+
+    private func setPulsing(_ on: Bool) {
+        guard on else {
+            var stop = Transaction()
+            stop.disablesAnimations = true
+            withTransaction(stop) {
+                fillProgress = 0
+                glowing = false
             }
-            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
-                glowing = true
-            }
+            return
+        }
+        withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
+            fillProgress = 1.0
+        }
+        withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+            glowing = true
         }
     }
 }
