@@ -213,6 +213,8 @@ final class CapacityDockController {
         )
         let panel = CapacityDockPanel()
         let hosting = CapacityDockHostingView(rootView: view.environment(store))
+        // Panel geometry has one owner; intrinsic resizing races the frame animator.
+        hosting.sizingOptions = []
         hosting.autoresizingMask = [.width, .height]
         // At the top edge the menu-bar/notch safe-area inset would push the rail
         // down, leaving a gap the bottom edge never shows. Opt the rail out of
@@ -252,6 +254,8 @@ final class CapacityDockController {
         )
         let panel = CapacityDockPanel()
         let hosting = CapacityDockHostingView(rootView: view.environment(store))
+        // Panel geometry has one owner; intrinsic resizing races the frame animator.
+        hosting.sizingOptions = []
         hosting.autoresizingMask = [.width, .height]
         hosting.interactiveShapeContains = { [weak model] point, bounds in
             guard let model else { return false }
