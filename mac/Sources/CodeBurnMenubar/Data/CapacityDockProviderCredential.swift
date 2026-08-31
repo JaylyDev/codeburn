@@ -193,30 +193,31 @@ enum CapacityDockProviderCredentialPresence {
         defaults: UserDefaults = .standard
     ) {
         guard CapacityDockProvider(rawValue: providerID) != nil else { return }
-        lock.lock()
-        var identifiers = providerIDsWithoutLock(defaults: defaults)
-        if present {
-            identifiers.insert(providerID)
-        } else {
-            identifiers.remove(providerID)
-        }
-        let ordered = CapacityDockPreferences.supportedProviders
-            .map(\.id)
-            .filter(identifiers.contains)
-        defaults.set(ordered, forKey: key)
-        lock.unlock()
-        if Thread.isMainThread {
+        let update = {
+            let ordered = lock.withLock {
+                var identifiers = providerIDsWithoutLock(defaults: defaults)
+                if present {
+                    identifiers.insert(providerID)
+                } else {
+                    identifiers.remove(providerID)
+                }
+                return CapacityDockPreferences.supportedProviders
+                    .map(\.id)
+                    .filter(identifiers.contains)
+            }
+
+            // UserDefaults notifies SwiftUI synchronously. Never hold our lock
+            // while doing that: SwiftUI may re-read provider presence inline.
+            defaults.set(ordered, forKey: key)
             NotificationCenter.default.post(
                 name: .capacityDockCredentialPresenceDidChange,
                 object: nil
             )
+        }
+        if Thread.isMainThread {
+            update()
         } else {
-            DispatchQueue.main.async {
-                NotificationCenter.default.post(
-                    name: .capacityDockCredentialPresenceDidChange,
-                    object: nil
-                )
-            }
+            DispatchQueue.main.sync(execute: update)
         }
     }
 }

@@ -113,6 +113,38 @@ struct ProviderSettingsEditorStateTests {
         }
     }
 
+    @Test("presence writes allow a synchronous UserDefaults callback to read presence")
+    func presenceWritesDoNotDeadlockSwiftUICallbacks() async throws {
+        let suiteName = "CodeBurnMenubarTests.PresenceReentry.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let defaultsBox = SendableUserDefaults(defaults)
+        let callbackFinished = LockedCompletionFlag()
+        let writeFinished = LockedCompletionFlag()
+        let observer = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: defaults,
+            queue: nil
+        ) { _ in
+            _ = CapacityDockProviderCredentialPresence.contains("kimi", defaults: defaultsBox.value)
+            callbackFinished.setCompleted()
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            CapacityDockProviderCredentialPresence.set(true, for: "kimi", defaults: defaultsBox.value)
+            writeFinished.setCompleted()
+        }
+        for _ in 0..<50 where !writeFinished.isCompleted {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(callbackFinished.isCompleted)
+        #expect(writeFinished.isCompleted)
+        if writeFinished.isCompleted {
+            NotificationCenter.default.removeObserver(observer)
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+    }
+
     @Test("credential mutations await their real Keychain completion")
     func credentialMutationsDoNotTimeOutInTheBackground() async throws {
         let semaphore = DispatchSemaphore(value: 0)
@@ -131,6 +163,11 @@ struct ProviderSettingsEditorStateTests {
         #expect(try await task.value == 7)
         #expect(completion.isCompleted)
     }
+}
+
+private final class SendableUserDefaults: @unchecked Sendable {
+    let value: UserDefaults
+    init(_ value: UserDefaults) { self.value = value }
 }
 
 private final class LockedCompletionFlag: @unchecked Sendable {
