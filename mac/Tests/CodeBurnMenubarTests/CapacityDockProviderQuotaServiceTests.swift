@@ -11,6 +11,10 @@ struct CapacityDockProviderQuotaServiceTests {
         Issue.record("Wrong adapter dispatched")
         return Self.summary()
     }
+    nonisolated private static let unusedZai: @Sendable (String?) async throws -> QuotaSummary = { _ in
+        Issue.record("Wrong adapter dispatched")
+        return Self.summary()
+    }
 
     @Test("ClinePass dispatches with only its provider-scoped API key")
     func dispatchesClinePass() async throws {
@@ -21,7 +25,8 @@ struct CapacityDockProviderQuotaServiceTests {
                 await capture.record(apiKey)
                 return expected
             },
-            refreshCursor: Self.unusedCursor
+            refreshCursor: Self.unusedCursor,
+            refreshZai: Self.unusedZai
         ))
         let provider = try #require(CapacityDockProvider(rawValue: "clinepass"))
         let credential = CapacityDockProviderCredential(
@@ -36,6 +41,33 @@ struct CapacityDockProviderQuotaServiceTests {
         #expect(capturedKeys == ["synthetic-clinepass-key"])
     }
 
+    @Test("Z.ai dispatches with only its provider-scoped API key")
+    func dispatchesZai() async throws {
+        let capture = SecretCapture()
+        let expected = Self.summary(percent: 0.18)
+        let service = CapacityDockProviderQuotaService(dependencies: .init(
+            refreshClinePass: { _ in
+                Issue.record("Wrong adapter dispatched")
+                return Self.summary()
+            },
+            refreshCursor: Self.unusedCursor,
+            refreshZai: { apiKey in
+                if let apiKey { await capture.record(apiKey) }
+                return expected
+            }
+        ))
+        let provider = try #require(CapacityDockProvider(rawValue: "zai"))
+
+        let result = try await service.fetch(
+            provider: provider,
+            credential: CapacityDockProviderCredential(sourceMode: "api", apiKey: "  synthetic-zai-key  ")
+        )
+
+        let capturedKeys = await capture.values
+        #expect(result == expected)
+        #expect(capturedKeys == ["synthetic-zai-key"])
+    }
+
     @Test("Cursor dispatches through passive local-session discovery")
     func dispatchesCursor() async throws {
         let expected = Self.summary(percent: 0.37)
@@ -44,7 +76,8 @@ struct CapacityDockProviderQuotaServiceTests {
                 Issue.record("Wrong adapter dispatched")
                 return Self.summary()
             },
-            refreshCursor: { expected }
+            refreshCursor: { expected },
+            refreshZai: Self.unusedZai
         ))
         let provider = try #require(CapacityDockProvider(rawValue: "cursor"))
 
@@ -63,7 +96,8 @@ struct CapacityDockProviderQuotaServiceTests {
                 Issue.record("Adapter must not run without a key")
                 return Self.summary()
             },
-            refreshCursor: Self.unusedCursor
+            refreshCursor: Self.unusedCursor,
+            refreshZai: Self.unusedZai
         ))
         let provider = try #require(CapacityDockProvider(rawValue: "clinepass"))
 
@@ -93,7 +127,8 @@ struct CapacityDockProviderQuotaServiceTests {
                 Issue.record("Wrong adapter dispatched")
                 return Self.summary()
             },
-            refreshCursor: Self.unusedCursor
+            refreshCursor: Self.unusedCursor,
+            refreshZai: Self.unusedZai
         ))
         let provider = try #require(CapacityDockProvider(rawValue: "openrouter"))
 
@@ -114,7 +149,8 @@ struct CapacityDockProviderQuotaServiceTests {
     func classifiesAuthenticationFailure() async throws {
         let service = CapacityDockProviderQuotaService(dependencies: .init(
             refreshClinePass: { _ in throw ClinePassSubscriptionService.FetchError.authenticationRejected },
-            refreshCursor: Self.unusedCursor
+            refreshCursor: Self.unusedCursor,
+            refreshZai: Self.unusedZai
         ))
         let provider = try #require(CapacityDockProvider(rawValue: "clinepass"))
 
@@ -138,7 +174,8 @@ struct CapacityDockProviderQuotaServiceTests {
         for error in errors {
             let service = CapacityDockProviderQuotaService(dependencies: .init(
                 refreshClinePass: { _ in throw error },
-                refreshCursor: Self.unusedCursor
+                refreshCursor: Self.unusedCursor,
+                refreshZai: Self.unusedZai
             ))
             do {
                 _ = try await service.fetch(
@@ -171,7 +208,8 @@ struct CapacityDockProviderQuotaServiceTests {
                 await gate.pause()
                 return Self.summary(percent: 0.73)
             },
-            refreshCursor: Self.unusedCursor
+            refreshCursor: Self.unusedCursor,
+            refreshZai: Self.unusedZai
         ))
 
         let refresh = Task { await store.refreshCapacityDockProvider(provider) }
