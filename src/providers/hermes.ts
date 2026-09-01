@@ -463,11 +463,16 @@ function resolveHermesCost(
     tokens.cacheReadTokens,
     0,
   )
-  // This slice treats explicit $0 as recorded. null still falls through.
+  // actual is a recorded invoice amount; explicit $0 still counts as recorded.
   if (row && row.actual_cost_usd != null) {
     return { costUSD: row.actual_cost_usd, costIsEstimated: false, costBasis: 'actual' }
   }
-  if (row && row.estimated_cost_usd != null) {
+  // estimated_cost_usd = 0.0 is not a measurement: Hermes writes it when cost_status
+  // is 'unknown' (no pricing data) or 'included' (flat subscription), so trusting it
+  // would zero out every subscription session. Only positive estimates are trusted;
+  // anything else falls through to the token-based calculation. A genuinely free
+  // model still lands on $0 either way, since litellm prices it at 0.
+  if (row && row.estimated_cost_usd != null && row.estimated_cost_usd > 0) {
     return { costUSD: row.estimated_cost_usd, costIsEstimated: false, costBasis: 'estimated' }
   }
   return { costUSD: calculatedCost, costIsEstimated: true, costBasis: 'calculated' }
