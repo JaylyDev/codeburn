@@ -105,7 +105,12 @@ pub fn show(app: &AppHandle) -> tauri::Result<()> {
     apply_layout(&window, 1, false);
     window.show()?;
     #[cfg(debug_assertions)]
-    eprintln!("codeburn dock: window created and shown");
+    {
+        eprintln!("codeburn dock: window created and shown");
+        if std::env::var_os("CODEBURN_DOCK_DEVTOOLS").is_some() {
+            window.open_devtools();
+        }
+    }
     Ok(())
 }
 
