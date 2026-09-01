@@ -742,43 +742,6 @@ function parseLegacyChatSession(
 // ---------------------------------------------------------------------------
 // Model display names (unchanged from original)
 // ---------------------------------------------------------------------------
-const modelDisplayNames: Record<string, string> = {
-  'gpt-4.1-nano': 'GPT-4.1 Nano',
-  'gpt-4.1-mini': 'GPT-4.1 Mini',
-  'gpt-4.1': 'GPT-4.1',
-  'gpt-4-1': 'GPT-4.1',
-  'gpt-4o-mini': 'GPT-4o Mini',
-  'gpt-5.4': 'GPT-5.4',
-  'gpt-5-4': 'GPT-5.4',
-  'gpt-5.3-codex': 'GPT-5.3 Codex',
-  'gpt-5-3-codex': 'GPT-5.3 Codex',
-  'gpt-5.2-codex': 'GPT-5.2 Codex',
-  'gpt-5-2-codex': 'GPT-5.2 Codex',
-  'gpt-5.1-codex-max': 'GPT-5.1 Codex Max',
-  'gpt-5-1-codex-max': 'GPT-5.1 Codex Max',
-  'gpt-5.4-mini': 'GPT-5.4 Mini',
-  'gpt-5-4-mini': 'GPT-5.4 Mini',
-  'gpt-5-mini': 'GPT-5 Mini',
-  'gpt-5': 'GPT-5',
-  'claude-sonnet-4-6': 'Sonnet 4.6',
-  'claude-sonnet-4-5': 'Sonnet 4.5',
-  'claude-sonnet-4': 'Sonnet 4',
-  'claude-opus-4-7': 'Opus 4.7',
-  'claude-opus-4-6': 'Opus 4.6',
-  'claude-3-7-sonnet': 'Sonnet 3.7',
-  'claude-3-5-sonnet': 'Sonnet 3.5',
-  'claude-haiku-4-5': 'Haiku 4.5',
-  'gemini-3-1-pro-preview': 'Gemini 3.1 Pro',
-  'gemini-3-pro-preview': 'Gemini 3 Pro',
-  'gemini-2-5-pro': 'Gemini 2.5 Pro',
-  'o4-mini': 'o4-mini',
-  'o3': 'o3',
-  'copilot-auto': 'Copilot (auto)',
-  'auto': 'Copilot (auto)',
-  'copilot-openai-auto': 'Copilot (OpenAI auto)',
-  'copilot-anthropic-auto': 'Copilot (Anthropic auto)',
-}
-
 // ---------------------------------------------------------------------------
 // Tool name normalisation (unchanged from original, plus OTel tool names)
 // ---------------------------------------------------------------------------
@@ -839,10 +802,6 @@ function normalizeTool(rawTool: string): string {
   }
   return rawTool
 }
-
-const modelDisplayEntries = Object.entries(modelDisplayNames).sort(
-  (a, b) => b[0].length - a[0].length
-)
 
 // Tool names that represent shell/bash execution. When the AI calls one of
 // these, we extract the `arguments.command` string into bashCommands[].
@@ -1852,11 +1811,17 @@ function createChatSessionParser(
 // Known JetBrains Copilot model tokens, longest-first so we match the most
 // specific name (e.g. "gpt-4.1-mini" before "gpt-4.1").
 const JETBRAINS_MODEL_TOKENS = [
+  'claude-opus-4.7',
+  'claude-opus-4.6',
   'claude-opus-4.5',
   'claude-opus-4.1',
   'claude-opus-4',
+  'claude-sonnet-4.6',
   'claude-sonnet-4.5',
   'claude-sonnet-4',
+  'claude-haiku-4.5',
+  'gpt-5.4-mini',
+  'gpt-5.4',
   'gpt-5.3-codex',
   'gpt-5.3',
   'gpt-5.2',
@@ -1868,6 +1833,8 @@ const JETBRAINS_MODEL_TOKENS = [
   'gpt-4.1',
   'gpt-4o-mini',
   'gpt-4o',
+  'gemini-3.1-pro',
+  'gemini-3-pro',
   'gemini-2.5-pro',
   'gemini-2.0-flash',
   'o3-mini',
@@ -3635,9 +3602,6 @@ export function createCopilotProvider(
     },
 
     modelDisplayName(model: string): string {
-      for (const [key, display] of modelDisplayEntries) {
-        if (model === key || model.includes(key)) return display
-      }
       return getShortModelName(model)
     },
 
