@@ -128,21 +128,23 @@ struct ProviderSettingsEditorStateTests {
             _ = CapacityDockProviderCredentialPresence.contains("kimi", defaults: defaultsBox.value)
             callbackFinished.setCompleted()
         }
+        defer {
+            NotificationCenter.default.removeObserver(observer)
+            defaults.removePersistentDomain(forName: suiteName)
+        }
 
         DispatchQueue.global(qos: .userInitiated).async {
             CapacityDockProviderCredentialPresence.set(true, for: "kimi", defaults: defaultsBox.value)
             writeFinished.setCompleted()
         }
-        for _ in 0..<50 where !writeFinished.isCompleted {
+        // A deadlocked write never completes, so the bound only needs to be
+        // generous enough that a loaded CI runner cannot fake one.
+        for _ in 0..<500 where !writeFinished.isCompleted {
             try await Task.sleep(for: .milliseconds(10))
         }
 
         #expect(callbackFinished.isCompleted)
         #expect(writeFinished.isCompleted)
-        if writeFinished.isCompleted {
-            NotificationCenter.default.removeObserver(observer)
-            defaults.removePersistentDomain(forName: suiteName)
-        }
     }
 
     @Test("credential mutations await their real Keychain completion")

@@ -214,6 +214,12 @@ enum CapacityDockProviderCredentialPresence {
                 object: nil
             )
         }
+        // The lock only covers the compute above; releasing it before the
+        // defaults write is what breaks the reentrancy deadlock. What keeps the
+        // read-modify-write atomic across concurrent callers is that every
+        // mutation runs serialized on the main queue, so this must stay a
+        // synchronous hop: switching it to async reintroduces lost updates and
+        // breaks read-after-write (see CredentialKeychainContinuityTests).
         if Thread.isMainThread {
             update()
         } else {
