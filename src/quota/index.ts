@@ -10,6 +10,7 @@ import { fetchAntigravityQuota } from './antigravity.js'
 import { fetchClaudeQuota } from './claude.js'
 import { fetchCodexQuota } from './codex.js'
 import { fetchCopilotQuota } from './copilot.js'
+import { fetchCursorQuota } from './cursor.js'
 import { fetchGeminiQuota } from './gemini.js'
 import { fetchKimiQuota } from './kimi.js'
 import type { ProviderName, QuotaProvider } from './types.js'
@@ -38,6 +39,7 @@ const READERS: { id: ProviderName; name: string; read: ProviderReader }[] = [
   { id: 'copilot', name: 'GitHub Copilot', read: async signal => (await fetchCopilotQuota({ signal })).quota },
   { id: 'antigravity', name: 'Antigravity', read: () => fetchAntigravityQuota() },
   { id: 'kimi', name: 'Kimi', read: async signal => (await fetchKimiQuota({ signal })).quota },
+  { id: 'cursor', name: 'Cursor', read: async signal => (await fetchCursorQuota({ signal })).quota },
 ]
 
 const DEFAULT_TIMEOUT_MS = 5_000
