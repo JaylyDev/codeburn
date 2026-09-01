@@ -1,170 +1,289 @@
-/* Capacity Dock rail. Metrics are the macOS dock's whole-point values at its default 0.6
-   scale (mac/Sources/CodeBurnMenubar/Views/CapacityDockView.swift); the window that holds
-   them is sized in src-tauri/src/dock.rs and the two must stay in step. */
+/* Capacity Dock, the Windows twin of mac/Sources/CodeBurnMenubar/Views/CapacityDockView.swift.
+   Metrics come from src/dockGeometry.ts (the mac values at its 0.6 default scale) and the
+   window that holds them is sized in src-tauri/src/dock.rs; all three stay in step. The dock is
+   always the mac's dark graphite surface, whichever theme the popover is in. */
 
 :root {
-  --dock-rail-w: 56px;
-  --dock-row-h: 50px;
-  --dock-row-gap: 7px;
-  --dock-pad: 12px;
-  --dock-detail-w: 300px;
-  --dock-radius: 10px;
-
-  /* claude, codex and copilot are tokens.json color.categorical; the remaining three keep
-     the ring colours the macOS Capacity Dock already gives them. */
-  --dock-claude: #C9521D;
-  --dock-codex: #5C7CA3;
-  --dock-copilot: #B8944C;
-  --dock-gemini: #478CFA;
-  --dock-kimi: #E6F014;
-  --dock-antigravity: #FF7A45;
+  /* Warm off-white: a mild orange tint so bright labels on the dark card read softer. */
+  --dock-text: #FAF2E6;
+  --dock-green: #30D158;
+  --dock-yellow: #FFD60A;
+  --dock-orange: #FF9F0A;
+  --dock-red: #FF453A;
+  --dock-rail-expand: cubic-bezier(0.22, 1, 0.36, 1);
+  --dock-detail-present: cubic-bezier(0.16, 1, 0.3, 1);
+  --dock-detail-follow: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --dock-detail-dismiss: cubic-bezier(0.4, 0, 1, 1);
 }
 
 .dock {
-  display: flex;
-  justify-content: flex-end;
+  position: relative;
+  width: 100%;
   height: 100%;
   overflow: hidden;
   font-family: var(--font-sans);
+  color: var(--dock-text);
+  user-select: none;
+  -webkit-user-select: none;
 }
 
+.dock-surface {
+  position: absolute;
+  inset: 0;
+  display: block;
+  pointer-events: none;
+}
+
+/* Rail */
+
 .dock-rail {
-  flex: 0 0 var(--dock-rail-w);
+  position: absolute;
+  right: 0;
+  box-sizing: border-box;
+}
+
+.dock-rows {
+  position: absolute;
+  left: 0;
+  right: 0;
   display: flex;
   flex-direction: column;
-  gap: var(--dock-row-gap);
-  padding: var(--dock-pad) 0;
-  background: var(--surface);
-  border-radius: var(--dock-radius) 0 0 var(--dock-radius);
-  border: 1px solid var(--separator);
-  border-right: none;
-  box-shadow: var(--menu-shadow);
+  gap: 7px;
 }
 
 .dock-row {
-  height: var(--dock-row-h);
+  appearance: none;
+  border: 0;
+  margin: 0;
+  padding: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: default;
+  height: 50px;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 2px;
+  gap: 4px;
+}
+
+.dock-row:focus-visible {
+  outline: none;
+}
+
+.dock-gauge {
+  position: relative;
+  width: 31px;
+  height: 31px;
+  display: grid;
+  place-items: center;
 }
 
 .dock-ring {
-  transform: rotate(-90deg);
-}
-
-.dock-ring-track {
-  fill: none;
-  stroke: var(--fill-12);
+  position: absolute;
+  top: -3px;
+  left: -3px;
+  overflow: visible;
 }
 
 .dock-ring-arc {
-  fill: none;
-  stroke: var(--dock-accent, var(--label-2));
-  stroke-linecap: round;
-  transition: stroke-dashoffset 240ms var(--ease-ui);
+  transition: stroke-dasharray 240ms var(--ease-ui), stroke 240ms var(--ease-ui);
+}
+
+.dock-glyph {
+  position: relative;
+  display: grid;
+  place-items: center;
+  color: #fff;
+}
+
+.dock-glyph.is-loading {
+  opacity: 0.6;
+}
+
+.dock-row-alert {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dock-red);
+  box-shadow: 0 0 0 1.5px #000;
 }
 
 .dock-pct {
   font-size: 10px;
+  font-weight: 500;
+  line-height: 12px;
   font-variant-numeric: tabular-nums;
-  color: var(--label-2);
+  color: var(--dock-text);
 }
 
-.dock-pct.is-spent {
-  color: var(--danger);
-}
+.dock-pct.is-empty { color: rgba(250, 242, 230, 0.72); }
+.dock-pct.is-warning { color: var(--dock-yellow); }
+.dock-pct.is-critical { color: var(--dock-orange); }
+.dock-pct.is-danger { color: var(--dock-red); }
 
-.dock-quiet {
-  font-size: 10px;
-  color: var(--label-3);
-}
+/* Detail bubble */
 
 .dock-detail {
-  flex: 0 0 var(--dock-detail-w);
-  overflow-y: auto;
-  padding: var(--dock-pad);
+  position: absolute;
+  box-sizing: border-box;
+  padding: 14px 20px;
+  transition:
+    transform 200ms var(--dock-detail-present),
+    opacity 200ms var(--dock-detail-present),
+    top 220ms var(--dock-detail-follow),
+    left 220ms var(--dock-detail-follow);
+}
+
+/* Measured before it is placed: laid out at full size, but neither seen nor hit. */
+.dock-detail.is-measuring {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* Starts a step toward the rail so the bubble emerges from the dock. */
+.dock-detail.is-entering {
+  transform: translateX(10px);
+  opacity: 0;
+  transition: none;
+}
+
+.dock-detail.is-dismissing {
+  transform: translateX(6px);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform 140ms var(--dock-detail-dismiss),
+    opacity 140ms var(--dock-detail-dismiss);
+}
+
+.dock-detail-body {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 10px;
-  background: var(--surface);
-  border-radius: var(--dock-radius) 0 0 var(--dock-radius);
-  border: 1px solid var(--separator);
-  border-right: none;
-  box-shadow: var(--menu-shadow);
-}
-
-.dock-notice {
-  margin: 0;
-  font-size: 11px;
-  color: var(--label-2);
-}
-
-.dock-detail-card {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
 }
 
 .dock-detail-head {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
+  align-items: center;
+  gap: 7px;
 }
 
-.dock-detail-name {
-  font-size: 12px;
+.dock-detail-glyph {
+  display: grid;
+  place-items: center;
+  color: var(--dock-text);
+  flex: 0 0 auto;
+}
+
+.dock-detail-title {
+  font-size: 17px;
   font-weight: 600;
-  color: var(--label);
+  line-height: 1.2;
+  white-space: nowrap;
 }
 
 .dock-detail-plan {
+  margin-left: auto;
   font-size: 10px;
-  color: var(--label-2);
+  font-weight: 500;
+  color: rgba(250, 242, 230, 0.62);
+  white-space: nowrap;
 }
 
-.dock-window {
+.dock-conn,
+.dock-conn-reason,
+.dock-conn-hint,
+.dock-conn-instruction {
+  margin: 0;
+}
+
+.dock-conn-block {
   display: flex;
   flex-direction: column;
   gap: 3px;
 }
 
+.dock-conn.is-loading {
+  font-size: 10px;
+  color: rgba(250, 242, 230, 0.52);
+}
+
+.dock-conn.is-disconnected {
+  font-size: 11px;
+  color: rgba(250, 242, 230, 0.6);
+}
+
+.dock-conn.is-failed {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--dock-red);
+}
+
+.dock-conn-reason {
+  font-size: 10px;
+  color: rgba(250, 242, 230, 0.58);
+}
+
+.dock-conn-hint {
+  font-size: 10px;
+  color: rgba(250, 242, 230, 0.72);
+}
+
+.dock-conn-instruction {
+  font-size: 12px;
+  color: rgba(250, 242, 230, 0.62);
+}
+
+.dock-window {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
 .dock-window-top {
   display: flex;
+  align-items: baseline;
   justify-content: space-between;
-  gap: 8px;
-  font-size: 11px;
-  color: var(--label-2);
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.dock-window-label {
+  color: rgba(250, 242, 230, 0.82);
 }
 
 .dock-window-pct {
   font-variant-numeric: tabular-nums;
-  color: var(--label);
+  color: var(--dock-text);
 }
 
 .dock-track {
-  height: 4px;
-  border-radius: var(--radius-bar);
-  background: var(--fill-12);
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(250, 242, 230, 0.14);
   overflow: hidden;
 }
 
 .dock-fill {
   height: 100%;
-  border-radius: var(--radius-bar);
-  background: var(--dock-accent, var(--label-2));
+  border-radius: 999px;
+  background: var(--dock-green);
 }
+
+.dock-fill.is-warning { background: var(--dock-yellow); }
+.dock-fill.is-critical { background: var(--dock-orange); }
+.dock-fill.is-danger { background: var(--dock-red); }
 
 .dock-window-resets {
+  align-self: flex-end;
   font-size: 10px;
-  color: var(--label-3);
+  font-variant-numeric: tabular-nums;
+  color: rgba(250, 242, 230, 0.5);
 }
-
-[data-provider='claude'] { --dock-accent: var(--dock-claude); }
-[data-provider='codex'] { --dock-accent: var(--dock-codex); }
-[data-provider='copilot'] { --dock-accent: var(--dock-copilot); }
-[data-provider='gemini'] { --dock-accent: var(--dock-gemini); }
-[data-provider='kimi'] { --dock-accent: var(--dock-kimi); }
-[data-provider='antigravity'] { --dock-accent: var(--dock-antigravity); }

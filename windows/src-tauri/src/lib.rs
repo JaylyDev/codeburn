@@ -93,6 +93,17 @@ pub fn run() {
 
             Ok(())
         })
+        // The dock's right-click menu pops up from `dock::popup_context_menu`; its items report
+        // here rather than to the tray handler.
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "dock_refresh" => {
+                if let Some(window) = app.get_webview_window(dock::DOCK_LABEL) {
+                    let _ = window.emit("codeburn://dock-refresh", ());
+                }
+            }
+            "dock_hide" => set_dock_enabled(app, false),
+            _ => {}
+        })
         .on_window_event(|window, event| {
             // The dock is a persistent rail: it owns its own lifecycle and must survive both
             // the hide-on-blur and the hide-on-close that keep the popover alive.
@@ -128,6 +139,9 @@ pub fn run() {
             commands::set_launch_at_login,
             commands::dock_quota,
             commands::dock_set_layout,
+            commands::dock_preferred,
+            commands::dock_set_preferred,
+            commands::dock_context_menu,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -620,12 +634,32 @@ mod commands {
         Ok(cli.fetch_quota().await)
     }
 
-    /// The rail only knows its own provider count and hover state; the geometry that turns
-    /// those into a window lives in `dock`.
+    /// The page only knows its row count, hover state and the bubble's measured height; the
+    /// geometry that turns those into a window lives in `dock`. Synchronous on purpose: the
+    /// replies must arrive in request order or a stale frame could land after a newer one.
     #[tauri::command]
-    pub fn dock_set_layout(app: AppHandle, rows: u32, expanded: bool) {
-        if let Some(window) = app.get_webview_window(crate::dock::DOCK_LABEL) {
-            crate::dock::apply_layout(&window, rows, expanded);
-        }
+    pub fn dock_set_layout(
+        app: AppHandle,
+        request: crate::dock::LayoutRequest,
+    ) -> Result<crate::dock::DockFrame, String> {
+        let window = app
+            .get_webview_window(crate::dock::DOCK_LABEL)
+            .ok_or_else(|| "dock window is not open".to_string())?;
+        crate::dock::apply_layout(&window, &request).ok_or_else(|| "no primary monitor".to_string())
+    }
+
+    #[tauri::command]
+    pub fn dock_preferred() -> Option<String> {
+        crate::dock::preferred_provider()
+    }
+
+    #[tauri::command]
+    pub fn dock_set_preferred(id: String) -> Result<(), String> {
+        crate::dock::set_preferred_provider(&id).map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub fn dock_context_menu(app: AppHandle) -> Result<(), String> {
+        crate::dock::popup_context_menu(&app).map_err(|e| e.to_string())
     }
 }
