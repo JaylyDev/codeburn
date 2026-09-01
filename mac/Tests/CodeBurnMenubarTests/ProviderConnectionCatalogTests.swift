@@ -34,7 +34,7 @@ struct ProviderConnectionCatalogTests {
     func pinnedSourceModeCoverage() {
         let providers = ProviderConnectionCatalog.providers
         #expect(providers.count(with: .automatic) == 69)
-        #expect(providers.count(with: .web) == 31)
+        #expect(providers.count(with: .web) == 30)
         #expect(providers.count(with: .cli) == 14)
         #expect(providers.count(with: .oauth) == 5)
         #expect(providers.count(with: .api) == 44)
@@ -46,7 +46,7 @@ struct ProviderConnectionCatalogTests {
             .filter(\.hasLiveCodeBurnQuotaAdapter)
             .map(\.id)
             .sorted()
-        #expect(live == ["antigravity", "claude", "clinepass", "codex", "copilot", "cursor", "gemini", "kimi", "zai"])
+        #expect(live == ["antigravity", "claude", "clinepass", "codex", "copilot", "cursor", "gemini", "grok", "kimi", "zai"])
     }
 
 }

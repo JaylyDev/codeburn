@@ -360,6 +360,18 @@ struct CapacityDockPresentationTests {
             "Sign in to Command Code in a supported browser, then click Retry.")
     }
 
+    @Test("Grok Build offers direct one-click local login discovery")
+    func grokBuildConnectionGuidance() {
+        let provider = CapacityDockProvider(rawValue: "grok")!
+        #expect(ProviderConnectionGuidance.instruction(for: provider) ==
+            "Sign in with the Grok app or CLI, then click Retry.")
+        #expect(ProviderConnectionSubmissionPolicy.resolve(
+            credential: CapacityDockProviderCredential(),
+            savedCredential: CapacityDockProviderCredential(),
+            requiresExplicitCredential: false
+        ) == .connect)
+    }
+
     @Test("Connect saves edited credentials before fetching")
     func connectionSubmissionPolicy() {
         let empty = CapacityDockProviderCredential()
