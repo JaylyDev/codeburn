@@ -502,6 +502,8 @@ Sync sends token counts, costs, models, and projects, never prompts or code. Thi
 
 | Command | What it does |
 |---------|--------------|
+| `codeburn quota` | Live provider capacity: quota windows for each signed-in coding tool |
+| `codeburn quota --format json` | The same capacity readings as JSON |
 | `codeburn doctor` | Per-provider detection status: paths probed, sessions found, parse health (`--json`, `--provider`) |
 | `codeburn audit` | Per provider-model token source table: where every number comes from |
 | `codeburn context` | What fills a session's context window: interactive browser (Claude Code and Codex) |
@@ -664,6 +666,31 @@ codeburn doctor --json              # machine-readable, pipe to jq
 ```
 
 For each provider it shows the exact directories or databases probed (with any env override such as `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or `OPENCODE_DATA_DIR` and whether the path exists), how many session files were found, how many of a bounded sample parsed cleanly, the cached file count, and a one-line verdict: `OK (n sessions)`, `NOTHING FOUND` with the likely cause (directory missing, override points at an empty dir, or the tool is not installed), or `ERRORS (n parse failures)`. A provider that throws is caught and reported as its own error row, never crashing the rest of the report.
+
+### Provider quota
+
+`codeburn quota` reads how much of each provider's plan you have already spent, from the credentials the tools themselves keep on this machine. Claude, Codex, Gemini, GitHub Copilot and Kimi are read from their own signed-in sessions; Antigravity is read from its local language server.
+
+```bash
+codeburn quota               # table of every provider and its windows
+codeburn quota --format json # machine-readable, pipe to jq
+```
+
+Providers you are not signed in to are listed with `available: false` and no error. Reads run in parallel with a short per-provider timeout, and the command always exits 0 so a status bar or tray can poll it safely.
+
+```json
+{
+  "providers": [
+    {
+      "id": "claude",
+      "name": "Claude",
+      "available": true,
+      "plan": "Max 20x",
+      "windows": [{ "label": "Weekly", "usedPct": 42.5, "resetsAt": "2026-09-08T12:00:00.000Z" }]
+    }
+  ]
+}
+```
 
 ### JSON Output
 
