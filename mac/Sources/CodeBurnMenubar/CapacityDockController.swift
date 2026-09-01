@@ -122,7 +122,7 @@ final class CapacityDockController {
         pointerInsideDetail = false
         hoveredRowProvider = nil
 
-        detailPanel?.orderOut(nil)
+        releaseDetailPanel()
         railPanel?.orderOut(nil)
         detailPanel = nil
         railPanel = nil
@@ -238,6 +238,14 @@ final class CapacityDockController {
         panel.acceptsMouseMovedEvents = true
         hosting.clipsToBounds = true
         railPanel = panel
+    }
+
+    /// The bubble is cheap to rebuild and expensive to keep: a hidden, ordered-out
+    /// bubble panel left the app re-laying it out at display cadence for as long
+    /// as it lived (0.1 percent idle CPU before the first hover, 6 percent after).
+    private func releaseDetailPanel() {
+        detailPanel?.orderOut(nil)
+        detailPanel = nil
     }
 
     private func ensureDetailPanel() {
@@ -565,7 +573,7 @@ final class CapacityDockController {
         guard let provider, detailPanel?.isVisible == true else {
             model.hoveredProvider = nil
             detailIsDismissing = false
-            detailPanel?.orderOut(nil)
+            releaseDetailPanel()
             return
         }
         if animated {
@@ -574,7 +582,7 @@ final class CapacityDockController {
             stopDetailMotion()
             model.hoveredProvider = nil
             detailIsDismissing = false
-            detailPanel?.orderOut(nil)
+            releaseDetailPanel()
             detailPanel?.alphaValue = 1
         }
     }
@@ -1132,7 +1140,7 @@ final class CapacityDockController {
                 guard let self, generation == self.detailMotionGeneration else { return }
                 self.detailMotion = nil
                 if fadeOut {
-                    self.detailPanel?.orderOut(nil)
+                    self.releaseDetailPanel()
                     self.detailPanel?.alphaValue = 1
                     self.model.hoveredProvider = nil
                     self.detailIsDismissing = false

@@ -1398,12 +1398,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         popover.animates = true
         popover.delegate = self
 
+        popover.contentViewController = makePopoverContent()
+    }
+
+    /// Built fresh for every show and dropped on close: a popover content view
+    /// that outlives its window kept re-laying itself out at display cadence
+    /// after being shown once during the first load (6 percent idle CPU until
+    /// relaunch). Rebuilding a 360pt view on open is far cheaper than that.
+    private func makePopoverContent() -> NSViewController {
         let content = MenuBarContent()
             .environment(store)
             .environment(updateChecker)
             .frame(width: popoverWidth)
 
-        popover.contentViewController = NSHostingController(rootView: content)
+        let hosting = NSHostingController(rootView: content)
+        // Let the popover size itself from preferredContentSize only. With the
+        // default options the hosting view also pushes min/max content sizes at
+        // its window on every pass, and once the popover has been shown while
+        // loading (content 520pt tall, then the real height), the closed
+        // popover keeps re-laying itself out at display cadence: 6 percent idle
+        // CPU until relaunch.
+        hosting.sizingOptions = [.preferredContentSize]
+        return hosting
     }
 
     @objc private func handleButtonClick(_ sender: AnyObject?) {
@@ -1427,6 +1443,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             // closes. The popover's window takes keyboard focus on its own
             // via makeKeyAndOrderFront, which is enough for keystrokes to
             // reach the SwiftUI content.
+            if popover.contentViewController == nil {
+                popover.contentViewController = makePopoverContent()
+            }
             store.menuPopoverVisible = true
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             if let window = popover.contentViewController?.view.window {
@@ -1642,6 +1661,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
 
     func popoverDidClose(_ notification: Notification) {
         store.menuPopoverVisible = false
+        popover.contentViewController = nil
         // Catch up on any menubar title updates that were skipped while the
         // popover was anchored.
         refreshStatusButton()
