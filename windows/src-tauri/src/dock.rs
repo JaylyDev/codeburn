@@ -560,6 +560,8 @@ fn relayout(window: &tauri::WebviewWindow) -> Option<DockFrame> {
     let mut state = lock();
     let placement = *state.placement.get_or_insert_with(load_placement);
     let frame = layout(area, &placement, &state.request);
+    #[cfg(debug_assertions)]
+    let (request_rows, request_total, request_expanded) = (state.request.rows, state.request.total_rows, state.request.expanded);
     let moved = state.frame.map(|f| f.window) != Some(frame.window);
     state.area = area;
     state.scale = scale;
@@ -568,8 +570,9 @@ fn relayout(window: &tauri::WebviewWindow) -> Option<DockFrame> {
     if moved {
         #[cfg(debug_assertions)]
         eprintln!(
-            "codeburn dock: work_area={},{} {}x{} -> window {},{} {}x{}",
-            area.x, area.y, area.w, area.h, frame.window.x, frame.window.y, frame.window.w, frame.window.h
+            "codeburn dock: work_area={},{} {}x{} rows={} total={} expanded={} placement={:?} -> window {},{} {}x{}",
+            area.x, area.y, area.w, area.h, request_rows, request_total, request_expanded, placement,
+            frame.window.x, frame.window.y, frame.window.w, frame.window.h
         );
         move_window(window, frame.window, scale);
     }
@@ -907,6 +910,19 @@ mod tests {
         assert_eq!(detail.y, frame.rail.y + frame.rail.h + DETAIL_GAP);
         let row_mid = frame.rail.x + 31 + (ROW_HEIGHT + ROW_SPACING) + ROW_HEIGHT / 2;
         assert_eq!(detail.x + detail.w / 2, row_mid);
+    }
+
+    #[test]
+    fn a_top_rail_in_the_corner_keeps_its_window_inside_the_work_area() {
+        let placement = Placement { docked: Some(Edge::Top), attachment: Edge::Top, x: Some(0.986), y: Some(0.0) };
+        for expanded in [false, true] {
+            let frame = layout(AREA, &placement, &LayoutRequest { rows: 1, total_rows: 1, expanded, detail: None });
+            let rail = rail_on_screen(&frame);
+            assert_eq!(rail, Rect { x: 1456, y: 0, w: 112, h: HORIZONTAL_RAIL_WIDTH });
+            assert_eq!(frame.window.right(), 1600);
+            assert_eq!(frame.window.x, 1600 - (112 + DETAIL_OVERHANG * 2));
+            assert!(frame.rail.x + frame.rail.w <= frame.window.w);
+        }
     }
 
     #[test]

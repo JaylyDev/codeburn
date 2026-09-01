@@ -288,8 +288,10 @@ export function Dock() {
   const [detailPhase, setDetailPhase] = useState<DetailPhase>('entering')
   const [detailHeight, setDetailHeight] = useState(0)
   const [frame, setFrame] = useState<DockFrame | null>(null)
-  // Attachment while dragging comes straight from the cursor poll; otherwise it eases.
-  const [dragAttachment, setDragAttachment] = useState<number | null>(null)
+  // Attachment while dragging comes straight from the cursor poll; otherwise it eases. The
+  // edge it refers to matters: a flare only makes sense on an edge of the rail's own
+  // orientation, so nearing a perpendicular edge shows the loose pill until the drop.
+  const [drag, setDrag] = useState<{ attachment: number; edge: Edge | null } | null>(null)
   // Where the rail was before a settle, relative to the new window, so it can glide in.
   const [glide, setGlide] = useState<{ dx: number; dy: number; key: number } | null>(null)
   const { schedule, cancel } = useTimers()
@@ -474,12 +476,17 @@ export function Dock() {
     const listeners = [
       listen('codeburn://dock-refresh', () => void load()),
       listen<PointerSnapshot>('codeburn://dock-pointer', (event) => applyPointer(event.payload)),
-      listen<{ attachment: number }>('codeburn://dock-drag', (event) => setDragAttachment(event.payload.attachment)),
+      listen<{ attachment: number; edge: Edge | null }>('codeburn://dock-drag', (event) => setDrag(event.payload)),
       listen<{ from: Rect; frame: DockFrame }>('codeburn://dock-settled', (event) => {
         const { from, frame: next } = event.payload
         setFrame(next)
-        setDragAttachment(null)
-        setGlide({ dx: from.x - next.rail.x, dy: from.y - next.rail.y, key: Date.now() })
+        setDrag(null)
+        // Glide from centre to centre: the rail may have changed orientation on the way.
+        setGlide({
+          dx: from.x + from.w / 2 - (next.rail.x + next.rail.w / 2),
+          dy: from.y + from.h / 2 - (next.rail.y + next.rail.h / 2),
+          key: Date.now(),
+        })
         // A re-homed rail starts from a clean hover: the bubble is gone on the Rust side, and
         // the poll re-derives hover from the settled geometry on its next tick.
         ;['expand', 'collapse', 'detailShow', 'detailExit'].forEach(cancel)
@@ -584,7 +591,10 @@ export function Dock() {
   // Attachment: 1 docked, 0 loose. Eases home after a drop; tracks the poll during a drag.
   const attachmentTarget = frame?.docked ? 1 : 0
   const easedAttachment = useEased(attachmentTarget, ATTACH_MOTION)
-  const attachment = dragAttachment ?? easedAttachment
+  const railVertical = frame?.vertical ?? true
+  const dragEdgeFits = drag?.edge != null && isVertical(drag.edge) === railVertical
+  const attachment = drag ? (dragEdgeFits ? drag.attachment : 0) : easedAttachment
+  const flareEdge: Edge = dragEdgeFits && drag?.edge ? drag.edge : (frame?.edge ?? 'right')
 
   // Glide: after a settle the rail starts where it was dropped and eases into place.
   const glideKey = glide?.key ?? 0
@@ -595,8 +605,8 @@ export function Dock() {
     if (glide && glideProgress >= 1) setGlide(null)
   }, [glide, glideProgress])
 
-  const edge: Edge = frame?.edge ?? 'right'
-  const vertical = frame?.vertical ?? true
+  const edge = flareEdge
+  const vertical = railVertical
   const cross = vertical ? M.railWidth : M.horizontalRailWidth
   const pad = alongPad(attachment)
   const restLength = railLength(1, attachment)
@@ -619,9 +629,22 @@ export function Dock() {
   const detailH = detailHeight
   const tail = detailFrame ? detailFrame.tail : (isVertical(tailEdge) ? detailH : detailW) / 2
 
+  // Rows hug the reveal origin: the anchored end gets the along padding, the other end floats.
   const rowsStyle: CSSProperties = vertical
-    ? { flexDirection: 'column', left: M.railCrossPad, right: M.railCrossPad, ...(anchor === 'end' ? { bottom: pad } : { top: pad }) }
-    : { flexDirection: 'row', top: M.railCrossPad, bottom: M.railCrossPad, ...(anchor === 'end' ? { right: pad } : { left: pad }) }
+    ? {
+        flexDirection: 'column',
+        left: M.railCrossPad,
+        right: M.railCrossPad,
+        top: anchor === 'end' ? 'auto' : pad,
+        bottom: anchor === 'end' ? pad : 'auto',
+      }
+    : {
+        flexDirection: 'row',
+        top: M.railCrossPad,
+        bottom: M.railCrossPad,
+        left: anchor === 'end' ? 'auto' : pad,
+        right: anchor === 'end' ? pad : 'auto',
+      }
 
   return (
     <div className="dock" onContextMenu={(e) => { e.preventDefault(); void invoke('dock_context_menu') }}>
