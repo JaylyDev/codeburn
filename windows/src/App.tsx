@@ -9,7 +9,7 @@ import { PayloadCache } from './lib/cache'
 import { relativePast } from './lib/dates'
 import { applyTheme, currentTheme, readSetting, writeSetting } from './lib/settings'
 import { TRAY_BADGE_SUPPORTED } from './lib/platform'
-import { AgentTabStrip, detectedProviders } from './components/AgentTabStrip'
+import { AgentTabStrip, ALL_PROVIDER, providerLabel, providerTabs } from './components/AgentTabStrip'
 import type { Provider } from './components/AgentTabStrip'
 import { ModelsSection } from './components/ModelsSection'
 import { InsightPills, INSIGHT_ORDER, isInsightMode, type InsightMode } from './components/InsightPills'
@@ -51,7 +51,7 @@ type FetchOptions = {
 
 export function App() {
   const [period, setPeriod] = useState<Period>('today')
-  const [provider, setProvider] = useState<Provider>('all')
+  const [provider, setProvider] = useState<Provider>(ALL_PROVIDER)
   const [payload, setPayload] = useState<MenubarPayload | null>(null)
   const [todayPayload, setTodayPayload] = useState<MenubarPayload | null>(null)
   const [currency, setCurrency] = useState<CurrencyState>(USD)
@@ -258,8 +258,10 @@ export function App() {
     writeSetting('insight', mode)
   }
 
-  const providers = detectedProviders(todayPayload)
-  const planVisible = provider === 'claude' || (provider === 'all' && providers.length === 1 && providers[0] === 'claude')
+  const tabs = providerTabs(todayPayload)
+  const detected = tabs.filter(t => t.id !== ALL_PROVIDER && t.detected)
+  const planVisible = provider === 'claude'
+    || (provider === ALL_PROVIDER && detected.length === 1 && detected[0].id === 'claude')
   const visibleModes = useMemo(
     () => INSIGHT_ORDER.filter(m => m !== 'plan' || planVisible),
     [planVisible],
@@ -269,9 +271,9 @@ export function App() {
   const cliBlocked = cliStatus !== null && (!cliStatus.found || !cliStatus.compatible)
   // The version gate above is what keeps these fields present; the optional reads are the
   // backstop that turns a surprising payload into an empty state rather than a blank window.
-  const isFilteredEmpty = payload !== null && provider !== 'all'
+  const isFilteredEmpty = payload !== null && provider !== ALL_PROVIDER
     && (payload.current?.cost ?? 0) <= 0 && (payload.current?.calls ?? 0) === 0
-  const neverAnyData = payload !== null && provider === 'all'
+  const neverAnyData = payload !== null && provider === ALL_PROVIDER
     && (payload.current?.calls ?? 0) === 0 && (payload.current?.sessions ?? 0) === 0
     && (payload.history?.daily?.length ?? 0) === 0
 
@@ -317,7 +319,7 @@ export function App() {
             <PeriodTabs selected={period} onSelect={setPeriod} />
 
             {isFilteredEmpty ? (
-              <EmptyProviderState provider={provider} period={period} />
+              <EmptyProviderState label={providerLabel(tabs, provider)} period={period} />
             ) : neverAnyData ? (
               <NoDataState onRefresh={() => refreshAll({ includeOptimize: true, showOverlay: true })} />
             ) : (

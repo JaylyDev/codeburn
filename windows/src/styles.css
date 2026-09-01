@@ -194,16 +194,44 @@ code { font-family: var(--font-mono); }
   z-index: 40;
   border-bottom: 1px solid var(--separator);
 }
-.agent-tabs {
+.agent-tabs-row {
   display: flex;
-  gap: 5px;
+  align-items: center;
+}
+.agent-tabs {
+  flex: 1 1 auto;
+  min-width: 0;
   padding: 8px 12px;
   overflow-x: auto;
   scrollbar-width: none;
   mask-image: linear-gradient(90deg, #000 calc(100% - 18px), transparent);
   -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 18px), transparent);
 }
+.agent-tabs-content {
+  display: flex;
+  gap: 5px;
+  width: max-content;
+}
 .agent-tabs::-webkit-scrollbar { display: none; }
+/* Overflow arrows, as on the mac: they select the neighbouring tab rather than scrolling
+   blindly, so the strip and the active filter never disagree about what is in view. */
+.tab-chevron {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--label);
+}
+.tab-chevron:hover:not(:disabled) { background: var(--fill-08); }
+.tab-chevron:disabled { color: var(--label-3); }
+.agent-tabs-row > .tab-chevron:first-child { margin-left: 6px; }
+.agent-tabs-row > .tab-chevron:last-child { margin-right: 6px; }
+.agent-tabs-row > .tab-chevron:first-child + .agent-tabs { padding-left: 6px; }
 .tab-muted, .tab-muted:hover { background: transparent; color: var(--label-3); box-shadow: inset 0 0 0 1px var(--fill-08); }
 .tab-preview {
   position: absolute;
@@ -238,6 +266,16 @@ code { font-family: var(--font-mono); }
 }
 .tab:hover { background: var(--fill-12); }
 .tab-active, .tab-active:hover { background: var(--brand-accent); color: #fff; }
+/* The provider's brand mark, from ProviderFilter.color on the mac. */
+.tab-dot {
+  align-self: center;
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+}
+.tab-active .tab-dot { background: rgba(255, 255, 255, 0.85); }
+.tab-muted .tab-dot { opacity: 0.4; }
 .tab-cost {
   font-family: var(--font-mono);
   font-size: 10.5px;
