@@ -52,6 +52,10 @@ pub struct AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Must be registered before any other plugin so it can intercept a second launch.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_popover(app, None);
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -108,8 +112,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
         .run(|_app, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                api.prevent_exit();
+            // `code` is `None` only when the last window closed on its own; an explicit
+            // `app.exit(..)` (tray Quit, `commands::quit_app`) always carries `Some(_)` and
+            // must be allowed through, or Quit does nothing.
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                if code.is_none() {
+                    api.prevent_exit();
+                }
             }
         });
 }
