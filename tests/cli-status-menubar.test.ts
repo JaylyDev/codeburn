@@ -129,6 +129,49 @@ describe('codeburn status --format menubar-json', () => {
     }
   })
 
+  it('reports calls for a zero-cost provider so the menubar can show its tab', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-zero-cost-provider-'))
+
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'myapp')
+      await mkdir(projectDir, { recursive: true })
+      const now = new Date()
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const userAt = new Date(Math.max(todayUtcMidnight, now.getTime() - 60_000))
+      const ts1 = userAt.toISOString().replace(/\.\d+Z$/, 'Z')
+      const ts2 = now.toISOString().replace(/\.\d+Z$/, 'Z')
+      await writeFile(
+        join(projectDir, 'session.jsonl'),
+        [
+          userLine('zero-cost', ts1),
+          assistantLine('zero-cost', ts2, 'msg-zero-cost', 'definitely-unpriced-model'),
+        ].join('\n'),
+      )
+
+      const result = runCli([
+        'status',
+        '--format', 'menubar-json',
+        '--period', 'today',
+        '--provider', 'all',
+        '--no-optimize',
+        '--no-timeline',
+      ], home)
+
+      expect(result.status, `stderr: ${result.stderr}`).toBe(0)
+      const payload = JSON.parse(result.stdout) as {
+        current: { providerDetails: Array<{ id: string; cost: number; calls: number; hasUsage: boolean }> }
+      }
+      expect(payload.current.providerDetails.find(p => p.id === 'claude')).toMatchObject({
+        id: 'claude',
+        cost: 0,
+        calls: 1,
+        hasUsage: true,
+      })
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
   it('omits history.timeline with --no-timeline, includes it by default', async () => {
     const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-tl-'))
     try {

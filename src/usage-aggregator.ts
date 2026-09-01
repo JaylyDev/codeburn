@@ -22,6 +22,17 @@ import { buildGranularHistory } from './granular-history.js'
 const TOP_BRANCHES = 15
 type SubagentRow = NonNullable<BreakdownArrays['subagents']>[number]
 
+export function providerSliceHasUsage(slice: ProviderDaySlice): boolean {
+  return slice.cost > 0
+    || slice.savingsUSD > 0
+    || slice.calls > 0
+    || (slice.sessions ?? 0) > 0
+    || (slice.inputTokens ?? 0) > 0
+    || (slice.outputTokens ?? 0) > 0
+    || (slice.cacheReadTokens ?? 0) > 0
+    || (slice.cacheWriteTokens ?? 0) > 0
+}
+
 
 export function buildPeriodData(label: string, projects: ProjectSummary[]): PeriodData {
   const sessions = projects.flatMap(p => p.sessions)
@@ -763,23 +774,29 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   )
 
   // PROVIDERS
-  // For .all: enumerate every provider with cost across the period (from cache) + installed-but-zero.
-  // For specific: just this single provider with its scoped cost.
+  // For .all: enumerate every provider with usage across the period (from cache) + installed-but-idle.
+  // `hasUsage` preserves token-only and subscription-backed activity while
+  // distinguishing a provider merely discovered on disk.
+  // For specific: just this single provider with its scoped totals.
   const allProviders = await getAllProviders()
   const displayNameByName = new Map(allProviders.map(p => [p.name, p.displayName]))
   const providers: ProviderCost[] = []
   if (isClaudeConfigScoped) {
-    const providerTotals: Record<string, number> = {}
+    const providerTotals: Record<string, { cost: number; calls: number; hasUsage: boolean }> = {}
     for (const d of aggregateProjectsIntoDays(scanProjects)) {
       for (const [name, p] of Object.entries(d.providers)) {
-        providerTotals[name] = (providerTotals[name] ?? 0) + p.cost
+        const total = providerTotals[name] ?? { cost: 0, calls: 0, hasUsage: false }
+        total.cost += p.cost
+        total.calls += p.calls
+        total.hasUsage ||= providerSliceHasUsage(p)
+        providerTotals[name] = total
       }
     }
-    for (const [name, cost] of Object.entries(providerTotals)) {
-      providers.push({ name, displayName: displayNameByName.get(name) ?? name, cost })
+    for (const [name, total] of Object.entries(providerTotals)) {
+      providers.push({ name, displayName: displayNameByName.get(name) ?? name, ...total })
     }
     if (providers.length === 0 && claudeConfigs?.selectedId) {
-      providers.push({ name: 'claude', displayName: displayNameByName.get('claude') ?? 'Claude', cost: 0 })
+      providers.push({ name: 'claude', displayName: displayNameByName.get('claude') ?? 'Claude', cost: 0, calls: 0, hasUsage: false })
     }
   } else if (isAllProviders) {
     // Reuse the day set the headline was built from instead of rebuilding one
@@ -794,22 +811,39 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
     // implies !isClaudeConfigScoped, which forces the !effectivelyScoped path that
     // assigns it.
     const allDaysForProviders = cacheDaysForPeriod ?? []
-    const providerTotals: Record<string, number> = {}
+    const providerTotals: Record<string, { cost: number; calls: number; hasUsage: boolean }> = {}
     for (const d of allDaysForProviders) {
       for (const [name, p] of Object.entries(d.providers)) {
-        providerTotals[name] = (providerTotals[name] ?? 0) + p.cost
+        const total = providerTotals[name] ?? { cost: 0, calls: 0, hasUsage: false }
+        total.cost += p.cost
+        total.calls += p.calls
+        total.hasUsage ||= providerSliceHasUsage(p)
+        providerTotals[name] = total
       }
     }
-    for (const [name, cost] of Object.entries(providerTotals)) {
-      providers.push({ name, displayName: displayNameByName.get(name) ?? name, cost })
+    for (const [name, total] of Object.entries(providerTotals)) {
+      providers.push({ name, displayName: displayNameByName.get(name) ?? name, ...total })
     }
     for (const p of allProviders) {
       if (providers.some(pc => pc.name === p.name)) continue
       const sources = await safeDiscoverSessions(p)
-      if (sources.length > 0) providers.push({ name: p.name, displayName: p.displayName, cost: 0 })
+      if (sources.length > 0) providers.push({ name: p.name, displayName: p.displayName, cost: 0, calls: 0, hasUsage: false })
     }
   } else {
-    providers.push({ name: pf, displayName: displayNameByName.get(pf) ?? pf, cost: currentData.cost })
+    providers.push({
+      name: pf,
+      displayName: displayNameByName.get(pf) ?? pf,
+      cost: currentData.cost,
+      calls: currentData.calls,
+      hasUsage: currentData.cost > 0
+        || currentData.savingsUSD > 0
+        || currentData.calls > 0
+        || currentData.sessions > 0
+        || currentData.inputTokens > 0
+        || currentData.outputTokens > 0
+        || currentData.cacheReadTokens > 0
+        || currentData.cacheWriteTokens > 0,
+    })
   }
 
   // DAILY HISTORY (last 365 days)
