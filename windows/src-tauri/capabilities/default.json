@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default permissions for the CodeBurn tray app window",
-  "windows": ["popover"],
+  "windows": ["popover", "dock"],
   "permissions": [
     "core:default",
     "core:window:allow-close",

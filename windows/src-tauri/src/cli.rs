@@ -17,6 +17,7 @@ const MAX_PAYLOAD_BYTES: usize = 20 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 256 * 1024;
 const FETCH_TIMEOUT_SECS: u64 = 60;
 const VERSION_TIMEOUT_SECS: u64 = 20;
+const QUOTA_TIMEOUT_SECS: u64 = 45;
 
 /// Oldest CLI this app can talk to. 0.9.9 is the first release whose
 /// `status --format menubar-json` accepts `--no-optimize`, which every quiet background
@@ -60,6 +61,15 @@ pub struct CliStatus {
     pub min_version: String,
     pub compatible: bool,
     pub error: Option<String>,
+}
+
+/// What the Capacity Dock renders: the provider array, or the reason there isn't one.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum DockQuota {
+    Ready { providers: Value },
+    CliOutdated,
+    Unavailable { message: String },
 }
 
 impl CodeburnCli {
@@ -161,6 +171,38 @@ impl CodeburnCli {
         let payload: Value =
             serde_json::from_str(&stdout).with_context(|| "CLI returned invalid JSON")?;
         Ok(payload)
+    }
+
+    /// Spawns `codeburn quota --format json` for the Capacity Dock. A CLI without the
+    /// subcommand exits 1 with `unknown command`, which the dock reports as a quiet
+    /// "CLI update needed" state rather than an error.
+    pub async fn fetch_quota(&self) -> DockQuota {
+        let stdout = match self
+            .run_capture(&["quota", "--format", "json"], QUOTA_TIMEOUT_SECS)
+            .await
+        {
+            Ok(stdout) => stdout,
+            Err(err) => {
+                let message = err.to_string();
+                return if message.contains("unknown command") {
+                    DockQuota::CliOutdated
+                } else {
+                    DockQuota::Unavailable { message }
+                };
+            }
+        };
+
+        match serde_json::from_str::<Value>(&stdout) {
+            Ok(payload) => DockQuota::Ready {
+                providers: payload
+                    .get("providers")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(vec![])),
+            },
+            Err(err) => DockQuota::Unavailable {
+                message: format!("CLI returned invalid JSON: {err}"),
+            },
+        }
     }
 
     async fn run_capture(&self, args: &[&str], timeout_secs: u64) -> Result<String> {

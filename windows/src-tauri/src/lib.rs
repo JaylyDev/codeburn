@@ -1,6 +1,7 @@
 mod autostart;
 mod cli;
 mod config;
+mod dock;
 mod fx;
 mod plan;
 /// The spend-in-the-tray badge is a second tray icon, which only the Tauri tray backend
@@ -22,9 +23,12 @@ use tauri::Listener;
 
 #[cfg(not(target_os = "linux"))]
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
+
+#[cfg(not(target_os = "linux"))]
+static DOCK_MENU_ITEM: std::sync::OnceLock<CheckMenuItem<tauri::Wry>> = std::sync::OnceLock::new();
 
 use crate::cli::CodeburnCli;
 use crate::config::CurrencyConfig;
@@ -78,9 +82,18 @@ pub fn run() {
                 round_window_corners(&window);
             }
 
+            if dock::is_enabled() {
+                let _ = dock::show(app.handle());
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
+            // The dock is a persistent rail: it owns its own lifecycle and must survive both
+            // the hide-on-blur and the hide-on-close that keep the popover alive.
+            if window.label() == dock::DOCK_LABEL {
+                return;
+            }
             match event {
                 WindowEvent::CloseRequested { api, .. } => {
                     api.prevent_close();
@@ -108,6 +121,8 @@ pub fn run() {
             commands::plan_usage,
             commands::launch_at_login,
             commands::set_launch_at_login,
+            commands::dock_quota,
+            commands::dock_set_layout,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -132,6 +147,14 @@ fn build_tray_tauri(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open CodeBurn", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
     let theme = MenuItem::with_id(app, "toggle_theme", "Toggle Dark/Light", true, None::<&str>)?;
+    let capacity_dock = CheckMenuItem::with_id(
+        app,
+        "toggle_dock",
+        "Show Capacity Dock",
+        true,
+        dock::is_enabled(),
+        None::<&str>,
+    )?;
     let report = MenuItem::with_id(app, "report", "Open Full Report", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit CodeBurn", true, None::<&str>)?;
     let menu = Menu::with_items(
@@ -140,11 +163,15 @@ fn build_tray_tauri(app: &AppHandle) -> tauri::Result<()> {
             &open,
             &refresh,
             &theme,
+            &capacity_dock,
             &report,
             &PredefinedMenuItem::separator(app)?,
             &quit,
         ],
     )?;
+    // Both tray icons share one menu, so the handler needs the item itself to keep the
+    // checkmark in step with the persisted state.
+    let _ = DOCK_MENU_ITEM.set(capacity_dock);
 
     tray.set_menu(Some(menu.clone()))?;
     tray.set_show_menu_on_left_click(false)?;
@@ -190,6 +217,7 @@ fn on_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                 let _ = window.emit("codeburn://toggle-theme", ());
             }
         }
+        "toggle_dock" => set_dock_enabled(app, !dock::is_enabled()),
         "report" => {
             let _ = cli::spawn_in_terminal(app, &["report"]);
         }
@@ -288,6 +316,24 @@ fn now_ms() -> i64 {
 fn mark_hidden(app: &AppHandle) {
     LAST_HIDDEN_MS.store(now_ms(), Ordering::Relaxed);
     let _ = app.emit("codeburn://hidden", ());
+}
+
+/// Persists the dock preference, then brings the window in line with it. The checkmark is only
+/// moved once the state is stored, so a failed write cannot leave the menu lying.
+fn set_dock_enabled(app: &AppHandle, enabled: bool) {
+    if let Err(err) = dock::set_enabled(enabled) {
+        eprintln!("codeburn: failed to persist the Capacity Dock setting: {err}");
+        return;
+    }
+    if enabled {
+        let _ = dock::show(app);
+    } else {
+        dock::hide(app);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(item) = DOCK_MENU_ITEM.get() {
+        let _ = item.set_checked(enabled);
+    }
 }
 
 fn toggle_popover(app: &AppHandle, anchor: Option<(i32, i32)>) {
@@ -525,5 +571,20 @@ mod commands {
     #[tauri::command]
     pub async fn plan_usage(state: State<'_, AppState>) -> Result<crate::plan::PlanUsage, String> {
         state.plan.fetch().await.map_err(|e| e.to_string())
+    }
+
+    #[tauri::command]
+    pub async fn dock_quota(state: State<'_, AppState>) -> Result<crate::cli::DockQuota, String> {
+        let cli = state.cli.lock().map_err(|e| e.to_string())?.clone();
+        Ok(cli.fetch_quota().await)
+    }
+
+    /// The rail only knows its own provider count and hover state; the geometry that turns
+    /// those into a window lives in `dock`.
+    #[tauri::command]
+    pub fn dock_set_layout(app: AppHandle, rows: u32, expanded: bool) {
+        if let Some(window) = app.get_webview_window(crate::dock::DOCK_LABEL) {
+            crate::dock::apply_layout(&window, rows, expanded);
+        }
     }
 }
