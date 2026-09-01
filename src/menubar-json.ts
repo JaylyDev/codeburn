@@ -80,6 +80,10 @@ export type ProviderCost = {
   name: string
   displayName: string
   cost: number
+  /** Behavioral calls in the selected period; token-only supplementary usage may be zero. */
+  calls?: number
+  /** True when the selected period contains cost, calls, sessions, savings, or tokens. */
+  hasUsage?: boolean
 }
 import type { OptimizeResult } from './optimize.js'
 import { getCurrency } from './currency.js'
@@ -258,9 +262,10 @@ export type MenubarPayload = {
     localModelSavings: LocalModelSavings
     providers: Record<string, number>
     /// Provider identity alongside the `providers` map: `id` is the internal
-    /// provider name (round-trips as `--provider`), `label` the display name.
+    /// provider name (round-trips as `--provider`), `label` the display name,
+    /// and `hasUsage` the period-activity signal used by provider pickers.
     /// The `providers` map keys stay lowercased display names for compatibility.
-    providerDetails: Array<{ id: string; label: string; cost: number }>
+    providerDetails: Array<{ id: string; label: string; cost: number; calls: number; hasUsage: boolean }>
     topProjects: Array<{
       name: string
       cost: number
@@ -462,7 +467,13 @@ function buildProviders(providers: ProviderCost[]): Record<string, number> {
 function buildProviderDetails(providers: ProviderCost[]): MenubarPayload['current']['providerDetails'] {
   return providers
     .filter(p => p.cost >= 0)
-    .map(p => ({ id: p.name, label: p.displayName, cost: p.cost }))
+    .map(p => ({
+      id: p.name,
+      label: p.displayName,
+      cost: p.cost,
+      calls: p.calls ?? 0,
+      hasUsage: p.hasUsage ?? (p.cost > 0 || (p.calls ?? 0) > 0),
+    }))
 }
 
 function buildHistory(daily: DailyHistoryEntry[] | undefined, timeline?: GranularHistory): MenubarPayload['history'] {

@@ -174,8 +174,9 @@ export type MenubarPayload = {
     localModelSavings: LocalModelSavings
     providers: Record<string, number>
     // Optional: older CLIs omit it. `id` is the internal provider name (round-trips
-    // as --provider), `label` the display name. Fall back to `providers` when absent.
-    providerDetails?: Array<{ id: string; label: string; cost: number }>
+    // as --provider), `label` the display name. `hasUsage` distinguishes active $0
+    // providers from detected-but-idle providers when present.
+    providerDetails?: Array<{ id: string; label: string; cost: number; calls?: number; hasUsage?: boolean }>
     topProjects: Array<{
       name: string
       cost: number

@@ -15,6 +15,13 @@ export type MenubarPayload = {
     topActivities: Activity[]
     topModels: Model[]
     providers: Record<string, number>
+    providerDetails?: Array<{
+      id: string
+      label: string
+      cost: number
+      calls?: number
+      hasUsage?: boolean
+    }>
   }
   optimize: {
     findingCount: number
