@@ -164,7 +164,7 @@ export function Dock() {
   }
 
   return (
-    <div className={`dock${expanded ? ' is-expanded' : ''}`} onMouseEnter={open} onMouseLeave={close}>
+    <div className="dock" onMouseEnter={open} onMouseLeave={close}>
       {expanded ? <Detail providers={providers} message={message} /> : null}
       <div className="dock-rail" onDoubleClick={() => void load()}>
         {providers.map((provider) => (
