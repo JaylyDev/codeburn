@@ -27,20 +27,29 @@ enum CapacityDockMetrics {
     private static let basePercentageTextSize: CGFloat = 17
     private static let baseDetailWidth: CGFloat = 350
 
-    static func railWidth(scale: CGFloat) -> CGFloat { baseRailWidth * scale }
-    static func horizontalRailWidth(scale: CGFloat) -> CGFloat { baseHorizontalRailWidth * scale }
-    static func edgeFlareWidth(scale: CGFloat) -> CGFloat { baseEdgeFlareWidth * scale }
-    static func edgeShoulderDepth(scale: CGFloat) -> CGFloat { baseEdgeShoulderDepth * scale }
-    static func rowHeight(scale: CGFloat) -> CGFloat { baseRowHeight * scale }
-    static func rowSpacing(scale: CGFloat) -> CGFloat { baseRowSpacing * scale }
-    static func railAlongPad(scale: CGFloat) -> CGFloat { baseRailAlongPad * scale }
-    static func railCrossPad(scale: CGFloat) -> CGFloat { baseRailCrossPad * scale }
-    static func ringSize(scale: CGFloat) -> CGFloat { baseRingSize * scale }
-    static func ringStrokeWidth(scale: CGFloat) -> CGFloat { baseRingStrokeWidth * scale }
-    static func ringLabelSpacing(scale: CGFloat) -> CGFloat { baseRingLabelSpacing * scale }
-    static func providerIconSize(scale: CGFloat) -> CGFloat { baseProviderIconSize * scale }
-    static func percentageTextSize(scale: CGFloat) -> CGFloat { basePercentageTextSize * scale }
-    static func detailWidth(scale: CGFloat) -> CGFloat { baseDetailWidth * scale }
+    /// Every dock dimension lands on a whole point. Fractional sizes (85%
+    /// of 88 is 74.8) made SwiftUI's fitted content disagree with the
+    /// pixel-aligned panel frame on every layout pass, so the hosting view
+    /// re-laid itself out at display cadence forever: 5 to 7 percent idle CPU
+    /// at any scale except 100%.
+    private static func points(_ base: CGFloat, _ scale: CGFloat) -> CGFloat {
+        max(1, (base * scale).rounded())
+    }
+
+    static func railWidth(scale: CGFloat) -> CGFloat { points(baseRailWidth, scale) }
+    static func horizontalRailWidth(scale: CGFloat) -> CGFloat { points(baseHorizontalRailWidth, scale) }
+    static func edgeFlareWidth(scale: CGFloat) -> CGFloat { points(baseEdgeFlareWidth, scale) }
+    static func edgeShoulderDepth(scale: CGFloat) -> CGFloat { points(baseEdgeShoulderDepth, scale) }
+    static func rowHeight(scale: CGFloat) -> CGFloat { points(baseRowHeight, scale) }
+    static func rowSpacing(scale: CGFloat) -> CGFloat { points(baseRowSpacing, scale) }
+    static func railAlongPad(scale: CGFloat) -> CGFloat { points(baseRailAlongPad, scale) }
+    static func railCrossPad(scale: CGFloat) -> CGFloat { points(baseRailCrossPad, scale) }
+    static func ringSize(scale: CGFloat) -> CGFloat { points(baseRingSize, scale) }
+    static func ringStrokeWidth(scale: CGFloat) -> CGFloat { points(baseRingStrokeWidth, scale) }
+    static func ringLabelSpacing(scale: CGFloat) -> CGFloat { points(baseRingLabelSpacing, scale) }
+    static func providerIconSize(scale: CGFloat) -> CGFloat { points(baseProviderIconSize, scale) }
+    static func percentageTextSize(scale: CGFloat) -> CGFloat { points(basePercentageTextSize, scale) }
+    static func detailWidth(scale: CGFloat) -> CGFloat { points(baseDetailWidth, scale) }
 
     static func railHeight(providerCount: Int, alongPad: CGFloat, scale: CGFloat) -> CGFloat {
         let count = max(providerCount, 1)
