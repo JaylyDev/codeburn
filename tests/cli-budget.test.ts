@@ -39,7 +39,16 @@ function timestampFromDate(date: Date, offsetMinutes = 0): string {
 
 function currentMonthTimestamp(offsetMinutes: number): string {
   const now = new Date()
-  const base = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 12, 0, 0))
+  // Noon-today-UTC was month-safe but lands in the future for the 12 hours
+  // before it, and rows timestamped in the future don't surface in the
+  // overview on the 1st, so every CI run on the 1st before 12:00 UTC went
+  // red. Seed five minutes back instead, pinned to month start on the 1st so
+  // the row can't slip into the previous month. The child runs with TZ=UTC,
+  // so the month boundary has to be UTC too or the clamp misses in every
+  // other zone.
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
+  const fiveMinutesAgo = new Date(now.getTime() - 5 * 60_000)
+  const base = fiveMinutesAgo < monthStart ? monthStart : fiveMinutesAgo
   return timestampFromDate(base, offsetMinutes)
 }
 

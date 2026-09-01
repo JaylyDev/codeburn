@@ -1,3 +1,4 @@
+import type { Dirent } from 'node:fs'
 import { readdir, stat } from 'fs/promises'
 import { basename, join } from 'path'
 import { homedir } from 'os'
@@ -68,16 +69,23 @@ type PiEntry = {
   id?: string
   timestamp?: string
   cwd?: string
+  model?: string
   message?: {
     role?: string
     content?: Array<{ type?: string; text?: string; name?: string; arguments?: Record<string, unknown> }> | string
     model?: string
     responseId?: string
+    attribution?: {
+      timestamp?: number
+    }
     usage?: {
       input: number
       output: number
       cacheRead: number
       cacheWrite: number
+      cost?: {
+        total?: number
+      }
     }
   }
 }
@@ -131,28 +139,58 @@ async function discoverSessionsInDir(sessionsDir: string, providerName: string):
     const dirStat = await stat(dirPath).catch(() => null)
     if (!dirStat?.isDirectory()) continue
 
-    let files: string[]
+    let entries: Dirent[]
     try {
-      files = await readdir(dirPath)
+      entries = await readdir(dirPath, { withFileTypes: true })
     } catch {
       continue
     }
 
-    for (const file of files) {
-      if (!file.endsWith('.jsonl')) continue
-      const filePath = join(dirPath, file)
-      const fileStat = await stat(filePath).catch(() => null)
-      if (!fileStat?.isFile()) continue
-
+    const addSession = async (filePath: string, agentName?: string): Promise<void> => {
       const entry = await readSessionEntry(filePath)
-      if (!entry) continue
-
+      if (!entry) return
       const cwd = entry.cwd ?? dirName
-      sources.push({ path: filePath, project: basename(cwd), provider: providerName })
+      sources.push({
+        path: filePath,
+        project: basename(cwd),
+        provider: providerName,
+        ...(agentName ? {
+          agentName,
+          ...(typeof entry.timestamp === 'string' ? { agentStartedAt: entry.timestamp } : {}),
+        } : {}),
+      })
+    }
+
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        await addSession(join(dirPath, entry.name))
+        continue
+      }
+      if (providerName !== 'omp' || !entry.isDirectory()) continue
+
+      const agentDir = join(dirPath, entry.name)
+      const agentEntries = await readdir(agentDir, { withFileTypes: true }).catch(() => [])
+      for (const agentEntry of agentEntries) {
+        if (!agentEntry.isFile() || !agentEntry.name.endsWith('.jsonl')) continue
+        await addSession(join(agentDir, agentEntry.name), basename(agentEntry.name, '.jsonl'))
+      }
     }
   }
 
   return sources
+}
+
+// OMP records a session-level model (`model_change` entry) plus an optional
+// per-message `model`. The per-message value may be a bare model name without
+// the provider prefix (e.g. "gpt-5.6-terra" vs "openai-codex/gpt-5.6-terra").
+// Prefer the fully-qualified form when the two agree; fall back to whatever
+// the message carries, then the session model, then a safe default.
+function resolveMessageModel(messageModel: string, resolvedModel: string): string {
+  if (messageModel.includes('/')) return messageModel
+  if (resolvedModel && (!messageModel || resolvedModel === messageModel || resolvedModel.endsWith(`/${messageModel}`))) {
+    return resolvedModel
+  }
+  return messageModel || resolvedModel || 'gpt-5'
 }
 
 function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
@@ -162,7 +200,10 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       if (content === null) return
       const lines = content.split('\n').filter(l => l.trim())
       let sessionId = basename(source.path, '.jsonl')
+      let resolvedModel = ''
       let pendingUserMessage = ''
+      let sessionTimestamp = ''
+      let pendingUserTimestamp = ''
 
       for (const [lineIdx, line] of lines.entries()) {
         let entry: PiEntry
@@ -174,6 +215,11 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
         if (entry.type === 'session') {
           sessionId = entry.id ?? sessionId
+          if (typeof entry.timestamp === 'string' && entry.timestamp) sessionTimestamp = entry.timestamp
+          continue
+        }
+        if (entry.type === 'model_change') {
+          if (typeof entry.model === 'string' && entry.model) resolvedModel = entry.model
           continue
         }
 
@@ -183,6 +229,12 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         if (!msg) continue
 
         if (msg.role === 'user') {
+          const attributedTimestamp = msg.attribution?.timestamp
+          if (typeof entry.timestamp === 'string' && entry.timestamp) {
+            pendingUserTimestamp = entry.timestamp
+          } else if (typeof attributedTimestamp === 'number' && Number.isFinite(attributedTimestamp)) {
+            pendingUserTimestamp = new Date(attributedTimestamp).toISOString()
+          }
           const texts = normalizeContentBlocks(msg.content)
             .filter(c => c.type === 'text')
             .map(c => c.text ?? '')
@@ -194,16 +246,16 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         if (msg.role !== 'assistant' || !msg.usage) continue
 
         // Coerce undefined/null token fields to 0. Pi/OMP session files
-        // sometimes omit individual usage fields; the destructure used to
-        // pass undefined into calculateCost which then returned NaN, and
-        // that NaN propagated into every aggregate cost total.
+        // sometimes omit individual usage fields; pass only numeric values to
+        // the pricing fallback so it cannot contaminate aggregates with NaN.
         const input = msg.usage.input ?? 0
         const output = msg.usage.output ?? 0
         const cacheRead = msg.usage.cacheRead ?? 0
         const cacheWrite = msg.usage.cacheWrite ?? 0
         if (input === 0 && output === 0) continue
 
-        const model = msg.model ?? 'gpt-5'
+        const messageModel = msg.model ?? ''
+        const model = resolveMessageModel(messageModel, resolvedModel)
         const responseId = msg.responseId ?? ''
         const dedupKey = `${source.provider}:${source.path}:${responseId || entry.id || entry.timestamp || String(lineIdx)}`
 
@@ -237,9 +289,16 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
             return typeof cmd === 'string' ? extractBashCommands(cmd) : []
           })
 
-        const costUSD = calculateCost(model, input, output, cacheWrite, cacheRead, 0)
-        const timestamp = entry.timestamp ?? ''
-
+        const reportedCost = msg.usage.cost?.total
+        // A zero reported cost acts as absent: OMP writes cost.total = 0 for
+        // xai-oauth calls, so the alias table and price overrides never apply.
+        // A genuinely free call would recompute to a small nonzero number;
+        // that is the trade-off we accept for fixing the OAuth zero.
+        const costUSD = typeof reportedCost === 'number' && Number.isFinite(reportedCost) && reportedCost !== 0
+          ? reportedCost
+          : calculateCost(messageModel || resolvedModel || model, input, output, cacheWrite, cacheRead, 0)
+        const timestamp = entry.timestamp || pendingUserTimestamp || sessionTimestamp
+        if (!timestamp) continue
         yield {
           provider: source.provider,
           model,

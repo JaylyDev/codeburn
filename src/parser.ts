@@ -2006,11 +2006,12 @@ async function scanProjectDirs(
 
     const cached = section.files[filePath]
     const action = reconcileFile(fp, cached)
-    if (cached && (readOnly || action.action === 'unchanged')) {
+    if (!readOnly && deferToBackgroundFill(filePath, fp, cached)) {
+      continue
+    } else if (cached && (readOnly || action.action === 'unchanged')) {
       if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
       unchangedFiles.push({ filePath, dirName, source, cached: section.files[filePath]! })
     } else if (!readOnly) {
-      if (deferToBackgroundFill(filePath, fp, cached)) continue
       if (action.action === 'appended') {
         changedFiles.push({
           filePath,
@@ -2549,7 +2550,7 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
       webSearchRequests: call.webSearchRequests,
       cacheCreationOneHourTokens: 0,
     },
-    costUSD: (call.provider === 'mistral-vibe' || call.provider === 'antigravity' || call.provider === 'devin' || call.provider === 'vercel-gateway' || call.provider === 'hermes' || call.provider === 'kiro' || call.provider === 'codewhale' || call.provider === 'quickdesk' || call.provider === 'cline-cli') ? call.costUSD : undefined,
+    costUSD: (call.provider === 'mistral-vibe' || call.provider === 'antigravity' || call.provider === 'devin' || call.provider === 'vercel-gateway' || call.provider === 'hermes' || call.provider === 'kiro' || call.provider === 'codewhale' || call.provider === 'quickdesk' || call.provider === 'cline-cli' || call.provider === 'omp') ? call.costUSD : undefined,
     isEstimated: call.costIsEstimated || undefined,
     speed: call.speed,
     timestamp: call.timestamp,
@@ -3374,11 +3375,12 @@ export async function parseProviderSources(
     // A cached parse failure at this same fingerprint stays skipped — don't
     // re-read a file that already threw and hasn't changed. It re-parses only
     // when the file changes (then `reconcileFile` reports non-'unchanged').
-    if (cached && (readOnly || (action.action === 'unchanged' && (cached.failed || !cachedFileNeedsProviderReparse(providerName, source.path, cached))))) {
+    if (!readOnly && deferToBackgroundFill(source.path, fp, cached)) {
+      continue
+    } else if (cached && (readOnly || (action.action === 'unchanged' && (cached.failed || !cachedFileNeedsProviderReparse(providerName, source.path, cached))))) {
       if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
       unchangedSources.push({ source, cached })
     } else if (!readOnly) {
-      if (deferToBackgroundFill(source.path, fp, cached)) continue
       changedSources.push({ source, fp })
     } else {
       // Read-only with no cache entry at all — see scanProjectDirs.
@@ -3534,6 +3536,10 @@ export async function parseProviderSources(
         // every other provider returns `undefined` here, so the install path
         // stays a no-op for them.
         const sourceLineage = await resolveProviderLineage(providerName, source)
+        const sourceAgentMetadata = {
+          ...(source.agentName ? { agentName: source.agentName } : {}),
+          ...(source.agentStartedAt ? { agentStartedAt: source.agentStartedAt } : {}),
+        }
 
         // Store/merge parsed turns into the cache.
         // Durable providers use a union-by-deduplicationKey merge: existing turns
@@ -3582,7 +3588,7 @@ export async function parseProviderSources(
             // role to `root` here, never silently drops the field.
             if (sourceLineage) existingEntry.lineage = sourceLineage
           } else {
-            section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns, ...(prLinks.length ? { prLinks } : {}), ...(sourceLineage ? { lineage: sourceLineage } : {}) }
+            section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns, ...sourceAgentMetadata, ...(prLinks.length ? { prLinks } : {}), ...(sourceLineage ? { lineage: sourceLineage } : {}) }
           }
         } else {
           // Non-durable: overwrite (clearedPaths already deleted stale entry above)
@@ -3595,7 +3601,7 @@ export async function parseProviderSources(
             if (prLinks.length) existingCacheEntry.prLinks = [...new Set([...(existingCacheEntry.prLinks ?? []), ...prLinks])]
             if (sourceLineage) existingCacheEntry.lineage = sourceLineage
           } else {
-            section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns, ...(prLinks.length ? { prLinks } : {}), ...(sourceLineage ? { lineage: sourceLineage } : {}) }
+            section.files[source.path] = { fingerprint: fp, mcpInventory: [], turns, ...sourceAgentMetadata, ...(prLinks.length ? { prLinks } : {}), ...(sourceLineage ? { lineage: sourceLineage } : {}) }
           }
         }
         didParse = true
@@ -3953,7 +3959,7 @@ export async function parseProviderSources(
 
   // Query-time: derive SessionSummary from all cached turns.
   // Uses seenKeys (shared across providers) for cross-provider dedup.
-  const sessionMap = new Map<string, { project: string; projectPath?: string; workingDirectory?: string; turns: ClassifiedTurn[]; prLinks?: Set<string>; title?: string; lineage?: SessionLineage }>()
+  const sessionMap = new Map<string, { project: string; projectPath?: string; workingDirectory?: string; turns: ClassifiedTurn[]; prLinks?: Set<string>; title?: string; lineage?: SessionLineage; agentName?: string; agentStartedAt?: string }>()
 
   for (const source of servedSources) {
     const cachedFile = section.files[source.path]
@@ -4010,6 +4016,8 @@ export async function parseProviderSources(
         // every contributing file's evidence. A second cache entry that
         // re-states the same evidence is dropped silently.
         if (!existing.lineage && cachedFile.lineage) existing.lineage = cachedFile.lineage
+        if (!existing.agentName && cachedFile.agentName) existing.agentName = cachedFile.agentName
+        if (!existing.agentStartedAt && cachedFile.agentStartedAt) existing.agentStartedAt = cachedFile.agentStartedAt
       } else {
         sessionMap.set(key, {
           project,
@@ -4019,6 +4027,8 @@ export async function parseProviderSources(
           ...(cachedFile.prLinks?.length ? { prLinks: new Set(cachedFile.prLinks) } : {}),
           ...(cachedFile.title ? { title: cachedFile.title } : {}),
           ...(cachedFile.lineage ? { lineage: cachedFile.lineage } : {}),
+          ...(cachedFile.agentName ? { agentName: cachedFile.agentName } : {}),
+          ...(cachedFile.agentStartedAt ? { agentStartedAt: cachedFile.agentStartedAt } : {}),
         })
       }
     }
@@ -4209,7 +4219,7 @@ export async function parseProviderSources(
   }
 
   const projectMap = new Map<string, { projectPath?: string; sessions: SessionSummary[] }>()
-  for (const [key, { project, projectPath, workingDirectory, turns, prLinks, title, lineage }] of sessionMap) {
+  for (const [key, { project, projectPath, workingDirectory, turns, prLinks, title, lineage, agentName, agentStartedAt }] of sessionMap) {
     const sessionId = key.split(':')[1] ?? key
     const assembledTurns = providerName === 'copilot'
       ? foldCopilotSupplementaryTurns(sessionId, turns, copilotRecon?.supplementaryStoreKeys)
@@ -4224,6 +4234,8 @@ export async function parseProviderSources(
     if (workingDirectory) session.workingDirectory = workingDirectory
     if (title) session.title = title
     if (lineage) session.lineage = lineage
+    if (agentName) session.agentName = agentName
+    if (agentStartedAt) session.agentStartedAt = agentStartedAt
     // Supplementary-only sessions (e.g. a rollup with no per-turn calls) have
     // apiCalls 0 by design but their tokens/cost are real and must serve.
     if (session.apiCalls > 0 || session.totalCostUSD > 0 || session.totalInputTokens + session.totalOutputTokens + session.totalCacheReadTokens + session.totalCacheWriteTokens + session.totalReasoningTokens > 0) {
@@ -4341,7 +4353,13 @@ export function clearSessionCache(): void {
   singlePassScope?.parses.clear()
 }
 
+let sessionMemoPublications = 0
+export function sessionMemoPublicationCount(): number {
+  return sessionMemoPublications
+}
+
 function cachePut(key: string, data: ProjectSummary[], parseStartedAt: number) {
+  sessionMemoPublications++
   const now = Date.now()
   for (const [k, v] of sessionCache) {
     if (now - v.createdAt > CACHE_TTL_MS) sessionCache.delete(k)
@@ -5063,6 +5081,15 @@ function singlePassParse(dateRange: DateRange | undefined, providerFilter: strin
 export const FIRST_PAINT_MTIME_MARGIN_MS = 48 * 60 * 60 * 1000
 
 let firstPaintFloorMs: number | null = null
+// The TUI's Today-first paint also defers older entries already normalized in
+// a complete cache. Reading/aggregating those cached turns before Ink renders
+// is precisely the warm-start latency this mode removes. Other progressive
+// consumers keep the historical cold-only rule unless they opt in.
+let firstPaintIncludesCachedFiles = false
+// A complete, environment-compatible normalized cache can paint an honestly
+// labelled cached Today without waiting for source discovery/reconciliation.
+// The mounted dashboard immediately refreshes sources in the background.
+let firstPaintPrefersCompleteSnapshot = false
 // Files this scope deferred, as a SET of paths: one first paint runs several
 // parses (the scan, the plan window, the durable backfill) and each defers the
 // same old files, so a running count would report a multiple of the real work.
@@ -5108,17 +5135,25 @@ export function sessionHydrationSnapshot(): {
 export async function withColdFirstPaintFloor<T>(
   rangeStart: Date,
   fn: () => Promise<T>,
+  includeCachedFiles = false,
+  preferCompleteSnapshot = false,
 ): Promise<{ result: T; deferredFiles: number }> {
   const outer = firstPaintFloorMs
   const outerPaths = firstPaintDeferredPaths
+  const outerIncludeCached = firstPaintIncludesCachedFiles
+  const outerPreferSnapshot = firstPaintPrefersCompleteSnapshot
   firstPaintFloorMs = rangeStart.getTime() - FIRST_PAINT_MTIME_MARGIN_MS
   firstPaintDeferredPaths = new Set()
+  firstPaintIncludesCachedFiles = includeCachedFiles
+  firstPaintPrefersCompleteSnapshot = preferCompleteSnapshot
   try {
     const result = await fn()
     return { result, deferredFiles: firstPaintDeferredPaths.size }
   } finally {
     firstPaintFloorMs = outer
     firstPaintDeferredPaths = outerPaths
+    firstPaintIncludesCachedFiles = outerIncludeCached
+    firstPaintPrefersCompleteSnapshot = outerPreferSnapshot
   }
 }
 
@@ -5130,12 +5165,13 @@ export function shouldDeferToBackgroundFill(
   fp: { mtimeMs: number },
   cached: unknown,
   floorMs: number | null,
+  includeCachedFiles = false,
 ): boolean {
-  return floorMs !== null && cached === undefined && fp.mtimeMs < floorMs
+  return floorMs !== null && (includeCachedFiles || cached === undefined) && fp.mtimeMs < floorMs
 }
 
 function deferToBackgroundFill(path: string, fp: { mtimeMs: number }, cached: unknown): boolean {
-  if (!shouldDeferToBackgroundFill(fp, cached, firstPaintFloorMs)) return false
+  if (!shouldDeferToBackgroundFill(fp, cached, firstPaintFloorMs, firstPaintIncludesCachedFiles)) return false
   firstPaintDeferredPaths?.add(path)
   firstPaintDeferredThisRun++
   return true
@@ -5149,6 +5185,20 @@ export function parseAllSessions(dateRange?: DateRange, providerFilter?: string)
   // directory even if an embedding host changes the process env mid-parse.
   const codexCacheDir = getCodeburnCacheDir()
   return withCodexCacheDirectory(codexCacheDir, () => parseAllSessionsInCacheScope(dateRange, providerFilter))
+}
+
+function canServeCompleteSnapshot(cache: SessionCache, providerFilter?: string): boolean {
+  if (!isCacheComplete(cache)) return false
+  const sections = providerFilter && providerFilter !== 'all'
+    ? ([[providerFilter, cache.providers[providerFilter]]] as const).filter((entry): entry is readonly [string, ProviderSection] => entry[1] != null)
+    : Object.entries(cache.providers)
+  return sections.some(([, section]) => Object.keys(section.files).length > 0)
+    && sections.every(([name, section]) => section.envFingerprint === computeEnvFingerprint(name))
+}
+
+export async function isCompleteSessionSnapshotAvailable(dateRange: DateRange, providerFilter?: string): Promise<boolean> {
+  const diskCache = await loadCache(monthScopeForRange(dateRange.start, dateRange.end))
+  return canServeCompleteSnapshot(diskCache, providerFilter)
 }
 
 async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
@@ -5196,8 +5246,12 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
   // a proxied key emitted under two providers the attribution can land on a
   // different provider than a full load would pick.
   const loadScope = dateRange ? monthScopeForRange(dateRange.start, dateRange.end) : undefined
+  const cacheLoadStarted = performance.now()
   let diskCache = await loadCache(loadScope)
   await cleanupOrphanedTempFiles()
+  if (process.env['CODEBURN_VERBOSE'] === '1') {
+    process.stderr.write(`codeburn: startup timing cache-load=${(performance.now() - cacheLoadStarted).toFixed(1)}ms complete=${isCacheComplete(diskCache)}\n`)
+  }
 
   // Cold-hydration coordination (advisory, cross-process). Engages whenever the
   // on-disk cache is not COMPLETE — an empty cache OR a partial one an interrupted
@@ -5218,6 +5272,15 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
     }
   }
 
+  if (firstPaintPrefersCompleteSnapshot && canServeCompleteSnapshot(diskCache, providerFilter)) {
+    return runParse(key, diskCache, dateRange, providerFilter, {
+      readOnly: true,
+      snapshotOnly: true,
+      burstSig,
+      parseStartedAt,
+    })
+  }
+
   // A complete cache refresh is a strict read/reconcile/parse/save transaction.
   // Keep the snapshot loaded before acquisition: timeout/unavailable paths serve
   // exactly this complete snapshot and never mutate or invalidate the holder.
@@ -5229,10 +5292,14 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
   // lock (#1117). runParse arms its own keepalive; this covers the gap before it.
   startProgressKeepalive()
   let refresh: RefreshLockOutcome
+  const refreshWaitStarted = performance.now()
   try {
     refresh = await acquireCacheRefreshLock()
   } finally {
     stopProgressKeepalive()
+  }
+  if (process.env['CODEBURN_VERBOSE'] === '1') {
+    process.stderr.write(`codeburn: startup timing refresh-lock=${(performance.now() - refreshWaitStarted).toFixed(1)}ms outcome=${refresh.outcome}\n`)
   }
   if (refresh.outcome === 'timed-out' || refresh.outcome === 'unavailable') {
     return runParse(key, priorSnapshot, dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
@@ -5260,6 +5327,7 @@ class RefreshPublicationUnavailableError extends Error {}
 type RunParseOptions = {
   isCold?: boolean
   readOnly?: boolean
+  snapshotOnly?: boolean
   refreshLock?: RefreshLockHandle
   burstSig: string
   parseStartedAt: number
@@ -5289,13 +5357,22 @@ async function runParseInner(
   providerFilter: string | undefined,
   options: RunParseOptions,
 ): Promise<ProjectSummary[]> {
-  const { isCold = false, readOnly = false, refreshLock } = options
+  const { isCold = false, readOnly = false, snapshotOnly = false, refreshLock } = options
+  const timingStarted = performance.now()
+  let timingPrevious = timingStarted
+  const traceTiming = (stage: string, extra = ''): void => {
+    if (process.env['CODEBURN_VERBOSE'] !== '1') return
+    const now = performance.now()
+    process.stderr.write(`codeburn: startup timing ${stage}=${(now - timingPrevious).toFixed(1)}ms total=${(now - timingStarted).toFixed(1)}ms${extra}\n`)
+    timingPrevious = now
+  }
   readOnlyServedStale = false
   deferredRetryableSource = false
   firstPaintDeferredThisRun = 0
   const seenMsgIds = new Set<string>()
   const seenKeys = new Set<string>()
-  const allSources = await discoverAllSessions(providerFilter)
+  const allSources = snapshotOnly ? [] : await discoverAllSessions(providerFilter)
+  traceTiming('discovery', ` sources=${allSources.length}`)
 
   const claudeSources = allSources.filter(s => s.provider === 'claude')
   const nonClaudeSources = allSources.filter(s => s.provider !== 'claude')
@@ -5360,6 +5437,7 @@ async function runParseInner(
       emitScanProgress({ kind: 'provider', provider: 'claude', state: 'skipped' })
     }
   }
+  traceTiming('claude')
 
   const otherProjects: ProjectSummary[] = []
   for (const [providerName, sources] of providerGroups) {
@@ -5377,12 +5455,14 @@ async function runParseInner(
     }
     await saveProgress()
   }
+  traceTiming('other-providers', ` providers=${providerGroups.size}`)
 
   // Durable providers with cached data but NO discovered sources (all files pruned
   // by VS Code / the external tool) still need their orphan pass to run so the
   // monthly total never drops. Call parseProviderSources with empty sources for
   // any such provider found in the disk cache.
   const processedProviders = new Set(providerGroups.keys())
+  if (claudeInScope) processedProviders.add('claude')
   for (const providerName of Object.keys(diskCache.providers)) {
     if (processedProviders.has(providerName)) continue
     // Skip if filtered to a different provider
@@ -5393,7 +5473,7 @@ async function runParseInner(
     // processes a durableSources provider) OR the static DURABLE_PROVIDER_NAMES
     // constant — both checks are O(1) and avoid a getProvider() dynamic-import
     // round-trip for every unprocessed provider in the disk cache.
-    if (!section.durable && !DURABLE_PROVIDER_NAMES.has(providerName)) continue
+    if (!snapshotOnly && !section.durable && !DURABLE_PROVIDER_NAMES.has(providerName)) continue
     const projects = await parseProviderSources(providerName, [], seenKeys, diskCache, dateRange, saveProgress, readOnly)
     otherProjects.push(...projects)
   }
@@ -5466,7 +5546,13 @@ async function runParseInner(
 
   const result = Array.from(mergedMap.values()).sort((a, b) => b.totalCostUSD - a.totalCostUSD)
   correlateCrossProviderPrSessions(result)
-  if (dateRange) setCachePutMeta({ startMs: dateRange.start.getTime(), endMs: dateRange.end.getTime(), sig: options.burstSig })
-  cachePut(key, result, options.parseStartedAt)
+  // A snapshot is an explicitly stale, source-unvalidated view. Publishing it
+  // into either exact-key or burst reuse can suppress the reconciliation that
+  // the mounted dashboard starts immediately afterward for the full TTL.
+  if (!snapshotOnly) {
+    if (dateRange) setCachePutMeta({ startMs: dateRange.start.getTime(), endMs: dateRange.end.getTime(), sig: options.burstSig })
+    cachePut(key, result, options.parseStartedAt)
+  }
+  traceTiming('aggregate', ` projects=${result.length}`)
   return result
 }

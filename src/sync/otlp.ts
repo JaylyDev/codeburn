@@ -205,12 +205,67 @@ export interface BuildOtlpOptions {
    * watermark is not trusted.
    */
   coverageThrough?: string
+  /**
+   * Extra span attributes contributed by loaded plugins (plugin socket,
+   * teams issue #3). This is the enforcement point, not a convention: an
+   * attribute survives only if its key is in `pluginAttributeKeys` (the
+   * union of loaded manifests' declared `syncAttributes`) and is not a
+   * core key. Undeclared, core-shadowing, or unsanitizable values are
+   * dropped here, so no plugin - signed or dev-flagged - can widen the
+   * wire beyond what its disclosed manifest declared.
+   */
+  pluginAttributes?: OtlpAttribute[]
+  pluginAttributeKeys?: ReadonlySet<string>
+  /**
+   * Per-call attributes and extra spans from plugin exporters (sync exporter
+   * seam, teams issue #3 phase 2). Already guarded upstream; perCall attrs
+   * are attached to the span whose deduplicationKey matches, and extra spans
+   * are appended to the span list.
+   */
+  pluginEnrichment?: {
+    perCall: Map<string, OtlpAttribute[]>
+    extraSpans: OtlpSpan[]
+  }
+}
+
+/// Attribute keys the core emitter writes. Plugins add fields; they never
+/// overwrite these, so a plugin cannot lie about cost, tokens, or lineage.
+export const CORE_SYNC_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
+  'ai.provider', 'ai.model', 'ai.input_tokens', 'ai.output_tokens', 'ai.cost_usd', 'ai.speed',
+  'ai.project', 'ai.tools', 'ai.cost_estimated', 'ai.work_unit_id', 'ai.session_role',
+  'ai.lineage_evidence', 'ai.cache_read_tokens', 'ai.cache_write_tokens', 'ai.call_count',
+  'ai.session_duration_ms', 'ai.subscription_covered', 'codeburn.device_id',
+  'codeburn.coverage_through', 'codeburn.attribution_methodology',
+  'git.repo', 'git.sha', 'git.commit_count', 'git.in_main', 'git.was_reverted', 'git.pr_links',
+])
+
+/// Wire guard for plugin-supplied attributes (see BuildOtlpOptions).
+export function filterPluginAttributes(attrs: OtlpAttribute[], declaredKeys: ReadonlySet<string>): OtlpAttribute[] {
+  const kept: OtlpAttribute[] = []
+  for (const attr of attrs) {
+    if (!declaredKeys.has(attr.key) || CORE_SYNC_ATTRIBUTE_KEYS.has(attr.key)) continue
+    const v = attr.value
+    if ('stringValue' in v) {
+      // Same #1128 sanitizer vocabulary as every other wire string; a plugin
+      // value that looks like a path, URL, or credential never ships.
+      const safe = sanitizeIdentifier(v.stringValue, 256)
+      if (safe) kept.push({ key: attr.key, value: { stringValue: safe } })
+    } else if ('intValue' in v || 'doubleValue' in v || 'boolValue' in v) {
+      kept.push(attr)
+    }
+    // arrayValue and anything else: plugins may not ship structured values.
+  }
+  return kept
 }
 
 export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptions): OtlpPayload {
   const deviceId = getDeviceId()
+  const guardedPluginAttributes = opts?.pluginAttributes && opts.pluginAttributeKeys
+    ? filterPluginAttributes(opts.pluginAttributes, opts.pluginAttributeKeys)
+    : []
 
   const spans: OtlpSpan[] = calls.map(({ call, sessionId, workingDirectory, session }) => {
+    const perCallEnrichment = opts?.pluginEnrichment?.perCall.get(call.deduplicationKey) ?? []
     const startNano = toUnixNano(call.timestamp)
     // End time = start + 1ms (we don't have real duration, but OTLP requires both)
     const endNano = (BigInt(startNano) + 1_000_000n).toString()
@@ -283,6 +338,13 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
       }
     }
 
+    // Plugin socket: declared-and-guarded plugin fields only (see
+    // filterPluginAttributes). No plugins => no change to any byte.
+    attributes.push(...guardedPluginAttributes)
+
+    // Per-call enrichment from sync exporters
+    attributes.push(...perCallEnrichment)
+
     return {
       traceId: deriveTraceId(sessionId),
       spanId: deriveSpanId(call.deduplicationKey),
@@ -299,6 +361,11 @@ export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptio
   const coverageThrough = opts?.coverageThrough ? sanitizeIdentifier(opts.coverageThrough, 32) : undefined
   if (coverageThrough) {
     resourceAttributes.push({ key: 'codeburn.coverage_through', value: { stringValue: coverageThrough } })
+  }
+
+  // Append extra spans from plugin exporters
+  if (opts?.pluginEnrichment?.extraSpans) {
+    spans.push(...opts.pluginEnrichment.extraSpans)
   }
 
   return {

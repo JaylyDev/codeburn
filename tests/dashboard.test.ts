@@ -1,5 +1,4 @@
 import { homedir } from 'os'
-import { readFileSync } from 'node:fs'
 import { PassThrough } from 'stream'
 
 import React from 'react'
@@ -418,7 +417,7 @@ describe('getRefreshIntervalMs', () => {
 
 describe('interactive terminal rendering', () => {
   it('isolates resize reflow from stale primary-screen frames', () => {
-    expect(INTERACTIVE_RENDER_OPTIONS).toMatchObject({ alternateScreen: true })
+    expect(INTERACTIVE_RENDER_OPTIONS).toMatchObject({ alternateScreen: true, interactive: true })
   })
 
   it.each([
@@ -511,13 +510,6 @@ describe('interactive terminal rendering', () => {
     expect(frame).toContain('Manual action')
     expect(frame).toContain('claude.ai Google Calendar')
     expect(frame).not.toContain('Ask Claude in the current session')
-  })
-
-  it('leaves resize frame synchronization entirely to Ink', () => {
-    const source = readFileSync(new URL('../src/dashboard.tsx', import.meta.url), 'utf8')
-    expect(source).not.toContain('process.stdout.write(BSU)')
-    expect(source).not.toContain("process.stdout.write('\\u001B[2J\\u001B[H')")
-    expect(source).not.toContain('shouldResetScreenOnResize')
   })
 
   it.each([

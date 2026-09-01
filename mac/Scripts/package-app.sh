@@ -47,6 +47,8 @@ mkdir -p "${BUNDLE}/Contents/MacOS"
 mkdir -p "${BUNDLE}/Contents/Resources"
 cp "${BUILT_BINARY}" "${BUNDLE}/Contents/MacOS/${EXECUTABLE_NAME}"
 cp "${ICON_SOURCE}" "${BUNDLE}/Contents/Resources/menubar-logo.png"
+cp "${ROOT}/LICENSE" "${BUNDLE}/Contents/Resources/LICENSE.txt"
+cp "${ROOT}/THIRD_PARTY_NOTICES.md" "${BUNDLE}/Contents/Resources/THIRD_PARTY_NOTICES.md"
 
 # SwiftPM emits target resources as a sibling bundle; Bundle.module traps at
 # runtime if it is missing from Contents/Resources, so ship it when present.

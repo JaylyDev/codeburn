@@ -36,6 +36,7 @@ import { runOptimize } from './optimize.js'
 import { registerActCommands } from './act/cli.js'
 import { registerGuardCommands } from './guard/cli.js'
 import { registerSyncCommands } from './sync/cli.js'
+import { registerPluginCommands, registerLoadedPluginCommands } from './plugins/cli.js'
 import { runContextCommand } from './context-tree.js'
 import { renderCompare } from './compare.js'
 import { computeBudgetStatus, daysInMonth, diffCalendarDays, type BudgetStatus, type BudgetTier } from './budget.js'
@@ -45,7 +46,7 @@ import {
   uninstallAntigravityStatusLineHook,
 } from './antigravity-statusline.js'
 import { clearPlan, readConfig, readPlan, readPlans, saveConfig, savePlan, getConfigFilePath, type CodeburnConfig, type Plan, type PlanId, type PlanProvider } from './config.js'
-import { clampResetDay, getPlanUsageOrNull, getPlanUsages, type PlanUsage } from './plan-usage.js'
+import { clampResetDay, copilotCreditsNote, getPlanUsageOrNull, getPlanUsages, type PlanUsage } from './plan-usage.js'
 import { getPresetPlan, isPlanId, isPlanProvider, PLAN_IDS, PLAN_PROVIDERS, planDisplayName } from './plans.js'
 import { createRequire } from 'node:module'
 
@@ -54,7 +55,7 @@ const { version } = require('../package.json')
 // Bump when the menubar payload's rendering semantics change without a package
 // release or daily-cache version change. The envelope version in session-cache
 // protects record shape; this protects the meaning of an otherwise valid one.
-const STATUS_SNAPSHOT_RENDER_VERSION = 1
+const STATUS_SNAPSHOT_RENDER_VERSION = 2
 const STATUS_SNAPSHOT_SEMANTIC_KEY = `${version}:render-${STATUS_SNAPSHOT_RENDER_VERSION}:daily-${DAILY_CACHE_VERSION}`
 import { loadCurrency, getCurrency, isValidCurrencyCode } from './currency.js'
 import { CodexThroughputReader, newestCodexSession, renderCodexThroughput } from './codex-throughput.js'
@@ -156,6 +157,10 @@ type JsonPlanSummary = {
   spentCredits?: number
   budgetCredits?: number
   creditsIncomplete?: boolean
+  estimatedCredits?: number
+  creditRatedCalls?: number
+  creditUnratedCalls?: number
+  creditsNote?: string
   monthlyUsd?: number
   spentApiEquivalentUsd?: number
 }
@@ -178,6 +183,10 @@ function toJsonPlanSummary(planUsage: PlanUsage): JsonPlanSummary {
     summary.spentCredits = planUsage.spentCredits
     summary.budgetCredits = planUsage.budgetCredits
     summary.creditsIncomplete = planUsage.creditsIncomplete
+    summary.estimatedCredits = planUsage.estimatedCredits
+    summary.creditRatedCalls = planUsage.creditRatedCalls
+    summary.creditUnratedCalls = planUsage.creditUnratedCalls
+    summary.creditsNote = copilotCreditsNote(planUsage.creditRatedCalls ?? 0, planUsage.creditUnratedCalls ?? 0)
     summary.monthlyUsd = planUsage.plan.monthlyUsd
     summary.spentApiEquivalentUsd = planUsage.spentApiEquivalentUsd
   }
@@ -2603,6 +2612,7 @@ program
 registerActCommands(program)
 registerGuardCommands(program)
 registerSyncCommands(program)
+registerPluginCommands(program)
 
 program
   .command('serve')
@@ -2630,5 +2640,7 @@ if (process.argv[2] === 'serve') {
   // this child running as an orphan for as long as the machine is up.
   hardExit(0)
 } else {
-  buildProgram().parse()
+  const program = buildProgram()
+  await registerLoadedPluginCommands(program)
+  program.parse()
 }

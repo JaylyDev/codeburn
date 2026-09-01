@@ -447,10 +447,11 @@ describe('graceful kill (SIGTERM, then SIGKILL after the grace)', () => {
       `const fs = require('node:fs');
        fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
        process.on('SIGTERM', () => fs.appendFileSync(${JSON.stringify(signalFile)}, 'TERM'));
+       process.stdout.write('ready');
        setInterval(() => {}, 1000);`,
     )
 
-    await expect(spawnCli(['status'], { timeoutMs: 300 })).rejects.toMatchObject({ kind: 'timeout' })
+    await expect(spawnCli(['status'], { timeoutMs: 1_500 })).rejects.toMatchObject({ kind: 'timeout' })
     // SIGTERM arrives with the rejection; the child survives it and is SIGKILLed
     // only after KILL_GRACE_MS (5s).
     await waitFor(() => readMaybe(signalFile) === 'TERM')
@@ -496,10 +497,11 @@ describe('graceful kill (SIGTERM, then SIGKILL after the grace)', () => {
       'handles-sigterm.js',
       `const fs = require('node:fs');
        process.on('SIGTERM', () => { fs.writeFileSync(${JSON.stringify(cleanupFile)}, 'released'); process.exit(0); });
+       process.stdout.write('ready');
        setInterval(() => {}, 1000);`,
     )
     const began = Date.now()
-    await expect(spawnCli(['status'], { timeoutMs: 300 })).rejects.toMatchObject({ kind: 'timeout' })
+    await expect(spawnCli(['status'], { timeoutMs: 1_500 })).rejects.toMatchObject({ kind: 'timeout' })
     await waitFor(() => readMaybe(cleanupFile) === 'released')
     expect(Date.now() - began).toBeLessThan(5_000) // never waited out the grace
   })
@@ -726,6 +728,35 @@ describe('resident serve single-flight', () => {
 
     expect(readMaybe(startsFile)).toBe('ss')
     expect(readMaybe(oneShotsFile)).toBe('o')
+  })
+
+  it('falls back instead of crashing when a live resident closes its stdin', async () => {
+    const stdinClosedFile = join(dir, 'resident-stdin-closed')
+    fakeBin(
+      'closes-stdin-resident.js',
+      `const fs = require('node:fs'); const readline = require('node:readline');
+       if (process.argv[2] === 'serve') {
+         const rl = readline.createInterface({ input: process.stdin });
+         rl.once('line', line => {
+           const request = JSON.parse(line);
+           process.stdout.write(JSON.stringify({ id: request.id, ok: true, output: JSON.stringify({ via: 'serve' }) }) + '\\n', () => {
+             rl.close();
+             fs.closeSync(0);
+             fs.writeFileSync(${JSON.stringify(stdinClosedFile)}, 'closed');
+           });
+         });
+         setInterval(() => {}, 1000);
+       } else {
+         process.stdout.write(JSON.stringify({ via: 'spawn' }));
+       }`,
+    )
+    startServe()
+
+    await expect(spawnCli(['status', '--warm'], { timeoutMs: 5_000 }))
+      .resolves.toEqual({ via: 'serve' })
+    await waitFor(() => readMaybe(stdinClosedFile) === 'closed')
+    await expect(spawnCli(['models', '--after-stdin-close'], { timeoutMs: 5_000 }))
+      .resolves.toEqual({ via: 'spawn' })
   })
 
   it('gives the first resident status request the power-user cold timeout floor', async () => {
@@ -1100,6 +1131,56 @@ describe('resident serve single-flight', () => {
     await expect(pending).rejects.toMatchObject({ kind: 'nonzero' })
     await new Promise(resolve => setTimeout(resolve, 25))
     expect(readMaybe(oneShotsFile)).toBe('')
+  })
+
+  it('gracefully releases the resident lock, then force-reaps its process tree', async () => {
+    if (process.platform === 'win32') return
+    const pidFile = join(dir, 'resident-shutdown-pid')
+    const grandchildPidFile = join(dir, 'provider-child-pid')
+    const termFile = join(dir, 'resident-shutdown-term')
+    const grandchildTermFile = join(dir, 'provider-child-term')
+    const hydrationLock = join(dir, 'hydrating.lock')
+    const grandchildBody = `
+      const fs = require('node:fs');
+      fs.writeFileSync(${JSON.stringify(grandchildPidFile)}, String(process.pid));
+      process.on('SIGTERM', () => fs.appendFileSync(${JSON.stringify(grandchildTermFile)}, 'TERM'));
+      setInterval(() => {}, 1000);
+    `
+    fakeBin(
+      'stubborn-resident-shutdown.js',
+      `const fs = require('node:fs'); const readline = require('node:readline'); const { spawn } = require('node:child_process');
+       if (process.argv[2] === 'serve') {
+         fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+         fs.writeFileSync(${JSON.stringify(hydrationLock)}, 'owned');
+         spawn(process.execPath, ['-e', ${JSON.stringify(grandchildBody)}], { stdio: 'ignore' });
+         process.on('SIGTERM', () => {
+           fs.writeFileSync(${JSON.stringify(termFile)}, 'TERM');
+           try { fs.unlinkSync(${JSON.stringify(hydrationLock)}); } catch {}
+           setTimeout(() => process.exit(0), 50);
+         });
+         readline.createInterface({ input: process.stdin });
+         setInterval(() => {}, 1000);
+       } else { process.stdout.write('{}'); }`,
+    )
+    startServe()
+    await waitFor(() => readMaybe(pidFile).length > 0 && readMaybe(grandchildPidFile).length > 0)
+    const pids = [Number(readMaybe(pidFile)), Number(readMaybe(grandchildPidFile))]
+
+    try {
+      const startedAt = performance.now()
+      await shutdownAll()
+      const elapsedMs = performance.now() - startedAt
+
+      expect(elapsedMs).toBeLessThan(1_500)
+      expect(readMaybe(termFile)).toBe('TERM')
+      expect(readMaybe(grandchildTermFile)).toBe('TERM')
+      expect(readMaybe(hydrationLock)).toBe('')
+      for (const pid of pids) expect(() => process.kill(pid, 0)).toThrow()
+    } finally {
+      for (const pid of pids) {
+        try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+      }
+    }
   })
 
   it('keeps the warm resident child after a successful export', async () => {

@@ -35,6 +35,20 @@ describe('Copilot usage decode', () => {
     expect(quota.primary?.percent).toBeCloseTo(0.45)
   })
 
+  it('skips zero-entitlement and unlimited windows instead of showing 100% used', () => {
+    const quota = decodeCopilotUsage({
+      copilot_plan: 'individual',
+      quota_snapshots: {
+        premium_interactions: { entitlement: 0, remaining: 0, percent_remaining: 0, unlimited: false },
+        chat: { entitlement: 200, remaining: 190, percent_remaining: 95, unlimited: false },
+        completions: { entitlement: 2000, remaining: 2000, percent_remaining: 100, unlimited: true },
+      },
+    })
+    expect(quota.details.map(row => row.label)).toEqual(['Chat'])
+    expect(quota.primary?.label).toBe('Chat')
+    expect(quota.primary?.percent).toBeCloseTo(0.05, 6)
+  })
+
   it('survives a malformed payload without usable snapshots', () => {
     const quota = decodeCopilotUsage({ quota_snapshots: { chat: 'garbage' }, extra: true })
     expect(quota.connection).toBe('connected')

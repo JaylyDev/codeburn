@@ -44,8 +44,15 @@ final class CopilotQuotaTests: XCTestCase {
     private static func makeDeps(
         hosts: String?,
         apps: String? = nil,
+        config: String? = nil,
+        settings: String? = nil,
+        environment: [String: String] = [:],
+        ghToken: String? = nil,
+        savedToken: String? = nil,
         recorder: RequestRecorder,
         readFile: (@Sendable (URL) -> Data?)? = nil,
+        now: (@Sendable () -> Date)? = nil,
+        onGhProbe: (@Sendable () -> Void)? = nil,
         respond: @escaping @Sendable (URLRequest) -> (Data, HTTPURLResponse)
     ) -> CopilotSubscriptionService.Deps {
         CopilotSubscriptionService.Deps(
@@ -54,14 +61,52 @@ final class CopilotQuotaTests: XCTestCase {
                 return respond(request)
             },
             readFile: readFile ?? { url in
-                if url.lastPathComponent == "hosts.json" { return hosts?.data(using: .utf8) }
-                if url.lastPathComponent == "apps.json" { return apps?.data(using: .utf8) }
-                return nil
+                switch url.lastPathComponent {
+                case "hosts.json": return hosts?.data(using: .utf8)
+                case "apps.json": return apps?.data(using: .utf8)
+                case "config.json": return config?.data(using: .utf8)
+                case "settings.json": return settings?.data(using: .utf8)
+                default: return nil
+                }
             },
             hostsURL: URL(fileURLWithPath: "/tmp/codeburn-tests/.config/github-copilot/hosts.json"),
             appsURL: URL(fileURLWithPath: "/tmp/codeburn-tests/.config/github-copilot/apps.json"),
-            now: { Self.now }
+            copilotDirURL: URL(fileURLWithPath: "/tmp/codeburn-tests/.copilot"),
+            environment: { environment[$0] },
+            ghAuthToken: {
+                onGhProbe?()
+                return ghToken
+            },
+            savedToken: { savedToken },
+            now: now ?? { Self.now }
         )
+    }
+
+    override func setUp() {
+        super.setUp()
+        // The `gh` answer is cached process-wide.
+        CopilotSubscriptionService.resetProbeCache()
+    }
+
+    private func authorization(_ recorder: RequestRecorder) -> String? {
+        recorder.requests.first?.value(forHTTPHeaderField: "Authorization")
+    }
+
+    private func expectNoCredentials(
+        _ deps: CopilotSubscriptionService.Deps,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            _ = try await CopilotSubscriptionService.refresh(deps: deps)
+            XCTFail("expected noCredentials", file: file, line: line)
+        } catch let error as CopilotSubscriptionService.FetchError {
+            guard case .noCredentials = error else {
+                return XCTFail("expected noCredentials, got \(error)", file: file, line: line)
+            }
+        } catch {
+            XCTFail("unexpected error: \(error)", file: file, line: line)
+        }
     }
 
     // MARK: - Decode
@@ -84,6 +129,17 @@ final class CopilotQuotaTests: XCTestCase {
         XCTAssertEqual(usage.plan, "Business")
         XCTAssertEqual(usage.primary?.label, "Chat")
         XCTAssertEqual(usage.primary?.usedPercent ?? -1, 45, accuracy: 0.001)
+    }
+
+    func testDecodeSkipsZeroEntitlementAndUnlimitedWindows() throws {
+        // A Free/Individual plan reports premium_interactions with entitlement
+        // 0 and 0% remaining, which must not render as 100% used.
+        let body = #"{"copilot_plan":"individual","quota_snapshots":{"premium_interactions":{"entitlement":0,"remaining":0,"percent_remaining":0.0,"unlimited":false},"chat":{"entitlement":200,"remaining":190,"percent_remaining":95.0,"unlimited":false},"completions":{"entitlement":2000,"remaining":2000,"percent_remaining":100.0,"unlimited":true}}}"#
+        let usage = try CopilotSubscriptionService.decodeUsage(
+            data: body.data(using: .utf8)!, now: Self.now)
+        XCTAssertEqual(usage.details.map(\.label), ["Chat"])
+        XCTAssertEqual(usage.primary?.label, "Chat")
+        XCTAssertEqual(usage.primary?.usedPercent ?? -1, 5, accuracy: 0.001)
     }
 
     func testDecodeSurvivesMalformedSnapshots() throws {
@@ -278,6 +334,188 @@ final class CopilotQuotaTests: XCTestCase {
         } catch {
             XCTFail("unexpected error: \(error)")
         }
+    }
+
+    // MARK: - Discovery chain (issue #1198)
+
+
+
+    func testCopilotCLIConfigJSONIsUsedWhenLegacyFilesAreAbsent() async throws {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: nil,
+            config: #"{"loggedInUsers":["octocat"],"github_token":"ghp_config-token"}"#,
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        _ = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(authorization(recorder), "token ghp_config-token")
+    }
+
+    func testSettingsJSONIsReadWhenConfigJSONHasNoToken() async throws {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: nil,
+            config: #"{"storeTokenPlaintext":false,"installedPlugins":[]}"#,
+            settings: #"{"auth":{"token":"gho_settings-token"}}"#,
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        _ = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(authorization(recorder), "token gho_settings-token")
+    }
+
+    /// A refresh token is not a credential for this endpoint, so a file that
+    /// holds only one must read as absent.
+    func testRefreshTokenIsNotMistakenForAnAccessToken() async {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: nil,
+            config: #"{"refresh":"ghr_refresh-only"}"#,
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        await expectNoCredentials(deps)
+        XCTAssertTrue(recorder.requests.isEmpty)
+    }
+
+    func testEnvironmentTokensAreHonouredInCopilotCLIOrder() async throws {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: nil,
+            environment: [
+                "COPILOT_GITHUB_TOKEN": "gho_copilot-env",
+                "GH_TOKEN": "gho_gh-env",
+                "GITHUB_TOKEN": "gho_github-env",
+            ],
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        _ = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(authorization(recorder), "token gho_copilot-env")
+
+        let fallback = RequestRecorder()
+        let ghOnly = Self.makeDeps(
+            hosts: nil,
+            environment: ["GITHUB_TOKEN": "gho_github-env"],
+            recorder: fallback
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        CopilotSubscriptionService.resetProbeCache()
+        _ = try await CopilotSubscriptionService.refresh(deps: ghOnly)
+        XCTAssertEqual(authorization(fallback), "token gho_github-env")
+    }
+
+    func testGhCLITokenIsUsedWhenNothingElseIsPresent() async throws {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(hosts: nil, ghToken: "gho_gh-cli", recorder: recorder) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        _ = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(authorization(recorder), "token gho_gh-cli")
+    }
+
+    func testMissingGhCLIFallsThroughToThePastedToken() async throws {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: nil,
+            ghToken: nil,
+            savedToken: "github_pat_pasted",
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        _ = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(authorization(recorder), "token github_pat_pasted")
+    }
+
+    func testEveryRungAbsentStillReportsNoCredentialsWithoutFetching() async {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: nil,
+            config: "{}",
+            settings: "not json {",
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        await expectNoCredentials(deps)
+        XCTAssertTrue(recorder.requests.isEmpty)
+    }
+
+    /// Precedence over the whole chain: with every rung populated, the legacy
+    /// plugin file still wins, then ~/.copilot, then env, then gh, then the
+    /// pasted token.
+    func testDiscoveryPrecedenceOrder() async throws {
+        let rungs: [(String, [String: String])] = [
+            ("gho_hosts", [:]),
+            ("gho_config", ["drop": "hosts"]),
+            ("gho_settings", ["drop": "config"]),
+            ("gho_env", ["drop": "settings"]),
+            ("gho_gh", ["drop": "env"]),
+            ("gho_saved", ["drop": "gh"]),
+        ]
+        var dropped: Set<String> = []
+        for (expected, step) in rungs {
+            if let drop = step["drop"] { dropped.insert(drop) }
+            let recorder = RequestRecorder()
+            CopilotSubscriptionService.resetProbeCache()
+            let deps = Self.makeDeps(
+                hosts: dropped.contains("hosts") ? nil : #"{"github.com":{"oauth_token":"gho_hosts"}}"#,
+                config: dropped.contains("config") ? nil : #"{"token":"gho_config"}"#,
+                settings: dropped.contains("settings") ? nil : #"{"token":"gho_settings"}"#,
+                environment: dropped.contains("env") ? [:] : ["COPILOT_GITHUB_TOKEN": "gho_env"],
+                ghToken: dropped.contains("gh") ? nil : "gho_gh",
+                savedToken: "gho_saved",
+                recorder: recorder
+            ) { request in
+                Self.okJson(request, Self.usageBody)
+            }
+            _ = try await CopilotSubscriptionService.refresh(deps: deps)
+            XCTAssertEqual(authorization(recorder), "token \(expected)")
+        }
+    }
+
+    /// `gh auth token` is a process spawn, so repeated reads inside the TTL
+    /// must reuse the answer, and a read past it must probe again.
+    func testGhProbeIsCachedUntilTheTTLExpires() async throws {
+        final class Clock: @unchecked Sendable {
+            var probes = 0
+            var now = CopilotQuotaTests.now
+        }
+        let clock = Clock()
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: nil,
+            ghToken: "gho_gh-cli",
+            recorder: recorder,
+            now: { clock.now },
+            onGhProbe: { clock.probes += 1 }
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        _ = try await CopilotSubscriptionService.refresh(deps: deps)
+        _ = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(clock.probes, 1)
+
+        clock.now = Self.now.addingTimeInterval(CopilotSubscriptionService.probeCacheTTL + 1)
+        _ = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(clock.probes, 2)
+    }
+
+    func testNoCredentialsMessageOffersEveryConnectionRoute() {
+        let message = CopilotSubscriptionService.FetchError.noCredentials.localizedDescription
+        XCTAssertEqual(
+            message,
+            "No GitHub Copilot credentials found. Usage tracking still works. "
+                + "To show live quota, sign in with the Copilot CLI, run gh auth login, "
+                + "or paste a GitHub token in Settings.")
+        XCTAssertFalse(message.contains("—"))
     }
 
     func testMalformedSuccessBodyDegradesInsteadOfCrashing() async {

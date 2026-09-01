@@ -22,8 +22,9 @@ signing, so it lands inside the code signature.
 At runtime a packaged build spawns the bundled CLI with Electron's own binary
 acting as Node (`ELECTRON_RUN_AS_NODE=1`), so **no Node install is required** —
 the app is version-matched to itself. `main.ts` sets `CODEBURN_BUNDLED_CLI` to
-`Resources/cli/dist/launch.js` (a small shim that corrects `argv` for
-commander under Electron, then hands off to `main.js`), and `electron/cli.ts`
+`Resources/cli/dist/launch.js` (a small shim that preserves the argument shape
+expected by the resident and one-shot CLI paths, then hands off to `main.js`),
+and `electron/cli.ts`
 resolves it ahead of any persisted path or `PATH` lookup.
 
 A user-installed CLI is only consulted **outside** a packaged build (dev via the

@@ -1,6 +1,6 @@
 // Live Gemini quota via the OAuth-backed Code Assist APIs the Gemini CLI
-// itself calls (prior art: steipete/CodexBar docs/gemini.md, which derives the
-// flow from the CLI's own traffic):
+// itself calls, derived from the Google Code Assist client flow and the CLI's
+// own traffic:
 //
 // - POST https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist
 //     body { metadata: { ideType: 'GEMINI_CLI', pluginType: 'GEMINI' } }
@@ -83,7 +83,7 @@ async function refresh(credential: GeminiCredential, deps: GeminiDeps, signal?: 
 }
 
 // The `hd` claim (hosted domain) separates Google Workspace logins from
-// personal ones, mirroring CodexBar's tier labeling.
+// personal ones, matching the provider's tier labels.
 function workspaceClaim(idToken: string | undefined): boolean {
   if (!idToken) return false
   const [, payload] = idToken.split('.')

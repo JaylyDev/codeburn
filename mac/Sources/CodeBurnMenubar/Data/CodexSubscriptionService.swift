@@ -284,7 +284,7 @@ enum CodexSubscriptionService {
             }
         }
         // chatgpt.com sometimes serializes balance as a Double ("balance": 0.0)
-        // and other times as a String ("balance": "0.00"). Mirror CodexBar's
+        // and other times as a String ("balance": "0.00"). Preserve the
         // resilient decode so a schema drift on either shape doesn't blow up
         // the whole quota fetch.
         struct Credits: Decodable {

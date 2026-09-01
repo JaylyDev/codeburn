@@ -18,7 +18,7 @@ type QuitTelemetry = Pick<Telemetry, 'trackClose' | 'flush'>
 type BeforeQuitEvent = { preventDefault: () => void }
 type BeforeQuitDeps = {
   getTelemetry: () => QuitTelemetry | null
-  killAll: () => void
+  killAll: () => void | Promise<void>
   quit: () => void
   timeoutMs?: number
 }
@@ -40,7 +40,8 @@ export function createBeforeQuitHandler(deps: BeforeQuitDeps): (event: BeforeQui
     void (async () => {
       let timer: ReturnType<typeof setTimeout> | undefined
       try {
-        try { deps.killAll() } catch { /* child cleanup must not wedge quit */ }
+        let childCleanup: Promise<unknown> = Promise.resolve()
+        try { childCleanup = Promise.resolve(deps.killAll()).catch(() => undefined) } catch { /* child cleanup must not wedge quit */ }
 
         let telemetry: QuitTelemetry | null = null
         try { telemetry = deps.getTelemetry() } catch { /* telemetry lookup is best-effort */ }
@@ -57,7 +58,10 @@ export function createBeforeQuitHandler(deps: BeforeQuitDeps): (event: BeforeQui
         const timeout = new Promise<void>(resolve => {
           timer = setTimeout(resolve, deps.timeoutMs ?? QUIT_FLUSH_TIMEOUT_MS)
         })
-        await Promise.race([flush.catch(() => false), timeout])
+        await Promise.race([
+          Promise.all([flush.catch(() => false), childCleanup]),
+          timeout,
+        ])
       } finally {
         if (timer !== undefined) clearTimeout(timer)
         allowQuit = true
@@ -278,12 +282,20 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     return stillCold() && error.kind === 'timeout' ? { ...error, cold: true } : error
   }
 
-  const run = (build: (...args: any[]) => string[]): Handler => async (...args: any[]) => {
+  const run = (build: (...args: any[]) => string[], backgroundIndex?: number): Handler => async (...args: any[]) => {
     let cmd: string | undefined
     try {
-      const argv = build(...args)
+      const background = backgroundIndex !== undefined && args[backgroundIndex] === true
+      // `background` is renderer scheduling metadata, not a CLI argument.
+      const argv = build(...(backgroundIndex === undefined ? args : args.slice(0, backgroundIndex)))
       cmd = argv[0]
-      return { ok: true, value: await deps.spawnCli(argv, readOpts()) }
+      const baseOpts = readOpts()
+      return {
+        ok: true,
+        value: await deps.spawnCli(argv, background
+          ? { ...(baseOpts ?? {}), priority: 'background' }
+          : baseOpts),
+      }
     } catch (err) {
       const error = coldError(err)
       telemetry?.track('cli_error', cliErrorProps(err, cmd))
@@ -354,29 +366,29 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     'codeburn:getTimeline': run((period: string, provider: string, range?: DateRange) => [
       'status', '--format', 'menubar-json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
     ]),
-    'codeburn:getPlans': run((period: string) => ['status', '--format', 'json', '--period', vPeriod(period)]),
+    'codeburn:getPlans': run((period: string) => ['status', '--format', 'json', '--period', vPeriod(period)], 1),
     'codeburn:getActReport': run(() => ['act', 'report', '--json']),
     'codeburn:getModels': run((period: string, provider: string, byTask: boolean, range?: DateRange) => [
       'models', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...(byTask ? ['--by-task'] : []), ...rangeArgs(vRange(range)),
-    ]),
+    ], 4),
     'codeburn:getSessions': run((period: string, provider: string, range?: DateRange) => [
       'sessions', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
-    ]),
+    ], 3),
     'codeburn:getCompareModels': run((period: string, provider: string) => [
       'compare', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)),
-    ]),
+    ], 2),
     'codeburn:getCompare': run((period: string, provider: string, modelA: string, modelB: string) => [
       'compare', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), '--model-a', vToken(modelA), '--model-b', vToken(modelB),
     ]),
     'codeburn:getYield': run((period: string, provider: string, range?: DateRange) => [
       'yield', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
-    ]),
+    ], 3),
     'codeburn:getSpendFlow': run((period: string, provider: string, range?: DateRange) => [
       'spend', '--format', 'flow-json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
-    ]),
+    ], 3),
     'codeburn:getOptimizeReport': run((period: string, provider: string, range?: DateRange) => [
       'optimize', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
-    ]),
+    ], 3),
     'codeburn:getDevices': run((period: string) => ['devices', '--format', 'json', '--period', vPeriod(period)]),
     'codeburn:getDevicesScan': run(() => ['devices', 'scan', '--format', 'json']),
     'codeburn:getShareStatus': run(() => ['share', 'status', '--format', 'json']),
@@ -415,6 +427,33 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     // One-shot read of the cached update-availability status. The check itself
     // runs in the background (launch + 24h); this returns whatever is known.
     'codeburn:getUpdateStatus': async () => ({ ok: true, value: deps.getUpdateStatus ? await deps.getUpdateStatus() : NO_UPDATE_STATUS }),
+    // Plugin management reads (all return parsed JSON)
+    'codeburn:pluginList': run(() => ['plugin', 'list', '--json']),
+    'codeburn:pluginInfo': run((name: string) => ['plugin', 'info', vToken(name), '--json']),
+    'codeburn:syncAutoStatus': run(() => ['sync', 'auto', 'status', '--json']),
+    // Plugin management mutations
+    'codeburn:pluginAdd': runAction((source: string) => ['plugin', 'add', vToken(source)]),
+    'codeburn:pluginRemove': runAction((name: string) => ['plugin', 'remove', vToken(name), '--confirm']),
+    'codeburn:pluginVerify': runAction((name: string) => ['plugin', 'verify', vToken(name)]),
+    // Sync auto enable: special case - when accept=false, capture disclosure text from stdout
+    'codeburn:syncAutoEnable': async (cadence?: string, attribution?: boolean, accept?: boolean) => {
+      try {
+        const args = ['sync', 'auto', 'enable', '--cadence', cadence === 'hourly' ? 'hourly' : 'daily']
+        if (attribution) args.push('--attribution')
+        if (accept) args.push('--accept')
+
+        const result = await deps.spawnCliAction(args)
+        // When accept=false, the disclosure text is in stdout, we return it for display
+        // When accept=true, it succeeds with no special output needed
+        if (!accept && result.stdout) {
+          return { ok: true, value: { ok: true, disclosure: result.stdout, code: result.code } }
+        }
+        return { ok: true, value: { ...result, stderr: sanitizeError(result.stderr) } }
+      } catch (err) {
+        return { ok: false, error: toEnvelopeError(err) }
+      }
+    },
+    'codeburn:syncAutoDisable': runAction(() => ['sync', 'auto', 'disable']),
   }
 }
 
@@ -527,11 +566,9 @@ function createWindow(): BrowserWindow {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      // Chromium's default (kept explicit): when the window is minimized or fully
-      // occluded the renderer's document.visibilityState flips to 'hidden' and a
-      // visibilitychange fires. usePolled and the flame animation gate on that to
-      // stop background CLI polls and compositor wakeups while hidden. A merely
-      // unfocused-but-visible window stays 'visible' and keeps polling.
+      // Keep Chromium's normal background throttling so minimizing/occluding the
+      // window updates the Page Visibility API and pauses renderer animations.
+      // Data intervals remain registered and use a visibility catch-up on return.
       backgroundThrottling: true,
     },
   })

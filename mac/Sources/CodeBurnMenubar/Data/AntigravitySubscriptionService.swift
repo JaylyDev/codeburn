@@ -24,8 +24,8 @@ struct AntigravityUsage: Sendable, Equatable {
 }
 
 /// Live Antigravity quota from LOCAL surfaces only — the Antigravity app's own
-/// language server or a signed-in `agy` CLI's embedded server (prior art:
-/// steipete/CodexBar docs/antigravity.md, which marks this protocol internal
+/// language server or a signed-in `agy` CLI's embedded server, derived from
+/// observed Antigravity client traffic. This protocol is internal
 /// and experimental). No Google OAuth fallback: when no local server answers,
 /// the provider reports disconnected and the UI shows its Connect affordance.
 ///
@@ -34,7 +34,7 @@ struct AntigravityUsage: Sendable, Equatable {
 ///     (preferred; falls back to)
 /// - POST https://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/GetUserStatus
 ///
-/// Discovery mirrors CodexBar: `ps` finds candidate processes (app language
+/// Discovery uses `ps` to find candidate processes (app language
 /// servers need their `--csrf_token`; the `agy` CLI needs none), then `lsof`
 /// lists each pid's listening TCP ports. Local HTTPS uses a self-signed cert,
 /// so TLS verification is relaxed ONLY for the 127.0.0.1 loopback probes —
@@ -142,7 +142,7 @@ enum AntigravitySubscriptionService {
 
     // MARK: - Process discovery
 
-    /// Process kinds, mirroring CodexBar's classification. The app language
+    /// Process kinds distinguish the app language server from standalone processes.
     /// server carries richer quota data than the IDE variant, so IDE matches
     /// are skipped; a CLI (`agy`) match is accepted because its tokenless
     /// server exposes the same summary payload.
@@ -224,7 +224,10 @@ enum AntigravitySubscriptionService {
 
     /// Preferred payload: two named quota groups of model buckets.
     static func decodeSummary(_ body: Any?) -> [AntigravityUsage.Window] {
-        guard let data = body as? [String: Any] else { return [] }
+        guard let root = body as? [String: Any] else { return [] }
+        // Current Connect-RPC servers wrap the payload in `response`; older
+        // app/CLI builds returned the fields at the top level.
+        let data = root["response"] as? [String: Any] ?? root
         var windows: [AntigravityUsage.Window] = []
         for group in data["groups"] as? [Any] ?? [] {
             guard let group = group as? [String: Any] else { continue }
@@ -234,8 +237,13 @@ enum AntigravitySubscriptionService {
                 let bucketName = (bucket["displayName"] as? String) ?? (bucket["bucketId"] as? String) ?? ""
                 let name = [groupName, bucketName].filter { !$0.isEmpty }.joined(separator: " · ")
                 if name.isEmpty { continue }
-                let remaining = (bucket["remaining"] as? [String: Any])?["remainingFraction"]
-                if let window = makeWindow(label: name, remainingFraction: remaining, resetTime: nil) {
+                let remaining = bucket["remainingFraction"]
+                    ?? (bucket["remaining"] as? [String: Any])?["remainingFraction"]
+                if let window = makeWindow(
+                    label: name,
+                    remainingFraction: remaining,
+                    resetTime: bucket["resetTime"])
+                {
                     windows.append(window)
                 }
             }
@@ -251,7 +259,13 @@ enum AntigravitySubscriptionService {
         var windows: [AntigravityUsage.Window] = []
         for config in configData["clientModelConfigs"] as? [Any] ?? [] {
             guard let config = config as? [String: Any],
-                  let name = config["modelName"] as? String, !name.isEmpty else { continue }
+                  let name = firstNonBlankString([
+                      config["label"],
+                      config["modelName"],
+                      config["modelId"],
+                      (config["modelOrAlias"] as? [String: Any])?["model"],
+                  ])
+            else { continue }
             let quota = config["quotaInfo"] as? [String: Any]
             if let window = makeWindow(label: name, remainingFraction: quota?["remainingFraction"], resetTime: quota?["resetTime"]) {
                 windows.append(window)
@@ -264,14 +278,31 @@ enum AntigravitySubscriptionService {
     /// account_plan; the first non-blank string wins.
     static func planFromStatus(_ body: Any?) -> String? {
         guard let data = body as? [String: Any] else { return nil }
+        let response = data["response"] as? [String: Any]
+        let userStatus = (data["userStatus"] as? [String: Any])
+            ?? (response?["userStatus"] as? [String: Any])
+        let planStatus = userStatus?["planStatus"] as? [String: Any]
+        let planInfo = planStatus?["planInfo"] as? [String: Any]
+        let userTier = userStatus?["userTier"] as? [String: Any]
         let candidates = [
             data["planName"],
-            (data["userStatus"] as? [String: Any])?["planName"],
+            response?["planName"],
+            userStatus?["planName"],
+            userTier?["name"],
+            planInfo?["planDisplayName"],
+            planInfo?["displayName"],
+            planInfo?["planName"],
+            planInfo?["productName"],
+            planInfo?["planShortName"],
             data["account_plan"],
         ]
-        for candidate in candidates {
-            guard let raw = candidate as? String else { continue }
-            let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        return firstNonBlankString(candidates)
+    }
+
+    private static func firstNonBlankString(_ values: [Any?]) -> String? {
+        for value in values {
+            guard let raw = value as? String else { continue }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { return trimmed }
         }
         return nil
@@ -280,7 +311,22 @@ enum AntigravitySubscriptionService {
     private static func makeWindow(label: String, remainingFraction: Any?, resetTime: Any?) -> AntigravityUsage.Window? {
         guard let remaining = number(remainingFraction) else { return nil }
         let used = min(100, max(0, (1 - remaining) * 100))
-        return AntigravityUsage.Window(label: label, usedPercent: used, resetsAt: resetDate(resetTime))
+        return AntigravityUsage.Window(
+            label: presentationLabel(label),
+            usedPercent: used,
+            resetsAt: resetDate(resetTime)
+        )
+    }
+
+    /// Windows always render percent USED. Raw Antigravity bucket names can
+    /// still say remaining, so rewrite that copy to match the inverted value.
+    private static func presentationLabel(_ label: String) -> String {
+        let pattern = #"(?i)\bremaining\b"#
+        return label.replacingOccurrences(
+            of: pattern,
+            with: "used",
+            options: .regularExpression
+        )
     }
 
     /// JSON numbers only — booleans bridge to NSNumber and must not parse.

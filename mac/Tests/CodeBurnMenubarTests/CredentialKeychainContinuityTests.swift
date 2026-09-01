@@ -2,6 +2,14 @@ import Foundation
 import Testing
 @testable import CodeBurnMenubar
 
+private final class SendableUserDefaults: @unchecked Sendable {
+    let value: UserDefaults
+
+    init(_ value: UserDefaults) {
+        self.value = value
+    }
+}
+
 /// Implementation-continuity tests for option-3 evidence bar.
 /// Uses only InMemory/Controllable Keychain backends and temp Application Support —
 /// never the operator login Keychain or live credential files.
@@ -45,10 +53,14 @@ struct CredentialKeychainContinuityTests {
         CodexCredentialStore.userDefaultsOverride = defaults
         ClaudeCredentialStore.keychainCache = fake
         CodexCredentialStore.keychainCache = fake
+        CapacityDockProviderCredentialStore.keychainCache = fake
+        CapacityDockProviderCredentialStore.userDefaults = defaults
 
         defer {
             ClaudeCredentialStore.resetTestSeams()
             CodexCredentialStore.resetTestSeams()
+            CapacityDockProviderCredentialStore.keychainCache = LiveKeychainCredentialCache()
+            CapacityDockProviderCredentialStore.userDefaults = .standard
             defaults.removePersistentDomain(forName: suiteName)
             try? FileManager.default.removeItem(at: root)
         }
@@ -79,6 +91,122 @@ struct CredentialKeychainContinuityTests {
     }
 
     // MARK: - Continuity lifecycle
+
+    @Test("local provider sources bootstrap without creating CodeBurn Keychain copies")
+    func sourceFirstBootstrapAvoidsPrivateKeychainCopies() throws {
+        try withHarness { harness in
+            let claudeURL = harness.root.appendingPathComponent(".claude/.credentials.json")
+            try FileManager.default.createDirectory(
+                at: claudeURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let claudeBlob: [String: Any] = [
+                "claudeAiOauth": [
+                    "accessToken": accessSentinel,
+                    "refreshToken": refreshSentinel,
+                    "expiresAt": 1_900_000_000_000,
+                    "rateLimitTier": "default",
+                ],
+            ]
+            try JSONSerialization.data(withJSONObject: claudeBlob).write(to: claudeURL)
+
+            let codexURL = harness.root.appendingPathComponent(".codex/auth.json")
+            try FileManager.default.createDirectory(
+                at: codexURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let codexBlob: [String: Any] = [
+                "auth_mode": "chatgpt",
+                "tokens": [
+                    "access_token": accessSentinel,
+                    "refresh_token": refreshSentinel,
+                    "id_token": idSentinel,
+                    "account_id": accountSentinel,
+                ],
+                "last_refresh": "2026-08-28T10:00:00Z",
+            ]
+            try JSONSerialization.data(withJSONObject: codexBlob).write(to: codexURL)
+
+            #expect(CodexCredentialStore.hasCredentialSource)
+            #expect(try ClaudeCredentialStore.bootstrap().accessToken == accessSentinel)
+            #expect(try CodexCredentialStore.bootstrap().accessToken == accessSentinel)
+            #expect(harness.fakeKeychain.upsertCount == 0)
+        }
+    }
+
+    @Test("provider overrides are isolated by provider ID")
+    func providerOverridesAreIsolatedByProviderID() throws {
+        try withHarness { harness in
+            let clinePass = CapacityDockProviderCredential(
+                sourceMode: ProviderReferenceSourceMode.api.rawValue,
+                apiKey: "synthetic-clinepass-key"
+            )
+            let openCodeGo = CapacityDockProviderCredential(
+                sourceMode: ProviderReferenceSourceMode.api.rawValue,
+                apiKey: "synthetic-opencodego-key"
+            )
+
+            try CapacityDockProviderCredentialStore.save(clinePass, for: "clinepass")
+            try CapacityDockProviderCredentialStore.save(openCodeGo, for: "opencodego")
+
+            #expect(CapacityDockProviderCredentialPresence.providerIDs(defaults: harness.defaults) == [
+                "clinepass", "opencodego",
+            ])
+            #expect(try CapacityDockProviderCredentialStore.load(for: "clinepass") == clinePass)
+            #expect(try CapacityDockProviderCredentialStore.load(for: "opencodego") == openCodeGo)
+
+            try CapacityDockProviderCredentialStore.remove(for: "clinepass")
+            #expect(CapacityDockProviderCredentialPresence.providerIDs(defaults: harness.defaults) == [
+                "opencodego",
+            ])
+            #expect(try CapacityDockProviderCredentialStore.load(for: "clinepass").isEmpty)
+            #expect(try CapacityDockProviderCredentialStore.load(for: "opencodego") == openCodeGo)
+        }
+    }
+
+    @Test("concurrent provider-presence updates do not lose identifiers")
+    func providerPresenceUpdatesAreAtomic() async {
+        let suiteName = "codeburn.capacity-dock-presence.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        let defaultsBox = SendableUserDefaults(defaults)
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let providerIDs = Array(CapacityDockPreferences.supportedProviders.prefix(24).map(\.id))
+
+        await withTaskGroup(of: Void.self) { group in
+            for providerID in providerIDs {
+                group.addTask {
+                    CapacityDockProviderCredentialPresence.set(
+                        true,
+                        for: providerID,
+                        defaults: defaultsBox.value
+                    )
+                }
+            }
+        }
+
+        #expect(CapacityDockProviderCredentialPresence.providerIDs(defaults: defaults) == Set(providerIDs))
+    }
+
+    @Test("ClinePass override survives a credential-store restart")
+    func clinePassOverrideSurvivesRestart() throws {
+        try withHarness { harness in
+            let initial = CapacityDockProviderCredential(
+                sourceMode: ProviderReferenceSourceMode.api.rawValue,
+                apiKey: "synthetic-clinepass-restart-key"
+            )
+            try CapacityDockProviderCredentialStore.save(initial, for: "clinepass")
+
+            // Simulate a new process: discard the store instance while retaining
+            // the bytes that the login Keychain would preserve across launch.
+            CapacityDockProviderCredentialStore.keychainCache = harness.fakeKeychain.cloneStorage()
+
+            let afterRestart = try CapacityDockProviderCredentialStore.load(for: "clinepass")
+            #expect(afterRestart == initial)
+            #expect(afterRestart.resolvedSourceMode == .api)
+            #expect(afterRestart.sanitizedOverride.apiKey == "synthetic-clinepass-restart-key")
+        }
+    }
 
     @Test("Claude write → simulated restart → read → update → delete")
     func claudeWriteRestartReadUpdateDelete() throws {

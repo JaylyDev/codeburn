@@ -70,6 +70,14 @@ const CHANNELS = [
   'codeburn:telemetryOnboarded',
   'codeburn:telemetryTrack',
   'codeburn:getUpdateStatus',
+  'codeburn:pluginList',
+  'codeburn:pluginInfo',
+  'codeburn:pluginAdd',
+  'codeburn:pluginRemove',
+  'codeburn:pluginVerify',
+  'codeburn:syncAutoStatus',
+  'codeburn:syncAutoEnable',
+  'codeburn:syncAutoDisable',
 ] as const
 
 const ARGV_CASES: Array<{ channel: string; args: unknown[]; argv: string[] }> = [
@@ -120,6 +128,20 @@ const ARGV_CASES: Array<{ channel: string; args: unknown[]; argv: string[] }> = 
   { channel: 'codeburn:setPlan', args: ['claude-max', 'claude'], argv: ['plan', 'set', 'claude-max', '--provider', 'claude'] },
   { channel: 'codeburn:resetPlan', args: ['cursor'], argv: ['plan', 'reset', '--provider', 'cursor'] },
   { channel: 'codeburn:exportData', args: ['json', 'all', '/tmp/codeburn-export'], argv: ['export', '-f', 'json', '-o', '/tmp/codeburn-export', '--provider', 'all'] },
+  // Plugin management
+  { channel: 'codeburn:pluginList', args: [], argv: ['plugin', 'list', '--json'] },
+  { channel: 'codeburn:pluginInfo', args: ['test-plugin'], argv: ['plugin', 'info', 'test-plugin', '--json'] },
+  { channel: 'codeburn:pluginAdd', args: ['/path/to/plugin'], argv: ['plugin', 'add', '/path/to/plugin'] },
+  { channel: 'codeburn:pluginAdd', args: ['teams'], argv: ['plugin', 'add', 'teams'] },
+  { channel: 'codeburn:pluginRemove', args: ['test-plugin'], argv: ['plugin', 'remove', 'test-plugin', '--confirm'] },
+  { channel: 'codeburn:pluginVerify', args: ['test-plugin'], argv: ['plugin', 'verify', 'test-plugin'] },
+  // Sync auto
+  { channel: 'codeburn:syncAutoStatus', args: [], argv: ['sync', 'auto', 'status', '--json'] },
+  { channel: 'codeburn:syncAutoEnable', args: ['daily', false, false], argv: ['sync', 'auto', 'enable', '--cadence', 'daily'] },
+  { channel: 'codeburn:syncAutoEnable', args: ['hourly', true, false], argv: ['sync', 'auto', 'enable', '--cadence', 'hourly', '--attribution'] },
+  { channel: 'codeburn:syncAutoEnable', args: ['daily', false, true], argv: ['sync', 'auto', 'enable', '--cadence', 'daily', '--accept'] },
+  { channel: 'codeburn:syncAutoEnable', args: ['hourly', true, true], argv: ['sync', 'auto', 'enable', '--cadence', 'hourly', '--attribution', '--accept'] },
+  { channel: 'codeburn:syncAutoDisable', args: [], argv: ['sync', 'auto', 'disable'] },
 ]
 
 function flattenMenuItems(items: any[]): any[] {
@@ -357,6 +379,24 @@ describe('createBeforeQuitHandler', () => {
     }
   })
 
+  it('waits for asynchronous child cleanup before the final exit', async () => {
+    let releaseCleanup: (() => void) | undefined
+    const cleanup = new Promise<void>(resolve => { releaseCleanup = resolve })
+    const quit = vi.fn()
+    const handler = createBeforeQuitHandler({
+      getTelemetry: () => null,
+      killAll: () => cleanup,
+      quit,
+    })
+
+    handler({ preventDefault: vi.fn() })
+    await Promise.resolve()
+    expect(quit).not.toHaveBeenCalled()
+
+    releaseCleanup?.()
+    await vi.waitFor(() => expect(quit).toHaveBeenCalledOnce())
+  })
+
   it('still flushes and quits when trackClose throws synchronously', async () => {
     const trackClose = vi.fn(() => { throw new Error('track close failed') })
     const flush = vi.fn(async () => true)
@@ -449,6 +489,30 @@ describe('createBridgeHandlers (cold-start warmup)', () => {
     expect(opts[0]?.priority).toBeUndefined()
     expect(opts[1]?.priority).toBeUndefined()
     expect(opts[2]?.priority).toBe('background')
+  })
+
+  it('classifies every first-click report warm as background without leaking the scheduler flag into argv', async () => {
+    const calls: Array<{ args: string[]; opts?: Record<string, unknown> }> = []
+    const spawnCli = vi.fn(async (args: string[], opts?: Record<string, unknown>) => {
+      calls.push({ args, opts })
+      return []
+    })
+    const handlers = createBridgeHandlers(base({ spawnCli }))
+    const cases: Array<[string, unknown[]]> = [
+      ['codeburn:getPlans', ['today', true]],
+      ['codeburn:getModels', ['today', 'all', false, undefined, true]],
+      ['codeburn:getSessions', ['today', 'all', undefined, true]],
+      ['codeburn:getCompareModels', ['today', 'all', true]],
+      ['codeburn:getYield', ['today', 'all', undefined, true]],
+      ['codeburn:getSpendFlow', ['today', 'all', undefined, true]],
+      ['codeburn:getOptimizeReport', ['today', 'all', undefined, true]],
+    ]
+
+    for (const [channel, args] of cases) await handlers[channel]!(...args)
+
+    expect(calls).toHaveLength(cases.length)
+    expect(calls.every(call => call.opts?.priority === 'background')).toBe(true)
+    expect(calls.every(call => !call.args.includes('true'))).toBe(true)
   })
 
   it('re-arms the long timeout when the first overview fails (cache is still cold)', async () => {

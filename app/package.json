@@ -1,7 +1,7 @@
 {
   "name": "codeburn-desktop",
   "private": true,
-  "version": "0.9.22",
+  "version": "0.9.23",
   "description": "CodeBurn Desktop \u2014 Electron app fed by the codeburn CLI",
   "main": "dist/electron/main.js",
   "scripts": {
@@ -23,6 +23,7 @@
   "dependencies": {
     "@gsap/react": "^2.1.2",
     "gsap": "^3.15.0",
+    "lz-string": "^1.5.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },
@@ -163,10 +164,9 @@
             "interface": "personal-files",
             "read": [
               "$HOME/.claude/projects",
-              "$HOME/.claude/.credentials.json",
               "$HOME/.codex/sessions",
               "$HOME/.codex/archived_sessions",
-              "$HOME/.cline/data",
+              "$HOME/.cline/data/tasks",
               "$HOME/.codewhale/sessions",
               "$HOME/.copilot/session-state",
               "$HOME/.cursor/projects",
@@ -226,6 +226,14 @@
               "$HOME/.local/share/crush",
               "$HOME/.local/share/goose/sessions",
               "$HOME/.local/share/kilo"
+            ]
+          }
+        },
+        {
+          "claude-quota-credentials": {
+            "interface": "personal-files",
+            "read": [
+              "$HOME/.claude/.credentials.json"
             ]
           }
         }

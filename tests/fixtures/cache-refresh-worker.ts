@@ -3,9 +3,9 @@ import { mkdir, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
 
 import { acquireCacheRefreshLock } from '../../src/cache-refresh-lock.js'
-import { loadCache, markCacheDirty, saveCache } from '../../src/session-cache.js'
+import { exitAfterCacheCleanup, loadCache, markCacheDirty, saveCache } from '../../src/session-cache.js'
 
-const [cacheDir, barrierDir, id, sourcePath, bypass = 'false'] = process.argv.slice(2)
+const [cacheDir, barrierDir, id, sourcePath, bypass = 'false', exitViaCleanup = 'false'] = process.argv.slice(2)
 if (!cacheDir || !barrierDir || !id || !sourcePath) throw new Error('missing worker argument')
 
 async function waitFor(name: string): Promise<void> {
@@ -35,6 +35,10 @@ try {
   }
   markCacheDirty(cache, 'regression')
   await writeFile(join(barrierDir, `${id}.parsed`), '')
+  if (exitViaCleanup === 'true') {
+    await waitFor(`${id}.exit`)
+    exitAfterCacheCleanup(0)
+  }
   await waitFor(`${id}.save`)
   const published = await saveCache(cache, refresh?.handle.verifyStillOwner)
   await writeFile(join(barrierDir, `${id}.${published ? 'published' : 'fenced'}`), '')
