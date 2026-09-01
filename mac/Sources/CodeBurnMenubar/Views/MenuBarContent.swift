@@ -97,19 +97,18 @@ struct MenuBarContent: View {
         // local usage — the quota endpoint doesn't depend on local sessions.
         if store.selectedProvider == .claude || store.selectedProvider == .codex || store.selectedProvider == .kimiCode || store.selectedProvider == .gemini { return false }
         if store.payload.current.cost > 0 || store.payload.current.calls > 0 { return false }
-        if providerHasCostInAllPayload { return false }
+        if providerHasUsageInAllPayload { return false }
         return true
     }
 
-    private var providerHasCostInAllPayload: Bool {
+    private var providerHasUsageInAllPayload: Bool {
         guard let allPayload = store.periodAllPayload else { return false }
-        let providers = Dictionary(
-            allPayload.current.providers.map { ($0.key.lowercased(), $0.value) },
-            uniquingKeysWith: +
+        let activeKeys = ProviderVisibility.activeKeys(
+            providerDetails: allPayload.current.providerDetails,
+            legacyProviders: allPayload.current.providers
         )
-        return store.selectedProvider.providerKeys.contains { key in
-            (providers[key] ?? 0) > 0
-        }
+        return activeKeys.contains(store.selectedProvider.cliArg)
+            || store.selectedProvider.providerKeys.contains(where: activeKeys.contains)
     }
 
     /// Show the tab row whenever the CLI detected at least one AI coding tool installed
@@ -302,6 +301,7 @@ private struct FetchErrorOverlay: View {
 /// yellow→orange→red, looping.
 private struct BurnLoadingOverlay: View {
     let periodLabel: String
+    @Environment(AppStore.self) private var store
     @State private var fillProgress: CGFloat = 0
     @State private var glowing: Bool = false
 
@@ -320,13 +320,27 @@ private struct BurnLoadingOverlay: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .onAppear {
-            withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
-                fillProgress = 1.0
+        .onAppear { setPulsing(store.menuPopoverVisible) }
+        .onChange(of: store.menuPopoverVisible) { _, visible in
+            setPulsing(visible)
+        }
+    }
+
+    private func setPulsing(_ on: Bool) {
+        guard on else {
+            var stop = Transaction()
+            stop.disablesAnimations = true
+            withTransaction(stop) {
+                fillProgress = 0
+                glowing = false
             }
-            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
-                glowing = true
-            }
+            return
+        }
+        withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
+            fillProgress = 1.0
+        }
+        withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+            glowing = true
         }
     }
 }

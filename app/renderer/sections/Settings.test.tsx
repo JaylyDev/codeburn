@@ -52,6 +52,9 @@ const stored = new Map<string, string>()
 vi.stubGlobal('localStorage', {
   getItem: (key: string) => stored.get(key) ?? null,
   setItem: (key: string, value: string) => stored.set(key, value),
+  removeItem: (key: string) => stored.delete(key),
+  key: (index: number) => [...stored.keys()][index] ?? null,
+  get length() { return stored.size },
   clear: () => stored.clear(),
 })
 
@@ -124,6 +127,22 @@ describe('Settings', () => {
     render(<Settings period="month" />)
     expect(await screen.findByRole('heading', { name: 'General' })).toBeInTheDocument()
     expect(screen.queryByText('Claude config')).not.toBeInTheDocument()
+  })
+
+  it('discloses and clears local report snapshots without deleting preferences', async () => {
+    stored.set('codeburn.reportSnapshot.v1.sessions|today|all|-||2026-08-28', '{"at":1}')
+    stored.set('codeburn.overview-headlines.v2', '{}')
+    stored.set('codeburn.theme', 'dark')
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+    expect(screen.getByText('Local report snapshots')).toBeInTheDocument()
+    expect(screen.getByText(/Calculated usage and cost reports/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Clear snapshots' }))
+    expect([...stored.keys()].some(key => key.startsWith('codeburn.reportSnapshot.v1.'))).toBe(false)
+    expect(stored.has('codeburn.overview-headlines.v2')).toBe(false)
+    expect(stored.get('codeburn.theme')).toBe('dark')
+    expect(await screen.findByText('Cached report snapshots cleared')).toBeInTheDocument()
   })
 
   it('stores a positive daily budget from General', async () => {

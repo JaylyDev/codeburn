@@ -2,8 +2,8 @@
 // menubar's KimiSubscriptionService.swift):
 //
 // - GET https://api.kimi.com/coding/v1/usages
-//     Headers mirror the Kimi CLI (X-Msh-Platform / X-Msh-Device-Id, prior art:
-//     steipete/CodexBar). Numeric fields have shipped as both JSON numbers and
+//     Headers mirror observed Kimi Code client responses (X-Msh-Platform /
+//     X-Msh-Device-Id). Numeric fields have shipped as both JSON numbers and
 //     strings, and the reset stamp under several spellings, so decode leniently.
 //
 // Credential: the Kimi CLI's own ~/.kimi-code/credentials/kimi-code.json,

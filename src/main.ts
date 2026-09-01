@@ -36,6 +36,7 @@ import { runOptimize } from './optimize.js'
 import { registerActCommands } from './act/cli.js'
 import { registerGuardCommands } from './guard/cli.js'
 import { registerSyncCommands } from './sync/cli.js'
+import { registerPluginCommands, registerLoadedPluginCommands } from './plugins/cli.js'
 import { runContextCommand } from './context-tree.js'
 import { renderCompare } from './compare.js'
 import { computeBudgetStatus, daysInMonth, diffCalendarDays, type BudgetStatus, type BudgetTier } from './budget.js'
@@ -45,7 +46,7 @@ import {
   uninstallAntigravityStatusLineHook,
 } from './antigravity-statusline.js'
 import { clearPlan, readConfig, readPlan, readPlans, saveConfig, savePlan, getConfigFilePath, type CodeburnConfig, type Plan, type PlanId, type PlanProvider } from './config.js'
-import { clampResetDay, getPlanUsageOrNull, getPlanUsages, type PlanUsage } from './plan-usage.js'
+import { clampResetDay, copilotCreditsNote, getPlanUsageOrNull, getPlanUsages, type PlanUsage } from './plan-usage.js'
 import { getPresetPlan, isPlanId, isPlanProvider, PLAN_IDS, PLAN_PROVIDERS, planDisplayName } from './plans.js'
 import { createRequire } from 'node:module'
 
@@ -54,7 +55,7 @@ const { version } = require('../package.json')
 // Bump when the menubar payload's rendering semantics change without a package
 // release or daily-cache version change. The envelope version in session-cache
 // protects record shape; this protects the meaning of an otherwise valid one.
-const STATUS_SNAPSHOT_RENDER_VERSION = 1
+const STATUS_SNAPSHOT_RENDER_VERSION = 2
 const STATUS_SNAPSHOT_SEMANTIC_KEY = `${version}:render-${STATUS_SNAPSHOT_RENDER_VERSION}:daily-${DAILY_CACHE_VERSION}`
 import { loadCurrency, getCurrency, isValidCurrencyCode } from './currency.js'
 import { CodexThroughputReader, newestCodexSession, renderCodexThroughput } from './codex-throughput.js'
@@ -156,6 +157,10 @@ type JsonPlanSummary = {
   spentCredits?: number
   budgetCredits?: number
   creditsIncomplete?: boolean
+  estimatedCredits?: number
+  creditRatedCalls?: number
+  creditUnratedCalls?: number
+  creditsNote?: string
   monthlyUsd?: number
   spentApiEquivalentUsd?: number
 }
@@ -178,6 +183,10 @@ function toJsonPlanSummary(planUsage: PlanUsage): JsonPlanSummary {
     summary.spentCredits = planUsage.spentCredits
     summary.budgetCredits = planUsage.budgetCredits
     summary.creditsIncomplete = planUsage.creditsIncomplete
+    summary.estimatedCredits = planUsage.estimatedCredits
+    summary.creditRatedCalls = planUsage.creditRatedCalls
+    summary.creditUnratedCalls = planUsage.creditUnratedCalls
+    summary.creditsNote = copilotCreditsNote(planUsage.creditRatedCalls ?? 0, planUsage.creditUnratedCalls ?? 0)
     summary.monthlyUsd = planUsage.plan.monthlyUsd
     summary.spentApiEquivalentUsd = planUsage.spentApiEquivalentUsd
   }
@@ -1176,18 +1185,21 @@ program
         pricingGenerationKey: getPricingGenerationKey(),
       })
       // Optimize findings (the default; see --no-optimize) depend on mutable
-      // project/config/prompt/hook state — ~/.claude and project-level
-      // settings.json, CLAUDE.md, defined skills/agents/commands, MCP config
-      // — that computeCorpusFingerprint and queryKey never observe and that
-      // has no single enumerable fingerprint. Persisting THIS class of output
-      // would mean editing a hook or removing an unused skill leaves the
-      // menubar showing stale findings with no session change to ever
-      // invalidate them. Simplest correct fix: the optimize path never reads
-      // or writes the disk snapshot at all, it always recomputes fresh.
-      // (Computing scanAndDetect's findings requires the same parsed project
-      // data the snapshot exists to avoid recomputing, so skipping the
-      // snapshot loses no additional work versus fingerprinting these inputs
-      // — that path would still force a fresh parse to re-scan them.)
+      // project/config/prompt/hook state: ~/.claude and project-level
+      // settings.json, CLAUDE.md, defined skills/agents/commands, MCP config.
+      // computeCorpusFingerprint and queryKey never observe those inputs, and
+      // they have no single enumerable fingerprint. Persisting THAT class of
+      // output would leave an agent edit with no session change serving stale
+      // findings indefinitely. Caching only the base payload and re-deriving
+      // the findings on each hit (#1135 part 2) was tried on this branch and
+      // reverted in post-build review: scanAndDetect needs the parsed corpus,
+      // so the re-derivation pays the full parse the snapshot exists to avoid
+      // on exactly the cold processes the snapshot is for, and the resident
+      // serve child gains nothing either because its in-memory output memo
+      // already dedupes a repeated argv. Simplest correct stance: the
+      // optimize path never reads or writes the disk snapshot at all, it
+      // always recomputes fresh. One-shot and serve-child behavior are
+      // identical for both optimize values.
       const useSnapshot = !queryScope.optimize
       const corpus = useSnapshot ? await computeCorpusFingerprint(pf) : null
       const snapshot = corpus ? await loadStatusSnapshot(corpus.hash, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY) : null
@@ -1200,8 +1212,13 @@ program
       // result. Persisting it under the CURRENT (already-advanced) corpus
       // fingerprint would make that degraded answer look authoritative to
       // every future poll that matches this fingerprint — never checkpoint a
-      // partial hydration as if it were a real, complete parse.
-      if (useSnapshot && corpus && !snapshot && isSessionHydrationComplete()) {
+      // partial hydration as if it were a real, complete parse. Gate on the
+      // payload's own markers, captured at the one safe read point inside
+      // buildMenubarPayloadForRange: the hydration global is reassigned by
+      // every later parse (this function's own history re-parse included),
+      // so re-reading it here can bless a payload whose stale flag says
+      // degraded and pin its under-reported totals until the corpus changes.
+      if (useSnapshot && corpus && !snapshot && payload.stale !== true && payload.hydration === undefined && isSessionHydrationComplete()) {
         await saveStatusSnapshot(corpus.hash, corpus.newestMtimeMs, corpus.observedAtMs, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY, payload)
       }
       if (opts.scope === 'combined') {
@@ -2371,12 +2388,13 @@ program
   .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, cursor)', 'all')
   .option('--format <format>', 'Output format: table, json', 'table')
   .option('--by-pr', 'Group spend by the pull requests each session referenced')
+  .option('--by-work-unit', 'Group sessions into provider-recorded work units: one row per orchestration root with its delegated children folded beneath')
   .option('--no-pager', 'Print the complete table directly instead of opening the interactive browser')
   .action(async (opts) => {
     assertProvider(opts.provider, 'sessions')
     assertFormat(opts.format, ['table', 'json'], 'sessions')
-    const { aggregateSessions, buildPrAttribution, renderJson, renderTable } = await import('./sessions-report.js')
-    const wantsInteractive = opts.format === 'table' && !opts.byPr && opts.pager !== false && process.stdin.isTTY === true && process.stdout.isTTY === true
+    const { aggregateSessions, buildPrAttribution, renderJson, renderTable, renderWorkUnitJson, renderWorkUnitTable } = await import('./sessions-report.js')
+    const wantsInteractive = opts.format === 'table' && !opts.byPr && !opts.byWorkUnit && opts.pager !== false && process.stdin.isTTY === true && process.stdout.isTTY === true
     if (wantsInteractive) setInteractiveScanUI()
     await loadPricing()
 
@@ -2442,6 +2460,21 @@ program
       return
     }
     const rows = aggregateSessions(projects)
+    if (opts.byWorkUnit) {
+      const { resolveWorkUnits } = await import('./work-units.js')
+      const { inferSessionProvider } = await import('./session-output.js')
+      const resolution = resolveWorkUnits(projects.flatMap(project => project.sessions.map(session => ({
+        sessionId: session.sessionId,
+        provider: inferSessionProvider(session),
+        lineage: session.lineage,
+      }))))
+      if (opts.format === 'json') {
+        process.stdout.write(renderWorkUnitJson(rows, resolution) + '\n')
+        return
+      }
+      process.stdout.write(renderWorkUnitTable(rows, resolution) + '\n')
+      return
+    }
     if (opts.format === 'json') {
       process.stdout.write(renderJson(rows) + '\n')
       return
@@ -2580,6 +2613,7 @@ program
 registerActCommands(program)
 registerGuardCommands(program)
 registerSyncCommands(program)
+registerPluginCommands(program)
 
 program
   .command('serve')
@@ -2607,5 +2641,7 @@ if (process.argv[2] === 'serve') {
   // this child running as an orphan for as long as the machine is up.
   hardExit(0)
 } else {
-  buildProgram().parse()
+  const program = buildProgram()
+  await registerLoadedPluginCommands(program)
+  program.parse()
 }

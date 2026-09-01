@@ -113,13 +113,19 @@ struct AgentTabStrip: View {
     }
 
     private var visibleFilters: [ProviderFilter] {
-        // Tabs reflect the SELECTED range: every provider with usage (cost > 0)
-        // in the period, ordered by usage. Providers with no usage in the range
-        // are omitted. `.all` always leads. cost(for:) reads periodAll, so this
-        // updates as the user switches periods.
+        // Tabs reflect the selected range. The payload's activity signal keeps
+        // token-only and subscription/flat-rate providers visible while hiding
+        // providers merely discovered on disk. Older payloads lack the activity
+        // signal, so they preserve detected-provider visibility for compatibility.
+        let activeKeys = ProviderVisibility.activeKeys(
+            providerDetails: periodAll.current.providerDetails,
+            legacyProviders: periodAll.current.providers
+        )
         let costs = Dictionary(uniqueKeysWithValues: ProviderFilter.allCases.map { ($0, cost(for: $0) ?? 0) })
         let detected = ProviderFilter.allCases.filter { filter in
-            filter == .all || (costs[filter] ?? 0) > 0
+            filter == .all
+                || activeKeys.contains(filter.cliArg)
+                || filter.providerKeys.contains(where: activeKeys.contains)
         }
         return detected.sorted { a, b in
             if a == .all { return true }
@@ -221,37 +227,39 @@ private struct AgentTab: View {
     }
 
     var body: some View {
-        VStack(spacing: 3) {
-            HStack(spacing: 5) {
-                Text(filter.rawValue)
-                    .font(.system(size: 11.5, weight: .medium))
-                    .tracking(-0.05)
-                if let cost, cost > 0 {
-                    Text(cost.asCompactCurrency())
-                        .font(.codeMono(size: 10.5, weight: .medium))
-                        .foregroundStyle(isActive ? AnyShapeStyle(.white.opacity(0.8)) : AnyShapeStyle(.secondary))
-                        .tracking(-0.2)
-                }
-            }
-            if quota != nil {
-                AgentTabQuotaBar(quota: quota, isActive: isActive)
-                    .frame(height: 3)
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 4)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(isActive ? AnyShapeStyle(Theme.brandAccent) : AnyShapeStyle(Color.secondary.opacity(0.08)))
-        )
-        .foregroundStyle(isActive ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
-        .contentShape(Rectangle())
-        .onTapGesture {
+        Button {
             hoverPopoverShown = false
             hoverEnterTask?.cancel()
             clickDismissed = true
             onTap()
+        } label: {
+            VStack(spacing: 3) {
+                HStack(spacing: 5) {
+                    Text(filter.rawValue)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .tracking(-0.05)
+                    if let cost, cost > 0 {
+                        Text(cost.asCompactCurrency())
+                            .font(.codeMono(size: 10.5, weight: .medium))
+                            .foregroundStyle(isActive ? AnyShapeStyle(.white.opacity(0.8)) : AnyShapeStyle(.secondary))
+                            .tracking(-0.2)
+                    }
+                }
+                if quota != nil {
+                    AgentTabQuotaBar(quota: quota, isActive: isActive)
+                        .frame(height: 3)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isActive ? AnyShapeStyle(Theme.brandAccent) : AnyShapeStyle(Color.secondary.opacity(0.08)))
+            )
+            .foregroundStyle(isActive ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .onHover { hovering in
             hoverEnterTask?.cancel()
             hoverExitTask?.cancel()

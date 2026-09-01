@@ -95,6 +95,25 @@ export interface CallWithSession {
   project?: string
   /** Exact provider-recorded cwd. Synthetic labels and storage paths are excluded upstream. */
   workingDirectory?: string
+  /** Session-level wire context (CB-3). Absent on callers that predate it. */
+  session?: SessionWireContext
+}
+
+/**
+ * Session-level facts a usage span may carry (CB-3, boundary spec section 7).
+ * Every field is optional and emitted only when its value is proven; a session
+ * without provider-recorded lineage carries no workUnitId/sessionRole at all.
+ */
+export interface SessionWireContext {
+  /** Usage spans this session contributes in the parsed window. */
+  callCount: number
+  /** last - first provider-recorded event time. Undefined when either end is missing or unordered. */
+  durationMs?: number
+  /** deriveTraceId(root session id), the same derivation trace ids use. */
+  workUnitId?: string
+  sessionRole?: 'root' | 'child'
+  /** Plan/proxy-path decision. Undefined when the machinery cannot decide. */
+  subscriptionCovered?: boolean
 }
 
 function isEmailOrCredentialShaped(value: string): boolean {
@@ -179,10 +198,74 @@ function safeProjectAttribute(project: string | undefined): OtlpAttribute | null
   return { key: 'ai.project', value: { stringValue: project } }
 }
 
-export function buildOtlpPayload(calls: CallWithSession[]): OtlpPayload {
-  const deviceId = getDeviceId()
+export interface BuildOtlpOptions {
+  /**
+   * ISO date the local corpus is complete through (daily-cache watermark),
+   * stamped on the export batch as a resource attribute. Omit when the
+   * watermark is not trusted.
+   */
+  coverageThrough?: string
+  /**
+   * Extra span attributes contributed by loaded plugins (plugin socket,
+   * teams issue #3). This is the enforcement point, not a convention: an
+   * attribute survives only if its key is in `pluginAttributeKeys` (the
+   * union of loaded manifests' declared `syncAttributes`) and is not a
+   * core key. Undeclared, core-shadowing, or unsanitizable values are
+   * dropped here, so no plugin - signed or dev-flagged - can widen the
+   * wire beyond what its disclosed manifest declared.
+   */
+  pluginAttributes?: OtlpAttribute[]
+  pluginAttributeKeys?: ReadonlySet<string>
+  /**
+   * Per-call attributes and extra spans from plugin exporters (sync exporter
+   * seam, teams issue #3 phase 2). Already guarded upstream; perCall attrs
+   * are attached to the span whose deduplicationKey matches, and extra spans
+   * are appended to the span list.
+   */
+  pluginEnrichment?: {
+    perCall: Map<string, OtlpAttribute[]>
+    extraSpans: OtlpSpan[]
+  }
+}
 
-  const spans: OtlpSpan[] = calls.map(({ call, sessionId, workingDirectory }) => {
+/// Attribute keys the core emitter writes. Plugins add fields; they never
+/// overwrite these, so a plugin cannot lie about cost, tokens, or lineage.
+export const CORE_SYNC_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
+  'ai.provider', 'ai.model', 'ai.input_tokens', 'ai.output_tokens', 'ai.cost_usd', 'ai.speed',
+  'ai.project', 'ai.tools', 'ai.cost_estimated', 'ai.work_unit_id', 'ai.session_role',
+  'ai.lineage_evidence', 'ai.cache_read_tokens', 'ai.cache_write_tokens', 'ai.call_count',
+  'ai.session_duration_ms', 'ai.subscription_covered', 'codeburn.device_id',
+  'codeburn.coverage_through', 'codeburn.attribution_methodology',
+  'git.repo', 'git.sha', 'git.commit_count', 'git.in_main', 'git.was_reverted', 'git.pr_links',
+])
+
+/// Wire guard for plugin-supplied attributes (see BuildOtlpOptions).
+export function filterPluginAttributes(attrs: OtlpAttribute[], declaredKeys: ReadonlySet<string>): OtlpAttribute[] {
+  const kept: OtlpAttribute[] = []
+  for (const attr of attrs) {
+    if (!declaredKeys.has(attr.key) || CORE_SYNC_ATTRIBUTE_KEYS.has(attr.key)) continue
+    const v = attr.value
+    if ('stringValue' in v) {
+      // Same #1128 sanitizer vocabulary as every other wire string; a plugin
+      // value that looks like a path, URL, or credential never ships.
+      const safe = sanitizeIdentifier(v.stringValue, 256)
+      if (safe) kept.push({ key: attr.key, value: { stringValue: safe } })
+    } else if ('intValue' in v || 'doubleValue' in v || 'boolValue' in v) {
+      kept.push(attr)
+    }
+    // arrayValue and anything else: plugins may not ship structured values.
+  }
+  return kept
+}
+
+export function buildOtlpPayload(calls: CallWithSession[], opts?: BuildOtlpOptions): OtlpPayload {
+  const deviceId = getDeviceId()
+  const guardedPluginAttributes = opts?.pluginAttributes && opts.pluginAttributeKeys
+    ? filterPluginAttributes(opts.pluginAttributes, opts.pluginAttributeKeys)
+    : []
+
+  const spans: OtlpSpan[] = calls.map(({ call, sessionId, workingDirectory, session }) => {
+    const perCallEnrichment = opts?.pluginEnrichment?.perCall.get(call.deduplicationKey) ?? []
     const startNano = toUnixNano(call.timestamp)
     // End time = start + 1ms (we don't have real duration, but OTLP requires both)
     const endNano = (BigInt(startNano) + 1_000_000n).toString()
@@ -216,6 +299,52 @@ export function buildOtlpPayload(calls: CallWithSession[]): OtlpPayload {
     const isEstimated = call.provider === 'kiro' || call.usage.inputTokens === 0
     attributes.push({ key: 'ai.cost_estimated', value: { boolValue: isEstimated } })
 
+    // --- CB-3 additive fields (boundary spec section 7). Each is emitted only
+    // when its value is proven; an old receiver ignoring them loses nothing.
+
+    // Lineage: all three or none, and never inferred. The trio survives or
+    // falls together through the same #1128 sanitizers as the other strings.
+    if (session?.workUnitId && session.sessionRole) {
+      const workUnitId = sanitizeIdentifier(session.workUnitId, 64)
+      const role = sanitizeIdentifier(session.sessionRole, 16)
+      const evidence = sanitizeIdentifier('provider-recorded', 32)
+      if (workUnitId && role && evidence) {
+        attributes.push(
+          { key: 'ai.work_unit_id', value: { stringValue: workUnitId } },
+          { key: 'ai.session_role', value: { stringValue: role } },
+          { key: 'ai.lineage_evidence', value: { stringValue: evidence } },
+        )
+      }
+    }
+
+    // Cache tokens, billable-consistent with ai.input_tokens: providers record
+    // cache reads in exactly one vocabulary (Anthropic-style cacheRead or
+    // OpenAI-style cached-subset, the display layer's Math.max convention).
+    const cacheRead = Math.max(call.usage.cacheReadInputTokens, call.usage.cachedInputTokens)
+    if (cacheRead > 0) {
+      attributes.push({ key: 'ai.cache_read_tokens', value: { intValue: String(cacheRead) } })
+    }
+    if (call.usage.cacheCreationInputTokens > 0) {
+      attributes.push({ key: 'ai.cache_write_tokens', value: { intValue: String(call.usage.cacheCreationInputTokens) } })
+    }
+
+    if (session) {
+      attributes.push({ key: 'ai.call_count', value: { intValue: String(session.callCount) } })
+      if (session.durationMs !== undefined) {
+        attributes.push({ key: 'ai.session_duration_ms', value: { intValue: String(session.durationMs) } })
+      }
+      if (session.subscriptionCovered !== undefined) {
+        attributes.push({ key: 'ai.subscription_covered', value: { boolValue: session.subscriptionCovered } })
+      }
+    }
+
+    // Plugin socket: declared-and-guarded plugin fields only (see
+    // filterPluginAttributes). No plugins => no change to any byte.
+    attributes.push(...guardedPluginAttributes)
+
+    // Per-call enrichment from sync exporters
+    attributes.push(...perCallEnrichment)
+
     return {
       traceId: deriveTraceId(sessionId),
       spanId: deriveSpanId(call.deduplicationKey),
@@ -226,12 +355,23 @@ export function buildOtlpPayload(calls: CallWithSession[]): OtlpPayload {
     }
   })
 
+  const resourceAttributes: OtlpAttribute[] = [
+    { key: 'codeburn.device_id', value: { stringValue: deviceId } },
+  ]
+  const coverageThrough = opts?.coverageThrough ? sanitizeIdentifier(opts.coverageThrough, 32) : undefined
+  if (coverageThrough) {
+    resourceAttributes.push({ key: 'codeburn.coverage_through', value: { stringValue: coverageThrough } })
+  }
+
+  // Append extra spans from plugin exporters
+  if (opts?.pluginEnrichment?.extraSpans) {
+    spans.push(...opts.pluginEnrichment.extraSpans)
+  }
+
   return {
     resourceSpans: [{
       resource: {
-        attributes: [
-          { key: 'codeburn.device_id', value: { stringValue: deviceId } },
-        ],
+        attributes: resourceAttributes,
       },
       scopeSpans: [{
         spans,

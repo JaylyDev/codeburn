@@ -79,6 +79,56 @@ describe('plan budget copy', () => {
     expect(status).not.toMatch(/calendar/i)
   })
 
+  // #1199: with only 4 of 473 requests carrying GitHub's exact figure, the old
+  // headline read as a confident, wrong total. Say the number is estimated.
+  it('labels the Copilot total as estimated when requests carry no exact figure', () => {
+    const copilot = usage({
+      plan: {
+        id: 'copilot-max',
+        monthlyCredits: 20000,
+        monthlyUsd: 200,
+        provider: 'copilot',
+        resetDay: 1,
+        setAt: '2026-08-01T00:00:00.000Z',
+      },
+      budgetUsd: 200,
+      spentApiEquivalentUsd: 0.039,
+      spentCredits: 3.925845,
+      budgetCredits: 20000,
+      percentUsed: 0.02,
+      creditsIncomplete: true,
+      estimatedCredits: 9800.44,
+      creditRatedCalls: 4,
+      creditUnratedCalls: 469,
+    })
+    expect(planBudgetHeadline(copilot))
+      .toBe("Copilot Max: ~9800 / 20000 AI Credits (estimated; 4 of 473 requests carry GitHub's exact figure)")
+    expect(planBudgetHeadline(copilot)).not.toContain('—')
+  })
+
+  it('keeps the exact Copilot wording when every request is rated', () => {
+    const copilot = usage({
+      plan: {
+        id: 'copilot-pro',
+        monthlyCredits: 1500,
+        monthlyUsd: 15,
+        provider: 'copilot',
+        resetDay: 1,
+        setAt: '2026-08-01T00:00:00.000Z',
+      },
+      budgetUsd: 15,
+      spentApiEquivalentUsd: 0.015,
+      spentCredits: 1.5,
+      budgetCredits: 1500,
+      percentUsed: 0.1,
+      creditsIncomplete: false,
+      estimatedCredits: 1.5,
+      creditRatedCalls: 12,
+      creditUnratedCalls: 0,
+    })
+    expect(planBudgetHeadline(copilot)).toBe('Copilot Pro: 1.5 / 1500 AI Credits')
+  })
+
   // computePeriodFromResetDay builds an anniversary window from plan.resetDay
   // (1-28, settable with `codeburn plan set --reset-day`), so a plan that resets
   // on the 15th is NOT on a calendar month and must never be called one.

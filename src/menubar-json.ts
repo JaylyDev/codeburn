@@ -80,6 +80,10 @@ export type ProviderCost = {
   name: string
   displayName: string
   cost: number
+  /** Behavioral calls in the selected period; token-only supplementary usage may be zero. */
+  calls?: number
+  /** True when the selected period contains cost, calls, sessions, savings, or tokens. */
+  hasUsage?: boolean
 }
 import type { OptimizeResult } from './optimize.js'
 import { getCurrency } from './currency.js'
@@ -203,6 +207,11 @@ export type MenubarPayload = {
   /// a converged one. Distinct from `stale`: a first paint is fresh but
   /// partial, a stale payload is complete but old.
   hydration?: HydrationState
+  /// Add-only plugin socket sections (teams issue #3), keyed
+  /// `<plugin>.<section>`. Present only when a loaded plugin declared the
+  /// section AND its command wrote it. Surfaces render what they recognize
+  /// and ignore the rest; absence always means "no plugin output today".
+  plugins?: Record<string, unknown>
   current: {
     label: string
     cost: number
@@ -253,9 +262,10 @@ export type MenubarPayload = {
     localModelSavings: LocalModelSavings
     providers: Record<string, number>
     /// Provider identity alongside the `providers` map: `id` is the internal
-    /// provider name (round-trips as `--provider`), `label` the display name.
+    /// provider name (round-trips as `--provider`), `label` the display name,
+    /// and `hasUsage` the period-activity signal used by provider pickers.
     /// The `providers` map keys stay lowercased display names for compatibility.
-    providerDetails: Array<{ id: string; label: string; cost: number }>
+    providerDetails: Array<{ id: string; label: string; cost: number; calls: number; hasUsage: boolean }>
     topProjects: Array<{
       name: string
       cost: number
@@ -327,7 +337,19 @@ export type MenubarPayload = {
     }
     tools: Array<{ name: string; calls: number }>
     skills: Array<{ name: string; turns: number; cost: number }>
-    subagents: Array<{ name: string; calls: number; cost: number }>
+    subagents: Array<{
+      name: string
+      calls: number
+      cost: number
+      agentName?: string
+      model?: string
+      startedAt?: string
+      inputTokens?: number
+      outputTokens?: number
+      cacheReadTokens?: number
+      cacheWriteTokens?: number
+      totalTokens?: number
+    }>
     mcpServers: Array<{ name: string; calls: number }>
     /// Every pull request with attributed spend, cost-descending, plus the
     /// multi-link-safe distinct total. Absent when no PR links were observed and
@@ -445,7 +467,13 @@ function buildProviders(providers: ProviderCost[]): Record<string, number> {
 function buildProviderDetails(providers: ProviderCost[]): MenubarPayload['current']['providerDetails'] {
   return providers
     .filter(p => p.cost >= 0)
-    .map(p => ({ id: p.name, label: p.displayName, cost: p.cost }))
+    .map(p => ({
+      id: p.name,
+      label: p.displayName,
+      cost: p.cost,
+      calls: p.calls ?? 0,
+      hasUsage: p.hasUsage ?? (p.cost > 0 || (p.calls ?? 0) > 0),
+    }))
 }
 
 function buildHistory(daily: DailyHistoryEntry[] | undefined, timeline?: GranularHistory): MenubarPayload['history'] {

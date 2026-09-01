@@ -1,6 +1,6 @@
 import { behavioralCallCount } from './behavioral-weight.js'
 import { readPlans, type Plan, type PlanMap } from './config.js'
-import { creditsToUsd, isFiniteNanoAiu, nanoAiuToCredits } from './copilot-aiu.js'
+import { AI_CREDIT_USD, creditsToUsd, isFiniteNanoAiu, nanoAiuToCredits } from './copilot-aiu.js'
 import { parseAllSessions } from './parser.js'
 import { PLAN_PROVIDERS } from './plans.js'
 import type { DateRange, ParsedApiCall, ProjectSummary } from './types.js'
@@ -24,6 +24,11 @@ export type PlanUsage = {
   spentCredits?: number
   budgetCredits?: number
   creditsIncomplete?: boolean
+  /// spentCredits plus a token-priced estimate for the requests GitHub never
+  /// gave an exact figure for. Equals spentCredits when creditUnratedCalls is 0.
+  estimatedCredits?: number
+  creditRatedCalls?: number
+  creditUnratedCalls?: number
 }
 
 export function clampResetDay(resetDay: number | undefined): number {
@@ -95,9 +100,19 @@ function forEachPlanSession(projects: ProjectSummary[], visit: (calls: ParsedApi
   }
 }
 
-export function copilotCreditSpend(projects: ProjectSummary[]): { spentCredits: number; creditsIncomplete: boolean } {
+export type CopilotCreditSpend = {
+  spentCredits: number
+  estimatedCredits: number
+  creditRatedCalls: number
+  creditUnratedCalls: number
+  creditsIncomplete: boolean
+}
+
+export function copilotCreditSpend(projects: ProjectSummary[]): CopilotCreditSpend {
   let nanoSum = 0
-  let creditsIncomplete = false
+  let estimatedUsd = 0
+  let ratedCalls = 0
+  let unratedCalls = 0
   // Pairing is session-wide. foldCopilotSupplementaryTurns will not fold a
   // supplementary twin across a local-day boundary, so both nanoAiu rows can
   // occupy separate turns of the same session. Close the twin once here.
@@ -111,9 +126,37 @@ export function copilotCreditSpend(projects: ProjectSummary[]): { spentCredits: 
     // so a paired rollup cannot double the credits.
     const counted = primaryNano.length > 0 && suppNano.length > 0 ? primaryNano : [...primaryNano, ...suppNano]
     for (const call of counted) nanoSum += call.nanoAiu!
-    if (copilot.some(call => !isFiniteNanoAiu(call.nanoAiu))) creditsIncomplete = true
+    const unrated = copilot.filter(call => !isFiniteNanoAiu(call.nanoAiu))
+    ratedCalls += copilot.length - unrated.length
+    unratedCalls += unrated.length
+    // A rated row's total_nano_aiu is the whole request's bill, twin tokens
+    // included, so a session that carries any exact figure gets no estimate
+    // stacked on top of it. Everything else is priced from tokens at listed
+    // API rates. GitHub bills credits as exactly that (list rate with the
+    // cache-read/write split; request_multiplier is the legacy premium
+    // request weight and does not touch credits), verified against real
+    // session-store rows, so accuracy hinges on how completely the source
+    // recorded tokens and their cache split.
+    if (primaryNano.length === 0 && suppNano.length === 0) {
+      for (const call of unrated) estimatedUsd += call.costUSD
+    }
   })
-  return { spentCredits: nanoAiuToCredits(nanoSum), creditsIncomplete }
+  const spentCredits = nanoAiuToCredits(nanoSum)
+  return {
+    spentCredits,
+    estimatedCredits: spentCredits + estimatedUsd / AI_CREDIT_USD,
+    creditRatedCalls: ratedCalls,
+    creditUnratedCalls: unratedCalls,
+    creditsIncomplete: unratedCalls > 0,
+  }
+}
+
+export function copilotCreditsNote(rated: number, unrated: number): string {
+  if (rated === 0 && unrated === 0) return 'No Copilot requests in this period.'
+  if (unrated === 0) {
+    return `All ${rated} Copilot requests in this period carry GitHub's exact credit figure, so spentCredits is complete.`
+  }
+  return `${rated} of ${rated + unrated} Copilot requests carry GitHub's exact credit figure (Copilot CLI session-store rows are the only local source that has it). spentCredits counts only those; estimatedCredits adds the rest priced from tokens at listed API rates, which matched GitHub within about 15% on real Copilot CLI events; VS Code chat sessions record no cache split, so their estimate can land either side of the bill. percentUsed tracks estimatedCredits while any request is unrated.`
 }
 
 export function projectMonthEnd(
@@ -162,9 +205,13 @@ export function getPlanUsageFromProjects(plan: Plan, projects: ProjectSummary[],
   const daysUntilReset = Math.max(0, diffCalendarDays(today, periodEnd))
 
   if (isCopilotCreditsPlan(plan)) {
-    const { spentCredits, creditsIncomplete } = copilotCreditSpend(projects)
+    const { spentCredits, estimatedCredits, creditRatedCalls, creditUnratedCalls, creditsIncomplete } = copilotCreditSpend(projects)
     const budgetCredits = plan.monthlyCredits ?? 0
-    const percentUsed = budgetCredits > 0 ? (spentCredits / budgetCredits) * 100 : 0
+    // The bar follows the estimate once any request lacks an exact figure:
+    // a bar at 0% beside a 19k real bill is the misleading picture #1199
+    // reported, and a labelled estimate beats a confidently wrong zero.
+    const barCredits = creditUnratedCalls > 0 ? estimatedCredits : spentCredits
+    const percentUsed = budgetCredits > 0 ? (barCredits / budgetCredits) * 100 : 0
     const spent = creditsToUsd(spentCredits)
     const status: PlanStatus = percentUsed > 100 ? 'over' : percentUsed >= PLAN_NEAR_THRESHOLD_PCT ? 'near' : 'under'
     const projectedMonthUsd = projectMonthEnd(projects, periodStart, periodEnd, today, spent, call => planCallSpend(plan, call))
@@ -181,6 +228,9 @@ export function getPlanUsageFromProjects(plan: Plan, projects: ProjectSummary[],
       spentCredits,
       budgetCredits,
       creditsIncomplete,
+      estimatedCredits,
+      creditRatedCalls,
+      creditUnratedCalls,
     }
   }
 

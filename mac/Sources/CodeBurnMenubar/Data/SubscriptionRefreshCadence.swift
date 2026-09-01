@@ -1,6 +1,6 @@
 import Foundation
 
-/// User-configurable cadence for /api/oauth/usage polling. Mirrors CodexBar's
+/// User-configurable cadence for /api/oauth/usage polling. Uses
 /// "manual / 1m / 2m / 5m / 15m" preset set so users on tight rate-limit
 /// budgets can dial it down and power users can dial it up. Stored as the raw
 /// number of seconds in UserDefaults; `manual = 0` means "never auto-refresh".

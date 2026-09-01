@@ -12,6 +12,14 @@ CodeBurn uses semantic versioning (major.minor.patch). The CLI and macOS menubar
 
 ## Before Every Release
 
+The authoritative acceptance process lives in [`docs/release-acceptance/README.md`](docs/release-acceptance/README.md). Start a new evidence directory and run the exact candidate through the automated gate:
+
+```bash
+node scripts/release-acceptance/run.mjs --mode package --output /absolute/path/to/evidence/run-id
+```
+
+For a major release or material parser/cache/UI change, complete every blocking row in `docs/release-acceptance/cases.csv`, append the reviewed result to `docs/release-acceptance/ledger/history.jsonl`, and require installed-artifact click-through on every shipped surface. The automated runner does not replace Desktop, Menu Bar, or browser interaction.
+
 Run the test suite to catch any regressions:
 
 ```bash

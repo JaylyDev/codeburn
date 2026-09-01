@@ -81,6 +81,10 @@ See `docs/architecture.md` for a fuller map.
   runs under the full worker pool and fails intermittently; one that matches the prefix
   but is missing from `test:locks` never runs at all.
 
+### The full suite is the gate
+
+Before opening or updating a PR, run `npx vitest run` on your branch and on `main`, and compare. Your branch must introduce zero new failures. Listing only your own new tests as verification is not verification; the regressions we catch are almost always in tests the author never ran. For `mac/` changes the same applies to `swift test`.
+
 ## Commit Message Format
 
 Short imperative subject, optional body. Examples from `git log`:
@@ -102,6 +106,10 @@ If a flagged PR rejects on this check, the workflow prints the exact rebase comm
 
 **One PR at a time.** We will not review a second PR from you until the first is merged or closed. This keeps the review queue manageable and ensures each contribution gets proper attention.
 
+**Respond to review before writing more code.** If a maintainer posts findings on your PR, nothing new from you gets reviewed until you have addressed or answered them. Do not open PRs stacked on top of a branch with an unanswered review or known failing tests; a fix that lands above the bug it fixes means the PR below it was never mergeable.
+
+**You are accountable for what your agent submits.** Using AI agents to write PRs is fine; we do it too. But every PR carries your name, and "my agent generated it" is not a response to review findings. If your agent produces PRs faster than you can verify them against the full suite, slow the agent down.
+
 ## Adding a New Provider
 
 New providers have the highest bar because broken parsing silently produces wrong data for users. Before opening a PR:
@@ -110,6 +118,7 @@ New providers have the highest bar because broken parsing silently produces wron
 2. **Test against real data.** Run `npm run dev -- today` and `npm run dev -- models` with your real sessions and confirm the output looks correct — costs are non-zero, model names resolve, session counts match what you see in the tool.
 3. **Include proof in the PR.** Attach a screenshot or terminal output showing codeburn correctly parsing your real sessions. PRs for new providers without evidence of local testing will not be reviewed.
 4. **Do not rely on AI-generated guesses about storage paths or schemas.** Tools change their data formats between versions. The only way to know the current schema is to install the tool and inspect the actual files on disk.
+5. **Disclose your affiliation.** If you built the tool, work for the vendor, or otherwise benefit from it being listed, say so in the PR description. Being listed in CodeBurn is visibility in front of a large user base; undisclosed self-promotion gets the PR closed regardless of code quality. We may also hold new-tool submissions until the tool shows real adoption beyond its authors.
 
 PRs that add a provider based solely on online documentation or AI-generated code, without evidence of testing against real data, will be closed.
 

@@ -36,8 +36,8 @@ function waitForExit(child: ChildProcess): Promise<void> {
   })
 }
 
-function worker(cacheDir: string, barriers: string, id: string, source: string, bypass = false): ChildProcess {
-  return spawn(process.execPath, ['--import', 'tsx', join(process.cwd(), 'tests/fixtures/cache-refresh-worker.ts'), cacheDir, barriers, id, source, String(bypass)], {
+function worker(cacheDir: string, barriers: string, id: string, source: string, bypass = false, exitViaCleanup = false): ChildProcess {
+  return spawn(process.execPath, ['--import', 'tsx', join(process.cwd(), 'tests/fixtures/cache-refresh-worker.ts'), cacheDir, barriers, id, source, String(bypass), String(exitViaCleanup)], {
     cwd: process.cwd(),
     stdio: ['ignore', 'ignore', 'pipe'],
   })
@@ -156,6 +156,30 @@ describe('warm refresh child-process regression', () => {
     const exited = new Promise<void>(resolve => { holder.once('exit', () => resolve()) })
     holder.kill('SIGTERM')
     await exited
+    expect(existsSync(lock)).toBe(false)
+  })
+
+  it('unlinks its own warm-refresh lock on the TUI direct-exit boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cb-refresh-direct-exit-'))
+    roots.push(root)
+    const cacheDir = join(root, 'cache')
+    const barriers = join(root, 'barriers')
+    await mkdir(cacheDir, { recursive: true })
+    await mkdir(barriers, { recursive: true })
+    process.env['CODEBURN_CACHE_DIR'] = cacheDir
+    const initial = emptyCache()
+    initial.complete = true
+    await saveCache(initial)
+    const source = join(root, 'changed.json')
+    await writeFile(source, JSON.stringify({ output: 606 }))
+
+    const holder = worker(cacheDir, barriers, 'a', source, false, true)
+    await waitFor(join(barriers, 'a.parsed'))
+    const lock = join(cacheDir, 'session-refresh.lock')
+    expect(existsSync(lock)).toBe(true)
+
+    await writeFile(join(barriers, 'a.exit'), '')
+    await waitForExit(holder)
     expect(existsSync(lock)).toBe(false)
   })
 

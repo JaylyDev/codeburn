@@ -1,4 +1,4 @@
-type ActiveCurrency = { code: string; symbol: string; rate: number }
+export type ActiveCurrency = { code: string; symbol: string; rate: number }
 
 // Single source of truth for display currency. App.tsx sets it from the overview
 // payload; every formatUsd/formatConverted call site then converts for free.
@@ -11,7 +11,14 @@ export function setActiveCurrency(currency: ActiveCurrency): void {
 
 /** Raw-USD input: multiplies by the active FX rate, then prefixes the symbol. */
 export function formatUsd(n: number): string {
-  return formatConverted(n * activeCurrency.rate)
+  return formatUsdWithCurrency(n, activeCurrency)
+}
+
+/** Raw-USD input formatted against an explicit payload currency. This keeps a
+ * persisted exact snapshot correct on its very first paint, before App's
+ * global active-currency effect has had a chance to run. */
+export function formatUsdWithCurrency(n: number, currency: ActiveCurrency): string {
+  return `${currency.symbol}${(n * currency.rate).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
 /**

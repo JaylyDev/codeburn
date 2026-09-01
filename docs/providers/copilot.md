@@ -143,6 +143,33 @@ see the #927 ruling in `src/session-cache.ts`).
   stores parse identically without). Plan math sums finite `nanoAiu` into
   Copilot AI credits (`codeburn plan set copilot-pro`). Billing-grade cost
   rewrite of every report is still upstream #890.
+
+  These CLI session-store rows are the **only** local source that carries an
+  exact credit figure. VS Code chat sessions and transcripts, the OTel
+  `agent-traces.db`, JetBrains stores and the CLI session-state JSONL never do,
+  so on a typical machine most requests have no exact figure at all (#1199).
+  Everything unrated is estimated instead: the request's tokens priced at the
+  model's listed API rate, converted at 1 credit = $0.01. That is exactly how
+  GitHub bills credits, verified against real session-store rows: list rate
+  with the cache-read and cache-write split applied, and `request_multiplier`
+  (the legacy premium-request weight) never touches the credit figure. So the
+  estimate's accuracy hinges on the source: on Copilot CLI events, which carry
+  the cache split, CodeBurn's token pricing landed within about 15% of the
+  exact bill; VS Code chat sessions record prompt and output tokens only, so
+  their estimate can land either side of the bill, and the numbers in #1199
+  show the gap can reach roughly 2x. A session that carries any exact figure
+  is never estimated on top of, because `total_nano_aiu` already bills that
+  request's whole token set.
+
+  `codeburn plan` says so on the headline whenever anything is estimated
+  (`~9800 / 20000 AI Credits (estimated; 4 of 473 requests carry GitHub's exact
+  figure)`), and `codeburn status --format json | jq .plans.copilot` carries
+  `spentCredits` (exact only), `estimatedCredits` (exact plus estimate),
+  `creditRatedCalls` / `creditUnratedCalls`, `creditsIncomplete` and a plain
+  `creditsNote`. The bar and `percentUsed` follow `estimatedCredits` while any
+  request is unrated, and the exact figure once every request carries one.
+  For the live authoritative number, use the menubar's GitHub quota endpoint
+  (separate system, PR #1200).
 - **Sync.** `codeburn sync push` holds a copilot session until it has been
   quiet for 24 hours. The reconciliation output is mutable (a residual shrinks
   as rows land, a rollup is dropped once rows cover its leg, a row's pairing
@@ -180,6 +207,16 @@ community edition, `PyCharm2025.2`, …). `<kind>` ∈ `chat-agent-sessions`,
 XDG rules: `$XDG_CONFIG_HOME/github-copilot` when set, else
 `~/.config/github-copilot` (macOS / Linux) or `%LOCALAPPDATA%\github-copilot`
 (Windows).
+
+**Not available on the Linux Snap build.** `~/.config/github-copilot` also
+holds the Copilot OAuth credential files (`hosts.json`, `apps.json`) directly
+under that root, alongside the per-IDE nitrite stores at a variable
+`<ide>/<kind>/<storeId>/` depth. The strict-confinement snap's personal-files
+grant is a fixed list of literal paths, so it cannot reach the variable-depth
+`.db` files without also granting the credential files sitting beside them.
+JetBrains Copilot sessions are therefore not discovered when CodeBurn runs as
+a snap; every other Copilot source (CLI, VS Code core chat, VS Code extension
+transcripts, OTel) is unaffected.
 
 **Storage: the Nitrite `.db`.** An H2 MVStore file (header
 `H:2,block:9,…format:3`) of Java-serialized Nitrite documents (`NtAgentSession`,
@@ -274,6 +311,49 @@ surfaces, add a reader with a captured fixture.)
   turns, and the same session's turns are already read from
   `chat-agent-sessions`.
 - **Override the root** with `CODEBURN_COPILOT_JETBRAINS_DIR`.
+
+## Live quota (Copilot subscription)
+
+Separate from the log parser above: the macOS menubar reads live quota from
+`GET https://api.github.com/copilot_internal/user` with a GitHub token. Usage
+tracking never needs this token; only the quota bars do.
+
+`mac/Sources/CodeBurnMenubar/Data/CopilotSubscriptionService.swift` walks an
+ordered, read-only chain and takes the first token it finds. Every rung
+tolerates an absent, locked, or malformed source and falls through:
+
+1. `~/.config/github-copilot/hosts.json` (`github.com` preferred), then
+   `apps.json`. Written only by the older editor plugins; modern VS Code keeps
+   its GitHub login in encrypted secret storage, which CodeBurn deliberately
+   does not touch.
+2. `~/.copilot/config.json`, then `~/.copilot/settings.json` (the CLI moved
+   settings there in 1.0.35). The key holding the token is not documented and
+   has moved between releases, so instead of guessing key names the parser
+   takes the first string value carrying a GitHub access-token prefix
+   (`gho_`, `ghu_`, `ghp_`, `ghs_`, `github_pat_`). `ghr_` refresh tokens are
+   skipped: the usage endpoint rejects them.
+3. `COPILOT_GITHUB_TOKEN`, then `GH_TOKEN`, then `GITHUB_TOKEN`, matching the
+   Copilot CLI's own order. A GUI-launched app rarely inherits these.
+4. `gh auth token`, which resolves keyring vs `~/.config/gh/hosts.yml` itself.
+   The binary is located the same way `CodeburnCLI` locates codeburn.
+5. A token the user pastes into Settings, stored in CodeBurn's own
+   provider-scoped keychain item. A fine-grained personal access token with the
+   `Plan: Read-only` permission is enough.
+
+The Copilot CLI's own keychain item (generic password service `copilot-cli`)
+is deliberately **not** read. It is written by a Node keyring library, so
+`/usr/bin/security` is not in its partition list and every read would raise the
+macOS "allow access?" dialog; a user who clicks Deny would see it again on each
+refresh. Rung 4 reaches the same users anyway, because the Copilot CLI itself
+falls back to gh.
+
+Rung 4 costs a process spawn, so its answer is cached for `probeCacheTTL`
+(5 minutes) and dropped on disconnect and before the one 401 re-read.
+`hasCredential` is the cheap eligibility answer and never spawns: it
+approximates rung 4 with an installed `gh` binary.
+
+The Electron surface (`app/electron/quota/copilot.ts`) still implements only
+rung 1.
 
 ## Caching
 

@@ -20,7 +20,7 @@ struct GeminiUsage: Sendable, Equatable {
 }
 
 /// Live Gemini quota via the OAuth-backed Code Assist APIs the Gemini CLI
-/// itself calls (prior art: steipete/CodexBar docs/gemini.md, which derives
+/// itself calls (derived from the Google Code Assist client flow, which provides
 /// the flow from the CLI's own traffic):
 ///
 /// - POST .../v1internal:loadCodeAssist → tier (plan label) + quota project
@@ -307,7 +307,7 @@ enum GeminiSubscriptionService {
     }
 
     /// The `hd` claim (hosted domain) separates Google Workspace logins from
-    /// personal ones, mirroring CodexBar's tier labeling.
+    /// personal ones, matching the provider's tier labeling.
     private static func workspaceClaim(idToken: String?) -> Bool {
         guard let idToken else { return false }
         let parts = idToken.split(separator: ".")

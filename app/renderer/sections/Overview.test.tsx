@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { Polled } from '../hooks/usePolled'
 import { setActiveCurrency } from '../lib/format'
+import type { OverviewHeadlineSnapshot } from '../lib/overviewSnapshot'
 import type { ActReportJson, DailyHistoryEntry, MenubarPayload, YieldJsonReport } from '../lib/types'
 import { Overview, OverviewContent, deriveSignals, localDateKey } from './Overview'
 
@@ -275,6 +276,149 @@ describe('Overview', () => {
     expect(statsCard?.children).toHaveLength(2)
     expect(within(statsCard as HTMLElement).getByText('Projected month')).toBeInTheDocument()
     expect(screen.queryByText('Nearest limit')).not.toBeInTheDocument()
+  })
+
+  it('keeps six-month and lifetime chart dates legible by capping and spreading axis ticks', async () => {
+    const now = new Date()
+    const payload = makePayload(now)
+    payload.current.label = 'Lifetime'
+    payload.history.daily = consecutiveDays(now, 365, index => index + 1)
+    getOverview.mockResolvedValue(payload)
+
+    const { container } = render(<Overview period="lifetime" provider="all" />)
+
+    expect(await screen.findByText('Lifetime')).toBeInTheDocument()
+    const ticks = [...container.querySelectorAll('.ov-xax span')]
+    expect(ticks).toHaveLength(6)
+    expect(ticks[0]).toHaveTextContent(new Date(
+      now.getFullYear(), now.getMonth(), now.getDate() - 364,
+    ).toLocaleString('en-US', { month: 'short', day: 'numeric' }))
+    expect(ticks.at(-1)).toHaveTextContent(now.toLocaleString('en-US', { month: 'short', day: 'numeric' }))
+  })
+
+  it('opens the activity heatmap at the newest dates without pinning later manual scrolling', async () => {
+    const scrollWidth = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get').mockReturnValue(520)
+    const clientWidth = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(320)
+    try {
+      const now = new Date()
+      getOverview.mockResolvedValue(makePayload(now))
+
+      const { container } = render(<Overview period="30days" provider="all" />)
+
+      expect(await screen.findByText('$312.40')).toBeInTheDocument()
+      const scroller = container.querySelector('.ov-heatmap-scroll') as HTMLDivElement
+      expect(scroller.scrollLeft).toBe(200)
+
+      scroller.scrollLeft = 24
+      fireEvent.scroll(scroller)
+      expect(scroller.scrollLeft).toBe(24)
+    } finally {
+      scrollWidth.mockRestore()
+      clientWidth.mockRestore()
+    }
+  })
+
+  it('waits for the compact heatmap slot to reach its final width before aligning newest dates', async () => {
+    let measuredScrollWidth = 320
+    let measuredClientWidth = 320
+    const scrollWidth = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get')
+      .mockImplementation(() => measuredScrollWidth)
+    const clientWidth = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get')
+      .mockImplementation(() => measuredClientWidth)
+    let resizeCallback: ResizeObserverCallback | null = null
+    const disconnect = vi.fn()
+    class MockResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallback = callback
+      }
+      observe = vi.fn()
+      disconnect = disconnect
+      unobserve = vi.fn()
+    }
+    vi.stubGlobal('ResizeObserver', MockResizeObserver)
+
+    try {
+      const now = new Date()
+      getOverview.mockResolvedValue(makePayload(now))
+
+      const { container } = render(<Overview period="30days" provider="all" />)
+
+      expect(await screen.findByText('$312.40')).toBeInTheDocument()
+      const scroller = container.querySelector('.ov-heatmap-scroll') as HTMLDivElement
+      expect(scroller.scrollLeft).toBe(0)
+
+      measuredScrollWidth = 520
+      measuredClientWidth = 320
+      act(() => resizeCallback?.([], {} as ResizeObserver))
+      expect(scroller.scrollLeft).toBe(200)
+      expect(disconnect).not.toHaveBeenCalled()
+
+      scroller.scrollLeft = 24
+      fireEvent.scroll(scroller)
+      act(() => resizeCallback?.([], {} as ResizeObserver))
+      expect(scroller.scrollLeft).toBe(24)
+    } finally {
+      vi.unstubAllGlobals()
+      scrollWidth.mockRestore()
+      clientWidth.mockRestore()
+    }
+  })
+
+  it('keeps following the newest dates across later resizes until the user scrolls away', async () => {
+    let measuredScrollWidth = 520
+    let measuredClientWidth = 320
+    const scrollWidth = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get')
+      .mockImplementation(() => measuredScrollWidth)
+    const clientWidth = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get')
+      .mockImplementation(() => measuredClientWidth)
+    let resizeCallback: ResizeObserverCallback | null = null
+    class MockResizeObserver {
+      constructor(callback: ResizeObserverCallback) { resizeCallback = callback }
+      observe = vi.fn()
+      disconnect = vi.fn()
+      unobserve = vi.fn()
+    }
+    vi.stubGlobal('ResizeObserver', MockResizeObserver)
+
+    try {
+      const now = new Date()
+      getOverview.mockResolvedValue(makePayload(now))
+      const { container } = render(<Overview period="30days" provider="all" />)
+      expect(await screen.findByText('$312.40')).toBeInTheDocument()
+      const scroller = container.querySelector('.ov-heatmap-scroll') as HTMLDivElement
+      expect(scroller.scrollLeft).toBe(200)
+
+      measuredClientWidth = 240
+      act(() => resizeCallback?.([], {} as ResizeObserver))
+      expect(scroller.scrollLeft).toBe(280)
+
+      scroller.scrollLeft = 24
+      fireEvent.scroll(scroller)
+      measuredClientWidth = 200
+      act(() => resizeCallback?.([], {} as ResizeObserver))
+      expect(scroller.scrollLeft).toBe(24)
+    } finally {
+      vi.unstubAllGlobals()
+      scrollWidth.mockRestore()
+      clientWidth.mockRestore()
+    }
+  })
+
+  it('keeps weekday labels fixed while month context scrolls with the activity cells', async () => {
+    const now = new Date()
+    getOverview.mockResolvedValue(makePayload(now))
+
+    render(<Overview period="30days" provider="all" />)
+
+    expect(await screen.findByText('$312.40')).toBeInTheDocument()
+    const timeline = screen.getByRole('region', { name: 'Scrollable daily activity timeline' })
+    const weekdayLabels = screen.getByLabelText('Weekday labels')
+
+    expect(within(weekdayLabels).getByText('Mon')).toBeInTheDocument()
+    expect(within(weekdayLabels).getByText('Wed')).toBeInTheDocument()
+    expect(within(weekdayLabels).getByText('Fri')).toBeInTheDocument()
+    expect(within(timeline).queryByText('Mon')).not.toBeInTheDocument()
+    expect(within(timeline).getByText(now.toLocaleString('en-US', { month: 'short' }))).toBeInTheDocument()
   })
 
   it('renders efficiency, cost-per-outcome, and the weekday-spike risk signal', async () => {
@@ -741,6 +885,76 @@ describe('Overview', () => {
     const outcome = (await screen.findByText('Cost per outcome')).closest('.ov-panel') as HTMLElement
     expect(within(outcome).getByText('€22.50')).toBeInTheDocument()
     expect(within(outcome).getByText('€36.00')).toBeInTheDocument()
+  })
+
+  it('formats a persisted headline in its own currency on first paint and dates older snapshots', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2026, 7, 28, 10, 0, 0))
+    setActiveCurrency({ code: 'USD', symbol: '$', rate: 1 })
+    const captured = new Date(2026, 7, 26, 14, 30, 0)
+    const snapshot: OverviewHeadlineSnapshot = {
+      version: 2,
+      key: 'all|30days',
+      capturedAt: captured.getTime(),
+      generated: captured.toISOString(),
+      label: 'Last 30 days',
+      cost: 100,
+      calls: 12,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      currency: { code: 'EUR', symbol: '€', rate: 0.9 },
+    }
+    const loading: Polled<MenubarPayload> = {
+      data: null,
+      error: null,
+      loading: true,
+      switching: false,
+      lastSuccessAt: null,
+      refresh: vi.fn(),
+    }
+
+    render(<OverviewContent period="30days" provider="all" overview={loading} headlineSnapshot={snapshot} />)
+
+    expect(screen.getByText('€90.00')).toBeInTheDocument()
+    expect(screen.getByText('exact Aug 26 at 2:30 PM')).toBeInTheDocument()
+  })
+
+  it('suppresses only the persisted-headline handoff, not later filter animations', () => {
+    const now = new Date(2026, 7, 28, 10, 0, 0)
+    const payload = makePayload(now)
+    const snapshot: OverviewHeadlineSnapshot = {
+      version: 2,
+      key: 'all|30days',
+      capturedAt: now.getTime(),
+      generated: now.toISOString(),
+      label: 'Last 30 days',
+      cost: payload.current.cost,
+      calls: payload.current.calls,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      currency: { code: 'USD', symbol: '$', rate: 1 },
+    }
+    const loading: Polled<MenubarPayload> = {
+      data: null,
+      error: null,
+      loading: true,
+      switching: false,
+      lastSuccessAt: null,
+      refresh: vi.fn(),
+    }
+    const { container, rerender } = render(
+      <OverviewContent period="30days" provider="all" overview={loading} headlineSnapshot={snapshot} />,
+    )
+
+    rerender(<OverviewContent period="30days" provider="all" overview={polled(payload)} headlineSnapshot={snapshot} />)
+    expect(container.querySelector('[data-countup-animation]')).toHaveAttribute('data-countup-animation', 'suppressed')
+
+    rerender(<OverviewContent period="week" provider="all" overview={polled(payload)} headlineSnapshot={snapshot} />)
+    expect(container.querySelector('[data-countup-animation]')).toHaveAttribute('data-countup-animation', 'enabled')
   })
 })
 

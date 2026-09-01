@@ -3,10 +3,9 @@ import Security
 
 /// Owns the Codex (ChatGPT-mode) OAuth credential lifecycle. Mirrors
 /// ClaudeCredentialStore but reads from ~/.codex/auth.json — Codex CLI
-/// already stores its tokens as plaintext JSON in the home directory, so
-/// no keychain prompt is involved on bootstrap. After the user clicks
-/// Connect we cache a CodeBurn-owned copy in the macOS Keychain so
-/// we keep using rotated tokens after refresh.
+/// already stores its tokens as owner-only JSON in the home directory. That
+/// file remains authoritative: CodeBurn does not create another provider-
+/// specific Keychain item or require a separate Connect ceremony.
 enum CodexCredentialStore {
     private static let bootstrapCompletedKey = "codeburn.codex.bootstrapCompleted"
     private static let inMemoryTTL: TimeInterval = 5 * 60
@@ -53,6 +52,12 @@ enum CodexCredentialStore {
 
     private static var homeDirectory: URL {
         homeDirectoryOverride ?? FileManager.default.homeDirectoryForCurrentUser
+    }
+
+    static var hasCredentialSource: Bool {
+        FileManager.default.fileExists(
+            atPath: homeDirectory.appendingPathComponent(codexAuthPath).path
+        )
     }
 
     struct CachedRecord {
@@ -156,7 +161,6 @@ enum CodexCredentialStore {
     @discardableResult
     static func bootstrap() throws -> CredentialRecord {
         let record = try readCodexAuth()
-        try writeOurCache(record: record)
         isBootstrapCompleted = true
         cacheInMemory(record)
         return record
@@ -166,11 +170,10 @@ enum CodexCredentialStore {
         guard isBootstrapCompleted else { return nil }
         // The Codex CLI's auth.json is the source of truth. Read it fresh each
         // call so we always serve the CLI's current token rather than racing it
-        // with a stale private copy. Our cache is only a fallback for when the
-        // file is briefly unreadable.
+        // with a stale private copy. The historical CodeBurn Keychain cache is
+        // read only as a continuity fallback when the file is briefly unreadable.
         if let live = try? readCodexAuth() {
             cacheInMemory(live)
-            try? writeOurCache(record: live)
             return live
         }
         if let cached = lock.withLock({ memoryCache }), cached.isFresh {
@@ -209,7 +212,6 @@ enum CodexCredentialStore {
         // token, which would race the CLI and can invalidate its login.
         if let live = try? readCodexAuth(), live.accessToken != failedToken {
             cacheInMemory(live)
-            try? writeOurCache(record: live)
             return live.accessToken
         }
         guard let record = try currentRecord() else { throw StoreError.noRefreshToken }
@@ -492,7 +494,6 @@ enum CodexCredentialStore {
             if http.statusCode >= 400, http.statusCode < 500,
                let live = try? readCodexAuth(), live.refreshToken != record.refreshToken {
                 cacheInMemory(live)
-                try? writeOurCache(record: live)
                 return live
             }
             let body = String(data: data, encoding: .utf8)
@@ -518,14 +519,9 @@ enum CodexCredentialStore {
             lastRefresh: Date()
         )
         cacheInMemory(updated)
-        // Write the rotated grant back to the CLI's store first so the CLI keeps
-        // working, then mirror it into our fallback cache.
+        // Write the rotated grant back to the CLI's authoritative store so the
+        // CLI and CodeBurn continue sharing one login.
         writeBackToCodexAuth(record: updated)
-        do {
-            try writeOurCache(record: updated)
-        } catch {
-            NSLog("CodeBurn: codex cache write failed during refresh rotation: %@", String(describing: error))
-        }
         return updated
     }
 }

@@ -129,6 +129,49 @@ describe('codeburn status --format menubar-json', () => {
     }
   })
 
+  it('reports calls for a zero-cost provider so the menubar can show its tab', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-zero-cost-provider-'))
+
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'myapp')
+      await mkdir(projectDir, { recursive: true })
+      const now = new Date()
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const userAt = new Date(Math.max(todayUtcMidnight, now.getTime() - 60_000))
+      const ts1 = userAt.toISOString().replace(/\.\d+Z$/, 'Z')
+      const ts2 = now.toISOString().replace(/\.\d+Z$/, 'Z')
+      await writeFile(
+        join(projectDir, 'session.jsonl'),
+        [
+          userLine('zero-cost', ts1),
+          assistantLine('zero-cost', ts2, 'msg-zero-cost', 'definitely-unpriced-model'),
+        ].join('\n'),
+      )
+
+      const result = runCli([
+        'status',
+        '--format', 'menubar-json',
+        '--period', 'today',
+        '--provider', 'all',
+        '--no-optimize',
+        '--no-timeline',
+      ], home)
+
+      expect(result.status, `stderr: ${result.stderr}`).toBe(0)
+      const payload = JSON.parse(result.stdout) as {
+        current: { providerDetails: Array<{ id: string; cost: number; calls: number; hasUsage: boolean }> }
+      }
+      expect(payload.current.providerDetails.find(p => p.id === 'claude')).toMatchObject({
+        id: 'claude',
+        cost: 0,
+        calls: 1,
+        hasUsage: true,
+      })
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
   it('omits history.timeline with --no-timeline, includes it by default', async () => {
     const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-tl-'))
     try {
@@ -905,6 +948,51 @@ describe('codeburn status --format menubar-json', () => {
 
       expect(findingsAfter).toBe(findingsBefore + 1)
       expect(findSnapshotFiles(cacheDir)).toEqual([])
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('reflects appended session activity on the very next optimize-path call', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-optimize-miss-'))
+
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'myapp')
+      await mkdir(projectDir, { recursive: true })
+      const now = new Date()
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
+      const ts = (offset: number) => new Date(base.getTime() + offset).toISOString().replace(/\.\d+Z$/, 'Z')
+      await writeFile(
+        join(projectDir, 'session.jsonl'),
+        [userLine('s1', ts(0)), assistantLine('s1', ts(60_000), 'msg-1')].join('\n'),
+      )
+
+      // Same provider for both calls: the only delta between the two
+      // invocations is the appended session line, so a changed answer can
+      // only come from the corpus change being picked up, never from a
+      // queryKey change.
+      const args = ['status', '--format', 'menubar-json', '--period', 'today', '--provider', 'claude']
+
+      const first = runCli(args, home)
+      expect(first.status, `stderr: ${first.stderr}`).toBe(0)
+      const firstPayload = JSON.parse(first.stdout) as { current: { calls: number } }
+      expect(firstPayload.current.calls).toBe(1)
+
+      // The optimize path never reads the disk snapshot, so the new session
+      // line shows up immediately, with no settle window to wait out.
+      await writeFile(
+        join(projectDir, 'session.jsonl'),
+        [
+          userLine('s1', ts(0)), assistantLine('s1', ts(60_000), 'msg-1'),
+          userLine('s1', ts(120_000)), assistantLine('s1', ts(180_000), 'msg-2'),
+        ].join('\n'),
+      )
+
+      const second = runCli(args, home)
+      expect(second.status, `stderr: ${second.stderr}`).toBe(0)
+      const secondPayload = JSON.parse(second.stdout) as { current: { calls: number } }
+      expect(secondPayload.current.calls).toBe(2)
     } finally {
       await rm(home, { recursive: true, force: true })
     }

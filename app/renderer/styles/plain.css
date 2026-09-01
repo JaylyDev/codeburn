@@ -302,6 +302,7 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
 /* Notices — placeholder note, stale-data banner, daily-budget banner. */
 .empty-note { color: var(--mut); margin: 0; font-size: 12px; }
 .stale-banner { font-size: 11.5px; color: var(--mut); border-left: 2px solid var(--warn); padding: 3px 8px; margin: 0 0 8px; line-height: 1.4; }
+.switching-banner { color: var(--accent); border-left-color: var(--accent); }
 .budget-banner { display: flex; align-items: center; gap: 10px; padding: 6px 16px; font-size: 12px; font-weight: 550; color: var(--warn); border-left: 3px solid var(--warn); border-bottom: 1px solid var(--line); line-height: 1.4; }
 .budget-banner.exceeded { color: var(--bad); border-left-color: var(--bad); }
 .budget-banner > span { flex: 1; }
@@ -507,6 +508,7 @@ td:first-child { font-size: var(--fs-body); font-weight: var(--fw-body); }
 .ov-hero-split { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; align-items: stretch; }
 .ov-hero-split > * { min-width: 0; padding: 16px 18px; }
 .ov-hero-split > * + * { border-left: 1px solid var(--line2); }
+.ov-hero-split.snapshot-hero > * { grid-column: 1 / -1; }
 .ov-hero-main { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
 .ov-hero-top { width: 100%; }
 .ov-saved-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 7px; margin-top: 5px; padding-top: 9px; border-top: 1px solid var(--line2); color: var(--mut2); font-size: 10.5px; }
@@ -730,9 +732,14 @@ td:first-child { font-size: var(--fs-body); font-weight: var(--fw-body); }
 .ov-summary-chip span { color: var(--mut2); }
 .ov-summary-chip strong { color: var(--ink); font-family: var(--mono); font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .ov-active-days { color: var(--accent) !important; font-family: var(--mono); font-variant-numeric: tabular-nums; }
-.ov-heatmap-scroll { max-width: 100%; overflow-x: auto; padding: 2px 0 3px; }
-.ov-heatmap { display: grid; grid-template-columns: 28px max-content; align-items: start; gap: 7px; min-width: max-content; }
-.ov-heatmap-labels { display: grid; grid-template-rows: repeat(7, 11px); gap: 3px; color: var(--mut2); font-size: 9px; font-weight: 520; line-height: 11px; }
+.ov-heatmap-frame { display: grid; min-width: 0; grid-template-columns: 28px minmax(0, 1fr); grid-template-rows: 14px auto; align-items: start; column-gap: 7px; row-gap: 3px; }
+.ov-heatmap-corner { grid-column: 1; grid-row: 1; }
+.ov-heatmap-scroll { min-width: 0; max-width: 100%; overflow-x: auto; grid-column: 2; grid-row: 1 / span 2; padding: 0 0 3px; }
+.ov-heatmap-scroll:focus-visible { border-radius: 3px; outline: 1px solid var(--accent); outline-offset: 2px; }
+.ov-heatmap-track { display: grid; width: max-content; min-width: max-content; grid-template-rows: 14px auto; row-gap: 3px; }
+.ov-heatmap-months { display: grid; min-height: 14px; grid-template-columns: repeat(26, 11px); column-gap: 3px; color: var(--mut2); font-size: 9px; font-weight: 520; line-height: 12px; }
+.ov-heatmap-months span { overflow: visible; white-space: nowrap; }
+.ov-heatmap-labels { display: grid; grid-column: 1; grid-row: 2; grid-template-rows: repeat(7, 11px); gap: 3px; color: var(--mut2); font-size: 9px; font-weight: 520; line-height: 11px; }
 .ov-heatmap-labels span { text-align: right; }
 .ov-heatmap-cells { display: grid; grid-template-rows: repeat(7, 11px); grid-auto-flow: column; grid-auto-columns: 11px; gap: 3px; }
 .ov-heat-cell { width: 11px; height: 11px; padding: 0; border: 0; border-radius: 2px; background: var(--fill); cursor: default; }

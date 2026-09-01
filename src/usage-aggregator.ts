@@ -2,9 +2,10 @@ import { homedir } from 'node:os'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory, type DateRange } from './types.js'
 import { isBehavioralCall } from './behavioral-weight.js'
 import { type PeriodData, type ProviderCost, type BreakdownArrays, type MenubarPayload, type ClaudeConfigSelector, type HydrationState, buildMenubarPayload } from './menubar-json.js'
-import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, isSessionHydrationComplete, sessionHydrationSnapshot } from './parser.js'
+import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, filterProjectsByDateRange, isSessionHydrationComplete, sessionHydrationSnapshot } from './parser.js'
 import { findUnpricedModels, getFlatRateModelsConfigHash, getLocalModelSavingsConfigHash, getPriceOverridesConfigHash, getShortModelName, isExpectedFreeModel } from './models.js'
 import { getAllProviders, safeDiscoverSessions } from './providers/index.js'
+import { loadPlugins, pluginPayloadSections } from './plugins/loader.js'
 import { claude, getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { stat } from 'node:fs/promises'
 import { aggregateProjectsIntoDays, buildPeriodDataFromDays, dateKeyInTz } from './day-aggregator.js'
@@ -19,6 +20,19 @@ import { buildGranularHistory } from './granular-history.js'
 
 // Row caps for the by-PR / by-branch payload aggregations, ranked by cost.
 const TOP_BRANCHES = 15
+type SubagentRow = NonNullable<BreakdownArrays['subagents']>[number]
+
+export function providerSliceHasUsage(slice: ProviderDaySlice): boolean {
+  return slice.cost > 0
+    || slice.savingsUSD > 0
+    || slice.calls > 0
+    || (slice.sessions ?? 0) > 0
+    || (slice.inputTokens ?? 0) > 0
+    || (slice.outputTokens ?? 0) > 0
+    || (slice.cacheReadTokens ?? 0) > 0
+    || (slice.cacheWriteTokens ?? 0) > 0
+}
+
 
 export function buildPeriodData(label: string, projects: ProjectSummary[]): PeriodData {
   const sessions = projects.flatMap(p => p.sessions)
@@ -113,6 +127,21 @@ async function hydrateCache(): Promise<DailyCache> {
     )
     return emptyCache()
   }
+}
+
+/**
+ * Finish the existing durable day cache from an already-normalized lifetime
+ * session index. The parser callback is only a range projection of `projects`:
+ * no source discovery, transcript read, or session-cache parse is repeated.
+ */
+export async function hydrateDailyCacheFromNormalizedProjects(projects: ProjectSummary[], complete = true): Promise<DailyCache> {
+  return ensureCacheHydrated(
+    (range) => Promise.resolve(filterProjectsByDateRange(projects, range)),
+    aggregateProjectsIntoDays,
+    getDailyCacheConfigHash(),
+    () => complete,
+    (rangeProjects, tz) => aggregateProjectsIntoDays(rangeProjects, (iso) => dateKeyInTz(iso, tz)),
+  )
 }
 
 /// The `hydration` block is emitted ONLY inside the resident serve child, which
@@ -382,6 +411,102 @@ function unionDaysForPeriod(
   return daysSelection ? unfiltered.filter(d => daysSelection.has(d.date)) : unfiltered
 }
 
+export type IndexedDurableOverview = {
+  cost: number
+  savingsUSD: number
+  calls: number
+  sessions: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  carriedCostUSD: number
+}
+
+/**
+ * Project a dashboard headline from one normalized lifetime index. Existing
+ * durable cache days remain authoritative (so expired transcripts do not
+ * disappear); normalized days fill only dates the durable cache does not yet
+ * contain, which is the cold first-index case. Today always comes from the
+ * live normalized index. No parser is called here.
+ */
+export function buildDurableOverviewFromNormalizedIndex(
+  periodInfo: PeriodInfo,
+  normalizedProjects: ProjectSummary[],
+  cache: DailyCache,
+  opts: AggregateOpts = {},
+): IndexedDurableOverview {
+  const pf = opts.provider ?? 'all'
+  const include = (opts.project ?? []).map(value => value.toLowerCase())
+  const exclude = (opts.exclude ?? []).map(value => value.toLowerCase())
+  const hasProjectFilter = include.length > 0 || exclude.length > 0
+  const filteredProjects = filterProjectsByName(normalizedProjects, opts.project ?? [], opts.exclude ?? [])
+  const scanProjects = filterProjectsByDateRange(filteredProjects, periodInfo.range)
+  const now = new Date()
+  const todayStr = toDateString(now)
+  const normalizedDays = aggregateProjectsIntoDays(filteredProjects)
+  const todayDays = normalizedDays
+    .filter(day => day.date === todayStr)
+  const historicalSlice = hasProjectFilter
+    ? (day: DailyEntry): DailyEntry => sliceDayToProject(day, include, exclude)
+    : undefined
+  const cachedAllDays = unionDaysForPeriod(cache, todayDays, periodInfo, null, historicalSlice)
+  const cachedDates = new Set(cache.days.map(day => day.date))
+  const rangeStartStr = toDateString(periodInfo.range.start)
+  const rangeEndStr = toDateString(periodInfo.range.end)
+  // A provider-scoped index deliberately does not rewrite the shared all-
+  // provider durable cache. When that cache has no row for a surviving
+  // historical source, fill the missing date from this same normalized index;
+  // existing durable rows stay authoritative so expired history is preserved.
+  const canFillMissingDates = cache.complete !== true || cache.days.length === 0
+  const normalizedHistoricalDays = canFillMissingDates
+    ? normalizedDays.filter(day =>
+        day.date !== todayStr
+        && day.date >= rangeStartStr
+        && day.date <= rangeEndStr
+        && !cachedDates.has(day.date)
+      )
+    : []
+  const allDays = [...cachedAllDays, ...normalizedHistoricalDays].sort((a, b) => a.date.localeCompare(b.date))
+  const normalizedByDate = new Map(normalizedDays.map(day => [day.date, day]))
+  const days = pf === 'all' ? allDays : allDays.map(day => {
+    if (Object.hasOwn(day.providers, pf)) return sliceDayToProvider(day, pf)
+    const normalized = normalizedByDate.get(day.date)
+    // The shared cache can be complete for a date while lacking this selected
+    // provider's slice (for example, Claude was cached before Codex appeared).
+    // Fill only that absent slice from the provider-scoped normalized index.
+    // An existing slice remains authoritative, retaining carried/expired money
+    // and preventing the surviving source from being counted twice.
+    return normalized && Object.hasOwn(normalized.providers, pf)
+      ? sliceDayToProvider(normalized, pf)
+      : sliceDayToProvider(day, pf)
+  })
+  const data = buildPeriodDataFromDays(days, periodInfo.label)
+
+  // Fields whose durable day rows cannot project under a project filter come
+  // from the same normalized period slice that feeds the visible detail panels.
+  const scan = buildPeriodData(periodInfo.label, scanProjects)
+  data.sessions = Math.max(data.sessions, scan.sessions)
+  if (hasProjectFilter) {
+    data.inputTokens = scan.inputTokens
+    data.outputTokens = scan.outputTokens
+    data.cacheReadTokens = scan.cacheReadTokens
+    data.cacheWriteTokens = scan.cacheWriteTokens
+  }
+
+  return {
+    cost: data.cost,
+    savingsUSD: data.savingsUSD,
+    calls: data.calls,
+    sessions: data.sessions,
+    inputTokens: data.inputTokens,
+    outputTokens: data.outputTokens,
+    cacheReadTokens: data.cacheReadTokens,
+    cacheWriteTokens: data.cacheWriteTokens,
+    carriedCostUSD: days.reduce((sum, day) => sum + (day.carried ? day.cost : 0), 0),
+  }
+}
+
 /// The single durable-totals builder every CLI/TUI surface and the menubar share.
 /// Headline totals (cost/calls/sessions/tokens/models/categories/savings) come
 /// from the carry-forward daily cache unioned with today's live parse and sliced
@@ -649,23 +774,29 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   )
 
   // PROVIDERS
-  // For .all: enumerate every provider with cost across the period (from cache) + installed-but-zero.
-  // For specific: just this single provider with its scoped cost.
+  // For .all: enumerate every provider with usage across the period (from cache) + installed-but-idle.
+  // `hasUsage` preserves token-only and subscription-backed activity while
+  // distinguishing a provider merely discovered on disk.
+  // For specific: just this single provider with its scoped totals.
   const allProviders = await getAllProviders()
   const displayNameByName = new Map(allProviders.map(p => [p.name, p.displayName]))
   const providers: ProviderCost[] = []
   if (isClaudeConfigScoped) {
-    const providerTotals: Record<string, number> = {}
+    const providerTotals: Record<string, { cost: number; calls: number; hasUsage: boolean }> = {}
     for (const d of aggregateProjectsIntoDays(scanProjects)) {
       for (const [name, p] of Object.entries(d.providers)) {
-        providerTotals[name] = (providerTotals[name] ?? 0) + p.cost
+        const total = providerTotals[name] ?? { cost: 0, calls: 0, hasUsage: false }
+        total.cost += p.cost
+        total.calls += p.calls
+        total.hasUsage ||= providerSliceHasUsage(p)
+        providerTotals[name] = total
       }
     }
-    for (const [name, cost] of Object.entries(providerTotals)) {
-      providers.push({ name, displayName: displayNameByName.get(name) ?? name, cost })
+    for (const [name, total] of Object.entries(providerTotals)) {
+      providers.push({ name, displayName: displayNameByName.get(name) ?? name, ...total })
     }
     if (providers.length === 0 && claudeConfigs?.selectedId) {
-      providers.push({ name: 'claude', displayName: displayNameByName.get('claude') ?? 'Claude', cost: 0 })
+      providers.push({ name: 'claude', displayName: displayNameByName.get('claude') ?? 'Claude', cost: 0, calls: 0, hasUsage: false })
     }
   } else if (isAllProviders) {
     // Reuse the day set the headline was built from instead of rebuilding one
@@ -680,22 +811,39 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
     // implies !isClaudeConfigScoped, which forces the !effectivelyScoped path that
     // assigns it.
     const allDaysForProviders = cacheDaysForPeriod ?? []
-    const providerTotals: Record<string, number> = {}
+    const providerTotals: Record<string, { cost: number; calls: number; hasUsage: boolean }> = {}
     for (const d of allDaysForProviders) {
       for (const [name, p] of Object.entries(d.providers)) {
-        providerTotals[name] = (providerTotals[name] ?? 0) + p.cost
+        const total = providerTotals[name] ?? { cost: 0, calls: 0, hasUsage: false }
+        total.cost += p.cost
+        total.calls += p.calls
+        total.hasUsage ||= providerSliceHasUsage(p)
+        providerTotals[name] = total
       }
     }
-    for (const [name, cost] of Object.entries(providerTotals)) {
-      providers.push({ name, displayName: displayNameByName.get(name) ?? name, cost })
+    for (const [name, total] of Object.entries(providerTotals)) {
+      providers.push({ name, displayName: displayNameByName.get(name) ?? name, ...total })
     }
     for (const p of allProviders) {
       if (providers.some(pc => pc.name === p.name)) continue
       const sources = await safeDiscoverSessions(p)
-      if (sources.length > 0) providers.push({ name: p.name, displayName: p.displayName, cost: 0 })
+      if (sources.length > 0) providers.push({ name: p.name, displayName: p.displayName, cost: 0, calls: 0, hasUsage: false })
     }
   } else {
-    providers.push({ name: pf, displayName: displayNameByName.get(pf) ?? pf, cost: currentData.cost })
+    providers.push({
+      name: pf,
+      displayName: displayNameByName.get(pf) ?? pf,
+      cost: currentData.cost,
+      calls: currentData.calls,
+      hasUsage: currentData.cost > 0
+        || currentData.savingsUSD > 0
+        || currentData.calls > 0
+        || currentData.sessions > 0
+        || currentData.inputTokens > 0
+        || currentData.outputTokens > 0
+        || currentData.cacheReadTokens > 0
+        || currentData.cacheWriteTokens > 0,
+    })
   }
 
   // DAILY HISTORY (last 365 days)
@@ -918,6 +1066,17 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
     const toolMap: Record<string, number> = {}
     const skillMap: Record<string, { turns: number; cost: number }> = {}
     const subagentMap: Record<string, { calls: number; cost: number }> = {}
+    const ompSubagentMap = new Map<string, {
+      agentName: string
+      model: string
+      startedAt: string
+      calls: number
+      cost: number
+      inputTokens: number
+      outputTokens: number
+      cacheReadTokens: number
+      cacheWriteTokens: number
+    }>()
     const mcpMap: Record<string, number> = {}
     // Local-model savings rollup: avoided spend (cost forced to $0, baseline
     // recorded) grouped by model and provider. Mirrors the per-call savingsUSD
@@ -930,6 +1089,31 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
       for (const [t, d] of Object.entries(s.toolBreakdown)) { if (!t.startsWith('lang:')) toolMap[t] = (toolMap[t] ?? 0) + d.calls }
       for (const [sk, d] of Object.entries(s.skillBreakdown)) { const e = skillMap[sk] ?? { turns: 0, cost: 0 }; e.turns += d.turns; e.cost += d.costUSD; skillMap[sk] = e }
       for (const [sa, d] of Object.entries(s.subagentBreakdown)) { const e = subagentMap[sa] ?? { calls: 0, cost: 0 }; e.calls += d.calls; e.cost += d.costUSD; subagentMap[sa] = e }
+      if (s.agentName && s.turns.some(turn => turn.assistantCalls.some(call => call.provider === 'omp'))) {
+        const calls = s.turns.flatMap(turn => turn.assistantCalls)
+        const models = Array.from(new Set(calls.map(call => call.model))).sort()
+        const model = models.join(', ') || 'unknown'
+        const startedAt = s.agentStartedAt ?? s.firstTimestamp
+        const key = `${s.agentName}\u0000${model}\u0000${startedAt}`
+        const entry = ompSubagentMap.get(key) ?? {
+          agentName: s.agentName,
+          model,
+          startedAt,
+          calls: 0,
+          cost: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+        }
+        entry.calls += s.apiCalls
+        entry.cost += s.totalCostUSD
+        entry.inputTokens += s.totalInputTokens
+        entry.outputTokens += s.totalOutputTokens
+        entry.cacheReadTokens += s.totalCacheReadTokens
+        entry.cacheWriteTokens += s.totalCacheWriteTokens
+        ompSubagentMap.set(key, entry)
+      }
       for (const [m, d] of Object.entries(s.mcpBreakdown)) { mcpMap[m] = (mcpMap[m] ?? 0) + d.calls }
       for (const turn of s.turns) for (const call of turn.assistantCalls) {
         if (!call.savingsUSD || call.savingsUSD <= 0) continue
@@ -961,10 +1145,18 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
       byModel: Array.from(savingsByModel.entries()).sort(([, a], [, b]) => b.savingsUSD - a.savingsUSD).slice(0, 5).map(([name, d]) => ({ name, ...d })),
       byProvider: Array.from(savingsByProvider.entries()).sort(([, a], [, b]) => b.savingsUSD - a.savingsUSD).slice(0, 5).map(([name, d]) => ({ name, ...d })),
     }
+    const subagents: SubagentRow[] = [
+      ...Object.entries(subagentMap).map(([name, d]) => ({ name, ...d })),
+      ...Array.from(ompSubagentMap.values()).map(entry => ({
+        name: entry.agentName,
+        ...entry,
+        totalTokens: entry.inputTokens + entry.outputTokens + entry.cacheReadTokens + entry.cacheWriteTokens,
+      })),
+    ]
     return {
       tools: Object.entries(toolMap).sort(([, a], [, b]) => b - a).slice(0, 10).map(([name, calls]) => ({ name, calls })),
       skills: Object.entries(skillMap).sort(([, a], [, b]) => b.cost - a.cost).slice(0, 10).map(([name, d]) => ({ name, ...d })),
-      subagents: Object.entries(subagentMap).sort(([, a], [, b]) => b.cost - a.cost).slice(0, 10).map(([name, d]) => ({ name, ...d })),
+      subagents: subagents.sort((a, b) => b.cost - a.cost || (b.totalTokens ?? 0) - (a.totalTokens ?? 0)),
       mcpServers: Object.entries(mcpMap).sort(([, a], [, b]) => b - a).slice(0, 10).map(([name, calls]) => ({ name, calls })),
       localModelSavings,
     }
@@ -979,5 +1171,10 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   // instead, so the two are never conflated.
   const partialFirstPaint = hydration?.deferredForFirstPaint === true
   const stale = hydration?.complete === false && !partialFirstPaint ? true : undefined
-  return buildMenubarPayload(currentData, providers, optimize, dailyHistory, retryTax, routingWaste, breakdowns, claudeConfigs, granularHistory, stale, hydrationStateFor(hydration))
+  const payload = buildMenubarPayload(currentData, providers, optimize, dailyHistory, retryTax, routingWaste, breakdowns, claudeConfigs, granularHistory, stale, hydrationStateFor(hydration))
+  // Plugin socket: add-only sections from loaded plugins (empty socket by
+  // default, so the payload is byte-identical without plugins installed).
+  const pluginSections = await pluginPayloadSections(await loadPlugins())
+  if (Object.keys(pluginSections).length > 0) payload.plugins = pluginSections
+  return payload
 }

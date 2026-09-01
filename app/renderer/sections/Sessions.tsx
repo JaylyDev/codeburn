@@ -8,9 +8,11 @@ import { SectionSkeleton } from '../components/Skeleton'
 import { SegTabs } from '../components/SegTabs'
 import { StaleBanner } from '../components/StaleBanner'
 import { Stat } from '../components/Stat'
+import { SwitchingBanner } from '../components/SwitchingBanner'
 import { usePolled } from '../hooks/usePolled'
 import { formatCompact, formatDayLong, formatDayShort, formatDuration, formatUsd, shortenProjectPath } from '../lib/format'
 import { codeburn } from '../lib/ipc'
+import { reportMemoKey } from '../lib/reportMemoKey'
 import type { DateRange, Period, SessionRow } from '../lib/types'
 
 export const INITIAL_VISIBLE = 120
@@ -120,7 +122,7 @@ export function Sessions({
   const report = usePolled<SessionRow[]>(
     () => range ? codeburn.getSessions(period, provider, range) : codeburn.getSessions(period, provider),
     [period, provider, range?.from, range?.to, refreshToken],
-    { enabled: ready, memoKey: `sessions|${period}|${provider}|${range?.from ?? ''}-${range?.to ?? ''}` },
+    { enabled: ready, memoKey: reportMemoKey('sessions', period, provider, range) },
   )
   const rows = report.data ?? []
   const q = query.trim().toLowerCase()
@@ -187,10 +189,13 @@ export function Sessions({
 
   if (!report.data.length) {
     return (
-      <Panel title="Sessions">
-        <ProviderFilterRow provider={provider} detectedProviders={detectedProviders} onProviderChange={onProviderChange} />
-        <EmptyNote>No sessions in this range yet.</EmptyNote>
-      </Panel>
+      <>
+        {report.switching && <SwitchingBanner />}
+        <Panel title="Sessions">
+          <ProviderFilterRow provider={provider} detectedProviders={detectedProviders} onProviderChange={onProviderChange} />
+          <EmptyNote>No sessions in this range yet.</EmptyNote>
+        </Panel>
+      </>
     )
   }
 
@@ -200,6 +205,7 @@ export function Sessions({
 
   return (
     <div className="sessions-list-view">
+      {report.switching && <SwitchingBanner />}
       {report.error && <StaleBanner error={report.error} />}
       <ProviderFilterRow provider={provider} detectedProviders={detectedProviders} onProviderChange={onProviderChange} />
       <div className="sessions-toolbar">

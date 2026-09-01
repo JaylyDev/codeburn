@@ -4,7 +4,7 @@ import { createHash, randomBytes } from 'crypto'
 import { join } from 'path'
 
 import { getCodeburnCacheDir } from './cache-dir.js'
-import { acquireCacheRefreshLock } from './cache-refresh-lock.js'
+import { acquireCacheRefreshLock, releaseOwnedRefreshLocksForExit } from './cache-refresh-lock.js'
 import type { ToolCall } from './types.js'
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -113,6 +113,10 @@ export type CachedFile = {
   // the `agentType` from its sibling `.meta.json` (e.g. `workflow-subagent`,
   // `Explore`, `general-purpose`). Drives the Claude-scoped agent-type breakdown.
   agentType?: string
+  // OMP nested agent transcripts retain their file-stem identity and session
+  // header timestamp for the menubar's per-agent activity rows.
+  agentName?: string
+  agentStartedAt?: string
   // Negative-result marker: this file threw while parsing at the recorded
   // fingerprint. Cached so we don't re-read + re-throw it on every refresh; it
   // is re-parsed only when the file changes (fingerprint differs). Carries no
@@ -137,6 +141,12 @@ export type CachedFile = {
   // tool_use could not be paired (ambiguous multi-result record). Drives a
   // grace-window fallback for a late child. Absent when no pairing was ambiguous.
   ambiguousSpawnAgentIds?: string[]
+  // Provider-recorded parent/child lineage (CB-1, slice 1). Set when the
+  // parser captured durable evidence (see SessionLineage). Mirrors onto
+  // SessionSummary.lineage at serve time so a warm read retains the field.
+  // Absent when no provider-recorded evidence exists - the brief forbids
+  // inferring lineage from directory layout or time adjacency.
+  lineage?: import('./types.js').SessionLineage
 }
 
 export type ProviderSection = {
@@ -290,7 +300,14 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // LOC deltas / interruptions / userModified / toolErrors, and session-level
   // title / prLinks / isSidechain. Forces one re-parse so cached sessions gain
   // the new optional fields.
-  claude: 'advisor-usage-v1-skills-rich-capture-v1-cross-provider-pr-v1',
+  // session-lineage-capture-v1: SessionLineage (CB-1, slice 1) is now carried
+  // on the cached file. The child evidence is the transcript's
+  // provider-recorded `parentSessionId` (already captured); the root evidence
+  // is the parent-side `agentSpawnLinks` (already captured). A one-time
+  // re-parse is forced so cached sessions without the lineage field gain it.
+  // The field is purely additive; every cost / token / call total is
+  // byte-identical to a build that omits it (see parser-lineage-capture test).
+  claude: 'advisor-usage-v1-skills-rich-capture-v1-cross-provider-pr-v1-session-lineage-capture-v1',
   cline: 'worktree-project-grouping-v1',
   // reported-cost-v1: the CLI reports its own per-message cost, so entries
   // cached before cline-cli joined the reported-cost allowlist in parser.ts
@@ -356,7 +373,7 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // replays (double-counted before), takes the model from the reporting
   // assistant/message, and keeps agent-injected context out of the preview.
   dsh: 'seed-aware-v1',
-  hermes: 'reasoning-output-accounting-v1-est-cost-routed-ids-workspace-pr-v5',
+  hermes: 'reasoning-output-accounting-v1-est-cost-routed-ids-workspace-pr-v5-zero-estimate-fallback-v1',
   'lingtai-tui': 'token-ledger-registry-activity-v3',
   'ibm-bob': 'worktree-project-grouping-v1',
   // project-path-v1: the parser now records the session's full working
@@ -365,9 +382,21 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // the git repo. Cached entries from before the bump lack projectPath and
   // would serve attribution-blind sessions forever without a re-parse.
   kiro: 'ide-parsing-v1-est-cost-project-path-v1',
+  // nested-agent-v1: OMP writes crewmate transcripts one directory below each
+  // parent session. reported-cost-v2 persists those measured costs through the
+  // cache, including the explicit zero on xai-oauth turns.
+  omp: 'nested-agent-v1-reported-cost-v2',
   opencode: 'session-model-v1',
   quickdesk: 'emf-sqlite-v2-est-cost',
-  kimicode: 'wire-usage-v1-est-cost',
+  // session-lineage-capture-v1: SessionLineage (CB-1, slice 1) is now carried
+  // on the cached file for every kimicode wire. Child evidence is the
+  // provider-recorded `state.json` `agents[<id>].parentAgentId === 'main'`
+  // (any non-`main` agent); root evidence is a sibling non-`main` entry
+  // alongside the `main` agent. A one-time re-parse is forced so cached
+  // sessions without the lineage field gain it. The field is purely
+  // additive; every cost / token / call total is byte-identical to a build
+  // that omits it.
+  kimicode: 'wire-usage-v1-est-cost-session-lineage-capture-v1',
   'kilo-code': 'worktree-project-grouping-v1-session-model-v1',
   'roo-code': 'worktree-project-grouping-v1',
   warp: 'worktree-project-grouping-v1-est-cost',
@@ -574,6 +603,19 @@ function isOptionalStringRecord(v: unknown): boolean {
   return Object.values(v as Record<string, unknown>).every(e => typeof e === 'string')
 }
 
+// Validates the optional SessionLineage payload. Only `provider-recorded`
+// is accepted; a stray role/evidence value (e.g. an inferred-link stub the
+// brief forbids) must fail the shard validation rather than silently leak.
+function isOptionalLineage(v: unknown): boolean {
+  if (v === undefined) return true
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false
+  const o = v as Record<string, unknown>
+  if (isOptionalString(o['parentSessionId']) === false) return false
+  if (o['role'] !== 'root' && o['role'] !== 'child') return false
+  if (o['evidence'] !== 'provider-recorded') return false
+  return true
+}
+
 function isToolCall(v: unknown): boolean {
   if (!v || typeof v !== 'object') return false
   const o = v as Record<string, unknown>
@@ -663,10 +705,13 @@ function validateCachedFile(f: unknown): f is CachedFile {
     && (o['prLinks'] === undefined || isStringArray(o['prLinks']))
     && isOptionalBool(o['isSidechain'])
     && isOptionalString(o['agentType'])
+    && isOptionalString(o['agentName'])
+    && isOptionalString(o['agentStartedAt'])
     && isOptionalBool(o['failed'])
     && isOptionalString(o['parentSessionId'])
     && isOptionalStringRecord(o['agentSpawnLinks'])
     && (o['ambiguousSpawnAgentIds'] === undefined || isStringArray(o['ambiguousSpawnAgentIds']))
+    && isOptionalLineage(o['lineage'])
     && Array.isArray(o['turns'])
     && (o['turns'] as unknown[]).every(validateTurn)
 }
@@ -1108,6 +1153,13 @@ type ProviderPlan = {
   refs: Record<string, ShardRef>
 }
 
+// Surrender the event loop without microtask overhead. Used inside saveCache
+// between shard writes so an interactive TTY's stdin handler (Ink's useInput)
+// can run while a long save publishes a 21k-file cache (#1141).
+function yieldToEventLoop(): Promise<void> {
+  return new Promise(resolve => setImmediate(resolve))
+}
+
 export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Promise<boolean>): Promise<boolean> {
   const dir = sessionCacheDir()
   if (!existsSync(dir)) await mkdir(dir, { recursive: true, mode: 0o700 })
@@ -1189,6 +1241,13 @@ export async function saveCache(cache: SessionCache, verifyStillOwner?: () => Pr
         // the read happens against the CURRENT shard, not a stale name.
         if (loaded && !loaded.has(bucket) && prior) { plan.deferred.push(bucket); continue }
         plan.refs[bucket] = await writeShard(provider, bucket, files)
+        // Surrender the event loop between shard writes so an interactive
+        // TTY's stdin handler (Ink's useInput) can run while a long save
+        // publishes a 21k-file cache. The yield is BETWEEN shards - never
+        // inside one - so the temp+rename atomicity of writeFileAtomic is
+        // preserved and the in-process `written` set still tracks every
+        // file this save owns for the lost-fence cleanup below (#1141).
+        await yieldToEventLoop()
       }
     }
 
@@ -1389,7 +1448,13 @@ async function fingerprintSqliteFile(dbPath: string): Promise<FileFingerprint | 
   }
 }
 
+let fingerprintCalls = 0
+export function fingerprintFileCount(): number {
+  return fingerprintCalls
+}
+
 export async function fingerprintFile(filePath: string): Promise<FileFingerprint | null> {
+  fingerprintCalls++
   try {
     const s = await stat(filePath)
     // A source path that IS a SQLite database (copilot OTel's agent-traces.db)
@@ -1630,6 +1695,15 @@ function removeOurLockSync(): void {
     const parsed = JSON.parse(readFileSync(lockPath(), 'utf-8')) as Partial<LockRecord>
     if (parsed?.pid === process.pid) unlinkSync(lockPath())
   } catch { /* best-effort; nothing to clean or already gone */ }
+}
+
+/** Terminate an interactive CLI after synchronously releasing both cache-lock
+ * families it can own. The process cannot wait for background parsing to drain,
+ * but a direct exit must not make the next launch recover a stale live-pid lock. */
+export function exitAfterCacheCleanup(exitCode: number): never {
+  releaseOwnedRefreshLocksForExit()
+  removeOurLockSync()
+  process.exit(exitCode)
 }
 
 // Arm once, only while we hold the lock: on a catchable termination (Ctrl-C, or a
@@ -1914,6 +1988,12 @@ export async function loadStatusSnapshot(corpusFingerprint: string, queryKey: st
   const stored = await readStatusSnapshotRecord(queryKey)
   if (!stored) return null
   if (stored.semanticKey !== semanticKey) return null
+  // Belt-and-braces mirror of the save gate in main.ts: a payload marked
+  // degraded (`stale === true` or a `hydration` block) must never have been
+  // persisted, so one that somehow was (an older build, a hand-edited file)
+  // is treated as a miss and recomputed rather than served.
+  const candidate = stored.payload as { stale?: unknown; hydration?: unknown } | null | undefined
+  if (candidate !== null && typeof candidate === 'object' && (candidate.stale === true || candidate.hydration !== undefined)) return null
   if (stored.corpusFingerprint === corpusFingerprint) return stored.payload ?? null
 
   const now = Date.now()
