@@ -102,6 +102,10 @@ pub fn run() {
                 }
             }
             "dock_hide" => set_dock_enabled(app, false),
+            "dock_left" => dock::dock_to(app, dock::Edge::Left),
+            "dock_right" => dock::dock_to(app, dock::Edge::Right),
+            "dock_top" => dock::dock_to(app, dock::Edge::Top),
+            "dock_bottom" => dock::dock_to(app, dock::Edge::Bottom),
             _ => {}
         })
         .on_window_event(|window, event| {
@@ -142,6 +146,7 @@ pub fn run() {
             commands::dock_preferred,
             commands::dock_set_preferred,
             commands::dock_context_menu,
+            commands::dock_begin_drag,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -645,7 +650,14 @@ mod commands {
         let window = app
             .get_webview_window(crate::dock::DOCK_LABEL)
             .ok_or_else(|| "dock window is not open".to_string())?;
-        crate::dock::apply_layout(&window, &request).ok_or_else(|| "no primary monitor".to_string())
+        crate::dock::apply_layout(&window, request).ok_or_else(|| "no monitor".to_string())
+    }
+
+    /// The page decides when a press became a drag (3 px, as on the mac); from here the
+    /// cursor poll moves the window and settles it on release.
+    #[tauri::command]
+    pub fn dock_begin_drag(app: AppHandle, x: i32, y: i32) {
+        crate::dock::begin_drag(&app, (x, y));
     }
 
     #[tauri::command]

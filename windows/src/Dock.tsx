@@ -1,20 +1,25 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { ProviderGlyph } from './providerIcons'
 import {
-  DETAIL_INSETS,
   M,
   MOTION,
+  alongPad,
   bezier,
   bubblePath,
+  detailPadding,
   displayLabel,
   headlineWindow,
+  isVertical,
+  opposite,
   pct,
-  railHeight,
+  railLength,
   railPath,
   resetsIn,
   severity,
+  type Curve,
+  type Edge,
   type QuotaWindow,
   type Severity,
 } from './dockGeometry'
@@ -49,9 +54,17 @@ type DockQuota =
 type Rect = { x: number; y: number; w: number; h: number }
 type DockFrame = {
   rail: Rect
+  edge: Edge
+  vertical: boolean
+  docked: boolean
+  alongPad: number
   anchor: 'start' | 'end'
-  detail: (Rect & { tailY: number }) | null
+  bubbleSide: Edge
+  detail: (Rect & { tail: number }) | null
+  nativePointer: boolean
 }
+type PointerSnapshot = { railHovered: boolean; row: number | null; detailHovered: boolean }
+const NO_POINTER: PointerSnapshot = { railHovered: false, row: null, detailHovered: false }
 
 /// Port of CapacityDockInteractionState: the immediate truth that decides whether a delayed
 /// hover action is still valid when its timer fires.
@@ -60,10 +73,11 @@ type Interaction = {
   detailHovered: boolean
   pinned: boolean
   collapseGrace: boolean
+  dragging: boolean
 }
-const REST: Interaction = { railHovered: false, detailHovered: false, pinned: false, collapseGrace: false }
+const REST: Interaction = { railHovered: false, detailHovered: false, pinned: false, collapseGrace: false, dragging: false }
 const isExpanded = (i: Interaction) => i.pinned || i.railHovered || i.detailHovered || i.collapseGrace
-const canCollapse = (i: Interaction) => !i.pinned && !i.railHovered && !i.detailHovered && !i.collapseGrace
+const canCollapse = (i: Interaction) => !i.pinned && !i.railHovered && !i.detailHovered && !i.collapseGrace && !i.dragging
 
 type DetailPhase = 'entering' | 'shown' | 'dismissing'
 
@@ -90,34 +104,38 @@ function useTimers() {
   return { schedule, cancel }
 }
 
-/// The rail's presentation progress, 0 at rest and 1 expanded, eased with the mac's rail
-/// curves. A reversal restarts from the current value so a quick exit never snaps.
-function useRailProgress(target: 0 | 1, onSettled: (value: 0 | 1) => void): number {
-  const [progress, setProgress] = useState<number>(target)
+type Motion = { duration: number; curve: Curve }
+
+/// A value eased toward its target with the mac's curves. A retarget restarts from the current
+/// value so a quick reversal never snaps.
+function useEased(target: number, motionFor: (from: number, to: number) => Motion, onSettled?: (value: number) => void): number {
+  const [value, setValue] = useState(target)
   const live = useRef<{ value: number; raf: number }>({ value: target, raf: 0 })
   const settled = useRef(onSettled)
   settled.current = onSettled
+  const pick = useRef(motionFor)
+  pick.current = motionFor
   useEffect(() => {
     const from = live.current.value
     if (from === target) return
-    const motion = target === 1 ? MOTION.railExpand : MOTION.railCollapse
+    const motion = pick.current(from, target)
     const start = performance.now()
     const step = (now: number) => {
       const linear = Math.min(1, (now - start) / motion.duration)
-      const value = from + (target - from) * bezier(motion.curve, linear)
-      live.current.value = value
-      setProgress(value)
+      const next = from + (target - from) * bezier(motion.curve, linear)
+      live.current.value = next
+      setValue(next)
       if (linear < 1) {
         live.current.raf = requestAnimationFrame(step)
       } else {
-        settled.current(target)
+        settled.current?.(target)
       }
     }
     cancelAnimationFrame(live.current.raf)
     live.current.raf = requestAnimationFrame(step)
     return () => cancelAnimationFrame(live.current.raf)
   }, [target])
-  return progress
+  return value
 }
 
 const RING_COLORS: Record<Severity, string> = {
@@ -171,14 +189,13 @@ function Ring({ percent }: { percent: number | null }) {
 type RowProps = {
   provider: Provider
   loading: boolean
-  opacity: number
-  offset: number
+  style: CSSProperties
   onEnter: () => void
   onLeave: () => void
   onClick: () => void
 }
 
-function Row({ provider, loading, opacity, offset, onEnter, onLeave, onClick }: RowProps) {
+function Row({ provider, loading, style, onEnter, onLeave, onClick }: RowProps) {
   const headline = provider.available ? headlineWindow(provider.windows) : null
   const percent = headline ? pct(headline.usedPct) : null
   const sev = percent === null ? null : severity(percent)
@@ -186,7 +203,7 @@ function Row({ provider, loading, opacity, offset, onEnter, onLeave, onClick }: 
     <button
       type="button"
       className="dock-row"
-      style={{ opacity, transform: `translateY(${offset}px)` }}
+      style={style}
       onMouseEnter={onEnter}
       onMouseLeave={onLeave}
       onClick={onClick}
@@ -259,6 +276,9 @@ function Detail({ provider, quota, loading }: { provider: Provider; quota: DockQ
   )
 }
 
+const RAIL_MOTION = (_from: number, to: number) => (to === 1 ? MOTION.railExpand : MOTION.railCollapse)
+const ATTACH_MOTION = (_from: number, to: number) => (to === 1 ? MOTION.dockAttach : MOTION.dockDetach)
+
 export function Dock() {
   const [quota, setQuota] = useState<DockQuota | null>(null)
   const [preferredId, setPreferredId] = useState<string | null>(null)
@@ -268,6 +288,10 @@ export function Dock() {
   const [detailPhase, setDetailPhase] = useState<DetailPhase>('entering')
   const [detailHeight, setDetailHeight] = useState(0)
   const [frame, setFrame] = useState<DockFrame | null>(null)
+  // Attachment while dragging comes straight from the cursor poll; otherwise it eases.
+  const [dragAttachment, setDragAttachment] = useState<number | null>(null)
+  // Where the rail was before a settle, relative to the new window, so it can glide in.
+  const [glide, setGlide] = useState<{ dx: number; dy: number; key: number } | null>(null)
   const { schedule, cancel } = useTimers()
 
   const interactionRef = useRef(interaction)
@@ -276,8 +300,11 @@ export function Dock() {
   hoveredRef.current = hovered
   const phaseRef = useRef(detailPhase)
   phaseRef.current = detailPhase
-  const pointerInsideRail = useRef(false)
+  const pointerRef = useRef<PointerSnapshot>(NO_POINTER)
+  const orderedRef = useRef<Provider[]>([])
   const detailRef = useRef<HTMLDivElement>(null)
+  const press = useRef<{ x: number; y: number; dragged: boolean } | null>(null)
+  const suppressClick = useRef(false)
 
   const load = useCallback(async () => {
     try {
@@ -291,11 +318,7 @@ export function Dock() {
     void load()
     void invoke<string | null>('dock_preferred').then((id) => setPreferredId(id ?? null))
     const timer = window.setInterval(() => void load(), REFRESH_MS)
-    const unlisten = listen('codeburn://dock-refresh', () => void load())
-    return () => {
-      window.clearInterval(timer)
-      void unlisten.then((f) => f())
-    }
+    return () => window.clearInterval(timer)
   }, [load])
 
   // Providers: the ones the CLI reports signed in, else the preferred one as a dashed stand-in.
@@ -314,13 +337,14 @@ export function Dock() {
     : [preferred]
   const anchor = frame?.anchor ?? 'start'
   const ordered = anchor === 'end' ? [...displayed].reverse() : displayed
+  orderedRef.current = ordered
   const loading = quota === null
 
   const expanded = isExpanded(interaction)
   useEffect(() => {
     if (expanded) setPresentationExpanded(true)
   }, [expanded])
-  const progress = useRailProgress(expanded ? 1 : 0, (value) => {
+  const progress = useEased(expanded ? 1 : 0, RAIL_MOTION, (value) => {
     if (value === 0) setPresentationExpanded(false)
   })
 
@@ -337,14 +361,23 @@ export function Dock() {
     },
     [cancel]
   )
-  const hideDetail = useCallback(() => {
-    if (!hoveredRef.current) return
-    setDetailPhase('dismissing')
-    schedule('detailDismiss', MOTION.detailDismiss.duration, () => {
-      setHovered(null)
-      setDetailPhase('entering')
-    })
-  }, [schedule])
+  const hideDetail = useCallback(
+    (animated = true) => {
+      if (!hoveredRef.current) return
+      if (!animated) {
+        cancel('detailDismiss')
+        setHovered(null)
+        setDetailPhase('entering')
+        return
+      }
+      setDetailPhase('dismissing')
+      schedule('detailDismiss', MOTION.detailDismiss.duration, () => {
+        setHovered(null)
+        setDetailPhase('entering')
+      })
+    },
+    [cancel, schedule]
+  )
 
   const scheduleCollapse = useCallback(() => {
     schedule('collapse', MOTION.railHoverCloseDelay, () => {
@@ -354,52 +387,152 @@ export function Dock() {
     })
   }, [schedule, hideDetail])
 
-  const onRailEnter = () => {
-    pointerInsideRail.current = true
-    cancel('expand')
-    cancel('collapse')
-    schedule('expand', MOTION.railHoverOpenDelay, () => {
-      if (!pointerInsideRail.current) return
-      setInteraction((i) => ({ ...i, railHovered: true, collapseGrace: false }))
-    })
+  const railHoverChanged = useCallback(
+    (hovering: boolean) => {
+      if (interactionRef.current.dragging) return
+      cancel('expand')
+      cancel('collapse')
+      if (hovering) {
+        schedule('expand', MOTION.railHoverOpenDelay, () => {
+          if (!pointerRef.current.railHovered) return
+          setInteraction((i) => ({ ...i, railHovered: true, collapseGrace: false }))
+        })
+      } else {
+        setInteraction((i) => ({ ...i, railHovered: false, collapseGrace: true }))
+        scheduleCollapse()
+      }
+    },
+    [cancel, schedule, scheduleCollapse]
+  )
+  const rowHoverChanged = useCallback(
+    (id: string, hovering: boolean) => {
+      if (interactionRef.current.dragging) return
+      cancel('detailShow')
+      cancel('detailExit')
+      if (hovering) {
+        // Re-entering a row aborts a pending collapse; a row exit must not touch it.
+        cancel('collapse')
+        schedule('detailShow', MOTION.detailShowDelay, () => showDetail(id))
+      } else if (hoveredRef.current === id) {
+        // Enough time to cross the transparent gap into the bubble.
+        schedule('detailExit', MOTION.detailExitDelay, () => {
+          if (interactionRef.current.detailHovered) return
+          hideDetail()
+          scheduleCollapse()
+        })
+      }
+    },
+    [cancel, schedule, showDetail, hideDetail, scheduleCollapse]
+  )
+  const detailHoverChanged = useCallback(
+    (hovering: boolean) => {
+      if (interactionRef.current.dragging) return
+      cancel('collapse')
+      cancel('detailExit')
+      setInteraction((i) => ({ ...i, detailHovered: hovering }))
+      if (hovering && phaseRef.current === 'dismissing') {
+        cancel('detailDismiss')
+        setDetailPhase('shown')
+      } else if (!hovering) {
+        scheduleCollapse()
+      }
+    },
+    [cancel, scheduleCollapse]
+  )
+
+  // One entry point for hover, fed by the cursor poll on Windows and by DOM events elsewhere,
+  // the way the mac synthesizes hover from its event monitor.
+  const applyPointer = useCallback(
+    (next: PointerSnapshot) => {
+      const prev = pointerRef.current
+      pointerRef.current = next
+      const rows = orderedRef.current
+      if (next.detailHovered !== prev.detailHovered) detailHoverChanged(next.detailHovered)
+      if (next.railHovered !== prev.railHovered) railHoverChanged(next.railHovered)
+      if (next.row !== prev.row) {
+        const before = prev.row === null ? null : rows[prev.row]
+        const after = next.row === null ? null : rows[next.row]
+        if (before) rowHoverChanged(before.id, false)
+        if (after) rowHoverChanged(after.id, true)
+      }
+    },
+    [detailHoverChanged, railHoverChanged, rowHoverChanged]
+  )
+  const nativePointer = frame?.nativePointer ?? false
+  const domPointer = (patch: Partial<PointerSnapshot>) => {
+    if (nativePointer) return
+    applyPointer({ ...pointerRef.current, ...patch })
   }
-  const onRailLeave = () => {
-    pointerInsideRail.current = false
-    cancel('expand')
-    setInteraction((i) => ({ ...i, railHovered: false, collapseGrace: true }))
-    scheduleCollapse()
-  }
-  const onRowEnter = (id: string) => {
-    cancel('detailShow')
-    cancel('detailExit')
-    // Re-entering a row aborts a pending collapse; a row exit must not touch it.
-    cancel('collapse')
-    schedule('detailShow', MOTION.detailShowDelay, () => showDetail(id))
-  }
-  const onRowLeave = (id: string) => {
-    cancel('detailShow')
-    if (hoveredRef.current !== id) return
-    // Enough time to cross the transparent gap into the bubble.
-    schedule('detailExit', MOTION.detailExitDelay, () => {
-      if (interactionRef.current.detailHovered) return
-      hideDetail()
-      scheduleCollapse()
-    })
-  }
-  const onDetailEnter = () => {
-    cancel('collapse')
-    cancel('detailExit')
-    setInteraction((i) => ({ ...i, detailHovered: true }))
-    if (phaseRef.current === 'dismissing') {
-      cancel('detailDismiss')
-      setDetailPhase('shown')
+
+  const dismiss = useCallback(() => {
+    ;['expand', 'collapse', 'detailShow', 'detailExit'].forEach(cancel)
+    setInteraction((i) => ({ ...REST, dragging: i.dragging }))
+    hideDetail()
+  }, [cancel, hideDetail])
+
+  useEffect(() => {
+    const listeners = [
+      listen('codeburn://dock-refresh', () => void load()),
+      listen<PointerSnapshot>('codeburn://dock-pointer', (event) => applyPointer(event.payload)),
+      listen<{ attachment: number }>('codeburn://dock-drag', (event) => setDragAttachment(event.payload.attachment)),
+      listen<{ from: Rect; frame: DockFrame }>('codeburn://dock-settled', (event) => {
+        const { from, frame: next } = event.payload
+        setFrame(next)
+        setDragAttachment(null)
+        setGlide({ dx: from.x - next.rail.x, dy: from.y - next.rail.y, key: Date.now() })
+        // A re-homed rail starts from a clean hover: the bubble is gone on the Rust side, and
+        // the poll re-derives hover from the settled geometry on its next tick.
+        ;['expand', 'collapse', 'detailShow', 'detailExit'].forEach(cancel)
+        hideDetail(false)
+        setInteraction((i) => ({ ...REST, pinned: i.pinned }))
+        pointerRef.current = NO_POINTER
+      }),
+    ]
+    return () => {
+      listeners.forEach((p) => void p.then((unlisten) => unlisten()))
     }
+  }, [load, applyPointer, cancel, hideDetail])
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && isExpanded(interactionRef.current)) dismiss()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [dismiss])
+
+  // Dragging: the page owns the 3 px threshold, the cursor poll owns the rest.
+  const onPointerDown = (event: ReactPointerEvent) => {
+    if (event.button !== 0) return
+    suppressClick.current = false
+    press.current = { x: event.clientX, y: event.clientY, dragged: false }
+    // The rail is narrow; the first move often lands outside it, so keep the pointer here.
+    event.currentTarget.setPointerCapture(event.pointerId)
   }
-  const onDetailLeave = () => {
-    setInteraction((i) => ({ ...i, detailHovered: false }))
-    scheduleCollapse()
+  const onClickCapture = (event: ReactMouseEvent) => {
+    if (!suppressClick.current) return
+    suppressClick.current = false
+    event.stopPropagation()
   }
+  const onPointerMove = (event: ReactPointerEvent) => {
+    const start = press.current
+    if (!start || start.dragged) return
+    if (Math.hypot(event.clientX - start.x, event.clientY - start.y) <= MOTION.dragThreshold) return
+    start.dragged = true
+    suppressClick.current = true
+    ;['expand', 'collapse', 'detailShow', 'detailExit'].forEach(cancel)
+    hideDetail(false)
+    setInteraction((i) => ({ ...i, dragging: true, railHovered: false, detailHovered: false, collapseGrace: false }))
+    // The press point, not the cursor when the command lands: the rail must stay under the
+    // finger exactly where it was grabbed.
+    void invoke('dock_begin_drag', { x: Math.round(start.x), y: Math.round(start.y) })
+  }
+  const onPointerUp = () => {
+    press.current = null
+  }
+
   const onRowClick = (provider: Provider) => {
+    if (interactionRef.current.dragging) return
     cancel('expand')
     cancel('collapse')
     if (provider.id !== resolvedPreferredId) {
@@ -411,21 +544,8 @@ export function Dock() {
     }
     showDetail(provider.id)
   }
-  const dismiss = useCallback(() => {
-    ;['expand', 'collapse', 'detailShow', 'detailExit'].forEach(cancel)
-    setInteraction(REST)
-    hideDetail()
-  }, [cancel, hideDetail])
 
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && isExpanded(interactionRef.current)) dismiss()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [dismiss])
-
-  // The bubble is laid out at its natural height first; the window is sized from that.
+  // The bubble is laid out at its natural height first; its frame is computed from that.
   useLayoutEffect(() => {
     if (!hovered) {
       setDetailHeight(0)
@@ -436,12 +556,13 @@ export function Dock() {
   }, [hovered, quota])
 
   const rows = ordered.length
+  const totalRows = Math.max(selected.length, 1)
   const detailRow = hovered ? ordered.findIndex((p) => p.id === hovered) : -1
   const detailRequest = hovered && detailHeight > 0 && detailRow >= 0 ? { row: detailRow, height: detailHeight } : null
   useEffect(() => {
     let stale = false
     void invoke<DockFrame>('dock_set_layout', {
-      request: { rows, expanded: presentationExpanded, detail: detailRequest },
+      request: { rows, totalRows, expanded: presentationExpanded, detail: detailRequest },
     }).then((next) => {
       if (!stale) setFrame(next)
     })
@@ -450,7 +571,7 @@ export function Dock() {
     }
     // detailRequest is derived from the two scalars below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows, presentationExpanded, detailRow, detailHeight])
+  }, [rows, totalRows, presentationExpanded, detailRow, detailHeight])
 
   // Entering: the card is placed while invisible, then slides in on the next frame.
   const detailPlaced = frame?.detail != null && detailRequest != null
@@ -460,28 +581,62 @@ export function Dock() {
     return () => cancelAnimationFrame(raf)
   }, [detailPhase, detailPlaced])
 
-  const restLength = railHeight(1)
-  const targetLength = railHeight(rows)
+  // Attachment: 1 docked, 0 loose. Eases home after a drop; tracks the poll during a drag.
+  const attachmentTarget = frame?.docked ? 1 : 0
+  const easedAttachment = useEased(attachmentTarget, ATTACH_MOTION)
+  const attachment = dragAttachment ?? easedAttachment
+
+  // Glide: after a settle the rail starts where it was dropped and eases into place.
+  const glideKey = glide?.key ?? 0
+  const glideProgress = useEased(glideKey ? 1 : 0, () => (frame?.docked ? MOTION.dockAttach : MOTION.dockDetach))
+  const glideDx = glide ? glide.dx * (1 - glideProgress) : 0
+  const glideDy = glide ? glide.dy * (1 - glideProgress) : 0
+  useEffect(() => {
+    if (glide && glideProgress >= 1) setGlide(null)
+  }, [glide, glideProgress])
+
+  const edge: Edge = frame?.edge ?? 'right'
+  const vertical = frame?.vertical ?? true
+  const cross = vertical ? M.railWidth : M.horizontalRailWidth
+  const pad = alongPad(attachment)
+  const restLength = railLength(1, attachment)
+  const targetLength = railLength(rows, attachment)
   const bodyLength = Math.round(restLength + (targetLength - restLength) * progress)
-  const railRect = frame?.rail ?? { x: 0, y: 0, w: M.railWidth, h: restLength }
-  const railTop = anchor === 'end' ? railRect.y + railRect.h - bodyLength : railRect.y
-  const shape = railPath(M.railWidth, bodyLength)
+  const railRect = frame?.rail ?? { x: 0, y: 0, w: cross, h: restLength }
+  // The frame's rail is the target; the visual rail grows from the anchored end toward it.
+  const railTarget = vertical ? railRect.h : railRect.w
+  const alongOffset = anchor === 'end' ? railTarget - bodyLength : 0
+  const railLeft = (vertical ? railRect.x : railRect.x + alongOffset) + glideDx
+  const railTop = (vertical ? railRect.y + alongOffset : railRect.y) + glideDy
+  const railW = vertical ? cross : bodyLength
+  const railH = vertical ? bodyLength : cross
+  const shape = railPath(edge, cross, bodyLength, attachment)
 
   const hoveredProvider = hovered ? (ordered.find((p) => p.id === hovered) ?? null) : null
   const detailFrame = frame?.detail ?? null
+  const tailEdge = opposite(frame?.bubbleSide ?? 'left')
   const detailW = M.detailWidth
   const detailH = detailHeight
-  const tailY = detailFrame ? detailFrame.tailY : detailH / 2
+  const tail = detailFrame ? detailFrame.tail : (isVertical(tailEdge) ? detailH : detailW) / 2
+
+  const rowsStyle: CSSProperties = vertical
+    ? { flexDirection: 'column', left: M.railCrossPad, right: M.railCrossPad, ...(anchor === 'end' ? { bottom: pad } : { top: pad }) }
+    : { flexDirection: 'row', top: M.railCrossPad, bottom: M.railCrossPad, ...(anchor === 'end' ? { right: pad } : { left: pad }) }
 
   return (
     <div className="dock" onContextMenu={(e) => { e.preventDefault(); void invoke('dock_context_menu') }}>
       <div
-        className="dock-rail"
-        style={{ top: railTop, width: M.railWidth, height: bodyLength, clipPath: `path('${shape}')` }}
-        onMouseEnter={onRailEnter}
-        onMouseLeave={onRailLeave}
+        className={`dock-rail${interaction.dragging ? ' is-dragging' : ''}`}
+        style={{ left: railLeft, top: railTop, width: railW, height: railH, clipPath: `path('${shape}')` }}
+        onMouseEnter={() => domPointer({ railHovered: true })}
+        onMouseLeave={() => domPointer({ railHovered: false, row: null })}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
+        onClickCapture={onClickCapture}
       >
-        <svg className="dock-surface" width={M.railWidth} height={bodyLength} viewBox={`0 0 ${M.railWidth} ${bodyLength}`} aria-hidden="true">
+        <svg className="dock-surface" width={railW} height={railH} viewBox={`0 0 ${railW} ${railH}`} aria-hidden="true">
           <defs>
             <linearGradient id="dock-rail-fill" x1="0" y1="0" x2="1" y2="1">
               <stop offset="0" stopColor="#131416" />
@@ -503,21 +658,23 @@ export function Dock() {
           <path d={shape} fill="url(#dock-rail-glow)" />
           <path d={shape} fill="none" stroke="url(#dock-rail-edge)" strokeWidth="0.6" />
         </svg>
-        <div
-          className="dock-rows"
-          style={anchor === 'end' ? { bottom: M.railAlongPad } : { top: M.railAlongPad }}
-        >
-          {ordered.map((provider) => {
+        <div className="dock-rows" style={rowsStyle}>
+          {ordered.map((provider, index) => {
             const isPreferred = provider.id === preferred.id
+            const reveal = isPreferred ? 0 : M.rowReveal * (1 - progress)
             return (
               <Row
                 key={provider.id}
                 provider={provider}
                 loading={loading}
-                opacity={isPreferred ? 1 : progress}
-                offset={isPreferred ? 0 : M.rowReveal * (1 - progress)}
-                onEnter={() => onRowEnter(provider.id)}
-                onLeave={() => onRowLeave(provider.id)}
+                style={{
+                  width: vertical ? cross - M.railCrossPad * 2 : M.rowHeight,
+                  height: vertical ? M.rowHeight : cross - M.railCrossPad * 2,
+                  opacity: isPreferred ? 1 : progress,
+                  transform: vertical ? `translateY(${reveal}px)` : `translateX(${reveal}px)`,
+                }}
+                onEnter={() => domPointer({ row: index })}
+                onLeave={() => domPointer({ row: null })}
                 onClick={() => onRowClick(provider)}
               />
             )
@@ -528,21 +685,16 @@ export function Dock() {
       {hoveredProvider ? (
         <div
           ref={detailRef}
-          className={`dock-detail is-${detailPhase}${detailPlaced ? '' : ' is-measuring'}`}
-          style={{
-            left: detailFrame?.x ?? 0,
-            top: detailFrame?.y ?? 0,
-            width: detailW,
-            paddingRight: DETAIL_INSETS.horizontal + DETAIL_INSETS.tail,
-          }}
-          onMouseEnter={onDetailEnter}
-          onMouseLeave={onDetailLeave}
+          className={`dock-detail is-${detailPhase} is-tail-${tailEdge}${detailPlaced ? '' : ' is-measuring'}`}
+          style={{ left: detailFrame?.x ?? 0, top: detailFrame?.y ?? 0, width: detailW, padding: detailPadding(tailEdge) }}
+          onMouseEnter={() => domPointer({ detailHovered: true })}
+          onMouseLeave={() => domPointer({ detailHovered: false })}
         >
           {detailH > 0 ? (
             <svg className="dock-surface" width={detailW} height={detailH} viewBox={`0 0 ${detailW} ${detailH}`} aria-hidden="true">
-              <path d={bubblePath(detailW, detailH, tailY)} fill="url(#dock-rail-fill)" />
-              <path d={bubblePath(detailW, detailH, tailY)} fill="url(#dock-rail-glow)" />
-              <path d={bubblePath(detailW, detailH, tailY)} fill="none" stroke="rgba(255,255,255,0.09)" strokeWidth="0.9" />
+              <path d={bubblePath(tailEdge, detailW, detailH, tail)} fill="url(#dock-rail-fill)" />
+              <path d={bubblePath(tailEdge, detailW, detailH, tail)} fill="url(#dock-rail-glow)" />
+              <path d={bubblePath(tailEdge, detailW, detailH, tail)} fill="none" stroke="rgba(255,255,255,0.09)" strokeWidth="0.9" />
             </svg>
           ) : null}
           <Detail provider={hoveredProvider} quota={quota} loading={loading} />

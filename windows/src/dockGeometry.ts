@@ -13,10 +13,12 @@ function points(base: number, scale = SCALE): number {
 
 export const M = {
   railWidth: points(88),
+  horizontalRailWidth: points(106),
   rowHeight: points(84),
   rowSpacing: points(12),
+  railAlongPad: points(20),
   // Docked rails add 60% of the shoulder depth so content never crowds the concave flare.
-  railAlongPad: points(20) + Math.round(points(52) * 0.6),
+  flareCompensation: Math.round(points(52) * 0.6),
   railCrossPad: points(12),
   shoulderDepth: points(52),
   ringSize: points(52),
@@ -29,15 +31,46 @@ export const M = {
   rowReveal: -8 * SCALE,
 } as const
 
-export function railHeight(rows: number): number {
+export type Edge = 'left' | 'right' | 'top' | 'bottom'
+
+export function isVertical(edge: Edge): boolean {
+  return edge === 'left' || edge === 'right'
+}
+
+export function opposite(edge: Edge): Edge {
+  switch (edge) {
+    case 'left':
+      return 'right'
+    case 'right':
+      return 'left'
+    case 'top':
+      return 'bottom'
+    case 'bottom':
+      return 'top'
+  }
+}
+
+function smoothstep(p: number): number {
+  const t = Math.min(Math.max(p, 0), 1)
+  return t * t * (3 - 2 * t)
+}
+
+/// Along-axis padding for a given attachment progress, the mac's railAlongPad.
+export function alongPad(attachment: number): number {
+  return M.railAlongPad + M.flareCompensation * smoothstep(attachment)
+}
+
+export function railLength(rows: number, attachment: number): number {
   const count = Math.max(rows, 1)
-  return M.railAlongPad * 2 + count * M.rowHeight + (count - 1) * M.rowSpacing
+  return alongPad(attachment) * 2 + count * M.rowHeight + (count - 1) * M.rowSpacing
 }
 
 /// Motion: durations in ms and cubic-bezier control points, verbatim from CapacityDockMotion.
 export const MOTION = {
   railExpand: { duration: 520, curve: [0.22, 1, 0.36, 1] as const },
   railCollapse: { duration: 440, curve: [0.32, 0, 0.2, 1] as const },
+  dockAttach: { duration: 280, curve: [0.16, 1, 0.3, 1] as const },
+  dockDetach: { duration: 240, curve: [0.2, 0.8, 0.2, 1] as const },
   detailPresent: { duration: 200, curve: [0.16, 1, 0.3, 1] as const },
   detailFollow: { duration: 220, curve: [0.25, 0.1, 0.25, 1] as const },
   detailDismiss: { duration: 140, curve: [0.4, 0, 1, 1] as const },
@@ -46,14 +79,13 @@ export const MOTION = {
   detailShowDelay: 180,
   detailExitDelay: 240,
   detailAppearOffset: 10,
+  dragThreshold: 3,
 } as const
 
-export function cssCurve(curve: readonly [number, number, number, number]): string {
-  return `cubic-bezier(${curve.join(', ')})`
-}
+export type Curve = readonly [number, number, number, number]
 
 /// Cubic bezier easing solved by Newton iteration, matching CapacityDockMotion.cubicBezier.
-export function bezier(curve: readonly [number, number, number, number], x: number): number {
+export function bezier(curve: Curve, x: number): number {
   const [p1x, p1y, p2x, p2y] = curve
   const sampleX = (t: number) => ((1 - 3 * p2x + 3 * p1x) * t + (3 * p2x - 6 * p1x)) * t * t + 3 * p1x * t
   const sampleY = (t: number) => ((1 - 3 * p2y + 3 * p1y) * t + (3 * p2y - 6 * p1y)) * t * t + 3 * p1y * t
@@ -118,55 +150,130 @@ export function displayLabel(label: string): string {
     .replace(/Five-hour/i, '5-hour')
 }
 
-/// The docked rail outline (CapacityDockRailShape.rightFlarePath at full attachment): convex
-/// corners on the free left side, concave shoulders necking into the flush right edge, the
-/// system-notch technique. Coordinates are local to a w by h box.
-export function railPath(w: number, h: number): string {
-  const freeR = Math.min(22, h / 2, w * 0.45)
-  const contactR = Math.min(M.shoulderDepth * 0.6, h * 0.22, Math.max(0, h / 2 - freeR))
-  const f = (n: number) => n.toFixed(2)
-  return [
-    `M ${f(w)} 0`,
-    `Q ${f(w)} ${f(contactR)} ${f(w - contactR)} ${f(contactR)}`,
-    `L ${f(freeR)} ${f(contactR)}`,
-    `Q 0 ${f(contactR)} 0 ${f(contactR + freeR)}`,
-    `L 0 ${f(h - contactR - freeR)}`,
-    `Q 0 ${f(h - contactR)} ${f(freeR)} ${f(h - contactR)}`,
-    `L ${f(w - contactR)} ${f(h - contactR)}`,
-    `Q ${f(w)} ${f(h - contactR)} ${f(w)} ${f(h)}`,
-    'Z',
-  ].join(' ')
+/// Shapes are drawn once for a right-edge rail in a canonical box (cross by along) and mapped
+/// to the other edges with the same affine transforms the mac applies. `cross` is the
+/// canonical width.
+type Pt = readonly [number, number]
+
+function mapper(edge: Edge, cross: number): (p: Pt) => Pt {
+  switch (edge) {
+    case 'right':
+      return (p) => p
+    case 'left':
+      return ([x, y]) => [cross - x, y]
+    case 'bottom':
+      return ([x, y]) => [y, x]
+    case 'top':
+      return ([x, y]) => [y, cross - x]
+  }
 }
 
-/// Detail bubble with a tail on its right edge pointing at the hovered row
-/// (CapacityDockBubbleShape.rightTailPath). tailY is in local pixels.
-export function bubblePath(w: number, h: number, tailY: number): string {
-  const tailWidth = Math.min(22, Math.max(14, w * 0.055))
-  const bodyRight = w - tailWidth
-  const radius = Math.min(20, h * 0.18)
-  const midY = h * Math.min(Math.max(tailY / Math.max(h, 1), 0.18), 0.82)
-  const neck = Math.min(32, h * 0.19)
-  const f = (n: number) => n.toFixed(2)
-  return [
-    `M ${f(radius)} 0`,
-    `L ${f(bodyRight - radius)} 0`,
-    `Q ${f(bodyRight)} 0 ${f(bodyRight)} ${f(radius)}`,
-    `L ${f(bodyRight)} ${f(midY - neck)}`,
-    `C ${f(bodyRight)} ${f(midY - neck * 0.55)} ${f(w)} ${f(midY - tailWidth * 0.42)} ${f(w)} ${f(midY)}`,
-    `C ${f(w)} ${f(midY + tailWidth * 0.42)} ${f(bodyRight)} ${f(midY + neck * 0.55)} ${f(bodyRight)} ${f(midY + neck)}`,
-    `L ${f(bodyRight)} ${f(h - radius)}`,
-    `Q ${f(bodyRight)} ${f(h)} ${f(bodyRight - radius)} ${f(h)}`,
-    `L ${f(radius)} ${f(h)}`,
-    `Q 0 ${f(h)} 0 ${f(h - radius)}`,
-    `L 0 ${f(radius)}`,
-    `Q 0 0 ${f(radius)} 0`,
-    'Z',
-  ].join(' ')
+class PathBuilder {
+  private parts: string[] = []
+  constructor(private map: (p: Pt) => Pt) {}
+  private f(p: Pt): string {
+    const [x, y] = this.map(p)
+    return `${x.toFixed(2)} ${y.toFixed(2)}`
+  }
+  move(p: Pt) {
+    this.parts.push(`M ${this.f(p)}`)
+    return this
+  }
+  line(p: Pt) {
+    this.parts.push(`L ${this.f(p)}`)
+    return this
+  }
+  quad(control: Pt, to: Pt) {
+    this.parts.push(`Q ${this.f(control)} ${this.f(to)}`)
+    return this
+  }
+  cubic(c1: Pt, c2: Pt, to: Pt) {
+    this.parts.push(`C ${this.f(c1)} ${this.f(c2)} ${this.f(to)}`)
+    return this
+  }
+  close(): string {
+    this.parts.push('Z')
+    return this.parts.join(' ')
+  }
 }
 
-/// Trailing inset of the bubble content: the regular inset plus room for the tail.
+function roundedRect(b: PathBuilder, w: number, h: number, r: number): string {
+  return b
+    .move([r, 0])
+    .line([w - r, 0])
+    .quad([w, 0], [w, r])
+    .line([w, h - r])
+    .quad([w, h], [w - r, h])
+    .line([r, h])
+    .quad([0, h], [0, h - r])
+    .line([0, r])
+    .quad([0, 0], [r, 0])
+    .close()
+}
+
+/// The rail outline (CapacityDockRailShape): a plain rounded pill while loose, and once more
+/// than half attached, convex corners on the free side with concave shoulders necking into the
+/// flush contact edge, the system-notch technique. `len` runs along the edge.
+export function railPath(edge: Edge, cross: number, len: number, attachment: number): string {
+  const eased = smoothstep(attachment)
+  const b = new PathBuilder(mapper(edge, cross))
+  const freeR = Math.min(22, len / 2, cross * 0.45)
+  if (eased < 0.5) return roundedRect(b, cross, len, freeR)
+  const contactR = Math.min(M.shoulderDepth * 0.6, len * 0.22, Math.max(0, len / 2 - freeR)) * eased
+  return b
+    .move([cross, 0])
+    .quad([cross, contactR], [cross - contactR, contactR])
+    .line([freeR, contactR])
+    .quad([0, contactR], [0, contactR + freeR])
+    .line([0, len - contactR - freeR])
+    .quad([0, len - contactR], [freeR, len - contactR])
+    .line([cross - contactR, len - contactR])
+    .quad([cross, len - contactR], [cross, len])
+    .close()
+}
+
+/// Detail bubble (CapacityDockBubbleShape) with its tail on `tailEdge`, pointing at `tail`
+/// measured along that edge. `w` and `h` are the bubble's final box.
+export function bubblePath(tailEdge: Edge, w: number, h: number, tail: number): string {
+  const vertical = isVertical(tailEdge)
+  const cross = vertical ? w : h
+  const along = vertical ? h : w
+  const b = new PathBuilder(mapper(tailEdge, cross))
+  const tailWidth = Math.min(22, Math.max(14, cross * 0.055))
+  const bodyRight = cross - tailWidth
+  const radius = Math.min(20, along * 0.18)
+  const midY = along * Math.min(Math.max(tail / Math.max(along, 1), 0.18), 0.82)
+  const neck = Math.min(32, along * 0.19)
+  return b
+    .move([radius, 0])
+    .line([bodyRight - radius, 0])
+    .quad([bodyRight, 0], [bodyRight, radius])
+    .line([bodyRight, midY - neck])
+    .cubic([bodyRight, midY - neck * 0.55], [cross, midY - tailWidth * 0.42], [cross, midY])
+    .cubic([cross, midY + tailWidth * 0.42], [bodyRight, midY + neck * 0.55], [bodyRight, midY + neck])
+    .line([bodyRight, along - radius])
+    .quad([bodyRight, along], [bodyRight - radius, along])
+    .line([radius, along])
+    .quad([0, along], [0, along - radius])
+    .line([0, radius])
+    .quad([0, 0], [radius, 0])
+    .close()
+}
+
+/// Bubble content insets: the regular inset plus room for the tail on the tail edge.
 export const DETAIL_INSETS = {
   horizontal: Math.round(22 * DETAIL_SCALE),
   vertical: Math.round(16 * DETAIL_SCALE),
   tail: Math.round(18 * DETAIL_SCALE),
 } as const
+
+export function detailPadding(tailEdge: Edge): string {
+  const h = DETAIL_INSETS.horizontal
+  const v = DETAIL_INSETS.vertical
+  const t = DETAIL_INSETS.tail
+  const top = v + (tailEdge === 'top' ? t : 0)
+  const right = h + (tailEdge === 'right' ? t : 0)
+  const bottom = v + (tailEdge === 'bottom' ? t : 0)
+  const left = h + (tailEdge === 'left' ? t : 0)
+  return `${top}px ${right}px ${bottom}px ${left}px`
+}

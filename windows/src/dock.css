@@ -38,8 +38,13 @@
 
 .dock-rail {
   position: absolute;
-  right: 0;
   box-sizing: border-box;
+  will-change: left, top, width, height;
+  touch-action: none;
+}
+
+.dock-rail.is-dragging {
+  cursor: grabbing;
 }
 
 .dock-rows {
@@ -131,7 +136,6 @@
 .dock-detail {
   position: absolute;
   box-sizing: border-box;
-  padding: 14px 20px;
   transition:
     transform 200ms var(--dock-detail-present),
     opacity 200ms var(--dock-detail-present),
@@ -147,13 +151,20 @@
 
 /* Starts a step toward the rail so the bubble emerges from the dock. */
 .dock-detail.is-entering {
-  transform: translateX(10px);
   opacity: 0;
   transition: none;
 }
+.dock-detail.is-entering.is-tail-right { transform: translateX(10px); }
+.dock-detail.is-entering.is-tail-left { transform: translateX(-10px); }
+.dock-detail.is-entering.is-tail-top { transform: translateY(-10px); }
+.dock-detail.is-entering.is-tail-bottom { transform: translateY(10px); }
+
+.dock-detail.is-dismissing.is-tail-right { transform: translateX(6px); }
+.dock-detail.is-dismissing.is-tail-left { transform: translateX(-6px); }
+.dock-detail.is-dismissing.is-tail-top { transform: translateY(-6px); }
+.dock-detail.is-dismissing.is-tail-bottom { transform: translateY(6px); }
 
 .dock-detail.is-dismissing {
-  transform: translateX(6px);
   opacity: 0;
   pointer-events: none;
   transition:
