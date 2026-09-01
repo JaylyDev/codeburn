@@ -60,7 +60,7 @@ enum CapacityDockMetrics {
     }
 
     static func detailHeight(quota: QuotaSummary?, scale: CGFloat) -> CGFloat {
-        guard let quota else { return 186 * scale }
+        guard let quota else { return (186 * scale).rounded() }
         let rows = min(max(quota.details.count, quota.primary == nil ? 0 : 1), 5)
         let visibleFooter = CapacityDockQuotaPresentation.visibleFooterLines(
             quota.footerLines,
@@ -78,7 +78,10 @@ enum CapacityDockMetrics {
             470,
             max(132, 88 + CGFloat(rows) * 50 + CGFloat(footer) + actionExtra + connectionExtra)
         )
-        return base * scale
+        // Whole points, like every other dock metric: the bubble panel stays
+        // alive hidden after the first hover, and a fractional height re-runs
+        // its layout at display cadence forever (the rail had the same bug).
+        return (base * scale).rounded()
     }
 }
 
