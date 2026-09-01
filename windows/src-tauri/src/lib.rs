@@ -70,6 +70,9 @@ pub fn run() {
                 plan: plan::PlanClient::new(),
             });
 
+            #[cfg(all(debug_assertions, target_os = "windows"))]
+            warn_if_window_station_hidden();
+
             #[cfg(not(target_os = "linux"))]
             build_tray_tauri(app.handle())?;
 
@@ -279,6 +282,40 @@ fn parse_click(payload: &str) -> Option<(i32, i32)> {
     let x = value.get("x")?.as_i64()? as i32;
     let y = value.get("y")?.as_i64()? as i32;
     Some((x, y))
+}
+
+/// A process started from a service session (the QEMU guest agent's guest-exec, SSH, a
+/// scheduled task) gets a window station nobody is looking at: the tray icon and every window,
+/// dock included, report success and never reach the desktop. That exact trace cost a full
+/// debugging round on the VM, so debug builds now say so on startup.
+#[cfg(all(debug_assertions, target_os = "windows"))]
+fn warn_if_window_station_hidden() {
+    use windows_sys::Win32::System::StationsAndDesktops::{
+        GetProcessWindowStation, GetUserObjectInformationW, UOI_FLAGS, USEROBJECTFLAGS,
+    };
+    const WSF_VISIBLE: u32 = 0x0001;
+
+    let mut flags = USEROBJECTFLAGS {
+        fInherit: 0,
+        fReserved: 0,
+        dwFlags: 0,
+    };
+    let mut needed = 0u32;
+    let ok = unsafe {
+        GetUserObjectInformationW(
+            GetProcessWindowStation(),
+            UOI_FLAGS,
+            &mut flags as *mut USEROBJECTFLAGS as *mut std::ffi::c_void,
+            std::mem::size_of::<USEROBJECTFLAGS>() as u32,
+            &mut needed,
+        )
+    };
+    if ok != 0 && flags.dwFlags & WSF_VISIBLE == 0 {
+        eprintln!(
+            "codeburn: running on a non-interactive window station (service session launch); \
+             the tray icon and windows will never appear on the desktop"
+        );
+    }
 }
 
 /// Undecorated windows are square by default; ask DWM for the Windows 11 rounded corner so
