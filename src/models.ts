@@ -49,7 +49,7 @@ type PriceOverrideRates = {
   cacheCreation?: number
 }
 
-type LiteLLMEntry = {
+export type LiteLLMEntry = {
   input_cost_per_token?: number
   output_cost_per_token?: number
   cache_creation_input_token_cost?: number
@@ -509,6 +509,7 @@ const BUILTIN_ALIASES: Record<string, string> = {
 }
 
 let userAliases: Record<string, string> = {}
+let userModelNames: Record<string, string> = {}
 let userPriceOverrides: Map<string, ModelCosts> = new Map()
 let userPriceOverridesConfig: Record<string, PriceOverrideRates> = {}
 let sortedPriceOverrideKeys: string[] | null = null
@@ -518,6 +519,10 @@ let lowercasePriceOverrideIndex: Map<string, ModelCosts> | null = null
 // User aliases take precedence over built-ins.
 export function setModelAliases(aliases: Record<string, string>): void {
   userAliases = aliases
+}
+
+export function setModelNames(names: Record<string, string>): void {
+  userModelNames = names
 }
 
 function priceOverrideRatePerToken(usdPerMillion: number | undefined): number | null {
@@ -1372,6 +1377,7 @@ function deriveClaudeShortName(canonical: string): string | undefined {
 }
 
 function lookupShortName(id: string): string | undefined {
+  if (Object.hasOwn(userModelNames, id)) return userModelNames[id]!
   const claude = deriveClaudeShortName(id)
   if (claude) return claude
   for (const [key, name] of SORTED_SHORT_NAMES) {
