@@ -11,6 +11,10 @@ struct CapacityDockProviderQuotaServiceTests {
         Issue.record("Wrong adapter dispatched")
         return Self.summary()
     }
+    nonisolated private static let unusedGrok: @Sendable () async throws -> QuotaSummary = {
+        Issue.record("Wrong adapter dispatched")
+        return Self.summary()
+    }
     nonisolated private static let unusedZai: @Sendable (String?) async throws -> QuotaSummary = { _ in
         Issue.record("Wrong adapter dispatched")
         return Self.summary()
@@ -26,6 +30,7 @@ struct CapacityDockProviderQuotaServiceTests {
                 return expected
             },
             refreshCursor: Self.unusedCursor,
+            refreshGrok: Self.unusedGrok,
             refreshZai: Self.unusedZai
         ))
         let provider = try #require(CapacityDockProvider(rawValue: "clinepass"))
@@ -51,6 +56,7 @@ struct CapacityDockProviderQuotaServiceTests {
                 return Self.summary()
             },
             refreshCursor: Self.unusedCursor,
+            refreshGrok: Self.unusedGrok,
             refreshZai: { apiKey in
                 if let apiKey { await capture.record(apiKey) }
                 return expected
@@ -77,9 +83,32 @@ struct CapacityDockProviderQuotaServiceTests {
                 return Self.summary()
             },
             refreshCursor: { expected },
+            refreshGrok: Self.unusedGrok,
             refreshZai: Self.unusedZai
         ))
         let provider = try #require(CapacityDockProvider(rawValue: "cursor"))
+
+        let result = try await service.fetch(
+            provider: provider,
+            credential: CapacityDockProviderCredential()
+        )
+
+        #expect(result == expected)
+    }
+
+    @Test("Grok dispatches through passive Grok Build login discovery")
+    func dispatchesGrok() async throws {
+        let expected = Self.summary(percent: 0.21)
+        let service = CapacityDockProviderQuotaService(dependencies: .init(
+            refreshClinePass: { _ in
+                Issue.record("Wrong adapter dispatched")
+                return Self.summary()
+            },
+            refreshCursor: Self.unusedCursor,
+            refreshGrok: { expected },
+            refreshZai: Self.unusedZai
+        ))
+        let provider = try #require(CapacityDockProvider(rawValue: "grok"))
 
         let result = try await service.fetch(
             provider: provider,
@@ -97,6 +126,7 @@ struct CapacityDockProviderQuotaServiceTests {
                 return Self.summary()
             },
             refreshCursor: Self.unusedCursor,
+            refreshGrok: Self.unusedGrok,
             refreshZai: Self.unusedZai
         ))
         let provider = try #require(CapacityDockProvider(rawValue: "clinepass"))
@@ -128,6 +158,7 @@ struct CapacityDockProviderQuotaServiceTests {
                 return Self.summary()
             },
             refreshCursor: Self.unusedCursor,
+            refreshGrok: Self.unusedGrok,
             refreshZai: Self.unusedZai
         ))
         let provider = try #require(CapacityDockProvider(rawValue: "openrouter"))
@@ -150,6 +181,7 @@ struct CapacityDockProviderQuotaServiceTests {
         let service = CapacityDockProviderQuotaService(dependencies: .init(
             refreshClinePass: { _ in throw ClinePassSubscriptionService.FetchError.authenticationRejected },
             refreshCursor: Self.unusedCursor,
+            refreshGrok: Self.unusedGrok,
             refreshZai: Self.unusedZai
         ))
         let provider = try #require(CapacityDockProvider(rawValue: "clinepass"))
@@ -175,6 +207,7 @@ struct CapacityDockProviderQuotaServiceTests {
             let service = CapacityDockProviderQuotaService(dependencies: .init(
                 refreshClinePass: { _ in throw error },
                 refreshCursor: Self.unusedCursor,
+                refreshGrok: Self.unusedGrok,
                 refreshZai: Self.unusedZai
             ))
             do {
@@ -193,6 +226,40 @@ struct CapacityDockProviderQuotaServiceTests {
         ) == .transient)
     }
 
+    @Test("Grok login failures stop retries while quota outages preserve the connection")
+    func classifiesGrokFailures() async throws {
+        let provider = try #require(CapacityDockProvider(rawValue: "grok"))
+        let cases: [(GrokBuildSubscriptionService.FetchError, CapacityDockProviderFetchFailureDisposition)] = [
+            (.noCredentials, .terminal),
+            (.authenticationRejected, .terminal),
+            (.rateLimited, .transient),
+            (.providerUnavailable, .transient),
+            (.parseFailure, .transient),
+        ]
+
+        for (error, expectedDisposition) in cases {
+            let service = CapacityDockProviderQuotaService(dependencies: .init(
+                refreshClinePass: { _ in
+                    Issue.record("Wrong adapter dispatched")
+                    return Self.summary()
+                },
+                refreshCursor: Self.unusedCursor,
+                refreshGrok: { throw error },
+                refreshZai: Self.unusedZai
+            ))
+            do {
+                _ = try await service.fetch(
+                    provider: provider,
+                    credential: CapacityDockProviderCredential()
+                )
+                Issue.record("Expected \(error) to fail")
+            } catch let failure as CapacityDockProviderFetchFailure {
+                #expect(failure.disposition == expectedDisposition)
+                #expect(failure.message == error.localizedDescription)
+            }
+        }
+    }
+
     @Test("disconnect invalidates an in-flight provider refresh")
     func disconnectWinsOverInFlightRefresh() async throws {
         let provider = try #require(CapacityDockProvider(rawValue: "clinepass"))
@@ -209,6 +276,7 @@ struct CapacityDockProviderQuotaServiceTests {
                 return Self.summary(percent: 0.73)
             },
             refreshCursor: Self.unusedCursor,
+            refreshGrok: Self.unusedGrok,
             refreshZai: Self.unusedZai
         ))
 
