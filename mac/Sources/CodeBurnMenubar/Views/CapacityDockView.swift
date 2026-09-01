@@ -172,7 +172,9 @@ final class CapacityDockViewModel {
     var flareCompensation: CGFloat {
         let p = min(max(attachmentProgress, 0), 1)
         let eased = p * p * (3 - 2 * p)
-        return CapacityDockMetrics.edgeShoulderDepth(scale: scale) * 0.6 * eased
+        // Whole points once docked: a fractional pad puts the content length
+        // off the pixel-aligned panel and the rail relays out every frame.
+        return (CapacityDockMetrics.edgeShoulderDepth(scale: scale) * 0.6 * eased).rounded()
     }
     var railAlongPad: CGFloat { CapacityDockMetrics.railAlongPad(scale: scale) + flareCompensation }
     var railCrossPad: CGFloat { CapacityDockMetrics.railCrossPad(scale: scale) }
