@@ -2609,6 +2609,23 @@ program
     process.stdout.write(renderDoctorTable(report, { color: opts.color }))
   })
 
+program
+  .command('quota')
+  .description('Live provider capacity: quota windows for each signed-in coding tool on this machine')
+  .option('--format <format>', 'Output format: table, json', 'table')
+  .option('--no-color', 'Disable ANSI colors')
+  .action(async (opts) => {
+    const { collectQuota, renderQuotaTable } = await import('./quota/index.js')
+    const report = await collectQuota()
+    const out = opts.format === 'json'
+      ? JSON.stringify(report, null, 2) + '\n'
+      : renderQuotaTable(report, { color: opts.color }) + '\n'
+    // A keychain lookup or local-server probe abandoned by the per-provider
+    // timeout keeps its child alive long past the output, so leave on purpose
+    // once the write has flushed.
+    process.stdout.write(out, () => process.exit(0))
+  })
+
 registerActCommands(program)
 registerGuardCommands(program)
 registerSyncCommands(program)
