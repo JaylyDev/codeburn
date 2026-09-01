@@ -7,8 +7,10 @@
 //     normal connection states and never crash the panel.
 //
 // Credential: the GitHub OAuth token already on disk from a signed-in Copilot
-// plugin - ~/.config/github-copilot/hosts.json (keyed by host) falling back to
-// apps.json (keyed by app name). Read-only; no new storage.
+// plugin - hosts.json (keyed by host) falling back to apps.json (keyed by app
+// name). The plugins write those under ~/.config/github-copilot on macOS and
+// Linux but under %LOCALAPPDATA%\github-copilot on Windows, so the directory
+// is resolved per platform. Read-only; no new storage.
 import os from 'node:os'
 import path from 'node:path'
 
@@ -26,18 +28,37 @@ const HEADERS = {
 
 type HostRecord = Record<string, any> & { oauth_token?: unknown }
 
+const CREDENTIAL_FILES = ['hosts.json', 'apps.json'] as const
+
 export type CopilotDeps = {
   fetch: typeof fetch
-  hostsPath: string
-  appsPath: string
+  /** Ordered credential directories; the first file that yields a token wins. */
+  configDirs: string[]
   readFile: typeof readSecureFile
 }
 
-const defaults: CopilotDeps = {
-  fetch: globalThis.fetch,
-  hostsPath: path.join(os.homedir(), '.config', 'github-copilot', 'hosts.json'),
-  appsPath: path.join(os.homedir(), '.config', 'github-copilot', 'apps.json'),
-  readFile: readSecureFile,
+/**
+ * Where the signed-in Copilot plugins keep hosts.json / apps.json. Windows has
+ * no ~/.config: the plugins follow the platform convention and write under
+ * %LOCALAPPDATA%. The XDG path stays as a second candidate there, because a
+ * token copied in from a POSIX-style shell (Git Bash, an MSYS home) lands in
+ * it and is just as valid.
+ */
+export function copilotConfigDirs(
+  platform: string = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = os.homedir(),
+): string[] {
+  const xdg = path.join(home, '.config', 'github-copilot')
+  if (platform !== 'win32') return [xdg]
+  const localAppData = env['LOCALAPPDATA']?.trim() || path.join(home, 'AppData', 'Local')
+  return [path.join(localAppData, 'github-copilot'), xdg]
+}
+
+// Resolved per call rather than once at import so a caller (and the tests) can
+// change the platform or the environment the paths are derived from.
+function defaultDeps(): CopilotDeps {
+  return { fetch: globalThis.fetch, configDirs: copilotConfigDirs(), readFile: readSecureFile }
 }
 
 function empty(connection: QuotaProvider['connection']): QuotaProvider {
@@ -54,14 +75,16 @@ function tokenFromMap(raw: string): string | null {
 }
 
 async function credentialFromFiles(deps: CopilotDeps): Promise<string | null> {
-  for (const filePath of [deps.hostsPath, deps.appsPath]) {
-    try {
-      const raw = await deps.readFile(filePath, 64 * 1024)
-      if (!raw) continue
-      const token = tokenFromMap(raw)
-      if (token) return token
-    } catch {
-      // A malformed or unreadable file falls through to the next candidate.
+  for (const dir of deps.configDirs) {
+    for (const name of CREDENTIAL_FILES) {
+      try {
+        const raw = await deps.readFile(path.join(dir, name), 64 * 1024)
+        if (!raw) continue
+        const token = tokenFromMap(raw)
+        if (token) return token
+      } catch {
+        // A malformed or unreadable file falls through to the next candidate.
+      }
     }
   }
   return null
@@ -117,7 +140,7 @@ async function request(token: string, deps: CopilotDeps, parent?: AbortSignal): 
 export type CopilotResult = { quota: QuotaProvider; retryAfterSeconds?: number }
 
 export async function fetchCopilotQuota(options: Partial<CopilotDeps> & { signal?: AbortSignal } = {}): Promise<CopilotResult> {
-  const deps = { ...defaults, ...options }
+  const deps = { ...defaultDeps(), ...options }
   try {
     let token = await credentialFromFiles(deps)
     if (!token) return { quota: empty('disconnected') }
