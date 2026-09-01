@@ -83,7 +83,9 @@ pub fn run() {
             }
 
             if dock::is_enabled() {
-                let _ = dock::show(app.handle());
+                if let Err(err) = dock::show(app.handle()) {
+                    eprintln!("codeburn: failed to show the Capacity Dock: {err}");
+                }
             }
 
             Ok(())
@@ -326,7 +328,9 @@ fn set_dock_enabled(app: &AppHandle, enabled: bool) {
         return;
     }
     if enabled {
-        let _ = dock::show(app);
+        if let Err(err) = dock::show(app) {
+            eprintln!("codeburn: failed to show the Capacity Dock: {err}");
+        }
     } else {
         dock::hide(app);
     }

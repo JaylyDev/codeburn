@@ -69,6 +69,11 @@ pub fn apply_layout(window: &tauri::WebviewWindow, rows: u32, expanded: bool) {
     let x = area.position.x + area.size.width as i32 - w;
     let y = area.position.y + ((area.size.height as i32 - h) / 2).max(0);
 
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "codeburn dock: scale={scale} work_area={},{} {}x{} -> pos {x},{y} size {w}x{h}",
+        area.position.x, area.position.y, area.size.width, area.size.height
+    );
     let _ = window.set_size(tauri::PhysicalSize::new(w.max(1) as u32, h.max(1) as u32));
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
 }
@@ -99,6 +104,8 @@ pub fn show(app: &AppHandle) -> tauri::Result<()> {
 
     apply_layout(&window, 1, false);
     window.show()?;
+    #[cfg(debug_assertions)]
+    eprintln!("codeburn dock: window created and shown");
     Ok(())
 }
 
