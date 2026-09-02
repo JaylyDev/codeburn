@@ -2113,3 +2113,6 @@ code { font-family: var(--font-mono); }
   word-break: break-all;
   user-select: text;
 }
+.stg-readout { font-family: var(--font-mono); font-size: 11px; color: var(--label-2); min-width: 38px; text-align: right; }
+.stg-provider { display: inline-flex; align-items: center; gap: 7px; }
+.stg-attention { font-size: 10px; color: var(--danger); }

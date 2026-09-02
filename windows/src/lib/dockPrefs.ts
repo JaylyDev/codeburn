@@ -1,0 +1,111 @@
+/// The Capacity Dock's own preferences, from mac/.../Data/CapacityDockPreferences.swift.
+///
+/// They live in `windows-dock.json` rather than `windows-settings.json` because the rail's
+/// placement is already there and the dock reads the file from Rust before the page exists.
+/// `codeburn://dock-settings-changed` carries the whole object after every write.
+
+import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+
+export type DockTheme = 'graphite' | 'acrylic'
+export type DockGaugeShape = 'circle' | 'squircle'
+
+export const DOCK_THEMES: Array<{ id: DockTheme; label: string }> = [
+  { id: 'graphite', label: 'Graphite' },
+  // The mac's second appearance is Liquid Glass; the Windows equivalent is the acrylic
+  // window effect, so it is named after what it actually is here.
+  { id: 'acrylic', label: 'Acrylic' },
+]
+
+export const DOCK_GAUGE_SHAPES: Array<{ id: DockGaugeShape; label: string }> = [
+  { id: 'circle', label: 'Circle' },
+  { id: 'squircle', label: 'Squircle' },
+]
+
+/// CapacityDockPreferences.scaleRange and its 0.05 step.
+export const DOCK_SCALE_MIN = 0.6
+export const DOCK_SCALE_MAX = 1.2
+export const DOCK_SCALE_STEP = 0.05
+/// CapacityDockPreferences.maxAutoProviders.
+export const DOCK_MAX_AUTO_PROVIDERS = 5
+
+export type DockPrefs = {
+  enabled: boolean
+  preferred: string | null
+  scale: number
+  theme: DockTheme
+  gaugeShape: DockGaugeShape
+  /// Which providers the rail shows. Empty means nothing has been chosen yet, which is what
+  /// lets the dock auto-seed from whatever is connected.
+  providers: string[]
+  /// Latches once the user edits the provider set, so auto-seeding stops second-guessing them.
+  manualSelection: boolean
+}
+
+export const DEFAULT_DOCK_PREFS: DockPrefs = {
+  enabled: false,
+  preferred: null,
+  scale: DOCK_SCALE_MIN,
+  theme: 'graphite',
+  gaugeShape: 'circle',
+  providers: [],
+  manualSelection: false,
+}
+
+export function parseDockPrefs(raw: Record<string, unknown>): DockPrefs {
+  const scale = typeof raw.scale === 'number' && Number.isFinite(raw.scale) ? raw.scale : DOCK_SCALE_MIN
+  return {
+    enabled: raw.enabled === true,
+    preferred: typeof raw.preferred === 'string' ? raw.preferred : null,
+    scale: Math.min(DOCK_SCALE_MAX, Math.max(DOCK_SCALE_MIN, scale)),
+    theme: raw.theme === 'acrylic' ? 'acrylic' : 'graphite',
+    gaugeShape: raw.gaugeShape === 'squircle' ? 'squircle' : 'circle',
+    providers: Array.isArray(raw.providers) ? raw.providers.filter((p): p is string => typeof p === 'string') : [],
+    manualSelection: raw.manualSelection === true,
+  }
+}
+
+export async function loadDockPrefs(): Promise<DockPrefs> {
+  try {
+    return parseDockPrefs(await invoke<Record<string, unknown>>('dock_prefs') ?? {})
+  } catch {
+    return DEFAULT_DOCK_PREFS
+  }
+}
+
+export async function writeDockPrefs(patch: Partial<DockPrefs>): Promise<DockPrefs> {
+  try {
+    return parseDockPrefs(await invoke<Record<string, unknown>>('set_dock_prefs', { patch }) ?? {})
+  } catch {
+    return loadDockPrefs()
+  }
+}
+
+export function onDockPrefsChanged(listener: (prefs: DockPrefs) => void): () => void {
+  let stop: (() => void) | null = null
+  let cancelled = false
+  void listen<Record<string, unknown>>('codeburn://dock-settings-changed', event => {
+    listener(parseDockPrefs(event.payload ?? {}))
+  }).then(fn => {
+    if (cancelled) fn()
+    else stop = fn
+  })
+  return () => {
+    cancelled = true
+    if (stop) stop()
+  }
+}
+
+/// CapacityDockProviderSelection.canDeselect: the rail must never end up with nothing to
+/// show, so the last connected provider in the set stays switched on.
+export function canDeselect(id: string, selected: string[], isConnected: (id: string) => boolean): boolean {
+  if (!selected.includes(id)) return true
+  if (!isConnected(id)) return true
+  return selected.filter(isConnected).length > 1
+}
+
+/// CapacityDockProviderSelection.manageableProviders: everything connected, plus anything
+/// already in the set, so a provider whose connection later fails can still be removed.
+export function manageableProviders(all: string[], selected: string[], isConnected: (id: string) => boolean): string[] {
+  return all.filter(id => selected.includes(id) || isConnected(id))
+}

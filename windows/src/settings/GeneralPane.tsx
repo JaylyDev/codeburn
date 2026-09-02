@@ -10,8 +10,14 @@ import {
 } from '../lib/appSettings'
 import { applyTheme } from '../lib/settings'
 import { TRAY_BADGE_SUPPORTED, homePath } from '../lib/platform'
-import type { QuotaState } from '../lib/quota'
-import { Group, Note, Pane, Row, Select, Switch } from './controls'
+import { summaryFor, type QuotaState } from '../lib/quota'
+import {
+  DEFAULT_DOCK_PREFS, DOCK_GAUGE_SHAPES, DOCK_SCALE_MAX, DOCK_SCALE_MIN, DOCK_SCALE_STEP,
+  DOCK_THEMES, canDeselect, loadDockPrefs, manageableProviders, onDockPrefsChanged,
+  writeDockPrefs, type DockPrefs,
+} from '../lib/dockPrefs'
+import { ProviderGlyph } from '../providerIcons'
+import { Group, Note, Pane, Row, Select, Slider, Switch } from './controls'
 
 /// The mac's GeneralSettingsTab. Display first, because it is what the reader came for; the
 /// Windows-only rows (login item, tray badge) sit under System at the end, where the mac
@@ -23,7 +29,7 @@ type Props = {
   anchor: string | null
 }
 
-export function GeneralPane({ anchor }: Props) {
+export function GeneralPane({ quota, anchor }: Props) {
   const [settings, setSettings] = useState<AppSettings | null>(null)
   const [currency, setCurrency] = useState<CurrencyState>(USD)
   const [currencyError, setCurrencyError] = useState<string | null>(null)
@@ -152,6 +158,8 @@ export function GeneralPane({ anchor }: Props) {
         />
       </Group>
 
+      <CapacityDockSection quota={quota} />
+
       <Group title="System">
         <Row
           label="Theme"
@@ -196,5 +204,146 @@ export function GeneralPane({ anchor }: Props) {
         )}
       </Group>
     </Pane>
+  )
+}
+
+/// The mac's CapacityDockSettingsSection. These preferences live in windows-dock.json beside
+/// the rail's placement, because the dock reads that file from Rust before its page exists.
+function CapacityDockSection({ quota }: { quota: QuotaState }) {
+  const [prefs, setPrefs] = useState<DockPrefs>(DEFAULT_DOCK_PREFS)
+
+  useEffect(() => {
+    void loadDockPrefs().then(setPrefs)
+    return onDockPrefsChanged(setPrefs)
+  }, [])
+
+  const apply = (patch: Partial<DockPrefs>) => {
+    // Optimistic, so a slider stays under the pointer; the event corrects it either way.
+    setPrefs(current => ({ ...current, ...patch }))
+    void writeDockPrefs(patch).then(setPrefs)
+  }
+
+  const isConnected = (id: string) => {
+    const summary = summaryFor(quota, id)
+    return summary !== null && (summary.connection === 'connected' || summary.connection === 'stale')
+  }
+  const nameOf = (id: string) => quota.providers.find(p => p.id === id)?.name ?? id
+
+  const all = quota.providers.map(p => p.id)
+  const manageable = manageableProviders(all, prefs.providers, isConnected)
+  // The rail can only rest on a provider it is actually showing. With nothing chosen yet it
+  // shows everything connected, which is what an empty selection means.
+  const restable = (prefs.providers.length > 0 ? prefs.providers : all).filter(isConnected)
+  const resting = restable.includes(prefs.preferred ?? '') ? prefs.preferred! : restable[0] ?? ''
+
+  const toggleProvider = (id: string, on: boolean) => {
+    const base = prefs.providers.length > 0 ? prefs.providers : all.filter(isConnected)
+    const next = on ? [...base.filter(p => p !== id), id] : base.filter(p => p !== id)
+    // Ordered as the CLI reports them, so the rail reads the same top to bottom whichever
+    // order the switches were flipped in.
+    apply({ providers: all.filter(p => next.includes(p)), manualSelection: true })
+  }
+
+  return (
+    <Group
+      id="stg-dock"
+      title="Capacity Dock"
+      footer="Connected providers, and anything already in the dock, appear here, so a provider can always be removed even after its connection fails."
+    >
+      <Row
+        label="Show Capacity Dock"
+        hint="A slim quota rail docked to a screen edge."
+        control={
+          <Switch
+            ariaLabel="Show Capacity Dock"
+            on={prefs.enabled}
+            onToggle={() => apply({ enabled: !prefs.enabled })}
+          />
+        }
+      />
+      {restable.length > 0 && (
+        <Row
+          label="Resting provider"
+          hint="The one the rail shows before you hover it."
+          control={
+            <Select
+              ariaLabel="Resting provider"
+              value={resting}
+              options={restable.map(id => ({ id, label: nameOf(id) }))}
+              onChange={preferred => apply({ preferred })}
+            />
+          }
+        />
+      )}
+      <Row
+        label="Size"
+        control={
+          <>
+            <Slider
+              ariaLabel="Capacity Dock size"
+              value={prefs.scale}
+              min={DOCK_SCALE_MIN}
+              max={DOCK_SCALE_MAX}
+              step={DOCK_SCALE_STEP}
+              onChange={scale => apply({ scale })}
+            />
+            <span className="stg-readout">{Math.round(prefs.scale * 100)}%</span>
+          </>
+        }
+      />
+      <Row
+        label="Appearance"
+        control={
+          <Select
+            ariaLabel="Capacity Dock appearance"
+            value={prefs.theme}
+            options={DOCK_THEMES}
+            onChange={theme => apply({ theme })}
+          />
+        }
+      />
+      <Row
+        label="Gauge shape"
+        control={
+          <Select
+            ariaLabel="Capacity Dock gauge shape"
+            value={prefs.gaugeShape}
+            options={DOCK_GAUGE_SHAPES}
+            onChange={gaugeShape => apply({ gaugeShape })}
+          />
+        }
+      />
+      {manageable.length === 0 ? (
+        <Note>Connect a provider from its page in the sidebar to make it available here.</Note>
+      ) : (
+        manageable.map(id => {
+          const on = prefs.providers.length > 0 ? prefs.providers.includes(id) : isConnected(id)
+          return (
+            <Row
+              key={id}
+              label={
+                <span className="stg-provider">
+                  <ProviderGlyph id={id} size={14} />
+                  <span>{nameOf(id)}</span>
+                  {!isConnected(id) && <span className="stg-attention">Needs attention</span>}
+                </span>
+              }
+              control={
+                <Switch
+                  ariaLabel={nameOf(id)}
+                  on={on}
+                  disabled={on && !canDeselect(id, prefs.providers.length > 0 ? prefs.providers : all.filter(isConnected), isConnected)}
+                  onToggle={() => toggleProvider(id, !on)}
+                />
+              }
+            />
+          )
+        })
+      )}
+      <Note>
+        Size, appearance and gauge shape are stored now and the rail picks them up with the
+        Capacity Dock work that follows this one.
+      </Note>
+    </Group>
   )
 }

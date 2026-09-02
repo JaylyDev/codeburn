@@ -8,9 +8,14 @@ export function Pane({ children }: { children?: ReactNode }) {
   return <div className="stg-pane">{children}</div>
 }
 
-export function Group({ title, footer, children }: { title?: string; footer?: ReactNode; children: ReactNode }) {
+export function Group({ id, title, footer, children }: {
+  id?: string
+  title?: string
+  footer?: ReactNode
+  children: ReactNode
+}) {
   return (
-    <section className="stg-group">
+    <section className="stg-group" id={id}>
       {title && <h2 className="stg-group-title">{title}</h2>}
       <div className="stg-card">{children}</div>
       {footer && <p className="stg-footer">{footer}</p>}

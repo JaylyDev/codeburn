@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProp
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { ProviderGlyph } from './providerIcons'
+import { loadDockPrefs, onDockPrefsChanged } from './lib/dockPrefs'
 import {
   M,
   MOTION,
@@ -282,6 +283,7 @@ const ATTACH_MOTION = (_from: number, to: number) => (to === 1 ? MOTION.dockAtta
 export function Dock() {
   const [quota, setQuota] = useState<DockQuota | null>(null)
   const [preferredId, setPreferredId] = useState<string | null>(null)
+  const [chosenIds, setChosenIds] = useState<string[]>([])
   const [interaction, setInteraction] = useState<Interaction>(REST)
   const [presentationExpanded, setPresentationExpanded] = useState(false)
   const [hovered, setHovered] = useState<string | null>(null)
@@ -323,9 +325,25 @@ export function Dock() {
     return () => window.clearInterval(timer)
   }, [load])
 
-  // Providers: the ones the CLI reports signed in, else the preferred one as a dashed stand-in.
+  // The settings window writes both of these, so the rail follows a switch or a resting
+  // provider the moment it is changed rather than at the next refresh.
+  useEffect(() => {
+    void loadDockPrefs().then((prefs) => {
+      setPreferredId(prefs.preferred)
+      setChosenIds(prefs.providers)
+    })
+    return onDockPrefsChanged((prefs) => {
+      setPreferredId(prefs.preferred)
+      setChosenIds(prefs.providers)
+    })
+  }, [])
+
+  // Providers: the ones the CLI reports signed in, narrowed to the settings window's choice
+  // when one has been made, else the preferred one as a dashed stand-in. An empty choice is
+  // "nobody has picked yet", which is why it means everything rather than nothing.
   const all = quota?.state === 'ready' ? quota.providers : []
-  const available = all.filter((p) => p.available)
+  const signedIn = all.filter((p) => p.available)
+  const available = chosenIds.length > 0 ? signedIn.filter((p) => chosenIds.includes(p.id)) : signedIn
   const resolvedPreferredId = preferredId ?? available[0]?.id ?? all[0]?.id ?? 'claude'
   const preferred: Provider = all.find((p) => p.id === resolvedPreferredId) ?? {
     id: resolvedPreferredId,
