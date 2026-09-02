@@ -616,6 +616,108 @@ code { font-family: var(--font-mono); }
   color: var(--label);
   box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.10);
 }
+/* The calendar button is a fixed 28 px, as on the mac: the six period segments share what
+   is left, and its width must not move as the labels change. */
+.period-calendar-anchor { position: relative; flex: 0 0 28px; display: flex; }
+.period-calendar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  flex: 0 0 28px;
+  cursor: pointer;
+}
+.period-calendar.is-day-mode { color: var(--brand-accent); }
+
+/* Day picker. Anchored under the calendar button and right-aligned so a month never runs
+   off the popover. */
+.calendar-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  width: 234px;
+  padding: 10px 6px;
+  border-radius: var(--radius-card);
+  border: 1px solid var(--control-border);
+  background: var(--menu-bg);
+  box-shadow: var(--menu-shadow);
+}
+.calendar-head { display: flex; align-items: center; padding: 0 4px 6px; }
+.calendar-title { flex: 1; text-align: center; font-size: 12px; font-weight: 600; color: var(--label); }
+.calendar-nav {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-util);
+  background: transparent;
+  color: var(--label-2);
+  cursor: pointer;
+}
+.calendar-nav:hover:not(:disabled) { background: var(--control-hover); color: var(--label); }
+.calendar-nav:disabled { color: var(--label-3); cursor: default; }
+.calendar-weekdays, .calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 30px);
+  justify-content: center;
+}
+.calendar-weekdays span {
+  height: 16px;
+  text-align: center;
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--label-3);
+}
+.calendar-grid { gap: 2px 0; }
+.calendar-day {
+  justify-self: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--label);
+  cursor: pointer;
+}
+.calendar-day:hover:not(:disabled):not(.is-selected) { background: var(--control-hover); }
+.calendar-day.is-outside { color: var(--label-3); }
+.calendar-day.is-today { font-weight: 700; color: var(--brand-accent); border-color: var(--brand-accent); }
+.calendar-day.is-selected, .calendar-day.is-selected.is-today {
+  background: var(--brand-accent);
+  border-color: transparent;
+  color: #fff;
+}
+.calendar-day:disabled { color: var(--label-3); opacity: 0.5; cursor: default; }
+.calendar-foot { display: flex; align-items: center; gap: 8px; padding: 8px 4px 0; }
+.calendar-clear {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--label-2);
+  cursor: pointer;
+}
+.calendar-clear:hover { color: var(--label); }
+.calendar-summary { flex: 1; text-align: center; font-size: 10px; color: var(--label-3); }
+.calendar-done {
+  border: 0;
+  padding: 5px 14px;
+  border-radius: var(--radius-segment);
+  background: var(--brand-accent);
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  cursor: pointer;
+}
+.calendar-done.is-idle { background: var(--fill-18); color: var(--label-2); }
 
 /* ---- insight area -------------------------------------------------------------- */
 

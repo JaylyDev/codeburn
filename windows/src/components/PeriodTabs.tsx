@@ -1,7 +1,13 @@
-export type Period = 'today' | 'week' | '30days' | 'month' | 'all'
+import { useEffect, useRef, useState } from 'react'
+import { addDays, formatDateKey, startOfDay, todayKey } from '../lib/dates'
+import { CalendarIcon, ChevronLeft, ChevronRight } from './Icons'
 
+export type Period = 'today' | 'week' | '30days' | 'month' | 'all' | 'lifetime'
+
+/// Compact labels, as on the mac: six segments plus the calendar button share one narrow
+/// popover row, so "6 Months" and "Lifetime" would wrap.
 export const PERIOD_LABELS: Record<Period, string> = {
-  today: 'Today', week: '7 Days', '30days': '30 Days', month: 'Month', all: 'All',
+  today: 'Today', week: '7D', '30days': '30D', month: 'Month', all: '6M', lifetime: 'Life',
 }
 
 /// Short phrase used in sentences ("Sessions (7 days)", "No Claude data for this month").
@@ -10,17 +16,33 @@ export const PERIOD_PHRASES: Record<Period, string> = {
   week: 'the last 7 days',
   '30days': 'the last 30 days',
   month: 'this month',
-  all: 'all time',
+  all: 'the last 6 months',
+  lifetime: 'all time',
 }
 
 const PERIODS = Object.keys(PERIOD_LABELS) as Period[]
 
-type Props = {
-  selected: Period
-  onSelect: (p: Period) => void
+/// The days the reader picked in the calendar, sorted, empty when the period governs. One
+/// day goes to the CLI as `--day`, several as `--days`.
+export type DaySelection = string[]
+
+export function daySelectionLabel(days: DaySelection): string | null {
+  if (days.length === 0) return null
+  if (days.length === 1) return `Day (${days[0]})`
+  return `${days.length} days (${days[0]} .. ${days[days.length - 1]})`
 }
 
-export function PeriodTabs({ selected, onSelect }: Props) {
+type Props = {
+  selected: Period
+  days: DaySelection
+  onSelect: (p: Period) => void
+  onSelectDays: (days: DaySelection) => void
+}
+
+export function PeriodTabs({ selected, days, onSelect, onSelectDays }: Props) {
+  const [calendarOpen, setCalendarOpen] = useState(false)
+  const dayMode = days.length > 0
+
   return (
     <div className="period-wrap">
       <nav className="period-tabs" aria-label="Period">
@@ -28,14 +50,169 @@ export function PeriodTabs({ selected, onSelect }: Props) {
           <button
             key={p}
             type="button"
-            className={`period ${selected === p ? 'period-active' : ''}`}
-            aria-pressed={selected === p}
+            className={`period ${!dayMode && selected === p ? 'period-active' : ''}`}
+            aria-pressed={!dayMode && selected === p}
             onClick={() => onSelect(p)}
           >
             {PERIOD_LABELS[p]}
           </button>
         ))}
+        <div className="period-calendar-anchor">
+          <button
+            type="button"
+            className={`period period-calendar ${dayMode ? 'period-active is-day-mode' : ''}`}
+            aria-label="Pick days"
+            aria-expanded={calendarOpen}
+            onClick={() => setCalendarOpen(o => !o)}
+          >
+            <CalendarIcon size={11} />
+          </button>
+          {calendarOpen && (
+            <CalendarPopover
+              days={days}
+              onDone={next => { onSelectDays(next); setCalendarOpen(false) }}
+              onDismiss={() => setCalendarOpen(false)}
+            />
+          )}
+        </div>
       </nav>
     </div>
   )
+}
+
+const WEEKDAYS = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su']
+
+type DayCell = { key: string; day: number; date: string; currentMonth: boolean }
+
+/// Port of CalendarPopover in mac/.../Views/PeriodSegmentedControl.swift. Days go into a
+/// pending set and are only applied on Done, so choosing five days costs one CLI run
+/// rather than five.
+function CalendarPopover({ days, onDone, onDismiss }: {
+  days: DaySelection
+  onDone: (days: DaySelection) => void
+  onDismiss: () => void
+}) {
+  const [pending, setPending] = useState<Set<string>>(() => new Set(days))
+  const [month, setMonth] = useState(() => {
+    const base = days[0] ? new Date(`${days[0]}T00:00:00`) : new Date()
+    return new Date(base.getFullYear(), base.getMonth(), 1)
+  })
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node
+      // The calendar button toggles on click, so a press on it must not also dismiss here
+      // or the popover would close and reopen in the same gesture.
+      if (ref.current && !ref.current.contains(target) && !ref.current.parentElement?.contains(target)) {
+        onDismiss()
+      }
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [onDismiss])
+
+  const today = todayKey()
+  const forwardOk = new Date(month.getFullYear(), month.getMonth() + 1, 1) <= startOfDay(new Date())
+
+  const toggle = (date: string) => {
+    setPending(prev => {
+      const next = new Set(prev)
+      if (next.has(date)) next.delete(date)
+      else next.add(date)
+      return next
+    })
+  }
+
+  const summary = pending.size === 0 ? 'Pick dates' : pending.size === 1 ? '1 day' : `${pending.size} days`
+
+  return (
+    <div className="calendar-popover" ref={ref} role="dialog" aria-label="Pick days">
+      <div className="calendar-head">
+        <button
+          type="button"
+          className="calendar-nav"
+          aria-label="Previous month"
+          onClick={() => setMonth(m => new Date(m.getFullYear(), m.getMonth() - 1, 1))}
+        >
+          <ChevronLeft size={10} />
+        </button>
+        <span className="calendar-title">
+          {month.toLocaleDateString(undefined, { month: 'long', year: 'numeric' })}
+        </span>
+        <button
+          type="button"
+          className="calendar-nav"
+          aria-label="Next month"
+          disabled={!forwardOk}
+          onClick={() => setMonth(m => new Date(m.getFullYear(), m.getMonth() + 1, 1))}
+        >
+          <ChevronRight size={10} />
+        </button>
+      </div>
+      <div className="calendar-weekdays">
+        {WEEKDAYS.map(d => <span key={d}>{d}</span>)}
+      </div>
+      <div className="calendar-grid">
+        {monthCells(month).map(cell => {
+          const selected = pending.has(cell.date)
+          const cls = [
+            'calendar-day',
+            selected ? 'is-selected' : '',
+            cell.date === today ? 'is-today' : '',
+            cell.currentMonth ? '' : 'is-outside',
+          ].join(' ')
+          return (
+            <button
+              key={cell.key}
+              type="button"
+              className={cls}
+              disabled={cell.date > today}
+              aria-pressed={selected}
+              onClick={() => toggle(cell.date)}
+            >
+              {cell.day}
+            </button>
+          )
+        })}
+      </div>
+      <div className="calendar-foot">
+        {pending.size > 0 && (
+          <button type="button" className="calendar-clear" onClick={() => setPending(new Set())}>Clear</button>
+        )}
+        <span className="calendar-summary">{summary}</span>
+        <button
+          type="button"
+          className={`calendar-done ${pending.size === 0 ? 'is-idle' : ''}`}
+          onClick={() => onDone([...pending].sort())}
+        >
+          Done
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/// Whole weeks of cells starting on Monday, padded with the neighbouring months' days so
+/// the grid is always rectangular.
+function monthCells(month: Date): DayCell[] {
+  const first = new Date(month.getFullYear(), month.getMonth(), 1)
+  const length = new Date(month.getFullYear(), month.getMonth() + 1, 0).getDate()
+  // getDay() is Sunday-first; the grid is Monday-first.
+  const lead = (first.getDay() + 6) % 7
+  const cells: DayCell[] = []
+  for (let i = lead; i > 0; i--) {
+    const d = addDays(first, -i)
+    cells.push({ key: `prev-${i}`, day: d.getDate(), date: formatDateKey(d), currentMonth: false })
+  }
+  for (let day = 1; day <= length; day++) {
+    const d = new Date(month.getFullYear(), month.getMonth(), day)
+    cells.push({ key: `cur-${day}`, day, date: formatDateKey(d), currentMonth: true })
+  }
+  const last = new Date(month.getFullYear(), month.getMonth(), length)
+  for (let i = 1; cells.length % 7 !== 0; i++) {
+    const d = addDays(last, i)
+    cells.push({ key: `next-${i}`, day: d.getDate(), date: formatDateKey(d), currentMonth: false })
+  }
+  return cells
 }

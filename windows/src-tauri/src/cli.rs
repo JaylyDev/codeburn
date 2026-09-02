@@ -37,6 +37,18 @@ const CLAUDE_NAMES: [&str; 1] = ["claude"];
 /// Alphanumerics plus `._/-` and space, with `\`, `:`, `(`, `)` also allowed on Windows
 /// so a user-supplied `CODEBURN_BIN` path like `C:\Users\...\codeburn.cmd` is accepted.
 /// None of these are shell metacharacters in a direct-argv spawn (we never invoke `sh -c`).
+/// `YYYY-MM-DD` and nothing else, which is what `--day` and `--days` accept.
+fn is_iso_day(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit())
+}
+
 fn is_safe_arg(value: &str) -> bool {
     !value.is_empty()
         && value.chars().all(|c| {
@@ -148,21 +160,26 @@ impl CodeburnCli {
         &self,
         period: &str,
         provider: &str,
+        days: &[String],
         include_optimize: bool,
     ) -> Result<Value> {
         if !is_safe_arg(period) || !is_safe_arg(provider) {
             bail!("invalid period/provider argument");
         }
+        if !days.iter().all(|d| is_iso_day(d)) {
+            bail!("invalid day argument");
+        }
 
-        let mut args = vec![
-            "status",
-            "--format",
-            "menubar-json",
-            "--period",
-            period,
-            "--provider",
-            provider,
-        ];
+        // A picked day overrides the period, so the CLI gets one or the other, never
+        // both kinds of range. `--day` is the single-day form; `--days` takes a
+        // comma-separated list.
+        let joined = days.join(",");
+        let mut args = vec!["status", "--format", "menubar-json", "--provider", provider];
+        match days.len() {
+            0 => args.extend(["--period", period]),
+            1 => args.extend(["--day", joined.as_str()]),
+            _ => args.extend(["--days", joined.as_str()]),
+        }
         if !include_optimize {
             args.push("--no-optimize");
         }

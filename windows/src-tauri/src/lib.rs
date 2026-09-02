@@ -637,11 +637,12 @@ mod commands {
     pub async fn fetch_payload(
         period: String,
         provider: String,
+        days: Vec<String>,
         include_optimize: bool,
         state: State<'_, AppState>,
     ) -> Result<Value, String> {
         let cli = state.cli.lock().map_err(|e| e.to_string())?.clone();
-        cli.fetch_menubar_payload(&period, &provider, include_optimize)
+        cli.fetch_menubar_payload(&period, &provider, &days, include_optimize)
             .await
             .map_err(|e| e.to_string())
     }

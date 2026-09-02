@@ -5,7 +5,7 @@ import { listen } from '@tauri-apps/api/event'
 import type { MenubarPayload } from './lib/payload'
 import type { CurrencyState } from './lib/currency'
 import { USD, formatCurrency, plural, trayBadgeText } from './lib/currency'
-import { PayloadCache } from './lib/cache'
+import { PayloadCache, sameSelection, selectionKey, type Selection } from './lib/cache'
 import { relativePast } from './lib/dates'
 import { applyTheme, currentTheme, readSetting, writeSetting } from './lib/settings'
 import { TRAY_BADGE_SUPPORTED } from './lib/platform'
@@ -27,8 +27,8 @@ import { NoDataState } from './components/NoDataState'
 import { SetupState, type CliStatus } from './components/SetupState'
 import { StarBanner } from './components/StarBanner'
 import { HeroSection } from './components/HeroSection'
-import { PeriodTabs, PERIOD_LABELS } from './components/PeriodTabs'
-import type { Period } from './components/PeriodTabs'
+import { PeriodTabs, PERIOD_LABELS, daySelectionLabel } from './components/PeriodTabs'
+import type { DaySelection, Period } from './components/PeriodTabs'
 import { FooterBar } from './components/FooterBar'
 import { ErrorToast } from './components/ErrorToast'
 import { Header } from './components/Header'
@@ -36,6 +36,10 @@ import { applyAccent, savedAccent, type AccentPreset } from './lib/accent'
 import { SettingsPanel, type SettingsSection, type ThemeChoice } from './components/SettingsPanel'
 
 const payloadCache = new PayloadCache<MenubarPayload>()
+
+/// The tray badge, the tooltip and the tab strip costs all read this one key, whatever
+/// the popover is showing.
+const TODAY_ALL: Selection = { period: 'today', provider: 'all', days: [] }
 
 /// Background cadence, mirroring mac/Sources/CodeBurnMenubar/RefreshCadence.swift: every
 /// fetch is a full Node process, so the popover being closed has to cost less than it being
@@ -54,6 +58,9 @@ type FetchOptions = {
 
 export function App() {
   const [period, setPeriod] = useState<Period>('today')
+  // Days picked in the calendar. Non-empty overrides the period, as isDayMode does on
+  // the mac; the period stays put so clearing the picker returns to it.
+  const [days, setDays] = useState<DaySelection>([])
   const [provider, setProvider] = useState<Provider>(ALL_PROVIDER)
   const [payload, setPayload] = useState<MenubarPayload | null>(null)
   const [todayPayload, setTodayPayload] = useState<MenubarPayload | null>(null)
@@ -81,33 +88,35 @@ export function App() {
     return saved === 'dark' || saved === 'light' ? saved : 'system'
   })
 
-  const selection = useRef({ period, provider })
-  selection.current = { period, provider }
+  const current: Selection = { period, provider, days }
+  const selection = useRef(current)
+  selection.current = current
 
-  const fetchKey = useCallback(async (p: Period, prov: Provider, opts: FetchOptions) => {
-    if (payloadCache.isInFlight(p, prov)) return
-    payloadCache.markInFlight(p, prov)
-    const isSelected = () => selection.current.period === p && selection.current.provider === prov
+  const fetchKey = useCallback(async (key: Selection, opts: FetchOptions) => {
+    if (payloadCache.isInFlight(key)) return
+    payloadCache.markInFlight(key)
+    const isSelected = () => sameSelection(selection.current, key)
     if (opts.showOverlay && isSelected()) setOverlay(true)
     try {
       const json = await invoke<MenubarPayload>('fetch_payload', {
-        period: p,
-        provider: prov,
+        period: key.period,
+        provider: key.provider,
+        days: key.days,
         includeOptimize: opts.includeOptimize,
       })
       // A quiet (no-optimize) refresh must not wipe findings a previous full fetch had.
       if (!opts.includeOptimize) {
-        const previous = payloadCache.get(p, prov)
+        const previous = payloadCache.get(key)
         if (previous) json.optimize = previous.optimize
       }
-      payloadCache.set(p, prov, json)
+      payloadCache.set(key, json)
       if (isSelected()) {
         setPayload(json)
         // "updated Xs ago" describes what the user is looking at, so only a fetch of the
         // visible key may stamp it - a background today/all tick must not.
         setLastUpdated(new Date())
       }
-      if (p === 'today' && prov === 'all') setTodayPayload(json)
+      if (sameSelection(key, TODAY_ALL)) setTodayPayload(json)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       if (message.includes('CLI not found')) {
@@ -117,18 +126,18 @@ export function App() {
         setError(message)
       }
     } finally {
-      payloadCache.clearInFlight(p, prov)
+      payloadCache.clearInFlight(key)
       if (isSelected()) setOverlay(false)
     }
   }, [])
 
   const refreshAll = useCallback(async (opts: FetchOptions) => {
-    const { period: p, provider: prov } = selection.current
-    if (!(p === 'today' && prov === ALL_PROVIDER)) {
-      fetchKey('today', ALL_PROVIDER, { includeOptimize: false, showOverlay: false })
+    const key = selection.current
+    if (!sameSelection(key, TODAY_ALL)) {
+      fetchKey(TODAY_ALL, { includeOptimize: false, showOverlay: false })
     }
     void refreshQuota()
-    await fetchKey(p, prov, opts)
+    await fetchKey(key, opts)
   }, [fetchKey])
 
   /// The single source of truth for the CLI gate. Nothing else writes a "compatible"
@@ -164,28 +173,33 @@ export function App() {
     if (!cliReady) return
     const tick = popoverVisible
       ? () => refreshAll({ includeOptimize: true, showOverlay: false })
-      : () => fetchKey('today', 'all', { includeOptimize: false, showOverlay: false })
+      : () => fetchKey(TODAY_ALL, { includeOptimize: false, showOverlay: false })
     const id = setInterval(tick, popoverVisible ? REFRESH_ACTIVE_MS : REFRESH_IDLE_MS)
     return () => clearInterval(id)
   }, [cliReady, popoverVisible, refreshAll, fetchKey])
 
+  const selectionKeyValue = selectionKey(current)
   useEffect(() => {
-    const cached = payloadCache.get(period, provider)
+    const key = selection.current
+    const cached = payloadCache.get(key)
     setPayload(cached)
     if (!cliReady) return
     if (!cached) {
-      fetchKey(period, provider, { includeOptimize: true, showOverlay: true })
-    } else if (payloadCache.age(period, provider) > STALE_MS) {
-      fetchKey(period, provider, { includeOptimize: true, showOverlay: false })
+      fetchKey(key, { includeOptimize: true, showOverlay: true })
+    } else if (payloadCache.age(key) > STALE_MS) {
+      fetchKey(key, { includeOptimize: true, showOverlay: false })
     }
-  }, [period, provider, cliReady, fetchKey])
+    // The selection is a fresh object each render, so the key string is what changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectionKeyValue, cliReady, fetchKey])
 
   useEffect(() => {
     const unlistenRefresh = listen('codeburn://refresh', () => refreshAll({ includeOptimize: true, showOverlay: true }))
     const unlistenShown = listen('codeburn://shown', () => {
       setPopoverVisible(true)
-      const { period: p, provider: prov } = selection.current
-      if (payloadCache.age(p, prov) > STALE_MS) refreshAll({ includeOptimize: true, showOverlay: false })
+      if (payloadCache.age(selection.current) > STALE_MS) {
+        refreshAll({ includeOptimize: true, showOverlay: false })
+      }
     })
     const unlistenHidden = listen('codeburn://hidden', () => setPopoverVisible(false))
     const unlistenTheme = listen('codeburn://toggle-theme', () => toggleTheme())
@@ -356,8 +370,18 @@ export function App() {
           <SetupState status={cliStatus} checking={cliChecking} onCheckAgain={checkCli} />
         ) : (
           <>
-            <HeroSection payload={payload} currency={currency} periodLabel={PERIOD_LABELS[period]} isToday={period === 'today'} />
-            <PeriodTabs selected={period} onSelect={setPeriod} />
+            <HeroSection
+              payload={payload}
+              currency={currency}
+              periodLabel={daySelectionLabel(days) ?? PERIOD_LABELS[period]}
+              isToday={days.length === 0 && period === 'today'}
+            />
+            <PeriodTabs
+              selected={period}
+              days={days}
+              onSelect={p => { setDays([]); setPeriod(p) }}
+              onSelectDays={setDays}
+            />
 
             {isFilteredEmpty ? (
               <EmptyProviderState label={providerLabel(tabs, provider)} period={period} />
@@ -397,7 +421,7 @@ export function App() {
                 )}
               </>
             )}
-            {overlay && <LoadingOverlay periodLabel={PERIOD_LABELS[period]} />}
+            {overlay && <LoadingOverlay periodLabel={daySelectionLabel(days) ?? PERIOD_LABELS[period]} />}
           </>
         )}
       </div>

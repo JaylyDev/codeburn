@@ -34,6 +34,19 @@ export function ChevronRight(p: IconProps) {
   return <Svg {...p}><path d="M6 3.5 10.5 8 6 12.5" /></Svg>
 }
 
+export function ChevronLeft(p: IconProps) {
+  return <Svg {...p}><path d="M10 3.5 5.5 8 10 12.5" /></Svg>
+}
+
+export function CalendarIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <rect x="2.5" y="3.5" width="11" height="10" rx="1.5" />
+      <path d="M2.5 6.5h11M5.5 2v3M10.5 2v3" />
+    </Svg>
+  )
+}
+
 export function ChevronDown(p: IconProps) {
   return <Svg {...p}><path d="M3.5 6 8 10.5 12.5 6" /></Svg>
 }

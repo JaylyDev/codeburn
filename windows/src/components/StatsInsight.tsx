@@ -16,7 +16,8 @@ const PERIOD_SUFFIX: Record<Period, string> = {
   week: '(7 days)',
   '30days': '(30 days)',
   month: '(month)',
-  all: '(all time)',
+  all: '(6 months)',
+  lifetime: '(all time)',
 }
 
 export function StatsInsight({ payload, currency, period }: Props) {
