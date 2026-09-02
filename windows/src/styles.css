@@ -785,11 +785,15 @@ code { font-family: var(--font-mono); }
   gap: 4px;
   height: 100%;
 }
+/* The columns share the width, as the mac bars do: 19 of them land on the same 13 px
+   they always had, and 90 simply get thinner. */
 .trend-bar-col {
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
-  width: 13px;
+  flex: 1 1 0;
+  min-width: 0;
+  max-width: 13px;
   height: 100%;
 }
 .trend-bar {

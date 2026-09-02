@@ -14,7 +14,7 @@ import { AgentTabStrip, ALL_PROVIDER, providerLabel, providerTabs } from './comp
 import type { Provider } from './components/AgentTabStrip'
 import { ModelsSection } from './components/ModelsSection'
 import { InsightPills, INSIGHT_ORDER, isInsightMode, type InsightMode } from './components/InsightPills'
-import { TrendInsight } from './components/TrendInsight'
+import { TrendInsight, trendDayCount } from './components/TrendInsight'
 import { ForecastInsight } from './components/ForecastInsight'
 import { PulseInsight } from './components/PulseInsight'
 import { StatsInsight } from './components/StatsInsight'
@@ -401,7 +401,13 @@ export function App() {
                       onConnectClaude={connectClaude}
                     />
                   )}
-                  {activeInsight === 'trend' && <TrendInsight days={payload?.history?.daily ?? []} currency={currency} />}
+                  {activeInsight === 'trend' && (
+                    <TrendInsight
+                      days={payload?.history?.daily ?? []}
+                      currency={currency}
+                      dayCount={trendDayCount(period, days, payload?.history?.daily?.length ?? 0)}
+                    />
+                  )}
                   {activeInsight === 'forecast' && <ForecastInsight days={payload?.history?.daily ?? []} currency={currency} />}
                   {activeInsight === 'pulse' && payload && <PulseInsight payload={payload} currency={currency} />}
                   {activeInsight === 'stats' && payload && <StatsInsight payload={payload} currency={currency} period={period} />}
