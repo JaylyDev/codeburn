@@ -1146,7 +1146,8 @@ describe('usage_snapshot telemetry props', () => {
     return {
       provider: 'claude', providerDisplayName: 'Claude', category: null,
       inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, totalTokens: 0,
-      costUSD: 0, savingsUSD: 0, savingsBaselineModel: '', calls: 0, credits: null, ...over,
+      costUSD: 0, savingsUSD: 0, savingsBaselineModel: '', calls: 0, credits: null,
+      rawModels: [over.model], ...over,
     }
   }
 

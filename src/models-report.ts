@@ -28,6 +28,11 @@ export type ModelReportRow = {
   savingsUSD: number
   savingsBaselineModel: string
   calls: number
+  /// Raw provider/model ids folded into this row by the canonical-id merge
+  /// above (e.g. `minimax/MiniMax-M3` and `MiniMaxAI/MiniMax-M3` both showing
+  /// as "MiniMax M3"). Length 1 when nothing merged. Lets a cached vs
+  /// uncached route stay visible even though the row is one model (#1239).
+  rawModels: string[]
   /// Codex credit consumption (issues #408/#495). null for non-Codex models or
   /// Codex models without a known credit rate. A merged row that mixed rated
   /// and unrated buckets stores the partial sum of the rated ones.
@@ -217,6 +222,7 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
       existing.savingsUSD += bucket.savingsUSD
       existing.calls += bucket.calls
       existing.savingsBaselineModel = resolvedBaseline
+      if (!existing.rawModels.includes(bucket.model)) existing.rawModels.push(bucket.model)
       const existingRated = existing.credits !== null
       const incomingRated = bucketCredits !== null
       if (incomingRated) existing.credits = (existing.credits ?? 0) + bucketCredits
@@ -238,6 +244,7 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
         savingsUSD: bucket.savingsUSD,
         savingsBaselineModel: resolvedBaseline,
         calls: bucket.calls,
+        rawModels: [bucket.model],
         credits: bucketCredits,
       })
     }
@@ -657,6 +664,7 @@ export function renderJson(rows: ModelReportRow[]): string {
       providerDisplayName: r.providerDisplayName,
       model: r.model,
       modelDisplayName: r.modelDisplayName,
+      rawModels: r.rawModels,
       category: r.category ?? r.topCategory ?? null,
       agentType: r.agentType ?? null,
       topCategory: r.topCategory ?? null,
