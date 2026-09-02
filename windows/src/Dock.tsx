@@ -609,7 +609,11 @@ export function Dock() {
     const listeners = [
       listen('codeburn://dock-refresh', () => void load()),
       listen<PointerSnapshot>('codeburn://dock-pointer', (event) => applyPointer(event.payload)),
-      listen<{ attachment: number; edge: Edge | null }>('codeburn://dock-drag', (event) => setDrag(event.payload)),
+      listen<{ attachment: number; edge: Edge | null; frame?: DockFrame }>('codeburn://dock-drag', (event) => {
+        setDrag({ attachment: event.payload.attachment, edge: event.payload.edge })
+        // A rail that has just turned is in a different window, painting a different shape.
+        if (event.payload.frame) setFrame(event.payload.frame)
+      }),
       listen<{ from: Rect; frame: DockFrame }>('codeburn://dock-settled', (event) => {
         const { from, frame: next } = event.payload
         setFrame(next)

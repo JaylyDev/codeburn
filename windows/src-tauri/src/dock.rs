@@ -537,8 +537,11 @@ struct Pointer {
 
 #[derive(Clone, Copy, Debug)]
 struct Drag {
-    /// Cursor offset from the window origin at grab time, logical pixels.
-    anchor: (i32, i32),
+    /// Where in the rail it was grabbed, as a fraction of the rail's own width and height.
+    /// Proportional rather than absolute because the rail changes shape mid-drag when it
+    /// rotates, and the mac's pointerAnchoredDragFrame keeps the same grip through it.
+    ax: f64,
+    ay: f64,
     last: Option<(Edge, f64)>,
 }
 
@@ -601,6 +604,10 @@ struct SettledEvent {
 struct DragEvent {
     attachment: f64,
     edge: Option<Edge>,
+    /// Carried only when the rail has just changed orientation, since the page then has a
+    /// different window and a different rail to paint into.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frame: Option<DockFrame>,
 }
 
 /// One display: its work area in logical pixels, which is what the layout is written in, and
@@ -788,12 +795,23 @@ pub fn begin_drag(app: &AppHandle, anchor: (i32, i32)) {
     let all = screens(&window);
     let mut state = lock();
     let Some(frame) = state.frame else { return };
+    let grip = |along: i32, low: i32, len: i32| -> f64 {
+        if len > 0 { ((along - low) as f64 / len as f64).clamp(0.0, 1.0) } else { 0.5 }
+    };
     state.screens = all;
-    state.drag = Some(Drag { anchor, last: None });
+    state.drag = Some(Drag {
+        ax: grip(anchor.0, frame.rail.x, frame.rail.w),
+        ay: grip(anchor.1, frame.rail.y, frame.rail.h),
+        last: None,
+    });
     state.request.detail = None;
     drop(state);
     let _ = window.set_ignore_cursor_events(false);
-    let _ = app.emit_to(DOCK_LABEL, "codeburn://dock-drag", DragEvent { attachment: if frame.docked { 1.0 } else { 0.0 }, edge: None });
+    let _ = app.emit_to(
+        DOCK_LABEL,
+        "codeburn://dock-drag",
+        DragEvent { attachment: if frame.docked { 1.0 } else { 0.0 }, edge: None, frame: None },
+    );
 }
 
 #[cfg(target_os = "windows")]
@@ -850,21 +868,48 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) {
             settle(app, window, placement, rail);
             return;
         }
-        // The rail, not the window, is what stays on screen.
-        let mut origin = (cursor.0 - drag.anchor.0, cursor.1 - drag.anchor.1);
-        let rail_x = (origin.0 + frame.rail.x).clamp(area.x, area.right() - frame.rail.w);
-        let rail_y = (origin.1 + frame.rail.y).clamp(area.y, area.bottom() - frame.rail.h);
-        origin = (rail_x - frame.rail.x, rail_y - frame.rail.y);
-        let rail = Rect { x: rail_x, y: rail_y, w: frame.rail.w, h: frame.rail.h };
-        let candidate = attachment_candidate(&rail, &area);
+        // The rail, not the window, is what stays on screen: it hangs from the same fraction
+        // of itself the pointer grabbed, whatever shape it is now.
+        let under_pointer = |frame: &DockFrame| -> Rect {
+            let (w, h) = (frame.rail.w, frame.rail.h);
+            Rect {
+                x: (cursor.0 - (drag.ax * w as f64).round() as i32)
+                    .clamp(area.x, (area.right() - w).max(area.x)),
+                y: (cursor.1 - (drag.ay * h as f64).round() as i32)
+                    .clamp(area.y, (area.bottom() - h).max(area.y)),
+                w,
+                h,
+            }
+        };
+        let mut frame = frame;
+        let mut rail = under_pointer(&frame);
+        let mut candidate = attachment_candidate(&rail, &area);
+        // The mac turns the rail as soon as the edge in reach runs the other way, rather than
+        // waiting for the drop, and re-anchors it proportionally so it stays in the hand.
+        let mut rotated = false;
+        if let Some((edge, _)) = candidate {
+            let mut placement = state.placement.clone().unwrap_or_default();
+            if edge.is_vertical() != placement.attachment.is_vertical() {
+                placement.attachment = edge;
+                let (request, metrics) = (state.request, state.metrics);
+                frame = layout(area, &placement, &request, &metrics);
+                rail = under_pointer(&frame);
+                candidate = attachment_candidate(&rail, &area);
+                state.placement = Some(placement);
+                rotated = true;
+            }
+        }
         let progress = candidate.map(|(_, p)| p).unwrap_or(0.0);
         let key = candidate.map(|(edge, p)| (edge, (p * 100.0).round() / 100.0));
-        let moved = (origin.0, origin.1) != (frame.window.x, frame.window.y);
+        let window_rect = Rect {
+            x: rail.x - frame.rail.x,
+            y: rail.y - frame.rail.y,
+            ..frame.window
+        };
+        let moved = rotated || window_rect != frame.window;
+        frame.window = window_rect;
         if moved {
-            let mut next = frame;
-            next.window.x = origin.0;
-            next.window.y = origin.1;
-            state.frame = Some(next);
+            state.frame = Some(frame);
         }
         let changed = key != drag.last;
         if changed {
@@ -872,13 +917,17 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) {
         }
         drop(state);
         if moved {
-            move_window(window, Rect { x: origin.0, y: origin.1, ..frame.window }, scale);
+            move_window(window, window_rect, scale);
         }
-        if changed {
+        if changed || rotated {
             let _ = app.emit_to(
                 DOCK_LABEL,
                 "codeburn://dock-drag",
-                DragEvent { attachment: progress, edge: candidate.map(|(e, _)| e) },
+                DragEvent {
+                    attachment: progress,
+                    edge: candidate.map(|(e, _)| e),
+                    frame: rotated.then_some(frame),
+                },
             );
         }
         return;
