@@ -4,6 +4,7 @@ mod config;
 mod dock;
 mod fx;
 mod plan;
+mod refresh;
 mod settings;
 /// The spend-in-the-tray badge is a second tray icon, which only the Tauri tray backend
 /// provides; Linux runs its own SNI tray (`tray_linux`) and has no equivalent, so the
@@ -173,6 +174,7 @@ pub fn run() {
             commands::set_daily_budget,
             commands::provider_key_providers,
             commands::set_provider_key,
+            commands::usage_refresh_plan,
             commands::check_updates,
             commands::perform_update,
         ])
@@ -1026,6 +1028,14 @@ mod commands {
     pub fn set_provider_key(provider: String, key: String) -> Result<Vec<String>, String> {
         crate::settings::set_provider_key(&provider, &key).map_err(|e| e.to_string())?;
         Ok(crate::settings::stored_key_providers())
+    }
+
+    /// How long the page's background usage loop should wait before its next tick, and what
+    /// the machine is running on. Asked once per tick rather than worked out in the page:
+    /// the power state is a Win32 read, and it changes under a loop already armed.
+    #[tauri::command]
+    pub fn usage_refresh_plan(mode: i64, popover_open: bool) -> crate::refresh::RefreshPlan {
+        crate::refresh::plan(mode, popover_open)
     }
 
     /// Whether there is a newer app or CLI. Without `force` a cached answer inside the

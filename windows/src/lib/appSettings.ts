@@ -51,7 +51,7 @@ export type ThemeChoice = 'system' | 'light' | 'dark'
 export const USAGE_CADENCES: Array<{ id: number; label: string }> = [
   // The mac's label promises "less on battery", which is the adaptive refresh that comes
   // with the data-layer work; this one says what it actually does today.
-  { id: -1, label: 'Auto (1m open, 2m closed)' },
+  { id: -1, label: 'Auto (2m, less on battery)' },
   { id: 0, label: 'Manual' },
   { id: 60, label: '1 minute' },
   { id: 300, label: '5 minutes' },

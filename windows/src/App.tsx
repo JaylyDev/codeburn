@@ -13,6 +13,7 @@ import {
   writeSettings, type AppSettings, type ThemeChoice,
 } from './lib/appSettings'
 import { TRAY_BADGE_SUPPORTED } from './lib/platform'
+import { usageRefreshPlan } from './lib/refresh'
 import { EMPTY_QUOTA, refreshQuota, setQuotaCadence, subscribeQuota, worstSeverity, type QuotaState } from './lib/quota'
 import { AgentTabStrip, ALL_PROVIDER, providerLabel, providerTabs } from './components/AgentTabStrip'
 import type { Provider } from './components/AgentTabStrip'
@@ -69,14 +70,13 @@ function menubarSelection(settings: AppSettings): Selection {
   }
 }
 
-/// Background cadence, mirroring mac/Sources/CodeBurnMenubar/RefreshCadence.swift: every
-/// fetch is a full Node process, so the popover being closed has to cost less than it being
-/// open. Visible, a tick refreshes today/all plus the selected period/provider with optimize
-/// findings; hidden, a slower tick refreshes only today/all and skips optimize, since the
-/// tray badge and tooltip are the only things anyone can see. Entries younger than STALE_MS
-/// are left alone when the popover is re-opened.
-const REFRESH_ACTIVE_MS = 60_000
-const REFRESH_IDLE_MS = 120_000
+/// What a background tick does, mirroring mac/Sources/CodeBurnMenubar/RefreshCadence.swift:
+/// every fetch is a full Node process, so the popover being closed has to cost less than it
+/// being open. Visible, a tick refreshes today/all plus the selected period/provider with
+/// optimize findings; hidden, a slower tick refreshes only the tray key and skips optimize,
+/// since the badge and the tooltip are the only things anyone can see. How long the loop
+/// waits between ticks comes from Rust, since it follows the power state. Entries younger
+/// than STALE_MS are left alone when the popover is re-opened.
 const STALE_MS = 60_000
 
 /// Stuck-load recovery, from the mac BurnLoadingOverlay task: while the popover has
@@ -237,23 +237,34 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // The background loop. Rust is asked on every tick how long to wait for the next one,
+  // because the answer follows the machine: Auto is 30 s with the popover open, 120 s hidden,
+  // and backs off on battery and further in battery saver, all of which can change under a
+  // timer that has already been armed. Manual answers null and the loop stops; usage then
+  // refreshes only when the popover opens or Refresh is pressed.
   useEffect(() => {
     if (!cliReady) return
-    // Manual never spawns on a timer; usage then only refreshes when the popover opens or
-    // Refresh is pressed. A chosen cadence applies whether the popover is open or not, since
-    // the reader asked for that number specifically.
-    const cadence = settings.usageRefreshSeconds
-    if (cadence === 0) return
-    const period = cadence > 0
-      ? cadence * 1000
-      : popoverVisible ? REFRESH_ACTIVE_MS : REFRESH_IDLE_MS
-    const tick = popoverVisible
-      ? () => refreshAll({ includeOptimize: true, showOverlay: false })
-      // Hidden, the tray figure is the only thing anyone can see, so only its key is
-      // refreshed and the optimize pass is skipped.
-      : () => fetchKey(menubarRef.current, { includeOptimize: false, showOverlay: false })
-    const id = setInterval(tick, period)
-    return () => clearInterval(id)
+    let stopped = false
+    let timer = 0
+    const step = async (refresh: boolean) => {
+      let plan
+      try {
+        plan = await usageRefreshPlan(settings.usageRefreshSeconds, popoverVisible)
+      } catch {
+        return
+      }
+      if (stopped) return
+      if (refresh) {
+        if (popoverVisible) refreshAll({ includeOptimize: true, showOverlay: false })
+        // Hidden, the tray figure is the only thing anyone can see, so only its key is
+        // refreshed and the optimize pass is skipped.
+        else fetchKey(menubarRef.current, { includeOptimize: false, showOverlay: false })
+      }
+      if (plan.intervalMs === null) return
+      timer = window.setTimeout(() => { void step(true) }, plan.intervalMs)
+    }
+    void step(false)
+    return () => { stopped = true; window.clearTimeout(timer) }
   }, [cliReady, popoverVisible, refreshAll, fetchKey, settings.usageRefreshSeconds])
 
   const selectionKeyValue = selectionKey(current)
