@@ -54,6 +54,7 @@ struct DataClient {
                       includeOptimize: Bool,
                       scope: MenubarScope = .local,
                       claudeConfigSourceId: String? = nil,
+                      bypassResident: Bool = false,
                       qualityOfService: QualityOfService = .userInitiated) async throws -> MenubarPayload {
         let subcommand = statusSubcommand(
             period: period,
@@ -64,7 +65,11 @@ struct DataClient {
             scope: scope,
             claudeConfigSourceId: claudeConfigSourceId
         )
-        let result = try await runCLI(subcommand: subcommand, qualityOfService: qualityOfService)
+        let result = try await runCLI(
+            subcommand: subcommand,
+            bypassResident: bypassResident,
+            qualityOfService: qualityOfService
+        )
         guard result.exitCode == 0 else {
             throw DataClientError.nonZeroExit(code: result.exitCode, stderr: result.stderr)
         }
@@ -133,10 +138,12 @@ struct DataClient {
 
     private static func runCLI(
         subcommand: [String],
+        bypassResident: Bool = false,
         qualityOfService: QualityOfService = .userInitiated
     ) async throws -> ProcessResult {
         try await runCLI(
             subcommand: subcommand,
+            bypassResident: bypassResident,
             serveRequest: { args in
                 try await ServeConnection.shared.request(args: args)
             },
@@ -164,6 +171,7 @@ struct DataClient {
     /// the shared resident and globally limited one-shot closures above.
     static func runCLI(
         subcommand: [String],
+        bypassResident: Bool = false,
         serveRequest: ([String]) async throws -> Data,
         spawnFallback: () async throws -> ProcessResult
     ) async throws -> ProcessResult {
@@ -172,7 +180,7 @@ struct DataClient {
         // Transport/protocol failures fall back to the spawn path below, so
         // the resident remains an optimization. Resource-policy failures stay
         // terminal and cannot bypass the resident output ceiling.
-        if ServeConnection.isEligible(subcommand) {
+        if !bypassResident, ServeConnection.isEligible(subcommand) {
             do {
                 let stdout = try await serveRequest(subcommand)
                 return ProcessResult(stdout: stdout, stderr: "", exitCode: 0)

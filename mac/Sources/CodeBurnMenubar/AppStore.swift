@@ -41,6 +41,14 @@ struct PayloadCacheKey: Hashable {
     }
 }
 
+private struct ProviderPayloadConsistencyError: Error, CustomStringConvertible {
+    let provider: ProviderFilter
+
+    var description: String {
+        "Fresh \(provider.rawValue) verification still contradicted the matching all-provider payload."
+    }
+}
+
 @MainActor
 @Observable
 final class AppStore {
@@ -285,7 +293,7 @@ final class AppStore {
     var payload: MenubarPayload {
         if effectiveSelectedScope == .combined {
             let combinedPayload = cache[currentKey]?.payload
-            if let localPayload = cache[localCurrentKey]?.payload {
+            if let localPayload = consistentCachedPayload(for: localCurrentKey) {
                 if let combined = combinedPayload?.combined {
                     return MenubarPayload(
                         generated: combinedPayload?.generated ?? localPayload.generated,
@@ -302,7 +310,7 @@ final class AppStore {
                 return combinedPayload
             }
         }
-        return cache[currentKey]?.payload ?? selectionFallbackPayload ?? .empty
+        return consistentCachedPayload(for: currentKey) ?? selectionFallbackPayload ?? .empty
     }
 
     /// Today (across all providers) backs day-specific views in the popover.
@@ -446,7 +454,10 @@ final class AppStore {
         if effectiveSelectedScope == .combined {
             requiredKeys.insert(localCurrentKey)
         }
-        return requiredKeys.contains { cache[$0]?.isFresh != true } || hasStaleLoading
+        return requiredKeys.contains { key in
+            guard let cached = cache[key], cached.isFresh else { return true }
+            return providerPayloadContradictsAll(cached.payload, for: key)
+        } || hasStaleLoading
     }
 
     /// True if any cached payload reports at least one provider. Used to keep the
@@ -476,6 +487,26 @@ final class AppStore {
                                  days: Set<String> = [],
                                  claudeConfigSourceId: String? = nil) -> MenubarPayload? {
         cache[PayloadCacheKey(scope: scope, period: period, provider: provider, day: day, days: days, claudeConfigSourceId: claudeConfigSourceId)]?.payload
+    }
+
+    func providerPayloadContradictsAllForTesting(_ payload: MenubarPayload,
+                                                  scope: MenubarScope = .local,
+                                                  period: Period,
+                                                  provider: ProviderFilter,
+                                                  day: String? = nil,
+                                                  days: Set<String> = [],
+                                                  claudeConfigSourceId: String? = nil) -> Bool {
+        providerPayloadContradictsAll(
+            payload,
+            for: PayloadCacheKey(
+                scope: scope,
+                period: period,
+                provider: provider,
+                day: day,
+                days: days,
+                claudeConfigSourceId: claudeConfigSourceId
+            )
+        )
     }
 
     func setLastErrorForTesting(_ error: String,
@@ -757,6 +788,80 @@ final class AppStore {
         }
     }
 
+    private func consistentCachedPayload(for key: PayloadCacheKey) -> MenubarPayload? {
+        guard let payload = cache[key]?.payload,
+              !providerPayloadContradictsAll(payload, for: key) else { return nil }
+        return payload
+    }
+
+    /// An all-provider payload and its scoped sibling describe the same period,
+    /// day selection, scope, and Claude config. If the all-provider slice has a
+    /// positive contribution for the selected provider, a scoped 0/0 payload is
+    /// stale or incomplete rather than an honest answer. This is the exact
+    /// contract that prevents a provider tab advertising spend and then opening
+    /// onto a fabricated zero.
+    private func providerPayloadContradictsAll(_ payload: MenubarPayload, for key: PayloadCacheKey) -> Bool {
+        guard key.scope == .local,
+              key.provider != .all,
+              payload.current.cost == 0,
+              payload.current.calls == 0 else { return false }
+
+        let allKey = PayloadCacheKey(
+            scope: .local,
+            period: key.period,
+            provider: .all,
+            day: key.day,
+            days: key.days,
+            claudeConfigSourceId: key.claudeConfigSourceId
+        )
+        guard let all = cache[allKey]?.payload else { return false }
+        let providerKeys = Set(key.provider.providerKeys + [key.provider.cliArg])
+        if let detail = all.current.providerDetails.first(where: {
+            providerKeys.contains($0.id.lowercased()) || providerKeys.contains($0.label.lowercased())
+        }) {
+            return detail.cost > 0 || detail.calls > 0
+        }
+        return key.provider.providerKeys.reduce(0.0) { sum, providerKey in
+            sum + (all.current.providers[providerKey] ?? 0)
+        } > 0
+    }
+
+    private func fetchPayload(
+        for key: PayloadCacheKey,
+        includeOptimize: Bool,
+        qualityOfService: QualityOfService
+    ) async throws -> MenubarPayload {
+        let fresh = try await DataClient.fetch(
+            period: key.period,
+            day: key.day,
+            days: key.days,
+            provider: key.provider,
+            includeOptimize: includeOptimize,
+            scope: key.scope,
+            claudeConfigSourceId: key.claudeConfigSourceId,
+            qualityOfService: qualityOfService
+        )
+        guard providerPayloadContradictsAll(fresh, for: key) else { return fresh }
+
+        NSLog("CodeBurn: resident %@ payload contradicted its all-provider slice; verifying with a one-shot parse",
+              key.provider.rawValue)
+        let verified = try await DataClient.fetch(
+            period: key.period,
+            day: key.day,
+            days: key.days,
+            provider: key.provider,
+            includeOptimize: includeOptimize,
+            scope: key.scope,
+            claudeConfigSourceId: key.claudeConfigSourceId,
+            bypassResident: true,
+            qualityOfService: qualityOfService
+        )
+        guard !providerPayloadContradictsAll(verified, for: key) else {
+            throw ProviderPayloadConsistencyError(provider: key.provider)
+        }
+        return verified
+    }
+
     @discardableResult
     func recoverFromStuckLoading() async -> Bool {
         guard prepareStuckLoadingRecovery() else { return false }
@@ -849,7 +954,10 @@ final class AppStore {
         let cacheDateAtStart = cacheDate
         let generationAtStart = payloadRefreshGeneration
         if Task.isCancelled { return false }
-        if !force, cache[key]?.isFresh == true { return true }
+        if !force,
+           let cached = cache[key],
+           cached.isFresh,
+           !providerPayloadContradictsAll(cached.payload, for: key) { return true }
         if inFlightKeys[key] != nil { return false }
         inFlightKeys[key] = Date()
         attemptedKeys.insert(key)
@@ -881,14 +989,9 @@ final class AppStore {
         }
         var succeeded = false
         do {
-            let fresh = try await DataClient.fetch(
-                period: key.period,
-                day: key.day,
-                days: key.days,
-                provider: key.provider,
+            let fresh = try await fetchPayload(
+                for: key,
                 includeOptimize: includeOptimize,
-                scope: key.scope,
-                claudeConfigSourceId: key.claudeConfigSourceId,
                 qualityOfService: qualityOfService
             )
             if generationAtStart != payloadRefreshGeneration {
@@ -925,14 +1028,9 @@ final class AppStore {
             NSLog("CodeBurn: fetch failed for \(key.label)/\(key.provider.rawValue): \(error)")
             if includeOptimize, cache[key] == nil {
                 do {
-                    let fallback = try await DataClient.fetch(
-                        period: key.period,
-                        day: key.day,
-                        days: key.days,
-                        provider: key.provider,
+                    let fallback = try await fetchPayload(
+                        for: key,
                         includeOptimize: false,
-                        scope: key.scope,
-                        claudeConfigSourceId: key.claudeConfigSourceId,
                         qualityOfService: qualityOfService
                     )
                     guard !Task.isCancelled else { return false }
@@ -1003,7 +1101,10 @@ final class AppStore {
         qualityOfService: QualityOfService = .userInitiated
     ) async -> Bool {
         invalidateStaleDayCache()
-        if !force, cache[key]?.isFresh == true { return true }
+        if !force,
+           let cached = cache[key],
+           cached.isFresh,
+           !providerPayloadContradictsAll(cached.payload, for: key) { return true }
         if inFlightKeys[key] != nil { return false }
         inFlightKeys[key] = Date()
         attemptedKeys.insert(key)
@@ -1016,14 +1117,9 @@ final class AppStore {
             inFlightKeys[key] = nil
         }
         do {
-            let fresh = try await DataClient.fetch(
-                period: key.period,
-                day: key.day,
-                days: key.days,
-                provider: key.provider,
+            let fresh = try await fetchPayload(
+                for: key,
                 includeOptimize: includeOptimize,
-                scope: key.scope,
-                claudeConfigSourceId: key.claudeConfigSourceId,
                 qualityOfService: qualityOfService
             )
             if generationAtStart != payloadRefreshGeneration {

@@ -46,6 +46,10 @@ private func claudeConfigSelector(selectedId: String? = nil) -> ClaudeConfigSele
 }
 
 private func menubarPayload(cost: Double,
+                            calls: Int = 1,
+                            sessions: Int = 1,
+                            providers: [String: Double]? = nil,
+                            providerDetails: [ProviderDetail] = [],
                             combined: CombinedUsage? = nil,
                             claudeConfigs: ClaudeConfigSelector? = nil) -> MenubarPayload {
     MenubarPayload(
@@ -53,8 +57,8 @@ private func menubarPayload(cost: Double,
         current: CurrentBlock(
             label: "Today",
             cost: cost,
-            calls: 1,
-            sessions: 1,
+            calls: calls,
+            sessions: sessions,
             oneShotRate: nil,
             inputTokens: 1,
             outputTokens: 1,
@@ -63,7 +67,8 @@ private func menubarPayload(cost: Double,
             topActivities: [],
             topModels: [],
             localModelSavings: LocalModelSavings(totalUSD: 0, calls: 0, byModel: [], byProvider: []),
-            providers: ["claude": cost],
+            providers: providers ?? ["claude": cost],
+            providerDetails: providerDetails,
             topProjects: [],
             modelEfficiency: [],
             topSessions: [],
@@ -84,6 +89,89 @@ private func menubarPayload(cost: Double,
 @Suite("AppStore refresh recovery")
 @MainActor
 struct AppStoreRefreshRecoveryTests {
+    @Test("an active all-provider slice rejects a contradictory scoped zero")
+    func activeAllProviderSliceRejectsScopedZero() {
+        let store = AppStore()
+        let all = menubarPayload(
+            cost: 12,
+            providers: ["claude": 11.5, "hermes agent": 0.5],
+            providerDetails: [
+                ProviderDetail(id: "claude", label: "Claude", cost: 11.5, calls: 4, hasUsage: true),
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0.5, calls: 7, hasUsage: true),
+            ]
+        )
+        let falseZero = menubarPayload(
+            cost: 0,
+            calls: 0,
+            sessions: 0,
+            providers: ["hermes agent": 0],
+            providerDetails: [
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0, calls: 0, hasUsage: false),
+            ]
+        )
+
+        store.setCachedPayloadForTesting(all, period: .today, provider: .all, fetchedAt: Date())
+        store.suppressRefreshesForTesting()
+        store.switchTo(provider: .hermes)
+        store.setCachedPayloadForTesting(falseZero, period: .today, provider: .hermes, fetchedAt: Date())
+
+        #expect(store.providerPayloadContradictsAllForTesting(falseZero, period: .today, provider: .hermes))
+        #expect(store.payload.current.cost == 12)
+        #expect(store.needsInteractivePayloadRefresh)
+    }
+
+    @Test("flat-rate activity rejects a contradictory scoped zero")
+    func flatRateActivityRejectsScopedZero() {
+        let store = AppStore()
+        let all = menubarPayload(
+            cost: 12,
+            providers: ["claude": 12, "hermes agent": 0],
+            providerDetails: [
+                ProviderDetail(id: "claude", label: "Claude", cost: 12, calls: 4, hasUsage: true),
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0, calls: 7, hasUsage: true),
+            ]
+        )
+        let falseZero = menubarPayload(
+            cost: 0,
+            calls: 0,
+            sessions: 0,
+            providers: ["hermes agent": 0],
+            providerDetails: [
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0, calls: 0, hasUsage: false),
+            ]
+        )
+
+        store.setCachedPayloadForTesting(all, period: .today, provider: .all, fetchedAt: Date())
+
+        #expect(store.providerPayloadContradictsAllForTesting(falseZero, period: .today, provider: .hermes))
+    }
+
+    @Test("a genuine provider zero remains valid when the all-provider slice is also zero")
+    func genuineProviderZeroRemainsValid() {
+        let store = AppStore()
+        let all = menubarPayload(
+            cost: 12,
+            providers: ["claude": 12, "hermes agent": 0],
+            providerDetails: [
+                ProviderDetail(id: "claude", label: "Claude", cost: 12, calls: 4, hasUsage: true),
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0, calls: 0, hasUsage: false),
+            ]
+        )
+        let zero = menubarPayload(
+            cost: 0,
+            calls: 0,
+            sessions: 0,
+            providers: ["hermes agent": 0],
+            providerDetails: [
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0, calls: 0, hasUsage: false),
+            ]
+        )
+
+        store.setCachedPayloadForTesting(all, period: .today, provider: .all, fetchedAt: Date())
+
+        #expect(!store.providerPayloadContradictsAllForTesting(zero, period: .today, provider: .hermes))
+    }
+
     @Test("provider switches retain the last rendered payload until the target loads")
     func providerSwitchRetainsLastRenderedPayload() {
         let store = AppStore()
