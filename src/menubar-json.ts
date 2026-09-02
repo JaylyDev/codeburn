@@ -91,6 +91,7 @@ import type { GranularHistory } from './granular-history.js'
 import { getShortModelName } from './models.js'
 import type { ReworkedFile } from './workflow-insights.js'
 import type { PrRow, BranchRow } from './sessions-report.js'
+import type { LiveSessionsBlock } from './live-sessions.js'
 
 const TOP_ACTIVITIES_LIMIT = 20
 const TOP_MODELS_LIMIT = 20
@@ -212,6 +213,10 @@ export type MenubarPayload = {
   /// section AND its command wrote it. Surfaces render what they recognize
   /// and ignore the rest; absence always means "no plugin output today".
   plugins?: Record<string, unknown>
+  /// Add-only. Sessions whose transcript was appended inside the liveness
+  /// window, with the context each is holding. Omitted when the producer did
+  /// not compute it, so absence means "unknown", never "nothing is running".
+  liveSessions?: LiveSessionsBlock
   current: {
     label: string
     cost: number

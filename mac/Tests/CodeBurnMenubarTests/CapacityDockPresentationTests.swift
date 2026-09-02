@@ -284,7 +284,21 @@ struct CapacityDockPresentationTests {
             footerLines: [reason]
         )
 
-        #expect(CapacityDockMetrics.detailHeight(quota: quota, scale: 1) >= 216)
+        let height = CapacityDockMetrics.detailHeight(
+            quota: quota,
+            sessionCount: nil,
+            hasToday: false,
+            tailEdge: .right,
+            scale: 1
+        )
+        // Worst case the card must not clip: the provider header, the guidance
+        // block at full wrap ("Reconnect required", a 2-line reason and a 3-line
+        // instruction at ~13pt each, plus their spacing), and the action button.
+        // The windows row is absent, since a disconnected provider has no quota.
+        let guidance: CGFloat = 84
+        let actionButton: CGFloat = 38
+        let floor: CGFloat = CapacityDockGlance.headerHeight + guidance + actionButton
+        #expect(height >= floor)
     }
 
     @MainActor

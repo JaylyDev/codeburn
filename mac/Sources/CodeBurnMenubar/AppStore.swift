@@ -1675,6 +1675,23 @@ final class AppStore {
         }
     }
 
+    /// Sessions the CLI reported as live under this provider, newest first. Nil
+    /// when the payload carries no live-session block at all (a CLI that predates
+    /// it), which the popover renders as an absent section rather than as
+    /// "none running".
+    func capacityDockLiveSessions(for provider: CapacityDockProvider) -> [LiveSession]? {
+        guard let block = menubarPayload?.liveSessions else { return nil }
+        return block.sessions.filter { $0.provider == provider.id }
+    }
+
+    /// Today's totals for the dock popover. The background loop keeps the
+    /// menu-bar status payload fresh, so it wins whenever the badge is already
+    /// scoped to today; otherwise fall back to the popover's own today cache.
+    var capacityDockToday: CurrentBlock? {
+        if menubarPeriod == .today, let payload = menubarPayload { return payload.current }
+        return todayPayload?.current
+    }
+
     func capacityDockQuotaSummary(for provider: CapacityDockProvider) -> QuotaSummary? {
         if let filter = provider.legacyFilter {
             return quotaSummary(for: filter)
