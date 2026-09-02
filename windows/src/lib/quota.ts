@@ -290,7 +290,9 @@ export function subscribeQuota(listener: Listener): () => void {
   }
 }
 
-function connectionFor(provider: QuotaProvider, quota: QuotaState): Connection {
+/// The six-way connection state for one provider. Exported because the Capacity Dock's
+/// glance bubble tells the same six apart and must not rebuild the mapping for itself.
+export function connectionFor(provider: QuotaProvider, quota: QuotaState): Connection {
   // The CLI reports a provider it could not read as unavailable with the reason attached;
   // unavailable and silent means there were no credentials to read in the first place.
   if (!provider.available) return provider.error ? 'terminalFailure' : 'disconnected'

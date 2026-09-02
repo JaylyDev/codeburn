@@ -5,6 +5,8 @@
 /// src-tauri/src/dock.rs rebuilds the same numbers from the same scale and the two must stay
 /// in step.
 
+import type { Severity } from './lib/quota'
+
 /// CapacityDockPreferences.scaleRange and its default.
 export const MIN_SCALE = 0.6
 export const MAX_SCALE = 1.2
@@ -69,7 +71,9 @@ function build(scale: number): Metrics {
     detailWidth: points(350, detailScale),
     // The gap between rail and bubble is a placement constant on the mac, not a scaled metric.
     detailGap: 10,
-    detailGlyphSize: points(24, detailScale),
+    // The glance header's mark matches the 17pt title's cap height plus a little, so it reads
+    // as the title's equal rather than as a bullet.
+    detailGlyphSize: points(18, detailScale),
     rowReveal: -8 * scale,
   }
 }
@@ -87,6 +91,143 @@ export function metrics(scale: number): Metrics {
     CACHE.set(key, found)
   }
   return found
+}
+
+/// The glance bubble's block heights, ported from the CapacityDockGlance enum. The mac sums
+/// them into a panel frame it computes, because its hosting view does not size itself; here
+/// the page measures the bubble it has drawn and Rust lays the window out around it, so the
+/// same numbers are set as explicit heights and the measured total is their sum. Every one is
+/// a whole pixel at any detail scale, which is what keeps the window metrics whole.
+export type GlanceMetrics = {
+  /// The bubble's padding on all four sides, applied by each block rather than by the bubble
+  /// so a block's own fill can still run edge to edge.
+  inset: number
+  tail: number
+  headerTitle: number
+  headerPadBottom: number
+  sectionPadTop: number
+  sectionPadBottom: number
+  /// A 10.5pt caption's line box, shared by every section header.
+  captionLine: number
+  headGap: number
+  lineGap: number
+  blockGap: number
+  /// 8 padding + a 12pt line + 2 + a 10.5pt line + 8 padding.
+  pillHeight: number
+  pillGap: number
+  pillRadius: number
+  pillPadX: number
+  pillTitleLine: number
+  pillSubLine: number
+  /// The tint's fade tail, so a short band fades over its whole length instead of inverting.
+  pillFade: number
+  /// Three stacked lines, 13 + 13 + 12, with two 3pt gaps. Taller than the 17pt burned figure
+  /// beside it, so it sets the row.
+  todayContent: number
+  todayLine: number
+  todayCallsLine: number
+  todayLineGap: number
+  todayCostGap: number
+  windowPercent: number
+  windowReset: number
+  windowGap: number
+  connectHeight: number
+  /// A 10pt refreshing/retrying line, an 11pt state title, a 10pt guidance line, and the
+  /// mac's fixed allowance for the whole reconnect card.
+  connLoading: number
+  connTitle: number
+  connLine: number
+  connTerminal: number
+}
+
+/// The list scrolls past this many pills rather than truncating.
+export const MAX_VISIBLE_SESSION_ROWS = 4
+export const MAX_WINDOW_COLUMNS = 4
+
+function buildGlance(detailScale: number): GlanceMetrics {
+  const p = (base: number) => points(base, detailScale)
+  return {
+    inset: p(16),
+    tail: p(18),
+    headerTitle: p(20),
+    headerPadBottom: p(8),
+    sectionPadTop: p(8),
+    sectionPadBottom: p(10),
+    captionLine: p(13),
+    headGap: p(8),
+    lineGap: p(2),
+    blockGap: p(3),
+    pillHeight: p(46),
+    pillGap: p(6),
+    pillRadius: p(8),
+    pillPadX: p(12),
+    pillTitleLine: p(15),
+    pillSubLine: p(13),
+    pillFade: p(12),
+    todayContent: p(44),
+    todayLine: p(13),
+    todayCallsLine: p(12),
+    todayLineGap: p(3),
+    todayCostGap: p(5),
+    windowPercent: p(24),
+    windowReset: p(12),
+    windowGap: p(2),
+    connectHeight: p(22),
+    connLoading: p(16),
+    connTitle: p(18),
+    connLine: p(13),
+    connTerminal: p(90),
+  }
+}
+
+const GLANCE_CACHE = new Map<number, GlanceMetrics>()
+
+export function glanceMetrics(detailScale: number): GlanceMetrics {
+  const key = Math.round(detailScale * 100) / 100
+  let found = GLANCE_CACHE.get(key)
+  if (!found) {
+    found = buildGlance(key)
+    GLANCE_CACHE.set(key, found)
+  }
+  return found
+}
+
+/// Height of the scrolling pill list: every pill up to the visible cap, then it scrolls.
+export function sessionListHeight(g: GlanceMetrics, count: number): number {
+  const visible = Math.min(count, MAX_VISIBLE_SESSION_ROWS)
+  if (visible <= 0) return 0
+  return visible * g.pillHeight + (visible - 1) * g.pillGap
+}
+
+/// Four bands, matching the rail's own sense of escalation: comfortable, watch it, nearly
+/// out, over. The glance ramps later than a rail row does, so a healthy row of window
+/// percentages reads as text rather than as a wall of colour.
+export function glanceSeverity(fraction: number): Severity {
+  if (fraction >= 0.9) return 'danger'
+  if (fraction >= 0.8) return 'critical'
+  if (fraction >= 0.7) return 'warning'
+  return 'normal'
+}
+
+/// Anything outside 0...1 is a bad reading, not a reason to paint past the box.
+export function clampFraction(fraction: number): number {
+  return Math.min(Math.max(fraction, 0), 1)
+}
+
+/// How far the reveal edge leans, as a share of the text's height.
+export const GAUGE_SLANT_RATIO = 0.35
+
+/// The slanted wipe over a percentage's glyphs (PercentGaugeReveal). The mac solves the edge
+/// in points against a measured text box; here the box is the element, so the same edge is
+/// written as a share of its width plus the fixed slant in pixels. Both ends are clamped into
+/// the box, which turns the parallelogram into a triangle at the two extremes rather than
+/// letting it fold over itself.
+export function gaugeClipPath(fraction: number, lineHeight: number): string {
+  const f = clampFraction(fraction)
+  const slant = lineHeight * GAUGE_SLANT_RATIO
+  const edge = (offset: number) =>
+    `max(0px, min(100%, calc(${(f * 100).toFixed(3)}% + ${offset.toFixed(2)}px)))`
+  return `polygon(0 0, ${edge(slant * f - slant)} 0, ${edge(slant * f)} 100%, 0 100%)`
 }
 
 export type Edge = 'left' | 'right' | 'top' | 'bottom'
@@ -317,14 +458,13 @@ export function bubblePath(tailEdge: Edge, w: number, h: number, tail: number): 
     .close()
 }
 
-/// Bubble content insets: the regular inset plus room for the tail on the tail edge.
+/// Bubble content insets. Every glance block carries its own padding, so the bubble adds only
+/// the tail's allowance on whichever side the tail points (the mac's `detailInsets`).
 export function detailPadding(m: Metrics, tailEdge: Edge): string {
-  const h = points(22, m.detailScale)
-  const v = points(16, m.detailScale)
-  const t = points(18, m.detailScale)
-  const top = v + (tailEdge === 'top' ? t : 0)
-  const right = h + (tailEdge === 'right' ? t : 0)
-  const bottom = v + (tailEdge === 'bottom' ? t : 0)
-  const left = h + (tailEdge === 'left' ? t : 0)
+  const t = glanceMetrics(m.detailScale).tail
+  const top = tailEdge === 'top' ? t : 0
+  const right = tailEdge === 'right' ? t : 0
+  const bottom = tailEdge === 'bottom' ? t : 0
+  const left = tailEdge === 'left' ? t : 0
   return `${top}px ${right}px ${bottom}px ${left}px`
 }

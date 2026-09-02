@@ -3,7 +3,16 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { ProviderGlyph } from './providerIcons'
 import { providerColor } from './components/AgentTabStrip'
-import { ACCEPTS_KEY, EMPTY_QUOTA, refreshQuota, subscribeQuota, visibleFooterLines, type QuotaState } from './lib/quota'
+import {
+  ACCEPTS_KEY,
+  EMPTY_QUOTA,
+  connectionFor,
+  refreshQuota,
+  subscribeQuota,
+  visibleFooterLines,
+  type Connection,
+  type QuotaState,
+} from './lib/quota'
 import {
   DEFAULT_DOCK_PREFS,
   autoSeed,
@@ -14,13 +23,35 @@ import {
   type DockPrefs,
 } from './lib/dockPrefs'
 import {
+  EMPTY_GLANCE,
+  compactTokens,
+  contextFraction,
+  contextRemaining,
+  isIdle,
+  runningLabel,
+  sessionSubtitle,
+  sessionTitle,
+  sessionsFor,
+  subscribeDailyBudget,
+  subscribeGlance,
+  thousands,
+  usd,
+  type Glance,
+  type LiveSession,
+} from './lib/glance'
+import {
+  MAX_WINDOW_COLUMNS,
   MOTION,
   alongPad,
   bezier,
   bubblePath,
+  clampFraction,
   detailPadding,
   displayLabel,
+  gaugeClipPath,
   gaugePath,
+  glanceMetrics,
+  glanceSeverity,
   headlineWindow,
   isVertical,
   opposite,
@@ -29,17 +60,17 @@ import {
   metrics,
   railPath,
   resetsIn,
+  sessionListHeight,
   severity,
   type Curve,
   type Edge,
   type GaugeShape,
+  type GlanceMetrics,
   type Metrics,
   type QuotaWindow,
   type Severity,
 } from './dockGeometry'
 import './dock.css'
-
-const MAX_DETAIL_ROWS = 5
 
 const PROVIDER_NAMES: Record<string, string> = {
   claude: 'Claude',
@@ -255,7 +286,7 @@ function checkedLabel(fetchedAt: number, now: number): string {
 function footerLines(provider: Provider, fetchedAt: number | null, now: number): string[] {
   const lines: string[] = []
   if (fetchedAt !== null) lines.push(checkedLabel(fetchedAt, now))
-  const hidden = provider.windows.length - MAX_DETAIL_ROWS
+  const hidden = provider.windows.length - MAX_WINDOW_COLUMNS
   if (hidden > 0) lines.push(`${hidden} more window${hidden === 1 ? '' : 's'} not shown`)
   return visibleFooterLines(lines, provider.error ?? null).slice(0, 2)
 }
@@ -266,93 +297,238 @@ function instruction(provider: Provider, quota: QuotaState): string {
   return `Sign in with the ${provider.name} app or CLI. The dock checks again on the quota refresh cadence.`
 }
 
+/// A percentage drawn as its own gauge (PercentGaugeText): the glyphs sit dim, and the
+/// value's own severity colour fills them left to right up to the value, wiped off on a
+/// slant. One band colour, so the fill says how bad it is and the wipe says how far along.
+function GaugeText({
+  label,
+  fraction,
+  lineHeight,
+  className,
+}: {
+  label: string
+  fraction: number
+  lineHeight: number
+  className: string
+}) {
+  return (
+    <span className={`dock-gauge-text ${className}`}>
+      {/* The wipe is measured against the glyph run, as it is on the mac, so the run gets a
+          box of its own rather than being clipped against the column it is centred in. */}
+      <span className="dock-gauge-run">
+        <span className="dock-gauge-base">{label}</span>
+        <span
+          className={`dock-gauge-fill is-${glanceSeverity(fraction)}`}
+          style={{ clipPath: gaugeClipPath(fraction, lineHeight) }}
+          aria-hidden="true"
+        >
+          {label}
+        </span>
+      </span>
+    </span>
+  )
+}
+
+/// One running session. The pill itself is the context gauge: a tinted band over the first
+/// N% of its width, faded out at the leading edge so the boundary reads as a gradient rather
+/// than a rule. A session waiting on the user recedes; one that is generating does not.
+function SessionPill({ g, session, now }: { g: GlanceMetrics; session: LiveSession; now: number }) {
+  const fraction = contextFraction(session)
+  const remaining = contextRemaining(session)
+  const tint = fraction === null ? '' : ` is-${glanceSeverity(fraction)}`
+  return (
+    <div className={`dock-pill${tint}${isIdle(session) ? ' is-idle' : ''}`}>
+      {fraction === null ? null : (
+        <span className="dock-pill-fill" style={{ width: `${(clampFraction(fraction) * 100).toFixed(2)}%` }} />
+      )}
+      <span className="dock-pill-text">
+        <span className="dock-pill-title">{sessionTitle(session)}</span>
+        <span className="dock-pill-sub">{sessionSubtitle(session, now)}</span>
+      </span>
+      {fraction === null ? null : (
+        <span className="dock-pill-right">
+          <GaugeText
+            className="dock-pill-pct"
+            label={`${Math.round(fraction * 100)}%`}
+            fraction={fraction}
+            lineHeight={g.pillTitleLine}
+          />
+          {remaining === null ? null : (
+            <span className="dock-pill-left">{compactTokens(remaining)} left</span>
+          )}
+        </span>
+      )}
+    </div>
+  )
+}
+
+/// A provider that is not connected has no quota and no spend to stand in for one, so the
+/// windows row gives way to the reconnect guidance entirely (CapacityDockGlance.drawsWindows).
+function drawsWindows(connection: Connection): boolean {
+  return connection !== 'disconnected' && connection !== 'terminalFailure'
+}
+
+/// The glance popover. Sections stack at fixed heights, every one a whole pixel, separated by
+/// hairlines drawn as overlays so a rule never adds a pixel the height did not reserve. The
+/// page measures the result and Rust lays the window out around it.
 function Detail({
   m,
   provider,
   quota,
+  glance,
+  budget,
   loading,
   fetchedAt,
 }: {
   m: Metrics
   provider: Provider
   quota: QuotaState
+  glance: Glance
+  budget: number | null
   loading: boolean
   fetchedAt: number | null
 }) {
-  const windows = provider.windows.slice(0, MAX_DETAIL_ROWS)
-  const footer = footerLines(provider, fetchedAt, Date.now())
+  const g = glanceMetrics(m.detailScale)
+  const now = Date.now()
+  const connection: Connection = loading ? 'loading' : connectionFor(provider, quota)
+  const sessions = sessionsFor(glance, provider.id)
+  const today = glance.today
+  const windows = provider.windows.slice(0, MAX_WINDOW_COLUMNS)
+  const footer = footerLines(provider, fetchedAt, now)
   const action = loading ? null : connectionAction(provider)
+  // A single window has no siblings to line up with, so it reads as a left-aligned figure
+  // rather than as a lone centred digit.
+  const windowAlign = windows.length === 1 ? 'start' : 'center'
   return (
-    <div className="dock-detail-body">
-      <header className="dock-detail-head">
-        <span className="dock-detail-glyph">
+    <div className="dock-glance">
+      <header className="dock-glance-head has-rule">
+        <span className="dock-glance-glyph">
           <ProviderGlyph id={provider.id} size={m.detailGlyphSize} />
         </span>
-        <span className="dock-detail-title">{provider.name} Usage</span>
-        {provider.plan ? <span className="dock-detail-plan">{provider.plan}</span> : null}
+        <span className="dock-glance-name">{provider.name}</span>
+        {provider.plan ? <span className="dock-glance-plan">{provider.plan}</span> : null}
       </header>
 
-      {loading ? <p className="dock-conn is-loading">Refreshing…</p> : null}
-      {!loading && provider.error ? (
-        <div className="dock-conn-block">
+      {connection === 'loading' ? <p className="dock-conn is-loading">Refreshing…</p> : null}
+      {connection === 'stale' ? <p className="dock-conn is-stale">Last known usage · refreshing</p> : null}
+      {connection === 'transientFailure' ? (
+        <p className="dock-conn is-retrying">Last known usage · retrying</p>
+      ) : null}
+      {connection === 'disconnected' ? (
+        <div className="dock-conn-block is-disconnected">
+          <p className="dock-conn is-disconnected">Not connected</p>
+          <p className="dock-conn-instruction">{instruction(provider, quota)}</p>
+        </div>
+      ) : null}
+      {connection === 'terminalFailure' ? (
+        <div className="dock-conn-block is-failed">
           <p className="dock-conn is-failed">Reconnect required</p>
           <p className="dock-conn-reason">{provider.error}</p>
           <p className="dock-conn-hint">{instruction(provider, quota)}</p>
         </div>
       ) : null}
-      {!loading && !provider.error && !provider.available ? (
-        <div className="dock-conn-block">
-          <p className="dock-conn is-disconnected">Not connected</p>
-          <p className="dock-conn-instruction">{instruction(provider, quota)}</p>
-        </div>
+
+      {sessions ? (
+        <section className="dock-glance-block has-rule">
+          <div className="dock-glance-caption">
+            <span>Sessions</span>
+            <span className="dock-glance-caption-end">{runningLabel(sessions.length)}</span>
+          </div>
+          {sessions.length > 0 ? (
+            <div className="dock-pills" style={{ height: sessionListHeight(g, sessions.length) }}>
+              {sessions.map((session) => (
+                <SessionPill key={session.id} g={g} session={session} now={now} />
+              ))}
+            </div>
+          ) : null}
+        </section>
       ) : null}
 
-      {provider.available
-        ? windows.map((row) => {
-            const used = pct(row.usedPct)
-            const resets = resetsIn(row.resetsAt)
-            return (
-              <div className="dock-window" key={`${provider.id}-${row.label}`}>
-                <div className="dock-window-top">
-                  <span className="dock-window-label">{displayLabel(row.label)}</span>
-                  <span className="dock-window-pct">{used}%</span>
-                </div>
-                <div className="dock-track">
-                  <div className={`dock-fill is-${severity(used)}`} style={{ width: `max(2px, ${used}%)` }} />
-                </div>
-                {resets ? <span className="dock-window-resets">Resets in {resets}</span> : null}
-              </div>
-            )
-          })
-        : null}
+      {today ? (
+        <section className="dock-glance-block has-rule">
+          <div className="dock-glance-caption">
+            <span>Today</span>
+          </div>
+          <div className="dock-today">
+            <span className="dock-today-figure">
+              <span className="dock-today-cost">{usd(today.cost)}</span>
+              <span className="dock-today-burned">burned</span>
+            </span>
+            <span className="dock-today-stack">
+              <span className="dock-today-token">
+                <span className="dock-today-arrow">&darr;</span>
+                {compactTokens(today.inputTokens)}
+              </span>
+              <span className="dock-today-token">
+                <span className="dock-today-arrow">&uarr;</span>
+                {compactTokens(today.outputTokens)}
+              </span>
+              <span className="dock-today-calls">{thousands(today.calls)} calls</span>
+            </span>
+          </div>
+        </section>
+      ) : null}
+
+      {drawsWindows(connection) ? (
+        <section className={`dock-glance-windows${footer.length > 0 ? ' has-rule' : ''}`}>
+          {windows.length === 0 ? (
+            <p className="dock-budget-line">
+              {budget && budget > 0 ? `today ${usd(today?.cost ?? 0)} of ${usd(budget)}` : 'no budget set'}
+            </p>
+          ) : (
+            <div className="dock-window-row" style={{ textAlign: windowAlign }}>
+              {windows.map((row) => {
+                const used = pct(row.usedPct)
+                const resets = resetsIn(row.resetsAt)
+                return (
+                  <div className="dock-window-col" key={`${provider.id}-${row.label}`}>
+                    <GaugeText
+                      className="dock-window-pct"
+                      label={`${used}%`}
+                      fraction={used / 100}
+                      lineHeight={g.windowPercent}
+                    />
+                    <span className="dock-window-label">{displayLabel(row.label)}</span>
+                    <span className="dock-window-reset">{resets}</span>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </section>
+      ) : null}
 
       {footer.length > 0 ? (
-        <div className="dock-footer">
+        <section className="dock-footer">
           {footer.map((line) => (
             <p className="dock-footer-line" key={line}>
               {line}
             </p>
           ))}
-        </div>
+        </section>
       ) : null}
 
       {action ? (
-        <button
-          type="button"
-          className="dock-connect"
-          style={{ background: providerColor(provider.id) }}
-          onClick={() => void invoke('open_settings_window', { section: provider.id })}
-        >
-          {actionTitle(provider, action)}
-        </button>
+        <div className="dock-connect-row">
+          <button
+            type="button"
+            className="dock-connect"
+            style={{ background: providerColor(provider.id) }}
+            onClick={() => void invoke('open_settings_window', { section: provider.id })}
+          >
+            {actionTitle(provider, action)}
+          </button>
+        </div>
       ) : null}
     </div>
   )
 }
 
 /// The metrics the stylesheet needs. Everything the page can set inline is set inline; these
-/// are the ones that belong to a rule (gaps, type sizes, the alert dot's corner).
+/// are the ones that belong to a rule (gaps, type sizes, the alert dot's corner, and every
+/// block height of the glance popover).
 function dockVars(m: Metrics): CSSProperties {
+  const g = glanceMetrics(m.detailScale)
   return {
     '--dock-row-gap': `${m.rowSpacing}px`,
     '--dock-ring-gap': `${m.ringLabelSpacing}px`,
@@ -362,11 +538,35 @@ function dockVars(m: Metrics): CSSProperties {
     '--dock-alert-size': `${m.alertSize}px`,
     // The mac hangs the badge 19 points out from the ring centre, at 12 points across.
     '--dock-alert-inset': `${Math.round(m.ringSize / 2 - m.alertOffset - m.alertSize / 2)}px`,
-    '--dock-detail-gap': `${Math.round(11 * m.detailScale)}px`,
-    '--dock-detail-head-gap': `${Math.round(8 * m.detailScale)}px`,
-    '--dock-detail-row-gap': `${Math.round(6 * m.detailScale)}px`,
-    '--dock-detail-bar': `${Math.round(6 * m.detailScale)}px`,
-    '--dock-detail-block-gap': `${Math.round(3 * m.detailScale)}px`,
+    '--glance-inset': `${g.inset}px`,
+    '--glance-head-title': `${g.headerTitle}px`,
+    '--glance-head-pad-bottom': `${g.headerPadBottom}px`,
+    '--glance-head-gap': `${g.headGap}px`,
+    '--glance-pad-top': `${g.sectionPadTop}px`,
+    '--glance-pad-bottom': `${g.sectionPadBottom}px`,
+    '--glance-caption': `${g.captionLine}px`,
+    '--glance-line-gap': `${g.lineGap}px`,
+    '--glance-block-gap': `${g.blockGap}px`,
+    '--glance-pill-h': `${g.pillHeight}px`,
+    '--glance-pill-gap': `${g.pillGap}px`,
+    '--glance-pill-radius': `${g.pillRadius}px`,
+    '--glance-pill-pad-x': `${g.pillPadX}px`,
+    '--glance-pill-title': `${g.pillTitleLine}px`,
+    '--glance-pill-sub': `${g.pillSubLine}px`,
+    '--glance-pill-fade': `${g.pillFade}px`,
+    '--glance-today-content': `${g.todayContent}px`,
+    '--glance-today-line': `${g.todayLine}px`,
+    '--glance-today-calls': `${g.todayCallsLine}px`,
+    '--glance-today-line-gap': `${g.todayLineGap}px`,
+    '--glance-today-cost-gap': `${g.todayCostGap}px`,
+    '--glance-window-pct': `${g.windowPercent}px`,
+    '--glance-window-reset': `${g.windowReset}px`,
+    '--glance-window-gap': `${g.windowGap}px`,
+    '--glance-connect-h': `${g.connectHeight}px`,
+    '--glance-conn-loading': `${g.connLoading}px`,
+    '--glance-conn-title': `${g.connTitle}px`,
+    '--glance-conn-line': `${g.connLine}px`,
+    '--glance-conn-terminal': `${g.connTerminal}px`,
   } as CSSProperties
 }
 
@@ -397,6 +597,10 @@ function tuckedTransform(docked: boolean, edge: Edge, cross: number): string {
 
 export function Dock() {
   const [quota, setQuota] = useState<QuotaState>(EMPTY_QUOTA)
+  // What the glance bubble draws beside the quota: the sessions running now and today's
+  // totals. Rust caches the slice of every payload the popover's own fetch goes past.
+  const [glance, setGlance] = useState<Glance>(EMPTY_GLANCE)
+  const [budget, setBudget] = useState<number | null>(null)
   const [prefs, setPrefs] = useState<DockPrefs>(DEFAULT_DOCK_PREFS)
   // Nothing may be written back before the stored preferences have arrived: the defaults say
   // nobody has chosen a provider set yet, and acting on that would overwrite one.
@@ -436,6 +640,8 @@ export function Dock() {
   // cadence with the mac's backoff and jitter, rather than the fixed five minutes this window
   // used to keep to itself, and it stops while nobody could see the rail.
   useEffect(() => subscribeQuota(setQuota), [])
+  useEffect(() => subscribeGlance(setGlance), [])
+  useEffect(() => subscribeDailyBudget(setBudget), [])
 
   // The settings window writes these, so the rail follows a switch, a resting provider or a
   // size the moment it is changed rather than at the next refresh.
@@ -744,7 +950,7 @@ export function Dock() {
     }
     const el = detailRef.current
     if (el) setDetailHeight(Math.ceil(el.offsetHeight))
-  }, [hovered, quota])
+  }, [hovered, quota, glance, budget, m])
 
   const rows = ordered.length
   const totalRows = Math.max(selected.length, 1)
@@ -959,7 +1165,15 @@ export function Dock() {
               />
             </svg>
           ) : null}
-          <Detail m={m} provider={hoveredProvider} quota={quota} loading={loading} fetchedAt={quota.fetchedAt} />
+          <Detail
+            m={m}
+            provider={hoveredProvider}
+            quota={quota}
+            glance={glance}
+            budget={budget}
+            loading={loading}
+            fetchedAt={quota.fetchedAt}
+          />
         </div>
       ) : null}
     </div>
