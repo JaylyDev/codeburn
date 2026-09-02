@@ -63,12 +63,51 @@ pub struct AppState {
     pub plan: plan::PlanClient,
 }
 
+/// What a second launch is asking the running app to do. An app with no window of its own
+/// cannot be reached by clicking anything, so its own argv is the control channel: the
+/// single-instance plugin hands the running process whatever the second launch was started
+/// with. The desktop app (`app/`, which bundles this tray app) drives both from there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondLaunch {
+    /// A plain relaunch: the person started the app again, so show them the popover.
+    ShowPopover,
+    Quit,
+    /// Re-read what is on disk. Written by whoever changed a preference file behind the app's
+    /// back, which for the dock rail is the desktop app's Sidebar switch.
+    ReloadSettings,
+}
+
+/// Quit outranks a reload: a launch that asks for both wants the process gone, and reloading
+/// settings into a process about to exit is work nobody sees.
+pub fn parse_second_launch(args: &[String]) -> SecondLaunch {
+    // argv[0] is a path and can never equal either flag, so the whole vector is scanned
+    // rather than assuming the plugin hands over the program name.
+    if args.iter().any(|arg| arg == "--quit") {
+        return SecondLaunch::Quit;
+    }
+    if args.iter().any(|arg| arg == "--reload-settings") {
+        return SecondLaunch::ReloadSettings;
+    }
+    SecondLaunch::ShowPopover
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // `--quit` aimed at an app that is not running would otherwise start one and leave it
+    // there, which is the opposite of the request. Nothing has been built yet, so there is
+    // nothing to tear down.
+    if parse_second_launch(&std::env::args().collect::<Vec<_>>()) == SecondLaunch::Quit {
+        return;
+    }
+
     tauri::Builder::default()
         // Must be registered before any other plugin so it can intercept a second launch.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            show_popover(app, None);
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            match parse_second_launch(&args) {
+                SecondLaunch::ShowPopover => show_popover(app, None),
+                SecondLaunch::Quit => app.exit(0),
+                SecondLaunch::ReloadSettings => reload_settings(app),
+            }
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
@@ -640,6 +679,29 @@ fn set_dock_enabled(app: &AppHandle, enabled: bool) {
     if let Some(item) = DOCK_MENU_ITEM.get() {
         let _ = item.set_checked(enabled);
     }
+}
+
+/// Brings every surface in line with what is on disk, for a preference this process did not
+/// write. The dock rail is the one that needs it: the desktop app's Sidebar switch edits
+/// `windows-dock.json` directly, and a running tray app would otherwise keep the rail it had
+/// until the next launch.
+fn reload_settings(app: &AppHandle) {
+    let enabled = dock::is_enabled();
+    if enabled {
+        if let Err(err) = dock::show(app) {
+            eprintln!("codeburn: failed to show the Capacity Dock: {err}");
+        }
+        // A rail that was already up may also have had its size or appearance changed.
+        dock::prefs_changed(app);
+    } else {
+        dock::hide(app);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(item) = DOCK_MENU_ITEM.get() {
+        let _ = item.set_checked(enabled);
+    }
+    settings::broadcast(app, &settings::read());
+    sync_theme_menu_item();
 }
 
 fn toggle_popover(app: &AppHandle, anchor: Option<(i32, i32)>) {
@@ -1258,5 +1320,51 @@ mod commands {
     ) -> Result<crate::update::UpdateStatus, String> {
         let cli = state.cli.lock().map_err(|e| e.to_string())?.clone();
         Ok(crate::update::perform_update(&app, &cli).await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_second_launch, SecondLaunch};
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_plain_relaunch_shows_the_popover() {
+        assert_eq!(
+            parse_second_launch(&argv(&[r"C:\Program Files\CodeBurn Menubar\CodeBurn Menubar.exe"])),
+            SecondLaunch::ShowPopover
+        );
+    }
+
+    #[test]
+    fn quit_and_reload_are_recognised_past_the_program_name() {
+        assert_eq!(parse_second_launch(&argv(&["codeburn-menubar.exe", "--quit"])), SecondLaunch::Quit);
+        assert_eq!(
+            parse_second_launch(&argv(&["codeburn-menubar.exe", "--reload-settings"])),
+            SecondLaunch::ReloadSettings
+        );
+    }
+
+    #[test]
+    fn quit_outranks_reload_settings() {
+        assert_eq!(
+            parse_second_launch(&argv(&["exe", "--reload-settings", "--quit"])),
+            SecondLaunch::Quit
+        );
+    }
+
+    #[test]
+    fn an_unknown_flag_is_still_a_relaunch() {
+        assert_eq!(parse_second_launch(&argv(&["exe", "--quit-later", "-q"])), SecondLaunch::ShowPopover);
+    }
+
+    /// A path that happens to end in the flag's spelling is still a path, and an exact match
+    /// is what keeps it from being read as one.
+    #[test]
+    fn only_an_exact_flag_counts() {
+        assert_eq!(parse_second_launch(&argv(&[r"C:\tools\--quit\app.exe"])), SecondLaunch::ShowPopover);
     }
 }
