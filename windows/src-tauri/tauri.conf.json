@@ -51,6 +51,11 @@
       "icons/icon.png",
       "icons/icon.ico"
     ],
+    "windows": {
+      "wix": {
+        "upgradeCode": "cfe9191d-31ea-5040-83c8-cefd2a10b703"
+      }
+    },
     "linux": {
       "deb": {
         "depends": ["libwebkit2gtk-4.1-0", "libayatana-appindicator3-1"]
