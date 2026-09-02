@@ -18,7 +18,7 @@ import { TrendInsight } from './components/TrendInsight'
 import { ForecastInsight } from './components/ForecastInsight'
 import { PulseInsight } from './components/PulseInsight'
 import { StatsInsight } from './components/StatsInsight'
-import { PlanInsight, planTargets } from './components/PlanInsight'
+import { PlanInsight, planTarget } from './components/PlanInsight'
 import { FindingsSection } from './components/FindingsSection'
 import { ActivitySection } from './components/ActivitySection'
 import { LoadingOverlay } from './components/LoadingOverlay'
@@ -292,9 +292,9 @@ export function App() {
   }
 
   const tabs = providerTabs(todayPayload)
-  // The Plan pill is offered exactly when there is a plan to show: the selected provider has
-  // a live quota source, or All is selected and at least one provider does.
-  const planVisible = provider === 'claude' || planTargets(quota, provider).length > 0
+  // The Plan pill is offered exactly when there is one plan to show. All aggregates several
+  // providers and so has no plan of its own, as on the mac.
+  const planVisible = planTarget(quota, provider) !== null
   const visibleModes = useMemo(
     () => INSIGHT_ORDER.filter(m => m !== 'plan' || planVisible),
     [planVisible],

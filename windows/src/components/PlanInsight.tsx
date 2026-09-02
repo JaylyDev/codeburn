@@ -31,56 +31,38 @@ type Props = {
   onConnectClaude: () => void
 }
 
-/// Which providers the Plan tab has something to say about. Claude always qualifies: its
-/// tier and prior-cycle baseline come from the credential file, not from the CLI's quota
-/// answer, so it has a plan view before the store has replied. Otherwise it is whichever
-/// provider is selected, or, under All, every provider currently reporting quota.
-export function planTargets(quota: QuotaState, provider: Provider): QuotaSummary[] {
-  if (provider !== ALL_PROVIDER) {
-    const summary = summaryFor(quota, provider)
-    return summary ? [summary] : []
-  }
-  const connected = quota.providers
-    .filter(p => p.available && p.windows.length > 0)
-    .map(p => summaryFor(quota, p.id))
-    .filter((s): s is QuotaSummary => s !== null)
-  // Claude first, as on the mac, then the rest in the order the CLI reports them.
-  return connected.sort((a, b) => Number(b.id === 'claude') - Number(a.id === 'claude'))
+/// What the Plan tab has to say about the selected provider. All has no plan of its own, as
+/// on the mac, so the pill is hidden there. Claude always qualifies even before the quota
+/// store has answered: its tier and prior-cycle baseline come from the credential file, not
+/// from the CLI's quota answer.
+export function planTarget(quota: QuotaState, provider: Provider): QuotaSummary | 'claude' | null {
+  if (provider === ALL_PROVIDER) return null
+  const summary = summaryFor(quota, provider)
+  if (summary) return summary
+  return provider === 'claude' ? 'claude' : null
 }
 
 export function PlanInsight({ payload, currency, provider, quota, onOpenTerminal, onConnectClaude }: Props) {
-  const targets = planTargets(quota, provider)
-  // Selecting Claude shows its plan even before the quota store has answered, since that
-  // view does not depend on the store.
-  const blocks: Array<QuotaSummary | 'claude'> = provider === 'claude' && !targets.some(t => t.id === 'claude')
-    ? ['claude', ...targets]
-    : targets
-  const named = blocks.length > 1
-
-  return (
-    <div className="plan-stack">
-      {blocks.map(target => target === 'claude' || target.id === 'claude' ? (
-        <ClaudePlan
-          key="claude"
-          payload={payload}
-          currency={currency}
-          named={named}
-          onOpenTerminal={onOpenTerminal}
-          onConnectClaude={onConnectClaude}
-        />
-      ) : (
-        <ProviderPlan key={target.id} summary={target} named={named} />
-      ))}
-    </div>
-  )
+  const target = planTarget(quota, provider)
+  if (target === null) return null
+  if (target === 'claude' || target.id === 'claude') {
+    return (
+      <ClaudePlan
+        payload={payload}
+        currency={currency}
+        onOpenTerminal={onOpenTerminal}
+        onConnectClaude={onConnectClaude}
+      />
+    )
+  }
+  return <ProviderPlan summary={target} />
 }
 
 /// The Claude tab keeps its own path: `plan_usage` reads the credential file directly, which
 /// is the only source for the subscription tier and last cycle's final reading.
-function ClaudePlan({ payload, currency, named, onOpenTerminal, onConnectClaude }: {
+function ClaudePlan({ payload, currency, onOpenTerminal, onConnectClaude }: {
   payload: MenubarPayload | null
   currency: CurrencyState
-  named: boolean
   onOpenTerminal: (args: string[]) => void
   onConnectClaude: () => void
 }) {
@@ -146,7 +128,6 @@ function ClaudePlan({ payload, currency, named, onOpenTerminal, onConnectClaude 
       return (
         <div className="plan-insight">
           <div className="plan-header">
-            {named && <span className="plan-provider">Claude</span>}
             <span className="plan-tier">{usage.tier}</span>
             {reset && <span className="plan-reset">Resets {relativeFuture(reset, now)}</span>}
           </div>
@@ -175,7 +156,7 @@ function ClaudePlan({ payload, currency, named, onOpenTerminal, onConnectClaude 
 /// Every other provider reads the shared quota store, which is the same data the mac's
 /// per-provider plan tabs render. There is no prior-cycle baseline behind it, so a window
 /// too fresh to extrapolate simply gets no caption.
-function ProviderPlan({ summary, named }: { summary: QuotaSummary; named: boolean }) {
+function ProviderPlan({ summary }: { summary: QuotaSummary }) {
   const [now, setNow] = useState(() => new Date())
 
   useEffect(() => {
@@ -226,7 +207,6 @@ function ProviderPlan({ summary, named }: { summary: QuotaSummary; named: boolea
   return (
     <div className="plan-insight">
       <div className="plan-header">
-        {named && <span className="plan-provider">{summary.name}</span>}
         <span className="plan-tier">{summary.planLabel ?? summary.name}</span>
         {reset && <span className="plan-reset">Resets {relativeFuture(reset, now)}</span>}
       </div>
