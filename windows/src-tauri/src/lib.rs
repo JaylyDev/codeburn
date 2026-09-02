@@ -210,6 +210,7 @@ pub fn run() {
             commands::dock_set_layout,
             commands::dock_set_preferred,
             commands::dock_context_menu,
+            commands::dock_close,
             commands::dock_begin_drag,
             commands::dock_prefs,
             commands::set_dock_prefs,
@@ -1130,6 +1131,12 @@ mod commands {
         crate::dock::popup_context_menu(&app).map_err(|e| e.to_string())
     }
 
+    /// The page's half of the dismiss handshake: the rail has finished retracting, so the
+    /// window can go. Rust takes it anyway shortly after asking, in case this never comes.
+    #[tauri::command]
+    pub fn dock_close(app: AppHandle) {
+        crate::dock::close(&app);
+    }
 
     /// Everything the Capacity Dock reads out of `windows-dock.json`: whether it is on, its
     /// scale, appearance, gauge shape and provider set. One free-form object, so a new dock

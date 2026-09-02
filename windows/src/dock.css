@@ -16,6 +16,12 @@
   --dock-detail-present: cubic-bezier(0.16, 1, 0.3, 1);
   --dock-detail-follow: cubic-bezier(0.25, 0.1, 0.25, 1);
   --dock-detail-dismiss: cubic-bezier(0.4, 0, 1, 1);
+  /* MOTION.dockAttach and MOTION.dockDetach in dockGeometry.ts, which the drag glide and
+     the flare already ease with; the rail entering and leaving uses the same two. */
+  --dock-attach: cubic-bezier(0.16, 1, 0.3, 1);
+  --dock-attach-ms: 280ms;
+  --dock-detach: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dock-detach-ms: 240ms;
 }
 
 .dock {
@@ -47,6 +53,36 @@
 
 .dock-rail.is-dragging {
   cursor: grabbing;
+}
+
+/* Activation: the rail emerges from its edge rather than appearing. It is tucked a whole
+   cross width outside the window while `is-tucked` is on, so nothing of it shows, and the
+   transform is released on the frame after the first layout. A floating rail has no edge to
+   hide behind, so it fades and scales instead. The window never moves for either: this is a
+   transform on the rail alone, which is what keeps every window metric a whole pixel. */
+.dock-rail {
+  transition:
+    transform var(--dock-attach-ms) var(--dock-attach),
+    opacity var(--dock-attach-ms) var(--dock-attach);
+}
+
+.dock-rail.is-leaving {
+  transition:
+    transform var(--dock-detach-ms) var(--dock-detach),
+    opacity var(--dock-detach-ms) var(--dock-detach);
+}
+
+/* Dragging moves the rail every frame from Rust; an entrance curve on top of that would
+   fight it. */
+.dock-rail.is-dragging {
+  transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dock-rail,
+  .dock-rail.is-leaving {
+    transition: none;
+  }
 }
 
 .dock-rows {

@@ -373,6 +373,28 @@ function dockVars(m: Metrics): CSSProperties {
 const RAIL_MOTION = (_from: number, to: number) => (to === 1 ? MOTION.railExpand : MOTION.railCollapse)
 const ATTACH_MOTION = (_from: number, to: number) => (to === 1 ? MOTION.dockAttach : MOTION.dockDetach)
 
+/// Coming out of the edge, resting, or going back into it.
+type Presence = 'entering' | 'present' | 'leaving'
+
+/// Somebody who has asked for less movement gets the rail placed rather than played.
+function motionAllowed(): boolean {
+  return typeof window.matchMedia === 'function'
+    && !window.matchMedia('(prefers-reduced-motion: reduce)').matches
+}
+
+/// How far the rail sits outside the window while it is tucked away: its whole cross extent,
+/// pushed toward the edge it is docked to, so nothing of it shows. A floating rail has no edge
+/// to hide behind, so it fades and scales instead.
+function tuckedTransform(docked: boolean, edge: Edge, cross: number): string {
+  if (!docked) return 'scale(0.92)'
+  switch (edge) {
+    case 'left': return `translateX(${-cross}px)`
+    case 'right': return `translateX(${cross}px)`
+    case 'top': return `translateY(${-cross}px)`
+    default: return `translateY(${cross}px)`
+  }
+}
+
 export function Dock() {
   const [quota, setQuota] = useState<QuotaState>(EMPTY_QUOTA)
   const [prefs, setPrefs] = useState<DockPrefs>(DEFAULT_DOCK_PREFS)
@@ -393,6 +415,9 @@ export function Dock() {
   const [drag, setDrag] = useState<{ attachment: number; edge: Edge | null } | null>(null)
   // Where the rail was before a settle, relative to the new window, so it can glide in.
   const [glide, setGlide] = useState<{ dx: number; dy: number; key: number } | null>(null)
+  // The rail's whole life in this window, which is created for it and destroyed with it: it
+  // opens tucked behind its edge and leaves the same way, and the window itself never moves.
+  const [presence, setPresence] = useState<Presence>('entering')
   const { schedule, cancel } = useTimers()
 
   const interactionRef = useRef(interaction)
@@ -595,6 +620,32 @@ export function Dock() {
     hideDetail()
   }, [cancel, hideDetail])
 
+  // The rail emerges once there is a frame to emerge into: before the first layout it has no
+  // edge and no size, so there is nothing to tuck it behind. One frame later the transform is
+  // released and the transition carries it out. Reduced motion places it and skips the play.
+  useEffect(() => {
+    if (frame === null || presence !== 'entering') return
+    if (!motionAllowed()) {
+      setPresence('present')
+      return
+    }
+    const raf = requestAnimationFrame(() => requestAnimationFrame(() => setPresence('present')))
+    return () => cancelAnimationFrame(raf)
+  }, [frame, presence])
+
+  // Rust asks before it destroys the window, so the rail can go back into the edge rather than
+  // vanish. The bubble goes first, then the rail retracts, then the window is released. Rust
+  // keeps its own timer, so a page that never gets here costs a moment, not a stuck window.
+  useEffect(() => {
+    const pending = listen('codeburn://dock-dismiss', () => {
+      hideDetail()
+      setPresence('leaving')
+      const wait = motionAllowed() ? MOTION.dockDetach.duration : 0
+      window.setTimeout(() => { void invoke('dock_close') }, wait)
+    })
+    return () => { void pending.then((stop) => stop()) }
+  }, [hideDetail])
+
   useEffect(() => {
     const listeners = [
       listen('codeburn://dock-refresh', () => void refreshQuota()),
@@ -772,6 +823,9 @@ export function Dock() {
         ? { left: railLeft, bottom: -glideDy }
         : { left: railLeft, top: railTop }
 
+  // Tucked behind the edge before the entrance plays and again once the retract starts.
+  const tucked = presence !== 'present'
+
   const hoveredProvider = hovered ? (ordered.find((p) => p.id === hovered) ?? null) : null
   const detailFrame = frame?.detail ?? null
   const tailEdge = opposite(frame?.bubbleSide ?? 'left')
@@ -806,8 +860,14 @@ export function Dock() {
       }}
     >
       <div
-        className={`dock-rail${interaction.dragging ? ' is-dragging' : ''}`}
-        style={{ ...railPosition, width: railW, height: railH, clipPath: `path('${shape}')` }}
+        className={`dock-rail${interaction.dragging ? ' is-dragging' : ''}${tucked ? ' is-tucked' : ''}${presence === 'leaving' ? ' is-leaving' : ''}`}
+        style={{
+          ...railPosition,
+          width: railW,
+          height: railH,
+          clipPath: `path('${shape}')`,
+          ...(tucked ? { transform: tuckedTransform(Boolean(frame?.docked), edge, cross), opacity: frame?.docked ? 1 : 0 } : {}),
+        }}
         onMouseEnter={() => domPointer({ railHovered: true })}
         onMouseLeave={() => domPointer({ railHovered: false, row: null })}
         onPointerDown={onPointerDown}

@@ -13,6 +13,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -1034,6 +1035,8 @@ fn spawn_pointer_tracking(app: AppHandle) {
 }
 
 pub fn show(app: &AppHandle) -> tauri::Result<()> {
+    // A show cancels any retract still counting down for the window it is replacing.
+    next_generation();
     // A window under this label can survive a `hide` for a moment, since the destroy is
     // processed by the event loop rather than at the call. Reuse it when it is there: two
     // windows with one label is not a state this module can hold.
@@ -1136,7 +1139,78 @@ fn prefs_scale() -> f64 {
 /// and the window leaves the manager some time later. Switching the dock off and straight
 /// back on then found the dying window still under its label and only re-showed it, which
 /// left the rail invisible until the next launch.
+/// How long Rust waits for the page to play the retract before taking the window anyway. The
+/// animation is 240 ms, so this is that plus room for a slow frame: a page that never answers
+/// costs a fifth of a second, not a rail that will not go away.
+const DISMISS_FALLBACK: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Bumped by every show, hide and close. A pending fallback fires only while the number it
+/// captured is still current, so switching the dock off and straight back on cannot have the
+/// old timer destroy the new window.
+static DISMISS_GENERATION: AtomicU64 = AtomicU64::new(0);
+#[cfg(debug_assertions)]
+static DISMISS_ASKED_MS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(debug_assertions)]
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn next_generation() -> u64 {
+    DISMISS_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Destroying the window while the rail is still on screen makes it vanish rather than leave,
+/// so the page is asked to retract first and calls `dock_close` when it has. This only arms
+/// the timer that keeps a stuck page from holding the window open.
 pub fn hide(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(DOCK_LABEL) else {
+        return;
+    };
+    let generation = next_generation();
+    #[cfg(debug_assertions)]
+    {
+        DISMISS_ASKED_MS.store(now_ms(), Ordering::SeqCst);
+        eprintln!("codeburn: dock dismiss asked (generation {generation})");
+    }
+    if window.emit("codeburn://dock-dismiss", ()).is_err() {
+        // Nobody to play it: take the window now.
+        close(app);
+        return;
+    }
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(DISMISS_FALLBACK);
+        if DISMISS_GENERATION.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        #[cfg(debug_assertions)]
+        eprintln!("codeburn: dock dismiss fallback fired; the page never answered");
+        let inner = handle.clone();
+        let _ = handle.run_on_main_thread(move || {
+            if DISMISS_GENERATION.load(Ordering::SeqCst) == generation {
+                destroy_window(&inner);
+            }
+        });
+    });
+}
+
+/// The page's half of the handshake, and the fallback's. Bumping the generation here is what
+/// disarms a timer that is still waiting.
+pub fn close(app: &AppHandle) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "codeburn: dock close from the page after {} ms",
+        now_ms().saturating_sub(DISMISS_ASKED_MS.load(Ordering::SeqCst))
+    );
+    next_generation();
+    destroy_window(app);
+}
+
+fn destroy_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(DOCK_LABEL) {
         let _ = window.destroy();
     }
