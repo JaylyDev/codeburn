@@ -54,6 +54,7 @@ let state: UpdateState = EMPTY_UPDATE
 let listeners: Listener[] = []
 let timer: number | undefined
 let inFlight: Promise<void> | null = null
+let inFlightForced = false
 let stageListener: Promise<() => void> | null = null
 
 function publish(next: Partial<UpdateState>) {
@@ -63,7 +64,14 @@ function publish(next: Partial<UpdateState>) {
 
 /// `force` skips the two-day gate, which is what the buttons that say Check for Updates do.
 export async function checkUpdates(force: boolean): Promise<void> {
-  if (inFlight) return inFlight
+  if (inFlight) {
+    // Coalescing is right for two mounts asking the same question, and wrong for a reader
+    // who pressed the button: a forced check must not be answered by the cached one that
+    // was already on its way, so it waits for it and then asks properly.
+    if (!force || inFlightForced) return inFlight
+    return inFlight.then(() => checkUpdates(true))
+  }
+  inFlightForced = force
   publish({ checking: true })
   inFlight = (async () => {
     try {
