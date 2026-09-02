@@ -91,6 +91,8 @@ export function metrics(scale: number): Metrics {
 
 export type Edge = 'left' | 'right' | 'top' | 'bottom'
 
+export type GaugeShape = 'circle' | 'squircle'
+
 export function isVertical(edge: Edge): boolean {
   return edge === 'left' || edge === 'right'
 }
@@ -232,6 +234,38 @@ function roundedRect(b: PathBuilder, w: number, h: number, r: number): string {
     .line([0, r])
     .quad([0, 0], [r, 0])
     .close()
+}
+
+/// The gauge outline (CapacityDockGaugePath), drawn inside `box` at `size` across. Both
+/// shapes start at twelve o'clock and run clockwise, so a usage arc trimmed from the start
+/// fills the way the mac's does after its -90 degree rotation.
+export function gaugePath(kind: GaugeShape, box: number, size: number): string {
+  const min = (box - size) / 2
+  const max = min + size
+  const mid = box / 2
+  const r = size / 2
+  if (kind === 'circle') {
+    return `M ${mid} ${min} A ${r} ${r} 0 1 1 ${mid} ${max} A ${r} ${r} 0 1 1 ${mid} ${min} Z`
+  }
+  // The mac's continuous rounded rectangle at a 30 percent corner radius. A continuous corner
+  // reaches about one and a half radii along each edge and is drawn as one cubic whose control
+  // points sit a further 55 percent of that reach toward the corner; a circular quarter-arc
+  // would kink where it meets the straight edge, which is the whole difference from a circle.
+  const reach = Math.min(size * 0.3 * 1.5, size / 2)
+  const pull = reach * 0.45
+  const f = (n: number) => n.toFixed(2)
+  return [
+    `M ${f(mid)} ${f(min)}`,
+    `L ${f(max - reach)} ${f(min)}`,
+    `C ${f(max - pull)} ${f(min)} ${f(max)} ${f(min + pull)} ${f(max)} ${f(min + reach)}`,
+    `L ${f(max)} ${f(max - reach)}`,
+    `C ${f(max)} ${f(max - pull)} ${f(max - pull)} ${f(max)} ${f(max - reach)} ${f(max)}`,
+    `L ${f(min + reach)} ${f(max)}`,
+    `C ${f(min + pull)} ${f(max)} ${f(min)} ${f(max - pull)} ${f(min)} ${f(max - reach)}`,
+    `L ${f(min)} ${f(min + reach)}`,
+    `C ${f(min)} ${f(min + pull)} ${f(min + pull)} ${f(min)} ${f(min + reach)} ${f(min)}`,
+    'Z',
+  ].join(' ')
 }
 
 /// The rail outline (CapacityDockRailShape): a plain rounded pill while loose, and once more

@@ -10,6 +10,7 @@ import {
   bubblePath,
   detailPadding,
   displayLabel,
+  gaugePath,
   headlineWindow,
   isVertical,
   opposite,
@@ -21,6 +22,7 @@ import {
   severity,
   type Curve,
   type Edge,
+  type GaugeShape,
   type Metrics,
   type QuotaWindow,
   type Severity,
@@ -147,14 +149,14 @@ const RING_COLORS: Record<Severity, string> = {
   danger: '#FF453A',
 }
 
-function Ring({ m, percent }: { m: Metrics; percent: number | null }) {
+function Ring({ m, shape, percent }: { m: Metrics; shape: GaugeShape; percent: number | null }) {
   const size = m.ringSize
   const stroke = m.ringStroke
-  // Strokes are centred on the ring's circle like SwiftUI's, so the box gets a margin for them.
+  // Strokes are centred on the gauge path like SwiftUI's, so the box gets a margin for them.
   const box = size + m.ringMargin * 2
-  const c = box / 2
-  const r = size / 2
-  const circumference = 2 * Math.PI * r
+  const path = gaugePath(shape, box, size)
+  // The arc is trimmed by a dash pattern over a normalized path length, which is the one
+  // measure a circle and a squircle share.
   const amount = percent === null ? 0 : Math.min(1, Math.max(0, percent / 100))
   return (
     <svg className="dock-ring" width={box} height={box} viewBox={`0 0 ${box} ${box}`} aria-hidden="true">
@@ -165,21 +167,19 @@ function Ring({ m, percent }: { m: Metrics; percent: number | null }) {
           <stop offset="1" stopColor="#fff" stopOpacity="0.12" />
         </linearGradient>
       </defs>
-      <circle cx={c} cy={c} r={r} fill="none" stroke="rgba(0,0,0,0.74)" strokeWidth={stroke + 2 * m.scale} />
-      <circle cx={c} cy={c} r={r} fill="none" stroke="url(#dock-ring-sheen)" strokeWidth={stroke + 0.6 * m.scale} />
+      <path d={path} fill="none" stroke="rgba(0,0,0,0.74)" strokeWidth={stroke + 2 * m.scale} />
+      <path d={path} fill="none" stroke="url(#dock-ring-sheen)" strokeWidth={stroke + 0.6 * m.scale} />
       {percent === null ? (
-        <circle cx={c} cy={c} r={r} fill="none" stroke="rgba(255,255,255,0.24)" strokeWidth={2 * m.scale} strokeDasharray={`${3 * m.scale} ${4 * m.scale}`} />
+        <path d={path} fill="none" stroke="rgba(255,255,255,0.24)" strokeWidth={2 * m.scale} strokeDasharray={`${3 * m.scale} ${4 * m.scale}`} />
       ) : (
-        <circle
-          cx={c}
-          cy={c}
-          r={r}
+        <path
+          d={path}
           fill="none"
           stroke={RING_COLORS[severity(percent)]}
           strokeWidth={stroke}
           strokeLinecap="round"
-          strokeDasharray={`${circumference * amount} ${circumference}`}
-          transform={`rotate(-90 ${c} ${c})`}
+          pathLength={100}
+          strokeDasharray={`${(amount * 100).toFixed(2)} 100`}
           className="dock-ring-arc"
         />
       )}
@@ -189,6 +189,7 @@ function Ring({ m, percent }: { m: Metrics; percent: number | null }) {
 
 type RowProps = {
   m: Metrics
+  shape: GaugeShape
   provider: Provider
   loading: boolean
   style: CSSProperties
@@ -197,7 +198,7 @@ type RowProps = {
   onClick: () => void
 }
 
-function Row({ m, provider, loading, style, onEnter, onLeave, onClick }: RowProps) {
+function Row({ m, shape, provider, loading, style, onEnter, onLeave, onClick }: RowProps) {
   const headline = provider.available ? headlineWindow(provider.windows) : null
   const percent = headline ? pct(headline.usedPct) : null
   const sev = percent === null ? null : severity(percent)
@@ -212,7 +213,7 @@ function Row({ m, provider, loading, style, onEnter, onLeave, onClick }: RowProp
       aria-label={`${provider.name} usage`}
     >
       <span className="dock-gauge">
-        <Ring m={m} percent={percent} />
+        <Ring m={m} shape={shape} percent={percent} />
         <span className={`dock-glyph${loading ? ' is-loading' : ''}`}>
           <ProviderGlyph id={provider.id} size={m.providerIconSize} />
         </span>
@@ -729,6 +730,7 @@ export function Dock() {
               <Row
                 key={provider.id}
                 m={m}
+                shape={prefs.gaugeShape}
                 provider={provider}
                 loading={loading}
                 style={{
