@@ -48,6 +48,8 @@ private func claudeConfigSelector(selectedId: String? = nil) -> ClaudeConfigSele
 private func menubarPayload(cost: Double,
                             calls: Int = 1,
                             sessions: Int = 1,
+                            inputTokens: Int = 1,
+                            outputTokens: Int = 1,
                             providers: [String: Double]? = nil,
                             providerDetails: [ProviderDetail] = [],
                             combined: CombinedUsage? = nil,
@@ -60,8 +62,8 @@ private func menubarPayload(cost: Double,
             calls: calls,
             sessions: sessions,
             oneShotRate: nil,
-            inputTokens: 1,
-            outputTokens: 1,
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
             cacheHitPercent: 0,
             codexCredits: nil,
             topActivities: [],
@@ -120,6 +122,34 @@ struct AppStoreRefreshRecoveryTests {
         #expect(store.needsInteractivePayloadRefresh)
     }
 
+    @Test("positive provider spend cannot disappear when scoped calls survive")
+    func positiveSpendCannotDisappearWhenScopedCallsSurvive() {
+        let store = AppStore()
+        let all = menubarPayload(
+            cost: 12,
+            providers: ["claude": 11.5, "hermes agent": 0.5],
+            providerDetails: [
+                ProviderDetail(id: "claude", label: "Claude", cost: 11.5, calls: 4, hasUsage: true),
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0.5, calls: 7, hasUsage: true),
+            ]
+        )
+        let missingSpend = menubarPayload(
+            cost: 0,
+            calls: 7,
+            sessions: 7,
+            inputTokens: 100,
+            outputTokens: 20,
+            providers: ["hermes agent": 0],
+            providerDetails: [
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0, calls: 7, hasUsage: true),
+            ]
+        )
+
+        store.setCachedPayloadForTesting(all, period: .today, provider: .all, fetchedAt: Date())
+
+        #expect(store.providerPayloadContradictsAllForTesting(missingSpend, period: .today, provider: .hermes))
+    }
+
     @Test("flat-rate activity rejects a contradictory scoped zero")
     func flatRateActivityRejectsScopedZero() {
         let store = AppStore()
@@ -144,6 +174,96 @@ struct AppStoreRefreshRecoveryTests {
         store.setCachedPayloadForTesting(all, period: .today, provider: .all, fetchedAt: Date())
 
         #expect(store.providerPayloadContradictsAllForTesting(falseZero, period: .today, provider: .hermes))
+    }
+
+    @Test("token-only activity accepts a scoped payload with matching usage")
+    func tokenOnlyActivityAcceptsMatchingScopedUsage() {
+        let store = AppStore()
+        let all = menubarPayload(
+            cost: 12,
+            providers: ["claude": 12, "hermes agent": 0],
+            providerDetails: [
+                ProviderDetail(id: "claude", label: "Claude", cost: 12, calls: 4, hasUsage: true),
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0, calls: 0, hasUsage: true),
+            ]
+        )
+        let tokenOnly = menubarPayload(
+            cost: 0,
+            calls: 0,
+            sessions: 1,
+            inputTokens: 100,
+            outputTokens: 20,
+            providers: ["hermes agent": 0],
+            providerDetails: [
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0, calls: 0, hasUsage: true),
+            ]
+        )
+
+        store.setCachedPayloadForTesting(all, period: .today, provider: .all, fetchedAt: Date())
+
+        #expect(!store.providerPayloadContradictsAllForTesting(tokenOnly, period: .today, provider: .hermes))
+    }
+
+    @Test("token-only activity rejects a completely empty scoped payload")
+    func tokenOnlyActivityRejectsEmptyScopedPayload() {
+        let store = AppStore()
+        let all = menubarPayload(
+            cost: 12,
+            providers: ["claude": 12, "hermes agent": 0],
+            providerDetails: [
+                ProviderDetail(id: "claude", label: "Claude", cost: 12, calls: 4, hasUsage: true),
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0, calls: 0, hasUsage: true),
+            ]
+        )
+        let empty = menubarPayload(
+            cost: 0,
+            calls: 0,
+            sessions: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            providers: ["hermes agent": 0],
+            providerDetails: [
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0, calls: 0, hasUsage: false),
+            ]
+        )
+
+        store.setCachedPayloadForTesting(all, period: .today, provider: .all, fetchedAt: Date())
+
+        #expect(store.providerPayloadContradictsAllForTesting(empty, period: .today, provider: .hermes))
+    }
+
+    @Test("late all-provider evidence invalidates an already cached scoped zero")
+    func lateAllProviderEvidenceInvalidatesScopedZero() {
+        let store = AppStore()
+        let falseZero = menubarPayload(
+            cost: 0,
+            calls: 0,
+            sessions: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            providers: ["hermes agent": 0],
+            providerDetails: [
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0, calls: 0, hasUsage: false),
+            ]
+        )
+        let all = menubarPayload(
+            cost: 12,
+            providers: ["claude": 11.5, "hermes agent": 0.5],
+            providerDetails: [
+                ProviderDetail(id: "claude", label: "Claude", cost: 11.5, calls: 4, hasUsage: true),
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0.5, calls: 7, hasUsage: true),
+            ]
+        )
+
+        store.suppressRefreshesForTesting()
+        store.switchTo(provider: .hermes)
+        store.setCachedPayloadForTesting(falseZero, period: .today, provider: .hermes, fetchedAt: Date())
+        #expect(store.hasCachedData)
+
+        store.setCachedPayloadForTesting(all, period: .today, provider: .all, fetchedAt: Date())
+
+        #expect(!store.hasCachedData)
+        #expect(store.needsInteractivePayloadRefresh)
     }
 
     @Test("a genuine provider zero remains valid when the all-provider slice is also zero")

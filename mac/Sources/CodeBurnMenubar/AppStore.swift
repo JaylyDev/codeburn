@@ -412,7 +412,8 @@ final class AppStore {
     }
 
     var hasCachedData: Bool {
-        cache[currentKey] != nil || (effectiveSelectedScope == .combined && cache[localCurrentKey] != nil)
+        consistentCachedPayload(for: currentKey) != nil
+            || (effectiveSelectedScope == .combined && consistentCachedPayload(for: localCurrentKey) != nil)
     }
 
     var hasStaleLoading: Bool {
@@ -674,9 +675,12 @@ final class AppStore {
             } else if provider == .all {
                 await refresh(key: key, includeOptimize: false, force: false, showLoading: false)
             } else {
-                async let main = refresh(key: key, includeOptimize: false, force: false, showLoading: false)
-                async let all = refreshQuietly(key: allKey, includeOptimize: false, force: false)
-                _ = await (main, all)
+                // Establish the matching all-provider slice first. Otherwise a
+                // fast scoped zero can be accepted before the positive all
+                // result arrives, creating a brief false-zero flash and a
+                // cached lie until the next refresh.
+                _ = await refreshQuietly(key: allKey, includeOptimize: false, force: false)
+                await refresh(key: key, includeOptimize: false, force: false, showLoading: false)
             }
         }
     }
@@ -802,9 +806,7 @@ final class AppStore {
     /// onto a fabricated zero.
     private func providerPayloadContradictsAll(_ payload: MenubarPayload, for key: PayloadCacheKey) -> Bool {
         guard key.scope == .local,
-              key.provider != .all,
-              payload.current.cost == 0,
-              payload.current.calls == 0 else { return false }
+              key.provider != .all else { return false }
 
         let allKey = PayloadCacheKey(
             scope: .local,
@@ -816,14 +818,28 @@ final class AppStore {
         )
         guard let all = cache[allKey]?.payload else { return false }
         let providerKeys = Set(key.provider.providerKeys + [key.provider.cliArg])
-        if let detail = all.current.providerDetails.first(where: {
+        let detail = all.current.providerDetails.first(where: {
             providerKeys.contains($0.id.lowercased()) || providerKeys.contains($0.label.lowercased())
-        }) {
-            return detail.cost > 0 || detail.calls > 0
-        }
-        return key.provider.providerKeys.reduce(0.0) { sum, providerKey in
+        })
+        let allCost = detail?.cost ?? key.provider.providerKeys.reduce(0.0) { sum, providerKey in
             sum + (all.current.providers[providerKey] ?? 0)
-        } > 0
+        }
+        let allCalls = detail?.calls
+        let allHasUsage = detail?.hasUsage ?? (allCost > 0)
+
+        // Cost and call dimensions are independent. A scoped result that keeps
+        // its calls but loses the spend (or vice versa) is still stale.
+        if allCost > 0, payload.current.cost == 0 { return true }
+        if let allCalls, allCalls > 0, payload.current.calls == 0 { return true }
+
+        // `hasUsage` is authoritative for subscription/token-only providers,
+        // where both cost and behavioral calls may legitimately be zero.
+        let scopedHasUsage = payload.current.cost > 0
+            || payload.current.calls > 0
+            || payload.current.sessions > 0
+            || payload.current.inputTokens > 0
+            || payload.current.outputTokens > 0
+        return allHasUsage && !scopedHasUsage
     }
 
     private func fetchPayload(
@@ -914,6 +930,14 @@ final class AppStore {
             let (localSucceeded, combinedSucceeded) = await (local, combined)
             return localSucceeded && combinedSucceeded
         } else {
+            if currentKey.provider != .all {
+                _ = await refreshQuietly(
+                    key: periodAllKey,
+                    includeOptimize: false,
+                    force: force,
+                    qualityOfService: qualityOfService
+                )
+            }
             return await refresh(
                 key: currentKey,
                 includeOptimize: includeOptimize,
@@ -938,6 +962,17 @@ final class AppStore {
             async let combined = refreshQuietly(key: scopedKey, includeOptimize: false, force: force)
             _ = await (local, combined)
         } else {
+            if scopedKey.provider != .all {
+                let allKey = PayloadCacheKey(
+                    scope: .local,
+                    period: scopedKey.period,
+                    provider: .all,
+                    day: scopedKey.day,
+                    days: scopedKey.days,
+                    claudeConfigSourceId: scopedKey.claudeConfigSourceId
+                )
+                _ = await refreshQuietly(key: allKey, includeOptimize: false, force: force)
+            }
             await refreshQuietly(key: scopedKey, includeOptimize: false, force: force)
         }
     }
