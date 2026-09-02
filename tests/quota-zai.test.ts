@@ -92,7 +92,8 @@ describe('Z.ai credential discovery', () => {
   it('falls back to the Pi login on disk', async () => {
     const credentialPath = path.join(root, '.pi', 'agent', 'auth.json')
     await mkdir(path.dirname(credentialPath), { recursive: true })
-    await writeFile(credentialPath, JSON.stringify({ zai: { key: 'pi-zai-key' } }), 'utf8')
+    // A real login file is private to the user; readSecureFile rejects group or world bits on POSIX.
+    await writeFile(credentialPath, JSON.stringify({ zai: { key: 'pi-zai-key' } }), { encoding: 'utf8', mode: 0o600 })
 
     const seen: Record<string, string>[] = []
     const result = await fetchZaiQuota({

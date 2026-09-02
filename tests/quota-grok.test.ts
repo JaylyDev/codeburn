@@ -107,7 +107,8 @@ describe('Grok Build billing decoding', () => {
 describe('Grok Build quota fetch', () => {
   it('reuses one login for the quota and the plan name', async () => {
     const credentialPath = path.join(root, 'auth.json')
-    await writeFile(credentialPath, JSON.stringify(authFile), 'utf8')
+    // A real login file is private to the user; readSecureFile rejects group or world bits on POSIX.
+    await writeFile(credentialPath, JSON.stringify(authFile), { encoding: 'utf8', mode: 0o600 })
 
     const seen: { url: string; headers: Record<string, string> }[] = []
     const result = await fetchGrokQuota({
@@ -137,7 +138,7 @@ describe('Grok Build quota fetch', () => {
     const credentialPath = path.join(root, 'auth.json')
     await writeFile(credentialPath, JSON.stringify({
       'https://auth.x.ai::p': { key: 'synthetic-oidc-token', expires_at: '2026-08-01T10:00:00Z' },
-    }), 'utf8')
+    }), { encoding: 'utf8', mode: 0o600 })
 
     const result = await fetchGrokQuota({ credentialPath, now: () => NOW, fetch: neverFetch })
     expect(result.quota.connection).toBe('terminalFailure')
@@ -146,7 +147,7 @@ describe('Grok Build quota fetch', () => {
 
   it('reports an unreadable login file as terminal and never fetches', async () => {
     const credentialPath = path.join(root, 'auth.json')
-    await writeFile(credentialPath, 'not json', 'utf8')
+    await writeFile(credentialPath, 'not json', { encoding: 'utf8', mode: 0o600 })
 
     const result = await fetchGrokQuota({ credentialPath, now: () => NOW, fetch: neverFetch })
     expect(result.quota.connection).toBe('terminalFailure')
@@ -155,7 +156,7 @@ describe('Grok Build quota fetch', () => {
 
   it('maps the HTTP failures the way the menubar classifies them', async () => {
     const credentialPath = path.join(root, 'auth.json')
-    await writeFile(credentialPath, JSON.stringify(authFile), 'utf8')
+    await writeFile(credentialPath, JSON.stringify(authFile), { encoding: 'utf8', mode: 0o600 })
     const respond = async (status: number, headers: Record<string, string> = {}) => fetchGrokQuota({
       credentialPath,
       now: () => NOW,
@@ -174,7 +175,7 @@ describe('Grok Build quota fetch', () => {
 
   it('keeps the reading when only the plan lookup fails', async () => {
     const credentialPath = path.join(root, 'auth.json')
-    await writeFile(credentialPath, JSON.stringify(authFile), 'utf8')
+    await writeFile(credentialPath, JSON.stringify(authFile), { encoding: 'utf8', mode: 0o600 })
 
     const result = await fetchGrokQuota({
       credentialPath,
