@@ -140,6 +140,19 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
    to switch. Dimmed rather than hidden, so the row does not appear and vanish under a pointer
    on its way to About. */
 .companion-row.blocked .companion-label { opacity: .5; }
+
+/* The two tray-app panes in Settings: an accent picker, a size slider and a provider row. */
+.tray-accents { display: inline-flex; gap: 5px; align-items: center; }
+.tray-accent {
+  width: 16px; height: 16px; border-radius: 50%; padding: 0; cursor: pointer;
+  border: 1px solid color-mix(in srgb, var(--ink) 22%, transparent);
+}
+.tray-accent.on { outline: 2px solid var(--ink); outline-offset: 2px; }
+.tray-accent:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.set-range { width: 150px; accent-color: var(--accent); }
+.set-dock-prov { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.set-dock-prov img, .set-dock-prov svg { width: 16px; height: 16px; flex: 0 0 auto; }
+.set-dock-prov small { flex-basis: 100%; }
 /* The bare .switch is painted for the dark onboarding sheet; on the sidebar it keys off the
    theme tokens, exactly as the Settings surface does. */
 .companion .switch { border-color: var(--line2); background: var(--hover); }

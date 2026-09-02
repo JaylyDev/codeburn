@@ -23,9 +23,10 @@ import { showToast } from '../lib/toast'
 import { ToastHost } from '../components/ToastHost'
 import { rateLimitedNote } from './Plans'
 import { SharingPane } from './SettingsSharing'
-import type { ActionResult, AliasRow, ClaudeConfigSelector, CliError, CombinedUsage, DeviceScanResult, Identity, JsonPlanSummary, MenubarPayload, Period, PlanId, PlanProvider, PriceOverrideList, PriceOverrideRow, PriceRates, ProviderName, QuotaProvider, Scope, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
+import { CapacityDockPane, MenuBarPane } from './SettingsTray'
+import type { ActionResult, AliasRow, ClaudeConfigSelector, CompanionStatus, CliError, CombinedUsage, DeviceScanResult, Identity, JsonPlanSummary, MenubarPayload, Period, PlanId, PlanProvider, PriceOverrideList, PriceOverrideRow, PriceRates, ProviderName, QuotaProvider, Scope, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
 
-export type SettingsPane = 'general' | 'providers' | 'aliases' | 'pricing' | 'plans' | 'devices' | 'export' | 'privacy' | 'sharing'
+export type SettingsPane = 'general' | 'providers' | 'aliases' | 'pricing' | 'plans' | 'devices' | 'export' | 'privacy' | 'sharing' | 'menubar' | 'dock'
 type Pane = SettingsPane
 type Theme = 'system' | 'light' | 'dark'
 
@@ -69,6 +70,27 @@ const RAIL_ITEMS: Array<{ id: Pane; label: string; icon: React.ReactNode }> = [
   { id: 'privacy', label: 'Privacy & data', icon: <path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z" /> },
 ]
 
+/// Appended to the rail only while the matching switch in the sidebar corner is on.
+const TRAY_RAIL_ITEMS: Record<'menubar' | 'dock', { id: Pane; label: string; icon: React.ReactNode }> = {
+  menubar: { id: 'menubar', label: 'Menu bar', icon: <><rect x="2" y="4" width="20" height="5" rx="1.5" /><circle cx="18" cy="6.5" r="1" /><path d="M5 14h6M5 18h10" /></> },
+  dock: { id: 'dock', label: 'Capacity Dock', icon: <><rect x="16" y="4" width="5" height="16" rx="2.5" /><circle cx="18.5" cy="9" r="1.4" /><circle cx="18.5" cy="15" r="1.4" /><path d="M3 12h8" /></> },
+}
+
+/// The sidebar's two switches decide which tray panes exist, so this reads the same status
+/// the corner does. Null until the main process answers, and on any platform without a
+/// bundled tray app it stays unsupported and neither pane appears.
+function useCompanionStatus(): CompanionStatus | null {
+  const [status, setStatus] = useState<CompanionStatus | null>(null)
+  useEffect(() => {
+    let live = true
+    void codeburn?.companionStatus?.()
+      .then(next => { if (live) setStatus(next) })
+      .catch(() => {})
+    return () => { live = false }
+  }, [])
+  return status
+}
+
 function periodLabel(period: Period): string {
   if (period === 'today') return 'today'
   if (period === 'week') return 'last 7 days'
@@ -105,6 +127,20 @@ function ConfirmButton({ label, prompt, onConfirm }: { label: string; prompt: st
 
 export function Settings({ period, refreshToken = 0, onNavigate, initialPane, claudeConfigs, claudeConfigSource = null, onConfigMutated, scope = 'local', onScopeChange }: { period: Period; refreshToken?: number; onNavigate?: (section: Section) => void; initialPane?: SettingsPane; claudeConfigs?: ClaudeConfigSelector; claudeConfigSource?: string | null; onConfigMutated?: () => void; scope?: Scope; onScopeChange?: (scope: string) => void }) {
   const [pane, setPane] = useState<Pane>(initialPane ?? 'general')
+  // The tray app's own two panes, Windows only, each shown only while its switch in the
+  // sidebar corner is on: there is nothing to configure about a tray app that is not running,
+  // and the rail is one of its windows.
+  const companion = useCompanionStatus()
+  const railItems = [
+    ...RAIL_ITEMS,
+    ...(companion?.supported && companion.menuBar ? [TRAY_RAIL_ITEMS.menubar] : []),
+    ...(companion?.supported && companion.sidebar ? [TRAY_RAIL_ITEMS.dock] : []),
+  ]
+  // A pane whose switch has just been turned off cannot stay on screen.
+  const paneExists = railItems.some(item => item.id === pane)
+  useEffect(() => {
+    if (!paneExists) setPane('general')
+  }, [paneExists])
 
   return (
     <>
@@ -112,7 +148,7 @@ export function Settings({ period, refreshToken = 0, onNavigate, initialPane, cl
       <ToastHost />
       <div className={motionClass('body set-body', 'section-fade')}>
         <nav className="set-rail" aria-label="Settings sections">
-          {RAIL_ITEMS.map(item => (
+          {railItems.map(item => (
             <button key={item.id} className={pane === item.id ? 'set-rail-item on' : 'set-rail-item'} aria-current={pane === item.id ? 'page' : undefined} onClick={() => setPane(item.id)}>
               <svg viewBox="0 0 24 24" aria-hidden="true">{item.icon}</svg>{item.label}
             </button>
@@ -128,6 +164,8 @@ export function Settings({ period, refreshToken = 0, onNavigate, initialPane, cl
           {pane === 'export' && <ExportPane period={period} refreshToken={refreshToken} />}
           {pane === 'sharing' && <SharingPane />}
           {pane === 'privacy' && <PrivacyPane />}
+          {pane === 'menubar' && <MenuBarPane />}
+          {pane === 'dock' && <CapacityDockPane refreshToken={refreshToken} />}
         </main>
       </div>
       <Hint items={[{ k: shortcutLabel('1-8'), label: 'Navigate' }, { k: shortcutLabel('R'), label: 'Refresh' }]} right="pairing uses mutual TLS · approve-style, no PIN" />

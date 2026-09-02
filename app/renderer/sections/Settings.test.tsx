@@ -27,6 +27,11 @@ const mocks = vi.hoisted(() => ({
   resetPlan: vi.fn<(provider: string) => Promise<ActionResult>>(),
   chooseDirectory: vi.fn<() => Promise<string | null>>(),
   exportData: vi.fn<(format: string, provider: string, path: string) => Promise<ActionResult>>(),
+  companionStatus: vi.fn(),
+  trayPrefs: vi.fn(),
+  setTrayAppPref: vi.fn(),
+  setTrayDockPref: vi.fn(),
+  setLaunchAtLogin: vi.fn(),
 }))
 vi.mock('../lib/ipc', async orig => {
   const actual = await orig<typeof import('../lib/ipc')>()
@@ -48,6 +53,11 @@ const quotaProviders: QuotaProvider[] = [
   { provider: 'claude', connection: 'connected', primary: null, details: [], planLabel: 'Max 20x', footerLines: [] },
   { provider: 'codex', connection: 'disconnected', primary: null, details: [], planLabel: null, footerLines: [] },
 ]
+const trayPrefs = {
+  app: { metric: 'cost', menubarPeriod: 'today', accent: 'ember', trayBadge: false, usageRefreshSeconds: -1, quotaCadenceSeconds: 120, terminal: 'windowsTerminal' },
+  dock: { enabled: true, preferred: 'claude', scale: 0.6, theme: 'graphite', gaugeShape: 'circle', providers: ['claude'], manualSelection: true },
+  launchAtLogin: false,
+}
 const stored = new Map<string, string>()
 vi.stubGlobal('localStorage', {
   getItem: (key: string) => stored.get(key) ?? null,
@@ -81,6 +91,9 @@ describe('Settings', () => {
     mocks.resetPlan.mockResolvedValue(actionOk)
     mocks.chooseDirectory.mockResolvedValue('/Users/toruk/Exports')
     mocks.exportData.mockResolvedValue(actionOk)
+    // No bundled tray app unless a test says otherwise, which is every platform but Windows.
+    mocks.companionStatus.mockResolvedValue({ supported: false, menuBar: false, sidebar: false, store: false })
+    mocks.trayPrefs.mockResolvedValue(trayPrefs)
     localStorage.clear()
     document.documentElement.removeAttribute('data-theme')
   })
@@ -366,5 +379,34 @@ describe('Settings', () => {
     await user.click(screen.getByRole('button', { name: 'Devices' }))
     await waitFor(() => expect(screen.getAllByText('Locate the codeburn CLI')).toHaveLength(2))
     expect(screen.getByText('permission denied; grant Full Disk Access')).toHaveStyle({ color: 'var(--warn)' })
+  })
+
+  // The tray app has settings of its own, and they only exist while it does. Each pane is
+  // shown only while its switch in the sidebar corner is on.
+  it("offers no tray panes where there is no bundled tray app", async () => {
+    render(<Settings period="month" />)
+    await waitFor(() => expect(mocks.companionStatus).toHaveBeenCalled())
+    expect(screen.queryByRole("button", { name: "Menu bar" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Capacity Dock" })).toBeNull()
+  })
+
+  it("offers both tray panes while both switches are on", async () => {
+    mocks.companionStatus.mockResolvedValue({ supported: true, menuBar: true, sidebar: true, store: false })
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+
+    await user.click(await screen.findByRole("button", { name: "Menu bar" }))
+    expect(await screen.findByRole("heading", { name: "Menu bar" })).toBeInTheDocument()
+
+    await user.click(screen.getByRole("button", { name: "Capacity Dock" }))
+    expect(await screen.findByRole("heading", { name: "Capacity Dock" })).toBeInTheDocument()
+  })
+
+  it("drops the Capacity Dock pane when the Sidebar switch is off", async () => {
+    mocks.companionStatus.mockResolvedValue({ supported: true, menuBar: true, sidebar: false, store: false })
+    render(<Settings period="month" />)
+
+    expect(await screen.findByRole("button", { name: "Menu bar" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Capacity Dock" })).toBeNull()
   })
 })
