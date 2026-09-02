@@ -220,19 +220,51 @@ async function claudeConfigSelector(projects: ProjectSummary[], selectedId?: str
   return buildSelector(byId, selectedId)
 }
 
+/// `d.models` keys by the raw provider id (day-aggregator), same as
+/// PeriodData.models — buildTopModels (menubar-json.ts) already merges those
+/// into display names for `current.topModels`. Merge here too, so
+/// `history.daily[].topModels` (the Spend/Trend charts) cannot disagree with
+/// it or with `codeburn models` about what counts as one model (#1239). Raw
+/// ids that collapse into one row are kept as `rawModels` so a cached vs
+/// uncached route stays visible.
+export function mergeDayModelsByDisplayName(models: DailyEntry['models']): Array<{
+  name: string
+  cost: number
+  savingsUSD: number
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  rawModels: string[]
+}> {
+  const merged = new Map<string, { cost: number; savingsUSD: number; calls: number; inputTokens: number; outputTokens: number; rawModels: string[] }>()
+  for (const [raw, m] of Object.entries(models)) {
+    if (raw === '<synthetic>') continue
+    const name = getShortModelName(raw)
+    const acc = merged.get(name) ?? { cost: 0, savingsUSD: 0, calls: 0, inputTokens: 0, outputTokens: 0, rawModels: [] }
+    acc.cost += m.cost
+    acc.savingsUSD += m.savingsUSD ?? 0
+    acc.calls += m.calls
+    acc.inputTokens += m.inputTokens
+    acc.outputTokens += m.outputTokens
+    if (!acc.rawModels.includes(raw)) acc.rawModels.push(raw)
+    merged.set(name, acc)
+  }
+  return [...merged.entries()].map(([name, d]) => ({ name, ...d }))
+}
+
 function dailyEntriesToHistory(days: ReturnType<typeof aggregateProjectsIntoDays>): MenubarPayload['history']['daily'] {
   return days.map(d => {
-    const topModels = Object.entries(d.models)
-      .filter(([name]) => name !== '<synthetic>')
-      .sort(([, a], [, b]) => b.cost - a.cost)
+    const topModels = mergeDayModelsByDisplayName(d.models)
+      .sort((a, b) => b.cost - a.cost)
       .slice(0, 5)
-      .map(([name, m]) => ({
-        name,
+      .map(m => ({
+        name: m.name,
         cost: m.cost,
         savingsUSD: m.savingsUSD,
         calls: m.calls,
         inputTokens: m.inputTokens,
         outputTokens: m.outputTokens,
+        ...(m.rawModels.length > 1 ? { rawModels: m.rawModels } : {}),
       }))
     return {
       date: d.date,

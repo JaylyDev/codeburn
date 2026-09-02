@@ -56,6 +56,9 @@ export type DailyModelBreakdown = {
   calls: number
   inputTokens: number
   outputTokens: number
+  // Raw provider/model ids that collapsed into this display name. Present
+  // only when more than one folded in; absent for an older CLI (#1239).
+  rawModels?: string[]
 }
 
 export type DailyHistoryEntry = {
@@ -323,6 +326,9 @@ export type ModelReportRow = {
   providerDisplayName: string
   model: string
   modelDisplayName: string
+  // Raw provider/model ids folded into this row (e.g. two routes of the same
+  // model). Length 1 when nothing merged.
+  rawModels: string[]
   category: TaskCategory | null
   inputTokens: number
   outputTokens: number
