@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { fetchAntigravityQuota, decodeAntigravitySummary } from '../src/quota/antigravity.js'
+import { fetchAntigravityQuota, decodeAntigravitySummary, parseNetstatPorts } from '../src/quota/antigravity.js'
 import { decodeClaudeUsage, fetchClaudeQuota } from '../src/quota/claude.js'
 import { decodeCodexUsage, fetchCodexQuota } from '../src/quota/codex.js'
 import { decodeCopilotUsage, fetchCopilotQuota } from '../src/quota/copilot.js'
@@ -123,8 +123,68 @@ describe('Antigravity quota', () => {
     const quota = await fetchAntigravityQuota({
       execFile: async () => ({ stdout: '  501 /usr/bin/unrelated --flag\n' }),
       request: async () => { throw new Error('the test must not probe a port') },
+      platform: 'darwin',
     })
     expect(quota.connection).toBe('disconnected')
+  })
+
+  // Windows has neither `ps` nor `lsof`. Asking for them is a spawn failure rather than an
+  // empty answer, so every poll printed "ps: unknown option -- x" and reported a transient
+  // failure instead of saying the provider simply is not running.
+  it('never asks Windows for ps or lsof', async () => {
+    const asked: string[] = []
+    const quota = await fetchAntigravityQuota({
+      platform: 'win32',
+      execFile: async (file, args) => {
+        asked.push(file)
+        expect(file).not.toMatch(/(^|[\\/])(ps|lsof)(\.exe)?$/i)
+        expect(args).not.toContain('-ax')
+        return { stdout: '' }
+      },
+      request: async () => { throw new Error('the test must not probe a port') },
+    })
+
+    expect(quota.connection).toBe('disconnected')
+    expect(asked[0]).toMatch(/powershell\.exe$/i)
+  })
+
+  it('finds a language server through the Windows process listing', async () => {
+    const line = '4321 C:\\Users\\x\\AppData\\Local\\antigravity\\language_server_windows_x64.exe'
+      + ' --app_data_dir=antigravity --csrf_token=abc --extension_server_port=51234'
+    const quota = await fetchAntigravityQuota({
+      platform: 'win32',
+      execFile: async file => {
+        if (/powershell\.exe$/i.test(file)) return { stdout: `${line}\r\n` }
+        // netstat, which is how a pid's listening ports are found there.
+        return { stdout: '  TCP    127.0.0.1:51234   0.0.0.0:0   LISTENING   4321\r\n' }
+      },
+      request: async (port, _tls, _path, _body, csrf) => {
+        expect(port).toBe(51234)
+        expect(csrf).toBe('abc')
+        return {
+          status: 200,
+          text: JSON.stringify({ groups: [{ displayName: 'Weekly', buckets: [{ displayName: 'Sonnet', remaining: { remainingFraction: 0.25 } }] }] }),
+        }
+      },
+    })
+
+    expect(quota.connection).toBe('connected')
+    expect(quota.primary?.label).toBe('Weekly · Sonnet')
+  })
+
+  it('reads only this pid out of a netstat listing', () => {
+    const stdout = [
+      'Active Connections',
+      '',
+      '  Proto  Local Address          Foreign Address        State           PID',
+      '  TCP    127.0.0.1:51234        0.0.0.0:0              LISTENING       4321',
+      '  TCP    127.0.0.1:60000        0.0.0.0:0              LISTENING       9999',
+      '  TCP    [::]:51999             [::]:0                 LISTENING       4321',
+      '  UDP    127.0.0.1:5353         *:*                                    4321',
+    ].join('\r\n')
+
+    expect(parseNetstatPorts(stdout, '4321')).toEqual([51234, 51999])
+    expect(parseNetstatPorts(stdout, '1')).toEqual([])
   })
 })
 

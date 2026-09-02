@@ -9,9 +9,10 @@
 //     (preferred; falls back to)
 // - POST https://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/GetUserStatus
 //
-// Discovery uses `ps` to find candidate processes (app language
-// servers need their `--csrf_token`; the `agy` CLI needs none), then `lsof`
-// lists each pid's listening TCP ports. Local HTTPS uses a self-signed cert,
+// Discovery lists processes to find candidates (app language
+// servers need their `--csrf_token`; the `agy` CLI needs none), then lists each
+// pid's listening TCP ports: `ps` and `lsof` on POSIX, Win32_Process and
+// `netstat` on Windows, which has neither. Local HTTPS uses a self-signed cert,
 // so TLS verification is relaxed ONLY for the 127.0.0.1 loopback probes.
 import { execFile } from 'node:child_process'
 import http from 'node:http'
@@ -37,6 +38,8 @@ export type LocalRequestFn = (
 export type AntigravityDeps = {
   execFile: ExecFileFn
   request: LocalRequestFn
+  /// Which process listing to ask for. Injected so both branches are testable from either OS.
+  platform: string
 }
 
 const execFileAsync: ExecFileFn = promisify(execFile)
@@ -70,6 +73,7 @@ function postLocal(port: number, tls: boolean, pathName: string, body: string, c
 const defaults: AntigravityDeps = {
   execFile: execFileAsync,
   request: postLocal,
+  platform: process.platform,
 }
 
 function empty(connection: QuotaProvider['connection']): QuotaProvider {
@@ -109,8 +113,56 @@ export function classifyProcessLine(line: string): Candidate | null {
   return { pid, cli: isCli, csrf, extPort: Number.isFinite(extPort) && extPort > 0 ? extPort : undefined }
 }
 
-async function discoverCandidates(deps: AntigravityDeps): Promise<Candidate[]> {
+/// Windows has no `ps`, and asking for one is a spawn failure rather than an empty answer:
+/// every quota poll there printed `ps: unknown option -- x` and reported a transient failure.
+/// Win32_Process is the same listing by another name, and it is already how
+/// src/providers/antigravity.ts finds these servers. The Where-Object is only a prefilter to
+/// keep the output small; `classifyProcessLine` still decides what counts.
+const WINDOWS_PROCESS_SCRIPT = [
+  "$ErrorActionPreference = 'SilentlyContinue'",
+  '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
+  'Get-CimInstance Win32_Process'
+    + " | Where-Object { $_.CommandLine -and ($_.CommandLine -like '*antigravity*'"
+    + " -or $_.CommandLine -like '*language_server*' -or $_.CommandLine -like '*agy*') }"
+    + ' | ForEach-Object { "$($_.ProcessId) $($_.CommandLine)" }',
+].join('; ')
+
+/// Windows searches the current directory before PATH, so a system tool by bare name lets
+/// anything dropped beside the caller answer for it.
+function system32(exe: string, env: NodeJS.ProcessEnv = process.env): string {
+  const root = env.SystemRoot
+  const base = root && /^[a-zA-Z]:[\\/]/.test(root) ? root.replace(/[\\/]+$/, '') : 'C:\\Windows'
+  return `${base}\\System32\\${exe}`
+}
+
+/// One line per process, `<pid> <command line>`, on every platform.
+async function listProcesses(deps: AntigravityDeps): Promise<string> {
+  if (deps.platform === 'win32') {
+    const { stdout } = await deps.execFile(system32('WindowsPowerShell\\v1.0\\powershell.exe'), [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', WINDOWS_PROCESS_SCRIPT,
+    ])
+    return stdout
+  }
   const { stdout } = await deps.execFile('ps', ['-ax', '-o', 'pid=,command='])
+  return stdout
+}
+
+/// `netstat -ano` rows are `Proto  Local  Foreign  State  PID`. The state word is localized,
+/// so it is not matched on: a row for this pid that is not listening only gives a port the
+/// probe then fails to reach, which costs one refused connection and no wrong answer.
+export function parseNetstatPorts(stdout: string, pid: string): number[] {
+  const ports = new Set<number>()
+  for (const line of stdout.split(/\r?\n/)) {
+    const parts = line.trim().split(/\s+/)
+    if (parts.length < 5 || !/^TCP$/i.test(parts[0]!) || parts[parts.length - 1] !== pid) continue
+    const port = Number(parts[1]!.split(':').pop())
+    if (Number.isFinite(port) && port > 0) ports.add(port)
+  }
+  return [...ports]
+}
+
+async function discoverCandidates(deps: AntigravityDeps): Promise<Candidate[]> {
+  const stdout = await listProcesses(deps)
   const seen = new Set<string>()
   const candidates: Candidate[] = []
   for (const line of stdout.split('\n')) {
@@ -125,6 +177,11 @@ async function discoverCandidates(deps: AntigravityDeps): Promise<Candidate[]> {
 
 async function listeningPorts(deps: AntigravityDeps, pid: string): Promise<number[]> {
   try {
+    // No lsof on Windows either; netstat is the listing that ships with it.
+    if (deps.platform === 'win32') {
+      const { stdout } = await deps.execFile(system32('netstat.exe'), ['-ano', '-p', 'TCP'])
+      return parseNetstatPorts(stdout, pid)
+    }
     const { stdout } = await deps.execFile('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN', '-a', '-p', pid])
     const ports = [...stdout.matchAll(/:(\d+)\s/g)].map(match => Number(match[1]))
     return [...new Set(ports)].filter(port => Number.isFinite(port) && port > 0)
@@ -208,9 +265,6 @@ function parseJson(text: string): unknown {
 
 export async function fetchAntigravityQuota(deps: Partial<AntigravityDeps> = {}): Promise<QuotaProvider> {
   const resolved = { ...defaults, ...deps }
-  // Discovery leans on `ps` and `lsof`, which Windows has no equivalent of, so
-  // report a clean disconnected rather than a spawn failure.
-  if (process.platform === 'win32' && !deps.execFile) return empty('disconnected')
   try {
     const candidates = await discoverCandidates(resolved)
     if (candidates.length === 0) return empty('disconnected')
