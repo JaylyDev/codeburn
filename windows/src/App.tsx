@@ -42,6 +42,7 @@ import { FooterBar } from './components/FooterBar'
 import { ErrorToast } from './components/ErrorToast'
 import { FetchErrorOverlay } from './components/FetchErrorOverlay'
 import { Header } from './components/Header'
+import { CLIUpdateBanner } from './components/CLIUpdateBanner'
 import { accentById, applyAccent, type AccentPreset } from './lib/accent'
 
 const payloadCache = new PayloadCache<MenubarPayload>()
@@ -646,6 +647,8 @@ export function App() {
         onOpenSettings={openSettingsWindow}
         footnote={footnote}
       />
+
+      <CLIUpdateBanner />
 
       <StarBanner />
 

@@ -40,6 +40,9 @@
   --danger: #C83F2C;
   /* Routing waste, from the mac OptimizeInsight purple. */
   --routing-ink: #8944AB;
+  /* The CLI update banner, from the mac's Color.blue: informational rather than branded,
+     so it never reads as the terracotta star banner two rows below it. */
+  --update-ink: #007AFF;
 
   /* Quota severity, from QuotaSummary.Severity: under 50 green, then yellow, orange, red.
      Three sets, because one colour cannot do three jobs here. The bare token is the bar
@@ -116,6 +119,7 @@
     --sev-critical-tip: #C2610A;
     --sev-danger-tip: #C83F2C;
     --routing-ink: #BF5AF2;
+    --update-ink: #0A84FF;
     --icon-contrast: #1C1816;
     color-scheme: dark;
   }
@@ -158,6 +162,7 @@
   --sev-critical-tip: #C2610A;
   --sev-danger-tip: #C83F2C;
   --routing-ink: #BF5AF2;
+  --update-ink: #0A84FF;
   --icon-contrast: #1C1816;
   color-scheme: dark;
 }
@@ -246,7 +251,30 @@ code { font-family: var(--font-mono); }
 .subhead { font-size: 10.5px; color: var(--label-2); }
 
 /* Accent picker: a dot showing the current preset, which reveals the nine swatches. */
+.header-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 .accent-picker { display: flex; align-items: center; margin-left: auto; }
+
+/* The update badge: the mac's borderedProminent mini pill in the brand tint, sitting where
+   the header has room for it and gone entirely when there is nothing to update. */
+.update-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 18px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--brand-accent);
+  color: #FFFFFF;
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.update-badge:hover:not(:disabled) { background: #B84A1A; }
+.update-badge:active:not(:disabled) { background: var(--ember-deep); }
+.update-badge:disabled { opacity: 0.75; }
+.update-badge-spin { display: inline-flex; animation: spin 0.9s linear infinite; }
 .accent-swatches {
   display: flex;
   gap: 5px;
@@ -1903,6 +1931,37 @@ code { font-family: var(--font-mono); }
   color: var(--label-2);
 }
 .star-banner-close:hover { background: var(--fill-08); }
+
+/* ---- CLI update banner ---------------------------------------------------------- */
+
+.cli-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: color-mix(in srgb, var(--update-ink) 8%, transparent);
+  box-shadow: inset 0 0.5px 0 var(--fill-18);
+}
+.cli-banner-icon { color: var(--update-ink); display: inline-flex; flex-shrink: 0; }
+.cli-banner-text { font-size: 10.5px; font-weight: 500; color: var(--label); white-space: nowrap; }
+.cli-banner-action,
+.cli-banner-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--update-ink);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.cli-banner-action:disabled { opacity: 0.6; }
+.cli-banner-copy code { font-family: var(--font-mono); font-size: 10px; font-weight: 500; }
+.cli-banner-copy:hover code { text-decoration: underline; }
+.cli-banner-spacer { flex: 1; }
 
 /* ---- error toast --------------------------------------------------------------- */
 

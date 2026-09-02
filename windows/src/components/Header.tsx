@@ -1,11 +1,12 @@
 import { useState } from 'react'
 import { ACCENT_PRESETS, type AccentPreset } from '../lib/accent'
 import { QuotaWarningRow } from './QuotaWarningRow'
+import { UpdateBadge } from './UpdateBadge'
 import type { QuotaState } from '../lib/quota'
 
 /// Port of Header in mac/Sources/CodeBurnMenubar/Views/MenuBarContent.swift: the flame
-/// wordmark and tagline on the left, the accent picker on the right, and the quota warning
-/// row underneath. Package E adds the update badge between them.
+/// wordmark and tagline on the left, the update badge and the accent picker on the right,
+/// and the quota warning row underneath.
 
 type Props = {
   quota: QuotaState
@@ -23,7 +24,10 @@ export function Header({ quota, showQuota, accent, onAccent, animate }: Props) {
           <FlameWordmark animate={animate} />
           <div className="subhead">Your AI Bill, Itemized</div>
         </div>
-        <AccentPicker accent={accent} onAccent={onAccent} />
+        <div className="header-actions">
+          <UpdateBadge />
+          <AccentPicker accent={accent} onAccent={onAccent} />
+        </div>
       </div>
       {showQuota && <QuotaWarningRow quota={quota} />}
     </header>

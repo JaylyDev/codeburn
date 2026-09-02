@@ -266,3 +266,13 @@ export function PowerIcon(p: IconProps) {
     </Svg>
   )
 }
+
+/// doc.on.doc, for the copyable command in the CLI update banner.
+export function CopyIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
+      <path d="M10.5 3.5a1.5 1.5 0 0 0-1.5-1.5H4a1.5 1.5 0 0 0-1.5 1.5V9a1.5 1.5 0 0 0 1.5 1.5" />
+    </Svg>
+  )
+}
