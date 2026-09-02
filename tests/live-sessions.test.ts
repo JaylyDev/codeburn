@@ -1,0 +1,182 @@
+import { describe, expect, it } from 'vitest'
+import { mkdtemp, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { LIVE_WINDOW_SECONDS, TAIL_BYTES, buildLiveSessions, scanTranscript, type LiveSessionInput } from '../src/live-sessions.js'
+
+const NOW = Date.parse('2026-09-01T12:00:00.000Z')
+
+function input(over: Partial<LiveSessionInput> = {}): LiveSessionInput {
+  return {
+    id: 'session-a',
+    provider: 'claude',
+    project: 'codeburn',
+    branch: 'main',
+    model: 'Opus 4.8',
+    contextTokens: 100_000,
+    contextWindow: 200_000,
+    startedMs: NOW - 3_600_000,
+    lastActivityMs: NOW - 10_000,
+    subagentActivityMs: [],
+    ...over,
+  }
+}
+
+describe('buildLiveSessions', () => {
+  it('keeps sessions touched inside the window and drops older ones', () => {
+    const block = buildLiveSessions([
+      input({ id: 'fresh', lastActivityMs: NOW - 10_000 }),
+      input({ id: 'stale', lastActivityMs: NOW - 3_600_000 }),
+    ], NOW, LIVE_WINDOW_SECONDS)
+    expect(block.sessions.map(s => s.id)).toEqual(['fresh'])
+    expect(block.windowSeconds).toBe(LIVE_WINDOW_SECONDS)
+  })
+
+  it('counts a session idle for minutes as still live, at ten minutes wide', () => {
+    expect(LIVE_WINDOW_SECONDS).toBe(600)
+    // A session waiting on the user for five minutes is still open, not gone.
+    const block = buildLiveSessions([
+      input({ id: 'thinking', lastActivityMs: NOW - 5_000 }),
+      input({ id: 'waiting', lastActivityMs: NOW - 300_000 }),
+    ], NOW, LIVE_WINDOW_SECONDS)
+    expect(block.sessions.map(s => s.id)).toEqual(['thinking', 'waiting'])
+    expect(block.sessions.map(s => s.idleSeconds)).toEqual([5, 300])
+  })
+
+  it('reports idle from the sub-agent that kept the session alive', () => {
+    const block = buildLiveSessions([
+      input({ lastActivityMs: NOW - 400_000, subagentActivityMs: [NOW - 20_000] }),
+    ], NOW, LIVE_WINDOW_SECONDS)
+    expect(block.sessions[0]!.idleSeconds).toBe(20)
+  })
+
+  it('keeps a parent alive while only its sub-agent is writing', () => {
+    const block = buildLiveSessions([
+      input({ id: 'parent', lastActivityMs: NOW - 3_600_000, subagentActivityMs: [NOW - 5_000] }),
+    ], NOW, LIVE_WINDOW_SECONDS)
+    expect(block.sessions).toHaveLength(1)
+    // The sub-agent's write is the session's last activity.
+    expect(block.sessions[0]!.lastActivityAt).toBe(new Date(NOW - 5_000).toISOString())
+  })
+
+  it('ignores a sub-agent that is itself stale', () => {
+    const block = buildLiveSessions([
+      input({ lastActivityMs: NOW - 3_600_000, subagentActivityMs: [NOW - 3_700_000] }),
+    ], NOW, LIVE_WINDOW_SECONDS)
+    expect(block.sessions).toEqual([])
+  })
+
+  it('sorts newest first and carries the context fields through', () => {
+    const block = buildLiveSessions([
+      input({ id: 'older', lastActivityMs: NOW - 60_000 }),
+      input({ id: 'newer', lastActivityMs: NOW - 1_000, contextTokens: 42, contextWindow: 1_000_000 }),
+    ], NOW, LIVE_WINDOW_SECONDS)
+    expect(block.sessions.map(s => s.id)).toEqual(['newer', 'older'])
+    expect(block.sessions[0]).toMatchObject({ contextTokens: 42, contextWindow: 1_000_000, branch: 'main' })
+  })
+
+  it('treats a missing timestamp as not live rather than as the epoch', () => {
+    expect(buildLiveSessions([input({ lastActivityMs: 0 })], NOW, LIVE_WINDOW_SECONDS).sessions).toEqual([])
+  })
+})
+
+describe('scanTranscript', () => {
+  async function transcript(lines: unknown[]): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), 'live-sessions-'))
+    const path = join(dir, 'abc123.jsonl')
+    await writeFile(path, lines.map(l => JSON.stringify(l)).join('\n'))
+    return path
+  }
+
+  it('reads branch, model and the last assistant context', async () => {
+    const path = await transcript([
+      { type: 'user', sessionId: 's1', cwd: '/Users/x/codeburn', gitBranch: 'feat/dock' },
+      {
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          model: 'claude-opus-4-5-20260101',
+          usage: { input_tokens: 10, cache_read_input_tokens: 90_000, cache_creation_input_tokens: 1_000, output_tokens: 500 },
+        },
+      },
+    ])
+    const scan = await scanTranscript(path)
+    expect(scan.sessionId).toBe('s1')
+    expect(scan.cwd).toBe('/Users/x/codeburn')
+    expect(scan.branch).toBe('feat/dock')
+    expect(scan.contextTokens).toBe(91_510)
+    expect(scan.contextWindow).toBe(200_000)
+    expect(scan.model).toBeTruthy()
+  })
+
+  it('takes the last assistant turn, not the largest', async () => {
+    const usage = (input: number) => ({
+      type: 'assistant',
+      message: { role: 'assistant', model: 'claude-sonnet-4-5', usage: { input_tokens: input } },
+    })
+    const scan = await scanTranscript(await transcript([usage(150_000), usage(20_000)]))
+    expect(scan.contextTokens).toBe(20_000)
+  })
+
+  it('widens the window when the session outgrew 200k', async () => {
+    const scan = await scanTranscript(await transcript([
+      { type: 'assistant', message: { role: 'assistant', model: 'claude-sonnet-4-5', usage: { input_tokens: 300_000 } } },
+      { type: 'assistant', message: { role: 'assistant', model: 'claude-sonnet-4-5', usage: { input_tokens: 250_000 } } },
+    ]))
+    expect(scan.contextWindow).toBe(1_000_000)
+  })
+
+  it('flags a sidechain and degrades with no usage at all', async () => {
+    const scan = await scanTranscript(await transcript([
+      { type: 'user', sessionId: 'parent-1', isSidechain: true, cwd: '/Users/x/eywa' },
+    ]))
+    expect(scan.isSidechain).toBe(true)
+    expect(scan.sessionId).toBe('parent-1')
+    expect(scan.contextTokens).toBeNull()
+    expect(scan.contextWindow).toBeNull()
+    expect(scan.model).toBeNull()
+  })
+
+  it('reads only the last 256 KB, so anything older than the tail is not seen', async () => {
+    expect(TAIL_BYTES).toBe(256 * 1024)
+    const usage = {
+      type: 'assistant',
+      message: { role: 'assistant', model: 'claude-sonnet-4-5', usage: { input_tokens: 4242 } },
+    }
+    // One real turn, then enough filler to push it clear out of the tail window.
+    const filler = { type: 'user', cwd: '/Users/x/codeburn', gitBranch: 'main', pad: 'x'.repeat(2000) }
+    const fillerCount = Math.ceil(TAIL_BYTES / JSON.stringify(filler).length) + 20
+    const dir = await mkdtemp(join(tmpdir(), 'live-sessions-'))
+    const path = join(dir, 'long.jsonl')
+    await writeFile(path, [usage, ...Array(fillerCount).fill(filler)].map(l => JSON.stringify(l)).join('\n'))
+
+    const scan = await scanTranscript(path)
+    // The identity fields still resolve, because they repeat on every entry.
+    expect(scan.branch).toBe('main')
+    // The assistant turn is beyond the tail, so no context is reported at all
+    // rather than a stale figure read from the head of a huge file.
+    expect(scan.contextTokens).toBeNull()
+    expect(scan.contextWindow).toBeNull()
+  })
+
+  it('still finds a turn that sits just inside the tail', async () => {
+    const filler = { type: 'user', cwd: '/Users/x/codeburn', gitBranch: 'main', pad: 'x'.repeat(2000) }
+    const fillerCount = Math.floor(TAIL_BYTES / JSON.stringify(filler).length / 2)
+    const usage = {
+      type: 'assistant',
+      message: { role: 'assistant', model: 'claude-sonnet-4-5', usage: { input_tokens: 4242 } },
+    }
+    const dir = await mkdtemp(join(tmpdir(), 'live-sessions-'))
+    const path = join(dir, 'short.jsonl')
+    await writeFile(path, [usage, ...Array(fillerCount).fill(filler)].map(l => JSON.stringify(l)).join('\n'))
+    expect((await scanTranscript(path)).contextTokens).toBe(4242)
+  })
+
+  it('survives malformed lines and an unreadable file', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'live-sessions-'))
+    const path = join(dir, 'broken.jsonl')
+    await writeFile(path, '{not json\n{"type":"user","gitBranch":"main"}\n')
+    expect((await scanTranscript(path)).branch).toBe('main')
+    expect((await scanTranscript(join(dir, 'missing.jsonl'))).contextTokens).toBeNull()
+  })
+})

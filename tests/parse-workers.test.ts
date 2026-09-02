@@ -262,7 +262,10 @@ function stripVolatile(payload: unknown): unknown {
   if (payload && typeof payload === 'object') {
     return Object.fromEntries(
       Object.entries(payload as Record<string, unknown>)
-        .filter(([k]) => !k.toLowerCase().startsWith('generated'))
+        // `generated` is a timestamp, and `liveSessions` is a wall-clock
+        // snapshot of what is running rather than anything the parse produced,
+        // so neither can be compared across two separate CLI invocations.
+        .filter(([k]) => !k.toLowerCase().startsWith('generated') && k !== 'liveSessions')
         .map(([k, v]) => [k, stripVolatile(v)]),
     )
   }

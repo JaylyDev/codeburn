@@ -28,8 +28,8 @@ There is no separate build step required to run the dev CLI. `npm run dev` runs 
 | `npm run test:locks` | Runs the three parallelism-sensitive `cache-refresh-lock` suites serially. |
 | `npm run test:watch` | Same scope as `npm test`, in watch mode. |
 | `npm run dev -- status` | Runs the CLI in dev mode against your real data. |
-| `npm run build` | Bundles the litellm pricing snapshot, then runs `tsup` to produce `dist/cli.js`. |
-| `npm run bundle-litellm` | Refreshes `src/data/litellm-snapshot.json` from the upstream litellm repo. |
+| `npm run build` | Builds the CLI and dashboard from the checked-in pricing catalogs without mutating tracked source files. |
+| `npm run bundle-litellm` | Explicitly refreshes the checked-in pricing catalogs from their upstream sources. Review and commit the resulting data changes separately. |
 
 To test a specific suite, run vitest directly with a path:
 

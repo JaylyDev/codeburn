@@ -10,8 +10,11 @@ export function sanitizeForSharing(payload: MenubarPayload): MenubarPayload {
   // Older peers may predate the history field even though current producers
   // always include it, so keep the boundary tolerant while sanitizing.
   const timeline = payload.history?.timeline
+  // Live sessions name the project and branch in flight, the most identifying
+  // block of all.
+  const { liveSessions: _liveSessions, ...rest } = payload
   return {
-    ...payload,
+    ...rest,
     current: {
       ...payload.current,
       topProjects: [],

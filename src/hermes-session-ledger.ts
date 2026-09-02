@@ -1,5 +1,5 @@
 import { open, rename, unlink, mkdir } from 'fs/promises'
-import { existsSync, readFileSync } from 'fs'
+import { existsSync, readFileSync, unlinkSync } from 'fs'
 import { randomBytes } from 'crypto'
 import { join } from 'path'
 
@@ -349,7 +349,17 @@ function validateLedger(raw: unknown): raw is HermesSessionLedger {
 
 function readLedgerFromDisk(): HermesSessionLedger {
   const path = hermesSessionLedgerPath()
-  if (!existsSync(path)) return emptyHermesSessionLedger()
+  if (!existsSync(path)) {
+    // The v1 file is superseded and can never be read again: the parse-version
+    // bump forces a cold re-parse that rebuilds every cursor from source.
+    // Left behind it is dead bytes that only invite a future reader to trust
+    // observations recorded under an accounting this branch replaced.
+    const v1 = join(getCodeburnCacheDir(), 'hermes-session-ledger.v1.json')
+    if (existsSync(v1)) {
+      try { unlinkSync(v1) } catch { /* another process got there first */ }
+    }
+    return emptyHermesSessionLedger()
+  }
   try {
     const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'))
     if (!validateLedger(parsed)) return emptyHermesSessionLedger()

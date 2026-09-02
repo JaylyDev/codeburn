@@ -61,4 +61,21 @@ describe('sanitizeForSharing', () => {
     const clean = sanitizeForSharing(fixture())
     expect(JSON.stringify(clean)).not.toContain('secret-project')
   })
+
+  it('drops the live-session block, which names the project and branch in flight', () => {
+    const withSessions = {
+      ...fixture(),
+      liveSessions: {
+        windowSeconds: 120,
+        sessions: [{
+          id: 'a', provider: 'claude', project: 'secret-project', branch: 'secret-branch',
+          model: 'Opus 4.8', contextTokens: 1, contextWindow: 200_000,
+          startedAt: '2026-09-01T10:00:00.000Z', lastActivityAt: '2026-09-01T12:00:00.000Z',
+        }],
+      },
+    }
+    const clean = sanitizeForSharing(withSessions)
+    expect(clean.liveSessions).toBeUndefined()
+    expect(JSON.stringify(clean)).not.toContain('secret-branch')
+  })
 })

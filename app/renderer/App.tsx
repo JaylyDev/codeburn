@@ -402,12 +402,13 @@ function AppMain() {
     if (!overview.data || overview.switching || provider !== 'all' || claudeConfigSource || scope !== 'local') return
     const details = overview.data.current.providerDetails
     // Prefer providerDetails (internal id + display label); fall back to the
-    // providers map keys (lowercased display names) for older CLIs. Explicit
-    // `hasUsage` preserves subscription-backed zero-cost activity while idle
-    // discovery rows stay out of the selected-period picker.
+    // providers map keys (lowercased display names) for older CLIs. `hasUsage`
+    // keeps idle discovery rows out of the picker, but only when the CLI
+    // actually emits it: every released CLI omits it, and falling back to cost
+    // there hid subscription-backed providers whose period spend is $0.
     const found = details
       ? [...details]
-          .filter(entry => entry.hasUsage ?? entry.cost > 0)
+          .filter(entry => entry.hasUsage ?? true)
           .sort((a, b) => b.cost - a.cost)
           .map(entry => ({ id: entry.id, label: entry.label }))
       : Object.entries(overview.data.current.providers)

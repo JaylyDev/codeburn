@@ -52,7 +52,7 @@ describe('provider-scoped menubar aggregation', () => {
       .toEqual(['hermes'])
   })
 
-  it('overlays a corrected live provider slice without losing expired-source history', () => {
+  it('overlays today without letting a shrunken parse rewrite settled history', () => {
     const slice = (cost: number, calls: number): ProviderDaySlice => ({ cost, calls, savingsUSD: 0, sessions: calls })
     const day = (date: string, providers: Record<string, ProviderDaySlice>): DailyEntry => ({
       date,
@@ -71,19 +71,26 @@ describe('provider-scoped menubar aggregation', () => {
       providers,
     })
 
+    // 2026-08-20 is settled and its sources have partially aged off disk: the
+    // fresh parse sees 3 of the 100 calls the cache finalized, so the cache
+    // stays authoritative. 2026-08-21 is a settled day the cache never held
+    // (cold cache), where the fresh parse is the only source there is.
     const result = overlayProviderDaySlices(
       [
-        day('2026-08-31', { hermes: slice(1.25, 2) }),
-        day('2026-09-01', { hermes: slice(4603, 6764), claude: slice(2, 3) }),
+        day('2026-08-20', { hermes: slice(10, 100), claude: slice(2, 3) }),
       ],
-      [day('2026-09-01', { hermes: slice(0.438, 6) })],
+      [
+        day('2026-08-20', { hermes: slice(0.3, 3) }),
+        day('2026-08-21', { hermes: slice(0.438, 6) }),
+      ],
       'hermes',
     )
 
     expect(result.map(entry => ({ date: entry.date, cost: entry.cost, calls: entry.calls }))).toEqual([
-      { date: '2026-08-31', cost: 1.25, calls: 2 },
-      { date: '2026-09-01', cost: 0.438, calls: 6 },
+      { date: '2026-08-20', cost: 10, calls: 100 },
+      { date: '2026-08-21', cost: 0.438, calls: 6 },
     ])
+    expect(result[0]!.providers).toEqual({ hermes: slice(10, 100) })
     expect(result[1]!.providers).toEqual({ hermes: slice(0.438, 6) })
   })
 })

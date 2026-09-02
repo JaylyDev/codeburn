@@ -32,23 +32,28 @@ struct AgentTabProviderVisibilityTests {
         #expect(keys == ["codex"])
     }
 
-    @Test("legacy provider details require a positive cost or call signal")
-    func legacyProviderDetailDecoding() throws {
-        let noSignal = try JSONDecoder().decode(
-            ProviderDetail.self,
-            from: Data(#"{"id":"hermes","label":"Hermes Agent","cost":0}"#.utf8)
-        )
-        let positiveLegacyCost = try JSONDecoder().decode(
-            ProviderDetail.self,
-            from: Data(#"{"id":"codex","label":"Codex","cost":1.25}"#.utf8)
-        )
-        let explicitIdleCalls = try JSONDecoder().decode(
-            ProviderDetail.self,
-            from: Data(#"{"id":"hermes","label":"Hermes Agent","cost":0,"calls":0}"#.utf8)
-        )
+    @Test("provider details without hasUsage stay visible")
+    func absentHasUsageDefaultsToVisible() throws {
+        func decode(_ json: String) throws -> ProviderDetail {
+            try JSONDecoder().decode(ProviderDetail.self, from: Data(json.utf8))
+        }
+        // Every RELEASED CLI omits hasUsage. Deriving it from cost there hid
+        // every subscription-backed provider whose period spend is $0.
+        let noHasUsage = try decode(#"{"id":"hermes","label":"Hermes Agent","cost":0}"#)
+        let noHasUsageWithCalls = try decode(#"{"id":"hermes","label":"Hermes Agent","cost":0,"calls":0}"#)
+        let explicitlyIdle = try decode(#"{"id":"hermes","label":"Hermes Agent","cost":0,"calls":0,"hasUsage":false}"#)
+        let explicitlyActive = try decode(#"{"id":"codex","label":"Codex","cost":0,"calls":0,"hasUsage":true}"#)
 
-        #expect(!noSignal.hasUsage)
-        #expect(positiveLegacyCost.hasUsage)
-        #expect(!explicitIdleCalls.hasUsage)
+        #expect(noHasUsage.hasUsage)
+        #expect(noHasUsageWithCalls.hasUsage)
+        // The strict signal still applies wherever the CLI actually emits it.
+        #expect(!explicitlyIdle.hasUsage)
+        #expect(explicitlyActive.hasUsage)
+
+        let keys = ProviderVisibility.activeKeys(
+            providerDetails: [noHasUsage, explicitlyIdle],
+            legacyProviders: [:]
+        )
+        #expect(keys.contains("hermes"))
     }
 }

@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises'
+import { existsSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -245,14 +246,15 @@ describe('hermes session ledger unit', () => {
     expect(isHermesLedgerPublicationError(caught)).toBe(true)
   })
 
-  it('does not adopt a v2 ledger whose migration could re-date historical observations', async () => {
-    await writeFile(join(cacheDir, 'hermes-session-ledger.v2.json'), JSON.stringify({
-      version: 2,
+  it('ignores a superseded v1 ledger and removes it from the cache dir', async () => {
+    const v1Path = join(cacheDir, 'hermes-session-ledger.v1.json')
+    await writeFile(v1Path, JSON.stringify({
+      version: 1,
       cursors: {
         default: {
-          corrupt: {
+          historical: {
             profile: 'default',
-            sessionId: 'corrupt',
+            sessionId: 'historical',
             lastSeen: {
               inputTokens: 1,
               outputTokens: 0,
@@ -267,7 +269,11 @@ describe('hermes session ledger unit', () => {
         },
       },
     }))
+    expect(existsSync(v1Path)).toBe(true)
 
+    // No v3 file: the loader starts empty, and the v1 file it can never read
+    // again must not survive the load.
     expect(loadHermesSessionLedger().cursors).toEqual({})
+    expect(existsSync(v1Path)).toBe(false)
   })
 })
