@@ -5,15 +5,15 @@
 //! One transparent window hosts both the rail and the hover bubble, sized once per placement
 //! for the fully expanded rail plus the bubble's reach. Hovering never moves or resizes it:
 //! WebView2 presents one stale frame at every window change, which read as the rail jumping.
-//! Pointer tracking (a 60 Hz cursor poll, the counterpart of the mac's global event monitor)
-//! makes the window click-through everywhere but the painted shapes, synthesizes hover for the
-//! page, and drives dragging: the rail follows the pointer, and on release snaps to whichever
-//! edge is within reach or stays floating. This module owns all of that geometry; the page only
-//! paints into the frames it is handed.
+//! Pointer tracking (a cursor poll, the counterpart of the mac's global event monitor) makes
+//! the window click-through everywhere but the painted shapes, synthesizes hover for the page,
+//! and drives dragging: the rail follows the pointer, and on release snaps to whichever edge is
+//! within reach or stays floating. This module owns all of that geometry; the page only paints
+//! into the frames it is handed.
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -21,6 +21,13 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub const DOCK_LABEL: &str = "dock";
+
+/// The dock is a Windows surface. Its window is a transparent, always-on-top rectangle far
+/// larger than the rail it paints, and what keeps it from swallowing every click that lands in
+/// the empty part is the user32 cursor tracking below. No other platform has that counterpart
+/// here: the Linux tray runs its own SNI menu and never had a dock. So off Windows the dock is
+/// simply not there, rather than a window nobody can see and nobody can click through.
+pub const AVAILABLE: bool = cfg!(target_os = "windows");
 
 /// The size scale the settings window writes, from CapacityDockPreferences.scaleRange.
 pub const MIN_SCALE: f64 = 0.6;
@@ -86,9 +93,20 @@ const DETAIL_GAP: i32 = 10;
 const DEFAULT_TOP_OFFSET: i32 = 156;
 const EDGE_INSET: i32 = 12;
 const DOCK_SNAP_DISTANCE: i32 = 44;
-const POLL_INTERVAL_MS: u64 = 16;
-/// Cursor ticks between two looks at the shape of the desktop, so about one a second.
-const DISPLAY_CHECK_TICKS: u32 = 60;
+
+/// Cursor poll rates. Hover is synthesized from these reads rather than from DOM events, so the
+/// fast one is the rate the rail reacts at; it runs only while the pointer is on or near the
+/// dock, or holding a button down. A pointer parked anywhere else on the desktop costs the slow
+/// one, which is what the dock idles at.
+const POLL_NEAR_MS: u64 = 16;
+const POLL_MID_MS: u64 = 40;
+const POLL_FAR_MS: u64 = 120;
+/// Logical pixels from the dock's window at which each rate takes over. The middle band is wide
+/// enough that a pointer travelling at a fast flick is read at least twice on its way in.
+const POLL_NEAR_DISTANCE: i32 = 120;
+const POLL_MID_DISTANCE: i32 = 600;
+/// How long between two looks at the shape of the desktop, on the same thread.
+const DISPLAY_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -465,11 +483,23 @@ fn write_state(state: &serde_json::Map<String, serde_json::Value>) -> Result<()>
     Ok(())
 }
 
+/// What the stored state reads as from outside. The file is shared with the desktop app, which
+/// writes it on every platform, so a switch turned on there is normalized away here rather than
+/// reported as a dock that is running when none can be.
+fn normalized(
+    mut state: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    if !AVAILABLE {
+        state.insert("enabled".into(), serde_json::Value::Bool(false));
+    }
+    state
+}
+
 /// The dock's own preferences, which the settings window edits and the rail renders from.
 /// `placement` is in here too, but it is written by dragging rather than by the settings, so
 /// the settings window simply leaves the key alone.
 pub fn read_prefs() -> serde_json::Map<String, serde_json::Value> {
-    read_state()
+    normalized(read_state())
 }
 
 pub fn patch_prefs(
@@ -484,14 +514,15 @@ pub fn patch_prefs(
         }
     }
     write_state(&state)?;
-    Ok(state)
+    Ok(normalized(state))
 }
 
 pub fn is_enabled() -> bool {
-    read_state()
-        .get("enabled")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
+    AVAILABLE
+        && read_state()
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
 }
 
 pub fn set_enabled(enabled: bool) -> Result<()> {
@@ -724,7 +755,7 @@ fn relayout(window: &tauri::WebviewWindow) -> Option<DockFrame> {
     drop(state);
     if moved {
         #[cfg(debug_assertions)]
-        eprintln!(
+        crate::log_line!(
             "codeburn dock: work_area={},{} {}x{} rows={} total={} expanded={} placement={:?} -> window {},{} {}x{}",
             area.x, area.y, area.w, area.h, request_rows, request_total, request_expanded, placement,
             frame.window.x, frame.window.y, frame.window.w, frame.window.h
@@ -734,10 +765,37 @@ fn relayout(window: &tauri::WebviewWindow) -> Option<DockFrame> {
     Some(frame)
 }
 
+/// What to do with a layout request the page has just sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutOutcome {
+    /// Lay the window out for the stored request and move it if it changed.
+    Relayout,
+    /// The pointer owns the window: answer with the frame the page is already painting into.
+    Deferred(Option<DockFrame>),
+}
+
+/// Records the request and says whether it may reach the window yet. A drag owns the window
+/// while it runs: `relayout` places the window from the stored placement, which is still where
+/// the rail was before the drag began, so a request that lands mid-drag would snap the rail out
+/// from under the pointer holding it. The request is kept either way and the settle lays out
+/// from it, so nothing is lost by waiting.
+fn record_request(state: &mut DockState, request: LayoutRequest) -> LayoutOutcome {
+    state.request = request;
+    if state.drag.is_some() {
+        LayoutOutcome::Deferred(state.frame)
+    } else {
+        LayoutOutcome::Relayout
+    }
+}
+
 /// Stores the page's request and returns the frames it paints into.
 pub fn apply_layout(window: &tauri::WebviewWindow, request: LayoutRequest) -> Option<DockFrame> {
-    lock().request = request;
-    relayout(window)
+    // Bound to a name so the guard is released before `relayout` asks for it again.
+    let outcome = record_request(&mut lock(), request);
+    match outcome {
+        LayoutOutcome::Deferred(frame) => frame,
+        LayoutOutcome::Relayout => relayout(window),
+    }
 }
 
 /// Re-homes the rail after a drop or a menu choice and tells the page where it came from so
@@ -843,12 +901,33 @@ fn primary_button_down() -> bool {
     false
 }
 
+/// How far a point lies outside a rectangle, along whichever axis it is furthest out on, and
+/// zero anywhere inside it.
+fn distance_to(rect: &Rect, x: i32, y: i32) -> i32 {
+    let dx = (rect.x - x).max(x - (rect.right() - 1)).max(0);
+    let dy = (rect.y - y).max(y - (rect.bottom() - 1)).max(0);
+    dx.max(dy)
+}
+
+/// How long to wait before reading the cursor again. `engaged` covers everything that needs the
+/// fast rate whatever the distance says: a drag, a button held down, and a pointer already on
+/// the rail or in the bubble, whose next move decides whether the hover ends.
+fn poll_interval_ms(distance: i32, engaged: bool) -> u64 {
+    if engaged || distance <= POLL_NEAR_DISTANCE {
+        POLL_NEAR_MS
+    } else if distance <= POLL_MID_DISTANCE {
+        POLL_MID_MS
+    } else {
+        POLL_FAR_MS
+    }
+}
+
 /// One tick of pointer tracking: drives a drag in progress, else hit-tests the painted
-/// shapes for hover and click-through.
-fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) {
-    let Some((cx, cy)) = cursor_position() else { return };
+/// shapes for hover and click-through. Returns how long to wait before the next one.
+fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
+    let Some((cx, cy)) = cursor_position() else { return POLL_FAR_MS };
     let mut state = lock();
-    let Some(frame) = state.frame else { return };
+    let Some(frame) = state.frame else { return POLL_FAR_MS };
 
     if let Some(drag) = state.drag {
         // The rail follows the pointer onto whichever display it is over, which is the mac's
@@ -871,7 +950,7 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) {
             let placement = placement_for_drop(&rail, &screen, &state.placement.clone().unwrap_or_default());
             drop(state);
             settle(app, window, placement, rail);
-            return;
+            return POLL_NEAR_MS;
         }
         // The rail, not the window, is what stays on screen: it hangs from the same fraction
         // of itself the pointer grabbed, whatever shape it is now.
@@ -935,7 +1014,8 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) {
                 },
             );
         }
-        return;
+        // The rail is in the hand: it has to keep up with the pointer, not with a band.
+        return POLL_NEAR_MS;
     }
 
     let scale = state.scale;
@@ -964,6 +1044,10 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) {
     let ignore = !(rail_hovered || detail_hovered) && !primary_button_down();
     let ignore_changed = state.ignoring != Some(ignore);
     state.ignoring = Some(ignore);
+    // Measured against the window rather than the rail: the window is the whole region the
+    // dock can paint into, bubble included, so a pointer outside it cannot be hovering
+    // anything and one just inside it is about to be.
+    let distance = distance_to(&frame.window, cursor.0, cursor.1);
     drop(state);
 
     if ignore_changed {
@@ -972,6 +1056,7 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) {
     if pointer_changed {
         let _ = app.emit_to(DOCK_LABEL, "codeburn://dock-pointer", pointer);
     }
+    poll_interval_ms(distance, !ignore)
 }
 
 /// A fingerprint of the desktop: how many displays there are, how large the virtual screen is,
@@ -1003,40 +1088,87 @@ fn display_signature() -> [i32; 9] {
     }
 }
 
-/// Runs until the dock window is gone. Sixty reads of the cursor a second cost nothing
-/// measurable, and they replace the DOM hover the click-through style would starve. Once a
-/// second the same thread checks whether the desktop itself has changed shape, which is the
-/// Windows counterpart of the mac's didChangeScreenParameters observer.
+/// Set while the cursor thread is alive. The window is only click-through because that thread
+/// keeps making it so; one that is up without a tracker is invisible and still hit-testable,
+/// which is a rectangle of desktop nobody can click. So the flag is what a `show` consults
+/// before deciding it already has tracking, rather than whether it built the window itself.
+static TRACKER_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Releases the flag however the thread leaves, a panic included, and hands the window back its
+/// click-through on the way out. If the window is still there, tracking it is still wanted, so
+/// a fresh thread takes over: without this, a tracker that ended in the moment between one
+/// window being destroyed and the next being built would never be replaced.
+#[cfg(target_os = "windows")]
+struct TrackerGuard(AppHandle);
+
+#[cfg(target_os = "windows")]
+impl Drop for TrackerGuard {
+    fn drop(&mut self) {
+        TRACKER_RUNNING.store(false, Ordering::SeqCst);
+        lock().ignoring = None;
+        let Some(window) = self.0.get_webview_window(DOCK_LABEL) else { return };
+        let _ = window.set_ignore_cursor_events(true);
+        spawn_pointer_tracking(self.0.clone());
+    }
+}
+
+/// Runs until the dock window is gone. The reads replace the DOM hover the click-through style
+/// would starve, at a rate that follows the pointer: fast on and around the dock, slow while it
+/// is elsewhere. Once a second the same thread checks whether the desktop itself has changed
+/// shape, which is the Windows counterpart of the mac's didChangeScreenParameters observer.
 #[cfg(target_os = "windows")]
 fn spawn_pointer_tracking(app: AppHandle) {
-    std::thread::Builder::new()
+    // One tracker at a time, and a new one whenever the last has gone.
+    if TRACKER_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let handle = app.clone();
+    let spawned = std::thread::Builder::new()
         .name("codeburn-dock-pointer".into())
         .spawn(move || {
+            let _guard = TrackerGuard(handle.clone());
             let mut displays = display_signature();
-            let mut ticks: u32 = 0;
+            let mut checked = std::time::Instant::now();
+            let mut interval = POLL_NEAR_MS;
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
-                let Some(window) = app.get_webview_window(DOCK_LABEL) else { break };
-                ticks = ticks.wrapping_add(1);
-                if ticks % DISPLAY_CHECK_TICKS == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(interval));
+                let Some(window) = handle.get_webview_window(DOCK_LABEL) else { break };
+                if checked.elapsed() >= DISPLAY_CHECK_INTERVAL {
+                    checked = std::time::Instant::now();
                     let next = display_signature();
                     if next != displays {
                         displays = next;
                         // Never mid-drag: the pointer owns the rail until it is let go.
                         if lock().drag.is_none() {
-                            publish(&app, &window, None);
+                            publish(&handle, &window, None);
                         }
                     }
                 }
-                pointer_tick(&app, &window);
+                // A panic in one tick must not end tracking for good: the window would stay on
+                // screen with nothing left to make it click-through again.
+                interval = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pointer_tick(&handle, &window)
+                }))
+                .unwrap_or(POLL_NEAR_MS);
             }
-        })
-        .ok();
+        });
+    if spawned.is_err() {
+        TRACKER_RUNNING.store(false, Ordering::SeqCst);
+        if let Some(window) = app.get_webview_window(DOCK_LABEL) {
+            let _ = window.set_ignore_cursor_events(true);
+        }
+    }
 }
 
 pub fn show(app: &AppHandle) -> tauri::Result<()> {
+    if !AVAILABLE {
+        return Ok(());
+    }
     // A show cancels any retract still counting down for the window it is replacing.
-    next_generation();
+    let generation = next_generation();
     // A window under this label can survive a `hide` for a moment, since the destroy is
     // processed by the event loop rather than at the call. Reuse it when it is there: two
     // windows with one label is not a state this module can hold.
@@ -1066,7 +1198,12 @@ pub fn show(app: &AppHandle) -> tauri::Result<()> {
             #[cfg(not(target_os = "macos"))]
             let builder = builder.transparent(true);
 
-            builder.build()?
+            let window = builder.build()?;
+            // Click-through from its very first frame: the painted shapes are a sliver of this
+            // window, and until the first cursor read says otherwise everything in it would
+            // swallow clicks meant for whatever is behind.
+            let _ = window.set_ignore_cursor_events(true);
+            window
         }
     };
 
@@ -1082,13 +1219,22 @@ pub fn show(app: &AppHandle) -> tauri::Result<()> {
     }
     relayout(&window);
     window.show()?;
-    if created {
-        #[cfg(target_os = "windows")]
-        spawn_pointer_tracking(app.clone());
+    // Whether or not this call built the window: a window kept from a dock that was switched
+    // off and straight back on can have outlived the thread that was tracking it, and the
+    // spawn is a no-op while one is already running.
+    #[cfg(target_os = "windows")]
+    spawn_pointer_tracking(app.clone());
+    // A reused window is one that was told to retract and is playing that now. It has to be
+    // told the retract is off, or the rail would sit tucked behind its edge until the next
+    // time the dock was switched on. The frame goes with it: the state was just reset and the
+    // window laid out again under a page that is still painting into the frame it had.
+    if !created {
+        let _ = window.emit("codeburn://dock-present", GenerationEvent { generation });
+        publish(app, &window, None);
     }
     #[cfg(debug_assertions)]
     {
-        eprintln!("codeburn dock: window {} and shown", if created { "created" } else { "reused" });
+        crate::log_line!("codeburn dock: window {} and shown", if created { "created" } else { "reused" });
         if created && std::env::var_os("CODEBURN_DOCK_DEVTOOLS").is_some() {
             window.open_devtools();
         }
@@ -1148,6 +1294,14 @@ const DISMISS_FALLBACK: std::time::Duration = std::time::Duration::from_millis(4
 /// captured is still current, so switching the dock off and straight back on cannot have the
 /// old timer destroy the new window.
 static DISMISS_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The number a dismiss was asked under. The page carries it back on `dock_close` so a retract
+/// that finishes after the dock has been switched on again cannot take the new window with it.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerationEvent {
+    generation: u64,
+}
 #[cfg(debug_assertions)]
 static DISMISS_ASKED_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -1174,11 +1328,14 @@ pub fn hide(app: &AppHandle) {
     #[cfg(debug_assertions)]
     {
         DISMISS_ASKED_MS.store(now_ms(), Ordering::SeqCst);
-        eprintln!("codeburn: dock dismiss asked (generation {generation})");
+        crate::log_line!("codeburn: dock dismiss asked (generation {generation})");
     }
-    if window.emit("codeburn://dock-dismiss", ()).is_err() {
+    if window
+        .emit("codeburn://dock-dismiss", GenerationEvent { generation })
+        .is_err()
+    {
         // Nobody to play it: take the window now.
-        close(app);
+        close(app, None);
         return;
     }
     let handle = app.clone();
@@ -1188,7 +1345,7 @@ pub fn hide(app: &AppHandle) {
             return;
         }
         #[cfg(debug_assertions)]
-        eprintln!("codeburn: dock dismiss fallback fired; the page never answered");
+        crate::log_line!("codeburn: dock dismiss fallback fired; the page never answered");
         let inner = handle.clone();
         let _ = handle.run_on_main_thread(move || {
             if DISMISS_GENERATION.load(Ordering::SeqCst) == generation {
@@ -1198,11 +1355,32 @@ pub fn hide(app: &AppHandle) {
     });
 }
 
+/// Whether a close still belongs to the window that is up. The page carries back the number its
+/// dismiss was asked under; anything else is a retract that finished after the dock had already
+/// been switched off and on again, and the window it was asked about is long gone. `None` is an
+/// unconditional close, which is what a dismiss nobody could be told about uses.
+fn close_is_current(generation: Option<u64>, current: u64) -> bool {
+    match generation {
+        Some(generation) => generation == current,
+        None => true,
+    }
+}
+
 /// The page's half of the handshake, and the fallback's. Bumping the generation here is what
 /// disarms a timer that is still waiting.
-pub fn close(app: &AppHandle) {
+pub fn close(app: &AppHandle, generation: Option<u64>) {
+    let current = DISMISS_GENERATION.load(Ordering::SeqCst);
+    if !close_is_current(generation, current) {
+        // The dock came back on while the old rail was still retracting. Destroying now would
+        // take the window that replaced it and leave the dock switched on with nothing drawn.
+        #[cfg(debug_assertions)]
+        crate::log_line!(
+            "codeburn: dock close for generation {generation:?} ignored; {current} is current"
+        );
+        return;
+    }
     #[cfg(debug_assertions)]
-    eprintln!(
+    crate::log_line!(
         "codeburn: dock close from the page after {} ms",
         now_ms().saturating_sub(DISMISS_ASKED_MS.load(Ordering::SeqCst))
     );
@@ -1450,6 +1628,76 @@ mod tests {
         // And the rail lays out inside that display rather than back on the first one.
         let frame = layout(second.area, &dropped, &request(1, false, None), &small());
         assert_eq!(rail_on_screen(&frame).right(), second.area.right());
+    }
+
+    #[test]
+    fn a_close_only_takes_the_window_the_dismiss_was_asked_for() {
+        // The whole point of the number: a retract that answers late, after the dock has been
+        // switched off and on again, must not destroy the window it came back as.
+        assert!(close_is_current(Some(7), 7));
+        assert!(!close_is_current(Some(7), 8));
+        // A dismiss the page was never told about has no number and closes unconditionally.
+        assert!(close_is_current(None, 8));
+
+        // The counter itself only ever moves forward, so a number handed out once can never
+        // come round again and make a stale close look current.
+        let asked = next_generation();
+        assert!(close_is_current(Some(asked), DISMISS_GENERATION.load(Ordering::SeqCst)));
+        let shown = next_generation();
+        assert_eq!(shown, asked + 1);
+        let current = DISMISS_GENERATION.load(Ordering::SeqCst);
+        assert!(!close_is_current(Some(asked), current));
+        assert!(close_is_current(Some(shown), current));
+    }
+
+    #[test]
+    fn the_poll_rate_follows_the_pointer_toward_the_dock() {
+        let window = Rect { x: 1000, y: 100, w: 400, h: 500 };
+        assert_eq!(distance_to(&window, 1200, 300), 0);
+        assert_eq!(distance_to(&window, 1000, 100), 0);
+        // Just past the far corner, on the axis it is furthest out on.
+        assert_eq!(distance_to(&window, 1400, 600), 1);
+        assert_eq!(distance_to(&window, 900, 300), 100);
+        assert_eq!(distance_to(&window, 1200, 20), 80);
+        assert_eq!(distance_to(&window, 300, 2000), 1401);
+
+        assert_eq!(poll_interval_ms(0, false), POLL_NEAR_MS);
+        assert_eq!(poll_interval_ms(POLL_NEAR_DISTANCE, false), POLL_NEAR_MS);
+        assert_eq!(poll_interval_ms(POLL_NEAR_DISTANCE + 1, false), POLL_MID_MS);
+        assert_eq!(poll_interval_ms(POLL_MID_DISTANCE, false), POLL_MID_MS);
+        assert_eq!(poll_interval_ms(POLL_MID_DISTANCE + 1, false), POLL_FAR_MS);
+        // A drag, a held button or a pointer already on the rail keeps the fast rate whatever
+        // the distance says, since the reading is what ends the hover.
+        assert_eq!(poll_interval_ms(4000, true), POLL_NEAR_MS);
+        // The idle rate is a real saving rather than a rounding: a pointer parked away from the
+        // dock costs at most a quarter of the reads a pointer beside it does.
+        assert!(poll_interval_ms(POLL_MID_DISTANCE + 1, false) >= poll_interval_ms(0, false) * 4);
+    }
+
+    #[test]
+    fn a_layout_request_during_a_drag_is_kept_but_not_laid_out() {
+        let mut state = DockState { metrics: small(), ..DockState::default() };
+        let resting = layout(AREA, &Placement::default(), &request(1, false, None), &small());
+        state.frame = Some(resting);
+
+        // No drag: the request reaches the window.
+        let expanded = request(3, true, None);
+        assert_eq!(record_request(&mut state, expanded), LayoutOutcome::Relayout);
+        assert_eq!(state.request.rows, 3);
+
+        // Mid-drag the window belongs to the pointer, so the page is answered with the frame it
+        // is already painting into rather than one computed from where the rail used to live.
+        state.drag = Some(Drag { ax: 0.5, ay: 0.5, last: None });
+        let taller = request(4, true, None);
+        assert_eq!(
+            record_request(&mut state, taller),
+            LayoutOutcome::Deferred(Some(resting))
+        );
+        // Kept, so the settle after the drop lays out from it.
+        assert_eq!((state.request.rows, state.request.total_rows), (4, 4));
+
+        state.drag = None;
+        assert_eq!(record_request(&mut state, taller), LayoutOutcome::Relayout);
     }
 
     #[test]

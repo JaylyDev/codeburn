@@ -169,7 +169,7 @@ pub fn run() {
 
             if dock::is_enabled() {
                 if let Err(err) = dock::show(app.handle()) {
-                    eprintln!("codeburn: failed to show the Capacity Dock: {err}");
+                    crate::log_line!("codeburn: failed to show the Capacity Dock: {err}");
                 }
             }
 
@@ -396,7 +396,7 @@ fn on_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
 /// blur, so the settings window taking focus is what closes it.
 fn open_settings(app: &AppHandle, section: &str) {
     if let Err(err) = settings::open(app, Some(section)) {
-        eprintln!("codeburn: failed to open the settings window: {err}");
+        crate::log_line!("codeburn: failed to open the settings window: {err}");
     }
 }
 
@@ -427,7 +427,7 @@ fn init_tray_linux(app: AppHandle, handle: tray_linux::LinuxTrayHandle) {
     let spawn_handle = handle.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(err) = tray_linux::spawn(spawn_app, spawn_handle).await {
-            eprintln!("codeburn: failed to spawn Linux tray: {err}");
+            crate::log_line!("codeburn: failed to spawn Linux tray: {err}");
         }
     });
 
@@ -481,7 +481,7 @@ fn warn_if_window_station_hidden() {
         )
     };
     if ok != 0 && flags.dwFlags & WSF_VISIBLE == 0 {
-        eprintln!(
+        crate::log_line!(
             "codeburn: running on a non-interactive window station (service session launch); \
              the tray icon and windows will never appear on the desktop"
         );
@@ -616,7 +616,7 @@ fn cycle_theme(app: &AppHandle) {
             settings::broadcast(app, &merged);
             sync_theme_menu_item();
         }
-        Err(err) => eprintln!("codeburn: failed to persist the theme: {err}"),
+        Err(err) => crate::log_line!("codeburn: failed to persist the theme: {err}"),
     }
 }
 
@@ -694,12 +694,12 @@ fn mark_hidden(app: &AppHandle) {
 /// moved once the state is stored, so a failed write cannot leave the menu lying.
 fn set_dock_enabled(app: &AppHandle, enabled: bool) {
     if let Err(err) = dock::set_enabled(enabled) {
-        eprintln!("codeburn: failed to persist the Capacity Dock setting: {err}");
+        crate::log_line!("codeburn: failed to persist the Capacity Dock setting: {err}");
         return;
     }
     if enabled {
         if let Err(err) = dock::show(app) {
-            eprintln!("codeburn: failed to show the Capacity Dock: {err}");
+            crate::log_line!("codeburn: failed to show the Capacity Dock: {err}");
         }
     } else {
         dock::hide(app);
@@ -718,7 +718,7 @@ fn reload_settings(app: &AppHandle) {
     let enabled = dock::is_enabled();
     if enabled {
         if let Err(err) = dock::show(app) {
-            eprintln!("codeburn: failed to show the Capacity Dock: {err}");
+            crate::log_line!("codeburn: failed to show the Capacity Dock: {err}");
         }
         // A rail that was already up may also have had its size or appearance changed.
         dock::prefs_changed(app);
@@ -1018,7 +1018,7 @@ mod commands {
         super::apply_tray_tooltip(&app, &text);
         let stored = text.clone();
         if let Err(err) = crate::tray_status::write_status(|status| status.tooltip = Some(stored)) {
-            eprintln!("codeburn: failed to persist the tray tooltip: {err}");
+            crate::log_line!("codeburn: failed to persist the tray tooltip: {err}");
         }
     }
 
@@ -1082,7 +1082,7 @@ mod commands {
         {
             let stored = text.clone();
             if let Err(err) = crate::tray_status::write_status(|status| status.badge = stored) {
-                eprintln!("codeburn: failed to persist the tray badge: {err}");
+                crate::log_line!("codeburn: failed to persist the tray badge: {err}");
             }
             super::apply_tray_badge(&app, text.as_deref(), muted.unwrap_or(false))
         }
@@ -1176,9 +1176,14 @@ mod commands {
 
     /// The page's half of the dismiss handshake: the rail has finished retracting, so the
     /// window can go. Rust takes it anyway shortly after asking, in case this never comes.
+    ///
+    /// `generation` is the number the dismiss carried. A dock switched off and straight back on
+    /// reuses the window that was retracting, and that retract still finishes and still answers;
+    /// without a number to check it against, the answer would destroy the rail the user has just
+    /// switched back on.
     #[tauri::command]
-    pub fn dock_close(app: AppHandle) {
-        crate::dock::close(&app);
+    pub fn dock_close(app: AppHandle, generation: Option<u64>) {
+        crate::dock::close(&app, generation);
     }
 
     /// Everything the Capacity Dock reads out of `windows-dock.json`: whether it is on, its

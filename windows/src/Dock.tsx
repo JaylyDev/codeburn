@@ -635,6 +635,8 @@ export function Dock() {
   const detailRef = useRef<HTMLDivElement>(null)
   const press = useRef<{ x: number; y: number; dragged: boolean } | null>(null)
   const suppressClick = useRef(false)
+  // The retract's own timer, cleared when the dock comes back on before it has run out.
+  const closeTimer = useRef(0)
 
   // The same store the popover and the settings window use: it polls on the quota refresh
   // cadence with the mac's backoff and jitter, rather than the fixed five minutes this window
@@ -842,14 +844,32 @@ export function Dock() {
   // Rust asks before it destroys the window, so the rail can go back into the edge rather than
   // vanish. The bubble goes first, then the rail retracts, then the window is released. Rust
   // keeps its own timer, so a page that never gets here costs a moment, not a stuck window.
+  //
+  // The generation the dismiss carries goes back with the answer. A dock switched off and
+  // straight back on reuses this very window, and the retract already under way still finishes:
+  // without the number, its answer would destroy the rail that was just switched back on.
   useEffect(() => {
-    const pending = listen('codeburn://dock-dismiss', () => {
-      hideDetail()
-      setPresence('leaving')
-      const wait = motionAllowed() ? MOTION.dockDetach.duration : 0
-      window.setTimeout(() => { void invoke('dock_close') }, wait)
-    })
-    return () => { void pending.then((stop) => stop()) }
+    const listeners = [
+      listen<{ generation: number }>('codeburn://dock-dismiss', (event) => {
+        const { generation } = event.payload
+        hideDetail()
+        setPresence('leaving')
+        window.clearTimeout(closeTimer.current)
+        const wait = motionAllowed() ? MOTION.dockDetach.duration : 0
+        closeTimer.current = window.setTimeout(() => { void invoke('dock_close', { generation }) }, wait)
+      }),
+      // The window was kept rather than rebuilt, so the retract is called off here too and the
+      // rail comes back out of its edge instead of staying tucked behind it.
+      listen('codeburn://dock-present', () => {
+        window.clearTimeout(closeTimer.current)
+        closeTimer.current = 0
+        setPresence((current) => (current === 'present' ? current : 'entering'))
+      }),
+    ]
+    return () => {
+      window.clearTimeout(closeTimer.current)
+      listeners.forEach((p) => void p.then((stop) => stop()))
+    }
   }, [hideDetail])
 
   useEffect(() => {
