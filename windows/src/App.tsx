@@ -15,6 +15,8 @@ import type { Provider } from './components/AgentTabStrip'
 import { ModelsSection } from './components/ModelsSection'
 import { InsightPills, INSIGHT_ORDER, isInsightMode, type InsightMode } from './components/InsightPills'
 import { TrendInsight, trendDayCount } from './components/TrendInsight'
+import { CalendarInsight } from './components/CalendarInsight'
+import { OptimizeInsight } from './components/OptimizeInsight'
 import { ForecastInsight } from './components/ForecastInsight'
 import { PulseInsight } from './components/PulseInsight'
 import { StatsInsight } from './components/StatsInsight'
@@ -419,8 +421,10 @@ export function App() {
                     />
                   )}
                   {activeInsight === 'forecast' && <ForecastInsight days={payload?.history?.daily ?? []} currency={currency} />}
+                  {activeInsight === 'calendar' && <CalendarInsight days={payload?.history?.daily ?? []} currency={currency} />}
                   {activeInsight === 'pulse' && payload && <PulseInsight payload={payload} currency={currency} />}
                   {activeInsight === 'stats' && payload && <StatsInsight payload={payload} currency={currency} period={period} />}
+                  {activeInsight === 'optimize' && payload && <OptimizeInsight payload={payload} currency={currency} />}
                 </div>
                 {payload?.current && (
                   <>

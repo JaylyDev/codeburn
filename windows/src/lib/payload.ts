@@ -17,6 +17,10 @@ export type MenubarPayload = {
     /// Counterfactual spend avoided by routing calls to a local model, from the
     /// mappings `codeburn model-savings` keeps. Absent on older CLI payloads.
     localModelSavings?: LocalModelSavings
+    /// What re-asking cost, and what the same edits would have cost on a cheaper model.
+    /// Both absent on older CLI payloads.
+    retryTax?: RetryTax
+    routingWaste?: RoutingWaste
     providers: Record<string, number>
     providerDetails?: Array<{
       id: string
@@ -52,6 +56,27 @@ export type Model = {
 export type LocalModelSavings = {
   totalUSD: number
   calls: number
+}
+
+export type RetryTax = {
+  totalUSD: number
+  retries: number
+  editTurns: number
+  byModel: Array<{ name: string; taxUSD: number; retries: number; retriesPerEdit?: number | null }>
+}
+
+export type RoutingWaste = {
+  totalSavingsUSD: number
+  baselineModel: string
+  baselineCostPerEdit: number
+  byModel: Array<{
+    name: string
+    costPerEdit: number
+    editTurns: number
+    actualUSD: number
+    counterfactualUSD: number
+    savingsUSD: number
+  }>
 }
 
 export type DailyModel = {

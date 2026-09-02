@@ -38,6 +38,8 @@
   --menu-shadow: 0 8px 28px rgba(0, 0, 0, 0.18), 0 1px 3px rgba(0, 0, 0, 0.10);
   --icon-contrast: #FFFFFF;
   --danger: #C83F2C;
+  /* Routing waste, from the mac OptimizeInsight purple. */
+  --routing-ink: #8944AB;
 
   /* Quota severity, from QuotaSummary.Severity: under 50 green, then yellow, orange, red.
      Three sets, because one colour cannot do three jobs here. The bare token is the bar
@@ -113,6 +115,7 @@
     --sev-danger-ink: #FF453A;
     --sev-critical-tip: #C2610A;
     --sev-danger-tip: #C83F2C;
+    --routing-ink: #BF5AF2;
     --icon-contrast: #1C1816;
     color-scheme: dark;
   }
@@ -154,6 +157,7 @@
   --sev-danger-ink: #FF453A;
   --sev-critical-tip: #C2610A;
   --sev-danger-tip: #C83F2C;
+  --routing-ink: #BF5AF2;
   --icon-contrast: #1C1816;
   color-scheme: dark;
 }
@@ -868,6 +872,152 @@ code { font-family: var(--font-mono); }
 .bar-tooltip-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bar-tooltip-tokens { font-family: var(--font-mono); font-size: 9.5px; color: var(--tooltip-fg-2); }
 .bar-tooltip-split { font-family: var(--font-mono); font-size: 9px; color: var(--tooltip-fg-3); }
+
+
+/* Calendar heatmap. Cell 8, gap 3, weekday gutter 26, from ContributionHeatmapInsight. */
+.calendar-insight { display: flex; flex-direction: column; gap: 10px; }
+.heat-active { font-size: 10.5px; font-weight: 500; color: var(--brand-accent); font-variant-numeric: tabular-nums; }
+.heat-body { display: flex; align-items: flex-start; gap: 6px; }
+.heat-weekdays {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 26px;
+  flex: 0 0 26px;
+}
+.heat-weekdays span {
+  height: 8px;
+  line-height: 8px;
+  text-align: right;
+  font-size: 8.5px;
+  font-weight: 500;
+  color: var(--label-3);
+}
+.heat-weeks { display: flex; gap: 3px; flex: 1; justify-content: flex-end; }
+.heat-week { display: flex; flex-direction: column; gap: 3px; }
+.heat-cell {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--fill-15);
+  box-shadow: inset 0 0 0 0 transparent;
+  transition: transform 100ms ease-out;
+}
+.heat-l1 { background: color-mix(in srgb, var(--brand-accent) 30%, transparent); }
+.heat-l2 { background: color-mix(in srgb, var(--brand-accent) 48%, transparent); }
+.heat-l3 { background: color-mix(in srgb, var(--brand-accent) 66%, transparent); }
+.heat-l4 { background: color-mix(in srgb, var(--brand-accent) 88%, transparent); }
+.heat-cell.is-future { background: var(--fill-06); }
+.heat-cell.is-today { box-shadow: inset 0 0 0 1px var(--brand-accent); }
+.heat-cell.is-hovered {
+  background: var(--brand-accent);
+  box-shadow: inset 0 0 0 1px var(--brand-accent);
+  transform: scale(1.35);
+}
+.heat-detail {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 42px;
+  padding: 7px 9px;
+  border-radius: var(--radius-pill);
+  background: var(--fill-06);
+}
+.heat-detail-main { flex: 1; min-width: 0; }
+.heat-detail-metric { min-width: 42px; text-align: right; }
+.heat-detail-label { font-size: 9px; font-weight: 500; color: var(--label-3); }
+.heat-detail-main .heat-detail-label { font-size: 10px; }
+.heat-detail-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--label);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.heat-detail-num {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--label);
+}
+
+
+/* Optimize. Retry tax and routing waste keep their own hues, as on the mac, so the two
+   kinds of avoidable spend never read as one pot. */
+.optimize-insight { display: flex; flex-direction: column; gap: 12px; }
+.optimize-empty { font-size: 11px; line-height: 1.45; color: var(--label-2); }
+.optimize-headline { padding-bottom: 2px; }
+.optimize-total {
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--sev-critical-ink);
+}
+.optimize-share { text-align: right; }
+.optimize-share-pct { font-size: 11px; font-weight: 600; color: var(--sev-critical-ink); }
+.optimize-share-note { font-size: 9.5px; color: var(--label-3); }
+.waste-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--separator-soft);
+}
+.waste-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.waste-spacer { flex: 1; }
+.waste-title { font-size: 10px; font-weight: 500; color: var(--label-3); }
+.waste-total {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.waste-share { font-size: 9.5px; color: var(--label-3); }
+.waste-note { font-size: 9.5px; color: var(--label-3); }
+.is-retry .waste-icon, .is-retry .waste-total { color: var(--sev-critical-ink); }
+.is-routing .waste-icon, .is-routing .waste-total { color: var(--routing-ink); }
+.waste-rows { display: flex; flex-direction: column; gap: 3px; }
+.waste-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 6px;
+  border-radius: var(--radius-util);
+}
+.is-retry .waste-row { background: rgba(255, 149, 0, 0.07); }
+.is-routing .waste-row { background: rgba(175, 82, 222, 0.07); }
+.waste-row-name {
+  font-size: 9.5px;
+  font-weight: 500;
+  color: var(--label-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.waste-row-note { font-size: 9px; color: var(--label-3); }
+.waste-row-value {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.is-retry .waste-row-value { color: var(--sev-critical-ink); }
+.is-routing .waste-row-value { color: var(--routing-ink); }
 
 .mini-stats { display: flex; gap: 14px; }
 .mini-stat { flex: 1; min-width: 0; }

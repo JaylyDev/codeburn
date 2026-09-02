@@ -34,6 +34,24 @@ export function ChevronRight(p: IconProps) {
   return <Svg {...p}><path d="M6 3.5 10.5 8 6 12.5" /></Svg>
 }
 
+export function RetryIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <path d="M2.5 6.5A5 5 0 0 1 12 5.4M13.5 9.5A5 5 0 0 1 4 10.6" />
+      <path d="M12.5 2.5v3h-3M3.5 13.5v-3h3" />
+    </Svg>
+  )
+}
+
+export function RouteIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <path d="M2.5 5h8.5M2.5 11h8.5" />
+      <path d="M9 2.5 11.5 5 9 7.5M5 8.5 2.5 11 5 13.5" />
+    </Svg>
+  )
+}
+
 export function LeafIcon(p: IconProps) {
   return (
     <Svg {...p}>
