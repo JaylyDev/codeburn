@@ -49,6 +49,8 @@ const RUN_VALUE = 'CodeBurn'
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'
 /** A `/passive` msiexec run waits on a UAC prompt, which is a person, not a process. */
 const INSTALL_TIMEOUT_MS = 5 * 60_000
+/** How long a launch that follows a `--quit` waits for the old process to be gone. */
+const QUIT_SETTLE_MS = 4_000
 
 /** Mirrors BundledInstallResult in src/menubar-installer.ts. */
 export type MenubarInstallResult = {
@@ -93,6 +95,8 @@ export type MenubarDeps = {
   runReg?: (args: string[]) => Promise<void>
   /** The tray app's existing Run value, or null when there is none. */
   readRunKey?: () => Promise<string | null>
+  /** Whether the tray app has a process right now. Injected so tests never spawn. */
+  isRunning?: () => Promise<boolean>
   /** Whether a path is on disk. Injected so the stale-path handling is testable. */
   exists?: (path: string) => boolean
   home?: string
@@ -252,6 +256,26 @@ function regRun(args: string[], env: NodeJS.ProcessEnv): Promise<void> {
   })
 }
 
+/** `tasklist` filtered to the tray exe prints its name when it is running and a "No tasks"
+ *  line when it is not. Anything going wrong reads as not running, which only shortens a wait. */
+function trayHasProcess(env: NodeJS.ProcessEnv): Promise<boolean> {
+  return new Promise(resolve => {
+    try {
+      const child = spawn(system32Path('tasklist.exe', env), ['/FI', `IMAGENAME eq ${TRAY_EXE}`, '/NH'], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+      })
+      let out = ''
+      child.stdout.setEncoding('utf8')
+      child.stdout.on('data', chunk => { out += chunk })
+      child.on('error', () => resolve(false))
+      child.on('close', () => resolve(out.toLowerCase().includes(TRAY_EXE)))
+    } catch {
+      resolve(false)
+    }
+  })
+}
+
 function regQueryRunValue(env: NodeJS.ProcessEnv): Promise<string | null> {
   return new Promise(resolve => {
     const child = spawn(system32Path('reg.exe', env), ['query', RUN_KEY, '/v', RUN_VALUE], {
@@ -289,6 +313,8 @@ export type CompanionStatus = {
 
 export class MenubarCompanion {
   private settings: CompanionSettings
+  /** When `--quit` was last sent, so a launch right after it can wait for the exit. */
+  private quitAskedAt = 0
 
   constructor(private readonly deps: MenubarDeps) {
     this.settings = readCompanionSettings(deps.stateDir)
@@ -296,6 +322,23 @@ export class MenubarCompanion {
 
   private get home(): string { return this.deps.home ?? homedir() }
   private get launch(): (exe: string, args: string[]) => void { return this.deps.launch ?? detachedLaunch }
+  private get isRunning(): () => Promise<boolean> {
+    return this.deps.isRunning ?? (() => trayHasProcess(this.deps.env))
+  }
+
+  /**
+   * A `--quit` takes the tray app a moment to act on, and a launch that arrives while the old
+   * process is still on its way out hands its request to that process (its single-instance
+   * window is still there) and exits with it, leaving the switch on and nothing running. So a
+   * launch that follows a quit waits for the process to be gone first, within reason.
+   */
+  private async awaitQuit(): Promise<void> {
+    if (Date.now() - this.quitAskedAt > QUIT_SETTLE_MS) return
+    const deadline = Date.now() + QUIT_SETTLE_MS
+    while (Date.now() < deadline && await this.isRunning()) {
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+  }
   private get runCli() { return this.deps.runCli ?? spawnCliAction }
   private runReg(args: string[]): Promise<void> {
     return this.deps.runReg ? this.deps.runReg(args) : regRun(args, this.deps.env)
@@ -440,7 +483,10 @@ export class MenubarCompanion {
       this.applyDockSetting(false)
       await this.setRunKey(false)
       const exePath = this.settings.trayExePath
-      if (exePath && this.exists(exePath)) this.launch(exePath, ['--quit'])
+      if (exePath && this.exists(exePath)) {
+        this.launch(exePath, ['--quit'])
+        this.quitAskedAt = Date.now()
+      }
       return this.status()
     }
 
@@ -453,6 +499,7 @@ export class MenubarCompanion {
     }
     this.save({ trayExePath: exePath })
     await this.setRunKey(true)
+    await this.awaitQuit()
     this.launch(exePath, ['--reload-settings'])
     return this.status()
   }

@@ -190,6 +190,7 @@ describe('MenubarCompanion', () => {
   let cliCalls: Array<{ args: string[]; env: NodeJS.ProcessEnv | undefined }>
   let installResult: MenubarInstallResult | null
   let existingRunKey: string | null
+  let trayRunning: boolean
   /** What is on disk, as far as the companion is concerned. TRAY_EXE is there by default. */
   let present: Set<string>
 
@@ -204,6 +205,7 @@ describe('MenubarCompanion', () => {
       launch: (exe: string, args: string[]) => { launches.push({ exe, args }) },
       runReg: async (args: string[]) => { regCalls.push(args) },
       readRunKey: async () => existingRunKey,
+      isRunning: async () => trayRunning,
       exists: (path: string) => present.has(path),
       runCli: async (args: string[], opts: { extraEnv?: NodeJS.ProcessEnv }) => {
         cliCalls.push({ args, env: opts.extraEnv })
@@ -242,6 +244,7 @@ describe('MenubarCompanion', () => {
     cliCalls = []
     installResult = result()
     existingRunKey = null
+    trayRunning = false
     present = new Set([TRAY_EXE])
   })
 
@@ -444,6 +447,25 @@ describe('MenubarCompanion', () => {
     expect(status).toEqual({ supported: true, menuBar: false, sidebar: false, store: false })
     expect(regCalls).toEqual([runKeyArgs(false, TRAY_EXE)])
     expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--quit'] }])
+  })
+
+  it('Menu bar on right after off waits for the old process before starting again', async () => {
+    stageMsi()
+    writeCompanionSettings(stateDir, { menuBar: true, sidebar: false, trayExePath: TRAY_EXE, seeded: true })
+    const companion = new MenubarCompanion(deps())
+    await companion.setMenuBarEnabled(false)
+    trayRunning = true
+    setTimeout(() => { trayRunning = false }, 250)
+
+    const started = Date.now()
+    const status = await companion.setMenuBarEnabled(true)
+
+    expect(status.menuBar).toBe(true)
+    expect(Date.now() - started).toBeGreaterThanOrEqual(200)
+    expect(launches).toEqual([
+      { exe: TRAY_EXE, args: ['--quit'] },
+      { exe: TRAY_EXE, args: ['--reload-settings'] },
+    ])
   })
 
   it('Menu bar on installs if it has to, then starts the tray app again', async () => {

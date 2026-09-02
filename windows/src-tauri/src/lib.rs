@@ -101,11 +101,24 @@ pub fn run() {
     tauri::Builder::default()
         // Must be registered before any other plugin so it can intercept a second launch.
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            match parse_second_launch(&args) {
-                SecondLaunch::ShowPopover => show_popover(app, None),
-                SecondLaunch::Quit => app.exit(0),
-                SecondLaunch::ReloadSettings => reload_settings(app),
-            }
+            // The plugin hands a second launch over with a synchronous SendMessage, so that
+            // launch sits inside it until this returns, and the message can land while setup
+            // still owns the main thread (a tray icon registering, the popover being built).
+            // Showing or closing a window from there waits on an event loop that is not running
+            // yet, this never returns, and every launch after it (the desktop app's next
+            // `--quit` included) blocks behind the same message. So the request is only
+            // recorded here and carried out once the loop is turning. `run_on_main_thread`
+            // from the main thread itself runs the work in place, hence the thread.
+            let request = parse_second_launch(&args);
+            let handle = app.clone();
+            std::thread::spawn(move || {
+                let inner = handle.clone();
+                let _ = handle.run_on_main_thread(move || match request {
+                    SecondLaunch::ShowPopover => show_popover(&inner, None),
+                    SecondLaunch::Quit => inner.exit(0),
+                    SecondLaunch::ReloadSettings => reload_settings(&inner),
+                });
+            });
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
