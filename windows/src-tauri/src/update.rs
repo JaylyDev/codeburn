@@ -556,7 +556,10 @@ fn secret_at(text: &str, start: usize) -> Option<(&'static str, usize)> {
             return Some(("eyJ***", start + len));
         }
     }
-    if rest.len() >= 6 && rest[..6].eq_ignore_ascii_case("bearer") {
+    // Compared as bytes rather than as a slice of the string: `&rest[..6]` would panic if
+    // those six bytes ended inside a multi-byte character, and a scrubber that panics on
+    // whatever a subprocess happened to print is worse than one that misses a token.
+    if rest.len() >= 6 && rest.as_bytes()[..6].eq_ignore_ascii_case(b"bearer") {
         let after = &rest[6..];
         let spaces = after.len() - after.trim_start_matches([' ', '\t']).len();
         if spaces > 0 {
@@ -710,6 +713,14 @@ mod tests {
         assert_eq!(scrub("bearer\tsecret-value"), "Bearer ***");
         // eyJ that is not a JWT is left alone rather than eaten.
         assert_eq!(scrub("eyJnope"), "eyJnope");
+        // Multi-byte text is carried through rather than sliced through the middle.
+        assert_eq!(scrub("café beareré"), "café beareré");
+        // The token runs to the next whitespace, as the mac's `Bearers+S+` does, so a
+        // trailing quotation mark goes with it rather than being left behind as a clue.
+        assert_eq!(
+            scrub("“Bearer abc123” and on"),
+            "“Bearer *** and on"
+        );
     }
 
     #[test]
