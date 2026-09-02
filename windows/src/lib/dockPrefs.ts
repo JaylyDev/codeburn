@@ -7,14 +7,17 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
-export type DockTheme = 'graphite' | 'acrylic'
+export type DockTheme = 'graphite' | 'glass'
 export type DockGaugeShape = 'circle' | 'squircle'
 
 export const DOCK_THEMES: Array<{ id: DockTheme; label: string }> = [
   { id: 'graphite', label: 'Graphite' },
-  // The mac's second appearance is Liquid Glass; the Windows equivalent is the acrylic
-  // window effect, so it is named after what it actually is here.
-  { id: 'acrylic', label: 'Acrylic' },
+  // The mac's second appearance is Liquid Glass. Windows cannot shape its acrylic material:
+  // the DWM backdrop is drawn for the whole window rectangle and neither a window region nor
+  // the corner preference clips it, and the dock's window is far bigger than the rail it
+  // paints. So this is a translucent surface the page draws inside the rail's own outline,
+  // which is what "glass" can mean for a shaped window here.
+  { id: 'glass', label: 'Glass' },
 ]
 
 export const DOCK_GAUGE_SHAPES: Array<{ id: DockGaugeShape; label: string }> = [
@@ -58,7 +61,7 @@ export function parseDockPrefs(raw: Record<string, unknown>): DockPrefs {
     enabled: raw.enabled === true,
     preferred: typeof raw.preferred === 'string' ? raw.preferred : null,
     scale: Math.min(DOCK_SCALE_MAX, Math.max(DOCK_SCALE_MIN, scale)),
-    theme: raw.theme === 'acrylic' ? 'acrylic' : 'graphite',
+    theme: raw.theme === 'glass' || raw.theme === 'acrylic' ? 'glass' : 'graphite',
     gaugeShape: raw.gaugeShape === 'squircle' ? 'squircle' : 'circle',
     providers: Array.isArray(raw.providers) ? raw.providers.filter((p): p is string => typeof p === 'string') : [],
     manualSelection: raw.manualSelection === true,

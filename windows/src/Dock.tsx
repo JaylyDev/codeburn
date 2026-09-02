@@ -639,6 +639,12 @@ export function Dock() {
     if (glide && glideProgress >= 1) setGlide(null)
   }, [glide, glideProgress])
 
+  // The mac's second appearance. Windows cannot shape its acrylic material, so the glass is
+  // painted inside the same outline as the graphite surface: translucent enough for the
+  // desktop to move behind it, dark enough to carry the warm off-white type over any
+  // wallpaper, with a brighter rim than graphite gets.
+  const glass = prefs.theme === 'glass'
+  const surfaceFill = glass ? 'url(#dock-glass-fill)' : 'url(#dock-rail-fill)'
   const edge = flareEdge
   const vertical = railVertical
   const cross = vertical ? m.railWidth : m.horizontalRailWidth
@@ -707,6 +713,16 @@ export function Dock() {
               <stop offset="0.46" stopColor="#09090A" />
               <stop offset="1" stopColor="#030304" />
             </linearGradient>
+            <linearGradient id="dock-glass-fill" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stopColor="#2A2C31" stopOpacity="0.60" />
+              <stop offset="0.46" stopColor="#131416" stopOpacity="0.66" />
+              <stop offset="1" stopColor="#060607" stopOpacity="0.74" />
+            </linearGradient>
+            <linearGradient id="dock-glass-edge" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stopColor="#fff" stopOpacity="0.22" />
+              <stop offset="0.55" stopColor="#fff" stopOpacity="0.14" />
+              <stop offset="1" stopColor="#fff" stopOpacity="0.20" />
+            </linearGradient>
             <radialGradient id="dock-rail-glow" cx="0" cy="0" r="180" gradientUnits="userSpaceOnUse">
               <stop offset="0" stopColor="#fff" stopOpacity="0.055" />
               <stop offset="1" stopColor="#fff" stopOpacity="0" />
@@ -718,9 +734,14 @@ export function Dock() {
               <stop offset="1" stopColor="#fff" stopOpacity="0.08" />
             </linearGradient>
           </defs>
-          <path d={shape} fill="url(#dock-rail-fill)" />
+          <path d={shape} fill={surfaceFill} />
           <path d={shape} fill="url(#dock-rail-glow)" />
-          <path d={shape} fill="none" stroke="url(#dock-rail-edge)" strokeWidth="0.6" />
+          <path
+            d={shape}
+            fill="none"
+            stroke={glass ? 'url(#dock-glass-edge)' : 'url(#dock-rail-edge)'}
+            strokeWidth={Math.max(0.6, m.scale * 0.8)}
+          />
         </svg>
         <div className="dock-rows" style={rowsStyle}>
           {ordered.map((provider, index) => {
@@ -758,9 +779,14 @@ export function Dock() {
         >
           {detailH > 0 ? (
             <svg className="dock-surface" width={detailW} height={detailH} viewBox={`0 0 ${detailW} ${detailH}`} aria-hidden="true">
-              <path d={bubblePath(tailEdge, detailW, detailH, tail)} fill="url(#dock-rail-fill)" />
+              <path d={bubblePath(tailEdge, detailW, detailH, tail)} fill={surfaceFill} />
               <path d={bubblePath(tailEdge, detailW, detailH, tail)} fill="url(#dock-rail-glow)" />
-              <path d={bubblePath(tailEdge, detailW, detailH, tail)} fill="none" stroke="rgba(255,255,255,0.09)" strokeWidth="0.9" />
+              <path
+                d={bubblePath(tailEdge, detailW, detailH, tail)}
+                fill="none"
+                stroke={glass ? 'rgba(255,255,255,0.20)' : 'rgba(255,255,255,0.09)'}
+                strokeWidth={Math.max(0.5, m.detailScale)}
+              />
             </svg>
           ) : null}
           <Detail m={m} provider={hoveredProvider} quota={quota} loading={loading} />
