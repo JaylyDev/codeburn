@@ -32,7 +32,10 @@ const appDir = join(here, '..')
 const root = join(appDir, '..')
 const stage = join(appDir, 'build', 'menubar')
 
-const MSI_PATTERN = /^CodeBurn\.Menubar_(.+)_x64_en-US\.msi$/
+// Tauri names the bundle after productName, so a local build is `CodeBurn Menubar_...`;
+// GitHub rewrites that space to a dot on release upload, and the dot form is what the CLI
+// installer, the Electron side and the tray's own updater all expect. Stage the dot form.
+const MSI_PATTERN = /^CodeBurn[ .]Menubar_(.+)_x64_en-US\.msi$/
 const TRAY_EXE = 'codeburn-menubar.exe'
 /// What the Tauri build puts beside the exe and the app needs at runtime. Anything absent is
 /// simply not copied: WebView2Loader ships only when the loader is not linked statically.
@@ -76,17 +79,18 @@ if (target === 'nsis') {
   const msiName = readdirSync(source).find(name => MSI_PATTERN.test(name))
   if (!msiName) fail('no CodeBurn.Menubar_<version>_x64_en-US.msi')
 
+  const stagedName = msiName.replace(' ', '.')
   const msiSource = join(source, msiName)
-  copyFileSync(msiSource, join(stage, msiName))
+  copyFileSync(msiSource, join(stage, stagedName))
 
   // The release carries its own .sha256; a local build does not, and computing it here keeps
   // the installer's verification meaningful in both cases rather than skipped in one.
   const checksumSource = `${msiSource}.sha256`
   if (existsSync(checksumSource)) {
-    copyFileSync(checksumSource, join(stage, `${msiName}.sha256`))
+    copyFileSync(checksumSource, join(stage, `${stagedName}.sha256`))
   } else {
     const digest = createHash('sha256').update(readFileSync(msiSource)).digest('hex')
-    writeFileSync(join(stage, `${msiName}.sha256`), `${digest}  ${msiName}\n`)
+    writeFileSync(join(stage, `${stagedName}.sha256`), `${digest}  ${stagedName}\n`)
   }
 
   const version = MSI_PATTERN.exec(msiName)[1]
@@ -96,7 +100,7 @@ if (target === 'nsis') {
   if (version !== appVersion) {
     console.warn(`stage-menubar: staging tray app ${version} into desktop app ${appVersion}`)
   }
-  console.log(`stage-menubar: staged ${msiName} -> ${stage}`)
+  console.log(`stage-menubar: staged ${stagedName} -> ${stage}`)
 } else {
   const exeSource = join(source, TRAY_EXE)
   if (!existsSync(exeSource)) fail(`no ${TRAY_EXE}`)
