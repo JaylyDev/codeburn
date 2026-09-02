@@ -125,7 +125,9 @@ function capture(bin, cacheDir, outDir, extra = {}) {
 }
 
 // The one field that moves between two runs of the same payload.
-const stripGenerated = obj => JSON.parse(JSON.stringify(obj, (k, v) => (k.startsWith('generated') ? undefined : v)))
+// liveSessions is a wall-clock snapshot (idleSeconds, lastActivityAt), not a parse
+// product, so two invocations legitimately differ there.
+const stripGenerated = obj => JSON.parse(JSON.stringify(obj, (k, v) => (k.startsWith('generated') || k === 'liveSessions' ? undefined : v)))
 
 // Shards carry real stat data and are published under a random filename, so
 // "identical" means identical after normalizing both away.
