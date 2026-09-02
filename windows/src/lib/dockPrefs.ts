@@ -99,6 +99,28 @@ export function onDockPrefsChanged(listener: (prefs: DockPrefs) => void): () => 
   }
 }
 
+/// CapacityDockPreferences.normalizedPreferred: the rail can only rest on a provider it is
+/// actually showing, so a resting provider that has left the set gives way to the first one
+/// still in it.
+export function normalizedPreferred(preferred: string | null, selected: string[]): string | null {
+  if (preferred !== null && selected.includes(preferred)) return preferred
+  return selected[0] ?? null
+}
+
+/// CapacityDockPreferences.autoSeedFromConnected: until the user edits the provider set, the
+/// dock mirrors whatever is connected, capped, so a fresh install shows what is actually
+/// active rather than nothing. Returns the patch to write, or null when there is nothing to do.
+export function autoSeed(prefs: DockPrefs, connected: string[]): Partial<DockPrefs> | null {
+  if (prefs.manualSelection) return null
+  const desired = connected.slice(0, DOCK_MAX_AUTO_PROVIDERS)
+  // Nothing connected yet is a reason to wait, not a reason to empty the dock.
+  if (desired.length === 0) return null
+  if (desired.length === prefs.providers.length && desired.every((id, i) => prefs.providers[i] === id)) {
+    return null
+  }
+  return { providers: desired, preferred: normalizedPreferred(prefs.preferred, desired) }
+}
+
 /// CapacityDockProviderSelection.canDeselect: the rail must never end up with nothing to
 /// show, so the last connected provider in the set stays switched on.
 export function canDeselect(id: string, selected: string[], isConnected: (id: string) => boolean): boolean {

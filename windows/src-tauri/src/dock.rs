@@ -494,14 +494,8 @@ pub fn set_enabled(enabled: bool) -> Result<()> {
     write_state(&state)
 }
 
-/// The provider the resting rail shows. A click on another row makes it the preferred one.
-pub fn preferred_provider() -> Option<String> {
-    read_state()
-        .get("preferred")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-}
-
+/// The provider the resting rail shows. A click on another row makes it the preferred one;
+/// the page reads the current one out of the preferences with everything else.
 pub fn set_preferred_provider(id: &str) -> Result<()> {
     let mut state = read_state();
     state.insert("preferred".into(), serde_json::Value::String(id.to_owned()));

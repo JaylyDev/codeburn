@@ -155,7 +155,6 @@ pub fn run() {
             commands::set_launch_at_login,
             commands::dock_quota,
             commands::dock_set_layout,
-            commands::dock_preferred,
             commands::dock_set_preferred,
             commands::dock_context_menu,
             commands::dock_begin_drag,
@@ -874,11 +873,6 @@ mod commands {
     #[tauri::command]
     pub fn dock_begin_drag(app: AppHandle, x: i32, y: i32) {
         crate::dock::begin_drag(&app, (x, y));
-    }
-
-    #[tauri::command]
-    pub fn dock_preferred() -> Option<String> {
-        crate::dock::preferred_provider()
     }
 
     #[tauri::command]

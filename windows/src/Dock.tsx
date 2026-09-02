@@ -2,7 +2,15 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProp
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { ProviderGlyph } from './providerIcons'
-import { DEFAULT_DOCK_PREFS, loadDockPrefs, onDockPrefsChanged, type DockPrefs } from './lib/dockPrefs'
+import {
+  DEFAULT_DOCK_PREFS,
+  autoSeed,
+  loadDockPrefs,
+  normalizedPreferred,
+  onDockPrefsChanged,
+  writeDockPrefs,
+  type DockPrefs,
+} from './lib/dockPrefs'
 import {
   MOTION,
   alongPad,
@@ -305,6 +313,9 @@ const ATTACH_MOTION = (_from: number, to: number) => (to === 1 ? MOTION.dockAtta
 export function Dock() {
   const [quota, setQuota] = useState<DockQuota | null>(null)
   const [prefs, setPrefs] = useState<DockPrefs>(DEFAULT_DOCK_PREFS)
+  // Nothing may be written back before the stored preferences have arrived: the defaults say
+  // nobody has chosen a provider set yet, and acting on that would overwrite one.
+  const [prefsLoaded, setPrefsLoaded] = useState(false)
   const [interaction, setInteraction] = useState<Interaction>(REST)
   const [presentationExpanded, setPresentationExpanded] = useState(false)
   const [hovered, setHovered] = useState<string | null>(null)
@@ -348,10 +359,23 @@ export function Dock() {
   // The settings window writes these, so the rail follows a switch, a resting provider or a
   // size the moment it is changed rather than at the next refresh.
   useEffect(() => {
-    void loadDockPrefs().then(setPrefs)
+    void loadDockPrefs().then((stored) => {
+      setPrefs(stored)
+      setPrefsLoaded(true)
+    })
     return onDockPrefsChanged(setPrefs)
   }, [])
   const m = metrics(prefs.scale)
+
+  // Until the user edits the set in the settings window, the dock follows what is connected,
+  // up to the mac's five. The write reaches the settings window through the same event, so a
+  // window open on the Capacity Dock section fills its switches in as the answer arrives.
+  useEffect(() => {
+    if (!prefsLoaded || quota?.state !== 'ready') return
+    const connected = quota.providers.filter((p) => p.available).map((p) => p.id)
+    const patch = autoSeed(prefs, connected)
+    if (patch) void writeDockPrefs(patch).then(setPrefs)
+  }, [prefsLoaded, quota, prefs])
 
   // Providers: the ones the CLI reports signed in, narrowed to the settings window's choice
   // when one has been made, else the preferred one as a dashed stand-in. An empty choice is
@@ -360,7 +384,8 @@ export function Dock() {
   const signedIn = all.filter((p) => p.available)
   const chosenIds = prefs.providers
   const available = chosenIds.length > 0 ? signedIn.filter((p) => chosenIds.includes(p.id)) : signedIn
-  const resolvedPreferredId = prefs.preferred ?? available[0]?.id ?? all[0]?.id ?? 'claude'
+  const resolvedPreferredId =
+    normalizedPreferred(prefs.preferred, available.map((p) => p.id)) ?? prefs.preferred ?? all[0]?.id ?? 'claude'
   const preferred: Provider = all.find((p) => p.id === resolvedPreferredId) ?? {
     id: resolvedPreferredId,
     name: PROVIDER_NAMES[resolvedPreferredId] ?? resolvedPreferredId,
