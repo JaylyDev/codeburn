@@ -36,6 +36,7 @@ import { ScopeControl, type Scope } from './components/ScopeControl'
 import type { DaySelection, Period } from './components/PeriodTabs'
 import { FooterBar } from './components/FooterBar'
 import { ErrorToast } from './components/ErrorToast'
+import { FetchErrorOverlay } from './components/FetchErrorOverlay'
 import { Header } from './components/Header'
 import { applyAccent, savedAccent, type AccentPreset } from './lib/accent'
 import { SettingsPanel, type SettingsSection, type ThemeChoice } from './components/SettingsPanel'
@@ -61,6 +62,17 @@ const TODAY_ALL: Selection = {
 const REFRESH_ACTIVE_MS = 60_000
 const REFRESH_IDLE_MS = 120_000
 const STALE_MS = 60_000
+
+/// Stuck-load recovery, from the mac BurnLoadingOverlay task: while the popover has
+/// nothing to show, retry the fetch on a doubling delay and then give up with a message
+/// rather than spinning forever. The first delay is longer than a healthy CLI run.
+const RECOVERY_FIRST_MS = 8_000
+const RECOVERY_MAX_MS = 60_000
+const RECOVERY_ATTEMPTS = 6
+/// A fetch older than the Rust side's own 60 s timeout is an orphan, not a slow run: its
+/// in-flight mark can be cleared. A younger one is left alone so recovery never kills a
+/// fetch that is still going to answer.
+const FLIGHT_WATCHDOG_MS = 65_000
 
 type FetchOptions = {
   includeOptimize: boolean
@@ -136,6 +148,7 @@ export function App() {
       }
       payloadCache.set(key, json)
       if (isSelected()) {
+        setError(null)
         setPayload(json)
         // "updated Xs ago" describes what the user is looking at, so only a fetch of the
         // visible key may stamp it - a background today/all tick must not.
@@ -207,6 +220,8 @@ export function App() {
   useEffect(() => {
     const key = selection.current
     const cached = payloadCache.get(key)
+    // The error describes the selection that failed, so it goes with it.
+    setError(null)
     setPayload(cached)
     if (!cliReady) return
     if (!cached) {
@@ -251,6 +266,34 @@ export function App() {
     invoke<number | null>('daily_budget').then(setDailyBudget).catch(() => {})
   }
   useEffect(readDailyBudget, [])
+
+  // Nothing on screen and nothing coming: retry on a doubling delay, then say so. A
+  // fetch torn down across sleep can leave its in-flight mark behind, which would make
+  // every retry bail on the guard, so a mark older than the watchdog is cleared first.
+  const coldLoading = overlay && payload === null && error === null
+  useEffect(() => {
+    if (!coldLoading || !cliReady) return
+    let attempt = 0
+    let delay = RECOVERY_FIRST_MS
+    let timer = 0
+    const tick = () => {
+      attempt += 1
+      const key = selection.current
+      if (payloadCache.flightAge(key) > FLIGHT_WATCHDOG_MS) payloadCache.clearInFlight(key)
+      fetchKey(key, { includeOptimize: false, showOverlay: true })
+      if (attempt >= RECOVERY_ATTEMPTS) {
+        setError(`Could not load ${label}. Check that the codeburn CLI is installed and working.`)
+        return
+      }
+      delay = Math.min(delay * 2, RECOVERY_MAX_MS)
+      timer = window.setTimeout(tick, delay)
+    }
+    timer = window.setTimeout(tick, delay)
+    return () => window.clearTimeout(timer)
+    // `label` only decorates the give-up message; re-arming the ladder on a relabel
+    // would restart the clock for no reason.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [coldLoading, cliReady, fetchKey])
 
   // The quota store polls only while something is watching it, so it starts here and stops
   // with the page. A manual Refresh asks it for a fresh answer too.
@@ -391,6 +434,8 @@ export function App() {
     && (payload.current?.calls ?? 0) === 0 && (payload.current?.sessions ?? 0) === 0
     && (payload.history?.daily?.length ?? 0) === 0
 
+  const label = daySelectionLabel(days) ?? PERIOD_LABELS[period]
+
   const footnote = [version ? `CodeBurn v${version}` : 'CodeBurn', lastUpdated ? `updated ${relativePast(lastUpdated)}` : null]
     .filter(Boolean)
     .join(' · ')
@@ -433,7 +478,7 @@ export function App() {
             <HeroSection
               payload={payload}
               currency={currency}
-              periodLabel={daySelectionLabel(days) ?? PERIOD_LABELS[period]}
+              periodLabel={label}
               isToday={days.length === 0 && period === 'today'}
               dailyBudget={dailyBudget}
               combinedScope={effectiveScope === 'combined'}
@@ -500,7 +545,20 @@ export function App() {
                 )}
               </>
             )}
-            {overlay && <LoadingOverlay periodLabel={daySelectionLabel(days) ?? PERIOD_LABELS[period]} />}
+            {/* The overlay only takes over on a cold cache, so a failed background
+                refresh leaves the numbers that are already on screen alone. */}
+            {payload === null && error !== null ? (
+              <FetchErrorOverlay
+                message={error}
+                periodLabel={label}
+                onRetry={() => {
+                  setError(null)
+                  refreshAll({ includeOptimize: false, showOverlay: true })
+                }}
+              />
+            ) : overlay ? (
+              <LoadingOverlay periodLabel={label} />
+            ) : null}
           </>
         )}
       </div>
@@ -524,7 +582,10 @@ export function App() {
 
       <StarBanner />
 
-      {error && <ErrorToast message={error} onDismiss={() => setError(null)} />}
+      {/* With something already on screen the failure is an aside, not a wall. */}
+      {error !== null && payload !== null && (
+        <ErrorToast message={error} onDismiss={() => setError(null)} />
+      )}
     </div>
   )
 }

@@ -30,7 +30,7 @@ interface CacheEntry<T> {
 
 export class PayloadCache<T> {
   private store = new Map<string, CacheEntry<T>>()
-  private flights = new Set<string>()
+  private flights = new Map<string, number>()
 
   get(selection: Selection): T | null {
     return this.store.get(selectionKey(selection))?.data ?? null
@@ -50,8 +50,15 @@ export class PayloadCache<T> {
     return this.flights.has(selectionKey(selection))
   }
 
+  /// Milliseconds since the in-flight fetch started, or 0 when there is none. Stuck-load
+  /// recovery uses this to tell an orphaned entry from a fetch that is simply slow.
+  flightAge(selection: Selection): number {
+    const started = this.flights.get(selectionKey(selection))
+    return started === undefined ? 0 : Date.now() - started
+  }
+
   markInFlight(selection: Selection): void {
-    this.flights.add(selectionKey(selection))
+    this.flights.set(selectionKey(selection), Date.now())
   }
 
   clearInFlight(selection: Selection): void {
