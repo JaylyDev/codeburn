@@ -1,5 +1,4 @@
 import { mkdir, readFile, writeFile } from 'fs/promises'
-import { sep } from 'path'
 import type { ProjectSummary } from '../types.js'
 import { flagsPath, guardDir } from './store.js'
 
@@ -55,7 +54,13 @@ export function flagsAgeMs(flags: GuardFlags): number {
 }
 
 function norm(p: string): string {
-  return p.length > 1 && p.endsWith(sep) ? p.slice(0, -1) : p
+  return p.length > 1 && (p.endsWith('/') || p.endsWith('\\')) ? p.slice(0, -1) : p
+}
+
+// A flagged project path comes from provider data and can be POSIX-shaped on a
+// Windows host, so either separator has to count as a directory boundary.
+function isWithin(target: string, base: string): boolean {
+  return target === base || target.startsWith(`${base}/`) || target.startsWith(`${base}\\`)
 }
 
 // Openers for the flagged project the cwd sits in (exact match or a subdir of
@@ -65,7 +70,7 @@ export function matchFlag(flags: GuardFlags, cwd: string): string[] {
   let best: ProjectFlag | null = null
   for (const flag of flags.projects) {
     const base = norm(flag.path)
-    if (target === base || target.startsWith(base + sep)) {
+    if (isWithin(target, base)) {
       if (!best || base.length > norm(best.path).length) best = flag
     }
   }

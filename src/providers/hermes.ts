@@ -415,9 +415,12 @@ function collectTools(messages: HermesMessageRow[]): { tools: string[]; toolSequ
 function isRealWorkspace(cwd: string | null | undefined): cwd is string {
   if (!cwd?.trim()) return false
   const trimmed = cwd.trim()
-  const isAbsolute = process.platform === 'win32'
-    ? /^[a-zA-Z]:[\\/]/.test(trimmed) || /^\\\\[^\\/]+\\/.test(trimmed)
-    : trimmed.startsWith('/') && !trimmed.startsWith('//')
+  // A Hermes state.db records the path shape of the machine that wrote it, which
+  // need not be the machine reading it, so both shapes count as absolute on every
+  // host. Slash-UNC (//server/share) stays out: it is not a local workspace.
+  const isAbsolute = /^[a-zA-Z]:[\\/]/.test(trimmed)
+    || /^\\\\[^\\/]+\\/.test(trimmed)
+    || (trimmed.startsWith('/') && !trimmed.startsWith('//'))
   if (!isAbsolute) return false
   const normalized = trimmed.replace(/\\/g, '/').replace(/\/+$/, '')
   if (normalized === '/' || normalized === homedir() || normalized === homedir().replace(/\\/g, '/') || isUserHomeRoot(normalized)) return false
