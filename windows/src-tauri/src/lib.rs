@@ -88,7 +88,7 @@ pub fn run() {
             if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
                 let _ = window.hide();
                 #[cfg(target_os = "windows")]
-                round_window_corners(&window);
+                strip_window_frame(&window);
             }
 
             if dock::is_enabled() {
@@ -377,21 +377,33 @@ fn warn_if_window_station_hidden() {
     }
 }
 
-/// Undecorated windows are square by default; ask DWM for the Windows 11 rounded corner so
-/// the acrylic backdrop is clipped to the same shape as the popover card. Silently ignored
-/// on Windows 10, where the corners stay square.
+/// The popover window paints nothing of its own: it is transparent, and the rounded card
+/// inside it is the whole visible shape. So DWM has to keep its hands off the frame. Its
+/// own rounding clips at the system radius rather than the card radius, and the 1 px
+/// frame it draws around a rounded window traces that wrong shape in grey just outside
+/// the card.
 #[cfg(target_os = "windows")]
-fn round_window_corners(window: &tauri::WebviewWindow) {
+fn strip_window_frame(window: &tauri::WebviewWindow) {
     use windows_sys::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWMWCP_DONOTROUND,
     };
+    /// DWMWA_COLOR_NONE: suppress the border rather than tint it.
+    const COLOR_NONE: u32 = 0xFFFF_FFFE;
     let Ok(hwnd) = window.hwnd() else { return };
-    let preference: u32 = DWMWCP_ROUND as u32;
+    let preference: u32 = DWMWCP_DONOTROUND as u32;
+    // Both are no-ops before Windows 11 build 22000, where the frame is square anyway.
     unsafe {
         DwmSetWindowAttribute(
             hwnd.0 as _,
             DWMWA_WINDOW_CORNER_PREFERENCE as u32,
             &preference as *const u32 as *const std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        DwmSetWindowAttribute(
+            hwnd.0 as _,
+            DWMWA_BORDER_COLOR as u32,
+            &COLOR_NONE as *const u32 as *const std::ffi::c_void,
             std::mem::size_of::<u32>() as u32,
         );
     }
@@ -553,12 +565,18 @@ fn show_popover(app: &AppHandle, anchor: Option<(i32, i32)>) {
 /// Places the popover against the taskbar / panel edge of the monitor that owns the click
 /// (or the cursor, when the request came from a menu). The work area already excludes the
 /// taskbar on Windows and panels on Linux, so we never need to guess their heights: the
-/// popover sits `MARGIN` inside the work area, horizontally centred on the anchor and
+/// card sits `GUTTER` inside the work area, horizontally centred on the anchor and
 /// clamped to the screen.
 fn position_popover(window: &tauri::WebviewWindow, anchor: Option<(i32, i32)>) {
-    const POPOVER_WIDTH_LOGICAL: f64 = 360.0;
-    const POPOVER_HEIGHT_LOGICAL: f64 = 660.0;
-    const MARGIN_LOGICAL: f64 = 8.0;
+    const CARD_WIDTH_LOGICAL: f64 = 360.0;
+    const CARD_HEIGHT_LOGICAL: f64 = 660.0;
+    /// Transparent margin the page paints the card shadow into, and the gap the card
+    /// keeps from the work-area edge. One value for both: the shadow needs the room and
+    /// the card needs the inset, so the window edge is exactly where the inset ends.
+    const GUTTER_LOGICAL: f64 = 12.0;
+    const POPOVER_WIDTH_LOGICAL: f64 = CARD_WIDTH_LOGICAL + 2.0 * GUTTER_LOGICAL;
+    const POPOVER_HEIGHT_LOGICAL: f64 = CARD_HEIGHT_LOGICAL + 2.0 * GUTTER_LOGICAL;
+    const MARGIN_LOGICAL: f64 = 0.0;
 
     let point = anchor
         .filter(|(x, y)| *x > 0 || *y > 0)

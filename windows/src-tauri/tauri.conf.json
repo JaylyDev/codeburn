@@ -14,8 +14,8 @@
       {
         "label": "popover",
         "title": "CodeBurn",
-        "width": 360,
-        "height": 660,
+        "width": 384,
+        "height": 684,
         "decorations": false,
         "transparent": true,
         "resizable": false,
@@ -23,11 +23,7 @@
         "skipTaskbar": true,
         "visible": false,
         "focus": false,
-        "shadow": true,
-        "windowEffects": {
-          "effects": ["acrylic"],
-          "state": "active"
-        }
+        "shadow": false
       }
     ],
     "security": {

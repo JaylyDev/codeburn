@@ -8,9 +8,10 @@
   --ember-deep: #8B3E13;
   --ember-glow: #F0A070;
 
-  /* Light: warm popover material over the desktop. */
-  --surface: rgba(250, 247, 243, 0.94);
-  --surface-solid: #FAF7F3;
+  /* The popover card. Opaque, because the window behind it is fully transparent: the
+     card is the only thing that paints, so its border-radius is the only shape there is
+     and nothing square can bleed at the corners. */
+  --surface: #FAF7F3;
   --surface-window: #FFFFFF;
   --label: rgba(0, 0, 0, 0.85);
   --label-2: rgba(0, 0, 0, 0.50);
@@ -61,7 +62,9 @@
   --font-mono: 'Cascadia Mono', 'Cascadia Code', Consolas, 'SF Mono', Menlo, monospace;
 
   --gutter: 14px;
-  --popover-radius: 10px;
+  --popover-radius: 12px;
+  --popover-gutter: 12px;
+  --popover-shadow: 0 4px 16px rgba(0, 0, 0, 0.22), 0 1px 3px rgba(0, 0, 0, 0.12);
   --radius-bar: 2px;
   --radius-util: 3px;
   --radius-segment: 5px;
@@ -75,8 +78,7 @@
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --surface: rgba(28, 24, 22, 0.92);
-    --surface-solid: #1C1816;
+    --surface: #1C1816;
     --surface-window: #2A2320;
     --label: rgba(255, 255, 255, 0.86);
     --label-2: rgba(255, 255, 255, 0.55);
@@ -117,8 +119,7 @@
 }
 
 :root[data-theme="dark"] {
-  --surface: rgba(28, 24, 22, 0.92);
-  --surface-solid: #1C1816;
+  --surface: #1C1816;
   --surface-window: #2A2320;
   --label: rgba(255, 255, 255, 0.86);
   --label-2: rgba(255, 255, 255, 0.55);
@@ -194,14 +195,18 @@ code { font-family: var(--font-mono); }
 
 /* ---- shell ---------------------------------------------------------------------- */
 
+/* The window is 12 px larger than the card on every side and paints nothing itself, so
+   this drop shadow follows the card radius instead of the square window frame. That is
+   why the window has no DWM shadow and no DWM rounding: both trace a rectangle. */
 .popover {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  margin: var(--popover-gutter);
+  height: calc(100% - 2 * var(--popover-gutter));
   overflow: hidden;
   border-radius: var(--popover-radius);
   background: var(--surface);
-  box-shadow: inset 0 0 0 0.5px var(--separator);
+  box-shadow: var(--popover-shadow), inset 0 0 0 0.5px var(--separator);
 }
 
 .header {
