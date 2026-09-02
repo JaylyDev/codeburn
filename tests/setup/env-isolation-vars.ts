@@ -9,6 +9,9 @@
 
 export const REDIRECTED = [
   'HOME',
+  // os.homedir() reads USERPROFILE on Windows and HOME on POSIX, never both, so
+  // redirecting HOME alone still leaves Windows resolving the real home.
+  'USERPROFILE',
   'XDG_CONFIG_HOME',
   'XDG_DATA_HOME',
   'XDG_CACHE_HOME',

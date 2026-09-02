@@ -96,7 +96,7 @@ function runCli(args: string[], home: string) {
       ...process.env,
       CLAUDE_CONFIG_DIR: join(home, '.claude'),
       CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'),
-      HOME: home,
+      HOME: home, USERPROFILE: home,
       TZ: 'UTC',
     },
     encoding: 'utf-8',

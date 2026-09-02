@@ -33,8 +33,31 @@ afterEach(async () => {
   if (existsSync(TMP_DIR)) await rm(TMP_DIR, { recursive: true })
 })
 
+function queryKeyHash(queryKey: string): string {
+  return createHash('sha256').update(queryKey).digest('hex').slice(0, 16)
+}
+
+/**
+ * Make every snapshot write for `queryKey` fail while its record stays
+ * readable, until the returned callback runs.
+ *
+ * The POSIX form drops write permission on the cache dir. Windows ignores that
+ * on a directory, so the per-query write lock's path is occupied by a directory
+ * instead: the writer can never create its lock there, so it reports the cache
+ * unavailable exactly as an unwritable dir does.
+ */
+async function blockSnapshotWrites(queryKey: string): Promise<() => Promise<void>> {
+  if (process.platform !== 'win32') {
+    await chmod(TMP_DIR, 0o500)
+    return async () => { await chmod(TMP_DIR, 0o700) }
+  }
+  const lockPath = join(TMP_DIR, `status-snapshot.${queryKeyHash(queryKey)}.write.lock`)
+  await mkdir(lockPath)
+  return async () => { await rm(lockPath, { recursive: true, force: true }) }
+}
+
 async function readRawRecord(queryKey: string): Promise<Record<string, unknown> | null> {
-  const hash = createHash('sha256').update(queryKey).digest('hex').slice(0, 16)
+  const hash = queryKeyHash(queryKey)
   try {
     const raw = await readFile(join(TMP_DIR, `status-snapshot.${hash}.json`), 'utf-8')
     return JSON.parse(raw) as Record<string, unknown>
@@ -110,7 +133,7 @@ describe('concurrent writers (status snapshot)', () => {
     process.env['CODEBURN_STATUS_SNAPSHOT_SETTLE_MS'] = '20'
     await saveStatusSnapshot('before', 1_000, 1_000, queryKey, SEMANTIC_KEY, { p: 'stale' })
 
-    await chmod(TMP_DIR, 0o500)
+    const unblock = await blockSnapshotWrites(queryKey)
     try {
       expect(await loadStatusSnapshot('after', queryKey, SEMANTIC_KEY)).toBeNull()
       await new Promise(resolve => { setTimeout(resolve, 40) })
@@ -118,7 +141,7 @@ describe('concurrent writers (status snapshot)', () => {
       // resetting the settle clock on every poll serves stale indefinitely.
       expect(await loadStatusSnapshot('after', queryKey, SEMANTIC_KEY)).toBeNull()
     } finally {
-      await chmod(TMP_DIR, 0o700)
+      await unblock()
       delete process.env['CODEBURN_STATUS_SNAPSHOT_SETTLE_MS']
     }
   })
@@ -221,7 +244,7 @@ function cliEnv(home: string, extraEnv: Record<string, string> = {}): NodeJS.Pro
     ...process.env,
     CLAUDE_CONFIG_DIR: join(home, '.claude'),
     CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'),
-    HOME: home,
+    HOME: home, USERPROFILE: home,
     TZ: 'UTC',
     ...extraEnv,
   }

@@ -28,7 +28,7 @@ function runCli(args: string[], home: string, extraEnv: Record<string, string | 
       ...process.env,
       CLAUDE_CONFIG_DIR: join(home, '.claude'),
       CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'),
-      HOME: home,
+      HOME: home, USERPROFILE: home,
       TZ: 'UTC',
       ...extraEnv,
     },
@@ -791,7 +791,9 @@ describe('codeburn status --format menubar-json', () => {
       // paths, so it must land group/world-unreadable regardless of umask.
       const snapshotFiles = findSnapshotFiles(join(home, '.cache', 'codeburn'))
       expect(snapshotFiles).toHaveLength(1)
-      expect(statSync(snapshotFiles[0]!).mode & 0o777).toBe(0o600)
+      // Windows has no POSIX mode bits: NTFS reports 0o666 whatever mode open()
+      // was handed, so owner-only permission is only assertable on POSIX.
+      if (process.platform !== 'win32') expect(statSync(snapshotFiles[0]!).mode & 0o777).toBe(0o600)
 
       // Identical query against an unchanged corpus: served from the
       // snapshot, byte-identical to the first call.

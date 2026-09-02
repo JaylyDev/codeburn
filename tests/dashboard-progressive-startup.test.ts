@@ -22,6 +22,7 @@ import { clearSessionCache, filesParsedFromSourceCount, isCompleteSessionSnapsho
 import { clearLoadCacheMemo, fingerprintFileCount, isColdCacheOnDisk } from '../src/session-cache.js'
 import { buildDurablePeriod } from '../src/usage-aggregator.js'
 import type { ProjectSummary } from '../src/types.js'
+import { setHome } from './setup/home.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -32,7 +33,7 @@ beforeEach(async () => {
   clearSessionCache()
   clearLoadCacheMemo()
   tmpDir = await mkdtemp(join(tmpdir(), 'dashboard-progressive-'))
-  process.env['HOME'] = tmpDir
+  setHome(tmpDir)
   process.env['CLAUDE_CONFIG_DIR'] = tmpDir
   process.env['CODEBURN_CACHE_DIR'] = join(tmpDir, 'cache')
   process.env['CODEBURN_DESKTOP_SESSIONS_DIR'] = join(tmpDir, 'desktop-sessions')
@@ -44,8 +45,8 @@ afterEach(async () => {
   delete process.env['CLAUDE_CONFIG_DIR']
   delete process.env['CODEBURN_CACHE_DIR']
   delete process.env['CODEBURN_DESKTOP_SESSIONS_DIR']
-  if (originalHome == null) delete process.env['HOME']
-  else process.env['HOME'] = originalHome
+  if (originalHome == null) setHome(undefined)
+  else setHome(originalHome)
   await rm(tmpDir, { recursive: true, force: true })
 })
 

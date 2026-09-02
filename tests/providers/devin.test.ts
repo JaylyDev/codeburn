@@ -6,12 +6,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { isSqliteAvailable } from '../../src/sqlite.js'
 import { createDevinProvider } from '../../src/providers/devin.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
+import { setHome } from '../setup/home.js'
 
 let tmpDir: string
 
 beforeEach(async () => {
   tmpDir = await mkdtemp(join(tmpdir(), 'devin-provider-'))
-  process.env['HOME'] = tmpDir
+  setHome(tmpDir)
 })
 
 afterEach(async () => {

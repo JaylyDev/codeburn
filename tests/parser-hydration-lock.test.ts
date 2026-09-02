@@ -17,6 +17,10 @@ import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.j
 let tmpHome: string
 let cacheDir: string
 
+// A pid that is alive and is not us. pid 1 is init on POSIX but does not exist
+// on Windows, where probing it reports ESRCH and the lock would read as dead.
+const LIVE_FOREIGN_PID = process.ppid
+
 function lockPath(): string {
   return join(cacheDir, 'hydrating.lock')
 }
@@ -84,9 +88,8 @@ describe('parseAllSessions hydration lock', () => {
     await rm(sessionCacheDir(), { recursive: true })
     clearSessionCache()
 
-    // A fresh lock held by another live process (pid 1 is always alive and is
-    // not us). The cold parse must block on it.
-    await writeFile(lockPath(), JSON.stringify({ pid: 1, at: Date.now() }))
+    // A fresh lock held by another live process. The cold parse must block on it.
+    await writeFile(lockPath(), JSON.stringify({ pid: LIVE_FOREIGN_PID, at: Date.now() }))
 
     let resolved = false
     const promise = parseAllSessions(undefined, 'claude').then(r => { resolved = true; return r })
@@ -113,7 +116,7 @@ describe('parseAllSessions hydration lock', () => {
     // A stale lock (timestamp well past the freshness window) must be ignored,
     // replaced, and the parse proceeds normally.
     await mkdir(cacheDir, { recursive: true })
-    await writeFile(lockPath(), JSON.stringify({ pid: 1, at: Date.now() - 20 * 60_000 }))
+    await writeFile(lockPath(), JSON.stringify({ pid: LIVE_FOREIGN_PID, at: Date.now() - 20 * 60_000 }))
 
     const result = await parseAllSessions(undefined, 'claude')
     expect(totalOutput(result)).toBe(50)
@@ -141,8 +144,8 @@ describe('parseAllSessions hydration lock', () => {
     await writeClaudeSession(50)
     await mkdir(cacheDir, { recursive: true })
 
-    // A fresh lock held by a live process (pid 1): the cold parse starts waiting.
-    await writeFile(lockPath(), JSON.stringify({ pid: 1, at: Date.now() }))
+    // A fresh lock held by a live process: the cold parse starts waiting.
+    await writeFile(lockPath(), JSON.stringify({ pid: LIVE_FOREIGN_PID, at: Date.now() }))
     let resolved = false
     const promise = parseAllSessions(undefined, 'claude').then(r => { resolved = true; return r })
     await delay(60)
