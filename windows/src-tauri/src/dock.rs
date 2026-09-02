@@ -787,29 +787,38 @@ fn spawn_pointer_tracking(app: AppHandle) {
 }
 
 pub fn show(app: &AppHandle) -> tauri::Result<()> {
-    if let Some(existing) = app.get_webview_window(DOCK_LABEL) {
-        existing.show()?;
-        return Ok(());
-    }
+    // A window under this label can survive a `hide` for a moment, since the destroy is
+    // processed by the event loop rather than at the call. Reuse it when it is there: two
+    // windows with one label is not a state this module can hold.
+    let existing = app.get_webview_window(DOCK_LABEL);
+    let created = existing.is_none();
+    let window = match existing {
+        Some(window) => window,
+        None => {
+            let builder = WebviewWindowBuilder::new(app, DOCK_LABEL, WebviewUrl::default())
+                .title("CodeBurn Capacity Dock")
+                .inner_size(RAIL_WIDTH as f64, rail_length(1, RAIL_ALONG_PAD + FLARE_COMPENSATION) as f64)
+                .decorations(false)
+                .resizable(false)
+                .always_on_top(true)
+                .skip_taskbar(true)
+                .focused(false)
+                .shadow(false)
+                .visible(false);
 
-    let builder = WebviewWindowBuilder::new(app, DOCK_LABEL, WebviewUrl::default())
-        .title("CodeBurn Capacity Dock")
-        .inner_size(RAIL_WIDTH as f64, rail_length(1, RAIL_ALONG_PAD + FLARE_COMPENSATION) as f64)
-        .decorations(false)
-        .resizable(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .focused(false)
-        .shadow(false)
-        .visible(false);
+            // The page draws its own card shapes, so the window behind them has to be
+            // see-through. `transparent` is only compiled in off macOS, where it needs the
+            // private-API feature.
+            #[cfg(not(target_os = "macos"))]
+            let builder = builder.transparent(true);
 
-    // The page draws its own card shapes, so the window behind them has to be see-through.
-    // `transparent` is only compiled in off macOS, where it needs the private-API feature.
-    #[cfg(not(target_os = "macos"))]
-    let builder = builder.transparent(true);
+            builder.build()?
+        }
+    };
 
-    let window = builder.build()?;
-
+    // Reset before laying out either way: `relayout` only moves the window when the frame it
+    // computes differs from the stored one, so a stale frame from the last time the dock was
+    // on would leave a fresh window sitting at its builder size in the corner.
     {
         let mut state = lock();
         *state = DockState::default();
@@ -818,23 +827,30 @@ pub fn show(app: &AppHandle) -> tauri::Result<()> {
     }
     relayout(&window);
     window.show()?;
-    #[cfg(target_os = "windows")]
-    spawn_pointer_tracking(app.clone());
+    if created {
+        #[cfg(target_os = "windows")]
+        spawn_pointer_tracking(app.clone());
+    }
     #[cfg(debug_assertions)]
     {
-        eprintln!("codeburn dock: window created and shown");
-        if std::env::var_os("CODEBURN_DOCK_DEVTOOLS").is_some() {
+        eprintln!("codeburn dock: window {} and shown", if created { "created" } else { "reused" });
+        if created && std::env::var_os("CODEBURN_DOCK_DEVTOOLS").is_some() {
             window.open_devtools();
         }
     }
     Ok(())
 }
 
-/// Closing rather than hiding is deliberate: a hidden webview keeps rendering, which is what
-/// cost the macOS popover 6% idle CPU.
+/// Destroying rather than hiding is deliberate: a hidden webview keeps rendering, which is
+/// what cost the macOS popover 6% idle CPU.
+///
+/// `destroy` rather than `close`, because close only *asks*: it posts a CloseRequested event
+/// and the window leaves the manager some time later. Switching the dock off and straight
+/// back on then found the dying window still under its label and only re-showed it, which
+/// left the rail invisible until the next launch.
 pub fn hide(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(DOCK_LABEL) {
-        let _ = window.close();
+        let _ = window.destroy();
     }
 }
 

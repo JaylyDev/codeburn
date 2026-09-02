@@ -904,8 +904,12 @@ mod commands {
     /// Writes dock preferences and brings the window in line with them. `enabled` is the one
     /// key with a side effect, since it creates or destroys the dock window; everything else
     /// only has to reach the page, which the event does.
+    ///
+    /// `async` matters: a synchronous command runs on the main thread, and building a window
+    /// from there waits on the event loop that is already busy running this call, so the dock
+    /// simply never came back. On the async runtime the build is dispatched and answered.
     #[tauri::command]
-    pub fn set_dock_prefs(
+    pub async fn set_dock_prefs(
         app: AppHandle,
         patch: serde_json::Map<String, Value>,
     ) -> Result<Value, String> {
@@ -922,9 +926,14 @@ mod commands {
         Ok(value)
     }
 
-    /// The popover's More menu and the tray both come through here.
+    /// The popover's More menu comes through here; the tray items call `settings::open`
+    /// directly from the menu handler. `async` for the same reason as `set_dock_prefs`: a
+    /// window cannot be built from the main thread while a command is holding it.
     #[tauri::command]
-    pub fn open_settings_window(app: AppHandle, section: Option<String>) -> Result<(), String> {
+    pub async fn open_settings_window(
+        app: AppHandle,
+        section: Option<String>,
+    ) -> Result<(), String> {
         crate::settings::open(&app, section.as_deref()).map_err(|e| e.to_string())
     }
 
