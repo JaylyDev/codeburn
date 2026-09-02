@@ -16,7 +16,7 @@ import { scanUserCorrections, medianTimeToFirstEditMs, aggregateFileChurn, compu
 import { buildPrAttribution, aggregateByBranch } from './sessions-report.js'
 import { scanAndDetect } from './optimize.js'
 import { callBillableOutputTokens, sessionBillableOutputTokens } from './session-output.js'
-import { getDaysInRange, ensureCacheHydrated, loadDailyCache, emptyCache, BACKFILL_DAYS, toDateString, type DailyCache, type DailyEntry, type ProjectDayStats, type ProviderDaySlice } from './daily-cache.js'
+import { getDaysInRange, ensureCacheHydrated, loadDailyCache, emptyCache, mergeDayEntries, BACKFILL_DAYS, toDateString, type DailyCache, type DailyEntry, type ProjectDayStats, type ProviderDaySlice } from './daily-cache.js'
 import { buildGranularHistory } from './granular-history.js'
 
 // Row caps for the by-PR / by-branch payload aggregations, ranked by cost.
@@ -284,21 +284,33 @@ function sliceDayToProvider(day: DailyEntry, provider: string): DailyEntry {
 }
 
 /// Overlay surviving provider-scoped source data onto the durable all-provider
-/// cache without touching unrelated providers. A fresh slice wins for its date;
-/// a missing fresh slice keeps the cached provider history because its source
-/// may simply have aged out. The result is provider-sliced so headline and
-/// history consumers cannot accidentally count unrelated providers.
+/// cache without touching unrelated providers. The result is provider-sliced so
+/// headline and history consumers cannot accidentally count unrelated providers.
+///
+/// A settled day's sources age off disk continuously, so a fresh
+/// provider-scoped parse of a historical date is a LOWER BOUND, not a
+/// correction. Setting it unconditionally (what this did) replaced finalized
+/// cache days with whatever the shrunken parse could still see, so the scoped
+/// view reported a fraction of the day the all-provider view served off the
+/// same cache.
+///
+/// The rule is therefore: fresh may FILL a (date, provider) the cache lacks,
+/// and wins on any day still inside the settle window, but it may never SHRINK
+/// a settled day the cache already holds. That is exactly mergeDayEntries with
+/// guardPartialSurvival, whose argument order matters: `fresh` is primary and
+/// the cache baseline is secondary, so the guard reads the shrink in the
+/// direction it expects. Filling still has to work, because on a cold cache
+/// the scoped parse is the only source a historical day has.
 export function overlayProviderDaySlices(
   baseline: DailyEntry[],
   fresh: DailyEntry[],
   provider: string,
 ): DailyEntry[] {
-  const byDate = new Map(baseline.map(day => [day.date, sliceDayToProvider(day, provider)]))
-  for (const day of fresh) {
-    if (!Object.hasOwn(day.providers, provider)) continue
-    byDate.set(day.date, sliceDayToProvider(day, provider))
-  }
-  return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date))
+  const freshSliced = fresh
+    .filter(day => Object.hasOwn(day.providers, provider))
+    .map(day => sliceDayToProvider(day, provider))
+  const sliced = baseline.map(day => sliceDayToProvider(day, provider))
+  return mergeDayEntries(freshSliced, sliced, false, undefined, true)
 }
 
 /// Does a cached day's project entry pass the active name filters? Mirrors
