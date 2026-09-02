@@ -919,6 +919,9 @@ mod commands {
             // reporting the value we asked for and a failed write nobody saw.
             merged = crate::dock::read_prefs();
         }
+        // The rail's own window is sized from the scale, so the geometry has to be redone
+        // here; the page re-renders from the event.
+        crate::dock::prefs_changed(&app);
         let value = Value::Object(merged);
         let _ = app.emit("codeburn://dock-settings-changed", &value);
         Ok(value)

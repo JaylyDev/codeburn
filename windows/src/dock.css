@@ -1,7 +1,9 @@
 /* Capacity Dock, the Windows twin of mac/Sources/CodeBurnMenubar/Views/CapacityDockView.swift.
-   Metrics come from src/dockGeometry.ts (the mac values at its 0.6 default scale) and the
-   window that holds them is sized in src-tauri/src/dock.rs; all three stay in step. The dock is
-   always the mac's dark graphite surface, whichever theme the popover is in. */
+   Metrics come from src/dockGeometry.ts (mac base values times the size scale) and the window
+   that holds them is sized in src-tauri/src/dock.rs; all three stay in step. Anything a rule
+   needs rather than an element arrives as a --dock-* variable on .dock, so the whole rail
+   follows the size setting. The dock is always the mac's dark graphite palette, whichever
+   theme the popover is in and whichever surface is behind it. */
 
 :root {
   /* Warm off-white: a mild orange tint so bright labels on the dark card read softer. */
@@ -51,7 +53,7 @@
   position: absolute;
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--dock-row-gap);
 }
 
 .dock-row {
@@ -63,12 +65,11 @@
   color: inherit;
   font: inherit;
   cursor: default;
-  height: 50px;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 4px;
+  gap: var(--dock-ring-gap);
 }
 
 .dock-row:focus-visible {
@@ -77,16 +78,16 @@
 
 .dock-gauge {
   position: relative;
-  width: 31px;
-  height: 31px;
+  width: var(--dock-gauge-size);
+  height: var(--dock-gauge-size);
   display: grid;
   place-items: center;
 }
 
 .dock-ring {
   position: absolute;
-  top: -3px;
-  left: -3px;
+  top: calc(-1 * var(--dock-ring-margin));
+  left: calc(-1 * var(--dock-ring-margin));
   overflow: visible;
 }
 
@@ -107,19 +108,19 @@
 
 .dock-row-alert {
   position: absolute;
-  top: -3px;
-  right: -3px;
-  width: 8px;
-  height: 8px;
+  top: var(--dock-alert-inset);
+  right: var(--dock-alert-inset);
+  width: var(--dock-alert-size);
+  height: var(--dock-alert-size);
   border-radius: 50%;
   background: var(--dock-red);
   box-shadow: 0 0 0 1.5px #000;
 }
 
 .dock-pct {
-  font-size: 10px;
+  font-size: var(--dock-pct-size);
   font-weight: 500;
-  line-height: 12px;
+  line-height: 1.2;
   font-variant-numeric: tabular-nums;
   color: var(--dock-text);
 }
@@ -174,13 +175,13 @@
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--dock-detail-gap);
 }
 
 .dock-detail-head {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--dock-detail-head-gap);
 }
 
 .dock-detail-glyph {
@@ -215,7 +216,7 @@
 .dock-conn-block {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: var(--dock-detail-block-gap);
 }
 
 .dock-conn.is-loading {
@@ -252,14 +253,14 @@
 .dock-window {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: var(--dock-detail-row-gap);
 }
 
 .dock-window-top {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 7px;
+  gap: var(--dock-detail-head-gap);
   font-size: 12px;
   font-weight: 500;
 }
@@ -274,7 +275,7 @@
 }
 
 .dock-track {
-  height: 5px;
+  height: var(--dock-detail-bar);
   border-radius: 999px;
   background: rgba(250, 242, 230, 0.14);
   overflow: hidden;

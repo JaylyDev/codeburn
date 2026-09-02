@@ -364,8 +364,8 @@ function CapacityDockSection({ quota }: { quota: QuotaState }) {
         })
       )}
       <Note>
-        Size, appearance and gauge shape are stored now and the rail picks them up with the
-        Capacity Dock work that follows this one.
+        Appearance and gauge shape are stored now and the rail picks them up with the Capacity
+        Dock work that follows this one.
       </Note>
     </Group>
   )

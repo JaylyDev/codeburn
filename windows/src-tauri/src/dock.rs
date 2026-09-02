@@ -21,23 +21,71 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub const DOCK_LABEL: &str = "dock";
 
-/// Whole-point metrics at the macOS dock's default 0.6 scale, the same numbers as
-/// `src/dockGeometry.ts`. Fractional sizes cost the mac app 5-7% idle CPU by making the
-/// hosting view re-lay itself out forever, so every value here stays an integer.
-const RAIL_WIDTH: i32 = 53;
-/// Horizontal rails stack the ring above its label, so their cross-extent needs more room.
-const HORIZONTAL_RAIL_WIDTH: i32 = 64;
-const ROW_HEIGHT: i32 = 50;
-const ROW_SPACING: i32 = 7;
-const RAIL_ALONG_PAD: i32 = 12;
-/// 60% of the 31 shoulder depth: a docked rail pads its ends so content never crowds the flare.
-const FLARE_COMPENSATION: i32 = 19;
-const DETAIL_WIDTH: i32 = 315;
-/// The mac caps its bubble at 470 points times the 0.9 detail scale.
-const DETAIL_MAX_HEIGHT: i32 = 423;
+/// The size scale the settings window writes, from CapacityDockPreferences.scaleRange.
+pub const MIN_SCALE: f64 = 0.6;
+pub const MAX_SCALE: f64 = 1.2;
+/// The bubble never shrinks with the rail: below 90% its type stops being readable.
+const MIN_DETAIL_SCALE: f64 = 0.9;
+
+/// The mac's base metrics times the size scale, the same arithmetic as `src/dockGeometry.ts`.
+/// Fractional sizes cost the mac app 5-7% idle CPU by making the hosting view re-lay itself
+/// out forever, so every value here is a whole pixel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Metrics {
+    rail_width: i32,
+    /// Horizontal rails stack the ring above its label, so their cross-extent needs more room.
+    horizontal_rail_width: i32,
+    row_height: i32,
+    row_spacing: i32,
+    rail_along_pad: i32,
+    /// 60% of the shoulder depth: a docked rail pads its ends so content never crowds the flare.
+    flare_compensation: i32,
+    detail_width: i32,
+    /// The mac caps its bubble at 470 points times the detail scale.
+    detail_max_height: i32,
+    /// How far past either end of the rail a bubble centred on an end row can reach.
+    detail_overhang: i32,
+}
+
+fn points(base: f64, scale: f64) -> i32 {
+    ((base * scale).round() as i32).max(1)
+}
+
+impl Metrics {
+    pub fn for_scale(scale: f64) -> Metrics {
+        let scale = if scale.is_finite() { scale.clamp(MIN_SCALE, MAX_SCALE) } else { MIN_SCALE };
+        let detail = scale.max(MIN_DETAIL_SCALE);
+        Metrics {
+            rail_width: points(88.0, scale),
+            horizontal_rail_width: points(106.0, scale),
+            row_height: points(84.0, scale),
+            row_spacing: points(12.0, scale),
+            rail_along_pad: points(20.0, scale),
+            flare_compensation: (points(52.0, scale) as f64 * 0.6).round() as i32,
+            detail_width: points(350.0, detail),
+            detail_max_height: points(470.0, detail),
+            detail_overhang: points(178.0, detail),
+        }
+    }
+
+    fn from_prefs() -> Metrics {
+        Metrics::for_scale(
+            read_state()
+                .get("scale")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(MIN_SCALE),
+        )
+    }
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Metrics::for_scale(MIN_SCALE)
+    }
+}
+
+/// Placement constants the mac keeps out of its scaled metrics (CapacityDockPlacement).
 const DETAIL_GAP: i32 = 10;
-/// How far past either end of the rail a bubble centred on an end row can reach.
-const DETAIL_OVERHANG: i32 = 160;
 /// The rail's resting top edge sits this far below the top of the work area.
 const DEFAULT_TOP_OFFSET: i32 = 156;
 const EDGE_INSET: i32 = 12;
@@ -188,14 +236,13 @@ pub struct DockFrame {
     pub native_pointer: bool,
 }
 
-fn rail_length(rows: u32, pad: i32) -> i32 {
-    let rows = rows.max(1) as i32;
-    pad * 2 + rows * ROW_HEIGHT + (rows - 1) * ROW_SPACING
+fn rail_length(m: &Metrics, rows: u32, pad: i32) -> i32 {
+    pad * 2 + rows_extent(m, rows)
 }
 
-fn rows_extent(rows: u32) -> i32 {
+fn rows_extent(m: &Metrics, rows: u32) -> i32 {
     let rows = rows.max(1) as i32;
-    rows * ROW_HEIGHT + (rows - 1) * ROW_SPACING
+    rows * m.row_height + (rows - 1) * m.row_spacing
 }
 
 fn denormalize(norm: Option<f64>, low: i32, high: i32, fallback: i32) -> i32 {
@@ -215,13 +262,13 @@ fn normalize(value: i32, low: i32, high: i32) -> f64 {
 }
 
 /// Pure layout in logical pixels. `area` is the monitor work area.
-pub fn layout(area: Rect, placement: &Placement, request: &LayoutRequest) -> DockFrame {
+pub fn layout(area: Rect, placement: &Placement, request: &LayoutRequest, m: &Metrics) -> DockFrame {
     let edge = placement.attachment;
     let vertical = edge.is_vertical();
     let docked = placement.docked.is_some();
-    let pad = RAIL_ALONG_PAD + if docked { FLARE_COMPENSATION } else { 0 };
-    let cross = if vertical { RAIL_WIDTH } else { HORIZONTAL_RAIL_WIDTH };
-    let rest_len = rail_length(1, pad);
+    let pad = m.rail_along_pad + if docked { m.flare_compensation } else { 0 };
+    let cross = if vertical { m.rail_width } else { m.horizontal_rail_width };
+    let rest_len = rail_length(m, 1, pad);
 
     // Along axis: y for vertical rails, x for horizontal ones. Cross axis is the other.
     let (area_along, area_along_len, area_cross, area_cross_len) = if vertical {
@@ -257,7 +304,7 @@ pub fn layout(area: Rect, placement: &Placement, request: &LayoutRequest) -> Doc
         Anchor::End
     };
     let rail_along = |rows: u32| -> (i32, i32) {
-        let len = rail_length(rows, pad);
+        let len = rail_length(m, rows, pad);
         let high = (area_along + area_along_len - EDGE_INSET - len).max(along_low);
         let start = match anchor {
             Anchor::Start => rest_start,
@@ -295,11 +342,12 @@ pub fn layout(area: Rect, placement: &Placement, request: &LayoutRequest) -> Doc
 
     // The window: the fully expanded rail, plus the bubble's reach on its side and past both
     // ends. Everything outside the painted shapes is click-through.
-    let reach = DETAIL_GAP + if vertical { DETAIL_WIDTH } else { DETAIL_MAX_HEIGHT };
+    let reach = DETAIL_GAP + if vertical { m.detail_width } else { m.detail_max_height };
+    let overhang = m.detail_overhang;
     let mut window = if vertical {
-        Rect { x: full.x, y: full.y - DETAIL_OVERHANG, w: full.w, h: full.h + DETAIL_OVERHANG * 2 }
+        Rect { x: full.x, y: full.y - overhang, w: full.w, h: full.h + overhang * 2 }
     } else {
-        Rect { x: full.x - DETAIL_OVERHANG, y: full.y, w: full.w + DETAIL_OVERHANG * 2, h: full.h }
+        Rect { x: full.x - overhang, y: full.y, w: full.w + overhang * 2, h: full.h }
     };
     match bubble_side {
         Edge::Left => {
@@ -317,12 +365,12 @@ pub fn layout(area: Rect, placement: &Placement, request: &LayoutRequest) -> Doc
 
     let rows_start = match anchor {
         Anchor::Start => rail_start + pad,
-        Anchor::End => rail_start + rail_len - pad - rows_extent(shown_rows),
+        Anchor::End => rail_start + rail_len - pad - rows_extent(m, shown_rows),
     };
     let detail = request.detail.map(|d| {
-        let w = DETAIL_WIDTH.min(window.w);
-        let h = d.height.clamp(1, DETAIL_MAX_HEIGHT).min(window.h);
-        let row_mid = rows_start + d.row as i32 * (ROW_HEIGHT + ROW_SPACING) + ROW_HEIGHT / 2;
+        let w = m.detail_width.min(window.w);
+        let h = d.height.clamp(1, m.detail_max_height).min(window.h);
+        let row_mid = rows_start + d.row as i32 * (m.row_height + m.row_spacing) + m.row_height / 2;
         let desired = match bubble_side {
             Edge::Left => Rect { x: rail.x - DETAIL_GAP - w, y: row_mid - h / 2, w, h },
             Edge::Right => Rect { x: rail.right() + DETAIL_GAP, y: row_mid - h / 2, w, h },
@@ -493,6 +541,7 @@ struct Drag {
 #[derive(Default)]
 struct DockState {
     placement: Option<Placement>,
+    metrics: Metrics,
     request: LayoutRequest,
     frame: Option<DockFrame>,
     area: Rect,
@@ -504,6 +553,19 @@ struct DockState {
 
 static STATE: Mutex<DockState> = Mutex::new(DockState {
     placement: None,
+    // Replaced from the stored scale the moment the window is created; the const initializer
+    // cannot call `Metrics::for_scale`, so the default rounding is spelled out here.
+    metrics: Metrics {
+        rail_width: 53,
+        horizontal_rail_width: 64,
+        row_height: 50,
+        row_spacing: 7,
+        rail_along_pad: 12,
+        flare_compensation: 19,
+        detail_width: 315,
+        detail_max_height: 423,
+        detail_overhang: 160,
+    },
     request: LayoutRequest { rows: 1, total_rows: 1, expanded: false, detail: None },
     frame: None,
     area: Rect { x: 0, y: 0, w: 0, h: 0 },
@@ -581,7 +643,8 @@ fn relayout(window: &tauri::WebviewWindow) -> Option<DockFrame> {
     let (area, scale) = work_area(window)?;
     let mut state = lock();
     let placement = *state.placement.get_or_insert_with(load_placement);
-    let frame = layout(area, &placement, &state.request);
+    let metrics = state.metrics;
+    let frame = layout(area, &placement, &state.request, &metrics);
     #[cfg(debug_assertions)]
     let (request_rows, request_total, request_expanded) = (state.request.rows, state.request.total_rows, state.request.expanded);
     let moved = state.frame.map(|f| f.window) != Some(frame.window);
@@ -741,14 +804,15 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) {
 
     let rail = frame.rail.offset(frame.window.x, frame.window.y);
     let rail_hovered = rail.contains(cursor.0, cursor.1);
+    let metrics = state.metrics;
     let row = rail_hovered.then(|| {
         let along = if frame.vertical { cursor.1 } else { cursor.0 } - frame.rows_start;
         if along < 0 {
             return None;
         }
-        let period = ROW_HEIGHT + ROW_SPACING;
+        let period = metrics.row_height + metrics.row_spacing;
         let slot = along / period;
-        (slot < frame.rows as i32 && along - slot * period < ROW_HEIGHT).then_some(slot as u32)
+        (slot < frame.rows as i32 && along - slot * period < metrics.row_height).then_some(slot as u32)
     }).flatten();
     let detail_hovered = frame
         .detail
@@ -795,9 +859,13 @@ pub fn show(app: &AppHandle) -> tauri::Result<()> {
     let window = match existing {
         Some(window) => window,
         None => {
+            let metrics = Metrics::from_prefs();
             let builder = WebviewWindowBuilder::new(app, DOCK_LABEL, WebviewUrl::default())
                 .title("CodeBurn Capacity Dock")
-                .inner_size(RAIL_WIDTH as f64, rail_length(1, RAIL_ALONG_PAD + FLARE_COMPENSATION) as f64)
+                .inner_size(
+                    metrics.rail_width as f64,
+                    rail_length(&metrics, 1, metrics.rail_along_pad + metrics.flare_compensation) as f64,
+                )
                 .decorations(false)
                 .resizable(false)
                 .always_on_top(true)
@@ -822,6 +890,7 @@ pub fn show(app: &AppHandle) -> tauri::Result<()> {
     {
         let mut state = lock();
         *state = DockState::default();
+        state.metrics = Metrics::from_prefs();
         state.request = LayoutRequest { rows: 1, total_rows: 1, expanded: false, detail: None };
         state.scale = 1.0;
     }
@@ -839,6 +908,21 @@ pub fn show(app: &AppHandle) -> tauri::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Re-reads the preferences the geometry depends on and brings the window in line with them.
+/// The page re-renders from the same event, but the window it paints into is sized here.
+pub fn prefs_changed(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(DOCK_LABEL) else { return };
+    let metrics = Metrics::from_prefs();
+    {
+        let mut state = lock();
+        if state.metrics == metrics {
+            return;
+        }
+        state.metrics = metrics;
+    }
+    relayout(&window);
 }
 
 /// Destroying rather than hiding is deliberate: a hidden webview keeps rendering, which is
@@ -878,6 +962,11 @@ mod tests {
 
     const AREA: Rect = Rect { x: 0, y: 0, w: 1600, h: 852 };
 
+    /// The default size, whose numbers the stylesheet and `src/dockGeometry.ts` also carry.
+    fn small() -> Metrics {
+        Metrics::for_scale(MIN_SCALE)
+    }
+
     fn request(rows: u32, expanded: bool, detail: Option<DetailRequest>) -> LayoutRequest {
         LayoutRequest { rows, total_rows: rows, expanded, detail }
     }
@@ -887,9 +976,48 @@ mod tests {
     }
 
     #[test]
+    fn every_metric_is_a_mac_base_times_the_scale_on_a_whole_pixel() {
+        let m = small();
+        assert_eq!(
+            (m.rail_width, m.horizontal_rail_width, m.row_height, m.row_spacing),
+            (53, 64, 50, 7)
+        );
+        assert_eq!((m.rail_along_pad, m.flare_compensation), (12, 19));
+        assert_eq!((m.detail_width, m.detail_max_height, m.detail_overhang), (315, 423, 160));
+
+        let full = Metrics::for_scale(1.0);
+        assert_eq!((full.rail_width, full.row_height, full.row_spacing), (88, 84, 12));
+        assert_eq!(full.flare_compensation, 31);
+        // The bubble never shrinks with the rail, so it is unchanged at full size.
+        assert_eq!((full.detail_width, full.detail_max_height), (350, 470));
+
+        let big = Metrics::for_scale(MAX_SCALE);
+        assert_eq!((big.rail_width, big.row_height), (106, 101));
+        assert_eq!((big.detail_width, big.detail_max_height), (420, 564));
+        // Out-of-range and nonsense scales land back inside the range rather than collapsing.
+        assert_eq!(Metrics::for_scale(4.0), big);
+        assert_eq!(Metrics::for_scale(f64::NAN), small());
+    }
+
+    #[test]
+    fn a_bigger_scale_grows_the_rail_and_the_window_it_lives_in() {
+        let small_frame = layout(AREA, &Placement::default(), &request(3, true, None), &small());
+        let big = Metrics::for_scale(MAX_SCALE);
+        let big_frame = layout(AREA, &Placement::default(), &request(3, true, None), &big);
+        assert_eq!(small_frame.rail.w, 53);
+        assert_eq!(big_frame.rail.w, 106);
+        assert_eq!(big_frame.along_pad, 24 + 37);
+        assert_eq!(big_frame.rail.h, big_frame.along_pad * 2 + 3 * 101 + 2 * 14);
+        assert_eq!(big_frame.window.w, 420 + DETAIL_GAP + 106);
+        assert!(big_frame.window.h > small_frame.window.h);
+        // Both stay flush with the right edge they are docked to.
+        assert_eq!(rail_on_screen(&big_frame).right(), AREA.right());
+    }
+
+    #[test]
     fn resting_rail_hugs_the_right_edge_below_the_default_offset() {
-        let frame = layout(AREA, &Placement::default(), &request(1, false, None));
-        assert_eq!(rail_on_screen(&frame), Rect { x: 1600 - RAIL_WIDTH, y: 156, w: RAIL_WIDTH, h: 112 });
+        let frame = layout(AREA, &Placement::default(), &request(1, false, None), &small());
+        assert_eq!(rail_on_screen(&frame), Rect { x: 1600 - 53, y: 156, w: 53, h: 112 });
         assert_eq!(frame.anchor, Anchor::Start);
         assert_eq!(frame.bubble_side, Edge::Left);
         assert!(frame.docked && frame.vertical);
@@ -899,66 +1027,96 @@ mod tests {
 
     #[test]
     fn the_window_is_sized_for_the_full_rail_and_the_bubble_and_does_not_move_on_hover() {
-        let rest = layout(AREA, &Placement::default(), &LayoutRequest { rows: 1, total_rows: 3, expanded: false, detail: None });
-        let expanded = layout(AREA, &Placement::default(), &LayoutRequest { rows: 3, total_rows: 3, expanded: true, detail: Some(DetailRequest { row: 0, height: 200 }) });
+        let m = small();
+        let rest = layout(
+            AREA,
+            &Placement::default(),
+            &LayoutRequest { rows: 1, total_rows: 3, expanded: false, detail: None },
+            &m,
+        );
+        let expanded = layout(
+            AREA,
+            &Placement::default(),
+            &LayoutRequest { rows: 3, total_rows: 3, expanded: true, detail: Some(DetailRequest { row: 0, height: 200 }) },
+            &m,
+        );
         assert_eq!(rest.window, expanded.window);
         assert_eq!(rest.window.right(), 1600);
-        assert_eq!(rest.window.w, DETAIL_WIDTH + DETAIL_GAP + RAIL_WIDTH);
+        assert_eq!(rest.window.w, m.detail_width + DETAIL_GAP + m.rail_width);
         // The overhang above the rail is cut by the top of the work area.
         assert_eq!(rest.window.y, 0);
         assert_eq!(rest.rail.y, 156);
-        assert_eq!(rest.window.h, expanded.rail.h + DETAIL_OVERHANG * 2);
+        assert_eq!(rest.window.h, expanded.rail.h + m.detail_overhang * 2);
         assert_eq!(expanded.rail.h, 31 * 2 + 3 * 50 + 2 * 7);
     }
 
     #[test]
     fn a_short_work_area_anchors_at_the_end_and_grows_upward() {
+        let m = small();
         let area = Rect { x: 0, y: 0, w: 1280, h: 400 };
-        let rest = layout(area, &Placement::default(), &request(1, false, None));
-        let expanded = layout(area, &Placement::default(), &request(3, true, None));
+        let rest = layout(area, &Placement::default(), &request(1, false, None), &m);
+        let expanded = layout(area, &Placement::default(), &request(3, true, None), &m);
         assert_eq!(rest.anchor, Anchor::End);
         assert_eq!(rail_on_screen(&expanded).bottom(), rail_on_screen(&rest).bottom());
         // A rail taller than the room above it is pushed down rather than off the screen.
-        let oversized = layout(area, &Placement::default(), &request(6, true, None));
+        let oversized = layout(area, &Placement::default(), &request(6, true, None), &m);
         assert_eq!(rail_on_screen(&oversized).y, area.y + EDGE_INSET);
     }
 
     #[test]
     fn detail_sits_left_of_the_rail_centred_on_its_row() {
-        let frame = layout(AREA, &Placement::default(), &request(2, true, Some(DetailRequest { row: 1, height: 160 })));
+        let m = small();
+        let frame = layout(
+            AREA,
+            &Placement::default(),
+            &request(2, true, Some(DetailRequest { row: 1, height: 160 })),
+            &m,
+        );
         let detail = frame.detail.expect("detail frame");
-        assert_eq!(detail.w, DETAIL_WIDTH);
+        assert_eq!(detail.w, m.detail_width);
         assert_eq!(detail.h, 160);
         assert_eq!(detail.x + detail.w + DETAIL_GAP, frame.rail.x);
-        let row_mid = frame.rail.y + 31 + (ROW_HEIGHT + ROW_SPACING) + ROW_HEIGHT / 2;
+        let row_mid = frame.rail.y + 31 + (m.row_height + m.row_spacing) + m.row_height / 2;
         assert_eq!(detail.y + detail.h / 2, row_mid);
         assert_eq!(detail.tail, row_mid - detail.y);
     }
 
     #[test]
     fn a_top_docked_rail_is_horizontal_with_the_bubble_below() {
+        let m = small();
         let placement = Placement { docked: Some(Edge::Top), attachment: Edge::Top, x: None, y: None };
-        let frame = layout(AREA, &placement, &request(2, true, Some(DetailRequest { row: 1, height: 120 })));
+        let frame = layout(
+            AREA,
+            &placement,
+            &request(2, true, Some(DetailRequest { row: 1, height: 120 })),
+            &m,
+        );
         assert!(!frame.vertical);
         assert_eq!(rail_on_screen(&frame).y, 0);
-        assert_eq!(frame.rail.h, HORIZONTAL_RAIL_WIDTH);
+        assert_eq!(frame.rail.h, m.horizontal_rail_width);
         assert_eq!(frame.rail.w, 31 * 2 + 2 * 50 + 7);
         assert_eq!(frame.bubble_side, Edge::Bottom);
         let detail = frame.detail.expect("detail frame");
         assert_eq!(detail.y, frame.rail.y + frame.rail.h + DETAIL_GAP);
-        let row_mid = frame.rail.x + 31 + (ROW_HEIGHT + ROW_SPACING) + ROW_HEIGHT / 2;
+        let row_mid = frame.rail.x + 31 + (m.row_height + m.row_spacing) + m.row_height / 2;
         assert_eq!(detail.x + detail.w / 2, row_mid);
     }
 
     #[test]
     fn a_top_rail_in_the_corner_keeps_its_window_inside_the_work_area() {
+        let m = small();
         let placement = Placement { docked: Some(Edge::Top), attachment: Edge::Top, x: Some(0.986), y: Some(0.0) };
         for expanded in [false, true] {
-            let frame = layout(AREA, &placement, &LayoutRequest { rows: 1, total_rows: 1, expanded, detail: None });
+            let frame = layout(
+                AREA,
+                &placement,
+                &LayoutRequest { rows: 1, total_rows: 1, expanded, detail: None },
+                &m,
+            );
             let rail = rail_on_screen(&frame);
-            assert_eq!(rail, Rect { x: 1456, y: 0, w: 112, h: HORIZONTAL_RAIL_WIDTH });
+            assert_eq!(rail, Rect { x: 1456, y: 0, w: 112, h: m.horizontal_rail_width });
             assert_eq!(frame.window.right(), 1600);
-            assert_eq!(frame.window.x, 1600 - (112 + DETAIL_OVERHANG * 2));
+            assert_eq!(frame.window.x, 1600 - (112 + m.detail_overhang * 2));
             assert!(frame.rail.x + frame.rail.w <= frame.window.w);
         }
     }
@@ -966,7 +1124,7 @@ mod tests {
     #[test]
     fn a_floating_rail_keeps_its_orientation_and_the_short_padding() {
         let placement = Placement { docked: None, attachment: Edge::Right, x: Some(0.5), y: Some(0.5) };
-        let frame = layout(AREA, &placement, &request(1, false, None));
+        let frame = layout(AREA, &placement, &request(1, false, None), &small());
         assert!(frame.vertical && !frame.docked);
         assert_eq!(frame.along_pad, 12);
         assert_eq!(frame.rail.h, 12 * 2 + 50);
@@ -992,7 +1150,8 @@ mod tests {
     fn attachment_progress_rises_as_the_edge_nears() {
         let far = attachment_candidate(&Rect { x: 700, y: 300, w: 53, h: 112 }, &AREA);
         assert!(far.is_none());
-        let (edge, progress) = attachment_candidate(&Rect { x: 1600 - 53 - 22, y: 300, w: 53, h: 112 }, &AREA).unwrap();
+        let (edge, progress) =
+            attachment_candidate(&Rect { x: 1600 - 53 - 22, y: 300, w: 53, h: 112 }, &AREA).unwrap();
         assert_eq!(edge, Edge::Right);
         assert!((progress - 0.5).abs() < 0.01);
     }

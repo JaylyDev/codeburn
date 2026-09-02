@@ -1,35 +1,93 @@
 /// Pure geometry and presentation rules for the Capacity Dock, ported from
 /// mac/Sources/CodeBurnMenubar/Views/CapacityDockView.swift, CapacityDockMotion.swift and
-/// Data/QuotaSummary.swift. Every metric is the mac value at its default 0.6 scale, rounded to a
-/// whole pixel the way CapacityDockMetrics.points does; src-tauri/src/dock.rs sizes the window
-/// from the same numbers and the two must stay in step.
+/// Data/QuotaSummary.swift. Every metric is a mac base value times the settings window's size
+/// scale, rounded to a whole pixel the way CapacityDockMetrics.points does;
+/// src-tauri/src/dock.rs rebuilds the same numbers from the same scale and the two must stay
+/// in step.
 
-export const SCALE = 0.6
-export const DETAIL_SCALE = 0.9
+/// CapacityDockPreferences.scaleRange and its default.
+export const MIN_SCALE = 0.6
+export const MAX_SCALE = 1.2
+export const DEFAULT_SCALE = MIN_SCALE
+/// The bubble never shrinks with the rail: below 90% its type stops being readable.
+const MIN_DETAIL_SCALE = 0.9
 
-function points(base: number, scale = SCALE): number {
+/// Fractional sizes cost the mac 5 to 7 percent idle CPU by making the hosting view re-lay
+/// itself out forever, so every metric lands on a whole pixel.
+function points(base: number, scale: number): number {
   return Math.max(1, Math.round(base * scale))
 }
 
-export const M = {
-  railWidth: points(88),
-  horizontalRailWidth: points(106),
-  rowHeight: points(84),
-  rowSpacing: points(12),
-  railAlongPad: points(20),
-  // Docked rails add 60% of the shoulder depth so content never crowds the concave flare.
-  flareCompensation: Math.round(points(52) * 0.6),
-  railCrossPad: points(12),
-  shoulderDepth: points(52),
-  ringSize: points(52),
-  ringStroke: points(4),
-  ringLabelSpacing: points(6),
-  providerIconSize: points(26),
-  percentTextSize: points(17),
-  detailWidth: points(350, DETAIL_SCALE),
-  detailGap: 10,
-  rowReveal: -8 * SCALE,
-} as const
+export type Metrics = {
+  scale: number
+  detailScale: number
+  railWidth: number
+  horizontalRailWidth: number
+  rowHeight: number
+  rowSpacing: number
+  railAlongPad: number
+  flareCompensation: number
+  railCrossPad: number
+  shoulderDepth: number
+  ringSize: number
+  ringStroke: number
+  ringMargin: number
+  ringLabelSpacing: number
+  providerIconSize: number
+  percentTextSize: number
+  alertSize: number
+  alertOffset: number
+  detailWidth: number
+  detailGap: number
+  detailGlyphSize: number
+  rowReveal: number
+}
+
+function build(scale: number): Metrics {
+  const detailScale = Math.max(scale, MIN_DETAIL_SCALE)
+  return {
+    scale,
+    detailScale,
+    railWidth: points(88, scale),
+    horizontalRailWidth: points(106, scale),
+    rowHeight: points(84, scale),
+    rowSpacing: points(12, scale),
+    railAlongPad: points(20, scale),
+    // Docked rails add 60% of the shoulder depth so content never crowds the concave flare.
+    flareCompensation: Math.round(points(52, scale) * 0.6),
+    railCrossPad: points(12, scale),
+    shoulderDepth: points(52, scale),
+    ringSize: points(52, scale),
+    ringStroke: points(4, scale),
+    // SVG strokes are centred on the path, so the ring box carries a margin for half of one.
+    ringMargin: points(5, scale),
+    ringLabelSpacing: points(6, scale),
+    providerIconSize: points(26, scale),
+    percentTextSize: points(17, scale),
+    alertSize: points(12, scale),
+    alertOffset: points(19, scale),
+    detailWidth: points(350, detailScale),
+    // The gap between rail and bubble is a placement constant on the mac, not a scaled metric.
+    detailGap: 10,
+    detailGlyphSize: points(24, detailScale),
+    rowReveal: -8 * scale,
+  }
+}
+
+const CACHE = new Map<number, Metrics>()
+
+/// Metrics for a size scale. Cached because the dock passes them through effect dependencies,
+/// where a fresh object on every render would restart the layout round trip forever.
+export function metrics(scale: number): Metrics {
+  const value = Number.isFinite(scale) ? scale : DEFAULT_SCALE
+  const key = Math.round(Math.min(MAX_SCALE, Math.max(MIN_SCALE, value)) * 100) / 100
+  let found = CACHE.get(key)
+  if (!found) {
+    found = build(key)
+    CACHE.set(key, found)
+  }
+  return found
+}
 
 export type Edge = 'left' | 'right' | 'top' | 'bottom'
 
@@ -56,13 +114,13 @@ function smoothstep(p: number): number {
 }
 
 /// Along-axis padding for a given attachment progress, the mac's railAlongPad.
-export function alongPad(attachment: number): number {
-  return M.railAlongPad + M.flareCompensation * smoothstep(attachment)
+export function alongPad(m: Metrics, attachment: number): number {
+  return m.railAlongPad + m.flareCompensation * smoothstep(attachment)
 }
 
-export function railLength(rows: number, attachment: number): number {
+export function railLength(m: Metrics, rows: number, attachment: number): number {
   const count = Math.max(rows, 1)
-  return alongPad(attachment) * 2 + count * M.rowHeight + (count - 1) * M.rowSpacing
+  return alongPad(m, attachment) * 2 + count * m.rowHeight + (count - 1) * m.rowSpacing
 }
 
 /// Motion: durations in ms and cubic-bezier control points, verbatim from CapacityDockMotion.
@@ -179,12 +237,12 @@ function roundedRect(b: PathBuilder, w: number, h: number, r: number): string {
 /// The rail outline (CapacityDockRailShape): a plain rounded pill while loose, and once more
 /// than half attached, convex corners on the free side with concave shoulders necking into the
 /// flush contact edge, the system-notch technique. `len` runs along the edge.
-export function railPath(edge: Edge, cross: number, len: number, attachment: number): string {
+export function railPath(m: Metrics, edge: Edge, cross: number, len: number, attachment: number): string {
   const eased = smoothstep(attachment)
   const b = new PathBuilder(mapper(edge, cross))
   const freeR = Math.min(22, len / 2, cross * 0.45)
   if (eased < 0.5) return roundedRect(b, cross, len, freeR)
-  const contactR = Math.min(M.shoulderDepth * 0.6, len * 0.22, Math.max(0, len / 2 - freeR)) * eased
+  const contactR = Math.min(m.shoulderDepth * 0.6, len * 0.22, Math.max(0, len / 2 - freeR)) * eased
   return b
     .move([cross, 0])
     .quad([cross, contactR], [cross - contactR, contactR])
@@ -226,16 +284,10 @@ export function bubblePath(tailEdge: Edge, w: number, h: number, tail: number): 
 }
 
 /// Bubble content insets: the regular inset plus room for the tail on the tail edge.
-export const DETAIL_INSETS = {
-  horizontal: Math.round(22 * DETAIL_SCALE),
-  vertical: Math.round(16 * DETAIL_SCALE),
-  tail: Math.round(18 * DETAIL_SCALE),
-} as const
-
-export function detailPadding(tailEdge: Edge): string {
-  const h = DETAIL_INSETS.horizontal
-  const v = DETAIL_INSETS.vertical
-  const t = DETAIL_INSETS.tail
+export function detailPadding(m: Metrics, tailEdge: Edge): string {
+  const h = points(22, m.detailScale)
+  const v = points(16, m.detailScale)
+  const t = points(18, m.detailScale)
   const top = v + (tailEdge === 'top' ? t : 0)
   const right = h + (tailEdge === 'right' ? t : 0)
   const bottom = v + (tailEdge === 'bottom' ? t : 0)

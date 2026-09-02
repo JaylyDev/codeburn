@@ -2,9 +2,8 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProp
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { ProviderGlyph } from './providerIcons'
-import { loadDockPrefs, onDockPrefsChanged } from './lib/dockPrefs'
+import { DEFAULT_DOCK_PREFS, loadDockPrefs, onDockPrefsChanged, type DockPrefs } from './lib/dockPrefs'
 import {
-  M,
   MOTION,
   alongPad,
   bezier,
@@ -16,11 +15,13 @@ import {
   opposite,
   pct,
   railLength,
+  metrics,
   railPath,
   resetsIn,
   severity,
   type Curve,
   type Edge,
+  type Metrics,
   type QuotaWindow,
   type Severity,
 } from './dockGeometry'
@@ -146,12 +147,11 @@ const RING_COLORS: Record<Severity, string> = {
   danger: '#FF453A',
 }
 
-function Ring({ percent }: { percent: number | null }) {
-  const size = M.ringSize
-  const stroke = M.ringStroke
+function Ring({ m, percent }: { m: Metrics; percent: number | null }) {
+  const size = m.ringSize
+  const stroke = m.ringStroke
   // Strokes are centred on the ring's circle like SwiftUI's, so the box gets a margin for them.
-  const margin = 3
-  const box = size + margin * 2
+  const box = size + m.ringMargin * 2
   const c = box / 2
   const r = size / 2
   const circumference = 2 * Math.PI * r
@@ -165,10 +165,10 @@ function Ring({ percent }: { percent: number | null }) {
           <stop offset="1" stopColor="#fff" stopOpacity="0.12" />
         </linearGradient>
       </defs>
-      <circle cx={c} cy={c} r={r} fill="none" stroke="rgba(0,0,0,0.74)" strokeWidth={stroke + 1.2} />
-      <circle cx={c} cy={c} r={r} fill="none" stroke="url(#dock-ring-sheen)" strokeWidth={stroke + 0.36} />
+      <circle cx={c} cy={c} r={r} fill="none" stroke="rgba(0,0,0,0.74)" strokeWidth={stroke + 2 * m.scale} />
+      <circle cx={c} cy={c} r={r} fill="none" stroke="url(#dock-ring-sheen)" strokeWidth={stroke + 0.6 * m.scale} />
       {percent === null ? (
-        <circle cx={c} cy={c} r={r} fill="none" stroke="rgba(255,255,255,0.24)" strokeWidth={1.2} strokeDasharray="1.8 2.4" />
+        <circle cx={c} cy={c} r={r} fill="none" stroke="rgba(255,255,255,0.24)" strokeWidth={2 * m.scale} strokeDasharray={`${3 * m.scale} ${4 * m.scale}`} />
       ) : (
         <circle
           cx={c}
@@ -188,6 +188,7 @@ function Ring({ percent }: { percent: number | null }) {
 }
 
 type RowProps = {
+  m: Metrics
   provider: Provider
   loading: boolean
   style: CSSProperties
@@ -196,7 +197,7 @@ type RowProps = {
   onClick: () => void
 }
 
-function Row({ provider, loading, style, onEnter, onLeave, onClick }: RowProps) {
+function Row({ m, provider, loading, style, onEnter, onLeave, onClick }: RowProps) {
   const headline = provider.available ? headlineWindow(provider.windows) : null
   const percent = headline ? pct(headline.usedPct) : null
   const sev = percent === null ? null : severity(percent)
@@ -211,9 +212,9 @@ function Row({ provider, loading, style, onEnter, onLeave, onClick }: RowProps) 
       aria-label={`${provider.name} usage`}
     >
       <span className="dock-gauge">
-        <Ring percent={percent} />
+        <Ring m={m} percent={percent} />
         <span className={`dock-glyph${loading ? ' is-loading' : ''}`}>
-          <ProviderGlyph id={provider.id} size={M.providerIconSize} />
+          <ProviderGlyph id={provider.id} size={m.providerIconSize} />
         </span>
         {provider.error ? <span className="dock-row-alert" /> : null}
       </span>
@@ -228,13 +229,13 @@ function instruction(provider: Provider, quota: DockQuota | null): string {
   return `Sign in with the ${provider.name} app or CLI. The dock checks again every five minutes.`
 }
 
-function Detail({ provider, quota, loading }: { provider: Provider; quota: DockQuota | null; loading: boolean }) {
+function Detail({ m, provider, quota, loading }: { m: Metrics; provider: Provider; quota: DockQuota | null; loading: boolean }) {
   const windows = provider.windows.slice(0, MAX_DETAIL_ROWS)
   return (
     <div className="dock-detail-body">
       <header className="dock-detail-head">
         <span className="dock-detail-glyph">
-          <ProviderGlyph id={provider.id} size={Math.round(24 * 0.9)} />
+          <ProviderGlyph id={provider.id} size={m.detailGlyphSize} />
         </span>
         <span className="dock-detail-title">{provider.name} Usage</span>
         {provider.plan ? <span className="dock-detail-plan">{provider.plan}</span> : null}
@@ -277,13 +278,32 @@ function Detail({ provider, quota, loading }: { provider: Provider; quota: DockQ
   )
 }
 
+/// The metrics the stylesheet needs. Everything the page can set inline is set inline; these
+/// are the ones that belong to a rule (gaps, type sizes, the alert dot's corner).
+function dockVars(m: Metrics): CSSProperties {
+  return {
+    '--dock-row-gap': `${m.rowSpacing}px`,
+    '--dock-ring-gap': `${m.ringLabelSpacing}px`,
+    '--dock-gauge-size': `${m.ringSize}px`,
+    '--dock-ring-margin': `${m.ringMargin}px`,
+    '--dock-pct-size': `${m.percentTextSize}px`,
+    '--dock-alert-size': `${m.alertSize}px`,
+    // The mac hangs the badge 19 points out from the ring centre, at 12 points across.
+    '--dock-alert-inset': `${Math.round(m.ringSize / 2 - m.alertOffset - m.alertSize / 2)}px`,
+    '--dock-detail-gap': `${Math.round(11 * m.detailScale)}px`,
+    '--dock-detail-head-gap': `${Math.round(8 * m.detailScale)}px`,
+    '--dock-detail-row-gap': `${Math.round(6 * m.detailScale)}px`,
+    '--dock-detail-bar': `${Math.round(6 * m.detailScale)}px`,
+    '--dock-detail-block-gap': `${Math.round(3 * m.detailScale)}px`,
+  } as CSSProperties
+}
+
 const RAIL_MOTION = (_from: number, to: number) => (to === 1 ? MOTION.railExpand : MOTION.railCollapse)
 const ATTACH_MOTION = (_from: number, to: number) => (to === 1 ? MOTION.dockAttach : MOTION.dockDetach)
 
 export function Dock() {
   const [quota, setQuota] = useState<DockQuota | null>(null)
-  const [preferredId, setPreferredId] = useState<string | null>(null)
-  const [chosenIds, setChosenIds] = useState<string[]>([])
+  const [prefs, setPrefs] = useState<DockPrefs>(DEFAULT_DOCK_PREFS)
   const [interaction, setInteraction] = useState<Interaction>(REST)
   const [presentationExpanded, setPresentationExpanded] = useState(false)
   const [hovered, setHovered] = useState<string | null>(null)
@@ -320,31 +340,26 @@ export function Dock() {
 
   useEffect(() => {
     void load()
-    void invoke<string | null>('dock_preferred').then((id) => setPreferredId(id ?? null))
     const timer = window.setInterval(() => void load(), REFRESH_MS)
     return () => window.clearInterval(timer)
   }, [load])
 
-  // The settings window writes both of these, so the rail follows a switch or a resting
-  // provider the moment it is changed rather than at the next refresh.
+  // The settings window writes these, so the rail follows a switch, a resting provider or a
+  // size the moment it is changed rather than at the next refresh.
   useEffect(() => {
-    void loadDockPrefs().then((prefs) => {
-      setPreferredId(prefs.preferred)
-      setChosenIds(prefs.providers)
-    })
-    return onDockPrefsChanged((prefs) => {
-      setPreferredId(prefs.preferred)
-      setChosenIds(prefs.providers)
-    })
+    void loadDockPrefs().then(setPrefs)
+    return onDockPrefsChanged(setPrefs)
   }, [])
+  const m = metrics(prefs.scale)
 
   // Providers: the ones the CLI reports signed in, narrowed to the settings window's choice
   // when one has been made, else the preferred one as a dashed stand-in. An empty choice is
   // "nobody has picked yet", which is why it means everything rather than nothing.
   const all = quota?.state === 'ready' ? quota.providers : []
   const signedIn = all.filter((p) => p.available)
+  const chosenIds = prefs.providers
   const available = chosenIds.length > 0 ? signedIn.filter((p) => chosenIds.includes(p.id)) : signedIn
-  const resolvedPreferredId = preferredId ?? available[0]?.id ?? all[0]?.id ?? 'claude'
+  const resolvedPreferredId = prefs.preferred ?? available[0]?.id ?? all[0]?.id ?? 'claude'
   const preferred: Provider = all.find((p) => p.id === resolvedPreferredId) ?? {
     id: resolvedPreferredId,
     name: PROVIDER_NAMES[resolvedPreferredId] ?? resolvedPreferredId,
@@ -561,7 +576,7 @@ export function Dock() {
     cancel('expand')
     cancel('collapse')
     if (provider.id !== resolvedPreferredId) {
-      setPreferredId(provider.id)
+      setPrefs((current) => ({ ...current, preferred: provider.id }))
       void invoke('dock_set_preferred', { id: provider.id })
       setInteraction((i) => (i.pinned ? i : { ...i, pinned: true }))
     } else {
@@ -596,7 +611,7 @@ export function Dock() {
     }
     // detailRequest is derived from the two scalars below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows, totalRows, presentationExpanded, detailRow, detailHeight])
+  }, [rows, totalRows, presentationExpanded, detailRow, detailHeight, m])
 
   // Entering: the card is placed while invisible, then slides in on the next frame.
   const detailPlaced = frame?.detail != null && detailRequest != null
@@ -625,10 +640,10 @@ export function Dock() {
 
   const edge = flareEdge
   const vertical = railVertical
-  const cross = vertical ? M.railWidth : M.horizontalRailWidth
-  const pad = alongPad(attachment)
-  const restLength = railLength(1, attachment)
-  const targetLength = railLength(rows, attachment)
+  const cross = vertical ? m.railWidth : m.horizontalRailWidth
+  const pad = alongPad(m, attachment)
+  const restLength = railLength(m, 1, attachment)
+  const targetLength = railLength(m, rows, attachment)
   const bodyLength = Math.round(restLength + (targetLength - restLength) * progress)
   const railRect = frame?.rail ?? { x: 0, y: 0, w: cross, h: restLength }
   // The frame's rail is the target; the visual rail grows from the anchored end toward it.
@@ -638,12 +653,12 @@ export function Dock() {
   const railTop = (vertical ? railRect.y + alongOffset : railRect.y) + glideDy
   const railW = vertical ? cross : bodyLength
   const railH = vertical ? bodyLength : cross
-  const shape = railPath(edge, cross, bodyLength, attachment)
+  const shape = railPath(m, edge, cross, bodyLength, attachment)
 
   const hoveredProvider = hovered ? (ordered.find((p) => p.id === hovered) ?? null) : null
   const detailFrame = frame?.detail ?? null
   const tailEdge = opposite(frame?.bubbleSide ?? 'left')
-  const detailW = M.detailWidth
+  const detailW = m.detailWidth
   const detailH = detailHeight
   const tail = detailFrame ? detailFrame.tail : (isVertical(tailEdge) ? detailH : detailW) / 2
 
@@ -651,21 +666,28 @@ export function Dock() {
   const rowsStyle: CSSProperties = vertical
     ? {
         flexDirection: 'column',
-        left: M.railCrossPad,
-        right: M.railCrossPad,
+        left: m.railCrossPad,
+        right: m.railCrossPad,
         top: anchor === 'end' ? 'auto' : pad,
         bottom: anchor === 'end' ? pad : 'auto',
       }
     : {
         flexDirection: 'row',
-        top: M.railCrossPad,
-        bottom: M.railCrossPad,
+        top: m.railCrossPad,
+        bottom: m.railCrossPad,
         left: anchor === 'end' ? 'auto' : pad,
         right: anchor === 'end' ? pad : 'auto',
       }
 
   return (
-    <div className="dock" onContextMenu={(e) => { e.preventDefault(); void invoke('dock_context_menu') }}>
+    <div
+      className="dock"
+      style={dockVars(m)}
+      onContextMenu={(e) => {
+        e.preventDefault()
+        void invoke('dock_context_menu')
+      }}
+    >
       <div
         className={`dock-rail${interaction.dragging ? ' is-dragging' : ''}`}
         style={{ left: railLeft, top: railTop, width: railW, height: railH, clipPath: `path('${shape}')` }}
@@ -702,15 +724,16 @@ export function Dock() {
         <div className="dock-rows" style={rowsStyle}>
           {ordered.map((provider, index) => {
             const isPreferred = provider.id === preferred.id
-            const reveal = isPreferred ? 0 : M.rowReveal * (1 - progress)
+            const reveal = isPreferred ? 0 : m.rowReveal * (1 - progress)
             return (
               <Row
                 key={provider.id}
+                m={m}
                 provider={provider}
                 loading={loading}
                 style={{
-                  width: vertical ? cross - M.railCrossPad * 2 : M.rowHeight,
-                  height: vertical ? M.rowHeight : cross - M.railCrossPad * 2,
+                  width: vertical ? cross - m.railCrossPad * 2 : m.rowHeight,
+                  height: vertical ? m.rowHeight : cross - m.railCrossPad * 2,
                   opacity: isPreferred ? 1 : progress,
                   transform: vertical ? `translateY(${reveal}px)` : `translateX(${reveal}px)`,
                 }}
@@ -727,7 +750,7 @@ export function Dock() {
         <div
           ref={detailRef}
           className={`dock-detail is-${detailPhase} is-tail-${tailEdge}${detailPlaced ? '' : ' is-measuring'}`}
-          style={{ left: detailFrame?.x ?? 0, top: detailFrame?.y ?? 0, width: detailW, padding: detailPadding(tailEdge) }}
+          style={{ left: detailFrame?.x ?? 0, top: detailFrame?.y ?? 0, width: detailW, padding: detailPadding(m, tailEdge) }}
           onMouseEnter={() => domPointer({ detailHovered: true })}
           onMouseLeave={() => domPointer({ detailHovered: false })}
         >
@@ -738,7 +761,7 @@ export function Dock() {
               <path d={bubblePath(tailEdge, detailW, detailH, tail)} fill="none" stroke="rgba(255,255,255,0.09)" strokeWidth="0.9" />
             </svg>
           ) : null}
-          <Detail provider={hoveredProvider} quota={quota} loading={loading} />
+          <Detail m={m} provider={hoveredProvider} quota={quota} loading={loading} />
         </div>
       ) : null}
     </div>
