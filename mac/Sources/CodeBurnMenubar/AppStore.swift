@@ -8,6 +8,10 @@ private let menubarPeriodDefaultsKey = "CodeBurnMenubarPeriod"
 struct CachedPayload {
     let payload: MenubarPayload
     let fetchedAt: Date
+    /// This scoped payload still disagreed with its all-provider slice after a
+    /// resident-bypassing one-shot re-parse. It is the best answer the CLI can
+    /// give, so it is served rather than discarded, with the UI saying so.
+    var contradictsAll: Bool = false
     var isFresh: Bool { Date().timeIntervalSince(fetchedAt) < cacheTTLSeconds }
 }
 
@@ -38,14 +42,6 @@ struct PayloadCacheKey: Hashable {
             return "\(first)..\(last)"
         }
         return day.map { "Day(\($0))" } ?? period.rawValue
-    }
-}
-
-private struct ProviderPayloadConsistencyError: Error, CustomStringConvertible {
-    let provider: ProviderFilter
-
-    var description: String {
-        "Fresh \(provider.rawValue) verification still contradicted the matching all-provider payload."
     }
 }
 
@@ -908,10 +904,28 @@ final class AppStore {
         }
     }
 
+    /// A cached payload the refresh paths may keep instead of refetching. A
+    /// contradicting one is refetched; one already VERIFIED as contradicting is
+    /// not, or every poll would re-run the expensive one-shot parse forever.
+    private func cachedPayloadIsUsable(_ cached: CachedPayload, for key: PayloadCacheKey) -> Bool {
+        cached.contradictsAll || !providerPayloadContradictsAll(cached.payload, for: key)
+    }
+
     private func consistentCachedPayload(for key: PayloadCacheKey) -> MenubarPayload? {
-        guard let payload = cache[key]?.payload,
-              !providerPayloadContradictsAll(payload, for: key) else { return nil }
-        return payload
+        guard let cached = cache[key] else { return nil }
+        // A payload already verified by a resident-bypassing re-parse is served
+        // even though it still disagrees: it is the CLI's real answer, and
+        // `selectedPayloadMayBeIncomplete` is what tells the user so.
+        if cached.contradictsAll { return cached.payload }
+        guard !providerPayloadContradictsAll(cached.payload, for: key) else { return nil }
+        return cached.payload
+    }
+
+    /// The visible payload was verified against its all-provider slice and
+    /// still disagreed. The popover shows one subdued line rather than an error.
+    var selectedPayloadMayBeIncomplete: Bool {
+        if cache[currentKey]?.contradictsAll == true { return true }
+        return effectiveSelectedScope == .combined && cache[localCurrentKey]?.contradictsAll == true
     }
 
     /// An all-provider payload and its scoped sibling describe the same period,
@@ -968,7 +982,7 @@ final class AppStore {
         includeOptimize: Bool,
         qualityOfService: QualityOfService,
         acceptAfter: (@Sendable () async -> Void)? = nil
-    ) async throws -> MenubarPayload {
+    ) async throws -> (payload: MenubarPayload, contradictsAll: Bool) {
         let fresh = try await DataClient.fetch(
             period: key.period,
             day: key.day,
@@ -984,7 +998,7 @@ final class AppStore {
         // two parses overlap and only the ACCEPTANCE is ordered. Waiting for it
         // before starting cost a full serialized parse on every tab click.
         await acceptAfter?()
-        guard providerPayloadContradictsAll(fresh, for: key) else { return fresh }
+        guard providerPayloadContradictsAll(fresh, for: key) else { return (fresh, false) }
 
         NSLog("CodeBurn: resident %@ payload contradicted its all-provider slice; verifying with a one-shot parse",
               key.provider.rawValue)
@@ -999,10 +1013,17 @@ final class AppStore {
             bypassResident: true,
             qualityOfService: qualityOfService
         )
-        guard !providerPayloadContradictsAll(verified, for: key) else {
-            throw ProviderPayloadConsistencyError(provider: key.provider)
+        // A second contradiction is not an error to show the user. The one-shot
+        // parse bypassed the resident child, so this IS what the CLI reports for
+        // this provider right now; throwing here replaced a real number with an
+        // error banner and left the tab with nothing at all. Serve it, flagged,
+        // and let the popover add one subdued line saying it may be incomplete.
+        let stillContradicts = providerPayloadContradictsAll(verified, for: key)
+        if stillContradicts {
+            NSLog("CodeBurn: verified %@ payload still contradicted its all-provider slice; serving it as possibly incomplete",
+                  key.provider.rawValue)
         }
-        return verified
+        return (verified, stillContradicts)
     }
 
     @discardableResult
@@ -1132,7 +1153,7 @@ final class AppStore {
         if !force,
            let cached = cache[key],
            cached.isFresh,
-           !providerPayloadContradictsAll(cached.payload, for: key) { return true }
+           cachedPayloadIsUsable(cached, for: key) { return true }
         // Join an in-flight fetch instead of reporting failure. Returning false
         // here made recoverFromStuckLoading() announce a failed recovery while a
         // perfectly healthy fetch was still running, which is what the quiet
@@ -1198,11 +1219,11 @@ final class AppStore {
                 NSLog("CodeBurn: dropping fetch result for \(key.label)/\(key.provider.rawValue) — calendar rolled mid-fetch")
                 return false
             }
-            cache[key] = CachedPayload(payload: fresh, fetchedAt: Date())
+            cache[key] = CachedPayload(payload: fresh.payload, fetchedAt: Date(), contradictsAll: fresh.contradictsAll)
             if key == currentKey || (effectiveSelectedScope == .combined && key == localCurrentKey) {
                 selectionFallbackPayload = nil
             }
-            reconcileClaudeConfigSelection(from: fresh, for: key)
+            reconcileClaudeConfigSelection(from: fresh.payload, for: key)
             lastSuccessByKey[key] = Date()
             lastErrorByKey[key] = nil
             succeeded = true
@@ -1222,8 +1243,8 @@ final class AppStore {
                         invalidateStaleDayCache()
                         return false
                     }
-                    cache[key] = CachedPayload(payload: fallback, fetchedAt: Date())
-                    reconcileClaudeConfigSelection(from: fallback, for: key)
+                    cache[key] = CachedPayload(payload: fallback.payload, fetchedAt: Date(), contradictsAll: fallback.contradictsAll)
+                    reconcileClaudeConfigSelection(from: fallback.payload, for: key)
                     lastSuccessByKey[key] = Date()
                     lastErrorByKey[key] = nil
                     return true
@@ -1288,7 +1309,7 @@ final class AppStore {
         if !force,
            let cached = cache[key],
            cached.isFresh,
-           !providerPayloadContradictsAll(cached.payload, for: key) { return true }
+           cachedPayloadIsUsable(cached, for: key) { return true }
         if inFlightKeys[key] != nil {
             await waitForInFlight(key)
             return consistentCachedPayload(for: key) != nil
@@ -1320,8 +1341,8 @@ final class AppStore {
                 invalidateStaleDayCache()
                 return false
             }
-            cache[key] = CachedPayload(payload: fresh, fetchedAt: Date())
-            reconcileClaudeConfigSelection(from: fresh, for: key)
+            cache[key] = CachedPayload(payload: fresh.payload, fetchedAt: Date(), contradictsAll: fresh.contradictsAll)
+            reconcileClaudeConfigSelection(from: fresh.payload, for: key)
             lastSuccessByKey[key] = Date()
             lastErrorByKey[key] = nil
         } catch {

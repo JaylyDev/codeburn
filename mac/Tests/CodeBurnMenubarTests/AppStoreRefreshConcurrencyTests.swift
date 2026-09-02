@@ -229,4 +229,42 @@ struct AppStoreRefreshConcurrencyTests {
         #expect(await first.value)
         #expect(await second.value)
     }
+
+    @Test("a twice-contradicting payload is cached and flagged instead of raising an error")
+    func twiceContradictingPayloadIsCachedAndFlagged() async {
+        let script = ScriptedFetch()
+        // The scoped payload reports nothing for a provider the all-provider
+        // slice says is active, and says so again on the verifying re-parse.
+        script.payloadForProvider = { provider in
+            provider == .all
+                ? scriptedPayload(cost: 12, providers: ["claude": 11.5, "hermes agent": 0.5],
+                                  providerDetails: [
+                                    ProviderDetail(id: "claude", label: "Claude", cost: 11.5, calls: 4, hasUsage: true),
+                                    ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0.5, calls: 7, hasUsage: true),
+                                  ])
+                : scriptedPayload(cost: 0, calls: 0, providers: ["hermes agent": 0],
+                                  providerDetails: [ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0, calls: 0, hasUsage: false)])
+        }
+        script.install()
+        defer { script.uninstall() }
+
+        let store = AppStore()
+        store.setCacheDateToTodayForTesting()
+        store.suppressRefreshesForTesting()
+        store.switchTo(provider: .hermes)
+
+        let task = Task { await store.refresh(includeOptimize: false, force: true) }
+        // all + scoped + the resident-bypassing verification of the scoped one.
+        #expect(await settle(until: { script.attempts.count >= 2 }))
+        for index in 0..<script.attempts.count { script.release(index) }
+        #expect(await settle(until: { script.attempts.count == 3 }))
+        script.release(2)
+        _ = await task.value
+
+        // Cached and served, with the caveat flag set. It used to throw, which
+        // left the tab with an error banner and no number at all.
+        #expect(store.cachedPayloadForTesting(period: .today, provider: .hermes) != nil)
+        #expect(store.selectedPayloadMayBeIncomplete)
+        #expect(store.lastError == nil)
+    }
 }

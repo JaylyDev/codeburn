@@ -20,6 +20,14 @@ struct MenuBarContent: View {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 0) {
                         HeroSection()
+                        if store.selectedPayloadMayBeIncomplete {
+                            Text("This total may be incomplete.")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Color.secondary.opacity(0.75))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 14)
+                                .padding(.bottom, 6)
+                        }
                         Divider().opacity(0.5)
                         PeriodSegmentedControl()
                         ScopeSegmentedControl()
