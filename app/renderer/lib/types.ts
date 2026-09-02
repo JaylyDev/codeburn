@@ -676,6 +676,16 @@ export type UpdateStatus = {
   tag: string | null
 }
 
+/** The tray app and the Capacity Dock the Windows desktop app bundles (app/electron/menubar.ts).
+ *  `supported` is false everywhere else, and on a Windows build with nothing staged. */
+export type CompanionStatus = {
+  supported: boolean
+  menuBar: boolean
+  sidebar: boolean
+  /** The Store route, where launch at login is the package's own startup task. */
+  store: boolean
+}
+
 export interface CodeburnBridge {
   /** Subscribe to cold-start scan progress; returns an unsubscribe fn. */
   onProgress(cb: (event: ScanProgressEvent) => void): () => void
@@ -728,6 +738,11 @@ export interface CodeburnBridge {
   completeOnboarding(enabled: boolean): Promise<TelemetryStatus | null>
   telemetryTrack(name: string, props?: Record<string, unknown>): Promise<boolean>
   openExternal(url: string): Promise<void>
+  /** The bundled tray app and Capacity Dock (Windows). Optional so a preload that
+   *  predates them degrades to "not supported" rather than throwing. */
+  companionStatus?(): Promise<CompanionStatus>
+  setMenuBarEnabled?(enabled: boolean): Promise<CompanionStatus>
+  setSidebarEnabled?(enabled: boolean): Promise<CompanionStatus>
   // Plugin management
   pluginList(): Promise<unknown>
   pluginInfo(name: string): Promise<unknown>

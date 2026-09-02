@@ -948,12 +948,16 @@ export function spawnCli(
 /** Spawn a config-mutating CLI command and return its text output verbatim.
  *  Mutations count as interactive, so they take a run slot ahead of any queued
  *  background warm — a Settings save is never stuck behind speculative prefetch. */
-export function spawnCliAction(args: string[], opts: { timeoutMs?: number } = {}): Promise<ActionResult> {
+export function spawnCliAction(args: string[], opts: { timeoutMs?: number; extraEnv?: NodeJS.ProcessEnv } = {}): Promise<ActionResult> {
   if (shuttingDown) return Promise.resolve({ ok: false, stdout: '', stderr: 'codeburn is shutting down', code: null })
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const target = resolveTarget()
   if (!target) return Promise.resolve({ ok: false, stdout: '', stderr: 'codeburn CLI not found', code: null })
   const spec = spawnSpecFor(target, args)
+  // Actions never ride the resident `serve` child, so an extra variable simply joins the
+  // one-shot spawn's env. The bundled-menubar install is the only caller: it names the .msi
+  // the desktop app staged rather than putting a path on a command line.
+  if (opts.extraEnv) spec.env = { ...spec.env, ...opts.extraEnv }
   return (async () => {
     try {
       await acquireSlot('interactive')

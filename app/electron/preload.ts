@@ -69,6 +69,11 @@ const bridge = {
     ipcRenderer.on('codeburn:update', listener)
     return () => { ipcRenderer.removeListener('codeburn:update', listener) }
   },
+  // The bundled tray app and its Capacity Dock (Windows). Every setter answers with the
+  // whole status, so the sidebar renders what took rather than what it asked for.
+  companionStatus: () => invoke('codeburn:companionStatus'),
+  setMenuBarEnabled: (enabled: boolean) => invoke('codeburn:setMenuBarEnabled', enabled),
+  setSidebarEnabled: (enabled: boolean) => invoke('codeburn:setSidebarEnabled', enabled),
   // Plugin management
   pluginList: () => invoke('codeburn:pluginList'),
   pluginInfo: (name: string) => invoke('codeburn:pluginInfo', name),

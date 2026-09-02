@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell, type Men
 import path from 'node:path'
 
 import { CliError, DESKTOP_COLD_TIMEOUT_MS, PROGRESS_LINE_PREFIX, reapOrphanServe, resolveCodeburnPath, shutdownAll, spawnCli, spawnCliAction, startServe, type ActionResult, type SpawnPriority } from './cli'
+import { MenubarCompanion, type CompanionStatus } from './menubar'
 import { getQuota, sanitizeError } from './quota'
 import { Telemetry } from './telemetry'
 import { createUpdateChecker, type UpdateChecker, type UpdateStatus } from './updates'
@@ -10,6 +11,11 @@ import { createUpdateChecker, type UpdateChecker, type UpdateStatus } from './up
 let telemetryInstance: Telemetry | null = null
 // The once-per-launch + 24h update-availability checker. Null under tests.
 let updateChecker: UpdateChecker | null = null
+// The bundled tray app and its Capacity Dock (Windows only). Null under tests.
+let companion: MenubarCompanion | null = null
+
+/** What the sidebar switches read on a platform that has no tray app to bundle. */
+export const NO_COMPANION: CompanionStatus = { supported: false, menuBar: false, sidebar: false, store: false }
 
 /** The slice of Telemetry the bridge handlers use — injectable for tests. */
 export type TelemetryBridge = Pick<Telemetry, 'status' | 'setEnabled' | 'completeOnboarding' | 'track'>
@@ -231,6 +237,8 @@ type Deps = {
   telemetry?: TelemetryBridge | null
   /** Cached update-availability status; absent under tests unless injected. */
   getUpdateStatus?: () => Promise<UpdateStatus>
+  /** The bundled tray app and Capacity Dock; absent off Windows and under tests. */
+  companion?: Pick<MenubarCompanion, 'status' | 'setMenuBarEnabled' | 'setSidebarEnabled'> | null
 }
 
 type Handler = (...args: any[]) => Promise<Envelope>
@@ -240,7 +248,7 @@ type Handler = (...args: any[]) => Promise<Envelope>
  * shell) and returns a result envelope. Pure + injectable so the wiring is
  * unit-testable without launching Electron.
  */
-export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, resolveCodeburnPath, getQuota, emitProgress: broadcastProgress, telemetry: telemetryInstance, getUpdateStatus: () => updateChecker ? updateChecker.getStatus() : Promise.resolve(NO_UPDATE_STATUS) }): Record<string, Handler> {
+export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, resolveCodeburnPath, getQuota, emitProgress: broadcastProgress, telemetry: telemetryInstance, getUpdateStatus: () => updateChecker ? updateChecker.getStatus() : Promise.resolve(NO_UPDATE_STATUS), companion: companion }): Record<string, Handler> {
   const emitProgress = deps.emitProgress ?? (() => {})
   const telemetry = deps.telemetry ?? null
   // Flips true after the first overview fetch succeeds. Until then, every
@@ -427,6 +435,14 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     // One-shot read of the cached update-availability status. The check itself
     // runs in the background (launch + 24h); this returns whatever is known.
     'codeburn:getUpdateStatus': async () => ({ ok: true, value: deps.getUpdateStatus ? await deps.getUpdateStatus() : NO_UPDATE_STATUS }),
+    // The bundled tray app and its Capacity Dock (Windows). Every setter answers with the
+    // whole status, so the sidebar renders the state that actually took rather than the one
+    // it asked for: an install that was cancelled leaves the switch where it was.
+    'codeburn:companionStatus': async () => ({ ok: true, value: deps.companion ? deps.companion.status() : NO_COMPANION }),
+    'codeburn:setMenuBarEnabled': async (enabled?: boolean) =>
+      ({ ok: true, value: deps.companion ? await deps.companion.setMenuBarEnabled(Boolean(enabled)) : NO_COMPANION }),
+    'codeburn:setSidebarEnabled': async (enabled?: boolean) =>
+      ({ ok: true, value: deps.companion ? await deps.companion.setSidebarEnabled(Boolean(enabled)) : NO_COMPANION }),
     // Plugin management reads (all return parsed JSON)
     'codeburn:pluginList': run(() => ['plugin', 'list', '--json']),
     'codeburn:pluginInfo': run((name: string) => ['plugin', 'info', vToken(name), '--json']),
@@ -651,6 +667,18 @@ function bootstrap(): void {
     } catch (err) {
       console.error('telemetry init failed (continuing without):', err)
     }
+    // The tray app and the Capacity Dock the desktop app carries on Windows. Constructed
+    // before the handlers so the sidebar's switches have something to read, and installed in
+    // the background so a `/passive` msiexec run never holds the first window back.
+    companion = new MenubarCompanion({
+      resourcesPath: app.isPackaged ? process.resourcesPath : null,
+      stateDir: app.getPath('userData'),
+      // Electron sets this in an installed AppX package, which is the Store route.
+      store: (process as NodeJS.Process & { windowsStore?: boolean }).windowsStore === true,
+      platform: process.platform,
+      env: process.env,
+    })
+    void companion.bootstrap().catch(err => console.error('menubar bootstrap failed:', err))
     registerHandlers()
     installApplicationMenu()
     createWindow()
