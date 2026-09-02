@@ -10,10 +10,34 @@ export type CurrencyState = {
 
 export const USD: CurrencyState = { code: 'USD', symbol: '$', rate: 1 }
 
+/// SupportedCurrency in mac/.../AppStore.swift, in its order.
 export const CURRENCY_CODES = [
-  'USD', 'GBP', 'EUR', 'AUD', 'CAD', 'NZD', 'JPY', 'CHF', 'INR',
-  'BRL', 'SEK', 'SGD', 'HKD', 'KRW', 'MXN', 'ZAR', 'DKK',
+  'USD', 'GBP', 'EUR', 'AUD', 'CAD', 'NZD', 'JPY', 'CNY', 'CHF', 'INR',
+  'BRL', 'SEK', 'SGD', 'HKD', 'KRW', 'MXN', 'ZAR', 'DKK', 'RON',
 ] as const
+
+/// Only the settings window spells the currency out; the footer picker stays on the code.
+export const CURRENCY_NAMES: Record<string, string> = {
+  USD: 'US Dollar',
+  GBP: 'British Pound',
+  EUR: 'Euro',
+  AUD: 'Australian Dollar',
+  CAD: 'Canadian Dollar',
+  NZD: 'New Zealand Dollar',
+  JPY: 'Japanese Yen',
+  CNY: 'Chinese Yuan',
+  CHF: 'Swiss Franc',
+  INR: 'Indian Rupee',
+  BRL: 'Brazilian Real',
+  SEK: 'Swedish Krona',
+  SGD: 'Singapore Dollar',
+  HKD: 'Hong Kong Dollar',
+  KRW: 'South Korean Won',
+  MXN: 'Mexican Peso',
+  ZAR: 'South African Rand',
+  DKK: 'Danish Krone',
+  RON: 'Romanian Leu',
+}
 
 const SUB_CENT = 0.005
 

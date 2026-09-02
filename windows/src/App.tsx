@@ -4,10 +4,14 @@ import { listen } from '@tauri-apps/api/event'
 
 import type { MenubarPayload } from './lib/payload'
 import type { CurrencyState } from './lib/currency'
-import { USD, formatCurrency, plural, trayBadgeText } from './lib/currency'
+import { USD, formatCurrency, formatTokens, plural, trayBadgeText } from './lib/currency'
 import { PayloadCache, sameSelection, selectionKey, type Selection } from './lib/cache'
 import { relativePast } from './lib/dates'
 import { applyTheme, currentTheme, readSetting, writeSetting } from './lib/settings'
+import {
+  DEFAULT_SETTINGS, MENUBAR_PERIODS, MENUBAR_SUFFIX, cacheThemeAndAccent, subscribeSettings,
+  writeSettings, type AppSettings, type ThemeChoice,
+} from './lib/appSettings'
 import { TRAY_BADGE_SUPPORTED } from './lib/platform'
 import { EMPTY_QUOTA, refreshQuota, subscribeQuota, worstSeverity, type QuotaState } from './lib/quota'
 import { AgentTabStrip, ALL_PROVIDER, providerLabel, providerTabs } from './components/AgentTabStrip'
@@ -38,19 +42,30 @@ import { FooterBar } from './components/FooterBar'
 import { ErrorToast } from './components/ErrorToast'
 import { FetchErrorOverlay } from './components/FetchErrorOverlay'
 import { Header } from './components/Header'
-import { applyAccent, savedAccent, type AccentPreset } from './lib/accent'
-import { SettingsPanel, type SettingsSection, type ThemeChoice } from './components/SettingsPanel'
+import { accentById, applyAccent, type AccentPreset } from './lib/accent'
 
 const payloadCache = new PayloadCache<MenubarPayload>()
 
-/// The tray badge, the tooltip and the tab strip costs all read this one key, whatever
-/// the popover is showing.
+/// The tab strip's costs read this one key, whatever the popover is showing.
 const TODAY_ALL: Selection = {
   period: 'today',
   provider: 'all',
   days: [],
   scope: 'local',
   claudeConfigSourceId: null,
+}
+
+/// What the tray figure is measured over, from the settings window's Period and Scope. The
+/// mac keeps a second payload key for exactly this, since the popover and the tray can be
+/// looking at different spans.
+function menubarSelection(settings: AppSettings): Selection {
+  return {
+    period: settings.menubarPeriod,
+    provider: 'all',
+    days: [],
+    scope: settings.menubarScope,
+    claudeConfigSourceId: null,
+  }
 }
 
 /// Background cadence, mirroring mac/Sources/CodeBurnMenubar/RefreshCadence.swift: every
@@ -101,18 +116,16 @@ export function App() {
   const [version, setVersion] = useState('')
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [theme, setTheme] = useState(() => currentTheme())
-  const [trayBadge, setTrayBadge] = useState(() => TRAY_BADGE_SUPPORTED && readSetting('trayBadge') !== 'off')
-  const [showSettings, setShowSettings] = useState(false)
-  const [settingsSection, setSettingsSection] = useState<SettingsSection>('general')
   const [quota, setQuota] = useState<QuotaState>(EMPTY_QUOTA)
   // The window starts hidden and is shown by a tray click, which emits `codeburn://shown`.
   const [popoverVisible, setPopoverVisible] = useState(false)
-  const [accent, setAccent] = useState<AccentPreset>(savedAccent)
   const [dailyBudget, setDailyBudget] = useState<number | null>(null)
-  const [themeChoice, setThemeChoice] = useState<ThemeChoice>(() => {
-    const saved = readSetting('theme')
-    return saved === 'dark' || saved === 'light' ? saved : 'system'
-  })
+  // Every preference the settings window owns arrives here through one store, so a change
+  // made in that window reaches this one without a reload.
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS)
+  const [menubarPayload, setMenubarPayload] = useState<MenubarPayload | null>(null)
+  const accent: AccentPreset = accentById(settings.accent)
+  const trayBadge = TRAY_BADGE_SUPPORTED && settings.trayBadge
 
   // The CLI refuses combined scope alongside a multi-day pick, since paired devices
   // report a range rather than a set of days. The mac falls back to local there too.
@@ -126,6 +139,10 @@ export function App() {
   }
   const selection = useRef(current)
   selection.current = current
+
+  const menubarKey = menubarSelection(settings)
+  const menubarRef = useRef(menubarKey)
+  menubarRef.current = menubarKey
 
   const fetchKey = useCallback(async (key: Selection, opts: FetchOptions) => {
     if (payloadCache.isInFlight(key)) return
@@ -155,6 +172,7 @@ export function App() {
         setLastUpdated(new Date())
       }
       if (sameSelection(key, TODAY_ALL)) setTodayPayload(json)
+      if (sameSelection(key, menubarRef.current)) setMenubarPayload(json)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       if (message.includes('CLI not found')) {
@@ -171,9 +189,16 @@ export function App() {
 
   const refreshAll = useCallback(async (opts: FetchOptions) => {
     const key = selection.current
-    if (!sameSelection(key, TODAY_ALL)) {
-      fetchKey(TODAY_ALL, { includeOptimize: false, showOverlay: false })
-    }
+    // Three keys can be in play at once: what the popover shows, today for the tab strip
+    // costs, and whatever span and scope the tray figure was set to. Usually they collapse
+    // into one, and each extra key is a whole CLI run, so only genuine differences are
+    // fetched.
+    const quiet = { includeOptimize: false, showOverlay: false }
+    const extras = [TODAY_ALL, menubarRef.current].filter(
+      (extra, index, all) =>
+        !sameSelection(extra, key) && all.findIndex(other => sameSelection(other, extra)) === index,
+    )
+    for (const extra of extras) fetchKey(extra, quiet)
     void refreshQuota()
     await fetchKey(key, opts)
   }, [fetchKey])
@@ -211,7 +236,9 @@ export function App() {
     if (!cliReady) return
     const tick = popoverVisible
       ? () => refreshAll({ includeOptimize: true, showOverlay: false })
-      : () => fetchKey(TODAY_ALL, { includeOptimize: false, showOverlay: false })
+      // Hidden, the tray figure is the only thing anyone can see, so only its key is
+      // refreshed and the optimize pass is skipped.
+      : () => fetchKey(menubarRef.current, { includeOptimize: false, showOverlay: false })
     const id = setInterval(tick, popoverVisible ? REFRESH_ACTIVE_MS : REFRESH_IDLE_MS)
     return () => clearInterval(id)
   }, [cliReady, popoverVisible, refreshAll, fetchKey])
@@ -244,21 +271,36 @@ export function App() {
     })
     const unlistenHidden = listen('codeburn://hidden', () => setPopoverVisible(false))
     const unlistenTheme = listen('codeburn://toggle-theme', () => toggleTheme())
-    // The tray's Settings, Capacity Dock Settings and About all land in the settings panel
-    // for now; package C gives each its own pane in a real settings window.
-    const unlistenPanel = listen<string>('codeburn://open-panel', event => {
-      // Capacity Dock Settings lands in General, as it does on the mac.
-      setSettingsSection(event.payload === 'about' ? 'about' : 'general')
-      setShowSettings(true)
+    const unlistenBudget = listen<{ cost: number | null }>('codeburn://budget-changed', event => {
+      setDailyBudget(event.payload?.cost ?? null)
+    })
+    const unlistenCurrency = listen<CurrencyState>('codeburn://currency-changed', event => {
+      if (event.payload) setCurrency(event.payload)
     })
     return () => {
       unlistenRefresh.then(fn => fn())
       unlistenShown.then(fn => fn())
       unlistenHidden.then(fn => fn())
       unlistenTheme.then(fn => fn())
-      unlistenPanel.then(fn => fn())
+      unlistenBudget.then(fn => fn())
+      unlistenCurrency.then(fn => fn())
     }
   }, [refreshAll])
+
+  // The one place the popover learns what the settings window changed. The theme and the
+  // accent are applied here rather than only stored, so a change made over there lands on
+  // this surface without a reload.
+  useEffect(() => subscribeSettings(next => {
+    setSettings(next)
+    applyAccent(accentById(next.accent))
+    applyTheme(next.theme === 'system' ? null : next.theme)
+    setTheme(currentTheme())
+    cacheThemeAndAccent(next)
+  }), [])
+
+  useEffect(() => {
+    invoke<CurrencyState>('currency').then(setCurrency).catch(() => {})
+  }, [])
 
   // The limit lives in the CLI config, which package C's settings window will write, so
   // it is re-read whenever the popover comes back rather than cached for the session.
@@ -299,10 +341,9 @@ export function App() {
   // with the page. A manual Refresh asks it for a fresh answer too.
   useEffect(() => subscribeQuota(setQuota), [])
 
+  // The stored theme is applied by the settings subscription; this only follows the system
+  // while the choice is System.
   useEffect(() => {
-    const saved = readSetting('theme')
-    if (saved === 'dark' || saved === 'light') applyTheme(saved)
-    setTheme(currentTheme())
     const media = window.matchMedia('(prefers-color-scheme: dark)')
     const onChange = () => setTheme(currentTheme())
     media.addEventListener('change', onChange)
@@ -318,21 +359,41 @@ export function App() {
   }, [])
 
   const todayCost = todayPayload?.current?.cost ?? null
+  const trayCurrent = menubarPayload?.current ?? null
+  // The tray figure is measured over the settings window's period, which is not always
+  // today, so the suffix says which. Combined scope prefers the cross-device total, as the
+  // mac's badge does, and falls back to local when pulling the peers did not work.
+  const trayCombined = settings.menubarScope === 'combined' ? menubarPayload?.combined?.combined ?? null : null
+  const trayCost = trayCombined?.cost ?? trayCurrent?.cost ?? null
+  const trayTokens = trayCurrent
+    ? (trayCombined?.inputTokens ?? trayCurrent.inputTokens) + (trayCombined?.outputTokens ?? trayCurrent.outputTokens)
+    : null
+  const traySuffix = MENUBAR_SUFFIX[settings.menubarPeriod]
+  const isTokenMetric = settings.metric === 'tokens' || settings.metric === 'totalTokens'
+  // The 16 px badge bitmap has room for about four glyphs, so the mac's up/down token pair
+  // cannot fit; both token metrics show the total there and the hero carries the split.
+  const trayFigure = isTokenMetric
+    ? (trayTokens === null ? null : `${formatTokens(trayTokens)} tok`)
+    : (trayCost === null ? null : formatCurrency(trayCost, currency))
 
   useEffect(() => {
-    if (todayCost === null) return
-    const text = `CodeBurn · ${formatCurrency(todayCost, currency)} today`
-    invoke('set_tray_tooltip', { text }).catch(() => {})
-  }, [todayCost, currency])
+    if (trayFigure === null) return
+    invoke('set_tray_tooltip', { text: `CodeBurn · ${trayFigure}${traySuffix}` }).catch(() => {})
+  }, [trayFigure, traySuffix])
 
   useEffect(() => {
     if (!TRAY_BADGE_SUPPORTED) return
+    const showBadge = trayBadge && settings.metric !== 'iconOnly'
     // Before the first payload there is nothing to say, and the badge restored from the last
     // session is already on screen: clearing it here would blank the tray on every launch.
-    if (trayBadge && todayCost === null) return
-    const text = trayBadge && todayCost !== null ? trayBadgeText(todayCost, currency) : null
+    if (showBadge && trayCost === null && trayTokens === null) return
+    const text = !showBadge
+      ? null
+      : isTokenMetric
+        ? (trayTokens === null ? null : formatTokens(trayTokens))
+        : (trayCost === null ? null : trayBadgeText(trayCost, currency))
     invoke('set_tray_badge', { text }).catch(err => setError(`Tray badge: ${String(err)}`))
-  }, [todayCost, currency, trayBadge])
+  }, [trayCost, trayTokens, currency, trayBadge, settings.metric, isTokenMetric])
 
   // The flame carries the worst connected provider's quota severity. Rust decides whether
   // today's spend is over the daily budget, since the limit lives in the CLI's config.
@@ -341,22 +402,22 @@ export function App() {
   }, [quota, todayCost])
 
   useEffect(() => {
-    const text = todayPayload?.current
-      ? `Today · ${formatCurrency(todayPayload.current.cost, currency)} · ${plural(todayPayload.current.calls, 'call')}`
-      : 'Today · no usage yet'
+    const span = MENUBAR_PERIODS.find(p => p.id === settings.menubarPeriod)?.label ?? 'Today'
+    const text = trayCurrent
+      ? `${span} · ${trayFigure} · ${plural(trayCurrent.calls, 'call')}`
+      : `${span} · no usage yet`
     invoke('set_tray_usage', { text }).catch(() => {})
-  }, [todayPayload, currency])
-
+  }, [trayCurrent, trayFigure, settings.menubarPeriod])
 
   const chooseAccent = (preset: AccentPreset) => {
     applyAccent(preset)
-    setAccent(preset)
+    void writeSettings({ accent: preset.id })
   }
 
   const chooseTheme = (choice: ThemeChoice) => {
     applyTheme(choice === 'system' ? null : choice)
-    setThemeChoice(choice)
     setTheme(currentTheme())
+    void writeSettings({ theme: choice })
   }
 
   const toggleTheme = () => {
@@ -364,8 +425,7 @@ export function App() {
   }
 
   const setTrayBadgePref = (on: boolean) => {
-    setTrayBadge(on)
-    writeSetting('trayBadge', on ? 'on' : 'off')
+    void writeSettings({ trayBadge: on })
   }
 
   const applyCurrency = async (code: string) => {
@@ -381,6 +441,11 @@ export function App() {
   }
   const connectClaude = () => {
     invoke('open_claude_login').catch(err => setError(String(err)))
+  }
+
+  /// Settings left the popover for a window of their own; what is left here is the link.
+  const openSettingsWindow = (section = 'general') => {
+    invoke('open_settings_window', { section }).catch(err => setError(String(err)))
   }
 
   // Combined pulls unfiltered totals from every paired device, so a provider filter or a
@@ -444,34 +509,18 @@ export function App() {
     <div className="popover">
       <Header
         quota={quota}
-        showQuota={!cliBlocked && !showSettings}
+        showQuota={!cliBlocked}
         accent={accent}
         onAccent={chooseAccent}
         animate={popoverVisible}
       />
 
-      {!cliBlocked && !showSettings && (
+      {!cliBlocked && (
         <AgentTabStrip selected={provider} onSelect={chooseProvider} payload={todayPayload} currency={currency} quota={quota} />
       )}
 
       <div className="main-content">
-        {showSettings ? (
-          <SettingsPanel
-            section={settingsSection}
-            onBack={() => setShowSettings(false)}
-            version={version}
-            currency={currency}
-            onCurrency={applyCurrency}
-            themeChoice={themeChoice}
-            onThemeChoice={chooseTheme}
-            trayBadge={trayBadge}
-            onTrayBadge={setTrayBadgePref}
-            cliStatus={cliStatus}
-            onCheckCli={checkCli}
-            cliChecking={cliChecking}
-            onQuit={() => invoke('quit_app').catch(() => {})}
-          />
-        ) : cliBlocked && cliStatus ? (
+        {cliBlocked && cliStatus ? (
           <SetupState status={cliStatus} checking={cliChecking} onCheckAgain={checkCli} />
         ) : (
           <>
@@ -575,8 +624,7 @@ export function App() {
         themeLabel={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
         trayBadge={trayBadge}
         onToggleTrayBadge={() => setTrayBadgePref(!trayBadge)}
-        onOpenSettings={() => { setSettingsSection('general'); setShowSettings(s => !s) }}
-        settingsOpen={showSettings}
+        onOpenSettings={openSettingsWindow}
         footnote={footnote}
       />
 

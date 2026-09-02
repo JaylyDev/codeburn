@@ -211,9 +211,17 @@ impl CodeburnCli {
     /// Spawns `codeburn quota --format json` for the Capacity Dock. A CLI without the
     /// subcommand exits 1 with `unknown command`, which the dock reports as a quiet
     /// "CLI update needed" state rather than an error.
+    ///
+    /// Provider keys pasted into the settings window ride along as environment variables on
+    /// the child, which is the only credential channel the CLI has. They are never put on a
+    /// command line and never logged.
     pub async fn fetch_quota(&self) -> DockQuota {
         let stdout = match self
-            .run_capture(&["quota", "--format", "json"], QUOTA_TIMEOUT_SECS)
+            .run_capture_with_env(
+                &["quota", "--format", "json"],
+                QUOTA_TIMEOUT_SECS,
+                &crate::settings::quota_environment(),
+            )
             .await
         {
             Ok(stdout) => stdout,
@@ -241,6 +249,15 @@ impl CodeburnCli {
     }
 
     async fn run_capture(&self, args: &[&str], timeout_secs: u64) -> Result<String> {
+        self.run_capture_with_env(args, timeout_secs, &[]).await
+    }
+
+    async fn run_capture_with_env(
+        &self,
+        args: &[&str],
+        timeout_secs: u64,
+        env: &[(String, String)],
+    ) -> Result<String> {
         let mut full_args = self.extra_args.clone();
         full_args.extend(args.iter().map(|s| s.to_string()));
 
@@ -250,6 +267,9 @@ impl CodeburnCli {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        for (name, value) in env {
+            cmd.env(name, value);
+        }
         #[cfg(windows)]
         {
             const CREATE_NO_WINDOW: u32 = 0x08000000;

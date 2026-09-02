@@ -4,6 +4,7 @@ mod config;
 mod dock;
 mod fx;
 mod plan;
+mod settings;
 /// The spend-in-the-tray badge is a second tray icon, which only the Tauri tray backend
 /// provides; Linux runs its own SNI tray (`tray_linux`) and has no equivalent, so the
 /// whole module is compiled out there rather than sitting unused.
@@ -116,8 +117,10 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             // The dock is a persistent rail: it owns its own lifecycle and must survive both
-            // the hide-on-blur and the hide-on-close that keep the popover alive.
-            if window.label() == dock::DOCK_LABEL {
+            // the hide-on-blur and the hide-on-close that keep the popover alive. The
+            // settings window is an ordinary window: it stays put when it loses focus, and
+            // closing it destroys it rather than parking a webview nobody can see.
+            if window.label() == dock::DOCK_LABEL || window.label() == settings::SETTINGS_LABEL {
                 return;
             }
             match event {
@@ -137,6 +140,7 @@ pub fn run() {
             commands::fetch_payload,
             commands::cli_status,
             commands::daily_budget,
+            commands::currency,
             commands::set_currency,
             commands::open_terminal_command,
             commands::open_claude_login,
@@ -156,6 +160,18 @@ pub fn run() {
             commands::dock_set_preferred,
             commands::dock_context_menu,
             commands::dock_begin_drag,
+            commands::dock_prefs,
+            commands::set_dock_prefs,
+            commands::open_settings_window,
+            commands::settings_section,
+            commands::settings_load,
+            commands::settings_patch,
+            commands::claude_config_dirs,
+            commands::set_claude_config_dirs,
+            commands::daily_budgets,
+            commands::set_daily_budget,
+            commands::provider_key_providers,
+            commands::set_provider_key,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -269,11 +285,11 @@ fn on_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
             }
         }
         "toggle_dock" => set_dock_enabled(app, !dock::is_enabled()),
-        // Two entries, one destination for now: the popover's settings panel. Package C
-        // turns them into deep links to the matching pane of the settings window.
-        "settings" => open_popover_panel(app, "settings"),
-        "dock_settings" => open_popover_panel(app, "dock"),
-        "about" => open_popover_panel(app, "about"),
+        // Deep links into the settings window: General, General scrolled to its Capacity
+        // Dock section, and About, exactly as the mac's three menu items land.
+        "settings" => open_settings(app, "general"),
+        "dock_settings" => open_settings(app, "general#dock"),
+        "about" => open_settings(app, "about"),
         "report" => {
             let _ = cli::spawn_in_terminal(app, &["report"]);
         }
@@ -281,12 +297,11 @@ fn on_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
     }
 }
 
-/// Shows the popover on a named panel. The event has to follow the window being shown, or a
-/// popover that was closed would swallow it.
-fn open_popover_panel(app: &AppHandle, panel: &str) {
-    show_popover(app, None);
-    if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
-        let _ = window.emit("codeburn://open-panel", panel);
+/// Opens the settings window on a named pane. The popover is left alone: it hides itself on
+/// blur, so the settings window taking focus is what closes it.
+fn open_settings(app: &AppHandle, section: &str) {
+    if let Err(err) = settings::open(app, Some(section)) {
+        eprintln!("codeburn: failed to open the settings window: {err}");
     }
 }
 
@@ -632,7 +647,7 @@ fn position_popover(window: &tauri::WebviewWindow, anchor: Option<(i32, i32)>) {
 mod commands {
     use super::{AppState, POPOVER_LABEL};
     use serde_json::Value;
-    use tauri::{AppHandle, Manager, State};
+    use tauri::{AppHandle, Emitter, Manager, State};
 
     #[tauri::command]
     pub async fn fetch_payload(
@@ -678,8 +693,40 @@ mod commands {
         Ok(status)
     }
 
+    /// The currency the CLI config names, with a live rate. Both windows ask for this on
+    /// mount: without it the popover opened in dollars every launch however the currency was
+    /// set, because nothing read the stored code back.
+    #[tauri::command]
+    pub async fn currency(state: State<'_, AppState>) -> Result<crate::fx::CurrencyApplied, String> {
+        let code = crate::config::read()
+            .get("currency")
+            .and_then(|currency| currency.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("USD")
+            .to_string();
+        let usd = crate::fx::CurrencyApplied {
+            code: "USD".into(),
+            symbol: "$".into(),
+            rate: 1.0,
+        };
+        if code == "USD" {
+            return Ok(usd);
+        }
+        // No rate means no honest conversion, so the figures stay in the dollars the CLI
+        // reports rather than being multiplied by a guess.
+        match state.fx.rate_for(&code).await {
+            Some(rate) => Ok(crate::fx::CurrencyApplied {
+                symbol: crate::fx::symbol_for(&code),
+                code,
+                rate,
+            }),
+            None => Ok(usd),
+        }
+    }
+
     #[tauri::command]
     pub async fn set_currency(
+        app: AppHandle,
         code: String,
         state: State<'_, AppState>,
     ) -> Result<crate::fx::CurrencyApplied, String> {
@@ -695,7 +742,11 @@ mod commands {
             .map_err(|e| e.to_string())?
             .set_currency(&code, &symbol)
             .map_err(|e| e.to_string())?;
-        Ok(crate::fx::CurrencyApplied { code, symbol, rate })
+        let applied = crate::fx::CurrencyApplied { code, symbol, rate };
+        // The settings window and the popover both show money, and either can be the one
+        // that changed it.
+        let _ = app.emit("codeburn://currency-changed", &applied);
+        Ok(applied)
     }
 
     #[tauri::command]
@@ -839,5 +890,105 @@ mod commands {
     #[tauri::command]
     pub fn dock_context_menu(app: AppHandle) -> Result<(), String> {
         crate::dock::popup_context_menu(&app).map_err(|e| e.to_string())
+    }
+
+    /// Everything the Capacity Dock reads out of `windows-dock.json`: whether it is on, its
+    /// scale, appearance, gauge shape and provider set. One free-form object, so a new dock
+    /// preference costs no Rust.
+    #[tauri::command]
+    pub fn dock_prefs() -> Value {
+        Value::Object(crate::dock::read_prefs())
+    }
+
+    /// Writes dock preferences and brings the window in line with them. `enabled` is the one
+    /// key with a side effect, since it creates or destroys the dock window; everything else
+    /// only has to reach the page, which the event does.
+    #[tauri::command]
+    pub fn set_dock_prefs(
+        app: AppHandle,
+        patch: serde_json::Map<String, Value>,
+    ) -> Result<Value, String> {
+        let enabled = patch.get("enabled").and_then(Value::as_bool);
+        let mut merged = crate::dock::patch_prefs(patch).map_err(|e| e.to_string())?;
+        if let Some(enabled) = enabled {
+            super::set_dock_enabled(&app, enabled);
+            // `set_dock_enabled` persists the key itself, so read it back rather than
+            // reporting the value we asked for and a failed write nobody saw.
+            merged = crate::dock::read_prefs();
+        }
+        let value = Value::Object(merged);
+        let _ = app.emit("codeburn://dock-settings-changed", &value);
+        Ok(value)
+    }
+
+    /// The popover's More menu and the tray both come through here.
+    #[tauri::command]
+    pub fn open_settings_window(app: AppHandle, section: Option<String>) -> Result<(), String> {
+        crate::settings::open(&app, section.as_deref()).map_err(|e| e.to_string())
+    }
+
+    /// The pane the window was opened on, asked for once by the page on mount. An event
+    /// cannot do this job: it would be emitted while the webview is still loading.
+    #[tauri::command]
+    pub fn settings_section() -> Option<String> {
+        crate::settings::take_pending_section()
+    }
+
+    #[tauri::command]
+    pub fn settings_load() -> Value {
+        Value::Object(crate::settings::read())
+    }
+
+    #[tauri::command]
+    pub fn settings_patch(
+        app: AppHandle,
+        patch: serde_json::Map<String, Value>,
+    ) -> Result<Value, String> {
+        let merged = crate::settings::patch(patch).map_err(|e| e.to_string())?;
+        crate::settings::broadcast(&app, &merged);
+        Ok(Value::Object(merged))
+    }
+
+    #[tauri::command]
+    pub fn claude_config_dirs() -> Vec<String> {
+        crate::settings::claude_config_dirs()
+    }
+
+    /// Persisted to the CLI's own config so every `codeburn` run honours the list, whether
+    /// this app spawned it or the user typed it in a terminal.
+    #[tauri::command]
+    pub fn set_claude_config_dirs(app: AppHandle, dirs: Vec<String>) -> Result<Vec<String>, String> {
+        crate::settings::set_claude_config_dirs(&dirs).map_err(|e| e.to_string())?;
+        let stored = crate::settings::claude_config_dirs();
+        let _ = app.emit("codeburn://claude-configs-changed", &stored);
+        Ok(stored)
+    }
+
+    /// Both daily alert thresholds. `None` on either means that alert is off.
+    #[tauri::command]
+    pub fn daily_budgets() -> Value {
+        serde_json::json!({
+            "cost": crate::tray_status::daily_budget(),
+            "tokens": crate::tray_status::daily_token_budget(),
+        })
+    }
+
+    #[tauri::command]
+    pub fn set_daily_budget(app: AppHandle, key: String, amount: Option<f64>) -> Result<(), String> {
+        crate::settings::set_daily_budget(&key, amount).map_err(|e| e.to_string())?;
+        let _ = app.emit("codeburn://budget-changed", daily_budgets());
+        Ok(())
+    }
+
+    /// Which providers have a key stored, never the keys themselves.
+    #[tauri::command]
+    pub fn provider_key_providers() -> Vec<String> {
+        crate::settings::stored_key_providers()
+    }
+
+    #[tauri::command]
+    pub fn set_provider_key(provider: String, key: String) -> Result<Vec<String>, String> {
+        crate::settings::set_provider_key(&provider, &key).map_err(|e| e.to_string())?;
+        Ok(crate::settings::stored_key_providers())
     }
 }

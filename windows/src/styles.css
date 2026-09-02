@@ -1666,43 +1666,6 @@ code { font-family: var(--font-mono); }
 .setup-error { margin-top: 6px; text-align: left; font-family: var(--font-mono); font-size: 10px; word-break: break-word; user-select: text; }
 .setup-error-muted { margin-top: 4px; text-align: left; font-size: 10px; color: var(--label-3); word-break: break-all; }
 
-/* ---- settings ------------------------------------------------------------------- */
-
-.settings { display: flex; flex-direction: column; padding: 8px 0 14px; }
-.settings-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 2px var(--gutter) 10px;
-}
-.settings-title { font-size: 13px; font-weight: 600; color: var(--label); }
-.settings-group {
-  display: flex;
-  flex-direction: column;
-  padding: 8px var(--gutter) 6px;
-  border-top: 1px solid var(--separator-soft);
-}
-.settings-group-label {
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.4px;
-  text-transform: uppercase;
-  color: var(--label-3);
-  margin-bottom: 4px;
-}
-.settings-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 7px 0;
-}
-.settings-row-text { flex: 1; min-width: 0; }
-.settings-row-label { font-size: 12px; font-weight: 500; color: var(--label); }
-.settings-row-hint { margin-top: 1px; font-size: 10.5px; line-height: 1.35; color: var(--label-2); word-break: break-word; }
-.settings-row-control { flex-shrink: 0; display: flex; align-items: center; }
-.settings-error { font-size: 10.5px; color: var(--danger); padding-bottom: 6px; }
-
 .toggle {
   position: relative;
   width: 34px;
@@ -1971,3 +1934,176 @@ code { font-family: var(--font-mono); }
   color: var(--tooltip-fg-2);
 }
 .error-toast-close:hover { background: rgba(127, 127, 127, 0.2); }
+
+/* ---- settings window ------------------------------------------------------------- */
+
+/* A decorated, resizable window rather than a panel inside the popover, so it paints its
+   own background edge to edge: the sidebar takes the warm surface and the detail pane the
+   lighter window surface, which is the arrangement macOS System Settings uses and the one
+   the mac app's SettingsView mirrors. */
+.stg {
+  display: flex;
+  height: 100%;
+  background: var(--surface-window);
+  color: var(--label);
+  font-size: 12px;
+}
+
+.stg-sidebar {
+  flex: 0 0 240px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 10px;
+  background: var(--surface);
+  border-right: 1px solid var(--separator);
+}
+
+.stg-search { padding: 12px 12px 8px; }
+.stg-search-field,
+.stg-field,
+.stg-select {
+  font: inherit;
+  color: var(--label);
+  background: var(--control-bg);
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius-pill);
+  padding: 4px 7px;
+}
+.stg-search-field { width: 100%; }
+.stg-search-field::-webkit-search-cancel-button { cursor: default; }
+.stg-select { min-width: 132px; }
+.stg-field { min-width: 120px; }
+.stg-select:focus-visible,
+.stg-field:focus-visible,
+.stg-search-field:focus-visible { outline: 2px solid var(--brand-accent); outline-offset: 1px; }
+
+.stg-list { list-style: none; margin: 0; padding: 0 8px; }
+.stg-list-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 14px 14px 5px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--label-3);
+}
+.stg-list-count { font-family: var(--font-mono); letter-spacing: 0; text-transform: none; }
+.stg-list-empty { padding: 4px 14px; font-size: 11px; color: var(--label-3); }
+
+.stg-row-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 30px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  text-align: left;
+}
+.stg-row-btn:hover { background: var(--control-hover); }
+.stg-row-btn-active,
+.stg-row-btn-active:hover { background: var(--brand-accent); color: #FFFFFF; }
+.stg-row-btn-dim { color: var(--label-2); }
+.stg-row-btn-active.stg-row-btn-dim { color: rgba(255, 255, 255, 0.86); }
+.stg-row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.stg-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  border-radius: 5px;
+  font-size: 9px;
+  font-weight: 700;
+  color: #FFFFFF;
+}
+.stg-chip-general { background: linear-gradient(var(--brand-accent-dark), var(--brand-accent)); }
+.stg-chip-about { background: linear-gradient(#9A9AA0, #75757A); }
+.stg-glyph { display: inline-flex; align-items: center; justify-content: center; width: 20px; flex-shrink: 0; }
+.stg-dot { width: 6px; height: 6px; border-radius: 3px; background: var(--sev-normal); flex-shrink: 0; }
+
+.stg-detail { flex: 1; min-width: 0; overflow-y: auto; }
+.stg-pane { padding: 20px 24px 32px; max-width: 640px; }
+
+.stg-group { margin-bottom: 22px; }
+.stg-group-title { margin: 0 0 7px 2px; font-size: 12px; font-weight: 600; color: var(--label); }
+.stg-card {
+  background: var(--surface);
+  border: 1px solid var(--separator);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+}
+.stg-footer { margin: 7px 2px 0; font-size: 10.5px; line-height: 1.4; color: var(--label-2); }
+
+.stg-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--separator-soft);
+}
+.stg-row:last-child, .stg-card > :last-child { border-bottom: 0; }
+.stg-row-stacked { flex-direction: column; align-items: stretch; gap: 8px; }
+.stg-row-text { min-width: 0; }
+.stg-row-label { font-size: 12px; font-weight: 500; color: var(--label); }
+.stg-row-hint { margin-top: 1px; font-size: 10.5px; line-height: 1.35; color: var(--label-2); }
+.stg-row-control { flex-shrink: 0; display: flex; align-items: center; gap: 8px; }
+.stg-row-stacked .stg-row-control { justify-content: flex-start; }
+.stg-note {
+  padding: 8px 12px;
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--label-2);
+  border-bottom: 1px solid var(--separator-soft);
+}
+.stg-error { color: var(--danger); }
+
+/* 18 px on a 26 px pitch: the popover's own swatches are 12 px and easy to miss. */
+.stg-swatches { display: flex; gap: 8px; }
+.stg-swatch {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--separator);
+  border-radius: 9px;
+}
+.stg-swatch-on { outline: 2px solid var(--label); outline-offset: 1px; }
+
+.stg-slider { width: 168px; accent-color: var(--brand-accent); }
+
+.stg-link-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--separator-soft);
+  background: transparent;
+  text-align: left;
+}
+.stg-link-row:hover { background: var(--control-hover); }
+.stg-link-arrow { color: var(--label-3); display: inline-flex; }
+.stg-link-row:hover .stg-link-arrow { color: var(--brand-accent); }
+
+.stg-hero { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 0 22px; }
+.stg-hero-mark { line-height: 0; margin-bottom: 8px; }
+.stg-hero-name { font-family: var(--font-display); font-size: 17px; font-weight: 600; }
+.stg-hero-version { font-size: 11.5px; color: var(--label-2); }
+.stg-hero-tagline { font-size: 11px; color: var(--label-3); }
+
+.stg-conn { display: flex; align-items: flex-start; gap: 10px; min-width: 0; }
+.stg-conn-icon { display: inline-flex; flex-shrink: 0; padding-top: 1px; color: var(--label-3); }
+.stg-conn-connected, .stg-conn-stale { color: var(--sev-normal-ink); }
+.stg-conn-terminalFailure { color: var(--danger); }
+.stg-conn-transientFailure { color: var(--sev-critical-ink); }
+.stg-row-btn-active .stg-dot { background: #FFFFFF; }

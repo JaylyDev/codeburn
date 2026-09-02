@@ -76,12 +76,22 @@ pub fn tray_icon(tint: Option<[u8; 3]>) -> Result<Image<'static>> {
     Ok(Image::new_owned(rgba, width, height))
 }
 
-/// Today's spend limit, shared with the CLI's config. Absent or zero means no budget, which
-/// is the default until the settings window can write one.
+/// Today's spend limit, kept beside the currency in the CLI's config so the tray can read it
+/// before any webview exists. Absent or zero means no budget. The settings window writes it.
 pub fn daily_budget() -> Option<f64> {
+    budget("dailyBudget")
+}
+
+/// The same alert measured in tokens, for the token display metrics. Only one of the two is
+/// ever armed, since the metric decides which one the flame is judged against.
+pub fn daily_token_budget() -> Option<f64> {
+    budget("dailyTokenBudget")
+}
+
+fn budget(key: &str) -> Option<f64> {
     let path = dirs::home_dir()?.join(".config/codeburn/config.json");
     let value: serde_json::Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    let budget = value.get("dailyBudget")?.as_f64()?;
+    let budget = value.get(key)?.as_f64()?;
     (budget > 0.0).then_some(budget)
 }
 

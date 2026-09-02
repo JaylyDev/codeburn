@@ -411,6 +411,28 @@ fn write_state(state: &serde_json::Map<String, serde_json::Value>) -> Result<()>
     Ok(())
 }
 
+/// The dock's own preferences, which the settings window edits and the rail renders from.
+/// `placement` is in here too, but it is written by dragging rather than by the settings, so
+/// the settings window simply leaves the key alone.
+pub fn read_prefs() -> serde_json::Map<String, serde_json::Value> {
+    read_state()
+}
+
+pub fn patch_prefs(
+    values: serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut state = read_state();
+    for (key, value) in values {
+        if value.is_null() {
+            state.remove(&key);
+        } else {
+            state.insert(key, value);
+        }
+    }
+    write_state(&state)?;
+    Ok(state)
+}
+
 pub fn is_enabled() -> bool {
     read_state()
         .get("enabled")
