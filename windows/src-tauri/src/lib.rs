@@ -1,3 +1,7 @@
+// Linux builds compile the Windows-only dock, session and tray-status code but never
+// call it (that platform runs its own SNI tray), so dead-code lints are for Windows only.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 mod autostart;
 mod cli;
 mod config;
@@ -832,6 +836,9 @@ mod commands {
     use serde_json::Value;
     use tauri::{AppHandle, Emitter, Manager, State};
 
+    // Every argument is one field of the payload query; a struct would only move the
+    // count into the frontend's invoke call.
+    #[allow(clippy::too_many_arguments)]
     #[tauri::command]
     pub async fn fetch_payload(
         app: AppHandle,

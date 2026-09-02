@@ -284,7 +284,7 @@ fn seal(plain: &[u8]) -> Result<Vec<u8>> {
     use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
     use windows_sys::Win32::Foundation::LocalFree;
 
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: plain.len() as u32,
         pbData: plain.as_ptr() as *mut u8,
     };
@@ -294,7 +294,7 @@ fn seal(plain: &[u8]) -> Result<Vec<u8>> {
     };
     let ok = unsafe {
         CryptProtectData(
-            &mut input,
+            &input,
             std::ptr::null(),
             std::ptr::null(),
             std::ptr::null(),
@@ -320,7 +320,7 @@ fn unseal(sealed: &[u8]) -> Result<Vec<u8>> {
     use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
     use windows_sys::Win32::Foundation::LocalFree;
 
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: sealed.len() as u32,
         pbData: sealed.as_ptr() as *mut u8,
     };
@@ -330,7 +330,7 @@ fn unseal(sealed: &[u8]) -> Result<Vec<u8>> {
     };
     let ok = unsafe {
         CryptUnprotectData(
-            &mut input,
+            &input,
             std::ptr::null_mut(),
             std::ptr::null(),
             std::ptr::null(),
