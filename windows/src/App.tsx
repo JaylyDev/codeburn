@@ -18,7 +18,7 @@ import { TrendInsight } from './components/TrendInsight'
 import { ForecastInsight } from './components/ForecastInsight'
 import { PulseInsight } from './components/PulseInsight'
 import { StatsInsight } from './components/StatsInsight'
-import { PlanInsight } from './components/PlanInsight'
+import { PlanInsight, planTargets } from './components/PlanInsight'
 import { FindingsSection } from './components/FindingsSection'
 import { ActivitySection } from './components/ActivitySection'
 import { LoadingOverlay } from './components/LoadingOverlay'
@@ -267,9 +267,9 @@ export function App() {
   }
 
   const tabs = providerTabs(todayPayload)
-  const detected = tabs.filter(t => t.id !== ALL_PROVIDER && t.detected)
-  const planVisible = provider === 'claude'
-    || (provider === ALL_PROVIDER && detected.length === 1 && detected[0].id === 'claude')
+  // The Plan pill is offered exactly when there is a plan to show: the selected provider has
+  // a live quota source, or All is selected and at least one provider does.
+  const planVisible = provider === 'claude' || planTargets(quota, provider).length > 0
   const visibleModes = useMemo(
     () => INSIGHT_ORDER.filter(m => m !== 'plan' || planVisible),
     [planVisible],
@@ -336,7 +336,14 @@ export function App() {
                 <div className="insight-area">
                   <InsightPills selected={activeInsight} onSelect={selectInsight} modes={visibleModes} />
                   {activeInsight === 'plan' && (
-                    <PlanInsight payload={payload} currency={currency} onOpenTerminal={openTerminal} onConnectClaude={connectClaude} />
+                    <PlanInsight
+                      payload={payload}
+                      currency={currency}
+                      provider={provider}
+                      quota={quota}
+                      onOpenTerminal={openTerminal}
+                      onConnectClaude={connectClaude}
+                    />
                   )}
                   {activeInsight === 'trend' && <TrendInsight days={payload?.history?.daily ?? []} currency={currency} />}
                   {activeInsight === 'forecast' && <ForecastInsight days={payload?.history?.daily ?? []} currency={currency} />}
