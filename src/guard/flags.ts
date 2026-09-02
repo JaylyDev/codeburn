@@ -53,14 +53,24 @@ export function flagsAgeMs(flags: GuardFlags): number {
   return Number.isNaN(t) ? Number.POSITIVE_INFINITY : Date.now() - t
 }
 
-function norm(p: string): string {
-  return p.length > 1 && (p.endsWith('/') || p.endsWith('\\')) ? p.slice(0, -1) : p
+// A flagged project path comes from provider data and can be POSIX-shaped on a
+// Windows host, so a Windows host has to count either separator as a directory
+// boundary. Everywhere else a backslash is an ordinary filename character and
+// must never split a path.
+const WINDOWS_HOST = process.platform === 'win32'
+
+function endsWithSeparator(p: string): boolean {
+  return p.endsWith('/') || (WINDOWS_HOST && p.endsWith('\\'))
 }
 
-// A flagged project path comes from provider data and can be POSIX-shaped on a
-// Windows host, so either separator has to count as a directory boundary.
+function norm(p: string): string {
+  return p.length > 1 && endsWithSeparator(p) ? p.slice(0, -1) : p
+}
+
 function isWithin(target: string, base: string): boolean {
-  return target === base || target.startsWith(`${base}/`) || target.startsWith(`${base}\\`)
+  if (target === base) return true
+  if (target.startsWith(`${base}/`)) return true
+  return WINDOWS_HOST && target.startsWith(`${base}\\`)
 }
 
 // Openers for the flagged project the cwd sits in (exact match or a subdir of
