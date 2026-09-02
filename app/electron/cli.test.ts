@@ -593,7 +593,10 @@ describe('graceful kill (SIGTERM, then SIGKILL after the grace)', () => {
   })
 })
 
-describe('orphan serve reaping', () => {
+// These start real children and then wait for the OS to report them gone, which is the same
+// reason the resident-serve block gets room: the assertions are about which process survives,
+// never about how quickly a busy machine gets round to ending it.
+describe('orphan serve reaping', { timeout: 30_000 }, () => {
   /** A long-lived stand-in for an orphaned `codeburn serve --stdio` child. */
   function orphanServe(): { pid: number; pidFile: string } {
     const bin = join(dir, 'codeburn')
