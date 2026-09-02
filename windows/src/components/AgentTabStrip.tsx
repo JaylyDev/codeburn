@@ -39,7 +39,8 @@ const KNOWN_TOOLS: Array<{ id: Provider; label: string; source: string }> = [
 ]
 
 /// Provider marks from mac/Sources/CodeBurnMenubar/Views/AgentTabStrip.swift (ProviderFilter
-/// .color), keyed by the CLI provider id rather than the Swift case name.
+/// .color), keyed by the CLI provider id rather than the Swift case name. Kept for the
+/// surfaces that still want a brand colour; the tab chips themselves carry none.
 const PROVIDER_COLORS: Record<string, string> = {
   all: '#C9521D',
   claude: '#C9521D',
@@ -234,7 +235,6 @@ export function AgentTabStrip({ selected, onSelect, payload, currency, quota }: 
                   }}
                 >
                   <span className="tab-chip">
-                    <span className="tab-dot" style={active ? undefined : { background: providerColor(tab.id) }} />
                     <span className="tab-label">{tab.label}</span>
                     {tab.detected && tab.cost > 0 && (
                       <span className="tab-cost">{formatCompactCurrency(tab.cost, currency)}</span>

@@ -386,16 +386,6 @@ code { font-family: var(--font-mono); }
 }
 .tab:hover { background: var(--fill-12); }
 .tab-active, .tab-active:hover { background: var(--brand-accent); color: #fff; }
-/* The provider's brand mark, from ProviderFilter.color on the mac. */
-.tab-dot {
-  align-self: center;
-  flex: 0 0 auto;
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-}
-.tab-active .tab-dot { background: rgba(255, 255, 255, 0.85); }
-.tab-muted .tab-dot { opacity: 0.4; }
 .tab-chip {
   display: inline-flex;
   align-items: baseline;
