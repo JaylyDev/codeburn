@@ -12,11 +12,13 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "stage-cli": "npm --prefix .. run build:cli && node scripts/stage-cli.mjs",
+    "stage-menubar": "node scripts/stage-menubar.mjs --target nsis",
+    "stage-menubar:store": "node scripts/stage-menubar.mjs --target appx",
     "package": "npm run stage-cli && npm run build && electron-builder --mac",
     "package:arm64": "npm run stage-cli && npm run build && electron-builder --mac --arm64",
     "package:x64": "npm run stage-cli && npm run build && electron-builder --mac --x64",
-    "package:win": "npm run stage-cli && npm run build && electron-builder --win",
-    "package:store": "npm run stage-cli && npm run build && electron-builder --win appx --x64",
+    "package:win": "npm run stage-cli && npm run stage-menubar && npm run build && electron-builder --win",
+    "package:store": "npm run stage-cli && npm run stage-menubar:store && npm run build && electron-builder --win appx --x64",
     "package:linux": "npm run stage-cli && npm run build && electron-builder --linux",
     "package:snap": "npm run stage-cli && npm run build && electron-builder --linux snap --x64"
   },
@@ -96,14 +98,25 @@
           ]
         }
       ],
-      "icon": "build/icon.png"
+      "icon": "build/icon.png",
+      "extraResources": [
+        {
+          "from": "build/menubar",
+          "to": "menubar",
+          "filter": [
+            "**/*"
+          ]
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,
       "perMachine": false,
-      "artifactName": "CodeBurn-Setup-${version}.${ext}"
+      "artifactName": "CodeBurn-Setup-${version}.${ext}",
+      "include": "build/installer.nsh"
     },
     "appx": {
+      "customExtensionsPath": "build/appx-extensions.xml",
       "applicationId": "CodeBurn",
       "identityName": "Codeburn.CodeBurn",
       "publisher": "CN=3EFA3336-87E1-46F2-9DFA-2EB5A7693F89",

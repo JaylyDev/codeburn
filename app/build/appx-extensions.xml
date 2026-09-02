@@ -1,0 +1,9 @@
+<!-- Launch at login for the tray app the Store package carries. The NSIS route writes an
+     HKCU Run value instead (app/electron/menubar.ts); a packaged app declares it here so the
+     person can turn it off in Settings > Apps > Startup like any other packaged app.
+     electron-builder splices this file inside the manifest's <Extensions> element, and the
+     desktop namespace is already declared by its template. The path is where extraResources
+     land inside the package: the app itself is app\CodeBurn.exe. -->
+<desktop:Extension Category="windows.startupTask" Executable="app\resources\menubar\codeburn-menubar.exe" EntryPoint="Windows.FullTrustApplication">
+  <desktop:StartupTask TaskId="CodeBurnMenubar" Enabled="true" DisplayName="CodeBurn Menubar" />
+</desktop:Extension>

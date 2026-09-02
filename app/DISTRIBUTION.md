@@ -52,6 +52,84 @@ bundled CLI's dependency tree gets stripped out of an `extraResources` copy
 in verbatim, which is the electron-builder-recommended mechanism for adding
 unpacked files that must not be ASAR-archived.
 
+## The bundled tray app and Capacity Dock (Windows only)
+
+The Windows desktop app also carries the Tauri tray app from `windows/`, so
+installing the desktop app gives the user the tray icon and the Capacity Dock
+without their having to know that `codeburn menubar` exists. Two switches in the
+sidebar's bottom-left corner turn each surface off ("Menu bar" is the tray
+process, "Sidebar" is the dock rail); both default on, and neither appears on
+macOS or Linux, or in a build with nothing staged.
+
+`scripts/stage-menubar.mjs` puts the tray app into `app/build/menubar`, which
+`build.win.extraResources` ships as `resources/menubar`. It copies rather than
+downloads, exactly like `stage-cli.mjs`: with no `--from` it takes the local
+`windows/src-tauri/target/release` output, and CI downloads the `windows-v*`
+release assets in its own step and passes `--from <dir>`.
+
+The two routes need different things staged, which is why there are two scripts:
+
+- `npm run stage-menubar` (run by `package:win`) stages
+  `CodeBurn.Menubar_<version>_x64_en-US.msi` and its `.sha256`. The digest is
+  copied from the release when it is there and computed when it is not, so a
+  local `cargo tauri build` stages the same shape a release does.
+- `npm run stage-menubar:store` (run by `package:store`) stages
+  `codeburn-menubar.exe` itself, plus any sidecar DLL beside it.
+
+### The NSIS route: install through the CLI, never downgrade
+
+`app/electron/menubar.ts` runs at every launch (which is also what covers a
+desktop-app update, since the staged MSI travels with the app) and hands the
+staged file to the CLI's own Windows installer by setting `CODEBURN_MENUBAR_MSI`
+on a `codeburn menubar` spawn. The install itself is not reimplemented on the
+Electron side: `src/menubar-installer.ts` owns the uninstall-registry read, the
+checksum verification, the `msiexec /i ... /passive /norestart` call and the
+rules that go with a bundled copy. It prints one `CODEBURN_MENUBAR_RESULT <json>`
+line that the desktop app reads.
+
+Two of those rules matter here:
+
+- **Deduplication.** The MSI carries a fixed WiX upgrade code
+  (`windows/src-tauri/tauri.conf.json`, `bundle.windows.wix.upgradeCode`), which
+  is the value Tauri already derived from the product name, so installing the
+  bundled copy over a manual `codeburn menubar` install is an in-place upgrade
+  rather than a second entry in Programs and Features.
+- **Never downgrade.** If the installed `DisplayVersion` is newer than the
+  bundled one, nothing is installed and the existing app is left alone.
+
+**The marker.** The installer writes
+`%LOCALAPPDATA%\codeburn-menubar\installed-by.json`, crediting `desktop` only
+when it installed onto a machine that had no tray app, and `manual` when it
+upgraded one that was already there. An existing marker's verdict is never
+rewritten. `build/installer.nsh` (wired as `nsis.include`) reads it in the
+uninstaller and removes the tray app only when the marker says `desktop`, so a
+tray app the user installed by hand survives an uninstall of the desktop app.
+
+Launch at login on this route is a single `HKCU\...\CurrentVersion\Run` value
+named `CodeBurn`, the same value the tray app's own settings toggle writes
+(`windows/src-tauri/src/autostart.rs`), so the two can never leave two entries.
+
+### The Store route: no msiexec
+
+A packaged app cannot run `msiexec` and would be fighting the package manager if
+it could, so the AppX build ships `codeburn-menubar.exe` inside the package and
+launches it from `app\resources\menubar\`. Launch at login is a
+`windows.startupTask` extension (`build/appx-extensions.xml`, wired as
+`appx.customExtensionsPath`), which also lets the user turn it off in
+**Settings > Apps > Startup**; no Run value is written. The tray app detects the
+package with `GetCurrentPackageFullName` and skips its own update checker
+entirely, since Store updates cover it.
+
+### Talking to a running tray app
+
+The tray app has no window of its own, so its argv is the control channel: the
+Tauri single-instance plugin hands a running instance whatever a second launch
+was started with (`windows/src-tauri/src/lib.rs`). `--quit` exits and
+`--reload-settings` re-reads the preference files. Turning "Sidebar" off writes
+`enabled: false` into `~/.config/codeburn/windows-dock.json` and then sends
+`--reload-settings`, so a running rail disappears at once rather than at the next
+launch.
+
 ## Versioning
 
 `app/package.json`'s `version` tracks the CLI's version (root
@@ -176,6 +254,11 @@ Config (`build.win` + `build.nsis`):
 - `win.target: nsis`, `arch: x64`.
 - `win.icon: build/icon.png` — electron-builder converts the 1024x1024 PNG to
   a multi-resolution `.ico` at build time (same source PNG as the mac icon).
+- `win.extraResources: build/menubar -> menubar`: the staged tray app (see
+  "The bundled tray app and Capacity Dock" above). No `node_modules` is
+  involved, so unlike the CLI this one can use `extraResources`.
+- `nsis.include: build/installer.nsh`: the uninstall macro that removes the
+  tray app only when the marker says the desktop app installed it.
 - `nsis.oneClick: false` — an assisted installer with a wizard, so users get
   an **install-directory choice** instead of a silent one-click install.
 - `nsis.perMachine: false` — installs per-user (into the user's `AppData`),
@@ -208,6 +291,10 @@ submission. Direct sideloading requires a separate trusted or development
 certificate. The AppX declares `runFullTrust` (electron-builder's required
 default for Electron apps), so CodeBurn retains access to the user's local
 provider session files rather than running in a UWP application sandbox.
+
+The tray app ships inside this package too (`app\resources\menubar\`), with a
+`windows.startupTask` extension for launch at login. `msiexec` is never run on
+this route. See "The Store route" above.
 
 ### Linux (`package:linux`)
 
