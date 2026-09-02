@@ -47,6 +47,14 @@ struct CLIDecodeFailure: Error, CustomStringConvertible {
 /// Runs the CLI via argv (no shell interpretation). See `CodeburnCLI` for why we never route
 /// commands through `/bin/zsh -c` anymore.
 struct DataClient {
+#if DEBUG
+    /// Test seam. The in-flight slot and the all-provider acceptance ordering
+    /// are only observable when two REAL fetches overlap, which needs a fetch
+    /// whose completion the test controls rather than a spawned CLI.
+    @MainActor
+    static var fetchHookForTesting: (@Sendable (ProviderFilter, Bool) async throws -> MenubarPayload)?
+#endif
+
     static func fetch(period: Period,
                       day: String? = nil,
                       days: Set<String> = [],
@@ -56,6 +64,11 @@ struct DataClient {
                       claudeConfigSourceId: String? = nil,
                       bypassResident: Bool = false,
                       qualityOfService: QualityOfService = .userInitiated) async throws -> MenubarPayload {
+#if DEBUG
+        if let hook = await MainActor.run(body: { fetchHookForTesting }) {
+            return try await hook(provider, bypassResident)
+        }
+#endif
         let subcommand = statusSubcommand(
             period: period,
             day: day,

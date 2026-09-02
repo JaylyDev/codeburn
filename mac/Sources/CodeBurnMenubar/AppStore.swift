@@ -1087,7 +1087,14 @@ final class AppStore {
            let cached = cache[key],
            cached.isFresh,
            !providerPayloadContradictsAll(cached.payload, for: key) { return true }
-        if inFlightKeys[key] != nil { return false }
+        // Join an in-flight fetch instead of reporting failure. Returning false
+        // here made recoverFromStuckLoading() announce a failed recovery while a
+        // perfectly healthy fetch was still running, which is what the quiet
+        // path already avoided by waiting.
+        if inFlightKeys[key] != nil {
+            await waitForInFlight(key)
+            return consistentCachedPayload(for: key) != nil
+        }
         inFlightKeys[key] = Date()
         attemptedKeys.insert(key)
         lastErrorByKey[key] = nil
