@@ -411,14 +411,22 @@ export class MenubarCompanion {
     return parsed.exePath || this.settings.trayExePath
   }
 
-  /** Menu bar off stops the process and drops the Run value; on installs if it has to, then
-   *  starts it again. The dock preference is left exactly as it was, so turning the tray back
-   *  on restores the rail the person had. */
+  /**
+   * Menu bar off stops the process and drops the Run value; on installs if it has to, then
+   * starts it again.
+   *
+   * The rail is a window of the tray app, so it cannot outlive it: turning Menu bar off turns
+   * Sidebar off with it. The preference is written before the process is asked to quit, so
+   * what the tray app finds the next time it starts is the state the switches are showing,
+   * rather than a rail that comes back on its own.
+   */
   async setMenuBarEnabled(enabled: boolean): Promise<CompanionStatus> {
     this.save({ menuBar: enabled })
     if (!this.supported()) return this.status()
 
     if (!enabled) {
+      this.save({ sidebar: false })
+      this.applyDockSetting(false)
       await this.setRunKey(false)
       const exePath = this.settings.trayExePath
       if (exePath && this.exists(exePath)) this.launch(exePath, ['--quit'])
@@ -426,18 +434,36 @@ export class MenubarCompanion {
     }
 
     const exePath = await this.resolveTrayExe()
-    if (!exePath) return this.status()
+    if (!exePath) {
+      // Nothing to turn on. The switch says so rather than claiming a tray app that is not
+      // there, and Sidebar cannot be on without one either.
+      this.save({ menuBar: false })
+      return this.status()
+    }
     this.save({ trayExePath: exePath })
     await this.setRunKey(true)
     this.launch(exePath, ['--reload-settings'])
     return this.status()
   }
 
-  /** The rail is the tray app's window, so this writes the preference and asks a running tray
-   *  app to notice. With the tray off there is nothing to tell, and the file is enough. */
+  /**
+   * The rail is a window of the tray app and every setting it reads belongs to the tray app,
+   * so there is no rail without one. Turning Sidebar on with Menu bar off turns Menu bar on
+   * first, installing and starting the tray app if it has to; if that cannot be done there is
+   * nothing to show a rail in, and the switch stays off.
+   */
   async setSidebarEnabled(enabled: boolean): Promise<CompanionStatus> {
+    if (!this.supported()) {
+      this.save({ sidebar: enabled })
+      return this.status()
+    }
+
+    if (enabled && !this.settings.menuBar) {
+      await this.setMenuBarEnabled(true)
+      if (!this.settings.menuBar) return this.status()
+    }
+
     this.save({ sidebar: enabled })
-    if (!this.supported()) return this.status()
     this.applyDockSetting(enabled)
     if (!this.settings.menuBar) return this.status()
     // The file is written either way; this only decides whether a running rail hears about

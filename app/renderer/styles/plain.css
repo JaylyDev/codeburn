@@ -136,6 +136,10 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
 .companion-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
 .companion-label { color: var(--mut); font-size: 12px; font-weight: 480; }
 .companion-row .switch { margin-left: auto; }
+/* Sidebar while the menu bar app is off: the rail is one of its windows, so there is nothing
+   to switch. Dimmed rather than hidden, so the row does not appear and vanish under a pointer
+   on its way to About. */
+.companion-row.blocked .companion-label { opacity: .5; }
 /* The bare .switch is painted for the dark onboarding sheet; on the sidebar it keys off the
    theme tokens, exactly as the Settings surface does. */
 .companion .switch { border-color: var(--line2); background: var(--hover); }

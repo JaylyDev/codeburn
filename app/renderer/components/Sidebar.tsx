@@ -124,23 +124,32 @@ function CompanionSwitches() {
       .finally(() => setBusy(null))
   }
 
-  const row = (key: 'menuBar' | 'sidebar', label: string, hint: string) => (
-    <div className="companion-row">
-      <span className="companion-label" title={hint}>{label}</span>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={status[key]}
-        aria-label={label}
-        title={hint}
-        disabled={busy !== null}
-        className={status[key] ? 'switch sm on' : 'switch sm'}
-        onClick={() => toggle(key)}
-      >
-        <span className="switch-knob" />
-      </button>
-    </div>
-  )
+  // The rail is a window of the tray app, and every setting it reads belongs to the tray app,
+  // so there is no rail without one. With Menu bar off the Sidebar switch has nothing to
+  // control and says so, rather than looking available and turning the tray app on underneath.
+  const railBlocked = !status.menuBar
+
+  const row = (key: 'menuBar' | 'sidebar', label: string, hint: string) => {
+    const blocked = key === 'sidebar' && railBlocked
+    const title = blocked ? 'The Capacity Dock needs the menu bar app' : hint
+    return (
+      <div className={blocked ? 'companion-row blocked' : 'companion-row'}>
+        <span className="companion-label" title={title}>{label}</span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={status[key]}
+          aria-label={label}
+          title={title}
+          disabled={busy !== null || blocked}
+          className={status[key] ? 'switch sm on' : 'switch sm'}
+          onClick={() => toggle(key)}
+        >
+          <span className="switch-knob" />
+        </button>
+      </div>
+    )
+  }
 
   return (
     <div className="companion">

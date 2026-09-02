@@ -143,6 +143,41 @@ describe('Sidebar companion switches', () => {
     expect(menuBar).toHaveAttribute('aria-checked', 'false')
   })
 
+  // The rail is a window of the tray app, so it cannot be switched on without one.
+  it('disables Sidebar while Menu bar is off, and says why', async () => {
+    await renderSwitches({ ...SUPPORTED, menuBar: false, sidebar: false })
+
+    const sidebar = screen.getByRole('switch', { name: 'Sidebar' })
+    expect(sidebar).toBeDisabled()
+    expect(sidebar).toHaveAttribute('title', 'The Capacity Dock needs the menu bar app')
+    expect(screen.getByRole('switch', { name: 'Menu bar' })).toBeEnabled()
+
+    fireEvent.click(sidebar)
+    expect(bridge.setSidebarEnabled).not.toHaveBeenCalled()
+  })
+
+  it('enables Sidebar again once Menu bar comes back on', async () => {
+    const menuBar = await renderSwitches({ ...SUPPORTED, menuBar: false, sidebar: false })
+    expect(screen.getByRole('switch', { name: 'Sidebar' })).toBeDisabled()
+    bridge.setMenuBarEnabled.mockResolvedValue({ ...SUPPORTED, menuBar: true, sidebar: false })
+
+    fireEvent.click(menuBar)
+
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Sidebar' })).toBeEnabled())
+  })
+
+  it('turning Menu bar off takes Sidebar down with it', async () => {
+    const menuBar = await renderSwitches()
+    bridge.setMenuBarEnabled.mockResolvedValue({ ...SUPPORTED, menuBar: false, sidebar: false })
+
+    fireEvent.click(menuBar)
+
+    await waitFor(() => expect(menuBar).toHaveAttribute('aria-checked', 'false'))
+    const sidebar = screen.getByRole('switch', { name: 'Sidebar' })
+    expect(sidebar).toHaveAttribute('aria-checked', 'false')
+    expect(sidebar).toBeDisabled()
+  })
+
   it('refuses a second click while one is still in flight', async () => {
     const menuBar = await renderSwitches()
     bridge.setMenuBarEnabled.mockReturnValue(new Promise(() => {}))

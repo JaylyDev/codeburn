@@ -440,11 +440,9 @@ describe('MenubarCompanion', () => {
 
     const status = await companion.setMenuBarEnabled(false)
 
-    expect(status).toEqual({ supported: true, menuBar: false, sidebar: true, store: false })
+    expect(status).toEqual({ supported: true, menuBar: false, sidebar: false, store: false })
     expect(regCalls).toEqual([runKeyArgs(false, TRAY_EXE)])
     expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--quit'] }])
-    // The dock preference is untouched, so turning the tray back on restores the rail.
-    expect(() => readFileSync(dockPrefsPath(home), 'utf8')).toThrow()
   })
 
   it('Menu bar on installs if it has to, then starts the tray app again', async () => {
@@ -459,6 +457,51 @@ describe('MenubarCompanion', () => {
     expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--reload-settings'] }])
   })
 
+  // The rail is a window of the tray app, so the two switches cannot disagree.
+  it('Menu bar off turns Sidebar off with it, writing the preference before the quit', async () => {
+    stageMsi()
+    writeCompanionSettings(stateDir, { menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+    writeDockEnabled(true, home)
+    const companion = new MenubarCompanion(deps())
+
+    const status = await companion.setMenuBarEnabled(false)
+
+    expect(status).toEqual({ supported: true, menuBar: false, sidebar: false, store: false })
+    // Written before --quit, so what the tray app finds next time is what the switches show.
+    expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toEqual({ enabled: false })
+    expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--quit'] }])
+    expect(readCompanionSettings(stateDir).sidebar).toBe(false)
+  })
+
+  it('Sidebar on with Menu bar off turns the tray app on first', async () => {
+    stageMsi()
+    writeCompanionSettings(stateDir, { menuBar: false, sidebar: false, trayExePath: null, seeded: true })
+
+    const status = await new MenubarCompanion(deps()).setSidebarEnabled(true)
+
+    expect(status).toMatchObject({ menuBar: true, sidebar: true })
+    expect(cliCalls).toHaveLength(1)
+    expect(regCalls).toEqual([runKeyArgs(true, TRAY_EXE)])
+    expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toEqual({ enabled: true })
+    // Started for the Menu bar switch, then nudged again for the rail.
+    expect(launches).toEqual([
+      { exe: TRAY_EXE, args: ['--reload-settings'] },
+      { exe: TRAY_EXE, args: ['--reload-settings'] },
+    ])
+  })
+
+  it('leaves both switches off when the tray app cannot be turned on', async () => {
+    stageMsi()
+    writeCompanionSettings(stateDir, { menuBar: false, sidebar: false, trayExePath: null, seeded: true })
+    installResult = result({ action: 'cancelled', exePath: '', installedBy: null })
+
+    const status = await new MenubarCompanion(deps()).setSidebarEnabled(true)
+
+    expect(status).toMatchObject({ menuBar: false, sidebar: false })
+    expect(launches).toEqual([])
+    expect(() => readFileSync(dockPrefsPath(home), 'utf8')).toThrow()
+  })
+
   it('Sidebar off writes the preference and asks a running tray app to notice', async () => {
     stageMsi()
     writeCompanionSettings(stateDir, { menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
@@ -470,13 +513,16 @@ describe('MenubarCompanion', () => {
     expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--reload-settings'] }])
   })
 
-  it('Sidebar with the tray app off writes the preference and tells nobody', async () => {
+  it('Sidebar off with the tray app off writes the preference and tells nobody', async () => {
     stageMsi()
-    writeCompanionSettings(stateDir, { menuBar: false, sidebar: false, trayExePath: TRAY_EXE, seeded: true })
+    writeCompanionSettings(stateDir, { menuBar: false, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+    writeDockEnabled(true, home)
 
-    await new MenubarCompanion(deps()).setSidebarEnabled(true)
+    await new MenubarCompanion(deps()).setSidebarEnabled(false)
 
-    expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toEqual({ enabled: true })
+    expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toEqual({ enabled: false })
+    // Nothing is running to be told, and turning the rail off never starts the tray app.
     expect(launches).toEqual([])
+    expect(cliCalls).toEqual([])
   })
 })
