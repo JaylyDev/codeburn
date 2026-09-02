@@ -159,6 +159,48 @@ struct AppStoreRefreshConcurrencyTests {
         #expect(store.inFlightWaiterCountForTesting(period: .today, provider: .claude) == 0)
     }
 
+    @Test("the all-provider and scoped fetches run together and only acceptance is ordered")
+    func allAndScopedFetchesOverlap() async {
+        let script = ScriptedFetch()
+        script.payloadForProvider = { provider in
+            provider == .all
+                ? scriptedPayload(cost: 12, providers: ["claude": 12],
+                                  providerDetails: [ProviderDetail(id: "claude", label: "Claude", cost: 12, calls: 4, hasUsage: true)])
+                : scriptedPayload(cost: 12, providers: ["claude": 12],
+                                  providerDetails: [ProviderDetail(id: "claude", label: "Claude", cost: 12, calls: 4, hasUsage: true)])
+        }
+        script.install()
+        defer { script.uninstall() }
+
+        let store = AppStore()
+        store.setCacheDateToTodayForTesting()
+        store.suppressRefreshesForTesting()
+        store.switchTo(provider: .claude)
+
+        let task = Task { await store.refresh(includeOptimize: false, force: true) }
+
+        // BOTH parses are in flight before either has produced a result. The
+        // serialized version could not reach two attempts until the first
+        // returned.
+        #expect(await settle(until: { script.attempts.count == 2 }))
+        #expect(Set(script.attempts.map(\.provider)) == Set([.all, .claude]))
+        #expect(script.isParked(0))
+        #expect(script.isParked(1))
+
+        // Acceptance is still ordered: release the scoped fetch first and it
+        // must not land until the all-provider evidence has.
+        let scopedIndex = script.indices(for: .claude)[0]
+        let allIndex = script.indices(for: .all)[0]
+        script.release(scopedIndex)
+        for _ in 0..<50 { await Task.yield() }
+        #expect(store.cachedPayloadForTesting(period: .today, provider: .claude) == nil)
+
+        script.release(allIndex)
+        #expect(await task.value)
+        #expect(store.cachedPayloadForTesting(period: .today, provider: .claude) != nil)
+        #expect(store.cachedPayloadForTesting(period: .today, provider: .all) != nil)
+    }
+
     @Test("an interactive refresh joins an in-flight fetch instead of reporting failure")
     func interactiveRefreshJoinsInFlightFetch() async {
         let script = ScriptedFetch()

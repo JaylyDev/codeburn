@@ -707,24 +707,43 @@ final class AppStore {
         let key = PayloadCacheKey(scope: scope, period: period, provider: provider, day: day, days: days, claudeConfigSourceId: claudeConfigSourceId)
         let localKey = PayloadCacheKey(scope: .local, period: period, provider: provider, day: day, days: days, claudeConfigSourceId: claudeConfigSourceId)
         let allKey = PayloadCacheKey(scope: .local, period: period, provider: .all, day: day, days: days, claudeConfigSourceId: claudeConfigSourceId)
-        switchTask = Task {
+        switchTask = Task { [weak self] in
+            guard let self else { return }
+            // The all-provider slice is the evidence that lets a scoped false
+            // zero be rejected, so it must be present BEFORE the scoped result
+            // is accepted. It does not have to be present before the scoped
+            // fetch STARTS: both run together and only the acceptance is
+            // ordered, via the gate passed as acceptAfter.
+            let allTask: Task<Bool, Never>? = provider == .all
+                ? nil
+                : self.startAllProviderEvidence(key: allKey, force: false)
+            let gate: (@Sendable () async -> Void)? = allTask.map { task in { @Sendable in _ = await task.value } }
             if scope == .combined {
-                if provider != .all {
-                    _ = await refreshQuietly(key: allKey, includeOptimize: false, force: false)
-                }
-                async let local = refresh(key: localKey, includeOptimize: false, force: false, showLoading: false)
-                async let combined = refresh(key: key, includeOptimize: false, force: false, showLoading: false)
+                async let local = self.refresh(key: localKey, includeOptimize: false, force: false, showLoading: false, acceptAfter: gate)
+                async let combined = self.refresh(key: key, includeOptimize: false, force: false, showLoading: false, acceptAfter: gate)
                 _ = await (local, combined)
-            } else if provider == .all {
-                await refresh(key: key, includeOptimize: false, force: false, showLoading: false)
             } else {
-                // Establish the matching all-provider slice first. Otherwise a
-                // fast scoped zero can be accepted before the positive all
-                // result arrives, creating a brief false-zero flash and a
-                // cached lie until the next refresh.
-                _ = await refreshQuietly(key: allKey, includeOptimize: false, force: false)
-                await refresh(key: key, includeOptimize: false, force: false, showLoading: false)
+                await self.refresh(key: key, includeOptimize: false, force: false, showLoading: false, acceptAfter: gate)
             }
+            _ = await allTask?.value
+        }
+    }
+
+    /// Start the all-provider fetch immediately and hand back its task, so a
+    /// scoped fetch can run alongside it and merely AWAIT it before accepting.
+    private func startAllProviderEvidence(
+        key: PayloadCacheKey,
+        force: Bool,
+        qualityOfService: QualityOfService = .userInitiated
+    ) -> Task<Bool, Never> {
+        Task { [weak self] in
+            guard let self else { return false }
+            return await self.refreshQuietly(
+                key: key,
+                includeOptimize: false,
+                force: force,
+                qualityOfService: qualityOfService
+            )
         }
     }
 
@@ -947,7 +966,8 @@ final class AppStore {
     private func fetchPayload(
         for key: PayloadCacheKey,
         includeOptimize: Bool,
-        qualityOfService: QualityOfService
+        qualityOfService: QualityOfService,
+        acceptAfter: (@Sendable () async -> Void)? = nil
     ) async throws -> MenubarPayload {
         let fresh = try await DataClient.fetch(
             period: key.period,
@@ -959,6 +979,11 @@ final class AppStore {
             claudeConfigSourceId: key.claudeConfigSourceId,
             qualityOfService: qualityOfService
         )
+        // The all-provider slice is the evidence providerPayloadContradictsAll
+        // reads. It is awaited HERE, after this fetch has already run, so the
+        // two parses overlap and only the ACCEPTANCE is ordered. Waiting for it
+        // before starting cost a full serialized parse on every tab click.
+        await acceptAfter?()
         guard providerPayloadContradictsAll(fresh, for: key) else { return fresh }
 
         NSLog("CodeBurn: resident %@ payload contradicted its all-provider slice; verifying with a one-shot parse",
@@ -1016,45 +1041,38 @@ final class AppStore {
         qualityOfService: QualityOfService = .userInitiated
     ) async -> Bool {
         let keys = selectionRefreshKeys()
+        // Runs concurrently with the scoped fetch below; only the acceptance is
+        // ordered behind it (see fetchPayload's acceptAfter).
+        let allTask: Task<Bool, Never>? = keys.scoped.provider == .all
+            ? nil
+            : startAllProviderEvidence(key: keys.all, force: force, qualityOfService: qualityOfService)
+        let gate: (@Sendable () async -> Void)? = allTask.map { task in { @Sendable in _ = await task.value } }
         if keys.scoped.scope == .combined {
-            if keys.scoped.provider != .all {
-                _ = await refreshQuietly(
-                    key: keys.all,
-                    includeOptimize: false,
-                    force: force,
-                    qualityOfService: qualityOfService
-                )
-            }
             async let local = refreshQuietly(
                 key: keys.local,
                 includeOptimize: includeOptimize,
                 force: force,
-                qualityOfService: qualityOfService
+                qualityOfService: qualityOfService,
+                acceptAfter: gate
             )
             async let combined = refresh(
                 key: keys.scoped,
                 includeOptimize: includeOptimize,
                 force: force,
                 showLoading: showLoading,
-                qualityOfService: qualityOfService
+                qualityOfService: qualityOfService,
+                acceptAfter: gate
             )
             let (localSucceeded, combinedSucceeded) = await (local, combined)
             return localSucceeded && combinedSucceeded
         } else {
-            if keys.scoped.provider != .all {
-                _ = await refreshQuietly(
-                    key: keys.all,
-                    includeOptimize: false,
-                    force: force,
-                    qualityOfService: qualityOfService
-                )
-            }
             return await refresh(
                 key: keys.scoped,
                 includeOptimize: includeOptimize,
                 force: force,
                 showLoading: showLoading,
-                qualityOfService: qualityOfService
+                qualityOfService: qualityOfService,
+                acceptAfter: gate
             )
         }
     }
@@ -1084,19 +1102,18 @@ final class AppStore {
             days: scopedKey.days,
             claudeConfigSourceId: scopedKey.claudeConfigSourceId
         )
+        let allTask: Task<Bool, Never>? = scopedKey.provider == .all
+            ? nil
+            : startAllProviderEvidence(key: allKey, force: force)
+        let gate: (@Sendable () async -> Void)? = allTask.map { task in { @Sendable in _ = await task.value } }
         if scope == .combined {
-            if scopedKey.provider != .all {
-                _ = await refreshQuietly(key: allKey, includeOptimize: false, force: force)
-            }
-            async let local = refreshQuietly(key: localKey, includeOptimize: false, force: false)
-            async let combined = refreshQuietly(key: scopedKey, includeOptimize: false, force: force)
+            async let local = refreshQuietly(key: localKey, includeOptimize: false, force: false, acceptAfter: gate)
+            async let combined = refreshQuietly(key: scopedKey, includeOptimize: false, force: force, acceptAfter: gate)
             _ = await (local, combined)
         } else {
-            if scopedKey.provider != .all {
-                _ = await refreshQuietly(key: allKey, includeOptimize: false, force: force)
-            }
-            await refreshQuietly(key: scopedKey, includeOptimize: false, force: force)
+            await refreshQuietly(key: scopedKey, includeOptimize: false, force: force, acceptAfter: gate)
         }
+        _ = await allTask?.value
     }
 
     @discardableResult
@@ -1105,7 +1122,8 @@ final class AppStore {
         includeOptimize: Bool,
         force: Bool = false,
         showLoading: Bool = false,
-        qualityOfService: QualityOfService = .userInitiated
+        qualityOfService: QualityOfService = .userInitiated,
+        acceptAfter: (@Sendable () async -> Void)? = nil
     ) async -> Bool {
         invalidateStaleDayCache()
         let cacheDateAtStart = cacheDate
@@ -1156,7 +1174,8 @@ final class AppStore {
             let fresh = try await fetchPayload(
                 for: key,
                 includeOptimize: includeOptimize,
-                qualityOfService: qualityOfService
+                qualityOfService: qualityOfService,
+                acceptAfter: acceptAfter
             )
             if generationAtStart != payloadRefreshGeneration {
                 NSLog("CodeBurn: dropping fetch result for \(key.label)/\(key.provider.rawValue) — refresh pipeline reset mid-fetch")
@@ -1262,7 +1281,8 @@ final class AppStore {
         key: PayloadCacheKey,
         includeOptimize: Bool,
         force: Bool = false,
-        qualityOfService: QualityOfService = .userInitiated
+        qualityOfService: QualityOfService = .userInitiated,
+        acceptAfter: (@Sendable () async -> Void)? = nil
     ) async -> Bool {
         invalidateStaleDayCache()
         if !force,
@@ -1287,7 +1307,8 @@ final class AppStore {
             let fresh = try await fetchPayload(
                 for: key,
                 includeOptimize: includeOptimize,
-                qualityOfService: qualityOfService
+                qualityOfService: qualityOfService,
+                acceptAfter: acceptAfter
             )
             if generationAtStart != payloadRefreshGeneration {
                 NSLog("CodeBurn: dropping quiet fetch result for \(key.label) — refresh pipeline reset mid-fetch")
