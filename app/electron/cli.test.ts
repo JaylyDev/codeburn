@@ -771,7 +771,10 @@ describe('spawnCli coalescing (read-only)', () => {
   })
 })
 
-describe('resident serve single-flight', () => {
+// Every test here starts several real node children, and the suite runs fifty files at once.
+// The assertions are about which child answers, never about how quickly, so the wall clock
+// gets room rather than the machine having to be fast enough for the default.
+describe('resident serve single-flight', { timeout: 30_000 }, () => {
   it('startServe is idempotent and creates only one resident child', async () => {
     const files = fakeResidentBin()
     startServe()
