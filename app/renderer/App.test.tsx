@@ -517,6 +517,25 @@ describe('App shortcuts', () => {
     expect(screen.queryByRole('option', { name: 'Hermes' })).not.toBeInTheDocument()
   })
 
+  it('keeps zero-cost providers in the picker when the CLI omits hasUsage', async () => {
+    // Every released CLI omits the field. Falling back to cost > 0 there hid
+    // subscription-backed providers whose period spend is $0.
+    const payload = overviewPayload()
+    payload.current.providers = { claude: 10, hermes: 0 }
+    payload.current.providerDetails = [
+      { id: 'claude', label: 'Claude', cost: 10 },
+      { id: 'hermes', label: 'Hermes', cost: 0 },
+    ]
+    mocks.getOverview.mockResolvedValue(payload)
+
+    render(<App />)
+    expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('All providers'))
+    expect(await screen.findByRole('option', { name: 'Claude' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'Hermes' })).toBeInTheDocument()
+  })
+
   it('does not carry another period provider catalog into a scoped period view', async () => {
     const payload = overviewPayload()
     payload.current.providerDetails = [

@@ -389,18 +389,14 @@ struct ProviderDetail: Codable, Sendable {
         id = try c.decode(String.self, forKey: .id)
         label = try c.decode(String.self, forKey: .label)
         cost = try c.decode(Double.self, forKey: .cost)
-        // Older CLIs emitted providerDetails without calls/hasUsage. Those
-        // payloads cannot distinguish period activity from a provider merely
-        // discovered on disk, so cost is the only safe activity signal.
-        let decodedCalls = try c.decodeIfPresent(Int.self, forKey: .calls)
-        calls = decodedCalls ?? 0
-        if let decodedUsage = try c.decodeIfPresent(Bool.self, forKey: .hasUsage) {
-            hasUsage = decodedUsage
-        } else if decodedCalls != nil {
-            hasUsage = cost > 0 || calls > 0
-        } else {
-            hasUsage = cost > 0
-        }
+        calls = try c.decodeIfPresent(Int.self, forKey: .calls) ?? 0
+        // EVERY released CLI omits hasUsage, so the absent case is the common
+        // one, not a legacy edge. Deriving activity from cost there hid every
+        // subscription-backed provider whose period spend is $0 (Hermes, Kimi,
+        // Copilot on an included plan). A provider the payload bothered to list
+        // is one the user has, so absent means visible; the strict signal
+        // applies only when the field is actually present.
+        hasUsage = try c.decodeIfPresent(Bool.self, forKey: .hasUsage) ?? true
     }
 }
 
