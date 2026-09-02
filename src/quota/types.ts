@@ -5,7 +5,7 @@ export type QuotaWindow = {
 }
 
 export type QuotaProvider = {
-  provider: 'claude' | 'codex' | 'gemini' | 'copilot' | 'antigravity' | 'kimi' | 'cursor' | 'zai'
+  provider: 'claude' | 'codex' | 'gemini' | 'copilot' | 'antigravity' | 'kimi' | 'cursor' | 'zai' | 'grok'
   connection: 'connected' | 'disconnected' | 'accessDenied' | 'loading' | 'stale' | 'transientFailure' | 'terminalFailure'
   primary: QuotaWindow | null
   details: QuotaWindow[]

@@ -12,6 +12,7 @@ import { fetchCodexQuota } from './codex.js'
 import { fetchCopilotQuota } from './copilot.js'
 import { fetchCursorQuota } from './cursor.js'
 import { fetchGeminiQuota } from './gemini.js'
+import { fetchGrokQuota } from './grok.js'
 import { fetchKimiQuota } from './kimi.js'
 import type { ProviderName, QuotaProvider } from './types.js'
 import { fetchZaiQuota } from './zai.js'
@@ -42,6 +43,7 @@ const READERS: { id: ProviderName; name: string; read: ProviderReader }[] = [
   { id: 'kimi', name: 'Kimi', read: async signal => (await fetchKimiQuota({ signal })).quota },
   { id: 'cursor', name: 'Cursor', read: async signal => (await fetchCursorQuota({ signal })).quota },
   { id: 'zai', name: 'Z.ai', read: async signal => (await fetchZaiQuota({ signal })).quota },
+  { id: 'grok', name: 'Grok', read: async signal => (await fetchGrokQuota({ signal })).quota },
 ]
 
 const DEFAULT_TIMEOUT_MS = 5_000
