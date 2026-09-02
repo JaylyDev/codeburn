@@ -736,11 +736,16 @@ describe('#946: a migration re-derives copilot instead of carrying it', () => {
 
   /// Seeds an older-version daily cache (what a 0.9.20 install leaves behind)
   /// so `loadDailyCache` takes the adoption path.
+  /// Pinned, not derived from DAILY_CACHE_VERSION: this fixture is the
+  /// pre-copilot-contract era, which is a fixed point in history.
+  /// `DAILY_CACHE_VERSION - 5` drifted across the copilot boundary (26) on the
+  /// next bump and silently stopped seeding the entitlement these tests check.
+  const PRE_COPILOT_CONTRACT_VERSION = 25
   const seedOlderCache = async (days: DailyEntry[]) => {
     await writeFile(
-      join(TMP_CACHE_ROOT, `daily-cache.v${DAILY_CACHE_VERSION - 5}.json`),
+      join(TMP_CACHE_ROOT, `daily-cache.v${PRE_COPILOT_CONTRACT_VERSION}.json`),
       JSON.stringify({
-        version: DAILY_CACHE_VERSION - 5,
+        version: PRE_COPILOT_CONTRACT_VERSION,
         savingsConfigHash: 'cfg-A',
         tzKey: currentTzKey(),
         lastComputedDate: daysAgoStr(1),

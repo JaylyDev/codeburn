@@ -174,10 +174,11 @@ import type { DateRange, ProjectSummary } from './types.js'
 // but optimize added reasoning again. Re-derive so report matches the live parse.
 // v29: #1118 OrcaRouter route pricing (fusion aliases + peel; auto stays unpriced).
 // v28 on main already shipped #1115.
-// v30: Hermes cost provenance. Subscription-included sessions stay $0,
+// v31: Hermes cost provenance. Subscription-included sessions stay $0,
 // explicit estimates retain their status, and surviving Hermes sources replace
 // v29 slices produced by the old API-equivalent fallback.
-export const DAILY_CACHE_VERSION = 30
+// 31: #1234 Hermes cost contract; 30 is claimed by #1132.
+export const DAILY_CACHE_VERSION = 31
 const MIN_SUPPORTED_VERSION = 28
 
 /// Providers whose per-day CALL COUNT means something different at
@@ -202,7 +203,9 @@ const MIN_SUPPORTED_VERSION = 28
 /// untouched, in both directions, and every other provider keeps the guard.
 const PENDING_REDERIVE_PROVIDER_VERSIONS: Readonly<Record<string, number>> = {
   copilot: 26,
-  hermes: 30,
+  // Tracks DAILY_CACHE_VERSION: a v30 file may have been written by #1132's
+  // accounting, which never carried the Hermes cost contract.
+  hermes: 31,
 }
 
 function providersPendingRederiveFrom(fromVersion: number): string[] {
