@@ -27,7 +27,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: https://api.frankfurter.app"
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc:"
     },
     "trayIcon": {
       "id": "codeburn-tray",
@@ -54,7 +54,9 @@
     "windows": {
       "allowDowngrades": false,
       "wix": {
-        "upgradeCode": "cfe9191d-31ea-5040-83c8-cefd2a10b703"
+        "upgradeCode": "cfe9191d-31ea-5040-83c8-cefd2a10b703",
+        "fragmentPaths": ["./wix/uninstall-cleanup.wxs"],
+        "componentGroupRefs": ["CodeBurnUninstallCleanup"]
       }
     },
     "linux": {

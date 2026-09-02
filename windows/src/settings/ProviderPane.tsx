@@ -214,7 +214,7 @@ function ProviderKey({ id, name }: { id: string; name: string }) {
   return (
     <Group
       title="API key"
-      footer="The key is encrypted for this Windows account with DPAPI, so the file is worthless on another machine or under another sign-in. It is passed to the codeburn CLI as an environment variable and is never written to a command line or a log."
+      footer="On Windows the key is encrypted for this account with DPAPI, so the file is worthless on another machine or under another sign-in; on Linux it sits in a file only your user can read. It is passed to the codeburn CLI as an environment variable and is never written to a command line or a log."
     >
       <Row
         label={has ? 'A key is stored' : 'No key stored'}

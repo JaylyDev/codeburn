@@ -65,7 +65,7 @@ pub fn note_attended() {
 fn publish(woke: bool) {
     let current = state();
     #[cfg(debug_assertions)]
-    eprintln!(
+    crate::log_line!(
         "codeburn: system state locked={} display_off={} woke={woke}",
         current.locked, current.display_off
     );
@@ -135,7 +135,7 @@ mod windows_impl {
             class_def.hInstance = instance;
             class_def.lpszClassName = class.as_ptr();
             if RegisterClassW(&class_def) == 0 {
-                eprintln!("codeburn: could not register the system watcher window class");
+                crate::log_line!("codeburn: could not register the system watcher window class");
                 return;
             }
             // Never shown and never sized: the window exists only as the address the session
@@ -155,11 +155,11 @@ mod windows_impl {
                 null(),
             );
             if hwnd.is_null() {
-                eprintln!("codeburn: could not create the system watcher window");
+                crate::log_line!("codeburn: could not create the system watcher window");
                 return;
             }
             if WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) == 0 {
-                eprintln!("codeburn: session lock notifications are unavailable");
+                crate::log_line!("codeburn: session lock notifications are unavailable");
             }
             // Display state covers the case system sleep does not: the screens go off on
             // their own timer while the machine keeps running.
@@ -169,10 +169,10 @@ mod windows_impl {
                 DEVICE_NOTIFY_WINDOW_HANDLE,
             ) == 0
             {
-                eprintln!("codeburn: display state notifications are unavailable");
+                crate::log_line!("codeburn: display state notifications are unavailable");
             }
             if RegisterSuspendResumeNotification(hwnd, DEVICE_NOTIFY_WINDOW_HANDLE) == 0 {
-                eprintln!("codeburn: suspend and resume notifications are unavailable");
+                crate::log_line!("codeburn: suspend and resume notifications are unavailable");
             }
 
             let mut msg: MSG = std::mem::zeroed();

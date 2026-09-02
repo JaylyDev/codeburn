@@ -168,8 +168,9 @@ npm run tauri build
   here: `codeburn menubar --force` does the install, which is what verifies the sha256.
   Subprocess stderr is capped at 64 KB and scrubbed of API keys, JWTs and bearer tokens
   before any of it is shown.
-- **CSP**: `connect-src` restricted to `self`, `ipc:`, and `https://api.frankfurter.app`. No
-  inline scripts.
+- **CSP**: `connect-src` restricted to `self` and `ipc:`. No inline scripts. The Frankfurter
+  rate is fetched in Rust (`fx.rs`), as the GitHub check is, so the webview needs no host of
+  its own and is not given one.
 
 ## CI and release tags
 

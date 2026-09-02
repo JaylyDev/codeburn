@@ -12,6 +12,10 @@
 //!   Rust at all.
 //! - `%LOCALAPPDATA%\codeburn\provider-keys.dat` for pasted provider API keys, encrypted
 //!   with DPAPI so the file is worthless on another machine or under another account.
+//!   Off Windows there is no DPAPI and no keyring here, so that same file is a plain-text
+//!   fallback: the key is readable by anything running as this user. It is written 0600 in a
+//!   0700 directory, which keeps it away from the other accounts on the box and does nothing
+//!   more than that. See `seal`.
 //!
 //! Every write emits `codeburn://settings-changed` with the whole settings object, because
 //! the popover, the tray and the Capacity Dock all render from it and none of them polls.
@@ -183,7 +187,7 @@ pub fn migrate_daily_budget(rate: f64) -> Option<f64> {
     };
     let display = stored.unwrap_or(legacy * rate);
     if let Err(err) = set_cli_daily_budget(Some(display)) {
-        eprintln!("codeburn: failed to move the daily budget onto budget.daily: {err}");
+        crate::log_line!("codeburn: failed to move the daily budget onto budget.daily: {err}");
         return Some(display);
     }
     Some(display)
@@ -223,17 +227,56 @@ fn load_keys() -> BTreeMap<String, String> {
 fn store_keys(keys: &BTreeMap<String, String>) -> Result<()> {
     let path = keys_path().context("no local app data directory")?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        create_private_dir(parent)?;
     }
     if keys.is_empty() {
         let _ = fs::remove_file(&path);
         return Ok(());
     }
     let sealed = seal(&serde_json::to_vec(keys)?)?;
+    // The temp file carries the same mode as the file it becomes: the rename does not change
+    // it, so a lax mode here would be the mode the key ends up stored under.
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, &sealed)?;
+    write_private(&tmp, &sealed)?;
     fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+/// Owner-only, because on Unix the file inside is plain text. A 0600 file under a 0755
+/// directory still tells every account on the box that a key exists and how long it is, and
+/// leaves the entry there to be replaced.
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        // Not only on creation: an older build made this directory under the plain umask.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Created 0600 rather than chmodded afterwards, so there is no moment in which the key sits
+/// on disk under the umask's mode. The mode is set again for the case the file already
+/// existed, where `mode` on the open is ignored.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// Which providers have a stored key. Deliberately not the keys themselves: nothing outside
@@ -352,8 +395,17 @@ fn unseal(sealed: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Linux support here is experimental and has no DPAPI equivalent that does not drag in a
-/// keyring daemon, so the file is written in the clear with owner-only permissions and the
-/// settings window says so before anything is pasted.
+/// keyring daemon, so the file is written in the clear.
+///
+/// This is a plain-text fallback and stays one: the only protection is the 0600 file in the
+/// 0700 directory that `store_keys` writes, which stops another account reading the key and
+/// stops nothing else. Anything running as this user can read it, as can anyone holding a
+/// backup of the home directory. A real fix is a keyring, and that is a new dependency the
+/// offline VM builds cannot fetch today.
+///
+/// The settings window does not say any of this yet: its footer promises DPAPI to everyone
+/// (`settings/ProviderPane.tsx`), which is true on Windows and a lie here. That text needs a
+/// platform-dependent branch before Linux is anything but experimental.
 #[cfg(not(windows))]
 fn seal(plain: &[u8]) -> Result<Vec<u8>> {
     Ok(plain.to_vec())
@@ -477,6 +529,35 @@ mod tests {
             .flat_map(|(_, vars)| vars.iter().copied())
             .collect();
         assert_eq!(vars, vec!["CLINEPASS_API_KEY", "CLINE_API_KEY"]);
+    }
+
+    /// Runs on the Linux half of the CI matrix, which is the only place the plain-text
+    /// fallback is reachable and so the only place the mode is the whole protection.
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_text_key_is_written_owner_only_inside_an_owner_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join("codeburn-keys-mode-test");
+        let _ = fs::remove_dir_all(&dir);
+        // The mode an older build would have left behind, to prove it is tightened and not
+        // merely set on the way in.
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = dir.join("provider-keys.dat");
+        // The same, for a temp file left over from a run that died before its rename.
+        fs::write(&path, b"stale").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        create_private_dir(&dir).unwrap();
+        write_private(&path, b"sk-test-value").unwrap();
+
+        let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(fs::read(&path).unwrap(), b"sk-test-value");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

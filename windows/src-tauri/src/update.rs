@@ -88,6 +88,18 @@ fn msi_version(name: &str) -> Option<&str> {
 /// The newest `windows-v*` release that carries an installable: an `.msi` and the `.sha256`
 /// beside it. A release missing either is skipped rather than reported, because
 /// `codeburn menubar` verifies the checksum before anything executes and would fail on it.
+///
+/// What that checksum is worth, stated plainly, because it is easy to read as more than it
+/// is. The `.sha256` comes from the same GitHub release as the `.msi` it describes, so it
+/// proves the download arrived intact and says nothing about who produced it: anyone who can
+/// publish to that release, or who can stand between this app and api.github.com with a
+/// certificate the machine trusts, replaces both files together and the check still passes.
+/// Nor can Windows tell the user otherwise, since the MSI is unsigned: SmartScreen warns of
+/// an unknown publisher and the elevation prompt says "Unknown". The trust boundary is the
+/// GitHub release, not the installer.
+///
+/// Closing that means signing the MSI, which is a release decision and not a code change, so
+/// nothing here attempts it.
 pub fn resolve_latest_windows_version(releases: &[GitHubRelease]) -> Option<String> {
     for release in releases
         .iter()
@@ -345,7 +357,7 @@ pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateSta
                 latest_cli: resolve_latest_cli_version(&releases),
             };
             if let Err(err) = write_cache(&fresh) {
-                eprintln!("codeburn: failed to cache the update check: {err}");
+                crate::log_line!("codeburn: failed to cache the update check: {err}");
             }
             status.latest_version = fresh.latest;
             status.latest_cli_version = fresh.latest_cli;
@@ -359,7 +371,7 @@ pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateSta
             status.checked_at = (cached.checked_at > 0).then_some(cached.checked_at);
             status.failure_stage = Some(FailureStage::Check);
             status.error = Some(scrub(&err.to_string()));
-            eprintln!("codeburn: update check failed: {err}");
+            crate::log_line!("codeburn: update check failed: {err}");
         }
     }
     status.recompute();
@@ -444,7 +456,7 @@ async fn run_captured(program: &str, args: &[&str]) -> Run {
         Ok(status) => status.ok(),
         Err(_) => {
             timed_out = true;
-            eprintln!(
+            crate::log_line!(
                 "codeburn: update subprocess timed out after {UPDATE_TIMEOUT_SECS}s - terminating"
             );
             let _ = child.kill().await;

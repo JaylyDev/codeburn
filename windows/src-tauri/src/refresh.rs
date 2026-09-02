@@ -124,7 +124,7 @@ pub fn plan(mode: i64, popover_open: bool) -> RefreshPlan {
         skip_reason,
     };
     #[cfg(debug_assertions)]
-    eprintln!(
+    crate::log_line!(
         "codeburn: refresh plan mode={mode} popover={popover_open} battery={} saver={} interval={:?} {}",
         power.on_battery,
         power.battery_saver,
