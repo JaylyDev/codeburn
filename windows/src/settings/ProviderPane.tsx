@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 
-import { refreshQuota, summaryFor, type Connection, type QuotaState } from '../lib/quota'
+import { ACCEPTS_KEY, refreshQuota, summaryFor, type Connection, type QuotaState } from '../lib/quota'
 import { QUOTA_CADENCES, subscribeSettings, writeSettings, type AppSettings } from '../lib/appSettings'
 import { homePath } from '../lib/platform'
 import { Field, Group, Note, Pane, Row, Select } from './controls'
@@ -121,10 +121,6 @@ export function ProviderPane({ id, name, quota }: Props) {
     </Pane>
   )
 }
-
-/// The providers whose adapter takes a key from the environment, from `src/quota/*.ts`. Rust
-/// refuses a key for anything else, so this list is the UI half of the same rule.
-const ACCEPTS_KEY = ['zai', 'clinepass']
 
 /// The mac's ClaudeConfigDirsSection. Persisted to the CLI's own config, so every `codeburn`
 /// run aggregates the same set whether this app spawned it or the user typed it.

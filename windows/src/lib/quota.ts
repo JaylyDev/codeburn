@@ -53,6 +53,18 @@ export function resetsIn(iso: string | undefined, now = Date.now()): string {
   return `${minutes}m`
 }
 
+/// The providers whose quota adapter takes a key from the environment, from `src/quota/*.ts`.
+/// Rust refuses a key for anything else, so this list is the UI half of the same rule.
+export const ACCEPTS_KEY = ['zai', 'clinepass']
+
+/// CapacityDockQuotaPresentation.visibleFooterLines: a footer line that only repeats the
+/// reason already shown above it is noise, so it is dropped rather than printed twice.
+export function visibleFooterLines(lines: string[], reason: string | null): string[] {
+  const needle = reason?.trim().toLowerCase()
+  if (!needle) return lines
+  return lines.filter((line) => line.trim().toLowerCase() !== needle)
+}
+
 export function displayLabel(label: string): string {
   return label
     .replace(/Claude and GPT models/i, 'Claude + GPT')

@@ -291,6 +291,39 @@
 .dock-fill.is-critical { background: var(--dock-orange); }
 .dock-fill.is-danger { background: var(--dock-red); }
 
+.dock-footer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dock-detail-block-gap);
+  padding-top: var(--dock-detail-row-gap);
+  border-top: 1px solid rgba(250, 242, 230, 0.12);
+}
+
+.dock-footer-line {
+  margin: 0;
+  font-size: 10px;
+  color: rgba(250, 242, 230, 0.58);
+}
+
+/* The mac's prominent small button, tinted with the provider's brand colour. */
+.dock-connect {
+  align-self: flex-start;
+  appearance: none;
+  border: 0;
+  border-radius: 6px;
+  padding: 5px 11px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: #fff;
+  cursor: default;
+}
+
+.dock-connect:hover {
+  filter: brightness(1.12);
+}
+
 .dock-window-resets {
   align-self: flex-end;
   font-size: 10px;

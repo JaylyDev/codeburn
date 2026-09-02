@@ -2,6 +2,8 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProp
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { ProviderGlyph } from './providerIcons'
+import { providerColor } from './components/AgentTabStrip'
+import { ACCEPTS_KEY, visibleFooterLines } from './lib/quota'
 import {
   DEFAULT_DOCK_PREFS,
   autoSeed,
@@ -232,14 +234,60 @@ function Row({ m, shape, provider, loading, style, onEnter, onLeave, onClick }: 
   )
 }
 
+/// CapacityDockConnectionAction.resolve: the one recovery the bubble offers. A provider the
+/// CLI could not read at all needs connecting; one it read and was refused needs reconnecting.
+function connectionAction(provider: Provider): 'Connect' | 'Reconnect' | null {
+  if (provider.available) return null
+  return provider.error ? 'Reconnect' : 'Connect'
+}
+
+/// The mac says "Add API Key" where the provider's only credential is a token. Here that is
+/// the same two providers whose settings pane offers a paste field.
+function actionTitle(provider: Provider, action: 'Connect' | 'Reconnect'): string {
+  return ACCEPTS_KEY.includes(provider.id) ? 'Add API Key' : action
+}
+
+function checkedLabel(fetchedAt: number, now: number): string {
+  const minutes = Math.floor(Math.max(0, now - fetchedAt) / 60_000)
+  if (minutes < 1) return 'Checked just now'
+  if (minutes < 60) return `Checked ${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  return `Checked ${hours}h ${minutes % 60}m ago`
+}
+
+/// The mac's footer carries provider facts its own adapters return. The CLI's `quota` output
+/// drops those, so the two the dock can still tell honestly are how old the reading is and
+/// what the bubble had no room to show.
+function footerLines(provider: Provider, fetchedAt: number | null, now: number): string[] {
+  const lines: string[] = []
+  if (fetchedAt !== null) lines.push(checkedLabel(fetchedAt, now))
+  const hidden = provider.windows.length - MAX_DETAIL_ROWS
+  if (hidden > 0) lines.push(`${hidden} more window${hidden === 1 ? '' : 's'} not shown`)
+  return visibleFooterLines(lines, provider.error ?? null).slice(0, 2)
+}
+
 function instruction(provider: Provider, quota: DockQuota | null): string {
   if (quota?.state === 'cliOutdated') return 'CLI update needed for live quota. Run npm install -g codeburn.'
   if (quota?.state === 'unavailable') return quota.message || 'Quota is unavailable right now.'
   return `Sign in with the ${provider.name} app or CLI. The dock checks again every five minutes.`
 }
 
-function Detail({ m, provider, quota, loading }: { m: Metrics; provider: Provider; quota: DockQuota | null; loading: boolean }) {
+function Detail({
+  m,
+  provider,
+  quota,
+  loading,
+  fetchedAt,
+}: {
+  m: Metrics
+  provider: Provider
+  quota: DockQuota | null
+  loading: boolean
+  fetchedAt: number | null
+}) {
   const windows = provider.windows.slice(0, MAX_DETAIL_ROWS)
+  const footer = footerLines(provider, fetchedAt, Date.now())
+  const action = loading ? null : connectionAction(provider)
   return (
     <div className="dock-detail-body">
       <header className="dock-detail-head">
@@ -283,6 +331,27 @@ function Detail({ m, provider, quota, loading }: { m: Metrics; provider: Provide
             )
           })
         : null}
+
+      {footer.length > 0 ? (
+        <div className="dock-footer">
+          {footer.map((line) => (
+            <p className="dock-footer-line" key={line}>
+              {line}
+            </p>
+          ))}
+        </div>
+      ) : null}
+
+      {action ? (
+        <button
+          type="button"
+          className="dock-connect"
+          style={{ background: providerColor(provider.id) }}
+          onClick={() => void invoke('open_settings_window', { section: provider.id })}
+        >
+          {actionTitle(provider, action)}
+        </button>
+      ) : null}
     </div>
   )
 }
@@ -312,6 +381,7 @@ const ATTACH_MOTION = (_from: number, to: number) => (to === 1 ? MOTION.dockAtta
 
 export function Dock() {
   const [quota, setQuota] = useState<DockQuota | null>(null)
+  const [fetchedAt, setFetchedAt] = useState<number | null>(null)
   const [prefs, setPrefs] = useState<DockPrefs>(DEFAULT_DOCK_PREFS)
   // Nothing may be written back before the stored preferences have arrived: the defaults say
   // nobody has chosen a provider set yet, and acting on that would overwrite one.
@@ -345,6 +415,7 @@ export function Dock() {
   const load = useCallback(async () => {
     try {
       setQuota(await invoke<DockQuota>('dock_quota'))
+      setFetchedAt(Date.now())
     } catch (err) {
       setQuota({ state: 'unavailable', message: String(err) })
     }
@@ -383,7 +454,10 @@ export function Dock() {
   const all = quota?.state === 'ready' ? quota.providers : []
   const signedIn = all.filter((p) => p.available)
   const chosenIds = prefs.providers
-  const available = chosenIds.length > 0 ? signedIn.filter((p) => chosenIds.includes(p.id)) : signedIn
+  // A chosen provider stays on the rail after it drops out, as it does on the mac: a dashed
+  // ring and a Reconnect button say more than a row that quietly disappeared. Nothing chosen
+  // yet means everything signed in, which is what the empty set is for until the seed runs.
+  const available = chosenIds.length > 0 ? all.filter((p) => chosenIds.includes(p.id)) : signedIn
   const resolvedPreferredId =
     normalizedPreferred(prefs.preferred, available.map((p) => p.id)) ?? prefs.preferred ?? all[0]?.id ?? 'claude'
   const preferred: Provider = all.find((p) => p.id === resolvedPreferredId) ?? {
@@ -814,7 +888,7 @@ export function Dock() {
               />
             </svg>
           ) : null}
-          <Detail m={m} provider={hoveredProvider} quota={quota} loading={loading} />
+          <Detail m={m} provider={hoveredProvider} quota={quota} loading={loading} fetchedAt={fetchedAt} />
         </div>
       ) : null}
     </div>
