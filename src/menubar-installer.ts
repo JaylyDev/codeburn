@@ -104,7 +104,7 @@ export type ReleaseApiFetch = (url: string, options?: FetchOptions) =>
 /// Release-asset delivery (github.com -> Azure blob) occasionally returns a transient 5xx or
 /// drops the socket. Three attempts with a short exponential backoff (0.5s, then 1s) rides out
 /// that class of blip while adding at most ~1.5s before a genuinely broken download reports
-/// back — `codeburn menubar` is interactive, so failing fast still matters.
+/// back, and `codeburn menubar` is interactive, so failing fast still matters.
 const ASSET_MAX_ATTEMPTS = 3
 const ASSET_BASE_DELAY_MS = 500
 
@@ -271,7 +271,7 @@ async function fetchLatestReleaseAssets(spec: ReleaseSpec = MAC_RELEASE, fetchIm
 
 /// 5xx means "GitHub/the CDN is unhappy right now" and is worth another attempt. 4xx is not:
 /// 404/410 must keep falling through to the release-API path untouched, and a 403/429 rate limit
-/// cannot clear inside a 1.5s backoff window — hammering it would only spend more of the budget,
+/// cannot clear inside a 1.5s backoff window, and hammering it would only spend more of the budget,
 /// so those surface immediately with the retry-after hint instead.
 function isTransientStatus(status: number): boolean {
   return status >= 500 && status <= 599
@@ -542,7 +542,9 @@ async function killRunningApp(): Promise<void> {
 
 /// Windows mirror of the mac install below: pin the release to the CLI's own version, fall back
 /// to the newest windows-v* release, verify the sha256 before anything executes the file, hand
-/// the .msi to msiexec, then launch what it installed.
+/// the .msi to msiexec, then launch what it installed. Two routes come before that one: an .msi
+/// another installer already staged (BUNDLED_MSI_ENV), and a Microsoft Store install of the
+/// desktop app, which carries the tray app inside its own package (findStoreMenubar).
 const WINDOWS_UNINSTALL_KEYS = [
   'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
   'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
@@ -551,12 +553,29 @@ const WINDOWS_UNINSTALL_KEYS = [
 /// 3010 is "installed, reboot to finish"; 1602 is the user closing the UAC/installer prompt.
 const MSI_EXIT_REBOOT_REQUIRED = 3010
 const MSI_EXIT_USER_CANCEL = 1602
+/// How long a running tray app gets to act on a `--quit` before it is closed outright. The same
+/// window the desktop app allows for the same request (app/electron/menubar.ts, QUIT_SETTLE_MS).
+const TRAY_QUIT_TIMEOUT_MS = 4000
+const TRAY_QUIT_POLL_MS = 200
+/// tasklist and taskkill answer immediately on a healthy machine; the bound is only there so a
+/// wedged one cannot hold up the install for ever.
+const TRAY_PROCESS_TIMEOUT_MS = 5000
 
 export type WindowsInstallHooks = {
   fetchOptions?: AssetFetchOptions
   apiFetch?: ReleaseApiFetch
   runInstaller?: (exe: string, args: string[]) => Promise<number>
   queryRegistry?: () => Promise<string>
+  /// The Store package's InstallLocation, or an empty string when the desktop app is not
+  /// installed from the Store. Replaced in tests so nothing spawns PowerShell.
+  queryStorePackage?: () => Promise<string>
+  /// Whether a tray process is running right now. Replaced in tests so nothing spawns tasklist.
+  isTrayRunning?: () => Promise<boolean>
+  /// Close a tray process that would not quit when asked. Replaced in tests so nothing spawns
+  /// taskkill.
+  killTray?: () => Promise<void>
+  /// The wait between two `isTrayRunning` polls, so tests need not spend the real one.
+  sleep?: (ms: number) => Promise<void>
   launch?: (exePath: string, args?: string[]) => void
   log?: (message: string) => void
   stagingDir?: string
@@ -668,13 +687,20 @@ export async function readMenubarMarker(env: NodeJS.ProcessEnv = process.env): P
 /// menubar here? Only a first install onto a machine that had none can say yes, and once a
 /// marker exists its verdict is never rewritten - an upgrade refreshes the version and the
 /// uninstall string, nothing else.
+///
+/// `fallback` is the verdict for a machine that has no marker yet, and it is the route that
+/// knows it: the desktop route credits itself only when it found nothing already installed,
+/// while a plain `codeburn menubar` is always 'manual'. Writing that 'manual' down is what
+/// stops a later desktop install from having to guess: a registry read that comes back empty
+/// because of a hive this process cannot see would otherwise read as "nothing was here", and
+/// the desktop uninstaller would take the user's own tray app away with it.
 async function writeMenubarMarker(
   installed: InstalledWindowsMenubar,
-  hadPreviousInstall: boolean,
+  fallback: MenubarInstalledBy,
   env: NodeJS.ProcessEnv,
 ): Promise<MenubarInstalledBy> {
   const existing = await readMenubarMarker(env)
-  const installedBy: MenubarInstalledBy = existing?.installedBy ?? (hadPreviousInstall ? 'manual' : 'desktop')
+  const installedBy: MenubarInstalledBy = existing?.installedBy ?? fallback
   const marker: MenubarInstallMarker = {
     installedBy,
     version: installed.version,
@@ -688,7 +714,10 @@ async function writeMenubarMarker(
 }
 
 /// Install from a file another installer staged. No network, no release lookup, no launch: the
-/// caller that staged the MSI owns the tray app's process, so starting it is its business.
+/// caller that staged the MSI owns the tray app's process, so starting it is its business. The
+/// `--quit` this route may send is not a launch of that kind: a second process started with it
+/// hands the argument to the running instance and exits, and nothing is sent when nothing is
+/// running (stopRunningMenubar).
 async function installStagedWindowsMenubar(
   msiPath: string,
   options: InstallOptions,
@@ -727,12 +756,15 @@ async function installStagedWindowsMenubar(
     log(decision === 'kept-newer'
       ? `CodeBurn Menubar ${before!.version} is newer than the bundled ${bundledVersion}; leaving it alone.`
       : `CodeBurn Menubar ${bundledVersion} is already installed.`)
-    const installedBy = before ? await writeMenubarMarker(before, true, env) : null
+    const installedBy = before ? await writeMenubarMarker(before, 'manual', env) : null
     return report(decision, before, installedBy)
   }
 
   log('Verifying checksum...')
   await verifyStagedChecksum(msiPath)
+  // After the checksum, so a file that is not going to be installed never costs anyone their
+  // running tray app.
+  await stopRunningMenubar(before?.exePath, hooks, log, env)
   log('Installing...')
   const msiexec = resolveSystem32Path('msiexec.exe', env)
   const exitCode = await (hooks.runInstaller ?? runMsiexec)(msiexec, ['/i', msiPath, '/passive', '/norestart'])
@@ -749,7 +781,7 @@ async function installStagedWindowsMenubar(
   if (!installed) {
     throw new Error('CodeBurn Menubar installed, but it was not found in the uninstall registry.')
   }
-  const installedBy = await writeMenubarMarker(installed, before !== undefined, env)
+  const installedBy = await writeMenubarMarker(installed, before === undefined ? 'desktop' : 'manual', env)
   log(`Installed CodeBurn Menubar ${installed.version}.`)
   return report('installed', installed, installedBy)
 }
@@ -790,6 +822,104 @@ export function parseInstalledWindowsMenubar(regOutput: string): InstalledWindow
   return undefined
 }
 
+// The Microsoft Store route -------------------------------------------------------------------
+
+/// The identity the Store build of the desktop app is published under (app/package.json,
+/// build.appx.identityName). Mirrored rather than imported: this module compiles with rootDir
+/// src/ and the published package ships only dist/, so app/ is reachable neither at build time
+/// nor at runtime. tests/menubar-installer-windows.test.ts fails if the two ever drift apart.
+export const STORE_IDENTITY_NAME = 'Codeburn.CodeBurn'
+/// Where the tray app sits inside that package: electron-builder puts extraResources under
+/// `app\resources`, and app/build/appx-extensions.xml names the same path in its startup task.
+const STORE_TRAY_SEGMENTS = ['app', 'resources', 'menubar', WINDOWS_BINARY_NAME]
+/// Get-AppxPackage on a warm machine answers well inside a second, but a cold PowerShell behind
+/// a slow disk or a policy-loaded profile can take much longer, and `codeburn menubar` is
+/// interactive. Past this the answer is "no Store install" and the .msi route takes over.
+const STORE_QUERY_TIMEOUT_MS = 5000
+
+export type StoreMenubar = { installLocation: string; exePath: string }
+
+export type WindowsMenubarSourceDecision = {
+  source: 'store' | 'msi'
+  storePresent: boolean
+  msiPresent: boolean
+}
+
+/// Which copy of the tray app this run should use. The Store copy wins whenever it is there: it
+/// is already installed and already registered for launch at login, so installing the .msi
+/// beside it would leave the machine running two tray apps with two autostart entries. Nothing
+/// is ever uninstalled here, and --force is the one way to ask for the .msi anyway.
+export function decideWindowsMenubarSource(
+  storePresent: boolean,
+  msiPresent: boolean,
+  force = false,
+): WindowsMenubarSourceDecision {
+  return { source: storePresent && !force ? 'store' : 'msi', storePresent, msiPresent }
+}
+
+/// Find the tray app inside an installed Store package of the desktop app.
+///
+/// The uninstall registry cannot answer this, which is the whole reason this exists: a Store
+/// (AppX) install writes no uninstall key, so a machine that already carries the tray app inside
+/// the packaged desktop app reads as empty to parseInstalledWindowsMenubar. Believing that would
+/// download the .msi and stand a second copy in Program Files, with a second launch-at-login
+/// entry, beside the one the package already provides.
+///
+/// `queryStorePackage` returns the package's InstallLocation, or an empty string when there is
+/// none. Every way this can come up short - no PowerShell, blocked by policy, too slow, a
+/// package whose exe is not where it should be - means "not a Store install".
+export async function findStoreMenubar(
+  queryStorePackage: () => Promise<string>,
+): Promise<StoreMenubar | undefined> {
+  let output: string
+  try {
+    output = await queryStorePackage()
+  } catch {
+    return undefined
+  }
+  const installLocation = output
+    .split(/\r?\n/)
+    .map(line => line.trim().replace(/^"(.*)"$/, '$1'))
+    .find(line => line.length > 0)
+  if (!installLocation) return undefined
+  const exePath = join(installLocation, ...STORE_TRAY_SEGMENTS)
+  return (await exists(exePath)) ? { installLocation, exePath } : undefined
+}
+
+async function queryStoreInstallLocation(env: NodeJS.ProcessEnv): Promise<string> {
+  // Same rule msiexec and reg follow above: an absolute System32 path, never a bare name.
+  const powershell = resolveSystem32Path('WindowsPowerShell\\v1.0\\powershell.exe', env)
+  return captureBounded(powershell, [
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    `Get-AppxPackage -Name ${STORE_IDENTITY_NAME} | Select-Object -First 1 -ExpandProperty InstallLocation`,
+  ], STORE_QUERY_TIMEOUT_MS)
+}
+
+/// captureCommand with a wall-clock limit and no rejection: a missing binary, a non-zero exit
+/// and a hang all mean the same thing to the one caller, so they all come back empty.
+async function captureBounded(command: string, args: string[], timeoutMs: number): Promise<string> {
+  return new Promise((resolve) => {
+    let settled = false
+    let out = ''
+    const finish = (value: string) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const proc = spawn(command, args, { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+    const timer = setTimeout(() => {
+      proc.kill()
+      finish('')
+    }, timeoutMs)
+    proc.stdout.on('data', (chunk: Buffer) => { out += chunk.toString() })
+    proc.on('error', () => finish(''))
+    proc.on('close', code => finish(code === 0 ? out : ''))
+  })
+}
+
 async function queryWindowsUninstallRegistry(env: NodeJS.ProcessEnv): Promise<string> {
   const reg = resolveSystem32Path('reg.exe', env)
   // reg exits non-zero for a hive the machine does not have; an empty block is the right answer.
@@ -807,10 +937,72 @@ async function runMsiexec(exe: string, args: string[]): Promise<number> {
   })
 }
 
-function launchWindowsApp(exePath: string): void {
-  const proc = spawn(exePath, [], { detached: true, stdio: 'ignore' })
+function launchWindowsApp(exePath: string, args: string[] = []): void {
+  const proc = spawn(exePath, args, { detached: true, stdio: 'ignore' })
   proc.on('error', err => console.error(`Could not launch ${exePath}: ${err.message}`))
   proc.unref()
+}
+
+async function trayHasProcess(env: NodeJS.ProcessEnv): Promise<boolean> {
+  const tasklist = resolveSystem32Path('tasklist.exe', env)
+  // tasklist prints a "no tasks are running" notice rather than failing, and captureBounded
+  // turns everything that can go wrong into an empty string, so both read as "not running".
+  const output = await captureBounded(
+    tasklist,
+    ['/FI', `IMAGENAME eq ${WINDOWS_BINARY_NAME}`, '/NH'],
+    TRAY_PROCESS_TIMEOUT_MS,
+  )
+  return output.toLowerCase().includes(WINDOWS_BINARY_NAME)
+}
+
+async function killTrayProcess(env: NodeJS.ProcessEnv): Promise<void> {
+  const taskkill = resolveSystem32Path('taskkill.exe', env)
+  await captureBounded(taskkill, ['/IM', WINDOWS_BINARY_NAME, '/F'], TRAY_PROCESS_TIMEOUT_MS)
+}
+
+/// Stop a running tray app before msiexec is allowed near the files it is running from.
+///
+/// Windows Installer does not fail on a file that is in use: it installs the new one and defers
+/// the swap to the next reboot, so an upgrade over a running tray leaves the old binary running
+/// and the launch that follows hands its arguments to that old process through the tray app's
+/// single-instance window (windows/src-tauri/src/lib.rs). The user is then told they are on the
+/// new version while the old one is still what is running.
+///
+/// So the tray app is asked to stop through that same single-instance protocol, which is how the
+/// desktop app asks (app/electron/menubar.ts): a second launch of the installed exe with
+/// `--quit` reaches the running instance. taskkill is the fallback for a tray that does not
+/// answer within the window, and a machine with no tray running skips all of it.
+async function stopRunningMenubar(
+  exePath: string | undefined,
+  hooks: WindowsInstallHooks,
+  log: (message: string) => void,
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  const isRunning = hooks.isTrayRunning ?? (() => trayHasProcess(env))
+  if (!(await isRunning())) return
+
+  const launch = hooks.launch ?? launchWindowsApp
+  const sleep = hooks.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)))
+
+  if (exePath) {
+    log('CodeBurn Menubar is running; asking it to quit before installing...')
+    launch(exePath, ['--quit'])
+    // Counted polls rather than a wall clock, so the wait is the same length however long the
+    // supplied sleep actually takes.
+    for (let attempt = 0; attempt < Math.ceil(TRAY_QUIT_TIMEOUT_MS / TRAY_QUIT_POLL_MS); attempt++) {
+      await sleep(TRAY_QUIT_POLL_MS)
+      if (!(await isRunning())) {
+        log('CodeBurn Menubar stopped.')
+        return
+      }
+    }
+  }
+
+  log('CodeBurn Menubar did not stop on its own; closing it now.')
+  await (hooks.killTray ?? (() => killTrayProcess(env)))()
+  if (await isRunning()) {
+    log('CodeBurn Menubar is still running; Windows will finish the upgrade after the next restart.')
+  }
 }
 
 async function stageWindowsInstaller(
@@ -833,17 +1025,43 @@ async function installWindowsMenubarApp(options: InstallOptions): Promise<Instal
   const log = hooks.log ?? console.log
   const env = hooks.env ?? process.env
   const queryRegistry = hooks.queryRegistry ?? (() => queryWindowsUninstallRegistry(env))
+  const queryStorePackage = hooks.queryStorePackage ?? (() => queryStoreInstallLocation(env))
   const launch = hooks.launch ?? launchWindowsApp
   const cliVersion = options.cliVersion ? normalizeCliVersion(options.cliVersion) : ''
 
   // An MSI already on disk short-circuits the whole release lookup: the desktop app ships the
   // matching build and points at it rather than sending every install of the desktop app to
-  // GitHub for a file it already has.
+  // GitHub for a file it already has. This stays ahead of the Store lookup because it is an
+  // explicit instruction from whoever staged the file, and the Store build never sets it.
   const bundledMsi = env[BUNDLED_MSI_ENV]
   if (bundledMsi) return installStagedWindowsMenubar(bundledMsi, options)
 
+  // The Store package is looked for before the uninstall registry, because it is the one install
+  // the registry cannot see at all (findStoreMenubar).
+  const store = await findStoreMenubar(queryStorePackage)
   const installed = parseInstalledWindowsMenubar(await queryRegistry())
+  const decision = decideWindowsMenubarSource(store !== undefined, installed !== undefined, options.force)
+
+  if (store && decision.source === 'store') {
+    // No ownership marker on this route: nothing was installed, the tray app lives inside the
+    // Store package and goes away with it, and there is no MSI product code for the desktop
+    // app's uninstaller to act on even if it wanted to (app/build/installer.nsh).
+    log('CodeBurn Menubar comes from the Microsoft Store CodeBurn desktop app; nothing to download.')
+    if (installed) {
+      log(`A separate .msi install is also present at ${installed.exePath}; leaving it in place and using the Store copy.`)
+    }
+    launch(store.exePath)
+    log('Launched CodeBurn Menubar.')
+    return { installedPath: store.exePath, launched: true }
+  }
+  if (decision.storePresent) {
+    log('CodeBurn Menubar comes from the Microsoft Store CodeBurn desktop app; --force installs the .msi as well and leaves the Store copy in place.')
+  }
+
   if (installed && !options.force && (!cliVersion || installed.version === cliVersion)) {
+    // Nothing was installed, but this is still the route that owns a hand-installed tray app,
+    // and a machine that was set up before the marker existed has none to show for it.
+    await writeMenubarMarker(installed, 'manual', env)
     launch(installed.exePath)
     log('Launched CodeBurn Menubar.')
     return { installedPath: installed.exePath, launched: true }
@@ -873,6 +1091,9 @@ async function installWindowsMenubarApp(options: InstallOptions): Promise<Instal
       msiPath = await stageWindowsInstaller(assets, stagingDir, hooks, log)
     }
 
+    // The .msi is downloaded and verified by now, so nothing is stopped for an install that was
+    // never going to happen.
+    await stopRunningMenubar(installed?.exePath, hooks, log, env)
     log('Installing...')
     const msiexec = resolveSystem32Path('msiexec.exe', env)
     const exitCode = await (hooks.runInstaller ?? runMsiexec)(msiexec, ['/i', msiPath, '/passive', '/norestart'])
@@ -889,6 +1110,10 @@ async function installWindowsMenubarApp(options: InstallOptions): Promise<Instal
     if (!nowInstalled) {
       throw new Error('CodeBurn Menubar installed, but it was not found in the uninstall registry; start it from the Start menu.')
     }
+    // A `codeburn menubar` install is the user's own, so the marker says 'manual'. An install
+    // the desktop app already credited to itself keeps that verdict: writeMenubarMarker never
+    // rewrites one, so upgrading a desktop-installed tray from the CLI does not orphan it.
+    await writeMenubarMarker(nowInstalled, 'manual', env)
     launch(nowInstalled.exePath)
     log('Launched CodeBurn Menubar.')
     return { installedPath: nowInstalled.exePath, launched: true }
