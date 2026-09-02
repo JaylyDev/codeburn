@@ -27,6 +27,12 @@ const SUPPORTED_OS = 'darwin'
 /// rewrites the spaces in the bundle name to dots when it stores the asset, so both the asset
 /// name and its download URL carry `CodeBurn.Menubar_...`.
 const WINDOWS_PRODUCT_NAME = 'CodeBurn Menubar'
+/// What the installed executable is actually called. Tauri names the binary after the Cargo
+/// package (windows/src-tauri/Cargo.toml) and the install directory after the product, so the
+/// two differ: `CodeBurn Menubar\codeburn-menubar.exe`. Joining the product name onto
+/// InstallLocation builds a path to nothing, which is what the post-install launch, the
+/// desktop app's stored path and the Run value it seeds were all built from.
+const WINDOWS_BINARY_NAME = 'codeburn-menubar.exe'
 const WINDOWS_ASSET_PATTERN = /^CodeBurn\.Menubar_.+_x64_en-US\.msi$/
 const MIN_MACOS_MAJOR = 14
 const PERSISTED_CLI_PATH = join(homedir(), 'Library', 'Application Support', 'CodeBurn', 'codeburn-cli-path.v1')
@@ -766,13 +772,13 @@ export function parseInstalledWindowsMenubar(regOutput: string): InstalledWindow
       if (match) values.set(match[1]!.trim(), match[2]!.trim())
     }
     if (values.get('DisplayName') !== WINDOWS_PRODUCT_NAME) continue
-    const location = values.get('InstallLocation')
-    // DisplayIcon is `<exe>[,<index>]` and points at the installed binary when there is no
-    // InstallLocation to join onto.
+    // DisplayIcon is `<exe>[,<index>]` and names the installed binary outright, so where an
+    // installer wrote one it is the answer rather than a guess. Tauri's MSI leaves it empty,
+    // so the path that actually gets used is InstallLocation joined with the binary name.
     const icon = values.get('DisplayIcon')?.split(',')[0]?.trim()
-    const exePath = location
-      ? `${location.replace(/[\\/]+$/, '')}\\${WINDOWS_PRODUCT_NAME}.exe`
-      : icon
+    const location = values.get('InstallLocation')
+    const exePath = icon
+      || (location ? `${location.replace(/[\\/]+$/, '')}\\${WINDOWS_BINARY_NAME}` : undefined)
     if (!exePath) continue
     const uninstallString = values.get('UninstallString')
     return {

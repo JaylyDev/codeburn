@@ -110,21 +110,42 @@ describe('resolveSystem32Path', () => {
 })
 
 describe('parseInstalledWindowsMenubar', () => {
-  it('reads the version and joins the exe onto InstallLocation', () => {
+  // The install directory is named after the product and the binary after the Cargo package,
+  // so the two are not the same word. This is exactly what a real install looks like: Tauri
+  // writes InstallLocation and leaves DisplayIcon empty.
+  it('joins the binary name, not the product name, onto InstallLocation', () => {
     expect(parseInstalledWindowsMenubar(INSTALLED_0_9_20)).toEqual({
       version: '0.9.20',
-      exePath: 'C:\\Program Files\\CodeBurn Menubar\\CodeBurn Menubar.exe',
+      exePath: 'C:\\Program Files\\CodeBurn Menubar\\codeburn-menubar.exe',
     })
   })
 
-  it('falls back to DisplayIcon when there is no InstallLocation', () => {
+  it('takes DisplayIcon over InstallLocation, since it names the binary outright', () => {
     const output = regBlock({
       DisplayName: 'CodeBurn Menubar',
       DisplayVersion: '0.9.20',
-      DisplayIcon: 'C:\\Program Files\\CodeBurn Menubar\\CodeBurn Menubar.exe,0',
+      InstallLocation: 'C:\\Program Files\\CodeBurn Menubar\\',
+      DisplayIcon: 'D:\\Elsewhere\\codeburn-menubar.exe,0',
     })
 
-    expect(parseInstalledWindowsMenubar(output)?.exePath).toBe('C:\\Program Files\\CodeBurn Menubar\\CodeBurn Menubar.exe')
+    expect(parseInstalledWindowsMenubar(output)?.exePath).toBe('D:\\Elsewhere\\codeburn-menubar.exe')
+  })
+
+  it('uses DisplayIcon when there is no InstallLocation', () => {
+    const output = regBlock({
+      DisplayName: 'CodeBurn Menubar',
+      DisplayVersion: '0.9.20',
+      DisplayIcon: 'C:\\Program Files\\CodeBurn Menubar\\codeburn-menubar.exe,0',
+    })
+
+    expect(parseInstalledWindowsMenubar(output)?.exePath).toBe('C:\\Program Files\\CodeBurn Menubar\\codeburn-menubar.exe')
+  })
+
+  it('is undefined when neither says where the binary is', () => {
+    expect(parseInstalledWindowsMenubar(regBlock({
+      DisplayName: 'CodeBurn Menubar',
+      DisplayVersion: '0.9.20',
+    }))).toBeUndefined()
   })
 
   it('returns undefined when the product is not installed', () => {
@@ -178,8 +199,8 @@ describe('installMenubarApp on windows', () => {
 
     expect(fetches).toBe(0)
     expect(installerCalls).toEqual([])
-    expect(launched).toEqual(['C:\\Program Files\\CodeBurn Menubar\\CodeBurn Menubar.exe'])
-    expect(result).toEqual({ installedPath: 'C:\\Program Files\\CodeBurn Menubar\\CodeBurn Menubar.exe', launched: true })
+    expect(launched).toEqual(['C:\\Program Files\\CodeBurn Menubar\\codeburn-menubar.exe'])
+    expect(result).toEqual({ installedPath: 'C:\\Program Files\\CodeBurn Menubar\\codeburn-menubar.exe', launched: true })
   })
 
   it('downloads, verifies, runs msiexec from System32 and launches the installed app', async () => {
@@ -196,7 +217,7 @@ describe('installMenubarApp on windows', () => {
       exe: 'C:\\Windows\\System32\\msiexec.exe',
       args: ['/i', join(sandbox, 'CodeBurn.Menubar_0.9.20_x64_en-US.msi'), '/passive', '/norestart'],
     }])
-    expect(launched).toEqual(['C:\\Program Files\\CodeBurn Menubar\\CodeBurn Menubar.exe'])
+    expect(launched).toEqual(['C:\\Program Files\\CodeBurn Menubar\\codeburn-menubar.exe'])
     expect(result.launched).toBe(true)
     expect(logs).toContain('Downloading CodeBurn.Menubar_0.9.20_x64_en-US.msi...')
     expect(logs).toContain('Verifying checksum...')
@@ -413,7 +434,7 @@ describe('installMenubarApp from a staged msi', () => {
       exe: 'C:\\Windows\\System32\\msiexec.exe',
       args: ['/i', msiPath, '/passive', '/norestart'],
     }])
-    expect(result.installedPath).toBe('C:\\Program Files\\CodeBurn Menubar\\CodeBurn Menubar.exe')
+    expect(result.installedPath).toBe('C:\\Program Files\\CodeBurn Menubar\\codeburn-menubar.exe')
     // The caller that staged the MSI owns the tray app's process, so nothing is launched here.
     expect(result.launched).toBe(false)
     expect(reported()).toMatchObject({
