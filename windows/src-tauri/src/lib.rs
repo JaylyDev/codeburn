@@ -93,13 +93,6 @@ pub fn parse_second_launch(args: &[String]) -> SecondLaunch {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // `--quit` aimed at an app that is not running would otherwise start one and leave it
-    // there, which is the opposite of the request. Nothing has been built yet, so there is
-    // nothing to tear down.
-    if parse_second_launch(&std::env::args().collect::<Vec<_>>()) == SecondLaunch::Quit {
-        return;
-    }
-
     tauri::Builder::default()
         // Must be registered before any other plugin so it can intercept a second launch.
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
@@ -112,6 +105,16 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            // `--quit` with nothing running: this launch is the instance being asked to go,
+            // so it goes without ever showing anything. It cannot be answered before the
+            // builder runs, because handing the argv to an instance that IS running is the
+            // single-instance plugin's job, and returning early meant the running app never
+            // heard the request at all.
+            if parse_second_launch(&std::env::args().collect::<Vec<_>>()) == SecondLaunch::Quit {
+                app.handle().exit(0);
+                return Ok(());
+            }
+
             app.manage(AppState {
                 cli: Mutex::new(CodeburnCli::resolve()),
                 config: Mutex::new(CurrencyConfig::load_or_default()),
@@ -1126,6 +1129,7 @@ mod commands {
     pub fn dock_context_menu(app: AppHandle) -> Result<(), String> {
         crate::dock::popup_context_menu(&app).map_err(|e| e.to_string())
     }
+
 
     /// Everything the Capacity Dock reads out of `windows-dock.json`: whether it is on, its
     /// scale, appearance, gauge shape and provider set. One free-form object, so a new dock
