@@ -109,6 +109,56 @@ private func settle(until condition: () -> Bool, turns: Int = 500) async -> Bool
 @MainActor
 struct AppStoreRefreshConcurrencyTests {
 
+    @Test("a fetch whose in-flight slot was evicted cannot release its successor's slot")
+    func evictedFetchCannotReleaseSuccessorSlot() async {
+        let script = ScriptedFetch()
+        script.install()
+        defer { script.uninstall() }
+
+        let store = AppStore()
+        store.setCacheDateToTodayForTesting()
+
+        // A claims the slot for (today, claude) and parks inside its fetch.
+        let taskA = Task { await store.refreshQuietlyForTesting(period: .today, provider: .claude) }
+        #expect(await settle(until: { script.attempts.count == 1 }))
+        #expect(store.isInFlightForTesting(period: .today, provider: .claude))
+
+        // The display-sleep reset evicts the slot out from under A.
+        store.resetLoadingState()
+        #expect(!store.isInFlightForTesting(period: .today, provider: .claude))
+
+        // B legitimately claims the same key afterwards.
+        let taskB = Task { await store.refreshQuietlyForTesting(period: .today, provider: .claude) }
+        #expect(await settle(until: { script.attempts.count == 2 }))
+        #expect(store.isInFlightForTesting(period: .today, provider: .claude))
+
+        // C finds the key busy and parks as a waiter on B.
+        var cFinished = false
+        let taskC = Task {
+            let result = await store.refreshQuietlyForTesting(period: .today, provider: .claude)
+            cFinished = true
+            return result
+        }
+        #expect(await settle(until: { store.inFlightWaiterCountForTesting(period: .today, provider: .claude) == 1 }))
+
+        // A finishes late. Its slot is gone, so its release must be a no-op:
+        // B keeps the slot and C stays parked. Untokened, A's defer cleared B's
+        // slot and woke C onto an empty cache.
+        script.release(0)
+        _ = await taskA.value
+        #expect(store.isInFlightForTesting(period: .today, provider: .claude))
+        #expect(store.inFlightWaiterCountForTesting(period: .today, provider: .claude) == 1)
+        #expect(!cFinished)
+
+        // B finishes and C resumes off B's result.
+        script.release(1)
+        #expect(await taskB.value)
+        #expect(await taskC.value)
+        #expect(cFinished)
+        #expect(!store.isInFlightForTesting(period: .today, provider: .claude))
+        #expect(store.inFlightWaiterCountForTesting(period: .today, provider: .claude) == 0)
+    }
+
     @Test("an interactive refresh joins an in-flight fetch instead of reporting failure")
     func interactiveRefreshJoinsInFlightFetch() async {
         let script = ScriptedFetch()

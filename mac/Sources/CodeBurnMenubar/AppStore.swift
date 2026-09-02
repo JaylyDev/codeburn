@@ -535,7 +535,8 @@ final class AppStore {
                                 provider: ProviderFilter,
                                 day: String? = nil,
                                 insertedAt: Date) {
-        inFlightKeys[PayloadCacheKey(scope: scope, period: period, provider: provider, day: day)] = insertedAt
+        inFlightKeys[PayloadCacheKey(scope: scope, period: period, provider: provider, day: day)] =
+            InFlightSlot(startedAt: insertedAt, token: UUID())
     }
 
     func setCacheDateToTodayForTesting() {
@@ -567,7 +568,7 @@ final class AppStore {
                                   period: Period,
                                   provider: ProviderFilter,
                                   day: String? = nil) {
-        finishInFlight(for: PayloadCacheKey(scope: scope, period: period, provider: provider, day: day))
+        forceFinishInFlight(for: PayloadCacheKey(scope: scope, period: period, provider: provider, day: day))
     }
 
     func selectionRefreshKeysForTesting() -> (scoped: PayloadCacheKey, all: PayloadCacheKey) {
@@ -727,7 +728,18 @@ final class AppStore {
         }
     }
 
-    private var inFlightKeys: [PayloadCacheKey: Date] = [:]
+    /// One occupancy of a key's in-flight slot. The token identifies WHICH
+    /// fetch owns the slot right now: the watchdog and the display-sleep reset
+    /// can evict an occupant, after which a later fetch legitimately claims the
+    /// same key. Without the token the evicted fetch's `defer` would then clear
+    /// the NEW owner's slot and resume its waiters, so a task parked on the
+    /// live fetch woke to an empty cache and reported failure.
+    private struct InFlightSlot {
+        let startedAt: Date
+        let token: UUID
+    }
+
+    private var inFlightKeys: [PayloadCacheKey: InFlightSlot] = [:]
     private var inFlightWaiters: [PayloadCacheKey: [CheckedContinuation<Void, Never>]] = [:]
 
     private func waitForInFlight(_ key: PayloadCacheKey) async {
@@ -741,7 +753,23 @@ final class AppStore {
         }
     }
 
-    private func finishInFlight(for key: PayloadCacheKey) {
+    private func claimInFlight(_ key: PayloadCacheKey) -> UUID {
+        let token = UUID()
+        inFlightKeys[key] = InFlightSlot(startedAt: Date(), token: token)
+        return token
+    }
+
+    /// Release the slot only if this fetch still owns it. A fetch whose slot was
+    /// evicted has nothing left to release and no waiters of its own.
+    private func finishInFlight(for key: PayloadCacheKey, token: UUID) {
+        guard inFlightKeys[key]?.token == token else { return }
+        forceFinishInFlight(for: key)
+    }
+
+    /// Evict whoever holds the slot and wake everyone parked on it. Only the
+    /// watchdog and the pipeline resets use this: they are declaring the slot
+    /// dead, not reporting a fetch that ended.
+    private func forceFinishInFlight(for key: PayloadCacheKey) {
         inFlightKeys[key] = nil
         let waiters = inFlightWaiters.removeValue(forKey: key) ?? []
         for waiter in waiters {
@@ -752,7 +780,7 @@ final class AppStore {
     private func finishAllInFlight() {
         let keys = Set(inFlightKeys.keys).union(inFlightWaiters.keys)
         for key in keys {
-            finishInFlight(for: key)
+            forceFinishInFlight(for: key)
         }
     }
 
@@ -784,8 +812,8 @@ final class AppStore {
         let staleLoading = loadingStartedAtByKey.filter {
             now.timeIntervalSince($0.value) > loadingWatchdogSeconds
         }
-        let staleInFlight = inFlightKeys.filter { (key, insertedAt) in
-            now.timeIntervalSince(insertedAt) > loadingWatchdogSeconds &&
+        let staleInFlight = inFlightKeys.filter { (key, slot) in
+            now.timeIntervalSince(slot.startedAt) > loadingWatchdogSeconds &&
             loadingStartedAtByKey[key] == nil
         }
         guard !staleLoading.isEmpty || !staleInFlight.isEmpty else { return false }
@@ -795,15 +823,15 @@ final class AppStore {
                   Int(now.timeIntervalSince(started)), key.label, key.provider.rawValue)
             loadingCountsByKey[key] = nil
             loadingStartedAtByKey[key] = nil
-            finishInFlight(for: key)
+            forceFinishInFlight(for: key)
             if cache[key] == nil {
                 lastErrorByKey[key] = "Refresh took longer than expected. CodeBurn will keep retrying in the background."
             }
         }
-        for (key, insertedAt) in staleInFlight {
+        for (key, slot) in staleInFlight {
             NSLog("CodeBurn: orphaned in-flight key stuck for %ds on %@/%@ — clearing",
-                  Int(now.timeIntervalSince(insertedAt)), key.label, key.provider.rawValue)
-            finishInFlight(for: key)
+                  Int(now.timeIntervalSince(slot.startedAt)), key.label, key.provider.rawValue)
+            forceFinishInFlight(for: key)
         }
         return true
     }
@@ -1095,7 +1123,7 @@ final class AppStore {
             await waitForInFlight(key)
             return consistentCachedPayload(for: key) != nil
         }
-        inFlightKeys[key] = Date()
+        let inFlightToken = claimInFlight(key)
         attemptedKeys.insert(key)
         lastErrorByKey[key] = nil
         let didShowLoading = showLoading || cache[key] == nil
@@ -1115,7 +1143,7 @@ final class AppStore {
         }
         defer {
             let abandonedAttempt = Task.isCancelled || generationAtStart != payloadRefreshGeneration
-            finishInFlight(for: key)
+            finishInFlight(for: key, token: inFlightToken)
             if didShowLoading {
                 finishLoading(for: key)
             }
@@ -1245,7 +1273,7 @@ final class AppStore {
             await waitForInFlight(key)
             return consistentCachedPayload(for: key) != nil
         }
-        inFlightKeys[key] = Date()
+        let inFlightToken = claimInFlight(key)
         attemptedKeys.insert(key)
         let cacheDateAtStart = cacheDate
         let generationAtStart = payloadRefreshGeneration
@@ -1253,7 +1281,7 @@ final class AppStore {
             NSLog("CodeBurn: refreshing stale today status payload after %ds", age)
         }
         defer {
-            finishInFlight(for: key)
+            finishInFlight(for: key, token: inFlightToken)
         }
         do {
             let fresh = try await fetchPayload(
