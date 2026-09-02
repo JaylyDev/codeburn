@@ -98,7 +98,9 @@ type FetchOptions = {
 }
 
 /// The two daily alert thresholds from the CLI config. Only the one the display metric is
-/// measured in is ever shown, as on the mac; `null` means that alert is off.
+/// measured in is ever shown, as on the mac; `null` means that alert is off. `cost` arrives in
+/// dollars, since that is what the payload is measured in; the settings window edits the
+/// display-currency figure that the CLI's `budget.daily` actually holds.
 type Budgets = { cost: number | null; tokens: number | null }
 
 export function App() {
@@ -323,8 +325,11 @@ export function App() {
     const unlistenBudget = listen<Budgets>('codeburn://budget-changed', event => {
       if (event.payload) setBudgets(event.payload)
     })
+    // The spend limit is stored in the display currency, so what it is worth in the dollars
+    // the payload reports changes with the currency, not only with the limit.
     const unlistenCurrency = listen<CurrencyState>('codeburn://currency-changed', event => {
       if (event.payload) setCurrency(event.payload)
+      invoke<Budgets>('daily_budgets').then(setBudgets).catch(() => {})
     })
     return () => {
       unlistenRefresh.then(fn => fn())

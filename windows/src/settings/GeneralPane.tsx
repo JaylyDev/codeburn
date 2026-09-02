@@ -181,7 +181,7 @@ export function GeneralPane({ quota, anchor }: Props) {
 
       <TerminalSection settings={settings} />
 
-      <AlertsSection settings={settings} />
+      <AlertsSection settings={settings} currency={currency} />
 
       <Group title="System">
         <Row
@@ -405,29 +405,35 @@ function TerminalSection({ settings }: { settings: AppSettings }) {
   )
 }
 
-/// The mac's Alerts section. The budget tracks whatever the tray figure shows: dollars for
-/// the Cost metric, tokens for the two token metrics. Both are stored beside the currency in
-/// the CLI config, because the tray reads them before any webview exists.
+/// The mac's Alerts section. The budget tracks whatever the tray figure shows: money for the
+/// Cost metric, tokens for the two token metrics. Both live in the CLI config, because the
+/// tray reads them before any webview exists. The spend limit is the CLI's own `budget.daily`
+/// and so is kept in the display currency, which is why the presets carry its symbol; the
+/// token limit has no CLI counterpart and stays where this app put it.
 const COST_PRESETS = [0, 25, 50, 100, 200, 500]
 const TOKEN_PRESETS = [0, 1e6, 5e6, 10e6, 25e6, 50e6, 100e6]
 const CUSTOM = -1
 
-function AlertsSection({ settings }: { settings: AppSettings }) {
-  const [budgets, setBudgets] = useState<{ cost: number | null; tokens: number | null }>({ cost: null, tokens: null })
+/// What `daily_budgets` answers; its `cost`, the same limit in dollars, is for the surfaces
+/// that compare it against the payload rather than edit it.
+type Budgets = { costDisplay: number | null; tokens: number | null }
+
+function AlertsSection({ settings, currency }: { settings: AppSettings; currency: CurrencyState }) {
+  const [budgets, setBudgets] = useState<Budgets>({ costDisplay: null, tokens: null })
   const [custom, setCustom] = useState(false)
   const [draft, setDraft] = useState('')
 
   const isTokens = settings.metric === 'tokens' || settings.metric === 'totalTokens'
-  const stored = isTokens ? budgets.tokens : budgets.cost
+  const stored = isTokens ? budgets.tokens : budgets.costDisplay
   const presets = isTokens ? TOKEN_PRESETS : COST_PRESETS
   const key = isTokens ? 'dailyTokenBudget' : 'dailyBudget'
   const unit = isTokens ? 1e6 : 1
 
   const read = () => {
-    invoke<{ cost: number | null; tokens: number | null }>('daily_budgets')
+    invoke<Budgets>('daily_budgets')
       .then(next => {
         setBudgets(next)
-        const value = (settings.metric === 'tokens' || settings.metric === 'totalTokens') ? next.tokens : next.cost
+        const value = (settings.metric === 'tokens' || settings.metric === 'totalTokens') ? next.tokens : next.costDisplay
         const list = (settings.metric === 'tokens' || settings.metric === 'totalTokens') ? TOKEN_PRESETS : COST_PRESETS
         // A stored amount that is not one of the presets is a custom one, so the field opens
         // with it rather than the picker silently rounding it to a preset.
@@ -442,7 +448,7 @@ function AlertsSection({ settings }: { settings: AppSettings }) {
 
   const write = (amount: number | null) => {
     invoke('set_daily_budget', { key, amount })
-      .then(() => setBudgets(current => ({ ...current, [isTokens ? 'tokens' : 'cost']: amount })))
+      .then(() => setBudgets(current => ({ ...current, [isTokens ? 'tokens' : 'costDisplay']: amount })))
       .catch(() => {})
   }
 
@@ -464,7 +470,7 @@ function AlertsSection({ settings }: { settings: AppSettings }) {
 
   const label = (value: number) => {
     if (value === 0) return 'Off'
-    return isTokens ? `${trim(value / 1e6)}M` : `$${trim(value)}`
+    return isTokens ? `${trim(value / 1e6)}M` : `${currency.symbol}${trim(value)}`
   }
 
   const armed = stored !== null && stored > 0
@@ -490,7 +496,7 @@ function AlertsSection({ settings }: { settings: AppSettings }) {
       />
       {custom && (
         <Row
-          label={isTokens ? 'Millions of tokens' : 'Amount in USD'}
+          label={isTokens ? 'Millions of tokens' : `Amount in ${currency.code}`}
           control={
             <Field
               ariaLabel="Custom daily budget"

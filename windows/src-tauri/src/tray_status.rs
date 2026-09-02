@@ -76,23 +76,36 @@ pub fn tray_icon(tint: Option<[u8; 3]>) -> Result<Image<'static>> {
     Ok(Image::new_owned(rgba, width, height))
 }
 
-/// Today's spend limit, kept beside the currency in the CLI's config so the tray can read it
-/// before any webview exists. Absent or zero means no budget. The settings window writes it.
-pub fn daily_budget() -> Option<f64> {
-    budget("dailyBudget")
+/// Today's spend limit, where the CLI's own config type keeps it: `budget.daily`, in the
+/// display currency (`src/config.ts`). Read from Rust because the tray is judged against it
+/// before any webview exists. Absent or zero means no budget.
+pub fn daily_budget_display() -> Option<f64> {
+    config_number(&["budget", "daily"])
+}
+
+/// What this app wrote before it learned the CLI's key: top level, and in dollars. Read once
+/// so a limit set by an older build survives the move, after which
+/// `settings::migrate_daily_budget` removes it.
+pub fn legacy_daily_budget() -> Option<f64> {
+    config_number(&["dailyBudget"])
 }
 
 /// The same alert measured in tokens, for the token display metrics. Only one of the two is
-/// ever armed, since the metric decides which one the flame is judged against.
+/// ever armed, since the metric decides which one the flame is judged against. The CLI has no
+/// token budget of its own, so this one stays where this app put it.
 pub fn daily_token_budget() -> Option<f64> {
-    budget("dailyTokenBudget")
+    config_number(&["dailyTokenBudget"])
 }
 
-fn budget(key: &str) -> Option<f64> {
-    let path = dirs::home_dir()?.join(".config/codeburn/config.json");
-    let value: serde_json::Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    let budget = value.get(key)?.as_f64()?;
-    (budget > 0.0).then_some(budget)
+fn config_number(path: &[&str]) -> Option<f64> {
+    let config = crate::config::read();
+    let (first, rest) = path.split_first()?;
+    let mut value = config.get(*first)?;
+    for key in rest {
+        value = value.get(key)?;
+    }
+    let number = value.as_f64()?;
+    (number > 0.0).then_some(number)
 }
 
 /// The badge text and tooltip from the last successful refresh.

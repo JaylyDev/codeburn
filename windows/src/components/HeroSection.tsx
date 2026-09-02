@@ -1,6 +1,6 @@
 import type { CombinedUsage, MenubarPayload } from '../lib/payload'
 import type { CurrencyState } from '../lib/currency'
-import { USD, formatCurrency, formatTokens, plural } from '../lib/currency'
+import { formatCurrency, formatTokens, plural } from '../lib/currency'
 import { prettyDate, todayKey } from '../lib/dates'
 import { SectionCaption } from './CollapsibleSection'
 import { ArrowDownRight, ArrowUpRight, LeafIcon, MonitorIcon, WarningIcon } from './Icons'
@@ -41,9 +41,10 @@ export function HeroSection({ payload, currency, periodLabel, isToday, dailyBudg
 
   const label = payload?.current.label || periodLabel
   const caption = combined ? `Combined · ${label}` : isToday ? `Today · ${todayLabel}` : label
-  // The budget is defined in USD, matching the CLI config and the presets the settings
-  // window offers, so it is compared and printed in USD rather than converted. Combined
-  // totals are several machines' spend, which the limit was never set against.
+  // The spend limit is stored in the display currency, as the CLI's own budget.daily is, and
+  // reaches this component already converted to the dollars the payload is measured in. It is
+  // printed back in the display currency, which is what the reader typed. Combined totals are
+  // several machines' spend, which the limit was never set against.
   const measured = isTokenMetric ? inputTokens + outputTokens : cost
   const overBudget = isToday && !combinedScope && dailyBudget !== null && payload !== null && measured >= dailyBudget
   const savings = combined ? 0 : payload?.current.localModelSavings?.totalUSD ?? 0
@@ -80,7 +81,7 @@ export function HeroSection({ payload, currency, periodLabel, isToday, dailyBudg
         <div className="hero-note hero-note-warn">
           <WarningIcon size={10} />
           <span>
-            Daily budget of {isTokenMetric ? `${formatTokens(dailyBudget)} tok` : formatCurrency(dailyBudget, USD)} exceeded
+            Daily budget of {isTokenMetric ? `${formatTokens(dailyBudget)} tok` : formatCurrency(dailyBudget, currency)} exceeded
           </span>
         </div>
       )}

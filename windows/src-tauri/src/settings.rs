@@ -119,11 +119,17 @@ pub fn set_claude_config_dirs(dirs: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The daily alert thresholds. Both live beside the currency because the tray reads them
-/// from Rust, before any webview exists. Zero means off, which is stored as the key's
-/// absence rather than a zero the CLI would have to special-case.
+/// The daily alert thresholds. Both live in the CLI's config because the tray reads them from
+/// Rust, before any webview exists. Zero means off, which is stored as the key's absence
+/// rather than a zero the CLI would have to special-case.
+///
+/// The spend limit goes where the CLI's own config type has always had it, `budget.daily` in
+/// the display currency; the token limit has no CLI counterpart and stays at the top level.
 pub fn set_daily_budget(key: &str, amount: Option<f64>) -> Result<()> {
-    if !matches!(key, "dailyBudget" | "dailyTokenBudget") {
+    if key == "dailyBudget" {
+        return set_cli_daily_budget(amount);
+    }
+    if key != "dailyTokenBudget" {
         return Err(anyhow!("unknown budget key `{key}`"));
     }
     let key = key.to_owned();
@@ -136,6 +142,51 @@ pub fn set_daily_budget(key: &str, amount: Option<f64>) -> Result<()> {
         }
     })?;
     Ok(())
+}
+
+/// `budget` is an object of tiers on the CLI's side, so the whole object is read and written
+/// back rather than one key, and an unset tier is removed rather than stored as a zero. The
+/// app's old top-level key is dropped on the way past: the two never coexist.
+fn set_cli_daily_budget(amount: Option<f64>) -> Result<()> {
+    crate::config::update(move |obj| {
+        obj.remove("dailyBudget");
+        let mut budget = obj
+            .get("budget")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        match amount {
+            Some(value) if value > 0.0 => {
+                budget.insert("daily".into(), serde_json::json!(value));
+            }
+            _ => {
+                budget.remove("daily");
+            }
+        }
+        if budget.is_empty() {
+            obj.remove("budget");
+        } else {
+            obj.insert("budget".into(), Value::Object(budget));
+        }
+    })?;
+    Ok(())
+}
+
+/// Moves a limit written by an older build onto the CLI's key, once. The old key was in
+/// dollars and the new one is in the display currency, so the rate is applied on the way
+/// across; a `budget.daily` that already exists wins, and the old key is removed either way so
+/// this never runs twice. Returns the limit in the display currency.
+pub fn migrate_daily_budget(rate: f64) -> Option<f64> {
+    let stored = crate::tray_status::daily_budget_display();
+    let Some(legacy) = crate::tray_status::legacy_daily_budget() else {
+        return stored;
+    };
+    let display = stored.unwrap_or(legacy * rate);
+    if let Err(err) = set_cli_daily_budget(Some(display)) {
+        eprintln!("codeburn: failed to move the daily budget onto budget.daily: {err}");
+        return Some(display);
+    }
+    Some(display)
 }
 
 // Provider API keys ---------------------------------------------------------------------

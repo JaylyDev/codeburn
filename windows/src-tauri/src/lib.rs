@@ -905,11 +905,12 @@ mod commands {
     }
 
     /// Tints the tray logo from the worst connected provider's quota severity, falling back
-    /// to the daily-budget warning. `today_cost` is the figure the hero shows; the limit it
-    /// is measured against is the CLI's own `dailyBudget`.
+    /// to the daily-budget warning. `today_cost` is the figure the hero shows, in dollars, so
+    /// the limit is converted out of the display currency the CLI's `budget.daily` holds.
     #[tauri::command]
-    pub fn set_tray_severity(
+    pub async fn set_tray_severity(
         app: AppHandle,
+        state: State<'_, AppState>,
         severity: String,
         today_cost: Option<f64>,
         today_tokens: Option<f64>,
@@ -922,8 +923,16 @@ mod commands {
             (Some(value), Some(limit)) => value >= limit,
             _ => false,
         };
-        let over_budget = over(today_cost, crate::tray_status::daily_budget())
-            || over(today_tokens, crate::tray_status::daily_token_budget());
+        let budget_usd = match crate::tray_status::daily_budget_display() {
+            Some(display) => {
+                let rate = display_rate(&state).await;
+                Some(if rate > 0.0 { display / rate } else { display })
+            }
+            // Not migrated yet: the old key was already in dollars.
+            None => crate::tray_status::legacy_daily_budget(),
+        };
+        let over_budget =
+            over(today_cost, budget_usd) || over(today_tokens, crate::tray_status::daily_token_budget());
         super::apply_tray_tint(&app, crate::tray_status::tint_for(severity, over_budget))
     }
 
@@ -1147,19 +1156,50 @@ mod commands {
         Ok(stored)
     }
 
+    /// The rate the display currency is worth against the dollar, from the cache the currency
+    /// command already fills. A missing rate falls back to 1, which is the same answer the
+    /// currency command gives: figures stay in the dollars the CLI reports rather than being
+    /// multiplied by a guess.
+    async fn display_rate(state: &AppState) -> f64 {
+        let code = crate::config::read()
+            .get("currency")
+            .and_then(|currency| currency.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("USD")
+            .to_string();
+        if code == "USD" {
+            return 1.0;
+        }
+        state.fx.rate_for(&code).await.unwrap_or(1.0)
+    }
+
     /// Both daily alert thresholds. `None` on either means that alert is off.
+    ///
+    /// The spend limit comes back twice: `cost` in dollars, which is what the payload is
+    /// measured in, and `costDisplay` in the currency it is stored and edited in. The
+    /// migration off the old top-level key happens here, on the first read after an upgrade.
     #[tauri::command]
-    pub fn daily_budgets() -> Value {
-        serde_json::json!({
-            "cost": crate::tray_status::daily_budget(),
+    pub async fn daily_budgets(state: State<'_, AppState>) -> Result<Value, String> {
+        let rate = display_rate(&state).await;
+        let display = crate::settings::migrate_daily_budget(rate);
+        Ok(serde_json::json!({
+            "cost": display.map(|amount| if rate > 0.0 { amount / rate } else { amount }),
+            "costDisplay": display,
             "tokens": crate::tray_status::daily_token_budget(),
-        })
+        }))
     }
 
     #[tauri::command]
-    pub fn set_daily_budget(app: AppHandle, key: String, amount: Option<f64>) -> Result<(), String> {
+    pub async fn set_daily_budget(
+        app: AppHandle,
+        state: State<'_, AppState>,
+        key: String,
+        amount: Option<f64>,
+    ) -> Result<(), String> {
         crate::settings::set_daily_budget(&key, amount).map_err(|e| e.to_string())?;
-        let _ = app.emit("codeburn://budget-changed", daily_budgets());
+        if let Ok(budgets) = daily_budgets(state).await {
+            let _ = app.emit("codeburn://budget-changed", budgets);
+        }
         Ok(())
     }
 
