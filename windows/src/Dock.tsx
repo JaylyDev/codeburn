@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { ProviderGlyph } from './providerIcons'
 import { providerColor } from './components/AgentTabStrip'
-import { ACCEPTS_KEY, visibleFooterLines } from './lib/quota'
+import { ACCEPTS_KEY, EMPTY_QUOTA, refreshQuota, subscribeQuota, visibleFooterLines, type QuotaState } from './lib/quota'
 import {
   DEFAULT_DOCK_PREFS,
   autoSeed,
@@ -39,7 +39,6 @@ import {
 } from './dockGeometry'
 import './dock.css'
 
-const REFRESH_MS = 5 * 60 * 1000
 const MAX_DETAIL_ROWS = 5
 
 const PROVIDER_NAMES: Record<string, string> = {
@@ -59,11 +58,6 @@ type Provider = {
   windows: QuotaWindow[]
   error?: string
 }
-
-type DockQuota =
-  | { state: 'ready'; providers: Provider[] }
-  | { state: 'cliOutdated' }
-  | { state: 'unavailable'; message: string }
 
 type Rect = { x: number; y: number; w: number; h: number }
 type DockFrame = {
@@ -266,10 +260,10 @@ function footerLines(provider: Provider, fetchedAt: number | null, now: number):
   return visibleFooterLines(lines, provider.error ?? null).slice(0, 2)
 }
 
-function instruction(provider: Provider, quota: DockQuota | null): string {
-  if (quota?.state === 'cliOutdated') return 'CLI update needed for live quota. Run npm install -g codeburn.'
-  if (quota?.state === 'unavailable') return quota.message || 'Quota is unavailable right now.'
-  return `Sign in with the ${provider.name} app or CLI. The dock checks again every five minutes.`
+function instruction(provider: Provider, quota: QuotaState): string {
+  if (quota.cliOutdated) return 'CLI update needed for live quota. Run npm install -g codeburn.'
+  if (quota.error) return quota.error
+  return `Sign in with the ${provider.name} app or CLI. The dock checks again on the quota refresh cadence.`
 }
 
 function Detail({
@@ -281,7 +275,7 @@ function Detail({
 }: {
   m: Metrics
   provider: Provider
-  quota: DockQuota | null
+  quota: QuotaState
   loading: boolean
   fetchedAt: number | null
 }) {
@@ -380,8 +374,7 @@ const RAIL_MOTION = (_from: number, to: number) => (to === 1 ? MOTION.railExpand
 const ATTACH_MOTION = (_from: number, to: number) => (to === 1 ? MOTION.dockAttach : MOTION.dockDetach)
 
 export function Dock() {
-  const [quota, setQuota] = useState<DockQuota | null>(null)
-  const [fetchedAt, setFetchedAt] = useState<number | null>(null)
+  const [quota, setQuota] = useState<QuotaState>(EMPTY_QUOTA)
   const [prefs, setPrefs] = useState<DockPrefs>(DEFAULT_DOCK_PREFS)
   // Nothing may be written back before the stored preferences have arrived: the defaults say
   // nobody has chosen a provider set yet, and acting on that would overwrite one.
@@ -412,20 +405,10 @@ export function Dock() {
   const press = useRef<{ x: number; y: number; dragged: boolean } | null>(null)
   const suppressClick = useRef(false)
 
-  const load = useCallback(async () => {
-    try {
-      setQuota(await invoke<DockQuota>('dock_quota'))
-      setFetchedAt(Date.now())
-    } catch (err) {
-      setQuota({ state: 'unavailable', message: String(err) })
-    }
-  }, [])
-
-  useEffect(() => {
-    void load()
-    const timer = window.setInterval(() => void load(), REFRESH_MS)
-    return () => window.clearInterval(timer)
-  }, [load])
+  // The same store the popover and the settings window use: it polls on the quota refresh
+  // cadence with the mac's backoff and jitter, rather than the fixed five minutes this window
+  // used to keep to itself, and it stops while nobody could see the rail.
+  useEffect(() => subscribeQuota(setQuota), [])
 
   // The settings window writes these, so the rail follows a switch, a resting provider or a
   // size the moment it is changed rather than at the next refresh.
@@ -442,7 +425,7 @@ export function Dock() {
   // up to the mac's five. The write reaches the settings window through the same event, so a
   // window open on the Capacity Dock section fills its switches in as the answer arrives.
   useEffect(() => {
-    if (!prefsLoaded || quota?.state !== 'ready') return
+    if (!prefsLoaded || quota.fetchedAt === null) return
     const connected = quota.providers.filter((p) => p.available).map((p) => p.id)
     const patch = autoSeed(prefs, connected)
     if (patch) void writeDockPrefs(patch).then(setPrefs)
@@ -451,7 +434,7 @@ export function Dock() {
   // Providers: the ones the CLI reports signed in, narrowed to the settings window's choice
   // when one has been made, else the preferred one as a dashed stand-in. An empty choice is
   // "nobody has picked yet", which is why it means everything rather than nothing.
-  const all = quota?.state === 'ready' ? quota.providers : []
+  const all = quota.providers
   const signedIn = all.filter((p) => p.available)
   const chosenIds = prefs.providers
   // A chosen provider stays on the rail after it drops out, as it does on the mac: a dashed
@@ -473,7 +456,7 @@ export function Dock() {
   const anchor = frame?.anchor ?? 'start'
   const ordered = anchor === 'end' ? [...displayed].reverse() : displayed
   orderedRef.current = ordered
-  const loading = quota === null
+  const loading = quota.fetchedAt === null && quota.error === null
 
   const expanded = isExpanded(interaction)
   useEffect(() => {
@@ -607,7 +590,7 @@ export function Dock() {
 
   useEffect(() => {
     const listeners = [
-      listen('codeburn://dock-refresh', () => void load()),
+      listen('codeburn://dock-refresh', () => void refreshQuota()),
       listen<PointerSnapshot>('codeburn://dock-pointer', (event) => applyPointer(event.payload)),
       listen<{ attachment: number; edge: Edge | null; frame?: DockFrame }>('codeburn://dock-drag', (event) => {
         setDrag({ attachment: event.payload.attachment, edge: event.payload.edge })
@@ -635,7 +618,7 @@ export function Dock() {
     return () => {
       listeners.forEach((p) => void p.then((unlisten) => unlisten()))
     }
-  }, [load, applyPointer, cancel, hideDetail])
+  }, [applyPointer, cancel, hideDetail])
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -892,7 +875,7 @@ export function Dock() {
               />
             </svg>
           ) : null}
-          <Detail m={m} provider={hoveredProvider} quota={quota} loading={loading} fetchedAt={fetchedAt} />
+          <Detail m={m} provider={hoveredProvider} quota={quota} loading={loading} fetchedAt={quota.fetchedAt} />
         </div>
       ) : null}
     </div>

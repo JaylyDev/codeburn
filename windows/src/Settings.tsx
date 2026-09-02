@@ -3,8 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 
-import { EMPTY_QUOTA, setQuotaCadence, subscribeQuota, summaryFor, type QuotaState } from './lib/quota'
-import { subscribeSettings } from './lib/appSettings'
+import { EMPTY_QUOTA, subscribeQuota, summaryFor, type QuotaState } from './lib/quota'
 import { ProviderGlyph } from './providerIcons'
 import { GeneralPane } from './settings/GeneralPane'
 import { ProviderPane } from './settings/ProviderPane'
@@ -39,8 +38,6 @@ export function Settings() {
   const [search, setSearch] = useState('')
 
   useEffect(() => subscribeQuota(setQuota), [])
-  // This window has its own copy of the quota store, so it needs the cadence too.
-  useEffect(() => subscribeSettings(next => setQuotaCadence(next.quotaCadenceSeconds)), [])
 
   // Where the tray item or the popover asked for. Taken once on mount, because an event
   // emitted while this webview was still loading would have had nobody to hear it.

@@ -14,7 +14,7 @@ import {
 } from './lib/appSettings'
 import { TRAY_BADGE_SUPPORTED } from './lib/platform'
 import { usageRefreshPlan } from './lib/refresh'
-import { EMPTY_QUOTA, refreshQuota, setQuotaCadence, subscribeQuota, worstSeverity, type QuotaState } from './lib/quota'
+import { EMPTY_QUOTA, refreshQuota, refreshQuotaIfDue, subscribeQuota, worstSeverity, type QuotaState } from './lib/quota'
 import { AgentTabStrip, ALL_PROVIDER, providerLabel, providerTabs } from './components/AgentTabStrip'
 import type { Provider } from './components/AgentTabStrip'
 import { ModelsSection } from './components/ModelsSection'
@@ -208,9 +208,18 @@ export function App() {
         !sameSelection(extra, key) && all.findIndex(other => sameSelection(other, extra)) === index,
     )
     for (const extra of extras) fetchKey(extra, quiet)
-    void refreshQuota()
+    // A usage tick may ride along with a quota poll the cadence has already earned, but it
+    // must not set the pace: one Refresh Now is a reader asking, a loop is not.
+    void refreshQuotaIfDue(false)
     await fetchKey(key, opts)
   }, [fetchKey])
+
+  /// Refresh Now, from the footer, the tray or an empty state. A reader asking is the one
+  /// thing that outranks the quota cadence, as the mac's force path does.
+  const userRefresh = useCallback(() => {
+    void refreshQuota()
+    refreshAll({ includeOptimize: true, showOverlay: true })
+  }, [refreshAll])
 
   /// The single source of truth for the CLI gate. Nothing else writes a "compatible"
   /// verdict: a payload that happens to parse does not prove the CLI is new enough, and a
@@ -291,10 +300,13 @@ export function App() {
   }, [selectionKeyValue, cliReady, fetchKey])
 
   useEffect(() => {
-    const unlistenRefresh = listen('codeburn://refresh', () => refreshAll({ includeOptimize: true, showOverlay: true }))
+    const unlistenRefresh = listen('codeburn://refresh', () => userRefresh())
     const unlistenShown = listen('codeburn://shown', () => {
       setPopoverVisible(true)
       readDailyBudget()
+      // The reader is looking at the bars now, so the quota gets an answer the cadence had
+      // not earned yet, down to the interactive floor.
+      void refreshQuotaIfDue(true)
       if (payloadCache.age(selection.current) > STALE_MS) {
         refreshAll({ includeOptimize: true, showOverlay: false })
       }
@@ -323,14 +335,13 @@ export function App() {
       unlistenBudget.then(fn => fn())
       unlistenCurrency.then(fn => fn())
     }
-  }, [refreshAll])
+  }, [refreshAll, userRefresh])
 
   // The one place the popover learns what the settings window changed. The theme and the
   // accent are applied here rather than only stored, so a change made over there lands on
   // this surface without a reload.
   useEffect(() => subscribeSettings(next => {
     setSettings(next)
-    setQuotaCadence(next.quotaCadenceSeconds)
     applyAccent(accentById(next.accent))
     applyTheme(next.theme === 'system' ? null : next.theme)
     setTheme(currentTheme())
@@ -594,7 +605,7 @@ export function App() {
             {isFilteredEmpty ? (
               <EmptyProviderState label={providerLabel(tabs, provider)} period={period} />
             ) : neverAnyData ? (
-              <NoDataState onRefresh={() => refreshAll({ includeOptimize: true, showOverlay: true })} />
+              <NoDataState onRefresh={userRefresh} />
             ) : (
               <>
                 <div className="insight-area">
@@ -661,7 +672,7 @@ export function App() {
         currency={currency}
         onCurrency={applyCurrency}
         loading={overlay}
-        onRefresh={() => refreshAll({ includeOptimize: true, showOverlay: true })}
+        onRefresh={userRefresh}
         onExport={format => openTerminal(['export', '-f', format])}
         onOpenReport={() => openTerminal(['report'])}
         onToggleTheme={toggleTheme}

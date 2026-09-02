@@ -12,6 +12,9 @@
 /// refresh in flight.
 
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+
+import { subscribeSettings } from './appSettings'
 
 export type Severity = 'normal' | 'warning' | 'critical' | 'danger'
 
@@ -139,6 +142,10 @@ const MAX_JITTER_MS = 5_000
 const MAX_BACKOFF_DOUBLINGS = 10
 /// Data older than this is described as stale, matching the mac's "as of" caption.
 const STALE_MS = 10 * 60_000
+/// interactiveQuotaRefreshFloorSeconds. The popover opening asks for a fresh answer whatever
+/// the cadence says, but never more often than this: otherwise a 30 s usage loop would drag
+/// the quota poll along behind it and the cadence setting would mean nothing.
+const INTERACTIVE_FLOOR_MS = 30_000
 
 export function backoffDelay(failureCount: number, cadenceMs: number, jitterUnit: number): number {
   if (cadenceMs <= 0) return 0
@@ -156,10 +163,16 @@ let timer: number | undefined
 let inFlight: Promise<void> | null = null
 let failures = 0
 let cadenceMs = DEFAULT_CADENCE_MS
+/// Set while the session is locked or the displays are off, from session.rs. A poll then only
+/// re-arms: nobody could see the answer, and it is a whole CLI run.
+let unattended = false
+let stopWatching: Array<() => void> = []
 
 /// The settings window's Quota Refresh picker, from SubscriptionRefreshCadence. Zero is
-/// Manual: the store then only answers Retry and the popover opening, and never polls.
-export function setQuotaCadence(seconds: number): void {
+/// Manual: the store then only answers Retry and the popover opening, and never polls. The
+/// store reads the setting itself rather than being told, because three windows run their own
+/// copy of it and a window that forgot to wire the cadence would poll at the default forever.
+function setCadence(seconds: number): void {
   const next = Math.max(0, seconds) * 1000
   if (next === cadenceMs) return
   cadenceMs = next
@@ -181,12 +194,35 @@ function publish(next: Partial<QuotaState>) {
 function schedule(delay: number) {
   window.clearTimeout(timer)
   if (cadenceMs === 0) return
-  timer = window.setTimeout(() => { void refreshQuota() }, delay)
+  timer = window.setTimeout(() => {
+    // The timer survives an unattended machine so the first cadence after the screens come
+    // back finds a fresh answer, but the spawn does not happen while nobody is there.
+    if (unattended) return schedule(cadenceMs)
+    void run()
+  }, delay)
+}
+
+/// Retry, Refresh Now, a key just pasted: the reader asked, so the cadence does not apply.
+export function refreshQuota(): Promise<void> {
+  return run()
+}
+
+/// A background usage tick or the popover opening. `interactive` is the popover: it gets an
+/// answer the cadence would not have earned yet, down to the interactive floor, which is what
+/// the mac's refreshLiveQuotaProgressForPopoverOpen does. A background tick only rides along
+/// with a poll the cadence has already earned, and never in Manual.
+export function refreshQuotaIfDue(interactive: boolean): Promise<void> {
+  const age = state.fetchedAt === null ? Infinity : Date.now() - state.fetchedAt
+  if (interactive) {
+    return age >= INTERACTIVE_FLOOR_MS ? run() : Promise.resolve()
+  }
+  if (cadenceMs === 0 || unattended) return Promise.resolve()
+  return age >= cadenceMs ? run() : Promise.resolve()
 }
 
 /// Single-flight: the strip, the warning row and the Plan insight all mount at once, and a
 /// CLI spawn each would be three Node processes for one answer.
-export async function refreshQuota(): Promise<void> {
+async function run(): Promise<void> {
   if (inFlight) return inFlight
   publish({ loading: true })
   inFlight = (async () => {
@@ -226,17 +262,31 @@ export async function refreshQuota(): Promise<void> {
 }
 
 /// Subscribing starts the poll and unsubscribing the last listener stops it, so a hidden
-/// popover costs nothing.
+/// popover costs nothing. The cadence and the machine's own state are watched for the same
+/// span, since neither matters while nobody is reading the store.
 export function subscribeQuota(listener: Listener): () => void {
   listeners.push(listener)
   listener(state)
   if (listeners.length === 1) {
-    if (state.fetchedAt === null) void refreshQuota()
+    stopWatching.push(subscribeSettings(next => setCadence(next.quotaCadenceSeconds)))
+    void listen<{ locked: boolean; displayOff: boolean }>('codeburn://system-state', event => {
+      unattended = event.payload.locked || event.payload.displayOff
+    }).then(fn => stopWatching.push(fn))
+    // The reading is as old as the sleep was long, so waking asks for a fresh one on the
+    // cadence rather than waiting out the rest of it.
+    void listen('codeburn://wake', () => {
+      unattended = false
+      void refreshQuotaIfDue(false)
+    }).then(fn => stopWatching.push(fn))
+    if (state.fetchedAt === null) void run()
     else schedule(Math.max(0, cadenceMs - (Date.now() - state.fetchedAt)))
   }
   return () => {
     listeners = listeners.filter(l => l !== listener)
-    if (listeners.length === 0) window.clearTimeout(timer)
+    if (listeners.length > 0) return
+    window.clearTimeout(timer)
+    for (const stop of stopWatching) stop()
+    stopWatching = []
   }
 }
 
