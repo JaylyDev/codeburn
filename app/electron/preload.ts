@@ -74,6 +74,11 @@ const bridge = {
   companionStatus: () => invoke('codeburn:companionStatus'),
   setMenuBarEnabled: (enabled: boolean) => invoke('codeburn:setMenuBarEnabled', enabled),
   setSidebarEnabled: (enabled: boolean) => invoke('codeburn:setSidebarEnabled', enabled),
+  // The tray app's own settings, in the two files it reads them from.
+  trayPrefs: () => invoke('codeburn:trayPrefs'),
+  setTrayAppPref: (patch: Record<string, unknown>) => invoke('codeburn:setTrayAppPref', patch),
+  setTrayDockPref: (patch: Record<string, unknown>) => invoke('codeburn:setTrayDockPref', patch),
+  setLaunchAtLogin: (enabled: boolean) => invoke('codeburn:setLaunchAtLogin', enabled),
   // Plugin management
   pluginList: () => invoke('codeburn:pluginList'),
   pluginInfo: (name: string) => invoke('codeburn:pluginInfo', name),

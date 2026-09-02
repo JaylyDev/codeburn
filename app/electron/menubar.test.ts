@@ -20,6 +20,7 @@ import {
   writeDockEnabled,
   type MenubarInstallResult,
 } from './menubar'
+import { readTrayFile } from './tray-settings'
 
 const VERSION = '0.9.23'
 const MSI_NAME = `CodeBurn.Menubar_${VERSION}_x64_en-US.msi`
@@ -511,6 +512,95 @@ describe('MenubarCompanion', () => {
     expect(status.sidebar).toBe(false)
     expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toEqual({ enabled: false })
     expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--reload-settings'] }])
+  })
+
+  // The tray app's own settings, which the two panes in the desktop app's Settings render.
+  describe('tray preferences', () => {
+    const settingsPath = () => join(home, '.config', 'codeburn', 'windows-settings.json')
+
+    function running(): MenubarCompanion {
+      stageMsi()
+      writeCompanionSettings(stateDir, { menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+      return new MenubarCompanion(deps())
+    }
+
+    it('reads both files and the Run value', async () => {
+      const companion = running()
+      mkdirSync(join(home, '.config', 'codeburn'), { recursive: true })
+      writeFileSync(settingsPath(), JSON.stringify({ metric: 'tokens', accent: 'green' }))
+      writeDockEnabled(true, home)
+      existingRunKey = `"${TRAY_EXE}"`
+
+      const prefs = await companion.trayPrefs()
+
+      expect(prefs.app).toMatchObject({ metric: 'tokens', accent: 'green', terminal: 'windowsTerminal' })
+      expect(prefs.dock).toMatchObject({ enabled: true, scale: 0.6 })
+      expect(prefs.launchAtLogin).toBe(true)
+    })
+
+    it('writes a setting and nudges the running tray app to re-read it', async () => {
+      const companion = running()
+
+      const prefs = await companion.setTrayAppPref({ metric: 'iconOnly' })
+
+      expect(JSON.parse(readFileSync(settingsPath(), 'utf8'))).toEqual({ metric: 'iconOnly' })
+      expect(prefs.app.metric).toBe('iconOnly')
+      expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--reload-settings'] }])
+    })
+
+    it('writes nothing and nudges nobody for a patch it will not accept', async () => {
+      const companion = running()
+
+      await companion.setTrayAppPref({ placement: { docked: 'left' } })
+
+      expect(launches).toEqual([])
+      expect(readTrayFile('app', home)).toEqual({})
+    })
+
+    it('keeps the rail placement while writing a dock setting', async () => {
+      const companion = running()
+      mkdirSync(join(home, '.config', 'codeburn'), { recursive: true })
+      writeFileSync(dockPrefsPath(home), JSON.stringify({ enabled: true, placement: { docked: 'right' } }))
+
+      await companion.setTrayDockPref({ scale: 1.1, theme: 'glass' })
+
+      expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toEqual({
+        enabled: true, placement: { docked: 'right' }, scale: 1.1, theme: 'glass',
+      })
+    })
+
+    it('moves the resting provider when it leaves the set', async () => {
+      const companion = running()
+      mkdirSync(join(home, '.config', 'codeburn'), { recursive: true })
+      writeFileSync(dockPrefsPath(home), JSON.stringify({ enabled: true, preferred: 'gemini' }))
+
+      await companion.setTrayDockPref({ providers: ['claude', 'codex'] })
+
+      expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toMatchObject({
+        providers: ['claude', 'codex'], preferred: 'claude', manualSelection: true,
+      })
+    })
+
+    // Showing the rail is the Sidebar switch under another name, so it takes the same path
+    // and keeps the rule that the rail cannot outlive the tray app.
+    it('routes the show switch through the Sidebar rule', async () => {
+      const companion = running()
+
+      const prefs = await companion.setTrayDockPref({ enabled: false })
+
+      expect(prefs.dock.enabled).toBe(false)
+      expect(companion.status().sidebar).toBe(false)
+    })
+
+    it('writes launch at login to the Run value this app owns', async () => {
+      const companion = running()
+
+      await companion.setLaunchAtLogin(true)
+      expect(regCalls).toEqual([runKeyArgs(true, TRAY_EXE)])
+
+      await companion.setLaunchAtLogin(false)
+      expect(regCalls[1]).toEqual(runKeyArgs(false, TRAY_EXE))
+    })
   })
 
   it('Sidebar off with the tray app off writes the preference and tells nobody', async () => {

@@ -686,6 +686,30 @@ export type CompanionStatus = {
   store: boolean
 }
 
+/** The tray app's own settings, from the two files it reads them from
+ *  (windows-settings.json, windows-dock.json) plus the HKCU Run value. */
+export type TrayPrefs = {
+  app: {
+    metric: string
+    menubarPeriod: string
+    accent: string
+    trayBadge: boolean
+    usageRefreshSeconds: number
+    quotaCadenceSeconds: number
+    terminal: string
+  }
+  dock: {
+    enabled: boolean
+    preferred: string | null
+    scale: number
+    theme: string
+    gaugeShape: string
+    providers: string[]
+    manualSelection: boolean
+  }
+  launchAtLogin: boolean
+}
+
 export interface CodeburnBridge {
   /** Subscribe to cold-start scan progress; returns an unsubscribe fn. */
   onProgress(cb: (event: ScanProgressEvent) => void): () => void
@@ -743,6 +767,11 @@ export interface CodeburnBridge {
   companionStatus?(): Promise<CompanionStatus>
   setMenuBarEnabled?(enabled: boolean): Promise<CompanionStatus>
   setSidebarEnabled?(enabled: boolean): Promise<CompanionStatus>
+  /** The tray app's own settings. Null when there is no tray app to have any. */
+  trayPrefs?(): Promise<TrayPrefs | null>
+  setTrayAppPref?(patch: Record<string, unknown>): Promise<TrayPrefs | null>
+  setTrayDockPref?(patch: Record<string, unknown>): Promise<TrayPrefs | null>
+  setLaunchAtLogin?(enabled: boolean): Promise<TrayPrefs | null>
   // Plugin management
   pluginList(): Promise<unknown>
   pluginInfo(name: string): Promise<unknown>

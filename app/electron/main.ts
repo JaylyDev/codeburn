@@ -238,7 +238,10 @@ type Deps = {
   /** Cached update-availability status; absent under tests unless injected. */
   getUpdateStatus?: () => Promise<UpdateStatus>
   /** The bundled tray app and Capacity Dock; absent off Windows and under tests. */
-  companion?: Pick<MenubarCompanion, 'status' | 'setMenuBarEnabled' | 'setSidebarEnabled'> | null
+  companion?: Pick<
+    MenubarCompanion,
+    'status' | 'setMenuBarEnabled' | 'setSidebarEnabled' | 'trayPrefs' | 'setTrayAppPref' | 'setTrayDockPref' | 'setLaunchAtLogin'
+  > | null
 }
 
 type Handler = (...args: any[]) => Promise<Envelope>
@@ -443,6 +446,15 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
       ({ ok: true, value: deps.companion ? await deps.companion.setMenuBarEnabled(Boolean(enabled)) : NO_COMPANION }),
     'codeburn:setSidebarEnabled': async (enabled?: boolean) =>
       ({ ok: true, value: deps.companion ? await deps.companion.setSidebarEnabled(Boolean(enabled)) : NO_COMPANION }),
+    // The tray app's own settings, which live in the files it reads them from. Every setter
+    // answers with the whole set, so the panes render what landed rather than what was sent.
+    'codeburn:trayPrefs': async () => ({ ok: true, value: deps.companion ? await deps.companion.trayPrefs() : null }),
+    'codeburn:setTrayAppPref': async (patch?: Record<string, unknown>) =>
+      ({ ok: true, value: deps.companion ? await deps.companion.setTrayAppPref(patch ?? {}) : null }),
+    'codeburn:setTrayDockPref': async (patch?: Record<string, unknown>) =>
+      ({ ok: true, value: deps.companion ? await deps.companion.setTrayDockPref(patch ?? {}) : null }),
+    'codeburn:setLaunchAtLogin': async (enabled?: boolean) =>
+      ({ ok: true, value: deps.companion ? await deps.companion.setLaunchAtLogin(Boolean(enabled)) : null }),
     // Plugin management reads (all return parsed JSON)
     'codeburn:pluginList': run(() => ['plugin', 'list', '--json']),
     'codeburn:pluginInfo': run((name: string) => ['plugin', 'info', vToken(name), '--json']),

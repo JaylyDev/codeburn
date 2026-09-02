@@ -31,6 +31,10 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import { spawnCliAction, type ActionResult } from './cli'
+import {
+  normalizedPreferred, parseTrayAppPrefs, parseTrayDockPrefs, patchTrayFile, readTrayFile,
+  sanitizeAppPatch, sanitizeDockPatch, type TrayAppPrefs, type TrayDockPrefs,
+} from './tray-settings'
 
 /** Env var the CLI's Windows installer reads; the source of truth is src/menubar-installer.ts. */
 export const BUNDLED_MSI_ENV = 'CODEBURN_MENUBAR_MSI'
@@ -267,6 +271,13 @@ function regQueryRunValue(env: NodeJS.ProcessEnv): Promise<string | null> {
 
 // The controller ---------------------------------------------------------------------------------
 
+/** What the two tray panes in the desktop app's Settings render from. */
+export type TrayPrefs = {
+  app: TrayAppPrefs
+  dock: TrayDockPrefs
+  launchAtLogin: boolean
+}
+
 export type CompanionStatus = {
   /** False on every platform but Windows, and on a Windows build with nothing staged. */
   supported: boolean
@@ -475,6 +486,74 @@ export class MenubarCompanion {
       this.launch(exePath, ['--reload-settings'])
     }
     return this.status()
+  }
+
+  // The tray app's own settings ------------------------------------------------------------
+
+  /** Everything the two tray panes render from, read straight out of the files the tray app
+   *  reads them from, so the panes and the tray app can never be showing different answers. */
+  async trayPrefs(): Promise<TrayPrefs> {
+    return {
+      app: parseTrayAppPrefs(readTrayFile('app', this.home)),
+      dock: parseTrayDockPrefs(readTrayFile('dock', this.home)),
+      launchAtLogin: (await this.existingRunKey()) !== null,
+    }
+  }
+
+  /** A setting the tray app keeps in `windows-settings.json`. Every other key in that file
+   *  is left alone, and the running tray app is told to re-read it. */
+  async setTrayAppPref(patch: Record<string, unknown>): Promise<TrayPrefs> {
+    const clean = sanitizeAppPatch(patch)
+    if (Object.keys(clean).length > 0) {
+      try {
+        patchTrayFile('app', clean, this.home)
+        await this.nudgeTray()
+      } catch (err) {
+        console.error('tray settings could not be saved:', err)
+      }
+    }
+    return this.trayPrefs()
+  }
+
+  /**
+   * A Capacity Dock setting. `enabled` is the Sidebar switch under another name, so it goes
+   * through the same path and keeps the rule that the rail cannot outlive the tray app.
+   * A provider set that no longer holds the resting provider moves it, as the rail would.
+   */
+  async setTrayDockPref(patch: Record<string, unknown>): Promise<TrayPrefs> {
+    if ('enabled' in patch) {
+      await this.setSidebarEnabled(patch.enabled === true)
+      return this.trayPrefs()
+    }
+    const clean = sanitizeDockPatch(patch)
+    if (Object.keys(clean).length > 0) {
+      try {
+        if (Array.isArray(clean.providers)) {
+          const current = parseTrayDockPrefs(readTrayFile('dock', this.home))
+          clean.preferred = normalizedPreferred(current.preferred, clean.providers as string[])
+        }
+        patchTrayFile('dock', clean, this.home)
+        await this.nudgeTray()
+      } catch (err) {
+        console.error('Capacity Dock settings could not be saved:', err)
+      }
+    }
+    return this.trayPrefs()
+  }
+
+  /** Launch at login is the one tray setting that is not in a file: it is the Run value, and
+   *  this app owns it, so the pane writes it here rather than through the tray app. */
+  async setLaunchAtLogin(enabled: boolean): Promise<TrayPrefs> {
+    await this.setRunKey(enabled)
+    return this.trayPrefs()
+  }
+
+  /** Makes a running tray app re-read both preference files and repaint. Nothing to do when
+   *  the switch is off or the executable is not there; the files are read at the next start. */
+  private async nudgeTray(): Promise<void> {
+    if (!this.settings.menuBar) return
+    const exePath = this.settings.trayExePath
+    if (exePath && this.exists(exePath)) this.launch(exePath, ['--reload-settings'])
   }
 
   private applyDockSetting(enabled: boolean): void {
