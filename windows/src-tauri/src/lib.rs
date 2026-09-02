@@ -37,6 +37,8 @@ use tauri::{
 static DOCK_MENU_ITEM: std::sync::OnceLock<CheckMenuItem<tauri::Wry>> = std::sync::OnceLock::new();
 #[cfg(not(target_os = "linux"))]
 static USAGE_MENU_ITEM: std::sync::OnceLock<MenuItem<tauri::Wry>> = std::sync::OnceLock::new();
+#[cfg(not(target_os = "linux"))]
+static THEME_MENU_ITEM: std::sync::OnceLock<MenuItem<tauri::Wry>> = std::sync::OnceLock::new();
 
 use crate::cli::CodeburnCli;
 use crate::config::CurrencyConfig;
@@ -209,7 +211,13 @@ fn build_tray_tauri(app: &AppHandle) -> tauri::Result<()> {
     let usage = MenuItem::with_id(app, "usage", "Today", false, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", "Open CodeBurn", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
-    let theme = MenuItem::with_id(app, "toggle_theme", "Toggle Dark/Light", true, None::<&str>)?;
+    let theme = MenuItem::with_id(
+        app,
+        "toggle_theme",
+        theme_menu_text(&theme_choice()),
+        true,
+        None::<&str>,
+    )?;
     let settings = MenuItem::with_id(app, "settings", "Settings...", true, None::<&str>)?;
     let dock_settings = MenuItem::with_id(
         app,
@@ -252,10 +260,15 @@ fn build_tray_tauri(app: &AppHandle) -> tauri::Result<()> {
     // checkmark in step with the persisted state and the usage row in step with the payload.
     let _ = DOCK_MENU_ITEM.set(capacity_dock);
     let _ = USAGE_MENU_ITEM.set(usage);
+    let _ = THEME_MENU_ITEM.set(theme);
 
     tray.set_menu(Some(menu.clone()))?;
     tray.set_show_menu_on_left_click(false)?;
     let _ = tray.set_tooltip(Some("CodeBurn"));
+    // A tray's menu handler is registered globally, not against that tray, so this one
+    // answers for both icons and the badge below must not register a second copy: two
+    // copies ran every item twice, which skipped a step of the theme cycle and left the
+    // Capacity Dock item toggling itself back.
     tray.on_menu_event(on_tray_menu_event);
     tray.on_tray_icon_event(on_tray_icon_event);
 
@@ -271,7 +284,6 @@ fn build_tray_tauri(app: &AppHandle) -> tauri::Result<()> {
         .tooltip("CodeBurn")
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .on_menu_event(on_tray_menu_event)
         .on_tray_icon_event(on_tray_icon_event)
         .build(app)?
         .set_visible(false)?;
@@ -292,11 +304,7 @@ fn on_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                 let _ = window.emit("codeburn://refresh", ());
             }
         }
-        "toggle_theme" => {
-            if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
-                let _ = window.emit("codeburn://toggle-theme", ());
-            }
-        }
+        "toggle_theme" => cycle_theme(app),
         "toggle_dock" => set_dock_enabled(app, !dock::is_enabled()),
         // Deep links into the settings window: General, General scrolled to its Capacity
         // Dock section, and About, exactly as the mac's three menu items land.
@@ -495,6 +503,64 @@ fn apply_tray_tint(app: &AppHandle, tint: Option<[u8; 3]>) -> Result<(), String>
     let _ = (app, tint);
     Ok(())
 }
+
+/// System, then Light, then Dark, then back. The mac has no counterpart: its windows follow
+/// the system appearance and offer no choice at all.
+fn next_theme(current: &str) -> &'static str {
+    match current {
+        "light" => "dark",
+        "dark" => "system",
+        _ => "light",
+    }
+}
+
+/// The item names the state it moves to rather than the one it is in, because a menu item
+/// reads as a verb.
+fn theme_menu_text(current: &str) -> String {
+    match next_theme(current) {
+        "light" => "Switch to Light Theme".into(),
+        "dark" => "Switch to Dark Theme".into(),
+        _ => "Switch to System Theme".into(),
+    }
+}
+
+fn theme_choice() -> String {
+    settings::read()
+        .get("theme")
+        .and_then(serde_json::Value::as_str)
+        .filter(|choice| matches!(*choice, "system" | "light" | "dark"))
+        .unwrap_or("system")
+        .to_owned()
+}
+
+/// Writing the preference rather than asking the popover to flip its own is what makes the
+/// item work with no popover on screen: every window renders from the broadcast.
+fn cycle_theme(app: &AppHandle) {
+    let mut patch = serde_json::Map::new();
+    patch.insert(
+        "theme".into(),
+        serde_json::json!(next_theme(&theme_choice())),
+    );
+    match settings::patch(patch) {
+        Ok(merged) => {
+            settings::broadcast(app, &merged);
+            sync_theme_menu_item();
+        }
+        Err(err) => eprintln!("codeburn: failed to persist the theme: {err}"),
+    }
+}
+
+/// Keeps the item honest when the theme changed somewhere else: the popover's More menu or
+/// the settings window.
+#[cfg(not(target_os = "linux"))]
+pub fn sync_theme_menu_item() {
+    if let Some(item) = THEME_MENU_ITEM.get() {
+        let _ = item.set_text(theme_menu_text(&theme_choice()));
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn sync_theme_menu_item() {}
 
 #[cfg(not(target_os = "linux"))]
 fn set_tray_usage_text(text: &str) {
@@ -1005,6 +1071,7 @@ mod commands {
     ) -> Result<Value, String> {
         let merged = crate::settings::patch(patch).map_err(|e| e.to_string())?;
         crate::settings::broadcast(&app, &merged);
+        crate::sync_theme_menu_item();
         Ok(Value::Object(merged))
     }
 

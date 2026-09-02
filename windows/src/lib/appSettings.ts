@@ -47,6 +47,21 @@ export type MenubarScope = 'local' | 'combined'
 
 export type ThemeChoice = 'system' | 'light' | 'dark'
 
+/// System, then Light, then Dark, then back. The tray item and the popover's More menu both
+/// step through this, and both name the state they move to rather than the one they are in.
+/// Kept in step by hand with `next_theme` in src-tauri/src/lib.rs, which the tray reads
+/// before any webview exists.
+export function nextTheme(current: ThemeChoice): ThemeChoice {
+  return current === 'light' ? 'dark' : current === 'dark' ? 'system' : 'light'
+}
+
+export function themeCycleLabel(current: ThemeChoice): string {
+  const next = nextTheme(current)
+  if (next === 'light') return 'Switch to Light Theme'
+  if (next === 'dark') return 'Switch to Dark Theme'
+  return 'Switch to System Theme'
+}
+
 /// UsageRefreshCadence. Auto is the adaptive default, manual never auto-spawns.
 export const USAGE_CADENCES: Array<{ id: number; label: string }> = [
   // The mac's label promises "less on battery", which is the adaptive refresh that comes

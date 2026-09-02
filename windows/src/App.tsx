@@ -7,9 +7,9 @@ import type { CurrencyState } from './lib/currency'
 import { USD, formatCurrency, formatTokens, plural, trayBadgeText } from './lib/currency'
 import { PayloadCache, sameSelection, selectionKey, type Selection } from './lib/cache'
 import { relativePast } from './lib/dates'
-import { applyTheme, currentTheme, readSetting, writeSetting } from './lib/settings'
+import { applyTheme, readSetting, writeSetting } from './lib/settings'
 import {
-  DEFAULT_SETTINGS, MENUBAR_PERIODS, MENUBAR_SUFFIX, cacheThemeAndAccent, subscribeSettings,
+  DEFAULT_SETTINGS, MENUBAR_PERIODS, MENUBAR_SUFFIX, cacheThemeAndAccent, nextTheme, subscribeSettings, themeCycleLabel,
   writeSettings, type AppSettings, type ThemeChoice,
 } from './lib/appSettings'
 import { TRAY_BADGE_SUPPORTED } from './lib/platform'
@@ -122,7 +122,6 @@ export function App() {
   const [cliChecking, setCliChecking] = useState(false)
   const [version, setVersion] = useState('')
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
-  const [theme, setTheme] = useState(() => currentTheme())
   const [quota, setQuota] = useState<QuotaState>(EMPTY_QUOTA)
   // The window starts hidden and is shown by a tray click, which emits `codeburn://shown`.
   const [popoverVisible, setPopoverVisible] = useState(false)
@@ -321,7 +320,6 @@ export function App() {
       if (cadence.current === 0) return
       refreshAll({ includeOptimize: false, showOverlay: false })
     })
-    const unlistenTheme = listen('codeburn://toggle-theme', () => toggleTheme())
     const unlistenBudget = listen<Budgets>('codeburn://budget-changed', event => {
       if (event.payload) setBudgets(event.payload)
     })
@@ -333,7 +331,6 @@ export function App() {
       unlistenShown.then(fn => fn())
       unlistenHidden.then(fn => fn())
       unlistenWake.then(fn => fn())
-      unlistenTheme.then(fn => fn())
       unlistenBudget.then(fn => fn())
       unlistenCurrency.then(fn => fn())
     }
@@ -346,7 +343,6 @@ export function App() {
     setSettings(next)
     applyAccent(accentById(next.accent))
     applyTheme(next.theme === 'system' ? null : next.theme)
-    setTheme(currentTheme())
     cacheThemeAndAccent(next)
   }), [])
 
@@ -392,15 +388,6 @@ export function App() {
   // The quota store polls only while something is watching it, so it starts here and stops
   // with the page. A manual Refresh asks it for a fresh answer too.
   useEffect(() => subscribeQuota(setQuota), [])
-
-  // The stored theme is applied by the settings subscription; this only follows the system
-  // while the choice is System.
-  useEffect(() => {
-    const media = window.matchMedia('(prefers-color-scheme: dark)')
-    const onChange = () => setTheme(currentTheme())
-    media.addEventListener('change', onChange)
-    return () => media.removeEventListener('change', onChange)
-  }, [])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -473,12 +460,11 @@ export function App() {
 
   const chooseTheme = (choice: ThemeChoice) => {
     applyTheme(choice === 'system' ? null : choice)
-    setTheme(currentTheme())
     void writeSettings({ theme: choice })
   }
 
-  const toggleTheme = () => {
-    chooseTheme(currentTheme() === 'dark' ? 'light' : 'dark')
+  const cycleTheme = () => {
+    chooseTheme(nextTheme(settings.theme))
   }
 
   const setTrayBadgePref = (on: boolean) => {
@@ -677,9 +663,9 @@ export function App() {
         onRefresh={userRefresh}
         onExport={format => openTerminal(['export', '-f', format])}
         onOpenReport={() => openTerminal(['report'])}
-        onToggleTheme={toggleTheme}
+        onToggleTheme={cycleTheme}
         onQuit={() => invoke('quit_app').catch(() => {})}
-        themeLabel={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+        themeLabel={themeCycleLabel(settings.theme)}
         trayBadge={trayBadge}
         onToggleTrayBadge={() => setTrayBadgePref(!trayBadge)}
         onOpenSettings={openSettingsWindow}
