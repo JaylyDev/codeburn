@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod dock;
 mod fx;
+mod glance;
 mod plan;
 mod refresh;
 mod session;
@@ -61,6 +62,10 @@ pub struct AppState {
     pub config: Mutex<CurrencyConfig>,
     pub fx: FxCache,
     pub plan: plan::PlanClient,
+    /// The Capacity Dock's slice of the last payload. It is kept here because the dock is a
+    /// window with no payload of its own, and a second CLI run to give it one would double
+    /// the cost of every refresh.
+    pub glance: glance::GlanceCache,
 }
 
 /// What a second launch is asking the running app to do. An app with no window of its own
@@ -120,6 +125,7 @@ pub fn run() {
                 config: Mutex::new(CurrencyConfig::load_or_default()),
                 fx: FxCache::new(),
                 plan: plan::PlanClient::new(),
+                glance: glance::GlanceCache::new(),
             });
 
             #[cfg(all(debug_assertions, target_os = "windows"))]
@@ -190,6 +196,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::fetch_payload,
+            commands::dock_glance,
             commands::cli_status,
             commands::currency,
             commands::set_currency,
@@ -814,6 +821,7 @@ mod commands {
 
     #[tauri::command]
     pub async fn fetch_payload(
+        app: AppHandle,
         period: String,
         provider: String,
         days: Vec<String>,
@@ -837,7 +845,22 @@ mod commands {
         // The anchor for the unchanged-roots guard is taken after an answer, never before
         // one: a fetch that failed must not make a later unchanged tick look successful.
         crate::usage_guard::record_success();
+        // The dock draws part of this answer and has no way of its own to ask for it. Only a
+        // glance that actually moved is broadcast, so a poll that found the same sessions and
+        // the same totals costs the dock no render.
+        let is_today = crate::glance::is_today_key(&period, &provider, &days, &scope);
+        if let Some(glance) = state.glance.record(&payload, is_today) {
+            let _ = app.emit("codeburn://glance", &glance);
+        }
         Ok(payload)
+    }
+
+    /// What the Capacity Dock's glance bubble draws, from whatever the last payload carried.
+    /// `None` means nothing has been fetched yet in this run, which is the dock's cue to ask
+    /// for one payload itself rather than sit empty until a popover is opened.
+    #[tauri::command]
+    pub fn dock_glance(state: State<'_, AppState>) -> Option<crate::glance::Glance> {
+        state.glance.snapshot()
     }
 
     /// Re-resolves the CLI each call so a freshly installed `codeburn` is picked up
