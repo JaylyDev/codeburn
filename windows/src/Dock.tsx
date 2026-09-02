@@ -385,6 +385,8 @@ export function Dock() {
   const [detailPhase, setDetailPhase] = useState<DetailPhase>('entering')
   const [detailHeight, setDetailHeight] = useState(0)
   const [frame, setFrame] = useState<DockFrame | null>(null)
+  // The scale the current frame was laid out for; see the metrics comment below.
+  const [layoutScale, setLayoutScale] = useState(DEFAULT_DOCK_PREFS.scale)
   // Attachment while dragging comes straight from the cursor poll; otherwise it eases. The
   // edge it refers to matters: a flare only makes sense on an edge of the rail's own
   // orientation, so nearing a perpendicular edge shows the loose pill until the drop.
@@ -415,11 +417,16 @@ export function Dock() {
   useEffect(() => {
     void loadDockPrefs().then((stored) => {
       setPrefs(stored)
+      setLayoutScale(stored.scale)
       setPrefsLoaded(true)
     })
     return onDockPrefsChanged(setPrefs)
   }, [])
-  const m = metrics(prefs.scale)
+  // The size the rail is drawn at follows the frame rather than the preference: a rail drawn
+  // at a size the window it sits in was not laid out for hangs off its own edge for as long
+  // as it takes a round trip to correct. Rust sends the new size and the new frame in one
+  // event and they are applied in one render, below.
+  const m = metrics(layoutScale)
 
   // Until the user edits the set in the settings window, the dock follows what is connected,
   // up to the mac's five. The write reaches the settings window through the same event, so a
@@ -597,6 +604,12 @@ export function Dock() {
         // A rail that has just turned is in a different window, painting a different shape.
         if (event.payload.frame) setFrame(event.payload.frame)
       }),
+      listen<{ scale: number; frame: DockFrame }>('codeburn://dock-metrics', (event) => {
+        // One render for both, so the rail is never drawn at a size its window was not laid
+        // out for. No glide: the rail is changing size in place, not moving home.
+        setFrame(event.payload.frame)
+        setLayoutScale(event.payload.scale)
+      }),
       listen<{ from: Rect; frame: DockFrame }>('codeburn://dock-settled', (event) => {
         const { from, frame: next } = event.payload
         setFrame(next)
@@ -747,6 +760,17 @@ export function Dock() {
   const railW = vertical ? cross : bodyLength
   const railH = vertical ? bodyLength : cross
   const shape = railPath(m, edge, cross, bodyLength, attachment)
+  // A docked rail's outer edge is the window's own edge, because the window is sized from the
+  // rail. Pinning it there with `right`/`bottom` rather than `left`/`top` is what keeps it
+  // flush while the window is resized underneath it: a size change moves the window before
+  // the page can repaint, and a left-anchored rail rides that move away from its edge for a
+  // frame, which reads as the rail coming loose.
+  const railPosition: CSSProperties =
+    frame?.docked && frame.edge === 'right'
+      ? { right: -glideDx, top: railTop }
+      : frame?.docked && frame.edge === 'bottom'
+        ? { left: railLeft, bottom: -glideDy }
+        : { left: railLeft, top: railTop }
 
   const hoveredProvider = hovered ? (ordered.find((p) => p.id === hovered) ?? null) : null
   const detailFrame = frame?.detail ?? null
@@ -783,7 +807,7 @@ export function Dock() {
     >
       <div
         className={`dock-rail${interaction.dragging ? ' is-dragging' : ''}`}
-        style={{ left: railLeft, top: railTop, width: railW, height: railH, clipPath: `path('${shape}')` }}
+        style={{ ...railPosition, width: railW, height: railH, clipPath: `path('${shape}')` }}
         onMouseEnter={() => domPointer({ railHovered: true })}
         onMouseLeave={() => domPointer({ railHovered: false, row: null })}
         onPointerDown={onPointerDown}

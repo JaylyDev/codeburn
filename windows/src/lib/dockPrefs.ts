@@ -76,12 +76,31 @@ export async function loadDockPrefs(): Promise<DockPrefs> {
   }
 }
 
-export async function writeDockPrefs(patch: Partial<DockPrefs>): Promise<DockPrefs> {
-  try {
-    return parseDockPrefs(await invoke<Record<string, unknown>>('set_dock_prefs', { patch }) ?? {})
-  } catch {
-    return loadDockPrefs()
+/// One write at a time. The command is async on the Rust side, so two writes started together
+/// are two tasks that can finish in either order, and a dragged size slider starts one every
+/// few pixels: the last value the reader chose could be overwritten by an earlier one, leaving
+/// the rail at a size the slider does not show. Writes queue behind each other, and a patch
+/// that is still waiting is merged into the one ahead of it rather than costing another round
+/// trip, which is also what keeps the rail moving smoothly under the slider.
+let writeChain: Promise<DockPrefs> = Promise.resolve(DEFAULT_DOCK_PREFS)
+let pending: Partial<DockPrefs> | null = null
+
+export function writeDockPrefs(patch: Partial<DockPrefs>): Promise<DockPrefs> {
+  if (pending) {
+    Object.assign(pending, patch)
+    return writeChain
   }
+  const queued: Partial<DockPrefs> = { ...patch }
+  pending = queued
+  writeChain = writeChain.then(async () => {
+    pending = null
+    try {
+      return parseDockPrefs(await invoke<Record<string, unknown>>('set_dock_prefs', { patch: queued }) ?? {})
+    } catch {
+      return loadDockPrefs()
+    }
+  })
+  return writeChain
 }
 
 export function onDockPrefsChanged(listener: (prefs: DockPrefs) => void): () => void {

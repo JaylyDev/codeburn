@@ -69,12 +69,7 @@ impl Metrics {
     }
 
     fn from_prefs() -> Metrics {
-        Metrics::for_scale(
-            read_state()
-                .get("scale")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(MIN_SCALE),
-        )
+        Metrics::for_scale(prefs_scale())
     }
 }
 
@@ -591,6 +586,15 @@ fn lock() -> std::sync::MutexGuard<'static, DockState> {
     STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// A size change: the frame the page must paint into, and the scale it was computed for, so
+/// the page applies both at once.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MetricsEvent {
+    scale: f64,
+    frame: DockFrame,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SettledEvent {
@@ -1090,10 +1094,17 @@ pub fn show(app: &AppHandle) -> tauri::Result<()> {
 }
 
 /// Re-reads the preferences the geometry depends on and brings the window in line with them.
-/// The page re-renders from the same event, but the window it paints into is sized here.
+///
+/// The new frame goes to the page in the same breath, carrying the scale it was computed for.
+/// The page paints inside the window it was last handed, so a window resized here while the
+/// page still holds the old frame draws the rail at the old offsets in the new window, which
+/// on a right-docked rail is a rail hanging off its own edge. One event carrying both the
+/// size and the frame lets the page change both in a single render, instead of drifting
+/// through a round trip's worth of mismatched paints.
 pub fn prefs_changed(app: &AppHandle) {
     let Some(window) = app.get_webview_window(DOCK_LABEL) else { return };
-    let metrics = Metrics::from_prefs();
+    let scale = prefs_scale();
+    let metrics = Metrics::for_scale(scale);
     {
         let mut state = lock();
         if state.metrics == metrics {
@@ -1101,7 +1112,21 @@ pub fn prefs_changed(app: &AppHandle) {
         }
         state.metrics = metrics;
     }
-    relayout(&window);
+    let Some(frame) = relayout(&window) else { return };
+    let _ = app.emit_to(
+        DOCK_LABEL,
+        "codeburn://dock-metrics",
+        MetricsEvent { scale, frame },
+    );
+}
+
+fn prefs_scale() -> f64 {
+    read_state()
+        .get("scale")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|scale| scale.is_finite())
+        .map(|scale| scale.clamp(MIN_SCALE, MAX_SCALE))
+        .unwrap_or(MIN_SCALE)
 }
 
 /// Destroying rather than hiding is deliberate: a hidden webview keeps rendering, which is
