@@ -198,6 +198,98 @@ struct GrokBuildSubscriptionServiceTests {
         #expect(result.planLabel == "SuperGrok")
     }
 
+    @Test("an active unified-billing window with no percent field is 0% used")
+    func treatsOmittedPercentInActivePeriodAsZero() async throws {
+        let credential = GrokBuildCredentialStore.Credential(
+            accessToken: "synthetic-oidc-token",
+            authMode: "oidc",
+            expiresAt: nil
+        )
+        let deps = GrokBuildSubscriptionService.Deps(
+            loadCredential: { credential },
+            fetch: { request in
+                let body: String
+                switch request.url?.path {
+                case "/v1/billing":
+                    body = #"""
+                    {"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-09-02T19:53:44.968223+00:00","end":"2026-09-09T19:53:44.968223+00:00"},"onDemandCap":{"val":0},"onDemandUsed":{"val":0},"isUnifiedBillingUser":true,"prepaidBalance":{"val":0},"billingPeriodEnd":"2026-09-09T19:53:44.968223+00:00"}}
+                    """#
+                case "/v1/settings":
+                    body = #"{"subscription_tier_display":"SuperGrok Heavy"}"#
+                default:
+                    Issue.record("Unexpected Grok endpoint")
+                    body = "{}"
+                }
+                return (
+                    Data(body.utf8),
+                    HTTPURLResponse(
+                        url: request.url!,
+                        statusCode: 200,
+                        httpVersion: nil,
+                        headerFields: nil
+                    )!
+                )
+            }
+        )
+
+        let result = try await GrokBuildSubscriptionService.refresh(
+            deps: deps,
+            now: ISO8601DateFormatter().date(from: "2026-09-02T21:00:00Z")!
+        )
+
+        #expect(result.connection == .connected)
+        #expect(result.primary?.percent == 0)
+        #expect(result.primary?.label == "Weekly")
+        #expect(result.primary?.resetsAt != nil)
+        #expect(result.details.count == 1)
+        #expect(result.planLabel == "SuperGrok Heavy")
+        #expect(result.footerLines == ["Source: Grok Build"])
+    }
+
+    @Test("an expired unified-billing window without a percent is not invented as 0%")
+    func doesNotInventZeroOutsideActivePeriod() async throws {
+        let credential = GrokBuildCredentialStore.Credential(
+            accessToken: "synthetic-oidc-token",
+            authMode: "oidc",
+            expiresAt: nil
+        )
+        let deps = GrokBuildSubscriptionService.Deps(
+            loadCredential: { credential },
+            fetch: { request in
+                let body: String
+                switch request.url?.path {
+                case "/v1/billing":
+                    body = #"""
+                    {"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-08-26T19:53:44.968223+00:00","end":"2026-09-02T19:53:44.968223+00:00"},"onDemandCap":{"val":0},"onDemandUsed":{"val":0},"isUnifiedBillingUser":true}}
+                    """#
+                case "/v1/settings":
+                    body = #"{"subscription_tier_display":"SuperGrok Heavy"}"#
+                default:
+                    Issue.record("Unexpected Grok endpoint")
+                    body = "{}"
+                }
+                return (
+                    Data(body.utf8),
+                    HTTPURLResponse(
+                        url: request.url!,
+                        statusCode: 200,
+                        httpVersion: nil,
+                        headerFields: nil
+                    )!
+                )
+            }
+        )
+
+        let result = try await GrokBuildSubscriptionService.refresh(
+            deps: deps,
+            now: ISO8601DateFormatter().date(from: "2026-09-02T21:00:00Z")!
+        )
+
+        #expect(result.connection == .connected)
+        #expect(result.primary == nil)
+        #expect(result.planLabel == "SuperGrok Heavy")
+    }
+
     @Test("cancellation during the optional plan request cancels the refresh")
     func cancellationWinsDuringPlanFetch() async throws {
         let credential = GrokBuildCredentialStore.Credential(
