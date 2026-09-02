@@ -250,7 +250,7 @@ export function quotaSummaries(quota: QuotaState): QuotaSummary[] {
 
 /// Every connected provider at or over the warning threshold, worst window first. The mac
 /// composes the same list for the header row and the menubar flame tint.
-export function quotaWarnings(quota: QuotaState, thresholdPct = 50): Array<{ name: string; percent: number }> {
+export function quotaWarnings(quota: QuotaState, thresholdPct = 70): Array<{ name: string; percent: number }> {
   return quotaSummaries(quota)
     .filter(s => s.connection !== 'disconnected' && s.connection !== 'terminalFailure')
     .map(s => ({ name: s.name, percent: s.worst?.usedPct ?? 0 }))
