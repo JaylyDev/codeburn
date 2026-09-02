@@ -14,6 +14,9 @@ export type MenubarPayload = {
     cacheHitPercent: number
     topActivities: Activity[]
     topModels: Model[]
+    /// Counterfactual spend avoided by routing calls to a local model, from the
+    /// mappings `codeburn model-savings` keeps. Absent on older CLI payloads.
+    localModelSavings?: LocalModelSavings
     providers: Record<string, number>
     providerDetails?: Array<{
       id: string
@@ -41,6 +44,13 @@ export type Activity = {
 export type Model = {
   name: string
   cost: number
+  /// What this model would have cost at its paid baseline. Zero for every paid model.
+  savingsUSD?: number
+  calls: number
+}
+
+export type LocalModelSavings = {
+  totalUSD: number
   calls: number
 }
 

@@ -34,6 +34,15 @@ export function ChevronRight(p: IconProps) {
   return <Svg {...p}><path d="M6 3.5 10.5 8 6 12.5" /></Svg>
 }
 
+export function LeafIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <path d="M13.5 2.5c0 6.1-3.1 9.5-7.3 9.5A3.7 3.7 0 0 1 2.5 8.3c0-4 3.6-5.8 11-5.8z" fill="currentColor" stroke="none" />
+      <path d="M11 5 3.5 13" />
+    </Svg>
+  )
+}
+
 export function ChevronLeft(p: IconProps) {
   return <Svg {...p}><path d="M10 3.5 5.5 8 10 12.5" /></Svg>
 }

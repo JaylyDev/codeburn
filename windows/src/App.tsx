@@ -83,6 +83,7 @@ export function App() {
   // The window starts hidden and is shown by a tray click, which emits `codeburn://shown`.
   const [popoverVisible, setPopoverVisible] = useState(false)
   const [accent, setAccent] = useState<AccentPreset>(savedAccent)
+  const [dailyBudget, setDailyBudget] = useState<number | null>(null)
   const [themeChoice, setThemeChoice] = useState<ThemeChoice>(() => {
     const saved = readSetting('theme')
     return saved === 'dark' || saved === 'light' ? saved : 'system'
@@ -197,6 +198,7 @@ export function App() {
     const unlistenRefresh = listen('codeburn://refresh', () => refreshAll({ includeOptimize: true, showOverlay: true }))
     const unlistenShown = listen('codeburn://shown', () => {
       setPopoverVisible(true)
+      readDailyBudget()
       if (payloadCache.age(selection.current) > STALE_MS) {
         refreshAll({ includeOptimize: true, showOverlay: false })
       }
@@ -218,6 +220,13 @@ export function App() {
       unlistenPanel.then(fn => fn())
     }
   }, [refreshAll])
+
+  // The limit lives in the CLI config, which package C's settings window will write, so
+  // it is re-read whenever the popover comes back rather than cached for the session.
+  const readDailyBudget = () => {
+    invoke<number | null>('daily_budget').then(setDailyBudget).catch(() => {})
+  }
+  useEffect(readDailyBudget, [])
 
   // The quota store polls only while something is watching it, so it starts here and stops
   // with the page. A manual Refresh asks it for a fresh answer too.
@@ -375,6 +384,7 @@ export function App() {
               currency={currency}
               periodLabel={daySelectionLabel(days) ?? PERIOD_LABELS[period]}
               isToday={days.length === 0 && period === 'today'}
+              dailyBudget={dailyBudget}
             />
             <PeriodTabs
               selected={period}

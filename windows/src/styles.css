@@ -549,6 +549,18 @@ code { font-family: var(--font-mono); }
   gap: 2px;
   font-variant-numeric: tabular-nums;
 }
+/* Two one-line notes under the hero figure: the budget alert and the local-model
+   saving. Both sit outside the amount so neither reads as part of it. */
+.hero-note {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  font-size: 11px;
+  font-weight: 500;
+}
+.hero-note-warn { color: var(--sev-critical-ink); }
+.hero-note-saved { color: var(--sev-normal-ink); }
 .hero-calls { font-size: 11px; color: var(--label-2); }
 .hero-sessions { font-size: 10.5px; color: var(--label-3); }
 
@@ -1113,6 +1125,15 @@ code { font-family: var(--font-mono); }
   color: var(--label);
 }
 .row-count { font-size: 11px; text-align: right; color: var(--label-2); }
+/* Counterfactual, not spend: green and never in the bar. */
+.row-saved {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: -0.2px;
+  text-align: right;
+  color: var(--label-2);
+}
+.row-saved-on { color: var(--sev-normal-ink); }
 .row-oneshot { font-size: 10.5px; text-align: right; color: var(--label-2); }
 
 .tokens-line {

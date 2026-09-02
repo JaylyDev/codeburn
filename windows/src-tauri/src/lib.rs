@@ -136,6 +136,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::fetch_payload,
             commands::cli_status,
+            commands::daily_budget,
             commands::set_currency,
             commands::open_terminal_command,
             commands::open_claude_login,
@@ -645,6 +646,13 @@ mod commands {
         cli.fetch_menubar_payload(&period, &provider, &days, include_optimize)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Today spend limit from the CLI config, so the hero can warn on the same number the
+    /// tray flame is tinted by. `None` means the alert is off.
+    #[tauri::command]
+    pub fn daily_budget() -> Option<f64> {
+        crate::tray_status::daily_budget()
     }
 
     /// Re-resolves the CLI each call so a freshly installed `codeburn` is picked up
