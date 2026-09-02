@@ -13,6 +13,8 @@ on:
       - app/**
       - src/**
       - scripts/**
+      # The installer now builds and ships the tray app, so a tray change must rebuild it.
+      - windows/**
       - package.json
       - package-lock.json
   push:

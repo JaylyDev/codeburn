@@ -7,8 +7,15 @@ on:
       - .github/workflows/build-windows-store.yml
       - app/**
       - src/**
+      # The Store package ships the tray exe, so a tray change must rebuild it.
+      - windows/**
       - package.json
       - package-lock.json
+  # A desktop release tag builds the Store package beside the NSIS installer, so both
+  # artifacts for a version come from one commit.
+  push:
+    tags:
+      - 'desktop-v*'
 
 permissions:
   contents: read
