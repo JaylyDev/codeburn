@@ -44,6 +44,30 @@ jobs:
         timeout-minutes: 5
         run: npm run test:locks
 
+  # The CLI is shipped to macOS and Windows users, and the Windows tray app depends on it
+  # there. One run per platform on the newest Node 22, without the serial lock suite, which
+  # is Linux-tuned. The Windows run uses three workers: the suite spawns the CLI through tsx
+  # often, and a Windows runner falls over under the default worker count.
+  test-platforms:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Test suite
+        run: npm test -- --maxWorkers=3
+
   desktop:
     runs-on: ubuntu-latest
     timeout-minutes: 15
