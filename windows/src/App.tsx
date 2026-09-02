@@ -13,7 +13,7 @@ import {
   writeSettings, type AppSettings, type ThemeChoice,
 } from './lib/appSettings'
 import { TRAY_BADGE_SUPPORTED } from './lib/platform'
-import { EMPTY_QUOTA, refreshQuota, subscribeQuota, worstSeverity, type QuotaState } from './lib/quota'
+import { EMPTY_QUOTA, refreshQuota, setQuotaCadence, subscribeQuota, worstSeverity, type QuotaState } from './lib/quota'
 import { AgentTabStrip, ALL_PROVIDER, providerLabel, providerTabs } from './components/AgentTabStrip'
 import type { Provider } from './components/AgentTabStrip'
 import { ModelsSection } from './components/ModelsSection'
@@ -292,6 +292,7 @@ export function App() {
   // this surface without a reload.
   useEffect(() => subscribeSettings(next => {
     setSettings(next)
+    setQuotaCadence(next.quotaCadenceSeconds)
     applyAccent(accentById(next.accent))
     applyTheme(next.theme === 'system' ? null : next.theme)
     setTheme(currentTheme())

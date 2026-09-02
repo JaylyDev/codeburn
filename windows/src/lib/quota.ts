@@ -1,7 +1,8 @@
 /// The one live-quota source the page has. Everything that shows a provider's remaining
 /// capacity -- the tab strip capsules and their hover popover, the warning row above the
-/// strip, the Plan insight -- reads this store, so one CLI spawn every two minutes feeds
-/// them all instead of each surface polling on its own.
+/// strip, the Plan insight, the settings window -- reads this store, so one CLI spawn per
+/// cadence feeds them all instead of each surface polling on its own. The cadence is the
+/// settings window's Quota Refresh setting, two minutes by default.
 ///
 /// Port of the macOS quota path (Data/QuotaSummary.swift for the presentation types,
 /// SubscriptionRefreshBackoff in CodeBurnApp.swift for the retry schedule). The CLI's
@@ -120,7 +121,7 @@ export const EMPTY_QUOTA: QuotaState = {
 /// The cadence and the retry schedule, from SubscriptionRefreshBackoff. A failure pulls the
 /// next attempt in and each further failure doubles it back out to the cadence, so a provider
 /// that has just come back is picked up quickly without hammering one that is down.
-const CADENCE_MS = 120_000
+const DEFAULT_CADENCE_MS = 120_000
 const INITIAL_BACKOFF_MS = 30_000
 const MAX_JITTER_MS = 5_000
 const MAX_BACKOFF_DOUBLINGS = 10
@@ -142,6 +143,23 @@ let listeners: Listener[] = []
 let timer: number | undefined
 let inFlight: Promise<void> | null = null
 let failures = 0
+let cadenceMs = DEFAULT_CADENCE_MS
+
+/// The settings window's Quota Refresh picker, from SubscriptionRefreshCadence. Zero is
+/// Manual: the store then only answers Retry and the popover opening, and never polls.
+export function setQuotaCadence(seconds: number): void {
+  const next = Math.max(0, seconds) * 1000
+  if (next === cadenceMs) return
+  cadenceMs = next
+  if (listeners.length === 0) return
+  if (cadenceMs === 0) {
+    window.clearTimeout(timer)
+    return
+  }
+  // Measured from the last answer, so shortening the cadence takes effect at once and
+  // lengthening it does not fire a run the old timer had already earned.
+  schedule(Math.max(0, cadenceMs - (Date.now() - (state.fetchedAt ?? 0))))
+}
 
 function publish(next: Partial<QuotaState>) {
   state = { ...state, ...next }
@@ -150,6 +168,7 @@ function publish(next: Partial<QuotaState>) {
 
 function schedule(delay: number) {
   window.clearTimeout(timer)
+  if (cadenceMs === 0) return
   timer = window.setTimeout(() => { void refreshQuota() }, delay)
 }
 
@@ -171,7 +190,7 @@ export async function refreshQuota(): Promise<void> {
           error: null,
           fetchedAt: Date.now(),
         })
-        schedule(CADENCE_MS)
+        schedule(cadenceMs)
         return
       }
       failures += 1
@@ -189,7 +208,7 @@ export async function refreshQuota(): Promise<void> {
         error: err instanceof Error ? err.message : String(err),
       })
     }
-    schedule(backoffDelay(failures, CADENCE_MS, Math.random()))
+    schedule(backoffDelay(failures, cadenceMs, Math.random()))
   })().finally(() => { inFlight = null })
   return inFlight
 }
@@ -201,7 +220,7 @@ export function subscribeQuota(listener: Listener): () => void {
   listener(state)
   if (listeners.length === 1) {
     if (state.fetchedAt === null) void refreshQuota()
-    else schedule(Math.max(0, CADENCE_MS - (Date.now() - state.fetchedAt)))
+    else schedule(Math.max(0, cadenceMs - (Date.now() - state.fetchedAt)))
   }
   return () => {
     listeners = listeners.filter(l => l !== listener)

@@ -168,6 +168,7 @@ pub fn run() {
             commands::settings_patch,
             commands::claude_config_dirs,
             commands::set_claude_config_dirs,
+            commands::pick_directory,
             commands::daily_budgets,
             commands::set_daily_budget,
             commands::provider_key_providers,
@@ -952,6 +953,20 @@ mod commands {
     #[tauri::command]
     pub fn claude_config_dirs() -> Vec<String> {
         crate::settings::claude_config_dirs()
+    }
+
+    /// The shell's folder browser, which is modal and has to run where the app's windows
+    /// live. `None` is a cancelled dialog, not a failure.
+    #[tauri::command]
+    pub async fn pick_directory(app: AppHandle, title: String) -> Result<Option<String>, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.run_on_main_thread(move || {
+            let _ = tx.send(crate::settings::browse_for_folder(&title));
+        })
+        .map_err(|e| e.to_string())?;
+        tauri::async_runtime::spawn_blocking(move || rx.recv().unwrap_or(None))
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Persisted to the CLI's own config so every `codeburn` run honours the list, whether

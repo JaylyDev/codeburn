@@ -313,6 +313,55 @@ fn unseal(sealed: &[u8]) -> Result<Vec<u8>> {
     Ok(sealed.to_vec())
 }
 
+// Directory picker ----------------------------------------------------------------------
+
+/// The Windows counterpart of the mac's NSOpenPanel in ClaudeConfigDirsSection. This is the
+/// shell's own folder browser rather than a dialog crate, which would be a new dependency
+/// for one button. It is modal and must run on the thread that owns the app's windows.
+#[cfg(windows)]
+pub fn browse_for_folder(title: &str) -> Option<String> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        SHBrowseForFolderW, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS,
+        BROWSEINFOW,
+    };
+
+    /// MAX_PATH, which is what SHGetPathFromIDListW writes into.
+    const MAX_PATH: usize = 260;
+
+    let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut display = [0u16; MAX_PATH];
+    let info = BROWSEINFOW {
+        hwndOwner: std::ptr::null_mut(),
+        pidlRoot: std::ptr::null_mut(),
+        pszDisplayName: display.as_mut_ptr(),
+        lpszTitle: title.as_ptr(),
+        ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
+        lpfn: None,
+        lParam: 0,
+        iImage: 0,
+    };
+
+    let pidl = unsafe { SHBrowseForFolderW(&info) };
+    if pidl.is_null() {
+        return None;
+    }
+    let mut path = [0u16; MAX_PATH];
+    let ok = unsafe { SHGetPathFromIDListW(pidl, path.as_mut_ptr()) };
+    unsafe { CoTaskMemFree(pidl as *const std::ffi::c_void) };
+    if ok == 0 {
+        return None;
+    }
+    let end = path.iter().position(|unit| *unit == 0).unwrap_or(path.len());
+    Some(String::from_utf16_lossy(&path[..end]))
+}
+
+#[cfg(not(windows))]
+pub fn browse_for_folder(title: &str) -> Option<String> {
+    let _ = title;
+    None
+}
+
 // The window ----------------------------------------------------------------------------
 
 /// Opens the settings window on `section`, creating it if it is not already up. Closing it

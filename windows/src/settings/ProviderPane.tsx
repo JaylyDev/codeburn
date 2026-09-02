@@ -1,6 +1,11 @@
+import { useEffect, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
+
 import { refreshQuota, summaryFor, type Connection, type QuotaState } from '../lib/quota'
-import { Group, Note, Pane } from './controls'
-import { CheckCircleIcon, KeySlashIcon, RetryIcon, WarningIcon } from '../components/Icons'
+import { QUOTA_CADENCES, subscribeSettings, writeSettings, type AppSettings } from '../lib/appSettings'
+import { homePath } from '../lib/platform'
+import { Field, Group, Note, Pane, Row, Select } from './controls'
+import { CheckCircleIcon, KeySlashIcon, RetryIcon, WarningIcon, XIcon } from '../components/Icons'
 
 /// One pane per provider the CLI has a live quota adapter for, from the mac's
 /// ClaudeSettingsTab / CodexSettingsTab / ... and GenericProviderSettingsTab.
@@ -35,7 +40,7 @@ const HOW_IT_WORKS: Record<string, string> = {
   antigravity: 'Antigravity quota talks to the local Antigravity language server on 127.0.0.1 only. Nothing leaves the machine and no credential files are read. If it shows as disconnected, start the Antigravity app, then click Retry.',
   kimi: 'Kimi Code quota reads %USERPROFILE%\\.kimi-code\\credentials\\kimi-code.json directly. Access tokens are short-lived and only the Kimi CLI refreshes them, so if the connection shows as expired, run the Kimi CLI once and click Retry.',
   cursor: 'Cursor quota opens the Cursor editor state database read-only for its access token, then asks cursor.com. Nothing is written back, so an expired token can only be refreshed by signing in to Cursor again.',
-  zai: 'Z.ai quota uses a supplied API key if there is one, and otherwise the Z.ai login the Pi CLI keeps in %USERPROFILE%\.pi\agent\auth.json.',
+  zai: 'Z.ai quota uses a supplied API key if there is one, and otherwise the Z.ai login the Pi CLI keeps in %USERPROFILE%\\.pi\\agent\\auth.json.',
   grok: 'Grok Build quota reads %USERPROFILE%\\.grok\\auth.json, preferring the current OIDC scope over an older sign-in entry.',
   clinepass: 'ClinePass has no local login file, so the only credential is an API key.',
 }
@@ -104,9 +109,180 @@ export function ProviderPane({ id, name, quota }: Props) {
         )}
       </Group>
 
+      {id === 'claude' && <ClaudeConfigDirs />}
+
+      {ACCEPTS_KEY.includes(id) && <ProviderKey id={id} name={name} />}
+
+      <QuotaCadence />
+
       <Group title="How it works">
         <Note>{HOW_IT_WORKS[id] ?? `${name} quota comes from the codeburn CLI, which reads the credential the provider's own tools left on this machine.`}</Note>
       </Group>
     </Pane>
+  )
+}
+
+/// The providers whose adapter takes a key from the environment, from `src/quota/*.ts`. Rust
+/// refuses a key for anything else, so this list is the UI half of the same rule.
+const ACCEPTS_KEY = ['zai', 'clinepass']
+
+/// The mac's ClaudeConfigDirsSection. Persisted to the CLI's own config, so every `codeburn`
+/// run aggregates the same set whether this app spawned it or the user typed it.
+function ClaudeConfigDirs() {
+  const [dirs, setDirs] = useState<string[]>([])
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    invoke<string[]>('claude_config_dirs').then(setDirs).catch(() => {})
+  }, [])
+
+  const apply = async (next: string[]) => {
+    setError(null)
+    try {
+      setDirs(await invoke<string[]>('set_claude_config_dirs', { dirs: next }))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  const add = async () => {
+    const picked = await invoke<string | null>('pick_directory', {
+      title: 'Choose a Claude config directory (one containing a projects folder).',
+    }).catch(() => null)
+    if (!picked || dirs.includes(picked)) return
+    void apply([...dirs, picked])
+  }
+
+  return (
+    <Group
+      title="Config Directories"
+      footer={`Aggregate usage across several Claude config directories, for instance work and personal accounts. Empty tracks just the default ${homePath('.claude')}. The CLAUDE_CONFIG_DIRS environment variable, when set, overrides this list.`}
+    >
+      {dirs.length === 0 ? (
+        <Note>No extra directories. Tracking the default {homePath('.claude')}.</Note>
+      ) : (
+        dirs.map((dir, index) => (
+          <Row
+            key={dir}
+            label={<span className="stg-path">{dir}</span>}
+            control={
+              <button
+                type="button"
+                className="btn btn-icon"
+                title="Remove"
+                aria-label={`Remove ${dir}`}
+                onClick={() => apply(dirs.filter((_, i) => i !== index))}
+              >
+                <XIcon size={11} />
+              </button>
+            }
+          />
+        ))
+      )}
+      {error && <Note><span className="stg-error">{error}</span></Note>}
+      <Row control={<button type="button" className="btn" onClick={add}>Add Directory...</button>} />
+    </Group>
+  )
+}
+
+/// The mac keeps its pasted keys in a CodeBurn-owned Keychain item. Here they are sealed with
+/// DPAPI under %LOCALAPPDATA%\codeburn and handed to the CLI as environment variables on the
+/// child process, because the CLI has no credential store of its own. The key is never read
+/// back into this window: all it learns is whether one is stored.
+function ProviderKey({ id, name }: { id: string; name: string }) {
+  const [stored, setStored] = useState<string[]>([])
+  const [draft, setDraft] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    invoke<string[]>('provider_key_providers').then(setStored).catch(() => {})
+  }, [])
+
+  const save = async (key: string) => {
+    setBusy(true)
+    setError(null)
+    try {
+      setStored(await invoke<string[]>('set_provider_key', { provider: id, key }))
+      setDraft('')
+      void refreshQuota()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const has = stored.includes(id)
+
+  return (
+    <Group
+      title="API key"
+      footer="The key is encrypted for this Windows account with DPAPI, so the file is worthless on another machine or under another sign-in. It is passed to the codeburn CLI as an environment variable and is never written to a command line or a log."
+    >
+      <Row
+        label={has ? 'A key is stored' : 'No key stored'}
+        hint={has ? `${name} quota is read with the key saved on this machine.` : `Paste a ${name} API key to read live quota.`}
+        control={
+          <button type="button" className="btn" disabled={!has || busy} onClick={() => save('')}>
+            Clear
+          </button>
+        }
+      />
+      <Row
+        stacked
+        label="Paste a key"
+        control={
+          <>
+            <Field
+              secure
+              ariaLabel={`${name} API key`}
+              placeholder={has ? 'Replace the stored key' : 'API key'}
+              value={draft}
+              onChange={setDraft}
+              width={280}
+            />
+            <button
+              type="button"
+              className="btn btn-prominent"
+              disabled={busy || draft.trim().length === 0}
+              onClick={() => save(draft)}
+            >
+              Save and Connect
+            </button>
+          </>
+        }
+      />
+      {error && <Note><span className="stg-error">{error}</span></Note>}
+    </Group>
+  )
+}
+
+/// SubscriptionRefreshCadence. One `codeburn quota` run answers for every provider, so this
+/// is deliberately one setting shown on each pane rather than ten that could disagree.
+function QuotaCadence() {
+  const [settings, setSettings] = useState<AppSettings | null>(null)
+  useEffect(() => subscribeSettings(setSettings), [])
+  if (!settings) return null
+
+  return (
+    <Group title="Quota Refresh">
+      <Row
+        label="Update every"
+        control={
+          <Select
+            ariaLabel="Quota refresh cadence"
+            value={settings.quotaCadenceSeconds}
+            options={QUOTA_CADENCES}
+            onChange={quotaCadenceSeconds => writeSettings({ quotaCadenceSeconds })}
+          />
+        }
+      />
+      <Note>
+        Providers rate-limit these endpoints per account, and one run answers for all of them,
+        so this cadence covers every provider. Manual only refreshes when you open the popover
+        or press Retry.
+      </Note>
+    </Group>
   )
 }
