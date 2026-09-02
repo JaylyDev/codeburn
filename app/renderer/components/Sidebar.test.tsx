@@ -1,16 +1,31 @@
 // @vitest-environment jsdom
-import { afterEach, describe, it, expect, vi } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 
 import { Sidebar } from './Sidebar'
+
+// The preload bridge is read once at module load, so the switches need it mocked rather than
+// assigned onto `window` after the fact.
+const bridge = vi.hoisted(() => ({
+  companionStatus: vi.fn(),
+  setMenuBarEnabled: vi.fn(),
+  setSidebarEnabled: vi.fn(),
+  openExternal: vi.fn(),
+}))
+vi.mock('../lib/ipc', () => ({ codeburn: bridge, normalizeCliError: (err: unknown) => err }))
 
 function setPlatform(platform: string): void {
   ;(window as unknown as { codeburn?: { platform?: string } }).codeburn = { platform }
 }
 
 describe('Sidebar', () => {
+  beforeEach(() => {
+    bridge.companionStatus.mockResolvedValue({ supported: false, menuBar: false, sidebar: false, store: false })
+  })
+
   afterEach(() => {
     delete (window as unknown as { codeburn?: { platform?: string } }).codeburn
+    vi.clearAllMocks()
   })
 
   it.each([
@@ -47,5 +62,95 @@ describe('Sidebar', () => {
     expect(flame?.tagName.toLowerCase()).toBe('img')
     // motionEnabled() is off under vitest, so the idle flicker never attaches.
     expect(container.querySelector('.fm-flicker')).toBeNull()
+  })
+
+  it('keeps About in the corner and the social glyphs out of it', async () => {
+    const { container } = render(<Sidebar active="overview" onNavigate={() => {}} />)
+    expect(screen.getByRole('link', { name: 'About' })).toBeInTheDocument()
+    expect(container.querySelector('.foot .social')).toBeNull()
+    // They moved into the About modal, which lists them under Links.
+    fireEvent.click(screen.getByRole('link', { name: 'About' }))
+    expect(await screen.findByRole('link', { name: /GitHub/ })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /LinkedIn/ })).toBeInTheDocument()
+  })
+})
+
+describe('Sidebar companion switches', () => {
+  const SUPPORTED = { supported: true, menuBar: true, sidebar: true, store: false }
+
+  afterEach(() => { vi.clearAllMocks() })
+
+  async function renderSwitches(status = SUPPORTED) {
+    bridge.companionStatus.mockResolvedValue(status)
+    render(<Sidebar active="overview" onNavigate={() => {}} />)
+    return screen.findByRole('switch', { name: 'Menu bar' })
+  }
+
+  it('shows nothing where the main process reports no bundled tray app', async () => {
+    bridge.companionStatus.mockResolvedValue({ supported: false, menuBar: false, sidebar: false, store: false })
+    render(<Sidebar active="overview" onNavigate={() => {}} />)
+
+    await waitFor(() => expect(bridge.companionStatus).toHaveBeenCalled())
+    expect(screen.queryByRole('switch')).toBeNull()
+  })
+
+  it('survives a preload that has never heard of them', async () => {
+    bridge.companionStatus.mockRejectedValue(new Error('no such channel'))
+    render(<Sidebar active="overview" onNavigate={() => {}} />)
+
+    await waitFor(() => expect(bridge.companionStatus).toHaveBeenCalled())
+    expect(screen.queryByRole('switch')).toBeNull()
+  })
+
+  it('renders both switches on, in the sidebar corner', async () => {
+    const menuBar = await renderSwitches()
+
+    expect(menuBar).toHaveAttribute('aria-checked', 'true')
+    expect(screen.getByRole('switch', { name: 'Sidebar' })).toHaveAttribute('aria-checked', 'true')
+  })
+
+  it('turning Menu bar off sends false and renders the status that came back', async () => {
+    const menuBar = await renderSwitches()
+    bridge.setMenuBarEnabled.mockResolvedValue({ ...SUPPORTED, menuBar: false })
+
+    fireEvent.click(menuBar)
+
+    expect(bridge.setMenuBarEnabled).toHaveBeenCalledWith(false)
+    await waitFor(() => expect(menuBar).toHaveAttribute('aria-checked', 'false'))
+    expect(screen.getByRole('switch', { name: 'Sidebar' })).toHaveAttribute('aria-checked', 'true')
+  })
+
+  it('turning Sidebar off leaves Menu bar alone', async () => {
+    await renderSwitches()
+    bridge.setSidebarEnabled.mockResolvedValue({ ...SUPPORTED, sidebar: false })
+
+    fireEvent.click(screen.getByRole('switch', { name: 'Sidebar' }))
+
+    expect(bridge.setSidebarEnabled).toHaveBeenCalledWith(false)
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Sidebar' })).toHaveAttribute('aria-checked', 'false'))
+    expect(screen.getByRole('switch', { name: 'Menu bar' })).toHaveAttribute('aria-checked', 'true')
+  })
+
+  /// An install the person cancelled at the UAC prompt comes back unchanged, and the switch
+  /// has to show that rather than the state it optimistically painted.
+  it('stays where it was when the main process reports no change', async () => {
+    const menuBar = await renderSwitches({ ...SUPPORTED, menuBar: false })
+    bridge.setMenuBarEnabled.mockResolvedValue({ ...SUPPORTED, menuBar: false })
+
+    fireEvent.click(menuBar)
+
+    await waitFor(() => expect(bridge.setMenuBarEnabled).toHaveBeenCalledWith(true))
+    expect(menuBar).toHaveAttribute('aria-checked', 'false')
+  })
+
+  it('refuses a second click while one is still in flight', async () => {
+    const menuBar = await renderSwitches()
+    bridge.setMenuBarEnabled.mockReturnValue(new Promise(() => {}))
+
+    fireEvent.click(menuBar)
+    fireEvent.click(screen.getByRole('switch', { name: 'Sidebar' }))
+
+    expect(bridge.setMenuBarEnabled).toHaveBeenCalledTimes(1)
+    expect(bridge.setSidebarEnabled).not.toHaveBeenCalled()
   })
 })
