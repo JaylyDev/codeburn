@@ -2,8 +2,8 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type MouseEv
 import type { MenubarPayload } from '../lib/payload'
 import type { CurrencyState } from '../lib/currency'
 import { formatCompactCurrency, formatCurrency, plural } from '../lib/currency'
-import { homePath } from '../lib/platform'
 import { severity, summaryFor, type QuotaState, type QuotaSummary } from '../lib/quota'
+import { WATCHED_TOOLS, watchedSource } from '../lib/watched'
 import { ChevronRight } from './Icons'
 import { QuotaPopover } from './QuotaPopover'
 
@@ -29,14 +29,12 @@ export type ProviderTab = {
 
 /// The tools the app can describe without any help from the payload. Used only when the CLI
 /// reports no provider with activity, which is the first-run case the copy is written for.
-const KNOWN_TOOLS: Array<{ id: Provider; label: string; source: string }> = [
-  { id: 'claude',   label: 'Claude',   source: `Claude Code sessions in ${homePath('.claude', 'projects')}` },
-  { id: 'codex',    label: 'Codex',    source: `Codex CLI sessions in ${homePath('.codex', 'sessions')}` },
-  { id: 'cursor',   label: 'Cursor',   source: 'the Cursor IDE local database' },
-  { id: 'copilot',  label: 'Copilot',  source: 'GitHub Copilot session events' },
-  { id: 'opencode', label: 'OpenCode', source: 'OpenCode session storage' },
-  { id: 'pi',       label: 'Pi',       source: 'Pi session logs' },
-]
+/// Both the label and the location come from lib/watched, which the empty state reads too.
+const KNOWN_TOOLS: Array<{ id: Provider; label: string; source: string }> = WATCHED_TOOLS.map(t => ({
+  id: t.id,
+  label: t.label,
+  source: watchedSource(t),
+}))
 
 /// Provider marks from mac/Sources/CodeBurnMenubar/Views/AgentTabStrip.swift (ProviderFilter
 /// .color), keyed by the CLI provider id rather than the Swift case name. Kept for the
