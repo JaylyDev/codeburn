@@ -118,7 +118,12 @@ struct AppStoreRefreshRecoveryTests {
         store.setCachedPayloadForTesting(falseZero, period: .today, provider: .hermes, fetchedAt: Date())
 
         #expect(store.providerPayloadContradictsAllForTesting(falseZero, period: .today, provider: .hermes))
-        #expect(store.payload.current.cost == 12)
+        // The Hermes tab must show NO dollar figure. It used to fall back to the
+        // previous selection's payload and print $12, which is Claude's spend
+        // plus Hermes', under a tab labelled Hermes.
+        #expect(!store.hasCachedData)
+        #expect(store.payload.current.cost == 0)
+        #expect(store.payload.current.calls == 0)
         #expect(store.needsInteractivePayloadRefresh)
     }
 
@@ -386,8 +391,8 @@ struct AppStoreRefreshRecoveryTests {
         #expect(!store.providerPayloadContradictsAllForTesting(zero, period: .today, provider: .hermes))
     }
 
-    @Test("provider switches retain the last rendered payload until the target loads")
-    func providerSwitchRetainsLastRenderedPayload() {
+    @Test("a provider switch shows no figure until the target provider loads")
+    func providerSwitchShowsNoStaleFigure() {
         let store = AppStore()
         store.suppressRefreshesForTesting()
         store.setCachedPayloadForTesting(
@@ -399,7 +404,16 @@ struct AppStoreRefreshRecoveryTests {
 
         store.switchTo(provider: .cursor)
 
+        // Keeping the all-provider payload mounted under the Cursor tab is not
+        // continuity, it is a wrong number: $12.34 is every provider's spend.
+        // Empty here is what puts the popover on its loading state instead.
         #expect(store.selectedProvider == .cursor)
+        #expect(!store.hasCachedData)
+        #expect(store.payload.current.cost == 0)
+
+        // The all-provider selection still reads its own cached payload.
+        store.switchTo(provider: .all)
+        #expect(store.hasCachedData)
         #expect(store.payload.current.cost == 12.34)
     }
 

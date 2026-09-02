@@ -213,7 +213,6 @@ final class AppStore {
     private var antigravityRefreshGen: Int = 0
 
     private var cache: [PayloadCacheKey: CachedPayload] = [:]
-    private var selectionFallbackPayload: MenubarPayload?
     private var cacheDate: String = ""
     private var switchTask: Task<Void, Never>?
     private var payloadRefreshGeneration: UInt64 = 0
@@ -317,7 +316,11 @@ final class AppStore {
                 return combinedPayload
             }
         }
-        return consistentCachedPayload(for: currentKey) ?? selectionFallbackPayload ?? .empty
+        // No fallback to the PREVIOUS selection's payload. It belonged to a
+        // different provider, so serving it under this tab printed another
+        // provider's dollar figure as if it were this one's. Empty here means
+        // `hasCachedData` is false and the popover renders its loading state.
+        return consistentCachedPayload(for: currentKey) ?? .empty
     }
 
     /// Today (across all providers) backs day-specific views in the popover.
@@ -654,9 +657,6 @@ final class AppStore {
     /// Existing content stays mounted while the background fetch runs, so a tab
     /// click never becomes a loading gate or resets unrelated in-flight work.
     func switchTo(provider: ProviderFilter) {
-        if provider != selectedProvider, hasCachedData {
-            selectionFallbackPayload = payload
-        }
         selectedProvider = provider
         // A Claude config scope only applies to All/Claude views; picking any
         // other provider tab clears it (the CLI rejects the contradictory combo).
@@ -815,7 +815,6 @@ final class AppStore {
         lastErrorByKey.removeAll()
         if clearCache {
             cache.removeAll()
-            selectionFallbackPayload = nil
         }
     }
 
@@ -879,7 +878,6 @@ final class AppStore {
         if cacheDate != today {
             payloadRefreshGeneration &+= 1
             cache.removeAll()
-            selectionFallbackPayload = nil
             loadingCountsByKey.removeAll()
             loadingStartedAtByKey.removeAll()
             finishAllInFlight()
@@ -892,7 +890,6 @@ final class AppStore {
 
     func invalidateCache() {
         cache.removeAll()
-        selectionFallbackPayload = nil
     }
 
     private func reconcileClaudeConfigSelection(from payload: MenubarPayload, for key: PayloadCacheKey) {
@@ -1220,9 +1217,6 @@ final class AppStore {
                 return false
             }
             cache[key] = CachedPayload(payload: fresh.payload, fetchedAt: Date(), contradictsAll: fresh.contradictsAll)
-            if key == currentKey || (effectiveSelectedScope == .combined && key == localCurrentKey) {
-                selectionFallbackPayload = nil
-            }
             reconcileClaudeConfigSelection(from: fresh.payload, for: key)
             lastSuccessByKey[key] = Date()
             lastErrorByKey[key] = nil
