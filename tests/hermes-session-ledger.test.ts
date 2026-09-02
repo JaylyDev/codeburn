@@ -245,9 +245,9 @@ describe('hermes session ledger unit', () => {
     expect(isHermesLedgerPublicationError(caught)).toBe(true)
   })
 
-  it('does not adopt a v1 ledger after the cost-provenance contract changes', async () => {
-    await writeFile(join(cacheDir, 'hermes-session-ledger.v1.json'), JSON.stringify({
-      version: 1,
+  it('does not adopt a v2 ledger whose migration could re-date historical observations', async () => {
+    await writeFile(join(cacheDir, 'hermes-session-ledger.v2.json'), JSON.stringify({
+      version: 2,
       cursors: {
         default: {
           corrupt: {

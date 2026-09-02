@@ -22,8 +22,11 @@ import type { CachedCall, ProviderSection } from './session-cache.js'
 //   dropped: sealed days are not re-read. This slice does not bump
 //   DAILY_CACHE_VERSION (one cold re-parse for every user) to recover history.
 
-export const HERMES_SESSION_LEDGER_FILENAME = 'hermes-session-ledger.v2.json'
-export const HERMES_SESSION_LEDGER_VERSION = 2 as const
+// v3 discards the local-only v2 migration candidate. Seeding v2 from the warm
+// session cache could preserve lifetime totals while assigning historical
+// observations to the migration day, inflating that day's scoped Hermes spend.
+export const HERMES_SESSION_LEDGER_FILENAME = 'hermes-session-ledger.v3.json'
+export const HERMES_SESSION_LEDGER_VERSION = 3 as const
 
 export type HermesCostBasis = 'actual' | 'estimated' | 'calculated' | 'included'
 
