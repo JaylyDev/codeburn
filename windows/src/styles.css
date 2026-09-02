@@ -1192,6 +1192,30 @@ code { font-family: var(--font-mono); }
   color: var(--label-2);
 }
 .pulse-value-accent { color: var(--brand-accent); }
+.pulse { display: flex; flex-direction: column; gap: 8px; }
+.pulse-cpe {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: var(--label-3);
+}
+.pulse-cpe-label { font-size: 10px; font-weight: 500; }
+.pulse-cpe-figure {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--label);
+}
+.pulse-cpe-best { color: var(--brand-accent); }
+.pulse-cpe-model {
+  font-size: 10px;
+  color: var(--label-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pulse-cpe-dash { font-size: 9px; color: var(--label-3); }
 
 /* Stats */
 .stats-grid { display: flex; gap: 14px; }

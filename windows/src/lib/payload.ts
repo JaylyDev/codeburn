@@ -24,6 +24,9 @@ export type MenubarPayload = {
     /// Where the money went, by repository and by session. Empty on older CLI payloads.
     topProjects?: ProjectEntry[]
     topSessions?: TopSessionEntry[]
+    /// Cost per accepted edit and one-shot rate per model, which is what the mac's Pulse
+    /// caption names its cheapest and dearest model from. Empty on older CLI payloads.
+    modelEfficiency?: Array<{ name: string; costPerEdit: number | null; oneShotRate: number | null }>
     /// What the agent reached for. Empty on older CLI payloads.
     tools?: Array<{ name: string; calls: number }>
     skills?: Array<{ name: string; turns: number; cost: number }>

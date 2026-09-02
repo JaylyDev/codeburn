@@ -245,6 +245,16 @@ export function EllipsisIcon(p: IconProps) {
   )
 }
 
+/// pencil.line, for the Pulse cost-per-edit caption.
+export function PencilLineIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <path d="M10.5 2.8 13.2 5.5 6.4 12.3 3.2 13l.7-3.2z" />
+      <path d="M2.5 14.5h11" />
+    </Svg>
+  )
+}
+
 export function CheckIcon(p: IconProps) {
   return <Svg {...p}><path d="M3.5 8.5 6.5 11.5 12.5 5" /></Svg>
 }
