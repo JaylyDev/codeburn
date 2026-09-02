@@ -204,6 +204,34 @@ struct AppStoreRefreshRecoveryTests {
         #expect(!store.providerPayloadContradictsAllForTesting(tokenOnly, period: .today, provider: .hermes))
     }
 
+    @Test("scoped providerDetails hasUsage remains authoritative with empty headline totals")
+    func scopedProviderDetailsUsageRemainsAuthoritative() {
+        let store = AppStore()
+        let all = menubarPayload(
+            cost: 12,
+            providers: ["claude": 12, "hermes agent": 0],
+            providerDetails: [
+                ProviderDetail(id: "claude", label: "Claude", cost: 12, calls: 4, hasUsage: true),
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0, calls: 0, hasUsage: true),
+            ]
+        )
+        let providerDetailOnly = menubarPayload(
+            cost: 0,
+            calls: 0,
+            sessions: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            providers: ["hermes agent": 0],
+            providerDetails: [
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0, calls: 0, hasUsage: true),
+            ]
+        )
+
+        store.setCachedPayloadForTesting(all, period: .today, provider: .all, fetchedAt: Date())
+
+        #expect(!store.providerPayloadContradictsAllForTesting(providerDetailOnly, period: .today, provider: .hermes))
+    }
+
     @Test("token-only activity rejects a completely empty scoped payload")
     func tokenOnlyActivityRejectsEmptyScopedPayload() {
         let store = AppStore()
@@ -264,6 +292,72 @@ struct AppStoreRefreshRecoveryTests {
 
         #expect(!store.hasCachedData)
         #expect(store.needsInteractivePayloadRefresh)
+    }
+
+    @Test("quiet refresh joins matching in-flight evidence instead of racing ahead")
+    func quietRefreshJoinsMatchingInFlightEvidence() async {
+        let store = AppStore()
+        let all = menubarPayload(
+            cost: 12,
+            providers: ["claude": 11.5, "hermes agent": 0.5],
+            providerDetails: [
+                ProviderDetail(id: "claude", label: "Claude", cost: 11.5, calls: 4, hasUsage: true),
+                ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0.5, calls: 7, hasUsage: true),
+            ]
+        )
+        store.setCacheDateToTodayForTesting()
+        store.seedInFlightForTesting(period: .today, provider: .all, insertedAt: Date())
+
+        let joined = Task { @MainActor in
+            await store.refreshQuietlyForTesting(period: .today, provider: .all)
+        }
+        while store.inFlightWaiterCountForTesting(period: .today, provider: .all) == 0 {
+            await Task.yield()
+        }
+
+        store.setCachedPayloadForTesting(all, period: .today, provider: .all, fetchedAt: Date())
+        store.finishInFlightForTesting(period: .today, provider: .all)
+
+        #expect(await joined.value)
+    }
+
+    @Test("refresh pipeline reset releases matching in-flight waiters")
+    func refreshPipelineResetReleasesInFlightWaiters() async {
+        let store = AppStore()
+        store.setCacheDateToTodayForTesting()
+        store.seedInFlightForTesting(period: .today, provider: .all, insertedAt: Date())
+
+        let joined = Task { @MainActor in
+            await store.refreshQuietlyForTesting(period: .today, provider: .all)
+        }
+        while store.inFlightWaiterCountForTesting(period: .today, provider: .all) == 0 {
+            await Task.yield()
+        }
+
+        store.resetLoadingState()
+
+        #expect(!(await joined.value))
+        #expect(!store.isInFlightForTesting(period: .today, provider: .all))
+    }
+
+    @Test("selection refresh snapshots scoped and all-provider keys together")
+    func selectionRefreshSnapshotsMatchingKeys() {
+        let store = AppStore()
+        store.suppressRefreshesForTesting()
+        store.switchTo(period: .month)
+        store.switchTo(provider: .hermes)
+
+        let snapshot = store.selectionRefreshKeysForTesting()
+        store.switchTo(period: .today)
+        store.switchTo(provider: .cursor)
+
+        #expect(snapshot.scoped.period == .month)
+        #expect(snapshot.scoped.provider == .hermes)
+        #expect(snapshot.all.period == .month)
+        #expect(snapshot.all.provider == .all)
+        #expect(snapshot.scoped.day == snapshot.all.day)
+        #expect(snapshot.scoped.days == snapshot.all.days)
+        #expect(snapshot.scoped.claudeConfigSourceId == snapshot.all.claudeConfigSourceId)
     }
 
     @Test("a genuine provider zero remains valid when the all-provider slice is also zero")

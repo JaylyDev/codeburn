@@ -290,6 +290,17 @@ final class AppStore {
         )
     }
 
+    /// Capture the keys that must describe one selection before any suspension
+    /// point. Reading `periodAllKey` before an await and `currentKey` afterward
+    /// can otherwise pair evidence from two different user selections.
+    private func selectionRefreshKeys() -> (
+        scoped: PayloadCacheKey,
+        local: PayloadCacheKey,
+        all: PayloadCacheKey
+    ) {
+        (scoped: currentKey, local: localCurrentKey, all: periodAllKey)
+    }
+
     var payload: MenubarPayload {
         if effectiveSelectedScope == .combined {
             let combinedPayload = cache[currentKey]?.payload
@@ -527,8 +538,41 @@ final class AppStore {
         inFlightKeys[PayloadCacheKey(scope: scope, period: period, provider: provider, day: day)] = insertedAt
     }
 
+    func setCacheDateToTodayForTesting() {
+        cacheDate = currentCacheDate()
+    }
+
     func isInFlightForTesting(scope: MenubarScope = .local, period: Period, provider: ProviderFilter, day: String? = nil) -> Bool {
         inFlightKeys[PayloadCacheKey(scope: scope, period: period, provider: provider, day: day)] != nil
+    }
+
+    func refreshQuietlyForTesting(scope: MenubarScope = .local,
+                                  period: Period,
+                                  provider: ProviderFilter,
+                                  day: String? = nil) async -> Bool {
+        await refreshQuietly(
+            key: PayloadCacheKey(scope: scope, period: period, provider: provider, day: day),
+            includeOptimize: false
+        )
+    }
+
+    func inFlightWaiterCountForTesting(scope: MenubarScope = .local,
+                                       period: Period,
+                                       provider: ProviderFilter,
+                                       day: String? = nil) -> Int {
+        inFlightWaiters[PayloadCacheKey(scope: scope, period: period, provider: provider, day: day)]?.count ?? 0
+    }
+
+    func finishInFlightForTesting(scope: MenubarScope = .local,
+                                  period: Period,
+                                  provider: ProviderFilter,
+                                  day: String? = nil) {
+        finishInFlight(for: PayloadCacheKey(scope: scope, period: period, provider: provider, day: day))
+    }
+
+    func selectionRefreshKeysForTesting() -> (scoped: PayloadCacheKey, all: PayloadCacheKey) {
+        let snapshot = selectionRefreshKeys()
+        return (snapshot.scoped, snapshot.all)
     }
 
     func suppressRefreshesForTesting() {
@@ -664,14 +708,12 @@ final class AppStore {
         let allKey = PayloadCacheKey(scope: .local, period: period, provider: .all, day: day, days: days, claudeConfigSourceId: claudeConfigSourceId)
         switchTask = Task {
             if scope == .combined {
+                if provider != .all {
+                    _ = await refreshQuietly(key: allKey, includeOptimize: false, force: false)
+                }
                 async let local = refresh(key: localKey, includeOptimize: false, force: false, showLoading: false)
                 async let combined = refresh(key: key, includeOptimize: false, force: false, showLoading: false)
-                if provider == .all {
-                    _ = await (local, combined)
-                } else {
-                    async let all = refreshQuietly(key: allKey, includeOptimize: false, force: false)
-                    _ = await (local, combined, all)
-                }
+                _ = await (local, combined)
             } else if provider == .all {
                 await refresh(key: key, includeOptimize: false, force: false, showLoading: false)
             } else {
@@ -686,12 +728,39 @@ final class AppStore {
     }
 
     private var inFlightKeys: [PayloadCacheKey: Date] = [:]
+    private var inFlightWaiters: [PayloadCacheKey: [CheckedContinuation<Void, Never>]] = [:]
+
+    private func waitForInFlight(_ key: PayloadCacheKey) async {
+        guard inFlightKeys[key] != nil else { return }
+        await withCheckedContinuation { continuation in
+            guard inFlightKeys[key] != nil else {
+                continuation.resume()
+                return
+            }
+            inFlightWaiters[key, default: []].append(continuation)
+        }
+    }
+
+    private func finishInFlight(for key: PayloadCacheKey) {
+        inFlightKeys[key] = nil
+        let waiters = inFlightWaiters.removeValue(forKey: key) ?? []
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    private func finishAllInFlight() {
+        let keys = Set(inFlightKeys.keys).union(inFlightWaiters.keys)
+        for key in keys {
+            finishInFlight(for: key)
+        }
+    }
 
     func resetLoadingState() {
         payloadRefreshGeneration &+= 1
         loadingCountsByKey.removeAll()
         loadingStartedAtByKey.removeAll()
-        inFlightKeys.removeAll()
+        finishAllInFlight()
         attemptedKeys.removeAll()
     }
 
@@ -726,7 +795,7 @@ final class AppStore {
                   Int(now.timeIntervalSince(started)), key.label, key.provider.rawValue)
             loadingCountsByKey[key] = nil
             loadingStartedAtByKey[key] = nil
-            inFlightKeys[key] = nil
+            finishInFlight(for: key)
             if cache[key] == nil {
                 lastErrorByKey[key] = "Refresh took longer than expected. CodeBurn will keep retrying in the background."
             }
@@ -734,7 +803,7 @@ final class AppStore {
         for (key, insertedAt) in staleInFlight {
             NSLog("CodeBurn: orphaned in-flight key stuck for %ds on %@/%@ — clearing",
                   Int(now.timeIntervalSince(insertedAt)), key.label, key.provider.rawValue)
-            inFlightKeys[key] = nil
+            finishInFlight(for: key)
         }
         return true
     }
@@ -770,7 +839,7 @@ final class AppStore {
             selectionFallbackPayload = nil
             loadingCountsByKey.removeAll()
             loadingStartedAtByKey.removeAll()
-            inFlightKeys.removeAll()
+            finishAllInFlight()
             attemptedKeys.removeAll()
             lastErrorByKey.removeAll()
             cacheDate = today
@@ -834,11 +903,16 @@ final class AppStore {
 
         // `hasUsage` is authoritative for subscription/token-only providers,
         // where both cost and behavioral calls may legitimately be zero.
-        let scopedHasUsage = payload.current.cost > 0
-            || payload.current.calls > 0
-            || payload.current.sessions > 0
-            || payload.current.inputTokens > 0
-            || payload.current.outputTokens > 0
+        let scopedDetail = payload.current.providerDetails.first(where: {
+            providerKeys.contains($0.id.lowercased()) || providerKeys.contains($0.label.lowercased())
+        })
+        let scopedHasUsage = scopedDetail?.hasUsage ?? (
+            payload.current.cost > 0
+                || payload.current.calls > 0
+                || payload.current.sessions > 0
+                || payload.current.inputTokens > 0
+                || payload.current.outputTokens > 0
+        )
         return allHasUsage && !scopedHasUsage
     }
 
@@ -913,15 +987,24 @@ final class AppStore {
         showLoading: Bool = false,
         qualityOfService: QualityOfService = .userInitiated
     ) async -> Bool {
-        if effectiveSelectedScope == .combined {
+        let keys = selectionRefreshKeys()
+        if keys.scoped.scope == .combined {
+            if keys.scoped.provider != .all {
+                _ = await refreshQuietly(
+                    key: keys.all,
+                    includeOptimize: false,
+                    force: force,
+                    qualityOfService: qualityOfService
+                )
+            }
             async let local = refreshQuietly(
-                key: localCurrentKey,
+                key: keys.local,
                 includeOptimize: includeOptimize,
                 force: force,
                 qualityOfService: qualityOfService
             )
             async let combined = refresh(
-                key: currentKey,
+                key: keys.scoped,
                 includeOptimize: includeOptimize,
                 force: force,
                 showLoading: showLoading,
@@ -930,16 +1013,16 @@ final class AppStore {
             let (localSucceeded, combinedSucceeded) = await (local, combined)
             return localSucceeded && combinedSucceeded
         } else {
-            if currentKey.provider != .all {
+            if keys.scoped.provider != .all {
                 _ = await refreshQuietly(
-                    key: periodAllKey,
+                    key: keys.all,
                     includeOptimize: false,
                     force: force,
                     qualityOfService: qualityOfService
                 )
             }
             return await refresh(
-                key: currentKey,
+                key: keys.scoped,
                 includeOptimize: includeOptimize,
                 force: force,
                 showLoading: showLoading,
@@ -957,20 +1040,31 @@ final class AppStore {
             days: selectedDays,
             claudeConfigSourceId: selectedClaudeConfigSourceId
         )
+        let localKey = PayloadCacheKey(
+            scope: .local,
+            period: scopedKey.period,
+            provider: scopedKey.provider,
+            day: scopedKey.day,
+            days: scopedKey.days,
+            claudeConfigSourceId: scopedKey.claudeConfigSourceId
+        )
+        let allKey = PayloadCacheKey(
+            scope: .local,
+            period: scopedKey.period,
+            provider: .all,
+            day: scopedKey.day,
+            days: scopedKey.days,
+            claudeConfigSourceId: scopedKey.claudeConfigSourceId
+        )
         if scope == .combined {
-            async let local = refreshQuietly(key: localCurrentKey, includeOptimize: false, force: false)
+            if scopedKey.provider != .all {
+                _ = await refreshQuietly(key: allKey, includeOptimize: false, force: force)
+            }
+            async let local = refreshQuietly(key: localKey, includeOptimize: false, force: false)
             async let combined = refreshQuietly(key: scopedKey, includeOptimize: false, force: force)
             _ = await (local, combined)
         } else {
             if scopedKey.provider != .all {
-                let allKey = PayloadCacheKey(
-                    scope: .local,
-                    period: scopedKey.period,
-                    provider: .all,
-                    day: scopedKey.day,
-                    days: scopedKey.days,
-                    claudeConfigSourceId: scopedKey.claudeConfigSourceId
-                )
                 _ = await refreshQuietly(key: allKey, includeOptimize: false, force: force)
             }
             await refreshQuietly(key: scopedKey, includeOptimize: false, force: force)
@@ -1014,7 +1108,7 @@ final class AppStore {
         }
         defer {
             let abandonedAttempt = Task.isCancelled || generationAtStart != payloadRefreshGeneration
-            inFlightKeys[key] = nil
+            finishInFlight(for: key)
             if didShowLoading {
                 finishLoading(for: key)
             }
@@ -1140,7 +1234,10 @@ final class AppStore {
            let cached = cache[key],
            cached.isFresh,
            !providerPayloadContradictsAll(cached.payload, for: key) { return true }
-        if inFlightKeys[key] != nil { return false }
+        if inFlightKeys[key] != nil {
+            await waitForInFlight(key)
+            return consistentCachedPayload(for: key) != nil
+        }
         inFlightKeys[key] = Date()
         attemptedKeys.insert(key)
         let cacheDateAtStart = cacheDate
@@ -1149,7 +1246,7 @@ final class AppStore {
             NSLog("CodeBurn: refreshing stale today status payload after %ds", age)
         }
         defer {
-            inFlightKeys[key] = nil
+            finishInFlight(for: key)
         }
         do {
             let fresh = try await fetchPayload(
