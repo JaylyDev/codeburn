@@ -798,6 +798,26 @@ describe('#946: a migration re-derives copilot instead of carrying it', () => {
     expect(loaded.pendingRederive).toEqual(['hermes'])
   })
 
+  it('preserves an older cache pending repair while adding a newer provider repair', async () => {
+    await writeFile(
+      join(TMP_CACHE_ROOT, `daily-cache.v${DAILY_CACHE_VERSION - 1}.json`),
+      JSON.stringify({
+        version: DAILY_CACHE_VERSION - 1,
+        savingsConfigHash: 'cfg-A',
+        tzKey: currentTzKey(),
+        lastComputedDate: daysAgoStr(1),
+        days: [day(settled, { copilot: PRE_STORE, hermes: slice(4603, 6764) })],
+        complete: true,
+        watermarkTrusted: true,
+        pendingRederive: ['copilot'],
+      }),
+      'utf-8',
+    )
+
+    const loaded = await loadDailyCache()
+    expect(loaded.pendingRederive).toEqual(['copilot', 'hermes'])
+  })
+
   it('still carries the slice whole when the sources are gone (never-lose, #1033)', async () => {
     await seedOlderCache([day(settled, { copilot: PRE_STORE })])
     // The re-derive finds nothing at all for that day: the store and the

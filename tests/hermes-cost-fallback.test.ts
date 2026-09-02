@@ -50,13 +50,16 @@ function seedDb(): void {
   insert.run('included-zero', 'gpt-5.6-sol', 100000, 10000, 0.0, null, 'included', 'none', startedAt)
   // Unknown cost with no usable estimate falls back to token pricing.
   insert.run('unknown-zero', 'claude-opus-4-6', 100000, 10000, 0.0, null, 'unknown', 'none', startedAt)
+  // An unknown row may retain a partial estimate from earlier priced calls.
+  // It is not a complete session total and must still be recalculated.
+  insert.run('unknown-partial', 'claude-opus-4-6', 100000, 10000, 0.25, null, 'unknown', 'official_docs_snapshot', startedAt)
   // A positive recorded estimate stays authoritative.
   insert.run('positive-estimate', 'claude-opus-4-6', 100000, 10000, 0.5, null, 'estimated', 'official_docs_snapshot', startedAt)
   // An explicitly estimated free value remains zero.
   insert.run('estimated-zero', 'free-model', 100000, 10000, 0.0, null, 'estimated', 'provider_models_api', startedAt)
   // An explicit $0 *actual* invoice amount is recorded fact and stays $0.
   insert.run('zero-actual', 'claude-opus-4-6', 100000, 10000, null, 0.0, 'actual', 'invoice', startedAt)
-  for (const id of ['included-zero', 'unknown-zero', 'positive-estimate', 'estimated-zero', 'zero-actual']) {
+  for (const id of ['included-zero', 'unknown-zero', 'unknown-partial', 'positive-estimate', 'estimated-zero', 'zero-actual']) {
     db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
       .run(id, 'user', `session ${id}`, startedAt)
     db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
@@ -92,6 +95,10 @@ skipUnlessSqlite('hermes recorded-cost fallback', () => {
 
     const unknown = byId.get('unknown-zero')!
     expect(unknown.totalCostUSD).toBeGreaterThan(0)
+
+    const unknownPartial = byId.get('unknown-partial')!
+    expect(unknownPartial.totalCostUSD).toBeGreaterThan(0)
+    expect(unknownPartial.totalCostUSD).not.toBe(0.25)
 
     const positive = byId.get('positive-estimate')!
     expect(positive.totalCostUSD).toBe(0.5)

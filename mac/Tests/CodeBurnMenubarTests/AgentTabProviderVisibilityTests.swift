@@ -4,11 +4,6 @@ import Testing
 
 @Suite("Agent tab provider visibility")
 struct AgentTabProviderVisibilityTests {
-    @Test func clineFilterRecognizesBothNativeAndCLIProviderIds() {
-        #expect(ProviderFilter.cline.providerKeys.contains("cline"))
-        #expect(ProviderFilter.cline.providerKeys.contains("cline-cli"))
-    }
-
     @Test("zero-cost providers with usage remain active while idle providers stay hidden")
     func zeroCostProvidersWithUsageRemainActive() {
         let details = [

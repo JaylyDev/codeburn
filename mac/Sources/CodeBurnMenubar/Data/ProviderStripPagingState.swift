@@ -1,5 +1,17 @@
 import Foundation
 
+enum ProviderStripPagingDirection: Sendable {
+    case backward
+    case forward
+
+    var offset: Int {
+        switch self {
+        case .backward: -1
+        case .forward: 1
+        }
+    }
+}
+
 struct ProviderStripPagingState: Sendable, Equatable {
     let filters: [ProviderFilter]
     let selectedProvider: ProviderFilter
@@ -25,9 +37,9 @@ struct ProviderStripPagingState: Sendable, Equatable {
     var canMoveForward: Bool { anchorIndex >= 0 && anchorIndex < filters.count - 1 }
 
     @discardableResult
-    mutating func move(direction: Int) -> ProviderFilter? {
-        guard !filters.isEmpty, direction != 0 else { return viewportAnchor }
-        let targetIndex = min(max(anchorIndex + (direction < 0 ? -1 : 1), 0), filters.count - 1)
+    mutating func move(direction: ProviderStripPagingDirection) -> ProviderFilter? {
+        guard !filters.isEmpty else { return viewportAnchor }
+        let targetIndex = min(max(anchorIndex + direction.offset, 0), filters.count - 1)
         viewportAnchor = filters[targetIndex]
         return viewportAnchor
     }

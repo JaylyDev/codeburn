@@ -11,11 +11,11 @@ struct ProviderStripPagingStateTests {
             viewportAnchor: .all
         )
 
-        #expect(state.move(direction: 1) == .claude)
+        #expect(state.move(direction: .forward) == .claude)
         #expect(state.viewportAnchor == .claude)
         #expect(state.selectedProvider == .all)
 
-        #expect(state.move(direction: 1) == .cursor)
+        #expect(state.move(direction: .forward) == .cursor)
         #expect(state.viewportAnchor == .cursor)
         #expect(state.selectedProvider == .all)
         #expect(!state.canMoveForward)
@@ -30,7 +30,7 @@ struct ProviderStripPagingStateTests {
         )
 
         #expect(state.viewportAnchor == .claude)
-        #expect(state.move(direction: -1) == .all)
+        #expect(state.move(direction: .backward) == .all)
         #expect(state.selectedProvider == .claude)
     }
 
@@ -42,7 +42,7 @@ struct ProviderStripPagingStateTests {
             viewportAnchor: nil
         )
 
-        #expect(state.move(direction: 1) == nil)
+        #expect(state.move(direction: .forward) == nil)
         #expect(!state.canMoveBackward)
         #expect(!state.canMoveForward)
     }

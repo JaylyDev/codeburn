@@ -470,6 +470,7 @@ function resolveHermesCost(
     return { costUSD: row.actual_cost_usd, costIsEstimated: false, costBasis: 'actual' }
   }
   const costStatus = row?.cost_status?.trim().toLowerCase()
+  const costSource = row?.cost_source?.trim().toLowerCase()
   // Included subscription usage is real activity but not metered API spend.
   // Its recorded zero must win over API-equivalent token pricing.
   if (costStatus === 'included') {
@@ -480,8 +481,10 @@ function resolveHermesCost(
   if (costStatus === 'estimated' && row?.estimated_cost_usd != null) {
     return { costUSD: row.estimated_cost_usd, costIsEstimated: true, costBasis: 'estimated' }
   }
-  // Older Hermes schemas may have a positive estimate without cost_status.
-  if (row && row.estimated_cost_usd != null && row.estimated_cost_usd > 0) {
+  // Only rows predating BOTH provenance fields use the legacy positive-estimate
+  // fallback. A provenance-aware `unknown` row can retain a partial estimate
+  // from earlier priced calls; treating that as the session total undercounts.
+  if (!costStatus && !costSource && row && row.estimated_cost_usd != null && row.estimated_cost_usd > 0) {
     return { costUSD: row.estimated_cost_usd, costIsEstimated: true, costBasis: 'estimated' }
   }
   return { costUSD: calculatedCost, costIsEstimated: true, costBasis: 'calculated' }

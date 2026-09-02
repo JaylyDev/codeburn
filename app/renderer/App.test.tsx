@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { App, overviewMemoKey, refreshedLabel, selectedReportMemoKeys, topCategoryByModel, usageSnapshotProps } from './App'
@@ -515,6 +515,34 @@ describe('App shortcuts', () => {
     expect(await screen.findByRole('option', { name: 'Claude' })).toBeInTheDocument()
     expect(screen.getByRole('option', { name: 'Cursor' })).toBeInTheDocument()
     expect(screen.queryByRole('option', { name: 'Hermes' })).not.toBeInTheDocument()
+  })
+
+  it('does not carry another period provider catalog into a scoped period view', async () => {
+    const payload = overviewPayload()
+    payload.current.providerDetails = [
+      { id: 'claude', label: 'Claude', cost: 10, hasUsage: true },
+      { id: 'hermes', label: 'Hermes', cost: 5, hasUsage: true },
+    ]
+    mocks.getOverview.mockResolvedValue(payload)
+
+    render(<App />)
+    expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('Providers'))
+    fireEvent.click(await screen.findByRole('option', { name: 'Claude' }))
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'claude'))
+
+    fireEvent.click(screen.getByText('Today'))
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('today', 'claude'))
+
+    fireEvent.click(screen.getByLabelText('Providers'))
+    expect(screen.getByRole('option', { name: 'Claude' })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: 'Hermes' })).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /^Sessions/ }))
+    const sessionFilters = await screen.findByRole('group', { name: 'Filter sessions by provider' })
+    expect(within(sessionFilters).getByRole('button', { name: 'Claude' })).toBeInTheDocument()
+    expect(within(sessionFilters).queryByRole('button', { name: 'Hermes' })).not.toBeInTheDocument()
   })
 
   it('hides the Claude config picker when the payload carries no claudeConfigs', async () => {

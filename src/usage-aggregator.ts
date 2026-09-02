@@ -15,7 +15,7 @@ import { scanUserCorrections, medianTimeToFirstEditMs, aggregateFileChurn, compu
 import { buildPrAttribution, aggregateByBranch } from './sessions-report.js'
 import { scanAndDetect } from './optimize.js'
 import { callBillableOutputTokens, sessionBillableOutputTokens } from './session-output.js'
-import { getDaysInRange, ensureCacheHydrated, emptyCache, BACKFILL_DAYS, toDateString, type DailyCache, type DailyEntry, type ProjectDayStats, type ProviderDaySlice } from './daily-cache.js'
+import { getDaysInRange, ensureCacheHydrated, loadDailyCache, emptyCache, BACKFILL_DAYS, toDateString, type DailyCache, type DailyEntry, type ProjectDayStats, type ProviderDaySlice } from './daily-cache.js'
 import { buildGranularHistory } from './granular-history.js'
 
 // Row caps for the by-PR / by-branch payload aggregations, ranked by cost.
@@ -282,6 +282,24 @@ function sliceDayToProvider(day: DailyEntry, provider: string): DailyEntry {
   }
 }
 
+/// Overlay surviving provider-scoped source data onto the durable all-provider
+/// cache without touching unrelated providers. A fresh slice wins for its date;
+/// a missing fresh slice keeps the cached provider history because its source
+/// may simply have aged out. The result is provider-sliced so headline and
+/// history consumers cannot accidentally count unrelated providers.
+export function overlayProviderDaySlices(
+  baseline: DailyEntry[],
+  fresh: DailyEntry[],
+  provider: string,
+): DailyEntry[] {
+  const byDate = new Map(baseline.map(day => [day.date, sliceDayToProvider(day, provider)]))
+  for (const day of fresh) {
+    if (!Object.hasOwn(day.providers, provider)) continue
+    byDate.set(day.date, sliceDayToProvider(day, provider))
+  }
+  return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date))
+}
+
 /// Does a cached day's project entry pass the active name filters? Mirrors
 /// parser.filterProjectsByName exactly — case-insensitive substring match
 /// against the project name OR its filesystem path, include first then exclude —
@@ -532,10 +550,10 @@ export type DurablePeriod = {
   /// Fresh per-period parse (provider + name filtered) for detail views that
   /// still need surviving session files.
   liveProjects: ProjectSummary[]
-  /// Hydrated all-provider cache (reused by the menubar's provider list + daily
-  /// history sections).
+  /// Shared durable cache. All-provider requests hydrate it; provider-scoped
+  /// requests load it without triggering unrelated provider scans.
   cache: DailyCache
-  /// Today-only slice, all providers, name-filtered (memo seed for the menubar).
+  /// Today-only, name-filtered slice for the active provider scope.
   todayAllDays: DailyEntry[]
   /// The scan range the live parse covered (today-only when the period is today).
   scanRange: DateRange
@@ -554,14 +572,18 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
   const rangeEndStr = toDateString(periodInfo.range.end)
   const isTodayOnly = rangeStartStr === todayStr && rangeEndStr === todayStr
 
-  const cache = await hydrateCache()
+  // The shared daily cache is hydrated only by an all-provider request. A
+  // provider tab must not turn into a hidden all-provider scan on a cold or
+  // migrating cache; it loads the durable cache as-is and overlays the selected
+  // provider's surviving source data below.
+  const cache = pf === 'all' ? await hydrateCache() : await loadDailyCache()
 
-  // Today's live data always comes from an all-provider parse so the union (and
-  // any per-provider slice of it) sees every provider's today. `todayAllDays` is
-  // the today bucket only — the union filters the historical remainder out of the
-  // cache.
+  // The unscoped path parses all providers. A provider-scoped path parses only
+  // that provider and overlays its fresh slices onto the durable cache below.
+  // `todayAllDays` is the today bucket for whichever scope is active.
   let liveProjects: ProjectSummary[]
   let todayAllDays: DailyEntry[]
+  let freshProviderDays: DailyEntry[] = []
   let scanRange: DateRange
   if (pf === 'all') {
     if (isTodayOnly) {
@@ -590,6 +612,7 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
     // here made a first hover deserialize the entire multi-gigabyte cache even
     // though the returned payload contains only `pf`.
     const rawProv = fp(await parseAllSessions(isTodayOnly ? todayRange : periodInfo.range, pf))
+    freshProviderDays = aggregateProjectsIntoDays(rawProv)
     todayAllDays = rangeEndStr >= todayStr
       ? aggregateProjectsIntoDays(filterProjectsByDays(rawProv, new Set([todayStr]))).filter(d => d.date === todayStr)
       : []
@@ -624,7 +647,14 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
     : undefined
 
   const allDays = unionDaysForPeriod(cache, todayAllDays, periodInfo, daysSelection?.days ?? null, sliceHistorical)
-  const days = pf === 'all' ? allDays : allDays.map(d => sliceDayToProvider(d, pf))
+  const freshDaysInSelection = freshProviderDays.filter(day =>
+    day.date >= rangeStartStr
+      && day.date <= rangeEndStr
+      && (!daysSelection || daysSelection.days.has(day.date)),
+  )
+  const days = pf === 'all'
+    ? allDays
+    : overlayProviderDaySlices(allDays, freshDaysInSelection, pf)
   const data = buildPeriodDataFromDays(days, periodInfo.label)
 
   // Enrich the cache-authoritative headline with fields DailyEntry cannot carry.
@@ -747,11 +777,10 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
     // still renders.
   }
   if (!effectivelyScoped) {
-    // Every non-scoped headline — all-provider AND provider-filtered — is built
-    // by the one shared durable-totals builder. It unions the carry-forward
-    // cache with today's live parse (slicing to the provider when filtered), so
-    // days whose session files have expired still count. The provider list and
-    // daily-history sections below reuse its cache + today slice.
+    // Every non-config-scoped headline is built by the shared durable-totals
+    // builder. The all-provider path hydrates the cache; a provider-filtered
+    // path overlays that provider's surviving source slices without scanning
+    // unrelated providers. Expired-source history remains durable in both.
     const durable = await buildDurablePeriod(periodInfo, {
       provider: pf,
       project: opts.project,
@@ -873,38 +902,9 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
     const fullHistory = [...allCacheDays, ...todayDays]
     dailyHistory = dailyEntriesToHistory(fullHistory)
   } else {
-    const emptyModels = [] as { name: string; cost: number; savingsUSD: number; calls: number; inputTokens: number; outputTokens: number }[]
-    const historyFromCache = allCacheDays.map(d => {
-      const prov = d.providers[pf] ?? { calls: 0, cost: 0, savingsUSD: 0 }
-      return {
-        date: d.date,
-        cost: prov.cost,
-        savingsUSD: prov.savingsUSD,
-        calls: prov.calls,
-        inputTokens: 0,
-        outputTokens: 0,
-        cacheReadTokens: 0,
-        cacheWriteTokens: 0,
-        topModels: emptyModels,
-      }
-    })
-    const todayFromParse = aggregateProjectsIntoDays(scanProjects)
-      .filter(d => d.date === todayStr)
-      .map(d => {
-        const prov = d.providers[pf] ?? { calls: 0, cost: 0, savingsUSD: 0 }
-        return {
-          date: d.date,
-          cost: prov.cost,
-          savingsUSD: prov.savingsUSD,
-          calls: prov.calls,
-          inputTokens: 0,
-          outputTokens: 0,
-          cacheReadTokens: 0,
-          cacheWriteTokens: 0,
-          topModels: emptyModels,
-        }
-      })
-    dailyHistory = [...historyFromCache, ...todayFromParse]
+    const freshHistory = [...aggregateProjectsIntoDays(scanProjects), ...(todayAllDays ?? [])]
+      .filter(day => day.date >= historyStartStr && day.date <= todayStr)
+    dailyHistory = dailyEntriesToHistory(overlayProviderDaySlices(allCacheDays, freshHistory, pf))
   }
 
   const home = homedir()

@@ -2252,7 +2252,7 @@ enum ProviderFilter: String, CaseIterable, Identifiable {
         switch self {
         case .cursor: ["cursor"]
         case .cursorAgent: ["cursor-agent", "cursor agent"]
-        case .cline: ["cline", "cline-cli"]
+        case .cline: ["cline"]
         case .codewhale: ["codewhale"]
         case .rooCode: ["roo-code", "roo code"]
         case .kiloCode: ["kilo-code", "kilocode"]

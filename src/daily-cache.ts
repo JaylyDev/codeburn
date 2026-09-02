@@ -465,14 +465,14 @@ function migrateDays(days: Record<string, unknown>[]): DailyEntry[] {
 /// an unspent entitlement out of the parsed file so a same-version reload does
 /// not drop it.
 function pendingRederiveFor(fromVersion: number, parsed: unknown): string[] | undefined {
-  if (fromVersion < DAILY_CACHE_VERSION) {
-    const pending = providersPendingRederiveFrom(fromVersion)
-    return pending.length > 0 ? pending : undefined
-  }
   const raw = (parsed as { pendingRederive?: unknown } | null)?.pendingRederive
-  if (!Array.isArray(raw)) return undefined
-  const kept = raw.filter((p): p is string => typeof p === 'string')
-  return kept.length > 0 ? kept : undefined
+  const pending = new Set(
+    Array.isArray(raw) ? raw.filter((p): p is string => typeof p === 'string') : [],
+  )
+  if (fromVersion < DAILY_CACHE_VERSION) {
+    for (const provider of providersPendingRederiveFrom(fromVersion)) pending.add(provider)
+  }
+  return pending.size > 0 ? [...pending] : undefined
 }
 
 function migratedFrom(parsed: { version: number; lastComputedDate: string | null; savingsConfigHash?: string; tzKey?: string; days: Record<string, unknown>[]; complete?: boolean; watermarkTrusted?: boolean }): DailyCache {
@@ -598,7 +598,7 @@ async function adoptOlderDailyCaches(): Promise<DailyCache> {
     pendingRederive: (() => {
       const pending = new Set(base.pendingRederive ?? [])
       for (const candidate of rest) {
-        for (const provider of providersPendingRederiveFrom(candidate.parsed.version)) {
+        for (const provider of pendingRederiveFor(candidate.parsed.version, candidate.parsed) ?? []) {
           pending.add(provider)
         }
       }

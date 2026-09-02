@@ -24,7 +24,7 @@ struct AgentTabStrip: View {
                 HStack(spacing: 4) {
                     if isOverflowing {
                         Button {
-                            pageProviderStrip(direction: -1, proxy: proxy)
+                            pageProviderStrip(direction: .backward, proxy: proxy)
                         } label: {
                             Image(systemName: "chevron.left")
                                 .font(.system(size: 10, weight: .semibold))
@@ -75,7 +75,7 @@ struct AgentTabStrip: View {
 
                     if isOverflowing {
                         Button {
-                            pageProviderStrip(direction: 1, proxy: proxy)
+                            pageProviderStrip(direction: .forward, proxy: proxy)
                         } label: {
                             Image(systemName: "chevron.right")
                                 .font(.system(size: 10, weight: .semibold))
@@ -91,30 +91,18 @@ struct AgentTabStrip: View {
                     stripViewportWidth = viewportGeo.size.width
                     installScrollWheelMonitorIfNeeded()
                     viewportAnchor = pagingState.viewportAnchor
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        if let viewportAnchor {
-                            proxy.scrollTo(viewportAnchor.id, anchor: .center)
-                        }
-                    }
+                    scrollToViewportAnchor(proxy: proxy)
                 }
                 .onChange(of: viewportGeo.size.width) { _, newWidth in
                     stripViewportWidth = newWidth
                 }
                 .onChange(of: store.selectedProvider) { _, newProvider in
                     viewportAnchor = visibleFilters.contains(newProvider) ? newProvider : pagingState.viewportAnchor
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        if let viewportAnchor {
-                            proxy.scrollTo(viewportAnchor.id, anchor: .center)
-                        }
-                    }
+                    scrollToViewportAnchor(proxy: proxy)
                 }
                 .onChange(of: visibleFilters) { _, _ in
                     viewportAnchor = pagingState.viewportAnchor
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        if let viewportAnchor {
-                            proxy.scrollTo(viewportAnchor.id, anchor: .center)
-                        }
-                    }
+                    scrollToViewportAnchor(proxy: proxy)
                 }
                 .onDisappear {
                     removeScrollWheelMonitorIfNeeded()
@@ -132,7 +120,7 @@ struct AgentTabStrip: View {
         // Tabs reflect the selected range. The payload's activity signal keeps
         // token-only and subscription/flat-rate providers visible while hiding
         // providers merely discovered on disk. Older payloads lack the activity
-        // signal, so they preserve detected-provider visibility for compatibility.
+        // signal, so their zero-cost discovery rows fail closed.
         let activeKeys = ProviderVisibility.activeKeys(
             providerDetails: periodAll.current.providerDetails,
             legacyProviders: periodAll.current.providers
@@ -177,12 +165,17 @@ struct AgentTabStrip: View {
     private var canMoveForward: Bool { pagingState.canMoveForward }
     private var isOverflowing: Bool { stripContentWidth > (stripViewportWidth - 30) }
 
-    private func pageProviderStrip(direction: Int, proxy: ScrollViewProxy) {
+    private func pageProviderStrip(direction: ProviderStripPagingDirection, proxy: ScrollViewProxy) {
         var state = pagingState
         guard let target = state.move(direction: direction) else { return }
         viewportAnchor = target
+        scrollToViewportAnchor(proxy: proxy)
+    }
+
+    private func scrollToViewportAnchor(proxy: ScrollViewProxy) {
+        guard let viewportAnchor else { return }
         withAnimation(.easeInOut(duration: 0.18)) {
-            proxy.scrollTo(target.id, anchor: .center)
+            proxy.scrollTo(viewportAnchor.id, anchor: .center)
         }
     }
 
