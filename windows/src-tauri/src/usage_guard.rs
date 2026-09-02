@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Unchanged-skips are honoured for at most this long after the last successful fetch.
 pub const MAX_SKIP_SECS: u64 = 30 * 60;
@@ -351,6 +351,7 @@ fn roots() -> Vec<Root> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     fn snapshot_with(pairs: &[(&str, u64)]) -> Snapshot {
         Snapshot {

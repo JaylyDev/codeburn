@@ -30,12 +30,6 @@ export function writeSetting(key: Key, value: string | null): void {
 
 export type Theme = 'light' | 'dark'
 
-export function currentTheme(): Theme {
-  const stamped = document.documentElement.getAttribute('data-theme')
-  if (stamped === 'dark' || stamped === 'light') return stamped
-  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
-}
-
 export function applyTheme(theme: Theme | null): void {
   if (theme) document.documentElement.setAttribute('data-theme', theme)
   else document.documentElement.removeAttribute('data-theme')

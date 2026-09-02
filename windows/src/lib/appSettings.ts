@@ -170,10 +170,6 @@ function migrated(raw: Record<string, unknown>): Record<string, unknown> {
   return next
 }
 
-export function settingsSnapshot(): AppSettings {
-  return current
-}
-
 export async function loadSettings(): Promise<AppSettings> {
   if (loading) return loading
   loading = (async () => {

@@ -249,24 +249,6 @@ export function CheckIcon(p: IconProps) {
   return <Svg {...p}><path d="M3.5 8.5 6.5 11.5 12.5 5" /></Svg>
 }
 
-export function SunMoonIcon(p: IconProps) {
-  return (
-    <Svg {...p}>
-      <circle cx="8" cy="8" r="4" />
-      <path d="M8 4V1.5M8 14.5V12M4 8H1.5M14.5 8H12M5.2 5.2 3.4 3.4M12.6 12.6l-1.8-1.8M5.2 10.8l-1.8 1.8M12.6 3.4l-1.8 1.8" />
-    </Svg>
-  )
-}
-
-export function PowerIcon(p: IconProps) {
-  return (
-    <Svg {...p}>
-      <path d="M8 2v6" />
-      <path d="M4.6 4.6a5 5 0 1 0 6.8 0" />
-    </Svg>
-  )
-}
-
 /// doc.on.doc, for the copyable command in the CLI update banner.
 export function CopyIcon(p: IconProps) {
   return (

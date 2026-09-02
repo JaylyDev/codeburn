@@ -76,7 +76,6 @@
   --radius-pill: 6px;
   --radius-track: 7px;
   --radius-card: 8px;
-  --scroll-height: 520px;
 
   --ease-ui: cubic-bezier(0.2, 0.7, 0.2, 1);
 }
@@ -1719,24 +1718,6 @@ code { font-family: var(--font-mono); }
   transition: transform 160ms var(--ease-ui);
 }
 .toggle-on .toggle-knob { transform: translateX(14px); }
-
-.segmented {
-  display: flex;
-  gap: 1px;
-  padding: 2px;
-  border-radius: var(--radius-track);
-  background: var(--fill-08);
-}
-.segment {
-  border: 0;
-  background: transparent;
-  padding: 3px 9px;
-  border-radius: var(--radius-segment);
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--label-2);
-}
-.segment-active { background: var(--surface-window); color: var(--label); box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.10); }
 
 /* ---- loading overlay ---------------------------------------------------------- */
 
