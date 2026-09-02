@@ -419,11 +419,23 @@ export function App() {
   const trayFigure = isTokenMetric
     ? (trayTokens === null ? null : `${formatTokens(trayTokens)} tok`)
     : (trayCost === null ? null : formatCurrency(trayCost, currency))
+  // Combined scope with a paired device that did not report this cycle: the figure is short
+  // of what these machines actually spent, and the mac says so beside its title with a dimmed
+  // "reachable/total". A 16 px bitmap has no room for that, so the badge is drawn dimmed and
+  // the counts go where there is room for words.
+  const trayShortfall = trayCombined !== null && trayCombined.reachableCount < trayCombined.deviceCount
+    ? { reachable: trayCombined.reachableCount, total: trayCombined.deviceCount }
+    : null
 
   useEffect(() => {
     if (trayFigure === null) return
-    invoke('set_tray_tooltip', { text: `CodeBurn · ${trayFigure}${traySuffix}` }).catch(() => {})
-  }, [trayFigure, traySuffix])
+    const devices = trayShortfall
+      ? ` · ${trayShortfall.reachable} of ${trayShortfall.total} devices reporting`
+      : ''
+    invoke('set_tray_tooltip', { text: `CodeBurn · ${trayFigure}${traySuffix}${devices}` }).catch(() => {})
+    // Only the counts matter here, not the object identity a render makes fresh every time.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trayFigure, traySuffix, trayShortfall?.reachable, trayShortfall?.total])
 
   useEffect(() => {
     if (!TRAY_BADGE_SUPPORTED) return
@@ -436,8 +448,9 @@ export function App() {
       : isTokenMetric
         ? (trayTokens === null ? null : formatTokens(trayTokens))
         : (trayCost === null ? null : trayBadgeText(trayCost, currency))
-    invoke('set_tray_badge', { text }).catch(err => setError(`Tray badge: ${String(err)}`))
-  }, [trayCost, trayTokens, currency, trayBadge, settings.metric, isTokenMetric])
+    invoke('set_tray_badge', { text, muted: trayShortfall !== null }).catch(err => setError(`Tray badge: ${String(err)}`))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trayCost, trayTokens, currency, trayBadge, settings.metric, isTokenMetric, trayShortfall?.reachable, trayShortfall?.total])
 
   // The flame carries the worst connected provider's quota severity. Rust decides whether
   // today's spend is over the daily budget, since the limit lives in the CLI's config.
@@ -452,11 +465,13 @@ export function App() {
 
   useEffect(() => {
     const span = MENUBAR_PERIODS.find(p => p.id === settings.menubarPeriod)?.label ?? 'Today'
+    const devices = trayShortfall ? ` · ${trayShortfall.reachable}/${trayShortfall.total} devices` : ''
     const text = trayCurrent
-      ? `${span} · ${trayFigure} · ${plural(trayCurrent.calls, 'call')}`
+      ? `${span} · ${trayFigure} · ${plural(trayCurrent.calls, 'call')}${devices}`
       : `${span} · no usage yet`
     invoke('set_tray_usage', { text }).catch(() => {})
-  }, [trayCurrent, trayFigure, settings.menubarPeriod])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trayCurrent, trayFigure, settings.menubarPeriod, trayShortfall?.reachable, trayShortfall?.total])
 
   const chooseAccent = (preset: AccentPreset) => {
     applyAccent(preset)

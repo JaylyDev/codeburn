@@ -467,7 +467,7 @@ fn apply_tray_tooltip(app: &AppHandle, text: &str) {
 
 /// `text` is a short spend string ("$87", "142", "1.2K"); `None` hides the badge icon.
 #[cfg(not(target_os = "linux"))]
-fn apply_tray_badge(app: &AppHandle, text: Option<&str>) -> Result<(), String> {
+fn apply_tray_badge(app: &AppHandle, text: Option<&str>, muted: bool) -> Result<(), String> {
     let Some(badge) = app.tray_by_id(BADGE_TRAY_ID) else {
         return Ok(());
     };
@@ -477,6 +477,7 @@ fn apply_tray_badge(app: &AppHandle, text: Option<&str>) -> Result<(), String> {
                 t,
                 tray_badge::small_icon_size(),
                 tray_badge::taskbar_is_dark(),
+                muted,
             );
             // Windows can only modify an icon that is currently shown, so show first
             // (re-adds the previous bitmap) and then swap the bitmap.
@@ -591,7 +592,9 @@ fn restore_tray_status(app: &AppHandle) {
         apply_tray_tooltip(app, tooltip);
     }
     if let Some(badge) = status.badge.as_deref() {
-        let _ = apply_tray_badge(app, Some(badge));
+        // Never restored dimmed: whether a paired device answers is this session's question,
+        // and the first refresh dims it again if it still cannot be reached.
+        let _ = apply_tray_badge(app, Some(badge), false);
     }
 }
 
@@ -944,14 +947,20 @@ mod commands {
     }
 
     /// `text` is a short spend string ("$87", "142", "1.2K"); `None` hides the badge icon.
+    /// `muted` says a paired device did not report under combined scope, so the figure is
+    /// short of what the reader's machines actually spent.
     #[tauri::command]
-    pub fn set_tray_badge(app: AppHandle, text: Option<String>) -> Result<(), String> {
+    pub fn set_tray_badge(
+        app: AppHandle,
+        text: Option<String>,
+        muted: Option<bool>,
+    ) -> Result<(), String> {
         #[cfg(target_os = "linux")]
         {
             // Unreachable from the UI: the frontend hides the control wherever the badge is
             // unsupported (lib/platform.ts). Saying so beats reporting a success that never
             // happened.
-            let _ = (app, text);
+            let _ = (app, text, muted);
             Err("the tray spend badge needs a second tray icon, which the Linux SNI tray does not provide".to_string())
         }
         #[cfg(not(target_os = "linux"))]
@@ -960,7 +969,7 @@ mod commands {
             if let Err(err) = crate::tray_status::write_status(|status| status.badge = stored) {
                 eprintln!("codeburn: failed to persist the tray badge: {err}");
             }
-            super::apply_tray_badge(&app, text.as_deref())
+            super::apply_tray_badge(&app, text.as_deref(), muted.unwrap_or(false))
         }
     }
 
