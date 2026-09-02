@@ -295,7 +295,7 @@ describe('buildMenubarPayload', () => {
     ])
   })
 
-  it('keeps zero-cost detected providers in the legacy dict for compatibility', () => {
+  it('keeps the legacy provider dict additive while providerDetails remains the activity authority', () => {
     const providers: ProviderCost[] = [
       { name: 'claude', displayName: 'Claude', cost: 76.45 },
       { name: 'codex', displayName: 'Codex', cost: 0 },
@@ -303,6 +303,11 @@ describe('buildMenubarPayload', () => {
     ]
     const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
     expect(payload.current.providers).toEqual({ claude: 76.45, codex: 0, cursor: 2.18 })
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'claude', label: 'Claude', cost: 76.45, calls: 0, hasUsage: true },
+      { id: 'codex', label: 'Codex', cost: 0, calls: 0, hasUsage: false },
+      { id: 'cursor', label: 'Cursor', cost: 2.18, calls: 0, hasUsage: true },
+    ])
   })
 
   it('includes up to 365 daily history entries sorted ascending by date', () => {

@@ -261,7 +261,11 @@ function AppMain() {
   const [settingsPane, setSettingsPane] = useState<SettingsPane>('general')
   const [period, setPeriod] = useState<Period>(initialPeriod)
   const [provider, setProvider] = useState<string>('all')
-  const [detectedProviders, setDetectedProviders] = useState<Array<{ id: string; label: string }>>([])
+  const [providerCatalog, setProviderCatalog] = useState<{
+    key: string | null
+    entries: Array<{ id: string; label: string }>
+  }>({ key: null, entries: [] })
+  const detectedProviders = providerCatalog.entries
   const [customRange, setCustomRange] = useState<DateRange | null>(null)
   const [claudeConfigSource, setClaudeConfigSource] = useState<string | null>(initialConfigSource)
   const [scope, setScopeState] = useState<Scope>(initialScope)
@@ -278,6 +282,10 @@ function AppMain() {
   // the config scope before this poll runs. Passing scope='local' produces the
   // same flag-free argv as before, so local users are unaffected.
   const activeOverviewKey = overviewMemoKey(provider, period, customRange, claudeConfigSource, scope, new Date(now))
+  // Provider membership is period/range-specific. Keep the catalog tied to the
+  // exact unscoped local overview that produced it so a scoped view cannot leak
+  // providers from a different time horizon while its own payload is loading.
+  const allProviderOverviewKey = overviewMemoKey('all', period, customRange, null, 'local', new Date(now))
   const overview = usePolled<MenubarPayload>(
     () => scope === 'combined'
       ? codeburn.getOverview(period, 'all', customRange ?? undefined, undefined, undefined, 'combined')
@@ -388,30 +396,41 @@ function AppMain() {
   }, [])
 
   useEffect(() => {
-    if (!overview.data) return
+    // Only the all-provider payload is authoritative for the picker. A scoped
+    // payload contains just the selected provider; merging it forever also
+    // leaked idle providers across period changes.
+    if (!overview.data || overview.switching || provider !== 'all' || claudeConfigSource || scope !== 'local') return
     const details = overview.data.current.providerDetails
     // Prefer providerDetails (internal id + display label); fall back to the
-    // providers map keys (lowercased display names) for older CLIs. The CLI
-    // only emits detected providers, so keep every entry (including ones with
-    // no spend this period) and sort by cost so zero-cost ones sit at the
-    // bottom of the picker.
+    // providers map keys (lowercased display names) for older CLIs. `hasUsage`
+    // keeps idle discovery rows out of the picker, but only when the CLI
+    // actually emits it: every released CLI omits it, and falling back to cost
+    // there hid subscription-backed providers whose period spend is $0.
     const found = details
       ? [...details]
+          .filter(entry => entry.hasUsage ?? true)
           .sort((a, b) => b.cost - a.cost)
           .map(entry => ({ id: entry.id, label: entry.label }))
       : Object.entries(overview.data.current.providers)
           // Fallback map keys are lowercased display names; ones with spaces
           // ("grok build") cannot round-trip as --provider, so exclude them
           // rather than offer a filter that is guaranteed to error.
-          .filter(([key]) => /^[a-z0-9-]+$/.test(key))
+          .filter(([key, cost]) => cost > 0 && /^[a-z0-9-]+$/.test(key))
           .sort(([, a], [, b]) => b - a)
           .map(([key]) => ({ id: key, label: providerName(key) }))
-    setDetectedProviders(current => {
-      const next = [...current]
-      for (const item of found) if (!next.some(entry => entry.id === item.id)) next.push(item)
-      return next.length === current.length ? current : next
-    })
-  }, [overview.data])
+    setProviderCatalog({ key: allProviderOverviewKey, entries: found })
+  }, [allProviderOverviewKey, claudeConfigSource, overview.data, overview.switching, provider, scope])
+
+  const selectedProviderEntry = useMemo(() => provider === 'all'
+    ? null
+    : detectedProviders.find(entry => entry.id === provider) ?? { id: provider, label: providerName(provider) },
+  [detectedProviders, provider])
+  const visibleProviderEntries = useMemo(() => providerCatalog.key === allProviderOverviewKey
+    ? detectedProviders
+    : selectedProviderEntry
+      ? [selectedProviderEntry]
+      : [],
+  [allProviderOverviewKey, detectedProviders, providerCatalog.key, selectedProviderEntry])
 
   useEffect(() => {
     const currency = overview.data?.currency
@@ -532,7 +551,7 @@ function AppMain() {
       // Keep the current-main provider-switch contract while the shared Core
       // provider snapshot work is still held: warm the visible period for each
       // detected provider only after the higher-value period/report queue.
-      for (const targetProvider of detectedProviders.map(entry => entry.id)) {
+      for (const targetProvider of visibleProviderEntries.map(entry => entry.id)) {
         if (cancelled || targetProvider === provider) continue
         const key = overviewMemoKey(targetProvider, period, null, null)
         if (warmedKeys.current.has(key) || hasPolledMemo(key)) continue
@@ -558,7 +577,7 @@ function AppMain() {
     // `overview.data == null` (a boolean) gates on first-resolution without
     // re-running every poll; the data content itself is intentionally not a dep.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, period, provider, detectedProviders, customRange, claudeConfigSource, scope, snapshotRevision, overview.data == null])
+  }, [ready, period, provider, visibleProviderEntries, customRange, claudeConfigSource, scope, snapshotRevision, overview.data == null])
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 1000)
@@ -662,9 +681,9 @@ function AppMain() {
   const claudeConfigs = overview.data?.claudeConfigs
   const providerOptions = [
     { value: 'all', label: 'All providers' },
-    ...detectedProviders.map(entry => ({ value: entry.id, label: entry.label })),
+    ...visibleProviderEntries.map(entry => ({ value: entry.id, label: entry.label })),
   ]
-  const providerLabel = detectedProviders.find(entry => entry.id === provider)?.label ?? providerName(provider)
+  const providerLabel = selectedProviderEntry?.label ?? providerName(provider)
   const activeConfigLabel = claudeConfigSource
     ? claudeConfigs?.options.find(option => option.id === claudeConfigSource)?.label ?? null
     : null
@@ -719,7 +738,7 @@ function AppMain() {
               {section === 'overview' ? (
                 <OverviewContent period={period} provider={provider} range={customRange} overview={overview} onNavigate={navigate} ready={ready} scope={scope} headlineSnapshot={headlineSnapshot} />
               ) : section === 'sessions' ? (
-                <Sessions period={period} provider={provider} range={customRange} refreshToken={refreshToken} detectedProviders={detectedProviders} onProviderChange={onProviderSelect} ready={ready} />
+                <Sessions period={period} provider={provider} range={customRange} refreshToken={refreshToken} detectedProviders={visibleProviderEntries} onProviderChange={onProviderSelect} ready={ready} />
               ) : section === 'pullRequests' ? (
                 <PullRequestsContent overview={overview} period={period} provider={provider} range={customRange} />
               ) : section === 'spend' ? (

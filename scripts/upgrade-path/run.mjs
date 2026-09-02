@@ -33,7 +33,6 @@ const WORK = process.env['UPGRADE_PATH_WORK'] || join(tmpdir(), 'codeburn upgrad
 const OLD_SESSION_CACHE = 'session-cache.v7.json'
 const OLD_DAILY_CACHE = 'daily-cache.v17.json'
 const NEW_SESSION_CACHE_DIR = 'session-cache.v9'
-const NEW_DAILY_CACHE = 'daily-cache.v29.json'
 
 const HOME = join(WORK, 'user home')
 const PAYLOADS = join(WORK, 'payloads')
@@ -47,6 +46,14 @@ const ok = msg => console.log(`  ok    ${msg}`)
 const fail = msg => { failures++; console.log(`  FAIL  ${msg}`) }
 const skip = msg => { skipped++; console.log(`  skip  ${msg}`) }
 const check = (cond, msg) => (cond ? ok(msg) : fail(msg))
+
+function newestDailyCacheAfter(dir, baselineName) {
+  const baseline = Number(baselineName.match(/^daily-cache\.v(\d+)\.json$/)?.[1] ?? -1)
+  return readdirSync(dir)
+    .map(name => ({ name, version: Number(name.match(/^daily-cache\.v(\d+)\.json$/)?.[1] ?? -1) }))
+    .filter(candidate => candidate.version > baseline)
+    .sort((a, b) => b.version - a.version)[0]?.name ?? null
+}
 
 function run(cmd, args, opts = {}) {
   const r = spawnSync(cmd, args, { encoding: 'utf8', maxBuffer: 1 << 29, shell: false, ...opts })
@@ -207,10 +214,12 @@ const envelope = JSON.parse(readFileSync(join(upgradeCache, NEW_SESSION_CACHE_DI
 check(envelope.version === 9 && Object.keys(envelope.providers ?? {}).length > 0,
   `envelope at version ${envelope.version} with ${Object.keys(envelope.providers ?? {}).length} providers`)
 check(readdirSync(join(upgradeCache, NEW_SESSION_CACHE_DIR)).some(n => n !== 'envelope.json'), 'shards published alongside the envelope')
-check(existsSync(join(upgradeCache, NEW_DAILY_CACHE)), `${NEW_DAILY_CACHE} re-derived`)
+const newDailyCache = newestDailyCacheAfter(upgradeCache, OLD_DAILY_CACHE)
+check(newDailyCache !== null, `${newDailyCache ?? 'current daily cache'} re-derived`)
 check(existsSync(join(upgradeCache, OLD_DAILY_CACHE)), `${OLD_DAILY_CACHE} kept as the carry-forward baseline`)
+if (!newDailyCache) process.exit(1)
 const oldDays = JSON.parse(readFileSync(join(upgradeCache, OLD_DAILY_CACHE), 'utf8')).days.length
-const newDays = JSON.parse(readFileSync(join(upgradeCache, NEW_DAILY_CACHE), 'utf8')).days.length
+const newDays = JSON.parse(readFileSync(join(upgradeCache, newDailyCache), 'utf8')).days.length
 check(newDays >= oldDays, `daily history did not shrink: ${oldDays} -> ${newDays} days`)
 
 // ── 4. payload parity ────────────────────────────────────────────────────────
@@ -415,7 +424,10 @@ else {
   for (const a of aged) ok(`${a.date}: ${a.kind} (removed ${a.removed} of ${a.removed + a.kept} transcripts)`)
 
   capture(newBin, agingCache, join(PAYLOADS, 'aging-upgraded'))
-  const upDaily = JSON.parse(readFileSync(join(agingCache, NEW_DAILY_CACHE), 'utf8'))
+  const agingDailyCache = newestDailyCacheAfter(agingCache, OLD_DAILY_CACHE)
+  check(agingDailyCache !== null, `${agingDailyCache ?? 'current aging daily cache'} re-derived`)
+  if (!agingDailyCache) process.exit(1)
+  const upDaily = JSON.parse(readFileSync(join(agingCache, agingDailyCache), 'utf8'))
   const usd = n => `$${n.toFixed(6)}`
 
   for (const a of aged) {

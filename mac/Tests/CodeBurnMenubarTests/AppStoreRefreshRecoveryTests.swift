@@ -84,6 +84,23 @@ private func menubarPayload(cost: Double,
 @Suite("AppStore refresh recovery")
 @MainActor
 struct AppStoreRefreshRecoveryTests {
+    @Test("provider switches retain the last rendered payload until the target loads")
+    func providerSwitchRetainsLastRenderedPayload() {
+        let store = AppStore()
+        store.suppressRefreshesForTesting()
+        store.setCachedPayloadForTesting(
+            menubarPayload(cost: 12.34),
+            period: .today,
+            provider: .all,
+            fetchedAt: Date()
+        )
+
+        store.switchTo(provider: .cursor)
+
+        #expect(store.selectedProvider == .cursor)
+        #expect(store.payload.current.cost == 12.34)
+    }
+
     @Test("stale visible payload triggers hard recovery without clearing cache")
     func stalePayloadTriggersHardRecoveryWithoutClearingCache() {
         let store = AppStore()

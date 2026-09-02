@@ -37,6 +37,8 @@ type HermesSessionRow = {
   reasoning_tokens: number | null
   estimated_cost_usd: number | null
   actual_cost_usd: number | null
+  cost_status: string | null
+  cost_source: string | null
   api_call_count: number | null
   tool_call_count: number | null
   started_at: number | null
@@ -467,13 +469,23 @@ function resolveHermesCost(
   if (row && row.actual_cost_usd != null) {
     return { costUSD: row.actual_cost_usd, costIsEstimated: false, costBasis: 'actual' }
   }
-  // estimated_cost_usd = 0.0 is not a measurement: Hermes writes it when cost_status
-  // is 'unknown' (no pricing data) or 'included' (flat subscription), so trusting it
-  // would zero out every subscription session. Only positive estimates are trusted;
-  // anything else falls through to the token-based calculation. A genuinely free
-  // model still lands on $0 either way, since litellm prices it at 0.
-  if (row && row.estimated_cost_usd != null && row.estimated_cost_usd > 0) {
-    return { costUSD: row.estimated_cost_usd, costIsEstimated: false, costBasis: 'estimated' }
+  const costStatus = row?.cost_status?.trim().toLowerCase()
+  const costSource = row?.cost_source?.trim().toLowerCase()
+  // Included subscription usage is real activity but not metered API spend.
+  // Its recorded zero must win over API-equivalent token pricing.
+  if (costStatus === 'included') {
+    return { costUSD: 0, costIsEstimated: false, costBasis: 'included' }
+  }
+  // An explicit Hermes estimate is authoritative even when it is zero (for
+  // example, a provider's free tier). Preserve that provenance in the UI.
+  if (costStatus === 'estimated' && row?.estimated_cost_usd != null) {
+    return { costUSD: row.estimated_cost_usd, costIsEstimated: true, costBasis: 'estimated' }
+  }
+  // Only rows predating BOTH provenance fields use the legacy positive-estimate
+  // fallback. A provenance-aware `unknown` row can retain a partial estimate
+  // from earlier priced calls; treating that as the session total undercounts.
+  if (!costStatus && !costSource && row && row.estimated_cost_usd != null && row.estimated_cost_usd > 0) {
+    return { costUSD: row.estimated_cost_usd, costIsEstimated: true, costBasis: 'estimated' }
   }
   return { costUSD: calculatedCost, costIsEstimated: true, costBasis: 'calculated' }
 }
@@ -507,9 +519,11 @@ function observationToCall(
     reasoningTokens: observation.reasoningTokens,
     webSearchRequests: 0,
     costUSD: observation.costUSD,
-    // Later observations keep the stored basis: calculated stays estimated;
-    // provider-recorded actual/estimated keep main's measured behavior.
-    costIsEstimated: later ? observation.costBasis === 'calculated' : args.costIsEstimated,
+    // Later observations keep the stored basis. Included and actual are
+    // recorded facts; estimated and calculated remain estimates.
+    costIsEstimated: later
+      ? observation.costBasis === 'calculated' || observation.costBasis === 'estimated'
+      : args.costIsEstimated,
     tools: later ? [] : args.tools,
     bashCommands: later ? [] : args.bashCommands,
     timestamp: observation.timestamp,
@@ -637,6 +651,8 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
                   ${numberColumn(columns, 'reasoning_tokens')},
                   ${nullableColumn(columns, 'estimated_cost_usd')},
                   ${nullableColumn(columns, 'actual_cost_usd')},
+                  ${nullableColumn(columns, 'cost_status')},
+                  ${nullableColumn(columns, 'cost_source')},
                   ${numberColumn(columns, 'api_call_count')},
                   ${numberColumn(columns, 'tool_call_count')},
                   ${nullableColumn(columns, 'started_at')},
