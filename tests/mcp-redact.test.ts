@@ -72,4 +72,21 @@ describe('redact', () => {
     expect(out.current.topProjects[0]!.sessionDetails![0]!.date).toBe('2026-06-01')
     expect(out.history.timeline?.sessionSeries[0]!.label).toContain('secret-client-repo')
   })
+  it('drops the live-session block even when names are included', () => {
+    const withSessions: MenubarPayload = {
+      ...payload(),
+      liveSessions: {
+        windowSeconds: 120,
+        sessions: [{
+          id: 'a', provider: 'claude', project: 'secret-client-repo', branch: 'secret-branch',
+          model: 'Opus 4.8', contextTokens: 1, contextWindow: 200_000,
+          startedAt: '2026-09-01T10:00:00.000Z', lastActivityAt: '2026-09-01T12:00:00.000Z',
+        }],
+      },
+    }
+    expect(redactProjectNames(withSessions, false).liveSessions).toBeUndefined()
+    const included = redactProjectNames(withSessions, true)
+    expect(included.liveSessions).toBeUndefined()
+    expect(JSON.stringify(included)).not.toContain('secret-branch')
+  })
 })

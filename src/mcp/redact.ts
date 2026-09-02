@@ -31,10 +31,12 @@ function redactSessionDetails(details: Array<{ cost: number; savingsUSD: number;
 }
 
 export function redactProjectNames(payload: MenubarPayload, includeNames: boolean): MenubarPayload {
-  if (includeNames) return payload
-  const timeline = payload.history?.timeline
+  // Live sessions name projects and branches; MCP consumers never need them.
+  const { liveSessions: _liveSessions, ...rest } = payload
+  if (includeNames) return rest
+  const timeline = rest.history?.timeline
   return {
-    ...payload,
+    ...rest,
     current: {
       ...payload.current,
       topProjects: payload.current.topProjects.map(p => ({

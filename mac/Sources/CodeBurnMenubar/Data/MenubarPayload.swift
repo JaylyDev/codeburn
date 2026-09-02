@@ -14,6 +14,10 @@ struct MenubarPayload: Codable, Sendable {
     let history: HistoryBlock
     let combined: CombinedUsage?
     let claudeConfigs: ClaudeConfigSelector?
+    /// Sessions whose transcript was appended inside the CLI's liveness window.
+    /// Absent on payloads from a CLI that predates the block, so absence means
+    /// "unknown", not "nothing running": the popover hides the section either way.
+    let liveSessions: LiveSessionsBlock?
 
     init(generated: String,
          current: CurrentBlock,
@@ -21,7 +25,9 @@ struct MenubarPayload: Codable, Sendable {
          history: HistoryBlock,
          combined: CombinedUsage?,
          claudeConfigs: ClaudeConfigSelector? = nil,
-         stale: Bool? = nil) {
+         stale: Bool? = nil,
+         liveSessions: LiveSessionsBlock? = nil) {
+        self.liveSessions = liveSessions
         self.generated = generated
         self.stale = stale
         self.current = current
@@ -32,7 +38,7 @@ struct MenubarPayload: Codable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case generated, stale, current, optimize, history, combined, claudeConfigs
+        case generated, stale, current, optimize, history, combined, claudeConfigs, liveSessions
     }
 
     init(from decoder: Decoder) throws {
@@ -44,6 +50,72 @@ struct MenubarPayload: Codable, Sendable {
         history = try c.decode(HistoryBlock.self, forKey: .history)
         combined = try c.decodeIfPresent(CombinedUsage.self, forKey: .combined)
         claudeConfigs = try c.decodeIfPresent(ClaudeConfigSelector.self, forKey: .claudeConfigs)
+        liveSessions = try c.decodeIfPresent(LiveSessionsBlock.self, forKey: .liveSessions)
+    }
+}
+
+struct LiveSessionsBlock: Codable, Sendable {
+    let windowSeconds: Int
+    let sessions: [LiveSession]
+}
+
+struct LiveSession: Codable, Sendable, Identifiable {
+    let id: String
+    /// Provider catalog id, matching the dock ring the session runs under.
+    let provider: String
+    let project: String
+    let branch: String?
+    let model: String?
+    let contextTokens: Int?
+    let contextWindow: Int?
+    let startedAt: String
+    let lastActivityAt: String
+    /// Seconds since this session last wrote, as of the payload's build. Absent
+    /// on payloads from a CLI that predates it, which reads as "not idle".
+    var idleSeconds: Int? = nil
+
+    /// A live session that is waiting on the user rather than generating. The
+    /// panel dims these so the two states are told apart at a glance.
+    var isIdle: Bool { (idleSeconds ?? 0) > Self.idleThresholdSeconds }
+
+    static let idleThresholdSeconds = 120
+
+    /// Row title: the folder in flight, plus the branch when the transcript
+    /// named one.
+    var title: String {
+        guard let branch, !branch.isEmpty else { return project }
+        return "\(project) · \(branch)"
+    }
+
+    /// Fraction of the context window in use, nil when the CLI could not read
+    /// a usage record so the row renders without a ring.
+    var contextFraction: Double? {
+        guard let contextTokens, let contextWindow, contextWindow > 0 else { return nil }
+        return min(max(Double(contextTokens) / Double(contextWindow), 0), 1)
+    }
+
+    var contextRemaining: Int? {
+        guard let contextTokens, let contextWindow else { return nil }
+        return max(0, contextWindow - contextTokens)
+    }
+
+    /// How long this session has been open, in the same shape the quota rows use
+    /// for resets. Empty when the timestamp is unparseable.
+    func elapsedLabel(now: Date = Date()) -> String {
+        guard let started = Self.parseISO8601(startedAt) else { return "" }
+        let minutes = Int(max(0, now.timeIntervalSince(started)) / 60)
+        let hours = minutes / 60
+        if hours > 0 { return "\(hours)h \(minutes % 60)m" }
+        return "\(minutes)m"
+    }
+
+    /// The CLI stamps milliseconds; the plain formatter rejects those, so try the
+    /// fractional variant first.
+    static func parseISO8601(_ value: String) -> Date? {
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFraction.date(from: value) { return date }
+        return ISO8601DateFormatter().date(from: value)
     }
 }
 

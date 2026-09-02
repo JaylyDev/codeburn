@@ -6,6 +6,7 @@ import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterPro
 import { findUnpricedModels, getFlatRateModelsConfigHash, getLocalModelSavingsConfigHash, getPriceOverridesConfigHash, getShortModelName, isExpectedFreeModel } from './models.js'
 import { getAllProviders, safeDiscoverSessions } from './providers/index.js'
 import { loadPlugins, pluginPayloadSections } from './plugins/loader.js'
+import { collectLiveSessions } from './live-sessions.js'
 import { claude, getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { stat } from 'node:fs/promises'
 import { aggregateProjectsIntoDays, buildPeriodDataFromDays, dateKeyInTz } from './day-aggregator.js'
@@ -1180,5 +1181,10 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   // default, so the payload is byte-identical without plugins installed).
   const pluginSections = await pluginPayloadSections(await loadPlugins())
   if (Object.keys(pluginSections).length > 0) payload.plugins = pluginSections
+  // Add-only live-session block. Its own disk pass is independent of the
+  // aggregation above, so a failure here must leave the rest of the payload
+  // intact rather than blank the menubar.
+  const liveSessions = await collectLiveSessions().catch(() => null)
+  if (liveSessions) payload.liveSessions = liveSessions
   return payload
 }
