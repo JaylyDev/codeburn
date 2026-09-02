@@ -38,6 +38,7 @@ jobs:
           cache-dependency-path: |
             package-lock.json
             app/package-lock.json
+            windows/package-lock.json
 
       - name: Install CLI dependencies
         run: npm ci
@@ -47,6 +48,24 @@ jobs:
 
       - name: Test installer verifier
         run: npm --prefix app test -- scripts/verify-windows-installer.test.ts
+
+      # The installer ships the tray app: stage-menubar.mjs takes the MSI that
+      # `tauri build` leaves in windows/src-tauri/target/release/bundle/msi.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: windows/src-tauri
+
+      - name: Install tray dependencies
+        working-directory: windows
+        run: npm ci
+
+      - name: Build tray app
+        working-directory: windows
+        run: npm run tauri build
 
       - name: Build NSIS installer
         run: npm --prefix app run package:win
