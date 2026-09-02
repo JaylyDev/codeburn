@@ -108,10 +108,14 @@ pub fn plan(mode: i64, popover_open: bool) -> RefreshPlan {
     // The timer keeps running while the machine is unattended: it costs nothing, and the
     // first tick after the screens come back then finds fresh numbers without waiting for a
     // notification that may never have been delivered.
+    // An open popover is never skipped, on either count: it is the mac's interactive
+    // refresh, and the reader is looking at the numbers.
     let skip_reason = if popover_open {
         None
     } else {
-        crate::session::state().reason()
+        crate::session::state()
+            .reason()
+            .or_else(|| crate::usage_guard::unchanged_since_last_success().then_some("unchanged"))
     };
     let plan = RefreshPlan {
         interval_ms: interval_secs(mode, popover_open, power).map(|secs| secs * 1000),

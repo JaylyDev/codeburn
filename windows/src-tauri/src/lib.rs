@@ -16,6 +16,7 @@ mod tray_badge;
 mod tray_linux;
 mod tray_status;
 mod update;
+mod usage_guard;
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -680,16 +681,21 @@ mod commands {
         state: State<'_, AppState>,
     ) -> Result<Value, String> {
         let cli = state.cli.lock().map_err(|e| e.to_string())?.clone();
-        cli.fetch_menubar_payload(
-            &period,
-            &provider,
-            &days,
-            &scope,
-            claude_config_source.as_deref(),
-            include_optimize,
-        )
+        let payload = cli
+            .fetch_menubar_payload(
+                &period,
+                &provider,
+                &days,
+                &scope,
+                claude_config_source.as_deref(),
+                include_optimize,
+            )
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        // The anchor for the unchanged-roots guard is taken after an answer, never before
+        // one: a fetch that failed must not make a later unchanged tick look successful.
+        crate::usage_guard::record_success();
+        Ok(payload)
     }
 
     /// Re-resolves the CLI each call so a freshly installed `codeburn` is picked up
