@@ -91,6 +91,8 @@ const DEFAULT_TOP_OFFSET: i32 = 156;
 const EDGE_INSET: i32 = 12;
 const DOCK_SNAP_DISTANCE: i32 = 44;
 const POLL_INTERVAL_MS: u64 = 16;
+/// Cursor ticks between two looks at the shape of the desktop, so about one a second.
+const DISPLAY_CHECK_TICKS: u32 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -118,12 +120,17 @@ impl Edge {
 /// Where the rail lives. `attachment` is the orientation edge, kept while floating so a rail
 /// dragged off the right edge stays vertical. Offsets are normalized over the travel range so
 /// they survive a resolution change; `None` means the mac defaults.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Placement {
     pub docked: Option<Edge>,
     pub attachment: Edge,
     pub x: Option<f64>,
     pub y: Option<f64>,
+    /// The display the rail was dropped on, by the name the OS gives it. Displays come and go,
+    /// so this is a hint rather than an address: a placement whose display is gone falls back
+    /// to the one the window is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<String>,
 }
 
 impl Default for Placement {
@@ -133,6 +140,7 @@ impl Default for Placement {
             attachment: Edge::Right,
             x: None,
             y: None,
+            monitor: None,
         }
     }
 }
@@ -418,7 +426,8 @@ fn attachment_candidate(rail: &Rect, area: &Rect) -> Option<(Edge, f64)> {
 
 /// Placement for a rail released at `rail`: docked when an edge is in reach, else floating
 /// where it was dropped.
-fn placement_for_drop(rail: &Rect, area: &Rect, current: &Placement) -> Placement {
+fn placement_for_drop(rail: &Rect, screen: &Screen, current: &Placement) -> Placement {
+    let area = &screen.area;
     let docked = attachment_candidate(rail, area).map(|(edge, _)| edge);
     let attachment = docked.unwrap_or(current.attachment);
     let x_low = area.x + EDGE_INSET;
@@ -430,6 +439,7 @@ fn placement_for_drop(rail: &Rect, area: &Rect, current: &Placement) -> Placemen
         attachment,
         x: Some(normalize(rail.x, x_low, x_high)),
         y: Some(normalize(rail.y, y_low, y_high)),
+        monitor: screen.name.clone(),
     }
 }
 
@@ -538,6 +548,9 @@ struct DockState {
     metrics: Metrics,
     request: LayoutRequest,
     frame: Option<DockFrame>,
+    /// The display the rail is laid out on, and the list a drag can move it between.
+    screen: Option<Screen>,
+    screens: Vec<Screen>,
     area: Rect,
     scale: f64,
     pointer: Pointer,
@@ -547,6 +560,8 @@ struct DockState {
 
 static STATE: Mutex<DockState> = Mutex::new(DockState {
     placement: None,
+    screen: None,
+    screens: Vec::new(),
     // Replaced from the stored scale the moment the window is created; the const initializer
     // cannot call `Metrics::for_scale`, so the default rounding is spelled out here.
     metrics: Metrics {
@@ -588,20 +603,64 @@ struct DragEvent {
     edge: Option<Edge>,
 }
 
-fn work_area(window: &tauri::WebviewWindow) -> Option<(Rect, f64)> {
-    let monitor = window.current_monitor().ok().flatten().or(window.primary_monitor().ok().flatten())?;
+/// One display: its work area in logical pixels, which is what the layout is written in, and
+/// its full bounds in physical pixels, which is what a cursor reading can be tested against.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Screen {
+    name: Option<String>,
+    area: Rect,
+    bounds: Rect,
+    scale: f64,
+}
+
+fn screen_of(monitor: &tauri::Monitor) -> Screen {
     let scale = monitor.scale_factor();
-    let area = monitor.work_area();
     let logical = |v: i32| (v as f64 / scale).round() as i32;
-    Some((
-        Rect {
+    let area = monitor.work_area();
+    let position = monitor.position();
+    let size = monitor.size();
+    Screen {
+        name: monitor.name().cloned(),
+        area: Rect {
             x: logical(area.position.x),
             y: logical(area.position.y),
             w: logical(area.size.width as i32),
             h: logical(area.size.height as i32),
         },
+        bounds: Rect {
+            x: position.x,
+            y: position.y,
+            w: size.width as i32,
+            h: size.height as i32,
+        },
         scale,
-    ))
+    }
+}
+
+fn screens(window: &tauri::WebviewWindow) -> Vec<Screen> {
+    window
+        .available_monitors()
+        .map(|monitors| monitors.iter().map(screen_of).collect())
+        .unwrap_or_default()
+}
+
+/// The display a placement belongs to: the one it names while that display is still there,
+/// else whichever one the window is on.
+fn screen_for(window: &tauri::WebviewWindow, name: Option<&str>) -> Option<Screen> {
+    if let Some(name) = name {
+        if let Some(found) = screens(window)
+            .into_iter()
+            .find(|screen| screen.name.as_deref() == Some(name))
+        {
+            return Some(found);
+        }
+    }
+    let monitor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or(window.primary_monitor().ok().flatten())?;
+    Some(screen_of(&monitor))
 }
 
 /// Size and position change together: two separate calls repaint twice, and between them the
@@ -634,9 +693,13 @@ fn move_window(window: &tauri::WebviewWindow, target: Rect, scale: f64) {
 /// Recomputes the layout from the stored placement and request, moving the window only when
 /// its rectangle actually changes.
 fn relayout(window: &tauri::WebviewWindow) -> Option<DockFrame> {
-    let (area, scale) = work_area(window)?;
+    // Resolved before the lock is taken: asking the window about its displays goes through the
+    // event loop, and the cursor thread holds this lock while it drives a drag.
+    let stored = { lock().placement.get_or_insert_with(load_placement).clone() };
+    let screen = screen_for(window, stored.monitor.as_deref())?;
+    let (area, scale) = (screen.area, screen.scale);
     let mut state = lock();
-    let placement = *state.placement.get_or_insert_with(load_placement);
+    let placement = state.placement.get_or_insert_with(load_placement).clone();
     let metrics = state.metrics;
     let frame = layout(area, &placement, &state.request, &metrics);
     #[cfg(debug_assertions)]
@@ -644,6 +707,7 @@ fn relayout(window: &tauri::WebviewWindow) -> Option<DockFrame> {
     let moved = state.frame.map(|f| f.window) != Some(frame.window);
     state.area = area;
     state.scale = scale;
+    state.screen = Some(screen);
     state.frame = Some(frame);
     drop(state);
     if moved {
@@ -674,13 +738,20 @@ fn settle(app: &AppHandle, window: &tauri::WebviewWindow, placement: Placement, 
         state.request.detail = None;
         state.drag = None;
     }
-    if let Some(frame) = relayout(window) {
-        let event = SettledEvent {
-            from: from_rail.offset(-frame.window.x, -frame.window.y),
-            frame,
-        };
-        let _ = app.emit_to(DOCK_LABEL, "codeburn://dock-settled", event);
-    }
+    publish(app, window, Some(from_rail));
+}
+
+/// Lays the rail out again and tells the page where it landed. The page paints into the frame
+/// it was last handed, so a window that moves on this side has to be announced; `from` is where
+/// the rail was, in screen coordinates, and the page glides it from there.
+fn publish(app: &AppHandle, window: &tauri::WebviewWindow, from: Option<Rect>) {
+    let Some(frame) = relayout(window) else { return };
+    let from = from.unwrap_or_else(|| frame.rail.offset(frame.window.x, frame.window.y));
+    let event = SettledEvent {
+        from: from.offset(-frame.window.x, -frame.window.y),
+        frame,
+    };
+    let _ = app.emit_to(DOCK_LABEL, "codeburn://dock-settled", event);
 }
 
 fn current_rail_screen(state: &DockState) -> Option<Rect> {
@@ -694,7 +765,7 @@ pub fn dock_to(app: &AppHandle, edge: Edge) {
     let (placement, from) = {
         let state = lock();
         let Some(from) = current_rail_screen(&state) else { return };
-        let current = state.placement.unwrap_or_default();
+        let current = state.placement.clone().unwrap_or_default();
         (
             Placement {
                 docked: Some(edge),
@@ -711,8 +782,13 @@ pub fn dock_to(app: &AppHandle, edge: Edge) {
 /// with the press point in window coordinates so the rail stays exactly where it was grabbed.
 pub fn begin_drag(app: &AppHandle, anchor: (i32, i32)) {
     let Some(window) = app.get_webview_window(DOCK_LABEL) else { return };
+    // Taken once, here, rather than per frame: the rail follows the pointer across displays,
+    // and asking the window for its monitor list sixty times a second would go through the
+    // event loop sixty times a second.
+    let all = screens(&window);
     let mut state = lock();
     let Some(frame) = state.frame else { return };
+    state.screens = all;
     state.drag = Some(Drag { anchor, last: None });
     state.request.detail = None;
     drop(state);
@@ -749,15 +825,27 @@ fn primary_button_down() -> bool {
 fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) {
     let Some((cx, cy)) = cursor_position() else { return };
     let mut state = lock();
-    let scale = state.scale;
-    let cursor = ((cx as f64 / scale).round() as i32, (cy as f64 / scale).round() as i32);
     let Some(frame) = state.frame else { return };
-    let area = state.area;
 
     if let Some(drag) = state.drag {
+        // The rail follows the pointer onto whichever display it is over, which is the mac's
+        // screenIndex(containing:). Containment is tested in physical pixels because that is
+        // what the cursor reads in; everything after it is in that display's logical pixels.
+        let screen = state
+            .screens
+            .iter()
+            .find(|screen| screen.bounds.contains(cx, cy))
+            .cloned()
+            .or_else(|| state.screen.clone())
+            .unwrap_or_else(|| Screen { area: state.area, scale: state.scale, ..Screen::default() });
+        let scale = if screen.scale > 0.0 { screen.scale } else { 1.0 };
+        let cursor = ((cx as f64 / scale).round() as i32, (cy as f64 / scale).round() as i32);
+        let area = screen.area;
+        state.scale = scale;
+        state.area = area;
         if !primary_button_down() {
             let rail = frame.rail.offset(frame.window.x, frame.window.y);
-            let placement = placement_for_drop(&rail, &area, &state.placement.unwrap_or_default());
+            let placement = placement_for_drop(&rail, &screen, &state.placement.clone().unwrap_or_default());
             drop(state);
             settle(app, window, placement, rail);
             return;
@@ -796,6 +884,8 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) {
         return;
     }
 
+    let scale = state.scale;
+    let cursor = ((cx as f64 / scale).round() as i32, (cy as f64 / scale).round() as i32);
     let rail = frame.rail.offset(frame.window.x, frame.window.y);
     let rail_hovered = rail.contains(cursor.0, cursor.1);
     let metrics = state.metrics;
@@ -830,16 +920,62 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) {
     }
 }
 
+/// A fingerprint of the desktop: how many displays there are, how large the virtual screen is,
+/// and where the primary work area ends. A resolution change, a display plugged or unplugged,
+/// and the taskbar moving or hiding all move at least one of them. Three user32 reads, with no
+/// trip through the event loop, which is what asking the window for its monitor list would
+/// cost a second.
+#[cfg(target_os = "windows")]
+fn display_signature() -> [i32; 9] {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SystemParametersInfoW, SM_CMONITORS, SM_CXVIRTUALSCREEN,
+        SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA,
+    };
+    let mut work = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    unsafe {
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut RECT as *mut _, 0);
+        [
+            GetSystemMetrics(SM_CMONITORS),
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            work.left,
+            work.top,
+            work.right,
+            work.bottom,
+        ]
+    }
+}
+
 /// Runs until the dock window is gone. Sixty reads of the cursor a second cost nothing
-/// measurable, and they replace the DOM hover the click-through style would starve.
+/// measurable, and they replace the DOM hover the click-through style would starve. Once a
+/// second the same thread checks whether the desktop itself has changed shape, which is the
+/// Windows counterpart of the mac's didChangeScreenParameters observer.
 #[cfg(target_os = "windows")]
 fn spawn_pointer_tracking(app: AppHandle) {
     std::thread::Builder::new()
         .name("codeburn-dock-pointer".into())
-        .spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
-            let Some(window) = app.get_webview_window(DOCK_LABEL) else { break };
-            pointer_tick(&app, &window);
+        .spawn(move || {
+            let mut displays = display_signature();
+            let mut ticks: u32 = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
+                let Some(window) = app.get_webview_window(DOCK_LABEL) else { break };
+                ticks = ticks.wrapping_add(1);
+                if ticks % DISPLAY_CHECK_TICKS == 0 {
+                    let next = display_signature();
+                    if next != displays {
+                        displays = next;
+                        // Never mid-drag: the pointer owns the rail until it is let go.
+                        if lock().drag.is_none() {
+                            publish(&app, &window, None);
+                        }
+                    }
+                }
+                pointer_tick(&app, &window);
+            }
         })
         .ok();
 }
@@ -969,6 +1105,10 @@ mod tests {
         frame.rail.offset(frame.window.x, frame.window.y)
     }
 
+    fn screen(area: Rect, name: &str) -> Screen {
+        Screen { name: Some(name.into()), area, bounds: area, scale: 1.0 }
+    }
+
     #[test]
     fn every_metric_is_a_mac_base_times_the_scale_on_a_whole_pixel() {
         let m = small();
@@ -1078,7 +1218,7 @@ mod tests {
     #[test]
     fn a_top_docked_rail_is_horizontal_with_the_bubble_below() {
         let m = small();
-        let placement = Placement { docked: Some(Edge::Top), attachment: Edge::Top, x: None, y: None };
+        let placement = Placement { docked: Some(Edge::Top), attachment: Edge::Top, ..Placement::default() };
         let frame = layout(
             AREA,
             &placement,
@@ -1099,7 +1239,7 @@ mod tests {
     #[test]
     fn a_top_rail_in_the_corner_keeps_its_window_inside_the_work_area() {
         let m = small();
-        let placement = Placement { docked: Some(Edge::Top), attachment: Edge::Top, x: Some(0.986), y: Some(0.0) };
+        let placement = Placement { docked: Some(Edge::Top), attachment: Edge::Top, x: Some(0.986), y: Some(0.0), monitor: None };
         for expanded in [false, true] {
             let frame = layout(
                 AREA,
@@ -1117,7 +1257,7 @@ mod tests {
 
     #[test]
     fn a_floating_rail_keeps_its_orientation_and_the_short_padding() {
-        let placement = Placement { docked: None, attachment: Edge::Right, x: Some(0.5), y: Some(0.5) };
+        let placement = Placement { docked: None, attachment: Edge::Right, x: Some(0.5), y: Some(0.5), monitor: None };
         let frame = layout(AREA, &placement, &request(1, false, None), &small());
         assert!(frame.vertical && !frame.docked);
         assert_eq!(frame.along_pad, 12);
@@ -1129,15 +1269,39 @@ mod tests {
     #[test]
     fn a_drop_near_an_edge_docks_and_elsewhere_floats() {
         let current = Placement::default();
-        let near_left = placement_for_drop(&Rect { x: 20, y: 300, w: 53, h: 112 }, &AREA, &current);
+        let here = screen(AREA, "one");
+        let near_left = placement_for_drop(&Rect { x: 20, y: 300, w: 53, h: 112 }, &here, &current);
         assert_eq!(near_left.docked, Some(Edge::Left));
         assert_eq!(near_left.attachment, Edge::Left);
-        let near_top = placement_for_drop(&Rect { x: 700, y: 10, w: 53, h: 112 }, &AREA, &current);
+        let near_top = placement_for_drop(&Rect { x: 700, y: 10, w: 53, h: 112 }, &here, &current);
         assert_eq!(near_top.docked, Some(Edge::Top));
-        let middle = placement_for_drop(&Rect { x: 700, y: 300, w: 53, h: 112 }, &AREA, &current);
+        let middle = placement_for_drop(&Rect { x: 700, y: 300, w: 53, h: 112 }, &here, &current);
         assert_eq!(middle.docked, None);
         assert_eq!(middle.attachment, Edge::Right);
         assert!((middle.x.unwrap() - 0.45).abs() < 0.05);
+    }
+
+    #[test]
+    fn a_drop_records_the_display_it_landed_on_and_the_offsets_are_that_displays_own() {
+        let second = Screen {
+            name: Some("two".into()),
+            area: Rect { x: 1600, y: 0, w: 1280, h: 800 },
+            bounds: Rect { x: 1600, y: 0, w: 1280, h: 800 },
+            scale: 1.0,
+        };
+        let dropped = placement_for_drop(
+            &Rect { x: 1600 + 1280 - 53, y: 300, w: 53, h: 112 },
+            &second,
+            &Placement::default(),
+        );
+        assert_eq!(dropped.monitor.as_deref(), Some("two"));
+        assert_eq!(dropped.docked, Some(Edge::Right));
+        // Normalized against the second display's own travel, not the desktop's.
+        assert!((dropped.x.unwrap() - 1.0).abs() < 0.01);
+
+        // And the rail lays out inside that display rather than back on the first one.
+        let frame = layout(second.area, &dropped, &request(1, false, None), &small());
+        assert_eq!(rail_on_screen(&frame).right(), second.area.right());
     }
 
     #[test]
