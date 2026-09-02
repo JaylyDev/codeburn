@@ -89,6 +89,8 @@ export type MenubarDeps = {
   runReg?: (args: string[]) => Promise<void>
   /** The tray app's existing Run value, or null when there is none. */
   readRunKey?: () => Promise<string | null>
+  /** Whether a path is on disk. Injected so the stale-path handling is testable. */
+  exists?: (path: string) => boolean
   home?: string
 }
 
@@ -132,7 +134,11 @@ function companionSettingsPath(stateDir: string): string {
 
 export function readCompanionSettings(stateDir: string): CompanionSettings {
   try {
-    const raw = JSON.parse(readFileSync(companionSettingsPath(stateDir), 'utf8')) as Partial<CompanionSettings>
+    // An unreadable file falls back to the defaults, which means seeding again: reinstalling
+    // the tray app and re-enabling the rail. A byte order mark is not a good enough reason
+    // for that, and anything that edits this file by hand on Windows tends to leave one.
+    const text = readFileSync(companionSettingsPath(stateDir), 'utf8').replace(/^﻿/, '')
+    const raw = JSON.parse(text) as Partial<CompanionSettings>
     return {
       menuBar: raw.menuBar ?? DEFAULT_COMPANION_SETTINGS.menuBar,
       sidebar: raw.sidebar ?? DEFAULT_COMPANION_SETTINGS.sidebar,
@@ -207,6 +213,11 @@ export function parseRunKeyValue(regOutput: string): string | null {
   const match = new RegExp(`^\\s+${RUN_VALUE}\\s{4}REG_\\w+\\s{4}(.*)$`, 'm').exec(regOutput)
   const value = match?.[1]?.trim()
   return value ? value : null
+}
+
+/** The executable a Run value points at: it is stored quoted, and only the file matters. */
+export function runKeyTarget(value: string): string {
+  return value.trim().replace(/^"(.*)"$/, '$1')
 }
 
 /** Windows searches the current directory before PATH, so `reg` by bare name lets anything
@@ -322,24 +333,62 @@ export class MenubarCompanion {
 
     if (!this.settings.menuBar) return
 
+    // The install runs on every launch, not only when a path is missing: it is what carries a
+    // desktop-app update forward, and it costs nothing when the versions already match.
     const exePath = this.deps.store
       ? findPackagedTrayExe(menubarResourcesDir(this.deps))
       : await this.install()
     if (!exePath) return
+    if (!this.exists(exePath)) {
+      // Storing a path to nothing is what made the switches send arguments into the void.
+      console.error(`the tray app was reported at ${exePath}, which is not there`)
+      return
+    }
     this.save({ trayExePath: exePath })
 
     if (firstRun && existingDock === undefined && this.settings.sidebar) this.applyDockSetting(true)
-    // Same rule for launch at login: an existing Run value was written by the tray app's own
-    // toggle or by an earlier launch of this one, and either way it is not this launch's to
-    // rewrite. After the first run only the Menu bar switch touches it.
-    if (firstRun && await this.existingRunKey() === null) await this.setRunKey(true)
+    await this.reconcileRunKey(firstRun)
     this.launch(exePath, ['--reload-settings'])
+  }
+
+  /**
+   * Launch at login, without overriding a choice. An existing Run value was written by the
+   * tray app's own toggle or by an earlier launch of this one, so it is left alone; only a
+   * first run seeds one. The exception is a value pointing at a file that is not there, which
+   * is not a preference but the old wrong path, and would fail silently at every login.
+   */
+  private async reconcileRunKey(firstRun: boolean): Promise<void> {
+    const existing = await this.existingRunKey()
+    if (existing === null) {
+      if (firstRun) await this.setRunKey(true)
+      return
+    }
+    if (!this.exists(runKeyTarget(existing))) await this.setRunKey(true)
   }
 
   private existingRunKey(): Promise<string | null> {
     if (this.deps.readRunKey) return this.deps.readRunKey()
     // The Store route has no Run value at all, so there is nothing to ask about.
     return this.deps.store ? Promise.resolve(null) : regQueryRunValue(this.deps.env)
+  }
+
+  private get exists(): (path: string) => boolean {
+    return this.deps.exists ?? existsSync
+  }
+
+  /**
+   * Where the tray app actually is, checked rather than remembered. A stored path can be
+   * wrong: written by a build that derived the binary name from the product name, or left
+   * behind by a tray app that has since been uninstalled. Re-resolving costs one
+   * `codeburn menubar`, which re-reads the registry and installs nothing when the version
+   * already matches.
+   */
+  private async resolveTrayExe(): Promise<string | null> {
+    if (this.deps.store) return findPackagedTrayExe(menubarResourcesDir(this.deps))
+    const stored = this.settings.trayExePath
+    if (stored && this.exists(stored)) return stored
+    const resolved = await this.install()
+    return resolved && this.exists(resolved) ? resolved : null
   }
 
   /** The install itself belongs to the CLI: it owns the registry read, the checksum, the
@@ -372,13 +421,11 @@ export class MenubarCompanion {
     if (!enabled) {
       await this.setRunKey(false)
       const exePath = this.settings.trayExePath
-      if (exePath) this.launch(exePath, ['--quit'])
+      if (exePath && this.exists(exePath)) this.launch(exePath, ['--quit'])
       return this.status()
     }
 
-    const exePath = this.deps.store
-      ? findPackagedTrayExe(menubarResourcesDir(this.deps))
-      : (this.settings.trayExePath ?? await this.install())
+    const exePath = await this.resolveTrayExe()
     if (!exePath) return this.status()
     this.save({ trayExePath: exePath })
     await this.setRunKey(true)
@@ -392,8 +439,15 @@ export class MenubarCompanion {
     this.save({ sidebar: enabled })
     if (!this.supported()) return this.status()
     this.applyDockSetting(enabled)
-    const exePath = this.settings.trayExePath
-    if (this.settings.menuBar && exePath) this.launch(exePath, ['--reload-settings'])
+    if (!this.settings.menuBar) return this.status()
+    // The file is written either way; this only decides whether a running rail hears about
+    // it now or at the next launch, so a tray app that cannot be found is not worth an
+    // install here.
+    const exePath = await this.resolveTrayExe()
+    if (exePath) {
+      this.save({ trayExePath: exePath })
+      this.launch(exePath, ['--reload-settings'])
+    }
     return this.status()
   }
 

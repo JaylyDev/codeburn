@@ -23,7 +23,7 @@ import {
 
 const VERSION = '0.9.23'
 const MSI_NAME = `CodeBurn.Menubar_${VERSION}_x64_en-US.msi`
-const TRAY_EXE = 'C:\\Program Files\\CodeBurn Menubar\\CodeBurn Menubar.exe'
+const TRAY_EXE = 'C:\\Program Files\\CodeBurn Menubar\\codeburn-menubar.exe'
 
 function result(overrides: Partial<MenubarInstallResult> = {}): MenubarInstallResult {
   return {
@@ -167,6 +167,16 @@ describe('companion settings', () => {
     writeFileSync(join(stateDir, 'companion.v1.json'), '{ broken')
     expect(readCompanionSettings(stateDir).menuBar).toBe(true)
   })
+
+  // Falling back to the defaults means seeding again, which reinstalls the tray app and
+  // re-enables the rail. A byte order mark, which anything editing this file by hand on
+  // Windows tends to leave, is not a good enough reason for that.
+  it('reads a file that was saved with a byte order mark', () => {
+    const settings = { menuBar: false, sidebar: false, trayExePath: TRAY_EXE, seeded: true }
+    writeFileSync(join(stateDir, 'companion.v1.json'), `﻿${JSON.stringify(settings)}`)
+
+    expect(readCompanionSettings(stateDir)).toEqual(settings)
+  })
 })
 
 describe('MenubarCompanion', () => {
@@ -179,6 +189,8 @@ describe('MenubarCompanion', () => {
   let cliCalls: Array<{ args: string[]; env: NodeJS.ProcessEnv | undefined }>
   let installResult: MenubarInstallResult | null
   let existingRunKey: string | null
+  /** What is on disk, as far as the companion is concerned. TRAY_EXE is there by default. */
+  let present: Set<string>
 
   function deps(overrides: Record<string, unknown> = {}) {
     return {
@@ -191,6 +203,7 @@ describe('MenubarCompanion', () => {
       launch: (exe: string, args: string[]) => { launches.push({ exe, args }) },
       runReg: async (args: string[]) => { regCalls.push(args) },
       readRunKey: async () => existingRunKey,
+      exists: (path: string) => present.has(path),
       runCli: async (args: string[], opts: { extraEnv?: NodeJS.ProcessEnv }) => {
         cliCalls.push({ args, env: opts.extraEnv })
         return {
@@ -213,6 +226,7 @@ describe('MenubarCompanion', () => {
     mkdirSync(join(resources, 'menubar'), { recursive: true })
     const exe = join(resources, 'menubar', 'codeburn-menubar.exe')
     writeFileSync(exe, 'exe')
+    present.add(exe)
     return exe
   }
 
@@ -227,6 +241,7 @@ describe('MenubarCompanion', () => {
     cliCalls = []
     installResult = result()
     existingRunKey = null
+    present = new Set([TRAY_EXE])
   })
 
   afterEach(() => { rmSync(sandbox, { recursive: true, force: true }) })
@@ -353,6 +368,69 @@ describe('MenubarCompanion', () => {
 
     expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--reload-settings'] }])
     error.mockRestore()
+  })
+
+  // A stored path can be wrong: written by a build that derived the binary name from the
+  // product name, or left behind by a tray app that has since been uninstalled.
+  const STALE_EXE = 'C:\\Program Files\\CodeBurn Menubar\\CodeBurn Menubar.exe'
+
+  it('re-resolves a stored path that is not on disk rather than launching it', async () => {
+    stageMsi()
+    writeCompanionSettings(stateDir, { menuBar: false, sidebar: true, trayExePath: STALE_EXE, seeded: true })
+
+    await new MenubarCompanion(deps()).setMenuBarEnabled(true)
+
+    // The install re-reads the registry and installs nothing when the version matches.
+    expect(cliCalls).toHaveLength(1)
+    expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--reload-settings'] }])
+    expect(readCompanionSettings(stateDir).trayExePath).toBe(TRAY_EXE)
+  })
+
+  it('does not send --quit into the void when the stored path is stale', async () => {
+    stageMsi()
+    writeCompanionSettings(stateDir, { menuBar: true, sidebar: true, trayExePath: STALE_EXE, seeded: true })
+
+    await new MenubarCompanion(deps()).setMenuBarEnabled(false)
+
+    expect(launches).toEqual([])
+    expect(regCalls).toEqual([runKeyArgs(false, STALE_EXE)])
+  })
+
+  it('gives up rather than storing a path the installer reported but nothing is at', async () => {
+    stageMsi()
+    installResult = result({ exePath: STALE_EXE })
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    await new MenubarCompanion(deps()).bootstrap()
+
+    expect(launches).toEqual([])
+    expect(regCalls).toEqual([])
+    expect(readCompanionSettings(stateDir).trayExePath).toBeNull()
+    expect(error).toHaveBeenCalled()
+    error.mockRestore()
+  })
+
+  it('repairs a Run value that points at a file which is not there', async () => {
+    stageMsi()
+    // Not a first run, so the seed rule would normally leave an existing value alone.
+    writeCompanionSettings(stateDir, { menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+    existingRunKey = `"${STALE_EXE}"`
+
+    await new MenubarCompanion(deps()).bootstrap()
+
+    expect(regCalls).toEqual([runKeyArgs(true, TRAY_EXE)])
+  })
+
+  it('still leaves a Run value alone when it points at something real', async () => {
+    stageMsi()
+    writeCompanionSettings(stateDir, { menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+    const other = 'C:\\Somewhere\\else.exe'
+    present.add(other)
+    existingRunKey = `"${other}"`
+
+    await new MenubarCompanion(deps()).bootstrap()
+
+    expect(regCalls).toEqual([])
   })
 
   it('Menu bar off quits the tray app and drops the Run value', async () => {
