@@ -21,6 +21,17 @@ export type MenubarPayload = {
     /// Both absent on older CLI payloads.
     retryTax?: RetryTax
     routingWaste?: RoutingWaste
+    /// Where the money went, by repository and by session. Empty on older CLI payloads.
+    topProjects?: ProjectEntry[]
+    topSessions?: TopSessionEntry[]
+    /// What the agent reached for. Empty on older CLI payloads.
+    tools?: Array<{ name: string; calls: number }>
+    skills?: Array<{ name: string; turns: number; cost: number }>
+    subagents?: Array<{ name: string; calls: number; cost: number }>
+    mcpServers?: Array<{ name: string; calls: number }>
+    /// Spend attributed to pull requests. Emitted for all-provider payloads only, so a
+    /// provider-scoped view has none and the section hides.
+    pullRequests?: { rows: PullRequestRow[] }
     providers: Record<string, number>
     providerDetails?: Array<{
       id: string
@@ -56,6 +67,37 @@ export type Model = {
 export type LocalModelSavings = {
   totalUSD: number
   calls: number
+}
+
+export type PullRequestRow = {
+  url: string
+  label: string
+  cost: number
+  sessions: number
+}
+
+export type ProjectEntry = {
+  name: string
+  cost: number
+  sessions: number
+  avgCostPerSession: number
+  sessionDetails?: SessionDetailEntry[]
+}
+
+export type SessionDetailEntry = {
+  cost: number
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  date: string
+  models?: Array<{ name: string; cost: number }>
+}
+
+export type TopSessionEntry = {
+  project: string
+  cost: number
+  calls: number
+  date: string
 }
 
 export type RetryTax = {

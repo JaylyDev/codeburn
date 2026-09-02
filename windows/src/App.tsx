@@ -22,6 +22,8 @@ import { PulseInsight } from './components/PulseInsight'
 import { StatsInsight } from './components/StatsInsight'
 import { PlanInsight, planTarget } from './components/PlanInsight'
 import { FindingsSection } from './components/FindingsSection'
+import { PullRequestsSection } from './components/PullRequestsSection'
+import { ToolingSection } from './components/ToolingSection'
 import { ActivitySection } from './components/ActivitySection'
 import { LoadingOverlay } from './components/LoadingOverlay'
 import { EmptyProviderState } from './components/EmptyProviderState'
@@ -436,6 +438,8 @@ export function App() {
                       cacheHitPercent={payload.current.cacheHitPercent}
                       currency={currency}
                     />
+                    <PullRequestsSection payload={payload} currency={currency} />
+                    <ToolingSection payload={payload} currency={currency} />
                     <FindingsSection payload={payload} currency={currency} onOpenTerminal={openTerminal} />
                   </>
                 )}

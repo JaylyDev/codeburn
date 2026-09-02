@@ -1104,6 +1104,106 @@ code { font-family: var(--font-mono); }
   color: var(--brand-accent);
 }
 
+
+/* Stats: top projects and the costliest session, from the mac StatsInsight. */
+.stats-spacer { flex: 1; }
+.stats-projects {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 10px;
+  border-top: 1px solid var(--separator-soft);
+}
+.project-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.project-name {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--label);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.project-sessions { font-size: 9.5px; color: var(--label-3); }
+.project-cost {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--label-2);
+  font-variant-numeric: tabular-nums;
+}
+.project-bar {
+  flex: 0 0 auto;
+  height: 6px;
+  border-radius: var(--radius-bar);
+  background: var(--brand-accent);
+  opacity: 0.5;
+}
+.session-list { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 0 14px; }
+.session-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 3px 6px;
+  border-radius: var(--radius-segment);
+  background: var(--fill-06);
+}
+.session-line { display: flex; align-items: center; gap: 6px; }
+.session-cost {
+  min-width: 52px;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--label);
+  font-variant-numeric: tabular-nums;
+}
+.session-calls { font-size: 9px; color: var(--label-3); }
+.session-tokens {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 9px;
+  color: var(--label-3);
+  font-variant-numeric: tabular-nums;
+}
+.session-models { display: flex; gap: 4px; margin-left: 52px; }
+.session-model {
+  padding: 1.5px 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--brand-accent) 10%, transparent);
+  font-size: 8.5px;
+  font-weight: 500;
+  color: var(--label-2);
+}
+.stats-costliest { display: flex; align-items: center; gap: 4px; }
+.stats-costliest-icon { color: var(--brand-accent); flex-shrink: 0; }
+.stats-costliest-label { font-size: 10px; font-weight: 500; color: var(--label-3); }
+.stats-costliest-value {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--label-2);
+  font-variant-numeric: tabular-nums;
+}
+.stats-costliest-project {
+  font-size: 10px;
+  color: var(--label-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Plan */
 .plan-header { display: flex; align-items: baseline; gap: 6px; }
 .plan-tier { font-size: 13px; font-weight: 600; color: var(--brand-accent); }
@@ -1194,6 +1294,45 @@ code { font-family: var(--font-mono); }
   overflow: hidden;
 }
 .plan-actions { display: flex; gap: 8px; margin-top: 2px; }
+
+/* Pull requests: the same 14 px gutter and separator as a collapsible section, but there
+   is nothing to collapse, so it is a plain block. */
+.pr-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 11px var(--gutter);
+  border-bottom: 1px solid var(--separator-soft);
+}
+.pr-row { display: flex; align-items: baseline; gap: 8px; }
+.pr-label {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--label);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pr-cost {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--label);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Tooling: three lists under one collapsible header. */
+.tooling-groups { display: flex; flex-direction: column; gap: 12px; }
+.tooling-group { display: flex; flex-direction: column; gap: 3px; }
+.tooling-title {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--label-3);
+  margin-bottom: 2px;
+}
 
 /* ---- collapsible sections (Activity / Models) ---------------------------------- */
 
