@@ -298,6 +298,11 @@ describe('getShortModelName', () => {
     expect(getShortModelName('claude-opus-9-9-20300101')).toBe('Opus 9.9')
   })
 
+  it('derives versioned Fable and Mythos labels from their model ids', () => {
+    expect(getShortModelName('claude-fable-5-1')).toBe('Fable 5.1')
+    expect(getShortModelName('claude-mythos-5-2-20300101')).toBe('Mythos 5.2')
+  })
+
   it('shows the real model name for pricing-sibling aliases, not the internal key', () => {
     // GLM-5.2 (and its lowercase Hermes spelling) price via the glm-5p1 sibling;
     // reports must show GLM-5.2, not the pricing key.
