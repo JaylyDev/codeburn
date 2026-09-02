@@ -13,6 +13,7 @@ mod tray_badge;
 #[cfg(target_os = "linux")]
 mod tray_linux;
 mod tray_status;
+mod update;
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -172,6 +173,8 @@ pub fn run() {
             commands::set_daily_budget,
             commands::provider_key_providers,
             commands::set_provider_key,
+            commands::check_updates,
+            commands::perform_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -1016,5 +1019,28 @@ mod commands {
     pub fn set_provider_key(provider: String, key: String) -> Result<Vec<String>, String> {
         crate::settings::set_provider_key(&provider, &key).map_err(|e| e.to_string())?;
         Ok(crate::settings::stored_key_providers())
+    }
+
+    /// Whether there is a newer app or CLI. Without `force` a cached answer inside the
+    /// two-day interval is returned without touching the network, so every mount can ask.
+    #[tauri::command]
+    pub async fn check_updates(
+        app: AppHandle,
+        force: bool,
+        state: State<'_, AppState>,
+    ) -> Result<crate::update::UpdateStatus, String> {
+        let cli = state.cli.lock().map_err(|e| e.to_string())?.clone();
+        Ok(crate::update::check(&app, &cli, force).await)
+    }
+
+    /// The CLI first, then the app, each reporting its own failure. Returns the status the
+    /// sequence ended on, so the caller renders the outcome rather than guessing at it.
+    #[tauri::command]
+    pub async fn perform_update(
+        app: AppHandle,
+        state: State<'_, AppState>,
+    ) -> Result<crate::update::UpdateStatus, String> {
+        let cli = state.cli.lock().map_err(|e| e.to_string())?.clone();
+        Ok(crate::update::perform_update(&app, &cli).await)
     }
 }

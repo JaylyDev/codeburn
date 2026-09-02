@@ -124,6 +124,15 @@ impl CodeburnCli {
         &self.program
     }
 
+    /// The program plus the arguments every call carries. For a caller that builds its own
+    /// spawn: the update stages need the exit code and the stderr separately rather than the
+    /// captured stdout `run_capture` returns.
+    pub fn argv(&self) -> Vec<String> {
+        let mut argv = vec![self.program.clone()];
+        argv.extend(self.extra_args.iter().cloned());
+        argv
+    }
+
     /// Runs `codeburn --version` and reports whether the CLI is present and new enough.
     pub async fn status(&self) -> CliStatus {
         let min_version = format!(
@@ -358,6 +367,25 @@ fn locate_cli() -> Option<String> {
 /// instead of letting the console shell resolve a bare `claude`.
 fn locate_claude() -> Option<String> {
     find_in_search_dirs(&CLAUDE_NAMES)
+}
+
+/// The npm that owns this CLI install, for the update's first stage. A global npm install
+/// keeps `codeburn.cmd` and `npm.cmd` in the same directory, so the launcher's own directory
+/// is asked first and names the right npm even where several node versions are installed;
+/// the PATH search is the fallback, under the same absolute-directory rule as everything
+/// else here.
+pub fn locate_npm(near: &str) -> Option<String> {
+    #[cfg(windows)]
+    let names: [&str; 2] = ["npm.cmd", "npm.exe"];
+    #[cfg(not(windows))]
+    let names: [&str; 1] = ["npm"];
+
+    if let Some(dir) = std::path::Path::new(near).parent() {
+        if let Some(found) = find_in_dirs(&[dir.to_path_buf()], &names) {
+            return Some(found);
+        }
+    }
+    find_in_search_dirs(&names)
 }
 
 fn find_in_search_dirs(names: &[&str]) -> Option<String> {
