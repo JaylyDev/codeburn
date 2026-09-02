@@ -873,10 +873,26 @@ code { font-family: var(--font-mono); }
   position: relative;
   z-index: 10;
 }
-.insight-pills { display: flex; gap: 4px; }
+/* Seven pills do not fit a 384 px popover, and Plan is the seventh whenever a provider with
+   quota is selected: Optimize was being clipped by the card edge. The mac puts the row in a
+   horizontal ScrollView with no indicator, so this scrolls the same way, and a pill keeps its
+   own width rather than being squeezed into an ellipsis. */
+.insight-pills {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  /* The focus ring sits 1 px outside the pill; without the padding the scroll box clips it. */
+  padding: 2px;
+  margin: -2px;
+}
+.insight-pills::-webkit-scrollbar { display: none; }
 .insight-pill {
   border: 0;
-  padding: 4px 10px;
+  flex: 0 0 auto;
+  /* A pixel off the mac's 10, which is what lets the six ordinary pills sit inside a 384 px
+     card without the last one being cut. The seventh, Plan, still scrolls. */
+  padding: 4px 9px;
   border-radius: var(--radius-pill);
   background: var(--fill-10);
   color: var(--label-2);
@@ -2151,7 +2167,30 @@ code { font-family: var(--font-mono); }
 }
 .stg-swatch-on { outline: 2px solid var(--label); outline-offset: 1px; }
 
-.stg-slider { width: 168px; accent-color: var(--brand-accent); }
+.stg-slider {
+  width: 168px;
+  height: 16px;
+  appearance: none;
+  background: transparent;
+}
+.stg-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(
+    to right,
+    var(--brand-accent) 0 var(--slider-filled),
+    var(--fill-15) var(--slider-filled) 100%
+  );
+}
+.stg-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border-radius: 50%;
+  background: var(--brand-accent);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
 
 .stg-link-row {
   display: flex;

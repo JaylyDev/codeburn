@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import type { CSSProperties, ReactNode } from 'react'
 
 /// The form furniture the settings window is built from, standing in for SwiftUI's
 /// `Form(.grouped)`, `Section`, `LabeledContent` and `Picker` in
@@ -95,10 +95,14 @@ export function Slider({ value, min, max, step, onChange, ariaLabel }: {
   onChange: (value: number) => void
   ariaLabel?: string
 }) {
+  // The track is painted here rather than left to the platform: Chromium's own unfilled
+  // track came out white on the dark theme, which is the loudest thing in the window.
+  const filled = max > min ? ((value - min) / (max - min)) * 100 : 0
   return (
     <input
       type="range"
       className="stg-slider"
+      style={{ '--slider-filled': `${filled}%` } as CSSProperties}
       aria-label={ariaLabel}
       min={min}
       max={max}
