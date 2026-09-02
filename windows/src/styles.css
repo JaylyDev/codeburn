@@ -215,6 +215,24 @@ code { font-family: var(--font-mono); }
 .brand-primary { color: var(--label); }
 .brand-accent { color: var(--brand-accent); }
 .subhead { font-size: 10.5px; color: var(--label-2); }
+/* Quota warning row: sits under the wordmark, above the strip, tinted by the worst
+   connected provider's severity. */
+.quota-warning {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  font-size: 10.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--label-2);
+  background: var(--fill-08);
+}
+.quota-warning.is-warning { color: var(--sev-warning-ink); background: rgba(217, 143, 41, 0.12); }
+.quota-warning.is-critical { color: var(--sev-critical-ink); background: rgba(255, 149, 0, 0.12); }
+.quota-warning.is-danger { color: var(--sev-danger-ink); background: rgba(255, 59, 48, 0.12); }
 
 .main-content {
   position: relative;

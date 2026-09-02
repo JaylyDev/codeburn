@@ -31,6 +31,7 @@ import { PeriodTabs, PERIOD_LABELS } from './components/PeriodTabs'
 import type { Period } from './components/PeriodTabs'
 import { FooterBar } from './components/FooterBar'
 import { ErrorToast } from './components/ErrorToast'
+import { QuotaWarningRow } from './components/QuotaWarningRow'
 import { SettingsPanel, type ThemeChoice } from './components/SettingsPanel'
 
 const payloadCache = new PayloadCache<MenubarPayload>()
@@ -296,6 +297,7 @@ export function App() {
           <span className="brand-accent">Burn</span>
         </div>
         <div className="subhead">AI Coding Cost Tracker</div>
+        {!cliBlocked && !showSettings && <QuotaWarningRow quota={quota} />}
       </header>
 
       {!cliBlocked && !showSettings && (

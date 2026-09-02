@@ -122,6 +122,20 @@ export function WarningIcon({ filled = true, ...p }: IconProps & { filled?: bool
   )
 }
 
+/// The rest of the severity ladder the quota warning row climbs, standing in for the mac's
+/// info.circle, exclamationmark.circle and octagon (WarningIcon covers the triangle).
+export function InfoCircleIcon(p: IconProps) {
+  return <Svg {...p}><circle cx="8" cy="8" r="6" /><path d="M8 7.3v3.4M8 5.2v.2" /></Svg>
+}
+
+export function ExclamationCircleIcon(p: IconProps) {
+  return <Svg {...p}><circle cx="8" cy="8" r="6" /><path d="M8 5.1v3.5M8 10.7v.2" /></Svg>
+}
+
+export function OctagonIcon(p: IconProps) {
+  return <Svg {...p}><path d="M5.9 2h4.2L13 4.9v4.2L10.1 12H5.9L3 9.1V4.9z" /></Svg>
+}
+
 export function ArrowUpRight(p: IconProps) {
   return <Svg {...p}><path d="M4.5 11.5 11.5 4.5M6 4.5h5.5V10" /></Svg>
 }
