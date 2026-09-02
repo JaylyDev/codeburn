@@ -1,0 +1,270 @@
+import Foundation
+import Testing
+@testable import CodeBurnMenubar
+
+/// A fetch whose completion the test controls, so two real refresh tasks can be
+/// held in flight at once. Every attempt records the provider it was issued for
+/// and parks until the test releases it by index.
+@MainActor
+private final class ScriptedFetch {
+    private var parked: [Int: CheckedContinuation<Void, Never>] = [:]
+    private(set) var attempts: [(index: Int, provider: ProviderFilter)] = []
+    private(set) var released: [Int] = []
+    var payloadForProvider: (ProviderFilter) -> MenubarPayload = { _ in scriptedPayload(cost: 1) }
+
+    func install() {
+        DataClient.fetchHookForTesting = { [weak self] provider, _ in
+            guard let self else { return scriptedPayload(cost: 0) }
+            let index = await self.begin(provider)
+            await self.park(index)
+            return await self.payload(for: provider)
+        }
+    }
+
+    func uninstall() {
+        DataClient.fetchHookForTesting = nil
+        for (_, continuation) in parked { continuation.resume() }
+        parked.removeAll()
+    }
+
+    private func begin(_ provider: ProviderFilter) -> Int {
+        let index = attempts.count
+        attempts.append((index: index, provider: provider))
+        return index
+    }
+
+    private func park(_ index: Int) async {
+        await withCheckedContinuation { parked[index] = $0 }
+    }
+
+    private func payload(for provider: ProviderFilter) -> MenubarPayload {
+        payloadForProvider(provider)
+    }
+
+    func isParked(_ index: Int) -> Bool { parked[index] != nil }
+
+    func release(_ index: Int) {
+        guard let continuation = parked.removeValue(forKey: index) else { return }
+        released.append(index)
+        continuation.resume()
+    }
+
+    func indices(for provider: ProviderFilter) -> [Int] {
+        attempts.filter { $0.provider == provider }.map(\.index)
+    }
+}
+
+private func scriptedPayload(cost: Double,
+                             calls: Int = 1,
+                             providers: [String: Double]? = nil,
+                             providerDetails: [ProviderDetail] = []) -> MenubarPayload {
+    MenubarPayload(
+        generated: "test",
+        current: CurrentBlock(
+            label: "Today",
+            cost: cost,
+            calls: calls,
+            sessions: 1,
+            oneShotRate: nil,
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheHitPercent: 0,
+            codexCredits: nil,
+            topActivities: [],
+            topModels: [],
+            localModelSavings: LocalModelSavings(totalUSD: 0, calls: 0, byModel: [], byProvider: []),
+            providers: providers ?? ["claude": cost],
+            providerDetails: providerDetails,
+            topProjects: [],
+            modelEfficiency: [],
+            topSessions: [],
+            retryTax: RetryTax(totalUSD: 0, retries: 0, editTurns: 0, byModel: []),
+            routingWaste: RoutingWaste(totalSavingsUSD: 0, baselineModel: "", baselineCostPerEdit: 0, byModel: []),
+            tools: [],
+            skills: [],
+            subagents: [],
+            mcpServers: []
+        ),
+        optimize: OptimizeBlock(findingCount: 0, savingsUSD: 0, topFindings: []),
+        history: HistoryBlock(daily: []),
+        combined: nil,
+        claudeConfigs: nil
+    )
+}
+
+/// Yield repeatedly until `condition` holds. The tasks under test suspend on
+/// real continuations, so progress needs actual scheduler turns, not a sleep.
+@MainActor
+private func settle(until condition: () -> Bool, turns: Int = 500) async -> Bool {
+    for _ in 0..<turns {
+        if condition() { return true }
+        await Task.yield()
+    }
+    return condition()
+}
+
+// Serialized: the DataClient fetch hook is process-global, so two of these
+// running at once would each see the other's attempts.
+@Suite("AppStore refresh concurrency", .serialized)
+@MainActor
+struct AppStoreRefreshConcurrencyTests {
+
+    @Test("a fetch whose in-flight slot was evicted cannot release its successor's slot")
+    func evictedFetchCannotReleaseSuccessorSlot() async {
+        let script = ScriptedFetch()
+        script.install()
+        defer { script.uninstall() }
+
+        let store = AppStore()
+        store.setCacheDateToTodayForTesting()
+
+        // A claims the slot for (today, claude) and parks inside its fetch.
+        let taskA = Task { await store.refreshQuietlyForTesting(period: .today, provider: .claude) }
+        #expect(await settle(until: { script.attempts.count == 1 }))
+        #expect(store.isInFlightForTesting(period: .today, provider: .claude))
+
+        // The display-sleep reset evicts the slot out from under A.
+        store.resetLoadingState()
+        #expect(!store.isInFlightForTesting(period: .today, provider: .claude))
+
+        // B legitimately claims the same key afterwards.
+        let taskB = Task { await store.refreshQuietlyForTesting(period: .today, provider: .claude) }
+        #expect(await settle(until: { script.attempts.count == 2 }))
+        #expect(store.isInFlightForTesting(period: .today, provider: .claude))
+
+        // C finds the key busy and parks as a waiter on B.
+        var cFinished = false
+        let taskC = Task {
+            let result = await store.refreshQuietlyForTesting(period: .today, provider: .claude)
+            cFinished = true
+            return result
+        }
+        #expect(await settle(until: { store.inFlightWaiterCountForTesting(period: .today, provider: .claude) == 1 }))
+
+        // A finishes late. Its slot is gone, so its release must be a no-op:
+        // B keeps the slot and C stays parked. Untokened, A's defer cleared B's
+        // slot and woke C onto an empty cache.
+        script.release(0)
+        _ = await taskA.value
+        #expect(store.isInFlightForTesting(period: .today, provider: .claude))
+        #expect(store.inFlightWaiterCountForTesting(period: .today, provider: .claude) == 1)
+        #expect(!cFinished)
+
+        // B finishes and C resumes off B's result.
+        script.release(1)
+        #expect(await taskB.value)
+        #expect(await taskC.value)
+        #expect(cFinished)
+        #expect(!store.isInFlightForTesting(period: .today, provider: .claude))
+        #expect(store.inFlightWaiterCountForTesting(period: .today, provider: .claude) == 0)
+    }
+
+    @Test("the all-provider and scoped fetches run together and only acceptance is ordered")
+    func allAndScopedFetchesOverlap() async {
+        let script = ScriptedFetch()
+        script.payloadForProvider = { provider in
+            provider == .all
+                ? scriptedPayload(cost: 12, providers: ["claude": 12],
+                                  providerDetails: [ProviderDetail(id: "claude", label: "Claude", cost: 12, calls: 4, hasUsage: true)])
+                : scriptedPayload(cost: 12, providers: ["claude": 12],
+                                  providerDetails: [ProviderDetail(id: "claude", label: "Claude", cost: 12, calls: 4, hasUsage: true)])
+        }
+        script.install()
+        defer { script.uninstall() }
+
+        let store = AppStore()
+        store.setCacheDateToTodayForTesting()
+        store.suppressRefreshesForTesting()
+        store.switchTo(provider: .claude)
+
+        let task = Task { await store.refresh(includeOptimize: false, force: true) }
+
+        // BOTH parses are in flight before either has produced a result. The
+        // serialized version could not reach two attempts until the first
+        // returned.
+        #expect(await settle(until: { script.attempts.count == 2 }))
+        #expect(Set(script.attempts.map(\.provider)) == Set([.all, .claude]))
+        #expect(script.isParked(0))
+        #expect(script.isParked(1))
+
+        // Acceptance is still ordered: release the scoped fetch first and it
+        // must not land until the all-provider evidence has.
+        let scopedIndex = script.indices(for: .claude)[0]
+        let allIndex = script.indices(for: .all)[0]
+        script.release(scopedIndex)
+        for _ in 0..<50 { await Task.yield() }
+        #expect(store.cachedPayloadForTesting(period: .today, provider: .claude) == nil)
+
+        script.release(allIndex)
+        #expect(await task.value)
+        #expect(store.cachedPayloadForTesting(period: .today, provider: .claude) != nil)
+        #expect(store.cachedPayloadForTesting(period: .today, provider: .all) != nil)
+    }
+
+    @Test("an interactive refresh joins an in-flight fetch instead of reporting failure")
+    func interactiveRefreshJoinsInFlightFetch() async {
+        let script = ScriptedFetch()
+        script.install()
+        defer { script.uninstall() }
+
+        let store = AppStore()
+        store.setCacheDateToTodayForTesting()
+
+        let first = Task { await store.refresh(includeOptimize: false, force: true) }
+        #expect(await settle(until: { script.attempts.count == 1 }))
+
+        // Second interactive refresh on the same key. It used to return false
+        // immediately, which is what made recoverFromStuckLoading() announce a
+        // failed recovery while a perfectly healthy fetch was still running.
+        var secondResult: Bool?
+        let second = Task {
+            let value = await store.refresh(includeOptimize: false, force: true)
+            secondResult = value
+            return value
+        }
+        #expect(await settle(until: { store.inFlightWaiterCountForTesting(period: .today, provider: .all) == 1 }))
+        #expect(secondResult == nil)
+
+        script.release(0)
+        #expect(await first.value)
+        #expect(await second.value)
+    }
+
+    @Test("a twice-contradicting payload is cached and flagged instead of raising an error")
+    func twiceContradictingPayloadIsCachedAndFlagged() async {
+        let script = ScriptedFetch()
+        // The scoped payload reports nothing for a provider the all-provider
+        // slice says is active, and says so again on the verifying re-parse.
+        script.payloadForProvider = { provider in
+            provider == .all
+                ? scriptedPayload(cost: 12, providers: ["claude": 11.5, "hermes agent": 0.5],
+                                  providerDetails: [
+                                    ProviderDetail(id: "claude", label: "Claude", cost: 11.5, calls: 4, hasUsage: true),
+                                    ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0.5, calls: 7, hasUsage: true),
+                                  ])
+                : scriptedPayload(cost: 0, calls: 0, providers: ["hermes agent": 0],
+                                  providerDetails: [ProviderDetail(id: "hermes", label: "Hermes Agent", cost: 0, calls: 0, hasUsage: false)])
+        }
+        script.install()
+        defer { script.uninstall() }
+
+        let store = AppStore()
+        store.setCacheDateToTodayForTesting()
+        store.suppressRefreshesForTesting()
+        store.switchTo(provider: .hermes)
+
+        let task = Task { await store.refresh(includeOptimize: false, force: true) }
+        // all + scoped + the resident-bypassing verification of the scoped one.
+        #expect(await settle(until: { script.attempts.count >= 2 }))
+        for index in 0..<script.attempts.count { script.release(index) }
+        #expect(await settle(until: { script.attempts.count == 3 }))
+        script.release(2)
+        _ = await task.value
+
+        // Cached and served, with the caveat flag set. It used to throw, which
+        // left the tab with an error banner and no number at all.
+        #expect(store.cachedPayloadForTesting(period: .today, provider: .hermes) != nil)
+        #expect(store.selectedPayloadMayBeIncomplete)
+        #expect(store.lastError == nil)
+    }
+}
