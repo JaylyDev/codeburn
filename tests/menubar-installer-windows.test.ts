@@ -1,15 +1,22 @@
 import { createHash } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
+  BUNDLED_MSI_ENV,
+  BUNDLED_RESULT_PREFIX,
   WINDOWS_RELEASE,
+  compareMenubarVersions,
+  decideBundledInstall,
   installMenubarApp,
+  menubarMarkerPath,
   parseInstalledWindowsMenubar,
+  parseWindowsMsiVersion,
   resolveLatestMenubarReleaseAssets,
   resolveSystem32Path,
   resolveVersionedMenubarReleaseAssets,
+  type BundledInstallResult,
   type ReleaseResponse,
 } from '../src/menubar-installer.js'
 
@@ -295,5 +302,199 @@ describe('installMenubarApp on windows', () => {
     expect(requested).toContain('https://example.test/msi')
     expect(installerCalls[0]?.args[1]).toBe(join(sandbox, 'CodeBurn.Menubar_0.9.19_x64_en-US.msi'))
     expect(result.launched).toBe(true)
+  })
+})
+
+describe('compareMenubarVersions', () => {
+  it('compares field by field, numerically', () => {
+    expect(compareMenubarVersions('0.9.9', '0.9.10')).toBe(-1)
+    expect(compareMenubarVersions('0.10.0', '0.9.30')).toBe(1)
+    expect(compareMenubarVersions('v0.9.23', '0.9.23')).toBe(0)
+  })
+
+  it('treats a missing or unreadable field as the oldest thing there is', () => {
+    expect(compareMenubarVersions('', '0.0.1')).toBe(-1)
+    expect(compareMenubarVersions('0.9', '0.9.0')).toBe(0)
+  })
+})
+
+describe('parseWindowsMsiVersion', () => {
+  it('reads the version out of the release asset name', () => {
+    expect(parseWindowsMsiVersion('CodeBurn.Menubar_0.9.23_x64_en-US.msi')).toBe('0.9.23')
+    expect(parseWindowsMsiVersion('CodeBurn-Setup-0.9.23.exe')).toBeUndefined()
+  })
+})
+
+describe('decideBundledInstall', () => {
+  it('installs onto a machine that has no menubar', () => {
+    expect(decideBundledInstall(undefined, '0.9.23')).toBe('installed')
+  })
+
+  it('upgrades an older install and leaves an equal one alone', () => {
+    expect(decideBundledInstall('0.9.20', '0.9.23')).toBe('installed')
+    expect(decideBundledInstall('0.9.23', '0.9.23')).toBe('up-to-date')
+  })
+
+  it('never downgrades', () => {
+    expect(decideBundledInstall('0.9.30', '0.9.23')).toBe('kept-newer')
+  })
+
+  it('reinstalls the same version under force', () => {
+    expect(decideBundledInstall('0.9.23', '0.9.23', true)).toBe('installed')
+  })
+})
+
+describe('installMenubarApp from a staged msi', () => {
+  const BUNDLED_VERSION = '0.9.23'
+  const MSI_NAME = `CodeBurn.Menubar_${BUNDLED_VERSION}_x64_en-US.msi`
+  const INSTALLED_0_9_23 = regBlock({
+    DisplayName: 'CodeBurn Menubar',
+    DisplayVersion: '0.9.23',
+    InstallLocation: 'C:\\Program Files\\CodeBurn Menubar\\',
+    UninstallString: 'MsiExec.exe /X{9c1e2f0a-0000-0000-0000-000000000001}',
+  })
+  const INSTALLED_0_9_30 = regBlock({
+    DisplayName: 'CodeBurn Menubar',
+    DisplayVersion: '0.9.30',
+    InstallLocation: 'C:\\Program Files\\CodeBurn Menubar\\',
+  })
+
+  let sandbox: string
+  let msiPath: string
+  let logs: string[]
+  let installerCalls: Array<{ exe: string; args: string[] }>
+
+  function env(): NodeJS.ProcessEnv {
+    return { SystemRoot: 'C:\\Windows', LOCALAPPDATA: join(sandbox, 'Local'), [BUNDLED_MSI_ENV]: msiPath }
+  }
+
+  function hooks(overrides: Record<string, unknown> = {}) {
+    return {
+      env: env(),
+      log: (message: string) => { logs.push(message) },
+      queryRegistry: async () => '',
+      runInstaller: async (exe: string, args: string[]) => { installerCalls.push({ exe, args }); return 0 },
+      fetchOptions: { fetchImpl: async () => { throw new Error('a staged install must not reach the network') } },
+      ...overrides,
+    }
+  }
+
+  function reported(): BundledInstallResult {
+    const line = logs.find(entry => entry.startsWith(BUNDLED_RESULT_PREFIX))
+    if (!line) throw new Error(`no result line in:\n${logs.join('\n')}`)
+    return JSON.parse(line.slice(BUNDLED_RESULT_PREFIX.length)) as BundledInstallResult
+  }
+
+  async function marker(): Promise<Record<string, unknown>> {
+    return JSON.parse(await readFile(menubarMarkerPath(env()), 'utf8')) as Record<string, unknown>
+  }
+
+  beforeEach(async () => {
+    sandbox = await mkdtemp(join(tmpdir(), 'menubar-staged-'))
+    msiPath = join(sandbox, MSI_NAME)
+    logs = []
+    installerCalls = []
+    await writeFile(msiPath, MSI_BYTES)
+    await writeFile(`${msiPath}.sha256`, `${sha256(MSI_BYTES)}  ${MSI_NAME}\n`)
+  })
+
+  afterEach(async () => {
+    await rm(sandbox, { recursive: true, force: true })
+  })
+
+  it('verifies the staged file, installs it and credits the desktop app', async () => {
+    let queries = 0
+    const result = await installMenubarApp({
+      platform: 'win32',
+      windows: hooks({ queryRegistry: async () => (queries++ === 0 ? '' : INSTALLED_0_9_23) }),
+    })
+
+    expect(installerCalls).toEqual([{
+      exe: 'C:\\Windows\\System32\\msiexec.exe',
+      args: ['/i', msiPath, '/passive', '/norestart'],
+    }])
+    expect(result.installedPath).toBe('C:\\Program Files\\CodeBurn Menubar\\CodeBurn Menubar.exe')
+    // The caller that staged the MSI owns the tray app's process, so nothing is launched here.
+    expect(result.launched).toBe(false)
+    expect(reported()).toMatchObject({
+      action: 'installed',
+      bundledVersion: BUNDLED_VERSION,
+      previousVersion: null,
+      installedBy: 'desktop',
+      uninstallString: 'MsiExec.exe /X{9c1e2f0a-0000-0000-0000-000000000001}',
+    })
+    expect(await marker()).toMatchObject({ installedBy: 'desktop', version: '0.9.23' })
+  })
+
+  it('upgrades a manual install in place without claiming it', async () => {
+    let queries = 0
+    await installMenubarApp({
+      platform: 'win32',
+      windows: hooks({ queryRegistry: async () => (queries++ === 0 ? INSTALLED_0_9_20 : INSTALLED_0_9_23) }),
+    })
+
+    expect(installerCalls).toHaveLength(1)
+    expect(reported()).toMatchObject({ action: 'installed', previousVersion: '0.9.20', installedBy: 'manual' })
+    expect(await marker()).toMatchObject({ installedBy: 'manual' })
+  })
+
+  it('keeps a newer install and runs no installer', async () => {
+    await installMenubarApp({
+      platform: 'win32',
+      windows: hooks({ queryRegistry: async () => INSTALLED_0_9_30 }),
+    })
+
+    expect(installerCalls).toEqual([])
+    expect(reported()).toMatchObject({ action: 'kept-newer', previousVersion: '0.9.30', installedBy: 'manual' })
+    expect(logs.some(line => line.includes('newer than the bundled'))).toBe(true)
+  })
+
+  it('does nothing when the bundled version is already installed', async () => {
+    await installMenubarApp({
+      platform: 'win32',
+      windows: hooks({ queryRegistry: async () => INSTALLED_0_9_23 }),
+    })
+
+    expect(installerCalls).toEqual([])
+    expect(reported()).toMatchObject({ action: 'up-to-date' })
+  })
+
+  it('never rewrites a marker that already credits the desktop app', async () => {
+    let queries = 0
+    await installMenubarApp({
+      platform: 'win32',
+      windows: hooks({ queryRegistry: async () => (queries++ === 0 ? '' : INSTALLED_0_9_23) }),
+    })
+    logs = []
+    await installMenubarApp({
+      platform: 'win32',
+      windows: hooks({ queryRegistry: async () => INSTALLED_0_9_23 }),
+    })
+
+    expect(reported()).toMatchObject({ action: 'up-to-date', installedBy: 'desktop' })
+  })
+
+  it('refuses a staged file whose digest does not match', async () => {
+    await writeFile(`${msiPath}.sha256`, `${sha256('other-bytes')}  ${MSI_NAME}\n`)
+
+    await expect(installMenubarApp({ platform: 'win32', windows: hooks() })).rejects.toThrow(/Checksum mismatch/)
+    expect(installerCalls).toEqual([])
+  })
+
+  it('refuses a staged file with no digest beside it', async () => {
+    await rm(`${msiPath}.sha256`)
+
+    await expect(installMenubarApp({ platform: 'win32', windows: hooks() })).rejects.toThrow(/Missing checksum file/)
+    expect(installerCalls).toEqual([])
+  })
+
+  it('reports a cancelled install rather than failing', async () => {
+    const result = await installMenubarApp({
+      platform: 'win32',
+      windows: hooks({ runInstaller: async () => 1602 }),
+    })
+
+    expect(result).toEqual({ installedPath: '', launched: false })
+    expect(reported()).toMatchObject({ action: 'cancelled', installedBy: null })
   })
 })

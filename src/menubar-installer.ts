@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir, platform, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
 import { ProxyAgent, fetch as undiciFetch } from 'undici'
@@ -363,15 +363,9 @@ async function fetchReleaseAsset<T>(
   }
 }
 
-export async function verifyChecksum(
-  archivePath: string,
-  checksumUrl: string,
-  options: AssetFetchOptions = {},
-): Promise<void> {
-  // Only the transport is retried. The digest comparison below is deliberately outside the retry:
-  // an integrity failure must abort on the first look and never re-download.
-  const text = await fetchReleaseAsset(checksumUrl, 'Checksum download', response => response.text(), options)
-  const expected = text.trim().split(/\s+/)[0]!.toLowerCase()
+/// `<digest>  <name>`, as sha256sum writes it; only the digest is compared.
+async function assertSha256(archivePath: string, checksumText: string): Promise<void> {
+  const expected = checksumText.trim().split(/\s+/)[0]!.toLowerCase()
   const fileBytes = await readFile(archivePath)
   const actual = createHash('sha256').update(fileBytes).digest('hex')
   if (actual !== expected) {
@@ -382,6 +376,31 @@ export async function verifyChecksum(
       `The download may be corrupted or tampered with.`
     )
   }
+}
+
+export async function verifyChecksum(
+  archivePath: string,
+  checksumUrl: string,
+  options: AssetFetchOptions = {},
+): Promise<void> {
+  // Only the transport is retried. The digest comparison is deliberately outside the retry:
+  // an integrity failure must abort on the first look and never re-download.
+  const text = await fetchReleaseAsset(checksumUrl, 'Checksum download', response => response.text(), options)
+  await assertSha256(archivePath, text)
+}
+
+/// The same check for an .msi that arrived with another installer rather than over the network:
+/// its digest sits in `<msi>.sha256` beside it. A missing digest file is a refusal rather than a
+/// skip, because the whole point is that nothing unverified reaches msiexec.
+export async function verifyStagedChecksum(archivePath: string): Promise<void> {
+  const checksumPath = `${archivePath}.sha256`
+  let text: string
+  try {
+    text = await readFile(checksumPath, 'utf8')
+  } catch {
+    throw new Error(`Missing checksum file ${checksumPath}; refusing to run an unverified installer.`)
+  }
+  await assertSha256(archivePath, text)
 }
 
 export async function downloadToFile(
@@ -532,13 +551,202 @@ export type WindowsInstallHooks = {
   apiFetch?: ReleaseApiFetch
   runInstaller?: (exe: string, args: string[]) => Promise<number>
   queryRegistry?: () => Promise<string>
-  launch?: (exePath: string) => void
+  launch?: (exePath: string, args?: string[]) => void
   log?: (message: string) => void
   stagingDir?: string
   env?: NodeJS.ProcessEnv
 }
 
-export type InstalledWindowsMenubar = { version: string; exePath: string }
+export type InstalledWindowsMenubar = {
+  version: string
+  exePath: string
+  /// `MsiExec.exe /X{product-code}` as Windows Installer wrote it. The desktop app's own
+  /// uninstaller has no other handle on the product it installed, so the bundled install
+  /// records this in the marker file.
+  uninstallString?: string
+}
+
+// The bundled .msi route ---------------------------------------------------------------------
+
+/// Names a `CodeBurn.Menubar_<version>_x64_en-US.msi` already on disk, with its `.sha256`
+/// beside it. The Electron desktop app ships the matching MSI in its own resources and sets
+/// this so `codeburn menubar` installs from that file instead of downloading a release. The
+/// MSI carries a fixed WiX upgrade code, so it upgrades a manual install in place rather than
+/// standing a second copy beside it.
+export const BUNDLED_MSI_ENV = 'CODEBURN_MENUBAR_MSI'
+/// One line on stdout so the caller that staged the MSI learns what happened without reading
+/// prose. Everything else the install prints stays human-readable.
+export const BUNDLED_RESULT_PREFIX = 'CODEBURN_MENUBAR_RESULT '
+
+export type BundledInstallAction = 'installed' | 'up-to-date' | 'kept-newer' | 'cancelled'
+
+export type BundledInstallResult = {
+  action: BundledInstallAction
+  bundledVersion: string
+  /// What the uninstall registry held before this run, or null when nothing was installed.
+  previousVersion: string | null
+  exePath: string
+  uninstallString: string | null
+  /// Who the marker file credits with the install: never this run when someone else got there
+  /// first, so the desktop uninstaller only ever removes what the desktop app put there.
+  installedBy: MenubarInstalledBy | null
+}
+
+export type MenubarInstalledBy = 'desktop' | 'manual'
+
+export type MenubarInstallMarker = {
+  installedBy: MenubarInstalledBy
+  version: string
+  uninstallString: string | null
+  installedAt: string
+}
+
+/// Numeric dotted compare, shortest field wins nothing: 0.9.9 is older than 0.9.10, and a
+/// missing or non-numeric field counts as 0 so an empty DisplayVersion reads as the oldest
+/// thing there is rather than throwing.
+export function compareMenubarVersions(a: string, b: string): number {
+  const pa = a.trim().replace(/^v/, '').split('.')
+  const pb = b.trim().replace(/^v/, '').split('.')
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = Number.parseInt(pa[i] ?? '0', 10) || 0
+    const y = Number.parseInt(pb[i] ?? '0', 10) || 0
+    if (x !== y) return x < y ? -1 : 1
+  }
+  return 0
+}
+
+/// `CodeBurn.Menubar_0.9.23_x64_en-US.msi` -> `0.9.23`. The staged file is the release asset
+/// verbatim, so its name is the only version statement that cannot disagree with its contents.
+export function parseWindowsMsiVersion(fileName: string): string | undefined {
+  return /^CodeBurn\.Menubar_(.+)_x64_en-US\.msi$/.exec(fileName)?.[1]
+}
+
+/// Never downgrade: a menubar newer than the bundled one was put there by a `codeburn menubar`
+/// install or a newer desktop build, and replacing it with what this build happens to carry
+/// would take working features away.
+export function decideBundledInstall(
+  installedVersion: string | undefined,
+  bundledVersion: string,
+  force = false,
+): Exclude<BundledInstallAction, 'cancelled'> {
+  if (installedVersion === undefined) return 'installed'
+  if (force) return 'installed'
+  const order = compareMenubarVersions(installedVersion, bundledVersion)
+  if (order > 0) return 'kept-newer'
+  return order === 0 ? 'up-to-date' : 'installed'
+}
+
+/// Beside the tray app's own `status.json` and `update.json`, which is where anything about a
+/// specific install of the menubar already lives.
+export function menubarMarkerPath(env: NodeJS.ProcessEnv = process.env): string {
+  const local = env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local')
+  return join(local, 'codeburn-menubar', 'installed-by.json')
+}
+
+export async function readMenubarMarker(env: NodeJS.ProcessEnv = process.env): Promise<MenubarInstallMarker | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(menubarMarkerPath(env), 'utf8')) as Partial<MenubarInstallMarker>
+    if (parsed.installedBy !== 'desktop' && parsed.installedBy !== 'manual') return undefined
+    return {
+      installedBy: parsed.installedBy,
+      version: typeof parsed.version === 'string' ? parsed.version : '',
+      uninstallString: typeof parsed.uninstallString === 'string' ? parsed.uninstallString : null,
+      installedAt: typeof parsed.installedAt === 'string' ? parsed.installedAt : '',
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/// The marker answers one question for the desktop app's uninstaller: did this app put the
+/// menubar here? Only a first install onto a machine that had none can say yes, and once a
+/// marker exists its verdict is never rewritten - an upgrade refreshes the version and the
+/// uninstall string, nothing else.
+async function writeMenubarMarker(
+  installed: InstalledWindowsMenubar,
+  hadPreviousInstall: boolean,
+  env: NodeJS.ProcessEnv,
+): Promise<MenubarInstalledBy> {
+  const existing = await readMenubarMarker(env)
+  const installedBy: MenubarInstalledBy = existing?.installedBy ?? (hadPreviousInstall ? 'manual' : 'desktop')
+  const marker: MenubarInstallMarker = {
+    installedBy,
+    version: installed.version,
+    uninstallString: installed.uninstallString ?? null,
+    installedAt: new Date().toISOString(),
+  }
+  const path = menubarMarkerPath(env)
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, `${JSON.stringify(marker, null, 2)}\n`)
+  return installedBy
+}
+
+/// Install from a file another installer staged. No network, no release lookup, no launch: the
+/// caller that staged the MSI owns the tray app's process, so starting it is its business.
+async function installStagedWindowsMenubar(
+  msiPath: string,
+  options: InstallOptions,
+): Promise<InstallResult> {
+  const hooks = options.windows ?? {}
+  const log = hooks.log ?? console.log
+  const env = hooks.env ?? process.env
+  const queryRegistry = hooks.queryRegistry ?? (() => queryWindowsUninstallRegistry(env))
+
+  const bundledVersion = parseWindowsMsiVersion(basename(msiPath))
+  if (!bundledVersion) {
+    throw new Error(`${msiPath} is not a CodeBurn.Menubar_<version>_x64_en-US.msi.`)
+  }
+
+  const before = parseInstalledWindowsMenubar(await queryRegistry())
+  const decision = decideBundledInstall(before?.version, bundledVersion, options.force)
+
+  const report = async (
+    action: BundledInstallAction,
+    installed: InstalledWindowsMenubar | undefined,
+    installedBy: MenubarInstalledBy | null,
+  ): Promise<InstallResult> => {
+    const result: BundledInstallResult = {
+      action,
+      bundledVersion,
+      previousVersion: before?.version ?? null,
+      exePath: installed?.exePath ?? '',
+      uninstallString: installed?.uninstallString ?? null,
+      installedBy,
+    }
+    log(`${BUNDLED_RESULT_PREFIX}${JSON.stringify(result)}`)
+    return { installedPath: result.exePath, launched: false }
+  }
+
+  if (decision !== 'installed') {
+    log(decision === 'kept-newer'
+      ? `CodeBurn Menubar ${before!.version} is newer than the bundled ${bundledVersion}; leaving it alone.`
+      : `CodeBurn Menubar ${bundledVersion} is already installed.`)
+    const installedBy = before ? await writeMenubarMarker(before, true, env) : null
+    return report(decision, before, installedBy)
+  }
+
+  log('Verifying checksum...')
+  await verifyStagedChecksum(msiPath)
+  log('Installing...')
+  const msiexec = resolveSystem32Path('msiexec.exe', env)
+  const exitCode = await (hooks.runInstaller ?? runMsiexec)(msiexec, ['/i', msiPath, '/passive', '/norestart'])
+  if (exitCode === MSI_EXIT_USER_CANCEL) {
+    log('Installation was cancelled; nothing was installed.')
+    return report('cancelled', undefined, null)
+  }
+  if (exitCode !== 0 && exitCode !== MSI_EXIT_REBOOT_REQUIRED) {
+    throw new Error(`msiexec exited with ${exitCode} while installing ${basename(msiPath)}.`)
+  }
+  if (exitCode === MSI_EXIT_REBOOT_REQUIRED) log('Windows wants a restart to finish the install.')
+
+  const installed = parseInstalledWindowsMenubar(await queryRegistry())
+  if (!installed) {
+    throw new Error('CodeBurn Menubar installed, but it was not found in the uninstall registry.')
+  }
+  const installedBy = await writeMenubarMarker(installed, before !== undefined, env)
+  log(`Installed CodeBurn Menubar ${installed.version}.`)
+  return report('installed', installed, installedBy)
+}
 
 /// Windows' `CreateProcess` searches the current directory before `PATH`, so spawning `msiexec`
 /// or `reg` by bare name lets anything dropped next to the CLI impersonate a system tool. Same
@@ -566,7 +774,12 @@ export function parseInstalledWindowsMenubar(regOutput: string): InstalledWindow
       ? `${location.replace(/[\\/]+$/, '')}\\${WINDOWS_PRODUCT_NAME}.exe`
       : icon
     if (!exePath) continue
-    return { version: values.get('DisplayVersion') ?? '', exePath }
+    const uninstallString = values.get('UninstallString')
+    return {
+      version: values.get('DisplayVersion') ?? '',
+      exePath,
+      ...(uninstallString ? { uninstallString } : {}),
+    }
   }
   return undefined
 }
@@ -616,6 +829,12 @@ async function installWindowsMenubarApp(options: InstallOptions): Promise<Instal
   const queryRegistry = hooks.queryRegistry ?? (() => queryWindowsUninstallRegistry(env))
   const launch = hooks.launch ?? launchWindowsApp
   const cliVersion = options.cliVersion ? normalizeCliVersion(options.cliVersion) : ''
+
+  // An MSI already on disk short-circuits the whole release lookup: the desktop app ships the
+  // matching build and points at it rather than sending every install of the desktop app to
+  // GitHub for a file it already has.
+  const bundledMsi = env[BUNDLED_MSI_ENV]
+  if (bundledMsi) return installStagedWindowsMenubar(bundledMsi, options)
 
   const installed = parseInstalledWindowsMenubar(await queryRegistry())
   if (installed && !options.force && (!cliVersion || installed.version === cliVersion)) {
