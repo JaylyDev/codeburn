@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { openUrl } from '@tauri-apps/plugin-opener'
 import type { CurrencyState } from '../lib/currency'
@@ -14,9 +14,14 @@ import { ChevronDown, ChevronRight } from './Icons'
 
 export type ThemeChoice = 'system' | 'light' | 'dark'
 
+/// Where an entry point wants the panel opened. The tray's Capacity Dock Settings lands in
+/// General, as it does on the mac, until package C gives the dock a pane of its own.
+export type SettingsSection = 'general' | 'about'
+
 const GITHUB_URL = 'https://github.com/getagentseal/codeburn'
 
 type Props = {
+  section: SettingsSection
   onBack: () => void
   version: string
   currency: CurrencyState
@@ -32,11 +37,12 @@ type Props = {
 }
 
 export function SettingsPanel({
-  onBack, version, currency, onCurrency, themeChoice, onThemeChoice, trayBadge, onTrayBadge,
+  section, onBack, version, currency, onCurrency, themeChoice, onThemeChoice, trayBadge, onTrayBadge,
   cliStatus, onCheckCli, cliChecking, onQuit,
 }: Props) {
   const [loginItem, setLoginItem] = useState<boolean | null>(null)
   const [loginError, setLoginError] = useState<string | null>(null)
+  const about = useRef<HTMLDivElement>(null)
 
   // No CLI probe here: App owns the gate and probes it on mount, so the panel only ever
   // displays what that probe found. Its own probe could otherwise fail transiently and drop
@@ -44,6 +50,10 @@ export function SettingsPanel({
   useEffect(() => {
     invoke<boolean>('launch_at_login').then(setLoginItem).catch(() => setLoginItem(false))
   }, [])
+
+  useEffect(() => {
+    if (section === 'about') about.current?.scrollIntoView({ block: 'start' })
+  }, [section])
 
   const toggleLogin = async () => {
     if (loginItem === null) return
@@ -117,7 +127,7 @@ export function SettingsPanel({
         </Row>
       </div>
 
-      <div className="settings-group">
+      <div className="settings-group" ref={about}>
         <div className="settings-group-label">About</div>
         <Row label={`CodeBurn Desktop ${version ? `v${version}` : ''}`} hint="Tracks AI coding spend from local session logs. Nothing leaves this machine except the Claude usage check.">
           <button type="button" className="btn" onClick={() => openUrl(GITHUB_URL)}>GitHub</button>
