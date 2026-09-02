@@ -219,6 +219,7 @@ fn build_tray_tauri(app: &AppHandle) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let report = MenuItem::with_id(app, "report", "Open Full Report", true, None::<&str>)?;
+    let updates = MenuItem::with_id(app, "check_updates", "Check for Updates", true, None::<&str>)?;
     let about = MenuItem::with_id(app, "about", "About CodeBurn", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit CodeBurn", true, None::<&str>)?;
     let menu = Menu::with_items(
@@ -233,6 +234,7 @@ fn build_tray_tauri(app: &AppHandle) -> tauri::Result<()> {
             &dock_settings,
             &capacity_dock,
             &report,
+            &updates,
             &PredefinedMenuItem::separator(app)?,
             &about,
             &quit,
@@ -293,6 +295,11 @@ fn on_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         "settings" => open_settings(app, "general"),
         "dock_settings" => open_settings(app, "general#dock"),
         "about" => open_settings(app, "about"),
+        // The mac answers this with an NSAlert. Here the three results (up to date, update
+        // available, check failed) belong on the About pane, which already has the version
+        // and the button that installs what the check found, so the menu item opens that
+        // pane and the anchor tells it to check straight away.
+        "check_updates" => open_settings(app, "about#check"),
         "report" => {
             let _ = cli::spawn_in_terminal(app, &["report"]);
         }

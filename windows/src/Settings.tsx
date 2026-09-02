@@ -150,7 +150,7 @@ export function Settings() {
 
       <main className="stg-detail">
         {selected === 'general' && <GeneralPane quota={quota} anchor={anchor} />}
-        {selected === 'about' && <AboutPane />}
+        {selected === 'about' && <AboutPane anchor={anchor} />}
         {!MAIN_PANES.includes(selected) && (
           <ProviderPane
             key={selected}
