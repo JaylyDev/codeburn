@@ -31,7 +31,8 @@ import { PeriodTabs, PERIOD_LABELS } from './components/PeriodTabs'
 import type { Period } from './components/PeriodTabs'
 import { FooterBar } from './components/FooterBar'
 import { ErrorToast } from './components/ErrorToast'
-import { QuotaWarningRow } from './components/QuotaWarningRow'
+import { Header } from './components/Header'
+import { applyAccent, savedAccent, type AccentPreset } from './lib/accent'
 import { SettingsPanel, type SettingsSection, type ThemeChoice } from './components/SettingsPanel'
 
 const payloadCache = new PayloadCache<MenubarPayload>()
@@ -74,6 +75,7 @@ export function App() {
   const [quota, setQuota] = useState<QuotaState>(EMPTY_QUOTA)
   // The window starts hidden and is shown by a tray click, which emits `codeburn://shown`.
   const [popoverVisible, setPopoverVisible] = useState(false)
+  const [accent, setAccent] = useState<AccentPreset>(savedAccent)
   const [themeChoice, setThemeChoice] = useState<ThemeChoice>(() => {
     const saved = readSetting('theme')
     return saved === 'dark' || saved === 'light' ? saved : 'system'
@@ -256,6 +258,11 @@ export function App() {
   }, [todayPayload, currency])
 
 
+  const chooseAccent = (preset: AccentPreset) => {
+    applyAccent(preset)
+    setAccent(preset)
+  }
+
   const chooseTheme = (choice: ThemeChoice) => {
     applyTheme(choice === 'system' ? null : choice)
     setThemeChoice(choice)
@@ -316,14 +323,13 @@ export function App() {
 
   return (
     <div className="popover">
-      <header className="header">
-        <div className="brand">
-          <span className="brand-primary">Code</span>
-          <span className="brand-accent">Burn</span>
-        </div>
-        <div className="subhead">AI Coding Cost Tracker</div>
-        {!cliBlocked && !showSettings && <QuotaWarningRow quota={quota} />}
-      </header>
+      <Header
+        quota={quota}
+        showQuota={!cliBlocked && !showSettings}
+        accent={accent}
+        onAccent={chooseAccent}
+        animate={popoverVisible}
+      />
 
       {!cliBlocked && !showSettings && (
         <AgentTabStrip selected={provider} onSelect={setProvider} payload={todayPayload} currency={currency} quota={quota} />
