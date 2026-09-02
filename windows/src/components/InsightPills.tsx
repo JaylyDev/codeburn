@@ -27,13 +27,15 @@ type Props = {
 
 export function InsightPills({ selected, onSelect, modes }: Props) {
   return (
-    <div className="insight-pills" role="tablist">
+    <div className="insight-pills" role="tablist" aria-label="Insight">
       {modes.map(m => (
         <button
           key={m}
           type="button"
           role="tab"
+          id={`insight-tab-${m}`}
           aria-selected={selected === m}
+          aria-controls="insight-panel"
           className={`insight-pill ${selected === m ? 'insight-pill-active' : ''}`}
           onClick={() => onSelect(m)}
         >

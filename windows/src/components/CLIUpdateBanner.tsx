@@ -44,6 +44,7 @@ export function CLIUpdateBanner() {
         type="button"
         className="cli-banner-copy"
         title="Copy the update command to the clipboard"
+        aria-label={`Copy ${command} to the clipboard`}
         onClick={copy}
       >
         <code>{command}</code>

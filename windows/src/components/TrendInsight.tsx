@@ -105,7 +105,12 @@ export function TrendInsight({ days, currency, dayCount }: Props) {
         )}
       </div>
 
-      <div className="trend-chart" onMouseLeave={() => setHoveredIdx(null)}>
+      <div
+        className="trend-chart"
+        role="group"
+        aria-label={`Daily spend, last ${dayCount} days`}
+        onMouseLeave={() => setHoveredIdx(null)}
+      >
         <div className="trend-bars" style={{ gap: `${barGap}px` }}>
           {bars.map((bar, i) => {
             const val = metric(bar)
@@ -120,6 +125,9 @@ export function TrendInsight({ days, currency, dayCount }: Props) {
               <div
                 key={bar.date}
                 className="trend-bar-col"
+                // A painted column with no text: the day and the figure live in its label.
+                role="img"
+                aria-label={`${prettyDate(bar.date)}: ${fmtVal(val)}`}
                 onMouseEnter={() => setHoveredIdx(i)}
               >
                 <div className={cls} style={{ height: `${Math.max(MIN_BAR_PCT, pct)}%` }} />

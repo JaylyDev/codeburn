@@ -147,13 +147,16 @@ export function CalendarInsight({ days, currency }: { days: DailyEntry[]; curren
         <div className="heat-weekdays">
           {WEEKDAY_LABELS.map((label, i) => <span key={i}>{label}</span>)}
         </div>
-        <div className="heat-weeks" onMouseLeave={() => setHovered(null)}>
+        {/* The cells are painted squares, so the day each one stands for lives in its
+            label. A bare span carries no role for that label to attach to, hence role="img". */}
+        <div className="heat-weeks" role="group" aria-label="Daily spend" onMouseLeave={() => setHovered(null)}>
           {weeks.map(week => (
             <div key={week.start} className="heat-week">
               {week.days.map(day => (
                 <span
                   key={day.date}
                   className={cellClass(day, hovered === day.date)}
+                  role="img"
                   title={helpText(day, currency)}
                   aria-label={helpText(day, currency)}
                   onMouseEnter={() => setHovered(day.date)}

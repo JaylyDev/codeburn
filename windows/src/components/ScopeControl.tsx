@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import type { ClaudeConfigOption } from '../lib/payload'
 import { CheckIcon, ChevronDown, PersonCircleIcon } from './Icons'
 
@@ -22,15 +22,33 @@ type Props = {
 }
 
 export function ScopeControl({ scope, onScope, configs, selectedConfigId, onConfig }: Props) {
+  const radios = useRef<HTMLElement>(null)
+  const activeIndex = Math.max(0, SCOPES.findIndex(s => s.id === scope))
+
+  // One tab stop, arrow keys between the two, as the radio-group pattern asks; the period
+  // strip above does the same.
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    const step = event.key === 'ArrowRight' || event.key === 'ArrowDown' ? 1
+      : event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1
+      : 0
+    if (step === 0) return
+    event.preventDefault()
+    const index = (activeIndex + step + SCOPES.length) % SCOPES.length
+    onScope(SCOPES[index].id)
+    radios.current?.querySelectorAll('button')[index]?.focus()
+  }
+
   return (
     <div className="scope-wrap">
-      <nav className="scope-tabs" aria-label="Scope">
-        {SCOPES.map(s => (
+      <nav className="scope-tabs" role="radiogroup" aria-label="Scope" ref={radios} onKeyDown={onKeyDown}>
+        {SCOPES.map((s, i) => (
           <button
             key={s.id}
             type="button"
+            role="radio"
             className={`period ${scope === s.id ? 'period-active' : ''}`}
-            aria-pressed={scope === s.id}
+            aria-checked={scope === s.id}
+            tabIndex={i === activeIndex ? 0 : -1}
             onClick={() => onScope(s.id)}
           >
             {s.label}

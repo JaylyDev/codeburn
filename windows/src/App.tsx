@@ -630,6 +630,8 @@ export function App() {
               <>
                 <div className="insight-area">
                   <InsightPills selected={activeInsight} onSelect={selectInsight} modes={visibleModes} />
+                  {/* One panel for whichever insight is showing: the pills are its tabs. */}
+                  <div id="insight-panel" role="tabpanel" aria-labelledby={`insight-tab-${activeInsight}`}>
                   {activeInsight === 'plan' && (
                     <PlanInsight
                       payload={payload}
@@ -652,6 +654,7 @@ export function App() {
                   {activeInsight === 'pulse' && payload && <PulseInsight payload={payload} currency={currency} />}
                   {activeInsight === 'stats' && payload && <StatsInsight payload={payload} currency={currency} period={period} />}
                   {activeInsight === 'optimize' && payload && <OptimizeInsight payload={payload} currency={currency} />}
+                  </div>
                 </div>
                 {payload?.current && (
                   <>

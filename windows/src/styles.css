@@ -189,11 +189,15 @@ button {
   color: inherit;
   cursor: default;
 }
-button:focus-visible, a:focus-visible, summary:focus-visible {
+button:focus-visible, a:focus-visible, summary:focus-visible, input:focus-visible {
   outline: 2px solid var(--brand-accent);
   outline-offset: 1px;
   border-radius: 4px;
 }
+/* A selected swatch already wears an outline, so a focused one needs its own ring outside
+   that: same colour, further out, or keyboard focus is invisible on exactly the control the
+   reader is about to change. */
+.stg-swatch:focus-visible, .accent-swatch:focus-visible { outline-offset: 3px; }
 a { color: inherit; }
 code { font-family: var(--font-mono); }
 
@@ -661,6 +665,10 @@ code { font-family: var(--font-mono); }
   color: var(--label);
   box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.10);
 }
+/* The six segments are wrapped in their own radio group; it lays out as a row of equal
+   segments so the strip looks exactly as it did before the group existed. */
+.period-radios { display: flex; gap: 1px; flex: 1; min-width: 0; }
+
 /* The calendar button is a fixed 28 px, as on the mac: the six period segments share what
    is left, and its width must not move as the labels change. */
 .period-calendar-anchor { position: relative; flex: 0 0 28px; display: flex; }

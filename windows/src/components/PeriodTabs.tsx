@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { addDays, formatDateKey, startOfDay, todayKey } from '../lib/dates'
 import { CalendarIcon, ChevronLeft, ChevronRight } from './Icons'
 
@@ -42,21 +42,43 @@ type Props = {
 export function PeriodTabs({ selected, days, onSelect, onSelectDays }: Props) {
   const [calendarOpen, setCalendarOpen] = useState(false)
   const dayMode = days.length > 0
+  const radios = useRef<HTMLDivElement>(null)
+  const activeIndex = dayMode ? 0 : Math.max(0, PERIODS.indexOf(selected))
+
+  // The radio-group pattern in full: one tab stop for the strip, arrow keys between the
+  // segments. Six tab stops for one choice is what a plain row of buttons gives, and it is
+  // why a reader ends up pressing Tab six times to leave a control they already answered.
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const step = event.key === 'ArrowRight' || event.key === 'ArrowDown' ? 1
+      : event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1
+      : 0
+    if (step === 0) return
+    event.preventDefault()
+    const index = (activeIndex + step + PERIODS.length) % PERIODS.length
+    onSelect(PERIODS[index])
+    radios.current?.querySelectorAll('button')[index]?.focus()
+  }
 
   return (
     <div className="period-wrap">
       <nav className="period-tabs" aria-label="Period">
-        {PERIODS.map(p => (
-          <button
-            key={p}
-            type="button"
-            className={`period ${!dayMode && selected === p ? 'period-active' : ''}`}
-            aria-pressed={!dayMode && selected === p}
-            onClick={() => onSelect(p)}
-          >
-            {PERIOD_LABELS[p]}
-          </button>
-        ))}
+        {/* One choice out of six, which is a radio group rather than six toggles: a screen
+            reader then says "3 of 6" and the arrow keys mean what they look like. */}
+        <div className="period-radios" role="radiogroup" aria-label="Period" ref={radios} onKeyDown={onKeyDown}>
+          {PERIODS.map((p, i) => (
+            <button
+              key={p}
+              type="button"
+              role="radio"
+              className={`period ${!dayMode && selected === p ? 'period-active' : ''}`}
+              aria-checked={!dayMode && selected === p}
+              tabIndex={i === activeIndex ? 0 : -1}
+              onClick={() => onSelect(p)}
+            >
+              {PERIOD_LABELS[p]}
+            </button>
+          ))}
+        </div>
         <div className="period-calendar-anchor">
           <button
             type="button"
@@ -153,7 +175,7 @@ function CalendarPopover({ days, onDone, onDismiss }: {
       <div className="calendar-weekdays">
         {WEEKDAYS.map(d => <span key={d}>{d}</span>)}
       </div>
-      <div className="calendar-grid">
+      <div className="calendar-grid" role="group" aria-label="Days">
         {monthCells(month).map(cell => {
           const selected = pending.has(cell.date)
           const cls = [
@@ -168,6 +190,9 @@ function CalendarPopover({ days, onDone, onDismiss }: {
               type="button"
               className={cls}
               disabled={cell.date > today}
+              // The number alone says nothing out of context: a reader arriving on a cell
+              // needs the date it belongs to, which is what the mac's own cells announce.
+              aria-label={dayLabel(cell.date)}
               aria-pressed={selected}
               onClick={() => toggle(cell.date)}
             >
@@ -191,6 +216,16 @@ function CalendarPopover({ days, onDone, onDismiss }: {
       </div>
     </div>
   )
+}
+
+/// "Wednesday, 2 September 2026", in the reader's own locale.
+function dayLabel(date: string): string {
+  return new Date(`${date}T00:00:00`).toLocaleDateString(undefined, {
+    weekday: 'long',
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+  })
 }
 
 /// Whole weeks of cells starting on Monday, padded with the neighbouring months' days so
