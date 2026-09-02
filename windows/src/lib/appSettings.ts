@@ -110,7 +110,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   menubarScope: 'local',
   accent: 'ember',
   theme: 'system',
-  trayBadge: true,
+  // Off by default: a second tray icon for the number reads as clutter beside the logo, so
+  // the figure lives in the tooltip and the menu until someone asks for it.
+  trayBadge: false,
   usageRefreshSeconds: -1,
   quotaCadenceSeconds: 120,
   terminal: 'windowsTerminal',
@@ -166,7 +168,12 @@ function migrated(raw: Record<string, unknown>): Record<string, unknown> {
     const saved = readSetting('theme')
     if (saved === 'dark' || saved === 'light') next.theme = saved
   }
-  if (next.trayBadge === undefined && readSetting('trayBadge') === 'off') next.trayBadge = false
+  if (next.trayBadge === undefined) {
+    // The badge used to default on; anyone who chose either way keeps their choice.
+    const saved = readSetting('trayBadge')
+    if (saved === 'on') next.trayBadge = true
+    if (saved === 'off') next.trayBadge = false
+  }
   return next
 }
 

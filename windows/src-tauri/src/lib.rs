@@ -591,7 +591,12 @@ fn restore_tray_status(app: &AppHandle) {
     if let Some(tooltip) = status.tooltip.as_deref() {
         apply_tray_tooltip(app, tooltip);
     }
-    if let Some(badge) = status.badge.as_deref() {
+    // The number icon is opt-in; without the setting the tray shows the logo alone.
+    let badge_wanted = settings::read()
+        .get("trayBadge")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if let (true, Some(badge)) = (badge_wanted, status.badge.as_deref()) {
         // Never restored dimmed: whether a paired device answers is this session's question,
         // and the first refresh dims it again if it still cannot be reached.
         let _ = apply_tray_badge(app, Some(badge), false);
