@@ -1,15 +1,20 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type WheelEvent } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type WheelEvent } from 'react'
 import type { MenubarPayload } from '../lib/payload'
 import type { CurrencyState } from '../lib/currency'
 import { formatCompactCurrency, formatCurrency, plural } from '../lib/currency'
 import { homePath } from '../lib/platform'
+import { severity, summaryFor, type QuotaState, type QuotaSummary } from '../lib/quota'
 import { ChevronRight } from './Icons'
+import { QuotaPopover } from './QuotaPopover'
 
 /// Any provider id the CLI reports, plus `all`. The CLI's own ids are what `--provider`
 /// accepts, so a tab built from the payload is directly usable as a filter argument.
 export type Provider = string
 
 export const ALL_PROVIDER: Provider = 'all'
+
+/// The popover's horizontal gutter, which the strip and the hover cards share.
+const GUTTER = 12
 
 export type ProviderTab = {
   id: Provider
@@ -105,19 +110,30 @@ export function providerLabel(tabs: ProviderTab[], id: Provider): string {
   return tabs.find(t => t.id === id)?.label ?? id
 }
 
+/// Hover delays from AgentTab in AgentTabStrip.swift.
+const QUOTA_HOVER_IN_MS = 250
+const QUOTA_HOVER_OUT_MS = 150
+const QUOTA_CARD_WIDTH = 260
+
 type Props = {
   selected: Provider
   onSelect: (p: Provider) => void
   payload: MenubarPayload | null
   currency: CurrencyState
+  quota: QuotaState
 }
 
-export function AgentTabStrip({ selected, onSelect, payload, currency }: Props) {
+export function AgentTabStrip({ selected, onSelect, payload, currency, quota }: Props) {
   const [hovered, setHovered] = useState<Provider | null>(null)
+  const [quotaCard, setQuotaCard] = useState<{ provider: Provider; left: number } | null>(null)
   const [overflowing, setOverflowing] = useState(false)
   const row = useRef<HTMLDivElement>(null)
   const scroller = useRef<HTMLDivElement>(null)
   const content = useRef<HTMLDivElement>(null)
+  const hoverTimer = useRef<number>(0)
+  // A click dismisses the card and holds it dismissed until the pointer leaves the tab, so
+  // switching provider does not leave a card sitting over the view you just switched to.
+  const clickDismissed = useRef(false)
   const tabs = providerTabs(payload)
 
   const onWheel = (e: WheelEvent<HTMLDivElement>) => {
@@ -150,16 +166,39 @@ export function AgentTabStrip({ selected, onSelect, payload, currency }: Props) 
       ?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
   }, [selected, tabs.length])
 
+  useEffect(() => () => window.clearTimeout(hoverTimer.current), [])
+
   const index = Math.max(0, tabs.findIndex(t => t.id === selected))
   const step = (direction: -1 | 1) => {
     const target = tabs[Math.min(Math.max(index + direction, 0), tabs.length - 1)]
     if (target && target.detected) onSelect(target.id)
   }
 
+  const enter = (tab: ProviderTab, event: ReactMouseEvent<HTMLElement>) => {
+    setHovered(tab.id)
+    window.clearTimeout(hoverTimer.current)
+    if (clickDismissed.current || summaryFor(quota, tab.id) === null) return
+    // Centre the card under its tab, then keep it inside the popover's gutters.
+    const chip = event.currentTarget.getBoundingClientRect()
+    const strip = row.current?.getBoundingClientRect()
+    const span = strip ? strip.width - 2 * GUTTER : QUOTA_CARD_WIDTH
+    const centred = chip.left + chip.width / 2 - (strip?.left ?? 0) - GUTTER - QUOTA_CARD_WIDTH / 2
+    const left = Math.min(Math.max(centred, 0), Math.max(0, span - QUOTA_CARD_WIDTH))
+    hoverTimer.current = window.setTimeout(() => setQuotaCard({ provider: tab.id, left }), QUOTA_HOVER_IN_MS)
+  }
+
+  const leave = () => {
+    setHovered(null)
+    clickDismissed.current = false
+    window.clearTimeout(hoverTimer.current)
+    hoverTimer.current = window.setTimeout(() => setQuotaCard(null), QUOTA_HOVER_OUT_MS)
+  }
+
   const preview = hovered ? previewFor(hovered, tabs, currency) : null
+  const card = quotaCard ? summaryFor(quota, quotaCard.provider) : null
 
   return (
-    <div className="agent-tabs-wrap" onMouseLeave={() => setHovered(null)}>
+    <div className="agent-tabs-wrap" onMouseLeave={leave}>
       <div className="agent-tabs-row" ref={row}>
         {overflowing && (
           <button
@@ -176,6 +215,7 @@ export function AgentTabStrip({ selected, onSelect, payload, currency }: Props) 
           <div className="agent-tabs-content" ref={content}>
             {tabs.map(tab => {
               const active = selected === tab.id
+              const summary = summaryFor(quota, tab.id)
               return (
                 <button
                   key={tab.id}
@@ -184,15 +224,23 @@ export function AgentTabStrip({ selected, onSelect, payload, currency }: Props) 
                   className={`tab ${active ? 'tab-active' : ''} ${tab.detected ? '' : 'tab-muted'}`}
                   aria-pressed={active}
                   aria-disabled={!tab.detected}
-                  onMouseEnter={() => setHovered(tab.id)}
+                  onMouseEnter={event => enter(tab, event)}
                   onFocus={() => setHovered(tab.id)}
-                  onClick={() => { if (tab.detected) onSelect(tab.id) }}
+                  onClick={() => {
+                    clickDismissed.current = true
+                    window.clearTimeout(hoverTimer.current)
+                    setQuotaCard(null)
+                    if (tab.detected) onSelect(tab.id)
+                  }}
                 >
-                  <span className="tab-dot" style={active ? undefined : { background: providerColor(tab.id) }} />
-                  <span className="tab-label">{tab.label}</span>
-                  {tab.detected && tab.cost > 0 && (
-                    <span className="tab-cost">{formatCompactCurrency(tab.cost, currency)}</span>
-                  )}
+                  <span className="tab-chip">
+                    <span className="tab-dot" style={active ? undefined : { background: providerColor(tab.id) }} />
+                    <span className="tab-label">{tab.label}</span>
+                    {tab.detected && tab.cost > 0 && (
+                      <span className="tab-cost">{formatCompactCurrency(tab.cost, currency)}</span>
+                    )}
+                  </span>
+                  {summary && <QuotaCapsule quota={summary} active={active} />}
                 </button>
               )
             })}
@@ -210,13 +258,42 @@ export function AgentTabStrip({ selected, onSelect, payload, currency }: Props) 
           </button>
         )}
       </div>
-      {preview && (
-        <div className="tab-preview" role="tooltip">
-          <div className="tab-preview-title">{preview.title}</div>
-          <div className="tab-preview-body">{preview.body}</div>
+      {(preview || card) && (
+        <div className="tab-hover">
+          {preview && (
+            <div className="tab-preview" role="tooltip">
+              <div className="tab-preview-title">{preview.title}</div>
+              <div className="tab-preview-body">{preview.body}</div>
+            </div>
+          )}
+          {card && quotaCard && (
+            <div className="quota-anchor" style={{ marginLeft: quotaCard.left }} role="tooltip">
+              <QuotaPopover quota={card} />
+            </div>
+          )}
         </div>
       )}
     </div>
+  )
+}
+
+/// AgentTabQuotaBar: the 3px capsule under a tab whose provider reports live quota. Solid red
+/// when the credential needs re-connecting, so a broken provider reads as broken at a glance.
+function QuotaCapsule({ quota, active }: { quota: QuotaSummary; active: boolean }) {
+  const percent = quota.headline?.usedPct
+  const broken = quota.connection === 'terminalFailure'
+  const tone = percent === undefined ? 'normal' : severity(percent)
+  return (
+    <span className={`tab-quota ${active ? 'tab-quota-active' : ''}`}>
+      {broken ? (
+        <span className="tab-quota-fill is-danger" style={{ width: '100%' }} />
+      ) : percent !== undefined ? (
+        <span
+          className={`tab-quota-fill is-${tone} ${active && tone === 'normal' ? 'tab-quota-fill-active' : ''}`}
+          style={{ width: `${Math.min(100, Math.max(2, percent))}%` }}
+        />
+      ) : null}
+    </span>
   )
 }
 

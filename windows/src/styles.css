@@ -38,6 +38,24 @@
   --icon-contrast: #FFFFFF;
   --danger: #C83F2C;
 
+  /* Quota severity, from QuotaSummary.Severity: under 50 green, then yellow, orange, red.
+     Three sets, because one colour cannot do three jobs here. The bare token is the bar
+     fill (the system colours the mac and the Capacity Dock use). `-ink` carries text and
+     icons on the popover surface: the mac only ever draws them on a dark material, and
+     plain yellow is unreadable on this warm light one, so the light theme darkens them.
+     `-tip` is the same text inside the hover card, which is a deliberately inverted
+     surface, so it takes the opposite theme's value. */
+  --sev-normal: #34C759;
+  --sev-warning: #FFCC00;
+  --sev-critical: #FF9500;
+  --sev-danger: #FF3B30;
+  --sev-normal-ink: #2C9E45;
+  --sev-warning-ink: #A9750B;
+  --sev-critical-ink: #C2610A;
+  --sev-danger-ink: #C83F2C;
+  --sev-critical-tip: #FF9F0A;
+  --sev-danger-tip: #FF453A;
+
   --font-sans: 'Segoe UI Variable Text', 'Segoe UI', -apple-system, system-ui, sans-serif;
   --font-display: 'Segoe UI Variable Display', 'Segoe UI', -apple-system, system-ui, sans-serif;
   --font-mono: 'Cascadia Mono', 'Cascadia Code', Consolas, 'SF Mono', Menlo, monospace;
@@ -83,6 +101,16 @@
     --control-hover: rgba(255, 255, 255, 0.10);
     --menu-bg: rgba(40, 35, 32, 0.98);
     --menu-shadow: 0 8px 28px rgba(0, 0, 0, 0.5), 0 1px 3px rgba(0, 0, 0, 0.3);
+    --sev-normal: #30D158;
+    --sev-warning: #FFD60A;
+    --sev-critical: #FF9F0A;
+    --sev-danger: #FF453A;
+    --sev-normal-ink: #30D158;
+    --sev-warning-ink: #FFD60A;
+    --sev-critical-ink: #FF9F0A;
+    --sev-danger-ink: #FF453A;
+    --sev-critical-tip: #C2610A;
+    --sev-danger-tip: #C83F2C;
     --icon-contrast: #1C1816;
     color-scheme: dark;
   }
@@ -115,6 +143,16 @@
   --control-hover: rgba(255, 255, 255, 0.10);
   --menu-bg: rgba(40, 35, 32, 0.98);
   --menu-shadow: 0 8px 28px rgba(0, 0, 0, 0.5), 0 1px 3px rgba(0, 0, 0, 0.3);
+  --sev-normal: #30D158;
+  --sev-warning: #FFD60A;
+  --sev-critical: #FF9F0A;
+  --sev-danger: #FF453A;
+  --sev-normal-ink: #30D158;
+  --sev-warning-ink: #FFD60A;
+  --sev-critical-ink: #FF9F0A;
+  --sev-danger-ink: #FF453A;
+  --sev-critical-tip: #C2610A;
+  --sev-danger-tip: #C83F2C;
   --icon-contrast: #1C1816;
   color-scheme: dark;
 }
@@ -233,11 +271,22 @@ code { font-family: var(--font-mono); }
 .agent-tabs-row > .tab-chevron:last-child { margin-right: 6px; }
 .agent-tabs-row > .tab-chevron:first-child + .agent-tabs { padding-left: 6px; }
 .tab-muted, .tab-muted:hover { background: transparent; color: var(--label-3); box-shadow: inset 0 0 0 1px var(--fill-08); }
-.tab-preview {
+/* The hover column under the strip: the share preview first, then the quota card, so the
+   card appearing after its 250ms delay never shifts the preview. */
+.tab-hover {
   position: absolute;
   left: 12px;
   right: 12px;
   top: calc(100% + 4px);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  pointer-events: none;
+}
+.quota-anchor { width: 260px; }
+.tab-preview {
+  align-self: stretch;
   padding: 8px 10px;
   border-radius: var(--radius-card);
   background: var(--tooltip-bg);
@@ -250,8 +299,8 @@ code { font-family: var(--font-mono); }
 .tab-preview-body { margin-top: 2px; font-size: 10px; color: var(--tooltip-fg-2); font-variant-numeric: tabular-nums; }
 .tab {
   display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
+  flex-direction: column;
+  gap: 3px;
   flex: 0 0 auto;
   border: 0;
   padding: 4px 10px;
@@ -276,6 +325,121 @@ code { font-family: var(--font-mono); }
 }
 .tab-active .tab-dot { background: rgba(255, 255, 255, 0.85); }
 .tab-muted .tab-dot { opacity: 0.4; }
+.tab-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+}
+/* AgentTabQuotaBar: 3px of live quota under the chip, in the four severity tiers. */
+.tab-quota {
+  display: block;
+  height: 3px;
+  border-radius: 1.5px;
+  background: var(--fill-18);
+  overflow: hidden;
+}
+.tab-quota-active { background: rgba(255, 255, 255, 0.2); }
+.tab-quota-fill {
+  display: block;
+  height: 100%;
+  border-radius: 1.5px;
+  background: var(--sev-normal);
+  transition: width 250ms var(--ease-ui);
+}
+.tab-quota-fill-active { background: #fff; }
+.tab-quota-fill.is-warning { background: var(--sev-warning); }
+.tab-quota-fill.is-critical { background: var(--sev-critical); }
+.tab-quota-fill.is-danger { background: var(--sev-danger); }
+
+/* ---- quota hover card ------------------------------------------------------------ */
+
+.quota-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px;
+  border-radius: var(--radius-card);
+  background: var(--tooltip-bg);
+  color: var(--tooltip-fg);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35), inset 0 0 0 0.5px var(--tooltip-border);
+  animation: fadeIn 120ms ease-out;
+}
+.quota-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.quota-head-title { font-size: 11px; font-weight: 600; }
+.quota-head-spacer { flex: 1 1 auto; }
+.quota-flag { font-size: 9.5px; color: var(--tooltip-fg-2); }
+.quota-flag-warn { color: var(--sev-critical-tip); }
+.quota-plan-pill {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(128, 128, 128, 0.22);
+  color: var(--tooltip-fg-2);
+  font-size: 9.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.quota-note { font-size: 11px; color: var(--tooltip-fg-2); }
+.quota-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-variant-numeric: tabular-nums;
+}
+.quota-row-label {
+  width: 92px;
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.quota-row-track {
+  flex: 1 1 auto;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(128, 128, 128, 0.3);
+  overflow: hidden;
+}
+.quota-row-fill { display: block; height: 100%; border-radius: 2px; background: var(--sev-normal); }
+.quota-row-fill.is-warning { background: var(--sev-warning); }
+.quota-row-fill.is-critical { background: var(--sev-critical); }
+.quota-row-fill.is-danger { background: var(--sev-danger); }
+.quota-row-pct {
+  width: 36px;
+  flex: 0 0 auto;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+}
+.quota-row-resets {
+  width: 50px;
+  flex: 0 0 auto;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--tooltip-fg-2);
+}
+.quota-footer {
+  margin-top: 2px;
+  padding-top: 6px;
+  border-top: 1px solid var(--tooltip-border);
+}
+.quota-footer-line { font-size: 10.5px; color: var(--tooltip-fg-2); }
+.quota-reconnect-title { font-size: 11.5px; font-weight: 600; color: var(--sev-danger-tip); }
+.quota-reconnect-reason {
+  font-size: 11px;
+  color: var(--tooltip-fg-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.quota-reconnect-note { font-size: 10.5px; color: var(--tooltip-fg-2); }
 .tab-cost {
   font-family: var(--font-mono);
   font-size: 10.5px;

@@ -9,6 +9,7 @@ import { PayloadCache } from './lib/cache'
 import { relativePast } from './lib/dates'
 import { applyTheme, currentTheme, readSetting, writeSetting } from './lib/settings'
 import { TRAY_BADGE_SUPPORTED } from './lib/platform'
+import { EMPTY_QUOTA, refreshQuota, subscribeQuota, type QuotaState } from './lib/quota'
 import { AgentTabStrip, ALL_PROVIDER, providerLabel, providerTabs } from './components/AgentTabStrip'
 import type { Provider } from './components/AgentTabStrip'
 import { ModelsSection } from './components/ModelsSection'
@@ -68,6 +69,7 @@ export function App() {
   const [theme, setTheme] = useState(() => currentTheme())
   const [trayBadge, setTrayBadge] = useState(() => TRAY_BADGE_SUPPORTED && readSetting('trayBadge') !== 'off')
   const [showSettings, setShowSettings] = useState(false)
+  const [quota, setQuota] = useState<QuotaState>(EMPTY_QUOTA)
   // The window starts hidden and is shown by a tray click, which emits `codeburn://shown`.
   const [popoverVisible, setPopoverVisible] = useState(false)
   const [themeChoice, setThemeChoice] = useState<ThemeChoice>(() => {
@@ -118,9 +120,10 @@ export function App() {
 
   const refreshAll = useCallback(async (opts: FetchOptions) => {
     const { period: p, provider: prov } = selection.current
-    if (!(p === 'today' && prov === 'all')) {
-      fetchKey('today', 'all', { includeOptimize: false, showOverlay: false })
+    if (!(p === 'today' && prov === ALL_PROVIDER)) {
+      fetchKey('today', ALL_PROVIDER, { includeOptimize: false, showOverlay: false })
     }
+    void refreshQuota()
     await fetchKey(p, prov, opts)
   }, [fetchKey])
 
@@ -189,6 +192,10 @@ export function App() {
       unlistenTheme.then(fn => fn())
     }
   }, [refreshAll])
+
+  // The quota store polls only while something is watching it, so it starts here and stops
+  // with the page. A manual Refresh asks it for a fresh answer too.
+  useEffect(() => subscribeQuota(setQuota), [])
 
   useEffect(() => {
     const saved = readSetting('theme')
@@ -292,7 +299,7 @@ export function App() {
       </header>
 
       {!cliBlocked && !showSettings && (
-        <AgentTabStrip selected={provider} onSelect={setProvider} payload={todayPayload} currency={currency} />
+        <AgentTabStrip selected={provider} onSelect={setProvider} payload={todayPayload} currency={currency} quota={quota} />
       )}
 
       <div className="main-content">

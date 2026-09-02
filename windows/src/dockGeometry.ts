@@ -103,52 +103,17 @@ export function bezier(curve: Curve, x: number): number {
   return sampleY(Math.min(1, Math.max(0, t)))
 }
 
-export type Severity = 'normal' | 'warning' | 'critical' | 'danger'
-
-/// Four tiers, from QuotaSummary.severity: below 50% is headroom, then yellow, orange, red.
-export function severity(percent: number): Severity {
-  if (percent >= 90) return 'danger'
-  if (percent >= 75) return 'critical'
-  if (percent >= 50) return 'warning'
-  return 'normal'
-}
-
-export type QuotaWindow = { label: string; usedPct: number; resetsAt?: string }
-
-/// The glance value: every provider on the same billing horizon, weekly if there is one, else
-/// monthly, else the window nearest exhaustion. Empty stays null rather than posing as 0%.
-export function headlineWindow(windows: QuotaWindow[]): QuotaWindow | null {
-  const find = (needle: string) => windows.find((row) => row.label.toLowerCase().includes(needle))
-  return (
-    find('week') ??
-    find('month') ??
-    windows.reduce<QuotaWindow | null>((worst, row) => (worst && worst.usedPct >= row.usedPct ? worst : row), null)
-  )
-}
-
-export function pct(value: number): number {
-  return Math.min(100, Math.max(0, Math.round(value)))
-}
-
-export function resetsIn(iso: string | undefined, now = Date.now()): string {
-  if (!iso) return ''
-  const seconds = (new Date(iso).getTime() - now) / 1000
-  if (Number.isNaN(seconds)) return ''
-  if (seconds < 60) return 'now'
-  const minutes = Math.floor(seconds / 60)
-  const hours = Math.floor(minutes / 60)
-  const days = Math.floor(hours / 24)
-  if (days > 0) return `${days}d ${hours % 24}h`
-  if (hours > 0) return `${hours}h ${minutes % 60}m`
-  return `${minutes}m`
-}
-
-export function displayLabel(label: string): string {
-  return label
-    .replace(/Claude and GPT models/i, 'Claude + GPT')
-    .replace(/Gemini Models/i, 'Gemini')
-    .replace(/Five-hour/i, '5-hour')
-}
+// The quota vocabulary the dock shares with the popover now lives in lib/quota, beside the
+// store that fetches it. Re-exported so the dock still has one import for a row's geometry.
+export {
+  displayLabel,
+  headlineWindow,
+  pct,
+  resetsIn,
+  severity,
+  type QuotaWindow,
+  type Severity,
+} from './lib/quota'
 
 /// Shapes are drawn once for a right-edge rail in a canonical box (cross by along) and mapped
 /// to the other edges with the same affine transforms the mac applies. `cross` is the
