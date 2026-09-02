@@ -5,7 +5,7 @@ import type { CurrencyState } from '../lib/currency'
 import { CURRENCY_CODES, CURRENCY_NAMES, USD } from '../lib/currency'
 import { ACCENT_PRESETS, accentById, applyAccent } from '../lib/accent'
 import {
-  DISPLAY_METRICS, MENUBAR_PERIODS, subscribeSettings, writeSettings,
+  DISPLAY_METRICS, MENUBAR_PERIODS, TERMINALS, USAGE_CADENCES, subscribeSettings, writeSettings,
   type AppSettings, type DisplayMetric, type MenubarPeriod, type MenubarScope, type ThemeChoice,
 } from '../lib/appSettings'
 import { applyTheme } from '../lib/settings'
@@ -17,7 +17,7 @@ import {
   writeDockPrefs, type DockPrefs,
 } from '../lib/dockPrefs'
 import { ProviderGlyph } from '../providerIcons'
-import { Group, Note, Pane, Row, Select, Slider, Switch } from './controls'
+import { Field, Group, Note, Pane, Row, Select, Slider, Switch } from './controls'
 
 /// The mac's GeneralSettingsTab. Display first, because it is what the reader came for; the
 /// Windows-only rows (login item, tray badge) sit under System at the end, where the mac
@@ -159,6 +159,29 @@ export function GeneralPane({ quota, anchor }: Props) {
       </Group>
 
       <CapacityDockSection quota={quota} />
+
+      <Group title="Usage Refresh">
+        <Row
+          label="Update every"
+          control={
+            <Select
+              ariaLabel="Usage refresh cadence"
+              value={settings.usageRefreshSeconds}
+              options={USAGE_CADENCES}
+              onChange={usageRefreshSeconds => writeSettings({ usageRefreshSeconds })}
+            />
+          }
+        />
+        <Note>
+          How often the tray figure re-reads your local session data. Auto refreshes every
+          minute while the popover is open and every two minutes when it is closed. Manual only
+          refreshes when you open the popover or press Refresh.
+        </Note>
+      </Group>
+
+      <TerminalSection settings={settings} />
+
+      <AlertsSection settings={settings} />
 
       <Group title="System">
         <Row
@@ -346,4 +369,148 @@ function CapacityDockSection({ quota }: { quota: QuotaState }) {
       </Note>
     </Group>
   )
+}
+
+/// The mac's Terminal section. Only consoles that can hold a command open in a live window
+/// are listed, and Rust says which of them are actually on this machine.
+function TerminalSection({ settings }: { settings: AppSettings }) {
+  const [installed, setInstalled] = useState<Record<string, boolean> | null>(null)
+
+  useEffect(() => {
+    invoke<Array<{ id: string; installed: boolean }>>('terminals')
+      .then(list => setInstalled(Object.fromEntries(list.map(t => [t.id, t.installed]))))
+      .catch(() => setInstalled({}))
+  }, [])
+
+  // Nothing to choose on Linux, where a terminal is found by probing at launch.
+  if (installed === null || Object.keys(installed).length === 0) return null
+
+  return (
+    <Group title="Terminal">
+      <Row
+        label="Open commands in"
+        control={
+          <Select
+            ariaLabel="Terminal"
+            value={settings.terminal}
+            options={TERMINALS.map(term => ({
+              id: term.id,
+              label: installed[term.id] === false ? `${term.label} (not installed)` : term.label,
+            }))}
+            onChange={terminal => writeSettings({ terminal })}
+          />
+        }
+      />
+      <Note>
+        Where Full Report and Optimize open. If the chosen console is not installed, CodeBurn
+        falls back to the Command Prompt, which always is.
+      </Note>
+    </Group>
+  )
+}
+
+/// The mac's Alerts section. The budget tracks whatever the tray figure shows: dollars for
+/// the Cost metric, tokens for the two token metrics. Both are stored beside the currency in
+/// the CLI config, because the tray reads them before any webview exists.
+const COST_PRESETS = [0, 25, 50, 100, 200, 500]
+const TOKEN_PRESETS = [0, 1e6, 5e6, 10e6, 25e6, 50e6, 100e6]
+const CUSTOM = -1
+
+function AlertsSection({ settings }: { settings: AppSettings }) {
+  const [budgets, setBudgets] = useState<{ cost: number | null; tokens: number | null }>({ cost: null, tokens: null })
+  const [custom, setCustom] = useState(false)
+  const [draft, setDraft] = useState('')
+
+  const isTokens = settings.metric === 'tokens' || settings.metric === 'totalTokens'
+  const stored = isTokens ? budgets.tokens : budgets.cost
+  const presets = isTokens ? TOKEN_PRESETS : COST_PRESETS
+  const key = isTokens ? 'dailyTokenBudget' : 'dailyBudget'
+  const unit = isTokens ? 1e6 : 1
+
+  const read = () => {
+    invoke<{ cost: number | null; tokens: number | null }>('daily_budgets')
+      .then(next => {
+        setBudgets(next)
+        const value = (settings.metric === 'tokens' || settings.metric === 'totalTokens') ? next.tokens : next.cost
+        const list = (settings.metric === 'tokens' || settings.metric === 'totalTokens') ? TOKEN_PRESETS : COST_PRESETS
+        // A stored amount that is not one of the presets is a custom one, so the field opens
+        // with it rather than the picker silently rounding it to a preset.
+        if (value !== null && !list.includes(value)) {
+          setCustom(true)
+          setDraft(trim(value / ((settings.metric === 'tokens' || settings.metric === 'totalTokens') ? 1e6 : 1)))
+        }
+      })
+      .catch(() => {})
+  }
+  useEffect(read, [settings.metric])
+
+  const write = (amount: number | null) => {
+    invoke('set_daily_budget', { key, amount })
+      .then(() => setBudgets(current => ({ ...current, [isTokens ? 'tokens' : 'cost']: amount })))
+      .catch(() => {})
+  }
+
+  const choose = (value: number) => {
+    if (value === CUSTOM) {
+      setCustom(true)
+      setDraft(stored ? trim(stored / unit) : '')
+      return
+    }
+    setCustom(false)
+    write(value > 0 ? value : null)
+  }
+
+  const applyDraft = (text: string) => {
+    setDraft(text)
+    const value = Number(text.trim())
+    write(Number.isFinite(value) && value > 0 ? value * unit : null)
+  }
+
+  const label = (value: number) => {
+    if (value === 0) return 'Off'
+    return isTokens ? `${trim(value / 1e6)}M` : `$${trim(value)}`
+  }
+
+  const armed = stored !== null && stored > 0
+  const help = custom && !armed
+    ? 'Enter an amount above, or the alert stays off.'
+    : `The tray flame turns yellow when today's ${isTokens ? 'tokens pass' : 'cost passes'} the daily budget.`
+
+  return (
+    <Group title="Alerts">
+      <Row
+        label="Daily budget"
+        control={
+          <Select
+            ariaLabel="Daily budget"
+            value={custom ? CUSTOM : stored ?? 0}
+            options={[
+              ...presets.map(value => ({ id: value, label: label(value) })),
+              { id: CUSTOM, label: 'Custom...' },
+            ]}
+            onChange={choose}
+          />
+        }
+      />
+      {custom && (
+        <Row
+          label={isTokens ? 'Millions of tokens' : 'Amount in USD'}
+          control={
+            <Field
+              ariaLabel="Custom daily budget"
+              placeholder="Amount"
+              value={draft}
+              onChange={applyDraft}
+              width={110}
+            />
+          }
+        />
+      )}
+      <Note>{help}</Note>
+    </Group>
+  )
+}
+
+function trim(value: number): string {
+  return value === Math.round(value) ? String(Math.round(value)) : String(value)
 }

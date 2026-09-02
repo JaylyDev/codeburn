@@ -3,20 +3,24 @@ import type { CurrencyState } from '../lib/currency'
 import { USD, formatCurrency, formatTokens, plural } from '../lib/currency'
 import { prettyDate, todayKey } from '../lib/dates'
 import { SectionCaption } from './CollapsibleSection'
-import { LeafIcon, MonitorIcon, WarningIcon } from './Icons'
+import { ArrowDownRight, ArrowUpRight, LeafIcon, MonitorIcon, WarningIcon } from './Icons'
+import type { DisplayMetric } from '../lib/appSettings'
 
 type Props = {
   payload: MenubarPayload | null
   currency: CurrencyState
   periodLabel: string
   isToday: boolean
-  /// Today spend limit from the CLI config, or null when the alert is off.
+  /// Today's limit from the CLI config, in whatever the metric counts, or null when the
+  /// alert is off.
   dailyBudget: number | null
+  /// The settings window's Display metric, so the hero and the tray figure never disagree.
+  metric: DisplayMetric
   /// True when the reader asked for every paired device, not just this one.
   combinedScope: boolean
 }
 
-export function HeroSection({ payload, currency, periodLabel, isToday, dailyBudget, combinedScope }: Props) {
+export function HeroSection({ payload, currency, periodLabel, isToday, dailyBudget, metric, combinedScope }: Props) {
   const todayLabel = prettyDate(todayKey())
   // Pulling the peers is best effort in the CLI, so combined scope can come back with local
   // totals and no `combined` block. The hero then reads as a plain local view, plus a note.
@@ -25,13 +29,23 @@ export function HeroSection({ payload, currency, periodLabel, isToday, dailyBudg
   const cost = totals?.cost ?? payload?.current.cost ?? 0
   const calls = totals?.calls ?? payload?.current.calls ?? 0
   const sessions = totals?.sessions ?? payload?.current.sessions ?? 0
+  const inputTokens = totals?.inputTokens ?? payload?.current.inputTokens ?? 0
+  const outputTokens = totals?.outputTokens ?? payload?.current.outputTokens ?? 0
+
+  // Both token metrics put the total in the headline, as the mac's heroText does; only the
+  // Tokens metric replaces calls and sessions with the up and down split.
+  const isTokenMetric = metric === 'tokens' || metric === 'totalTokens'
+  const headline = isTokenMetric
+    ? `${formatTokens(inputTokens + outputTokens)} tok`
+    : formatCurrency(cost, currency)
 
   const label = payload?.current.label || periodLabel
   const caption = combined ? `Combined · ${label}` : isToday ? `Today · ${todayLabel}` : label
   // The budget is defined in USD, matching the CLI config and the presets the settings
-  // window will offer, so it is compared and printed in USD rather than converted. Combined
+  // window offers, so it is compared and printed in USD rather than converted. Combined
   // totals are several machines' spend, which the limit was never set against.
-  const overBudget = isToday && !combinedScope && dailyBudget !== null && payload !== null && cost >= dailyBudget
+  const measured = isTokenMetric ? inputTokens + outputTokens : cost
+  const overBudget = isToday && !combinedScope && dailyBudget !== null && payload !== null && measured >= dailyBudget
   const savings = combined ? 0 : payload?.current.localModelSavings?.totalUSD ?? 0
 
   return (
@@ -39,20 +53,25 @@ export function HeroSection({ payload, currency, periodLabel, isToday, dailyBudg
       <SectionCaption text={caption} />
       <div className="hero-row">
         {payload ? (
-          <div className="hero-amount">{formatCurrency(cost, currency)}</div>
+          <div className="hero-amount">{headline}</div>
         ) : (
           <div className="hero-amount hero-skeleton" aria-label="Loading" />
         )}
         <div className="hero-meta">
-          {payload ? (
-            <>
-              <span className="hero-calls">{calls.toLocaleString()} {calls === 1 ? 'call' : 'calls'}</span>
-              <span className="hero-sessions">{plural(sessions, 'session')}</span>
-            </>
-          ) : (
+          {!payload ? (
             <>
               <span className="hero-skeleton-line" />
               <span className="hero-skeleton-line short" />
+            </>
+          ) : metric === 'tokens' ? (
+            <>
+              <span className="hero-calls"><ArrowUpRight size={9} />{formatTokens(outputTokens)}</span>
+              <span className="hero-sessions"><ArrowDownRight size={9} />{formatTokens(inputTokens)}</span>
+            </>
+          ) : (
+            <>
+              <span className="hero-calls">{calls.toLocaleString()} {calls === 1 ? 'call' : 'calls'}</span>
+              <span className="hero-sessions">{plural(sessions, 'session')}</span>
             </>
           )}
         </div>
@@ -60,7 +79,9 @@ export function HeroSection({ payload, currency, periodLabel, isToday, dailyBudg
       {overBudget && dailyBudget !== null && (
         <div className="hero-note hero-note-warn">
           <WarningIcon size={10} />
-          <span>Daily budget of {formatCurrency(dailyBudget, USD)} exceeded</span>
+          <span>
+            Daily budget of {isTokenMetric ? `${formatTokens(dailyBudget)} tok` : formatCurrency(dailyBudget, USD)} exceeded
+          </span>
         </div>
       )}
       {combined ? (

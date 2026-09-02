@@ -166,6 +166,7 @@ pub fn run() {
             commands::settings_section,
             commands::settings_load,
             commands::settings_patch,
+            commands::terminals,
             commands::claude_config_dirs,
             commands::set_claude_config_dirs,
             commands::pick_directory,
@@ -792,13 +793,18 @@ mod commands {
         app: AppHandle,
         severity: String,
         today_cost: Option<f64>,
+        today_tokens: Option<f64>,
     ) -> Result<(), String> {
         let severity = crate::tray_status::Severity::parse(&severity)
             .ok_or_else(|| format!("unknown quota severity `{severity}`"))?;
-        let over_budget = match (today_cost, crate::tray_status::daily_budget()) {
-            (Some(cost), Some(budget)) => cost >= budget,
+        // Either alert can be armed, and the mac tints the flame when the armed one is
+        // passed, so both are checked rather than only the one the metric happens to show.
+        let over = |value: Option<f64>, limit: Option<f64>| match (value, limit) {
+            (Some(value), Some(limit)) => value >= limit,
             _ => false,
         };
+        let over_budget = over(today_cost, crate::tray_status::daily_budget())
+            || over(today_tokens, crate::tray_status::daily_token_budget());
         super::apply_tray_tint(&app, crate::tray_status::tint_for(severity, over_budget))
     }
 
@@ -957,6 +963,13 @@ mod commands {
         let merged = crate::settings::patch(patch).map_err(|e| e.to_string())?;
         crate::settings::broadcast(&app, &merged);
         Ok(Value::Object(merged))
+    }
+
+    /// The consoles the settings window offers, each marked with whether it is on this
+    /// machine, so the "(not installed)" hint stays honest.
+    #[tauri::command]
+    pub fn terminals() -> Vec<crate::cli::TerminalOption> {
+        crate::cli::terminals()
     }
 
     #[tauri::command]

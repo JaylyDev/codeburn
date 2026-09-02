@@ -595,10 +595,6 @@ fn spawn_program_in_terminal(_app: &AppHandle, cli: &CodeburnCli, subcommand: &[
 
     #[cfg(target_os = "windows")]
     {
-        // `start` treats the first quoted argument as the window title, so we pass an
-        // explicit empty title. `/K` keeps the console open for non-interactive commands
-        // (export) so the user can read where the file went; the TUI (report/optimize)
-        // owns the window until the user quits it either way.
         // Only the unresolved default name is worth a second lookup; anything else is
         // either already absolute or a CODEBURN_BIN the user chose.
         let program = if cli.program == default_program_name() {
@@ -606,16 +602,19 @@ fn spawn_program_in_terminal(_app: &AppHandle, cli: &CodeburnCli, subcommand: &[
         } else {
             cli.program.clone()
         };
-        let cmd_exe = system32_path("cmd.exe");
+        let mut argv: Vec<String> = vec![program];
+        argv.extend(cli.extra_args.iter().cloned());
+        argv.extend(subcommand.iter().map(|s| s.to_string()));
+
+        // `start` treats the first quoted argument as the window title, so we pass an
+        // explicit empty title. It also detaches, which is what keeps the console the
+        // reader gets from being a child of this GUI process.
         let mut cmd = system_command("cmd.exe");
-        cmd.arg("/C").arg("start").arg("").arg(&cmd_exe).arg("/K").arg(&program);
-        for a in &cli.extra_args {
-            cmd.arg(a);
+        cmd.arg("/C").arg("start").arg("");
+        for arg in PreferredTerminal::resolved().launch_argv(&argv) {
+            cmd.arg(arg);
         }
-        for a in subcommand {
-            cmd.arg(a);
-        }
-        cmd.spawn().with_context(|| "failed to open cmd.exe")?;
+        cmd.spawn().with_context(|| "failed to open a terminal")?;
     }
 
     #[cfg(target_os = "macos")]
@@ -629,6 +628,155 @@ fn spawn_program_in_terminal(_app: &AppHandle, cli: &CodeburnCli, subcommand: &[
     }
 
     Ok(())
+}
+
+/// The Windows counterpart of mac/.../Security/PreferredTerminal.swift, and it exists for the
+/// same reason: a user preference must never become a free-form string inside a command line.
+/// The stored value is parsed back through `parse`, anything unrecognised collapses to the
+/// default, and every executable named below is a compile-time literal resolved from
+/// %SystemRoot% or %LOCALAPPDATA%.
+///
+/// Only consoles that can hold a command open in a live window are listed. That is what
+/// Full Report and Optimize need: a window that stays after the command exits.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreferredTerminal {
+    WindowsTerminal,
+    PowerShell,
+    CommandPrompt,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalOption {
+    pub id: &'static str,
+    pub installed: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl PreferredTerminal {
+    pub const ALL: [PreferredTerminal; 3] = [
+        PreferredTerminal::WindowsTerminal,
+        PreferredTerminal::PowerShell,
+        PreferredTerminal::CommandPrompt,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            PreferredTerminal::WindowsTerminal => "windowsTerminal",
+            PreferredTerminal::PowerShell => "powershell",
+            PreferredTerminal::CommandPrompt => "commandPrompt",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|term| term.id() == value)
+    }
+
+    /// Windows Terminal ships as an app-execution alias in the per-user WindowsApps folder;
+    /// PowerShell and the Command Prompt are always where %SystemRoot% says.
+    fn path(self) -> PathBuf {
+        match self {
+            PreferredTerminal::WindowsTerminal => dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from(r"C:\"))
+                .join("Microsoft")
+                .join("WindowsApps")
+                .join("wt.exe"),
+            PreferredTerminal::PowerShell => system32_path("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe"),
+            PreferredTerminal::CommandPrompt => system32_path("cmd.exe"),
+        }
+    }
+
+    pub fn is_installed(self) -> bool {
+        self.path().is_file()
+    }
+
+    /// The stored choice, falling back to whatever is actually installed. The Command Prompt
+    /// is the last rung and is always present, so this can never come back empty.
+    pub fn resolved() -> Self {
+        let stored = crate::settings::read()
+            .get("terminal")
+            .and_then(serde_json::Value::as_str)
+            .and_then(Self::parse);
+        match stored {
+            Some(term) if term.is_installed() => term,
+            _ => Self::ALL
+                .into_iter()
+                .find(|term| term.is_installed())
+                .unwrap_or(PreferredTerminal::CommandPrompt),
+        }
+    }
+
+    /// The argv that opens this console on `argv`, ready to hand to `cmd /C start ""`.
+    ///
+    /// `argv` is the codeburn command, token by token; every token has already passed
+    /// `is_safe_arg`, so none of them carries a quote, a `$`, a backtick or a `;`. That is
+    /// what makes the PowerShell line safe to build: it is the one case where the tokens are
+    /// re-parsed by a shell rather than passed straight through as argv.
+    fn launch_argv(self, argv: &[String]) -> Vec<String> {
+        let cmd_exe = system32_path("cmd.exe").to_string_lossy().into_owned();
+        let hold_open = |program: String| {
+            let mut out = vec![program, "/K".to_string()];
+            out.extend(argv.iter().cloned());
+            out
+        };
+        match self {
+            PreferredTerminal::CommandPrompt => hold_open(cmd_exe),
+            // Windows Terminal takes the command line to run as its trailing arguments, so
+            // the console that actually holds the command open is still cmd.
+            PreferredTerminal::WindowsTerminal => {
+                let mut out = vec![self.path().to_string_lossy().into_owned()];
+                out.extend(hold_open(cmd_exe));
+                out
+            }
+            PreferredTerminal::PowerShell => {
+                if !argv.iter().all(|token| is_safe_arg(token)) {
+                    return hold_open(cmd_exe);
+                }
+                let script = std::iter::once(format!("& '{}'", argv[0]))
+                    .chain(argv[1..].iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                vec![
+                    self.path().to_string_lossy().into_owned(),
+                    "-NoExit".to_string(),
+                    "-Command".to_string(),
+                    script,
+                ]
+            }
+        }
+    }
+}
+
+/// What the settings window lists, with the ones that are not on this machine marked so the
+/// "(not installed)" hint stays honest.
+#[cfg(target_os = "windows")]
+pub fn terminals() -> Vec<TerminalOption> {
+    PreferredTerminal::ALL
+        .into_iter()
+        .map(|term| TerminalOption {
+            id: term.id(),
+            installed: term.is_installed(),
+        })
+        .collect()
+}
+
+/// Linux and macOS pick a terminal by probing for one at launch, so there is nothing for the
+/// settings window to offer; it hides the control when this list is empty.
+#[cfg(not(target_os = "windows"))]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalOption {
+    pub id: &'static str,
+    pub installed: bool,
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn terminals() -> Vec<TerminalOption> {
+    Vec::new()
 }
 
 /// Minimal dependency: we only use `which` inside spawn_in_terminal on Linux. Vendored here

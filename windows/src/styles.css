@@ -2116,3 +2116,9 @@ code { font-family: var(--font-mono); }
 .stg-readout { font-family: var(--font-mono); font-size: 11px; color: var(--label-2); min-width: 38px; text-align: right; }
 .stg-provider { display: inline-flex; align-items: center; gap: 7px; }
 .stg-attention { font-size: 10px; color: var(--danger); }
+/* The Tokens metric swaps calls and sessions for an up and down pair, so those two rows
+   carry a glyph as well as a figure. */
+.hero-calls, .hero-sessions { display: inline-flex; align-items: center; gap: 2px; }
+/* The native popup is painted by the OS in its own colours, so an option that only inherits
+   the select's colour is white on white in the dark theme. Both are stated here. */
+.stg-select option { background: var(--surface-window); color: var(--label); }

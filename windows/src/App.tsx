@@ -94,6 +94,10 @@ type FetchOptions = {
   showOverlay: boolean
 }
 
+/// The two daily alert thresholds from the CLI config. Only the one the display metric is
+/// measured in is ever shown, as on the mac; `null` means that alert is off.
+type Budgets = { cost: number | null; tokens: number | null }
+
 export function App() {
   const [period, setPeriod] = useState<Period>('today')
   // Days picked in the calendar. Non-empty overrides the period, as isDayMode does on
@@ -119,7 +123,7 @@ export function App() {
   const [quota, setQuota] = useState<QuotaState>(EMPTY_QUOTA)
   // The window starts hidden and is shown by a tray click, which emits `codeburn://shown`.
   const [popoverVisible, setPopoverVisible] = useState(false)
-  const [dailyBudget, setDailyBudget] = useState<number | null>(null)
+  const [budgets, setBudgets] = useState<Budgets>({ cost: null, tokens: null })
   // Every preference the settings window owns arrives here through one store, so a change
   // made in that window reaches this one without a reload.
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS)
@@ -234,14 +238,22 @@ export function App() {
 
   useEffect(() => {
     if (!cliReady) return
+    // Manual never spawns on a timer; usage then only refreshes when the popover opens or
+    // Refresh is pressed. A chosen cadence applies whether the popover is open or not, since
+    // the reader asked for that number specifically.
+    const cadence = settings.usageRefreshSeconds
+    if (cadence === 0) return
+    const period = cadence > 0
+      ? cadence * 1000
+      : popoverVisible ? REFRESH_ACTIVE_MS : REFRESH_IDLE_MS
     const tick = popoverVisible
       ? () => refreshAll({ includeOptimize: true, showOverlay: false })
       // Hidden, the tray figure is the only thing anyone can see, so only its key is
       // refreshed and the optimize pass is skipped.
       : () => fetchKey(menubarRef.current, { includeOptimize: false, showOverlay: false })
-    const id = setInterval(tick, popoverVisible ? REFRESH_ACTIVE_MS : REFRESH_IDLE_MS)
+    const id = setInterval(tick, period)
     return () => clearInterval(id)
-  }, [cliReady, popoverVisible, refreshAll, fetchKey])
+  }, [cliReady, popoverVisible, refreshAll, fetchKey, settings.usageRefreshSeconds])
 
   const selectionKeyValue = selectionKey(current)
   useEffect(() => {
@@ -271,8 +283,8 @@ export function App() {
     })
     const unlistenHidden = listen('codeburn://hidden', () => setPopoverVisible(false))
     const unlistenTheme = listen('codeburn://toggle-theme', () => toggleTheme())
-    const unlistenBudget = listen<{ cost: number | null }>('codeburn://budget-changed', event => {
-      setDailyBudget(event.payload?.cost ?? null)
+    const unlistenBudget = listen<Budgets>('codeburn://budget-changed', event => {
+      if (event.payload) setBudgets(event.payload)
     })
     const unlistenCurrency = listen<CurrencyState>('codeburn://currency-changed', event => {
       if (event.payload) setCurrency(event.payload)
@@ -306,7 +318,7 @@ export function App() {
   // The limit lives in the CLI config, which package C's settings window will write, so
   // it is re-read whenever the popover comes back rather than cached for the session.
   const readDailyBudget = () => {
-    invoke<number | null>('daily_budget').then(setDailyBudget).catch(() => {})
+    invoke<Budgets>('daily_budgets').then(setBudgets).catch(() => {})
   }
   useEffect(readDailyBudget, [])
 
@@ -398,9 +410,14 @@ export function App() {
 
   // The flame carries the worst connected provider's quota severity. Rust decides whether
   // today's spend is over the daily budget, since the limit lives in the CLI's config.
+  const todayTokens = todayPayload?.current
+    ? todayPayload.current.inputTokens + todayPayload.current.outputTokens
+    : null
+  // `budgets` is in the list although Rust reads the limits from the config itself: without
+  // it, arming an alert would not tint the flame until the next refresh moved a figure.
   useEffect(() => {
-    invoke('set_tray_severity', { severity: worstSeverity(quota), todayCost }).catch(() => {})
-  }, [quota, todayCost])
+    invoke('set_tray_severity', { severity: worstSeverity(quota), todayCost, todayTokens }).catch(() => {})
+  }, [quota, todayCost, todayTokens, budgets])
 
   useEffect(() => {
     const span = MENUBAR_PERIODS.find(p => p.id === settings.menubarPeriod)?.label ?? 'Today'
@@ -530,7 +547,8 @@ export function App() {
               currency={currency}
               periodLabel={label}
               isToday={days.length === 0 && period === 'today'}
-              dailyBudget={dailyBudget}
+              metric={settings.metric}
+              dailyBudget={isTokenMetric ? budgets.tokens : budgets.cost}
               combinedScope={effectiveScope === 'combined'}
             />
             <PeriodTabs
