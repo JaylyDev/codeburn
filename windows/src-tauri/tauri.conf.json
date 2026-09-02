@@ -52,6 +52,7 @@
       "icons/icon.ico"
     ],
     "windows": {
+      "allowDowngrades": false,
       "wix": {
         "upgradeCode": "cfe9191d-31ea-5040-83c8-cefd2a10b703"
       }
