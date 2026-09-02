@@ -38,6 +38,7 @@ export function AboutPane({ anchor }: Props) {
   }, [anchor])
 
   const status = update.status
+  const storeManaged = status?.storeManaged ?? false
   const canInstall = (status?.updateAvailable || status?.cliUpdateAvailable) ?? false
   const busy = update.checking || update.updating
 
@@ -65,7 +66,7 @@ export function AboutPane({ anchor }: Props) {
         <Row
           label={version ? `Version ${version}` : 'Version'}
           hint={lastChecked(update)}
-          control={
+          control={storeManaged ? null : (
             <>
               {canInstall && (
                 <button
@@ -86,7 +87,7 @@ export function AboutPane({ anchor }: Props) {
                 {update.checking ? 'Checking...' : 'Check for Updates'}
               </button>
             </>
-          }
+          )}
         />
         <Note>{resultNote(update)}</Note>
       </Group>
@@ -121,6 +122,9 @@ function resultNote(update: UpdateState): string {
       : 'Installing the tray app. Windows will ask to run the installer.'
   }
   if (!status) return update.checking ? 'Checking GitHub for a newer release...' : ''
+  if (status.storeManaged) {
+    return 'This copy came from the Microsoft Store, which keeps it up to date. There is nothing to check here.'
+  }
   if (status.error) {
     return status.failureStage === 'check'
       ? `Check failed. ${status.error}`

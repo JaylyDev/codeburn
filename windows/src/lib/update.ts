@@ -25,6 +25,9 @@ export type UpdateStatus = {
   checkedAt: number | null
   failureStage: UpdateStage | null
   error: string | null
+  /// Running from an installed MSIX/AppX package, where the Store updates the app and this
+  /// check never ran. Every update surface goes quiet on it.
+  storeManaged: boolean
 }
 
 export type UpdateState = {
@@ -127,6 +130,7 @@ function blankStatus(): UpdateStatus {
     checkedAt: null,
     failureStage: null,
     error: null,
+    storeManaged: false,
   }
 }
 
@@ -193,5 +197,6 @@ export function badgeAction(state: UpdateState): 'check' | 'update' {
 export function badgeVisible(state: UpdateState): boolean {
   const status = state.status
   if (!status) return false
+  if (status.storeManaged) return false
   return status.updateAvailable || status.cliUpdateAvailable || status.error !== null
 }

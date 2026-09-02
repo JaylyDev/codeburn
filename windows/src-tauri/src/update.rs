@@ -136,6 +136,27 @@ fn is_cli_too_old(installed: Option<&str>) -> bool {
         .is_some_and(|version| version < MIN_CLI_VERSION_FOR_UPDATE)
 }
 
+/// True when this process runs from an installed MSIX/AppX package. The Store build of the
+/// desktop app ships this tray app inside its own package, and a package updates as one thing:
+/// an .msi install underneath it would be undone by the next Store update at best, and refused
+/// at worst. `GetCurrentPackageFullName` is the documented ask - it answers
+/// APPMODEL_ERROR_NO_PACKAGE outside a package and a buffer complaint inside one, which is why
+/// the length is asked for with no buffer to put it in.
+#[cfg(target_os = "windows")]
+pub fn is_packaged_app() -> bool {
+    use windows_sys::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
+    const APPMODEL_ERROR_NO_PACKAGE: u32 = 15700;
+
+    let mut length: u32 = 0;
+    let code = unsafe { GetCurrentPackageFullName(&mut length, std::ptr::null_mut()) };
+    code != APPMODEL_ERROR_NO_PACKAGE
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn is_packaged_app() -> bool {
+    false
+}
+
 // What the page renders -------------------------------------------------------------------
 
 /// Which stage failed, so the badge can say so. The mac's UpdateFailureStage; the labels and
@@ -164,6 +185,9 @@ pub struct UpdateStatus {
     pub checked_at: Option<u64>,
     pub failure_stage: Option<FailureStage>,
     pub error: Option<String>,
+    /// Running inside an installed MSIX/AppX package, where the Store owns updates and this
+    /// checker has nothing to offer. Every update surface hides itself on it.
+    pub store_managed: bool,
 }
 
 impl UpdateStatus {
@@ -180,7 +204,15 @@ impl UpdateStatus {
             checked_at: None,
             failure_stage: None,
             error: None,
+            store_managed: false,
         }
+    }
+
+    /// The whole answer for a packaged install: nothing was asked of GitHub, nothing is
+    /// offered, and the surfaces read `store_managed` rather than a silence they would
+    /// otherwise show as "up to date" with a Check for Updates button beside it.
+    fn store_managed(current_version: String) -> Self {
+        UpdateStatus { store_managed: true, ..UpdateStatus::new(current_version) }
     }
 
     /// The three derived answers, recomputed wherever a version moves: after a check, and
@@ -286,6 +318,13 @@ async fn installed_cli_version(cli: &CodeburnCli) -> Option<String> {
 /// The current answer. `force` skips the two-day gate; without it a cached answer inside the
 /// interval is returned untouched, which is what makes this cheap to call on every mount.
 pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateStatus {
+    // Inside a package the Store is the updater. Running this one there would offer an .msi
+    // install that MSIX would either refuse or quietly undo on its next update, so the check
+    // never happens: no request, no `codeburn --version` spawn, no cache file.
+    if is_packaged_app() {
+        return UpdateStatus::store_managed(app.package_info().version.to_string());
+    }
+
     let mut status = UpdateStatus::new(app.package_info().version.to_string());
     status.installed_cli_version = installed_cli_version(cli).await;
 
@@ -434,6 +473,11 @@ fn emit_stage(app: &AppHandle, stage: FailureStage) {
 /// stage stops the sequence and reports which one it was.
 pub async fn perform_update(app: &AppHandle, cli: &CodeburnCli) -> UpdateStatus {
     let mut status = check(app, cli, false).await;
+    // Belt and braces: no surface offers this inside a package, and nothing here runs if one
+    // ever does.
+    if status.store_managed {
+        return status;
+    }
     if UPDATING.swap(true, Ordering::SeqCst) {
         status.failure_stage = Some(FailureStage::Check);
         status.error = Some("An update is already running.".into());
@@ -602,6 +646,27 @@ pub fn scrub(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Store owns updates inside a package, so nothing is offered and no stage can run.
+    #[test]
+    fn a_store_managed_status_offers_nothing() {
+        let status = UpdateStatus::store_managed("0.9.23".into());
+
+        assert!(status.store_managed);
+        assert!(!status.update_available);
+        assert!(!status.cli_update_available);
+        assert!(!status.cli_too_old);
+        assert_eq!(status.latest_version, None);
+        assert_eq!(status.checked_at, None);
+        assert_eq!(status.failure_stage, None);
+    }
+
+    /// This test binary is an ordinary .exe, which is the branch every developer machine and
+    /// the NSIS install take.
+    #[test]
+    fn an_unpackaged_process_is_not_store_managed() {
+        assert!(!is_packaged_app());
+    }
 
     fn release(tag: &str, assets: &[&str]) -> GitHubRelease {
         GitHubRelease {

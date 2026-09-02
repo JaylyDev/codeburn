@@ -278,24 +278,25 @@ fn build_tray_tauri(app: &AppHandle) -> tauri::Result<()> {
     let updates = MenuItem::with_id(app, "check_updates", "Check for Updates", true, None::<&str>)?;
     let about = MenuItem::with_id(app, "about", "About CodeBurn", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit CodeBurn", true, None::<&str>)?;
-    let menu = Menu::with_items(
-        app,
-        &[
-            &usage,
-            &PredefinedMenuItem::separator(app)?,
-            &open,
-            &refresh,
-            &theme,
-            &settings,
-            &dock_settings,
-            &capacity_dock,
-            &report,
-            &updates,
-            &PredefinedMenuItem::separator(app)?,
-            &about,
-            &quit,
-        ],
-    )?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    // Inside a Store package the update check never runs, so the item that opens its result
+    // would only ever say there is nothing to check. It is not offered at all there.
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![
+        &usage,
+        &separator,
+        &open,
+        &refresh,
+        &theme,
+        &settings,
+        &dock_settings,
+        &capacity_dock,
+        &report,
+    ];
+    if !update::is_packaged_app() {
+        items.push(&updates);
+    }
+    items.extend([&separator as &dyn tauri::menu::IsMenuItem<tauri::Wry>, &about, &quit]);
+    let menu = Menu::with_items(app, &items)?;
     // Both tray icons share one menu, so the handler needs the items themselves to keep the
     // checkmark in step with the persisted state and the usage row in step with the payload.
     let _ = DOCK_MENU_ITEM.set(capacity_dock);
