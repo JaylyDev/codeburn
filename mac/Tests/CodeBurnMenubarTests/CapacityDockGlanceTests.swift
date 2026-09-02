@@ -65,7 +65,7 @@ struct CapacityDockGlanceTests {
     @Test("The tint's fade tail never inverts on a short fill")
     func pillFadeStart() {
         // A long band keeps a 12pt tail, so the fade starts near its end.
-        #expect(CapacityDockGlance.pillFadeStart(filledWidth: 112, scale: 1) == 100.0 / 112.0)
+        #expect(abs(CapacityDockGlance.pillFadeStart(filledWidth: 112, scale: 1) - 100.0 / 112.0) < 1e-9)
         // Shorter than the tail, the whole band is the fade.
         #expect(CapacityDockGlance.pillFadeStart(filledWidth: 8, scale: 1) == 0)
         #expect(CapacityDockGlance.pillFadeStart(filledWidth: 0, scale: 1) == 0)
