@@ -11,7 +11,9 @@ import {
   findPackagedTrayExe,
   findStagedMsi,
   parseInstallResult,
+  parseRunKeyValue,
   readCompanionSettings,
+  readDockEnabled,
   runKeyArgs,
   system32Path,
   writeCompanionSettings,
@@ -89,6 +91,22 @@ describe('runKeyArgs', () => {
   })
 })
 
+describe('parseRunKeyValue', () => {
+  it('reads the value out of a reg query, and null when there is none', () => {
+    const output = [
+      '',
+      'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Run',
+      `    CodeBurn    REG_SZ    "${TRAY_EXE}"`,
+      '',
+    ].join('\r\n')
+
+    expect(parseRunKeyValue(output)).toBe(`"${TRAY_EXE}"`)
+    expect(parseRunKeyValue('ERROR: The system was unable to find the specified registry key')).toBeNull()
+    // A different value under the same key is not this one.
+    expect(parseRunKeyValue('    OneDrive    REG_SZ    "C:\\OneDrive.exe"')).toBeNull()
+  })
+})
+
 describe('system32Path', () => {
   it('never resolves a system tool by bare name', () => {
     expect(system32Path('reg.exe', { SystemRoot: 'D:\\Windows' })).toBe('D:\\Windows\\System32\\reg.exe')
@@ -105,6 +123,20 @@ describe('the dock preference file', () => {
   it('creates the file the tray app reads before its page exists', () => {
     writeDockEnabled(true, home)
     expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toEqual({ enabled: true })
+  })
+
+  it('reports whether the tray app has already said something about the rail', () => {
+    expect(readDockEnabled(home)).toBeUndefined()
+
+    mkdirSync(join(home, '.config', 'codeburn'), { recursive: true })
+    writeFileSync(dockPrefsPath(home), JSON.stringify({ scale: 1.2 }))
+    expect(readDockEnabled(home)).toBeUndefined()
+
+    writeFileSync(dockPrefsPath(home), JSON.stringify({ enabled: false, scale: 1.2 }))
+    expect(readDockEnabled(home)).toBe(false)
+
+    writeFileSync(dockPrefsPath(home), '{ broken')
+    expect(readDockEnabled(home)).toBeUndefined()
   })
 
   it('keeps every key the tray app owns', () => {
@@ -146,6 +178,7 @@ describe('MenubarCompanion', () => {
   let regCalls: string[][]
   let cliCalls: Array<{ args: string[]; env: NodeJS.ProcessEnv | undefined }>
   let installResult: MenubarInstallResult | null
+  let existingRunKey: string | null
 
   function deps(overrides: Record<string, unknown> = {}) {
     return {
@@ -157,6 +190,7 @@ describe('MenubarCompanion', () => {
       home,
       launch: (exe: string, args: string[]) => { launches.push({ exe, args }) },
       runReg: async (args: string[]) => { regCalls.push(args) },
+      readRunKey: async () => existingRunKey,
       runCli: async (args: string[], opts: { extraEnv?: NodeJS.ProcessEnv }) => {
         cliCalls.push({ args, env: opts.extraEnv })
         return {
@@ -192,6 +226,7 @@ describe('MenubarCompanion', () => {
     regCalls = []
     cliCalls = []
     installResult = result()
+    existingRunKey = null
   })
 
   afterEach(() => { rmSync(sandbox, { recursive: true, force: true }) })
@@ -227,6 +262,53 @@ describe('MenubarCompanion', () => {
     writeDockEnabled(false, home)
     await new MenubarCompanion(deps()).bootstrap()
     expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toEqual({ enabled: false })
+  })
+
+  it('leaves a rail preference that was already there, and mirrors it into the switch', async () => {
+    stageMsi()
+    // A tray app installed by hand, with the rail deliberately off.
+    mkdirSync(join(home, '.config', 'codeburn'), { recursive: true })
+    writeFileSync(dockPrefsPath(home), JSON.stringify({ enabled: false, scale: 1.2 }))
+    const companion = new MenubarCompanion(deps())
+
+    await companion.bootstrap()
+
+    expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toEqual({ enabled: false, scale: 1.2 })
+    expect(companion.status().sidebar).toBe(false)
+    expect(readCompanionSettings(stateDir).sidebar).toBe(false)
+  })
+
+  it('still seeds when the file exists but has never mentioned the rail', async () => {
+    stageMsi()
+    mkdirSync(join(home, '.config', 'codeburn'), { recursive: true })
+    writeFileSync(dockPrefsPath(home), JSON.stringify({ scale: 1.2 }))
+
+    await new MenubarCompanion(deps()).bootstrap()
+
+    expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toEqual({ enabled: true, scale: 1.2 })
+  })
+
+  it('leaves an existing launch-at-login value alone', async () => {
+    stageMsi()
+    existingRunKey = `"${TRAY_EXE}"`
+
+    await new MenubarCompanion(deps()).bootstrap()
+
+    expect(regCalls).toEqual([])
+    // Everything else still happens: the install is what carries a version forward.
+    expect(cliCalls).toHaveLength(1)
+    expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--reload-settings'] }])
+  })
+
+  it('writes the launch-at-login value on the first run only', async () => {
+    stageMsi()
+    await new MenubarCompanion(deps()).bootstrap()
+    expect(regCalls).toEqual([runKeyArgs(true, TRAY_EXE)])
+
+    // A person turning launch at login off in the tray app's settings must not find it back on.
+    regCalls = []
+    await new MenubarCompanion(deps()).bootstrap()
+    expect(regCalls).toEqual([])
   })
 
   it('does nothing at all with the Menu bar switch off', async () => {

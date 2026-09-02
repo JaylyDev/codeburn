@@ -87,6 +87,8 @@ export type MenubarDeps = {
   runCli?: (args: string[], opts: { timeoutMs?: number; extraEnv?: NodeJS.ProcessEnv }) => Promise<ActionResult>
   launch?: (exePath: string, args: string[]) => void
   runReg?: (args: string[]) => Promise<void>
+  /** The tray app's existing Run value, or null when there is none. */
+  readRunKey?: () => Promise<string | null>
   home?: string
 }
 
@@ -151,6 +153,20 @@ export function writeCompanionSettings(stateDir: string, settings: CompanionSett
   }
 }
 
+/** Whether the tray app already has an opinion about the rail, or undefined when nobody has
+ *  said. The difference matters exactly once: a default is for a machine that has made no
+ *  choice, never an override of one already made. */
+export function readDockEnabled(home = homedir()): boolean | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+    const enabled = (parsed as Record<string, unknown>).enabled
+    return typeof enabled === 'boolean' ? enabled : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /** Read, change one key, write back. The tray app owns every other key in this file (the
  *  rail's placement, size and provider set), so the whole object is preserved. */
 export function writeDockEnabled(enabled: boolean, home = homedir()): void {
@@ -185,6 +201,14 @@ export function runKeyArgs(enabled: boolean, exePath: string): string[] {
     : ['delete', RUN_KEY, '/v', RUN_VALUE, '/f']
 }
 
+/** `reg query <key> /v CodeBurn` prints the value on its own indented line. Null means the
+ *  value is not there, which is the only thing the caller acts on. */
+export function parseRunKeyValue(regOutput: string): string | null {
+  const match = new RegExp(`^\\s+${RUN_VALUE}\\s{4}REG_\\w+\\s{4}(.*)$`, 'm').exec(regOutput)
+  const value = match?.[1]?.trim()
+  return value ? value : null
+}
+
 /** Windows searches the current directory before PATH, so `reg` by bare name lets anything
  *  dropped beside the app impersonate it. Same rule as src/menubar-installer.ts. */
 export function system32Path(exe: string, env: NodeJS.ProcessEnv): string {
@@ -210,6 +234,23 @@ function regRun(args: string[], env: NodeJS.ProcessEnv): Promise<void> {
     // read: a failure here must never stop a toggle the person just flipped.
     child.on('error', () => resolve())
     child.on('close', () => resolve())
+  })
+}
+
+function regQueryRunValue(env: NodeJS.ProcessEnv): Promise<string | null> {
+  return new Promise(resolve => {
+    const child = spawn(system32Path('reg.exe', env), ['query', RUN_KEY, '/v', RUN_VALUE], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    })
+    let out = ''
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', chunk => { out += chunk })
+    child.on('error', () => resolve(null))
+    // reg exits non-zero for a value that is not there, which is the answer rather than a
+    // failure; anything else that goes wrong reads the same way, and the only cost of
+    // guessing "absent" is one write of a value that already said the same thing.
+    child.on('close', code => resolve(code === 0 ? parseRunKeyValue(out) : null))
   })
 }
 
@@ -268,10 +309,16 @@ export class MenubarCompanion {
   async bootstrap(): Promise<void> {
     if (!this.supported()) return
 
-    // The defaults are seeded once. A person who later turns the rail off in the tray app's
-    // own settings must not find it back on at the next launch of this one.
+    // The defaults are seeded once, and only onto a machine that has made no choice. A tray
+    // app someone installed by hand has preferences of its own, and a default that overrode
+    // them would be this app deciding something the person already decided.
     const firstRun = !this.settings.seeded
-    if (firstRun) this.save({ seeded: true })
+    const existingDock = firstRun ? readDockEnabled(this.home) : undefined
+    if (firstRun) {
+      // An existing rail preference is mirrored into the switch rather than overwritten, so
+      // the corner opens saying what the rail is actually doing.
+      this.save({ seeded: true, ...(existingDock === undefined ? {} : { sidebar: existingDock }) })
+    }
 
     if (!this.settings.menuBar) return
 
@@ -281,9 +328,18 @@ export class MenubarCompanion {
     if (!exePath) return
     this.save({ trayExePath: exePath })
 
-    if (firstRun && this.settings.sidebar) this.applyDockSetting(true)
-    await this.setRunKey(true)
+    if (firstRun && existingDock === undefined && this.settings.sidebar) this.applyDockSetting(true)
+    // Same rule for launch at login: an existing Run value was written by the tray app's own
+    // toggle or by an earlier launch of this one, and either way it is not this launch's to
+    // rewrite. After the first run only the Menu bar switch touches it.
+    if (firstRun && await this.existingRunKey() === null) await this.setRunKey(true)
     this.launch(exePath, ['--reload-settings'])
+  }
+
+  private existingRunKey(): Promise<string | null> {
+    if (this.deps.readRunKey) return this.deps.readRunKey()
+    // The Store route has no Run value at all, so there is nothing to ask about.
+    return this.deps.store ? Promise.resolve(null) : regQueryRunValue(this.deps.env)
   }
 
   /** The install itself belongs to the CLI: it owns the registry read, the checksum, the
