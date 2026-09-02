@@ -8,6 +8,7 @@
 import { renderTable } from '../text-table.js'
 import { fetchAntigravityQuota } from './antigravity.js'
 import { fetchClaudeQuota } from './claude.js'
+import { fetchClinePassQuota } from './clinepass.js'
 import { fetchCodexQuota } from './codex.js'
 import { fetchCopilotQuota } from './copilot.js'
 import { fetchCursorQuota } from './cursor.js'
@@ -44,6 +45,7 @@ const READERS: { id: ProviderName; name: string; read: ProviderReader }[] = [
   { id: 'cursor', name: 'Cursor', read: async signal => (await fetchCursorQuota({ signal })).quota },
   { id: 'zai', name: 'Z.ai', read: async signal => (await fetchZaiQuota({ signal })).quota },
   { id: 'grok', name: 'Grok', read: async signal => (await fetchGrokQuota({ signal })).quota },
+  { id: 'clinepass', name: 'ClinePass', read: async signal => (await fetchClinePassQuota({ signal })).quota },
 ]
 
 const DEFAULT_TIMEOUT_MS = 5_000
