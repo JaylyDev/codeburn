@@ -329,6 +329,21 @@ impl CodeburnCli {
         }
     }
 
+    /// `codeburn export -f <format> -o <path>`, the mac's `runExport`. The path is built by
+    /// `commands::export_usage` rather than supplied by the reader, so it is not put through
+    /// the argument allowlist, which would reject a drive letter and a backslash. Nothing is
+    /// interpolated through a shell: this is argv, as every other spawn here is.
+    pub async fn export_to(&self, format: &str, output: &std::path::Path) -> Result<()> {
+        if !matches!(format, "csv" | "json") {
+            bail!("unknown export format");
+        }
+        let path = output.to_string_lossy().to_string();
+        let warm = PAYLOAD_SEEN.load(std::sync::atomic::Ordering::Relaxed);
+        self.run_capture(&["export", "-f", format, "-o", &path], silence_window(warm))
+            .await?;
+        Ok(())
+    }
+
     async fn run_capture(&self, args: &[&str], silence_secs: u64) -> Result<String> {
         self.run_capture_with_env(args, silence_secs, &[]).await
     }
@@ -762,6 +777,38 @@ fn expand_env(value: &str) -> String {
     }
     result.push_str(rest);
     result
+}
+
+/// Opens the folder holding `path` with `path` itself selected: the Windows counterpart of
+/// the mac's `NSWorkspace.activateFileViewerSelecting`, which is what the export reveal has
+/// always done there. `explorer.exe` is spawned out of `%SystemRoot%` for the same reason
+/// every other system tool here is, and its exit code is ignored because it reports 1 on a
+/// perfectly successful open.
+#[cfg(windows)]
+pub fn reveal_in_file_manager(path: &std::path::Path) -> Result<()> {
+    let root = env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    // One argument, comma-joined: `/select,C:\path`. Passing them as two would open the
+    // reader's Documents folder instead, which is explorer's answer to an unparsed switch.
+    let mut arg = std::ffi::OsString::from("/select,");
+    arg.push(path.as_os_str());
+    std::process::Command::new(root.join("explorer.exe"))
+        .arg(arg)
+        .spawn()
+        .with_context(|| "could not open Explorer")?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn reveal_in_file_manager(path: &std::path::Path) -> Result<()> {
+    let target = path.parent().unwrap_or(path);
+    std::process::Command::new("xdg-open")
+        .arg(target)
+        .spawn()
+        .with_context(|| "could not open the file manager")?;
+    Ok(())
 }
 
 /// Runs a codeburn subcommand in the user's terminal emulator so they can see the output.

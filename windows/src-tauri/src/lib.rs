@@ -153,6 +153,7 @@ pub fn run() {
             commands::set_currency,
             commands::open_terminal_command,
             commands::open_claude_login,
+            commands::export_usage,
             commands::quit_app,
             commands::hide_popover,
             commands::set_tray_tooltip,
@@ -843,6 +844,41 @@ mod commands {
     #[tauri::command]
     pub fn open_claude_login(app: AppHandle) -> Result<(), String> {
         crate::cli::spawn_claude_login(&app).map_err(|e| e.to_string())
+    }
+
+    /// Export straight into the Downloads folder and reveal what came out, the mac's
+    /// `runExport`: `~/Downloads/codeburn-<stamp>`, a folder of CSVs or one JSON file, then
+    /// the file manager opens with it selected. No console window and nothing left in the
+    /// working directory, which is what the old "export through a terminal" did.
+    ///
+    /// The stamp is formatted by the page because a local `yyyy-MM-dd-HHmmss` in Rust would
+    /// mean either a new dependency or a hand-rolled timezone conversion. It never reaches a
+    /// shell, but it does become a directory name, so it is checked here rather than trusted:
+    /// digits and hyphens only, and the length the format produces.
+    #[tauri::command]
+    pub async fn export_usage(format: String, stamp: String) -> Result<String, String> {
+        if !matches!(format.as_str(), "csv" | "json") {
+            return Err("unknown export format".into());
+        }
+        if stamp.len() != 17 || !stamp.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+            return Err("invalid export timestamp".into());
+        }
+        let downloads = dirs::download_dir()
+            .or_else(|| dirs::home_dir().map(|home| home.join("Downloads")))
+            .ok_or_else(|| "could not find your Downloads folder".to_string())?;
+        // CSV writes a folder of one-table-per-file CSVs; JSON writes a single file, which
+        // wants the extension the mac gives it.
+        let name = match format.as_str() {
+            "json" => format!("codeburn-{stamp}.json"),
+            _ => format!("codeburn-{stamp}"),
+        };
+        let output = downloads.join(name);
+        let cli = crate::cli::CodeburnCli::resolve();
+        cli.export_to(&format, &output)
+            .await
+            .map_err(|e| e.to_string())?;
+        crate::cli::reveal_in_file_manager(&output).map_err(|e| e.to_string())?;
+        Ok(output.to_string_lossy().to_string())
     }
 
     #[tauri::command]

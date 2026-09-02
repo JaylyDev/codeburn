@@ -482,6 +482,18 @@ export function App() {
   const openTerminal = (args: string[]) => {
     invoke('open_terminal_command', { args }).catch(err => setError(String(err)))
   }
+
+  /// The mac's runExport: into the Downloads folder as codeburn-<stamp>, then revealed in
+  /// the file manager with the result selected. The stamp is the mac's local-time
+  /// `yyyy-MM-dd-HHmmss`, which is why it is formatted here rather than in Rust.
+  const runExport = (format: 'csv' | 'json') => {
+    const now = new Date()
+    const two = (n: number) => String(n).padStart(2, '0')
+    const stamp = `${now.getFullYear()}-${two(now.getMonth() + 1)}-${two(now.getDate())}`
+      + `-${two(now.getHours())}${two(now.getMinutes())}${two(now.getSeconds())}`
+    invoke('export_usage', { format, stamp }).catch(err => setError(String(err)))
+  }
+
   const connectClaude = () => {
     invoke('open_claude_login').catch(err => setError(String(err)))
   }
@@ -661,7 +673,7 @@ export function App() {
         onCurrency={applyCurrency}
         loading={overlay}
         onRefresh={userRefresh}
-        onExport={format => openTerminal(['export', '-f', format])}
+        onExport={runExport}
         onOpenReport={() => openTerminal(['report'])}
         onToggleTheme={cycleTheme}
         onQuit={() => invoke('quit_app').catch(() => {})}
