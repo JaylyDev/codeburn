@@ -4,12 +4,12 @@ import { listen } from '@tauri-apps/api/event'
 
 import type { MenubarPayload } from './lib/payload'
 import type { CurrencyState } from './lib/currency'
-import { USD, formatCurrency, trayBadgeText } from './lib/currency'
+import { USD, formatCurrency, plural, trayBadgeText } from './lib/currency'
 import { PayloadCache } from './lib/cache'
 import { relativePast } from './lib/dates'
 import { applyTheme, currentTheme, readSetting, writeSetting } from './lib/settings'
 import { TRAY_BADGE_SUPPORTED } from './lib/platform'
-import { EMPTY_QUOTA, refreshQuota, subscribeQuota, type QuotaState } from './lib/quota'
+import { EMPTY_QUOTA, refreshQuota, subscribeQuota, worstSeverity, type QuotaState } from './lib/quota'
 import { AgentTabStrip, ALL_PROVIDER, providerLabel, providerTabs } from './components/AgentTabStrip'
 import type { Provider } from './components/AgentTabStrip'
 import { ModelsSection } from './components/ModelsSection'
@@ -32,7 +32,7 @@ import type { Period } from './components/PeriodTabs'
 import { FooterBar } from './components/FooterBar'
 import { ErrorToast } from './components/ErrorToast'
 import { QuotaWarningRow } from './components/QuotaWarningRow'
-import { SettingsPanel, type ThemeChoice } from './components/SettingsPanel'
+import { SettingsPanel, type SettingsSection, type ThemeChoice } from './components/SettingsPanel'
 
 const payloadCache = new PayloadCache<MenubarPayload>()
 
@@ -70,6 +70,7 @@ export function App() {
   const [theme, setTheme] = useState(() => currentTheme())
   const [trayBadge, setTrayBadge] = useState(() => TRAY_BADGE_SUPPORTED && readSetting('trayBadge') !== 'off')
   const [showSettings, setShowSettings] = useState(false)
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>('general')
   const [quota, setQuota] = useState<QuotaState>(EMPTY_QUOTA)
   // The window starts hidden and is shown by a tray click, which emits `codeburn://shown`.
   const [popoverVisible, setPopoverVisible] = useState(false)
@@ -186,11 +187,19 @@ export function App() {
     })
     const unlistenHidden = listen('codeburn://hidden', () => setPopoverVisible(false))
     const unlistenTheme = listen('codeburn://toggle-theme', () => toggleTheme())
+    // The tray's Settings, Capacity Dock Settings and About all land in the settings panel
+    // for now; package C gives each its own pane in a real settings window.
+    const unlistenPanel = listen<string>('codeburn://open-panel', event => {
+      // Capacity Dock Settings lands in General, as it does on the mac.
+      setSettingsSection(event.payload === 'about' ? 'about' : 'general')
+      setShowSettings(true)
+    })
     return () => {
       unlistenRefresh.then(fn => fn())
       unlistenShown.then(fn => fn())
       unlistenHidden.then(fn => fn())
       unlistenTheme.then(fn => fn())
+      unlistenPanel.then(fn => fn())
     }
   }, [refreshAll])
 
@@ -226,9 +235,25 @@ export function App() {
 
   useEffect(() => {
     if (!TRAY_BADGE_SUPPORTED) return
+    // Before the first payload there is nothing to say, and the badge restored from the last
+    // session is already on screen: clearing it here would blank the tray on every launch.
+    if (trayBadge && todayCost === null) return
     const text = trayBadge && todayCost !== null ? trayBadgeText(todayCost, currency) : null
     invoke('set_tray_badge', { text }).catch(err => setError(`Tray badge: ${String(err)}`))
   }, [todayCost, currency, trayBadge])
+
+  // The flame carries the worst connected provider's quota severity. Rust decides whether
+  // today's spend is over the daily budget, since the limit lives in the CLI's config.
+  useEffect(() => {
+    invoke('set_tray_severity', { severity: worstSeverity(quota), todayCost }).catch(() => {})
+  }, [quota, todayCost])
+
+  useEffect(() => {
+    const text = todayPayload?.current
+      ? `Today · ${formatCurrency(todayPayload.current.cost, currency)} · ${plural(todayPayload.current.calls, 'call')}`
+      : 'Today · no usage yet'
+    invoke('set_tray_usage', { text }).catch(() => {})
+  }, [todayPayload, currency])
 
 
   const chooseTheme = (choice: ThemeChoice) => {
@@ -307,6 +332,7 @@ export function App() {
       <div className="main-content">
         {showSettings ? (
           <SettingsPanel
+            section={settingsSection}
             onBack={() => setShowSettings(false)}
             version={version}
             currency={currency}
@@ -382,7 +408,7 @@ export function App() {
         themeLabel={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
         trayBadge={trayBadge}
         onToggleTrayBadge={() => setTrayBadgePref(!trayBadge)}
-        onOpenSettings={() => setShowSettings(s => !s)}
+        onOpenSettings={() => { setSettingsSection('general'); setShowSettings(s => !s) }}
         settingsOpen={showSettings}
         footnote={footnote}
       />

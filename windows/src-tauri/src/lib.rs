@@ -11,6 +11,7 @@ mod plan;
 mod tray_badge;
 #[cfg(target_os = "linux")]
 mod tray_linux;
+mod tray_status;
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -29,6 +30,8 @@ use tauri::{
 
 #[cfg(not(target_os = "linux"))]
 static DOCK_MENU_ITEM: std::sync::OnceLock<CheckMenuItem<tauri::Wry>> = std::sync::OnceLock::new();
+#[cfg(not(target_os = "linux"))]
+static USAGE_MENU_ITEM: std::sync::OnceLock<MenuItem<tauri::Wry>> = std::sync::OnceLock::new();
 
 use crate::cli::CodeburnCli;
 use crate::config::CurrencyConfig;
@@ -74,7 +77,10 @@ pub fn run() {
             warn_if_window_station_hidden();
 
             #[cfg(not(target_os = "linux"))]
-            build_tray_tauri(app.handle())?;
+            {
+                build_tray_tauri(app.handle())?;
+                restore_tray_status(app.handle());
+            }
 
             #[cfg(target_os = "linux")]
             init_tray_linux(app.handle().clone(), tray_linux::LinuxTrayHandle::empty());
@@ -137,6 +143,8 @@ pub fn run() {
             commands::hide_popover,
             commands::set_tray_tooltip,
             commands::set_tray_badge,
+            commands::set_tray_severity,
+            commands::set_tray_usage,
             commands::app_version,
             commands::plan_usage,
             commands::launch_at_login,
@@ -168,9 +176,20 @@ fn build_tray_tauri(app: &AppHandle) -> tauri::Result<()> {
         return Ok(());
     };
 
+    // Disabled by design: the mac's menu opens with what today cost, which is the one thing
+    // worth knowing without opening anything. The frontend fills it in on every refresh.
+    let usage = MenuItem::with_id(app, "usage", "Today", false, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", "Open CodeBurn", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
     let theme = MenuItem::with_id(app, "toggle_theme", "Toggle Dark/Light", true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, "settings", "Settings...", true, None::<&str>)?;
+    let dock_settings = MenuItem::with_id(
+        app,
+        "dock_settings",
+        "Capacity Dock Settings...",
+        true,
+        None::<&str>,
+    )?;
     let capacity_dock = CheckMenuItem::with_id(
         app,
         "toggle_dock",
@@ -180,22 +199,29 @@ fn build_tray_tauri(app: &AppHandle) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let report = MenuItem::with_id(app, "report", "Open Full Report", true, None::<&str>)?;
+    let about = MenuItem::with_id(app, "about", "About CodeBurn", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit CodeBurn", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
+            &usage,
+            &PredefinedMenuItem::separator(app)?,
             &open,
             &refresh,
             &theme,
+            &settings,
+            &dock_settings,
             &capacity_dock,
             &report,
             &PredefinedMenuItem::separator(app)?,
+            &about,
             &quit,
         ],
     )?;
-    // Both tray icons share one menu, so the handler needs the item itself to keep the
-    // checkmark in step with the persisted state.
+    // Both tray icons share one menu, so the handler needs the items themselves to keep the
+    // checkmark in step with the persisted state and the usage row in step with the payload.
     let _ = DOCK_MENU_ITEM.set(capacity_dock);
+    let _ = USAGE_MENU_ITEM.set(usage);
 
     tray.set_menu(Some(menu.clone()))?;
     tray.set_show_menu_on_left_click(false)?;
@@ -242,10 +268,24 @@ fn on_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
             }
         }
         "toggle_dock" => set_dock_enabled(app, !dock::is_enabled()),
+        // Two entries, one destination for now: the popover's settings panel. Package C
+        // turns them into deep links to the matching pane of the settings window.
+        "settings" => open_popover_panel(app, "settings"),
+        "dock_settings" => open_popover_panel(app, "dock"),
+        "about" => open_popover_panel(app, "about"),
         "report" => {
             let _ = cli::spawn_in_terminal(app, &["report"]);
         }
         _ => {}
+    }
+}
+
+/// Shows the popover on a named panel. The event has to follow the window being shown, or a
+/// popover that was closed would swallow it.
+fn open_popover_panel(app: &AppHandle, panel: &str) {
+    show_popover(app, None);
+    if let Some(window) = app.get_webview_window(POPOVER_LABEL) {
+        let _ = window.emit("codeburn://open-panel", panel);
     }
 }
 
@@ -354,6 +394,91 @@ fn round_window_corners(window: &tauri::WebviewWindow) {
             &preference as *const u32 as *const std::ffi::c_void,
             std::mem::size_of::<u32>() as u32,
         );
+    }
+}
+
+/// Both tray icons carry the same tooltip, so the number is there whichever one the pointer
+/// lands on.
+fn apply_tray_tooltip(app: &AppHandle, text: &str) {
+    #[cfg(not(target_os = "linux"))]
+    for id in [TRAY_ID, BADGE_TRAY_ID] {
+        if let Some(tray) = app.tray_by_id(id) {
+            let _ = tray.set_tooltip(Some(text));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let _ = (app, text);
+}
+
+/// `text` is a short spend string ("$87", "142", "1.2K"); `None` hides the badge icon.
+#[cfg(not(target_os = "linux"))]
+fn apply_tray_badge(app: &AppHandle, text: Option<&str>) -> Result<(), String> {
+    let Some(badge) = app.tray_by_id(BADGE_TRAY_ID) else {
+        return Ok(());
+    };
+    match text.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => {
+            let icon = tray_badge::render(
+                t,
+                tray_badge::small_icon_size(),
+                tray_badge::taskbar_is_dark(),
+            );
+            // Windows can only modify an icon that is currently shown, so show first
+            // (re-adds the previous bitmap) and then swap the bitmap.
+            badge.set_visible(true).map_err(|e| e.to_string())?;
+            badge.set_icon(Some(icon)).map_err(|e| e.to_string())?;
+        }
+        None => {
+            badge.set_visible(false).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_tray_tint(app: &AppHandle, tint: Option<[u8; 3]>) -> Result<(), String> {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return Ok(());
+    };
+    let icon = tray_status::tray_icon(tint).map_err(|e| e.to_string())?;
+    tray.set_icon(Some(icon)).map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_tray_tint(app: &AppHandle, tint: Option<[u8; 3]>) -> Result<(), String> {
+    let _ = (app, tint);
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_tray_usage_text(text: &str) {
+    if let Some(item) = USAGE_MENU_ITEM.get() {
+        let _ = item.set_text(text);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_tray_usage_text(text: &str) {
+    let _ = text;
+}
+
+/// How long a persisted badge is worth showing after a relaunch, from the mac's
+/// MenubarStatusCache. Past that the tray stays blank until the first CLI answer rather than
+/// quoting a figure that may be hours old.
+const STATUS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Puts the last known badge and tooltip back before the first refresh lands, so a relaunch
+/// does not blank the tray for the length of a CLI round trip.
+#[cfg(not(target_os = "linux"))]
+fn restore_tray_status(app: &AppHandle) {
+    let Some(status) = tray_status::read_status(STATUS_MAX_AGE) else {
+        return;
+    };
+    if let Some(tooltip) = status.tooltip.as_deref() {
+        apply_tray_tooltip(app, tooltip);
+    }
+    if let Some(badge) = status.badge.as_deref() {
+        let _ = apply_tray_badge(app, Some(badge));
     }
 }
 
@@ -564,16 +689,36 @@ mod commands {
     /// The tray cannot render text on Windows, so today's spend lives in the tooltip.
     #[tauri::command]
     pub fn set_tray_tooltip(app: AppHandle, text: String) {
-        #[cfg(not(target_os = "linux"))]
-        for id in [super::TRAY_ID, super::BADGE_TRAY_ID] {
-            if let Some(tray) = app.tray_by_id(id) {
-                let _ = tray.set_tooltip(Some(text.as_str()));
-            }
+        super::apply_tray_tooltip(&app, &text);
+        let stored = text.clone();
+        if let Err(err) = crate::tray_status::write_status(|status| status.tooltip = Some(stored)) {
+            eprintln!("codeburn: failed to persist the tray tooltip: {err}");
         }
-        #[cfg(target_os = "linux")]
-        {
-            let _ = (app, text);
-        }
+    }
+
+    /// Tints the tray logo from the worst connected provider's quota severity, falling back
+    /// to the daily-budget warning. `today_cost` is the figure the hero shows; the limit it
+    /// is measured against is the CLI's own `dailyBudget`.
+    #[tauri::command]
+    pub fn set_tray_severity(
+        app: AppHandle,
+        severity: String,
+        today_cost: Option<f64>,
+    ) -> Result<(), String> {
+        let severity = crate::tray_status::Severity::parse(&severity)
+            .ok_or_else(|| format!("unknown quota severity `{severity}`"))?;
+        let over_budget = match (today_cost, crate::tray_status::daily_budget()) {
+            (Some(cost), Some(budget)) => cost >= budget,
+            _ => false,
+        };
+        super::apply_tray_tint(&app, crate::tray_status::tint_for(severity, over_budget))
+    }
+
+    /// The usage row at the top of the tray menu: disabled, and there only to say what today
+    /// cost without opening the popover.
+    #[tauri::command]
+    pub fn set_tray_usage(text: String) {
+        super::set_tray_usage_text(&text);
     }
 
     /// `text` is a short spend string ("$87", "142", "1.2K"); `None` hides the badge icon.
@@ -589,26 +734,11 @@ mod commands {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let Some(badge) = app.tray_by_id(super::BADGE_TRAY_ID) else {
-                return Ok(());
-            };
-            match text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-                Some(t) => {
-                    let icon = crate::tray_badge::render(
-                        t,
-                        crate::tray_badge::small_icon_size(),
-                        crate::tray_badge::taskbar_is_dark(),
-                    );
-                    // Windows can only modify an icon that is currently shown, so show
-                    // first (re-adds the previous bitmap) and then swap the bitmap.
-                    badge.set_visible(true).map_err(|e| e.to_string())?;
-                    badge.set_icon(Some(icon)).map_err(|e| e.to_string())?;
-                }
-                None => {
-                    badge.set_visible(false).map_err(|e| e.to_string())?;
-                }
+            let stored = text.clone();
+            if let Err(err) = crate::tray_status::write_status(|status| status.badge = stored) {
+                eprintln!("codeburn: failed to persist the tray badge: {err}");
             }
-            Ok(())
+            super::apply_tray_badge(&app, text.as_deref())
         }
     }
 
