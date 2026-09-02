@@ -161,24 +161,42 @@ impl CodeburnCli {
         period: &str,
         provider: &str,
         days: &[String],
+        scope: &str,
+        claude_config_source: Option<&str>,
         include_optimize: bool,
     ) -> Result<Value> {
-        if !is_safe_arg(period) || !is_safe_arg(provider) {
-            bail!("invalid period/provider argument");
+        if !is_safe_arg(period) || !is_safe_arg(provider) || !is_safe_arg(scope) {
+            bail!("invalid period/provider/scope argument");
         }
         if !days.iter().all(|d| is_iso_day(d)) {
             bail!("invalid day argument");
+        }
+        if claude_config_source.is_some_and(|id| !is_safe_arg(id)) {
+            bail!("invalid claude config argument");
         }
 
         // A picked day overrides the period, so the CLI gets one or the other, never
         // both kinds of range. `--day` is the single-day form; `--days` takes a
         // comma-separated list.
         let joined = days.join(",");
-        let mut args = vec!["status", "--format", "menubar-json", "--provider", provider];
+        let mut args = vec![
+            "status",
+            "--format",
+            "menubar-json",
+            "--provider",
+            provider,
+            "--scope",
+            scope,
+        ];
         match days.len() {
             0 => args.extend(["--period", period]),
             1 => args.extend(["--day", joined.as_str()]),
             _ => args.extend(["--days", joined.as_str()]),
+        }
+        // The CLI rejects a config source alongside combined scope, since a Claude
+        // config scopes Claude usage on this machine only. The page never sends both.
+        if let Some(id) = claude_config_source {
+            args.extend(["--claude-config-source", id]);
         }
         if !include_optimize {
             args.push("--no-optimize");

@@ -47,6 +47,40 @@ export type MenubarPayload = {
     topFindings: Array<{ title: string; impact: 'high' | 'medium' | 'low'; savingsUSD: number }>
   }
   history: { daily: DailyEntry[] }
+  /// Totals from every paired device, present only under `--scope combined` and only
+  /// when pulling the peers worked. The CLI treats it as best-effort enrichment.
+  combined?: CombinedUsage
+  /// Claude config directories the CLI found. Emitted only when there is more than one,
+  /// which is exactly when the picker is worth showing.
+  claudeConfigs?: { selectedId?: string | null; options: ClaudeConfigOption[] }
+}
+
+export type ClaudeConfigOption = {
+  id: string
+  label: string
+  path: string
+}
+
+export type CombinedUsage = {
+  perDevice: CombinedDevice[]
+  combined: {
+    cost: number
+    calls: number
+    sessions: number
+    inputTokens: number
+    outputTokens: number
+    deviceCount: number
+    reachableCount: number
+  }
+}
+
+export type CombinedDevice = {
+  id: string
+  name: string
+  local: boolean
+  error?: string | null
+  cost: number
+  totalTokens: number
 }
 
 export type Activity = {

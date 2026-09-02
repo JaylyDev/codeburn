@@ -32,6 +32,7 @@ import { SetupState, type CliStatus } from './components/SetupState'
 import { StarBanner } from './components/StarBanner'
 import { HeroSection } from './components/HeroSection'
 import { PeriodTabs, PERIOD_LABELS, daySelectionLabel } from './components/PeriodTabs'
+import { ScopeControl, type Scope } from './components/ScopeControl'
 import type { DaySelection, Period } from './components/PeriodTabs'
 import { FooterBar } from './components/FooterBar'
 import { ErrorToast } from './components/ErrorToast'
@@ -43,7 +44,13 @@ const payloadCache = new PayloadCache<MenubarPayload>()
 
 /// The tray badge, the tooltip and the tab strip costs all read this one key, whatever
 /// the popover is showing.
-const TODAY_ALL: Selection = { period: 'today', provider: 'all', days: [] }
+const TODAY_ALL: Selection = {
+  period: 'today',
+  provider: 'all',
+  days: [],
+  scope: 'local',
+  claudeConfigSourceId: null,
+}
 
 /// Background cadence, mirroring mac/Sources/CodeBurnMenubar/RefreshCadence.swift: every
 /// fetch is a full Node process, so the popover being closed has to cost less than it being
@@ -65,6 +72,8 @@ export function App() {
   // Days picked in the calendar. Non-empty overrides the period, as isDayMode does on
   // the mac; the period stays put so clearing the picker returns to it.
   const [days, setDays] = useState<DaySelection>([])
+  const [scope, setScope] = useState<Scope>('local')
+  const [claudeConfigSourceId, setClaudeConfigSourceId] = useState<string | null>(null)
   const [provider, setProvider] = useState<Provider>(ALL_PROVIDER)
   const [payload, setPayload] = useState<MenubarPayload | null>(null)
   const [todayPayload, setTodayPayload] = useState<MenubarPayload | null>(null)
@@ -93,7 +102,16 @@ export function App() {
     return saved === 'dark' || saved === 'light' ? saved : 'system'
   })
 
-  const current: Selection = { period, provider, days }
+  // The CLI refuses combined scope alongside a multi-day pick, since paired devices
+  // report a range rather than a set of days. The mac falls back to local there too.
+  const effectiveScope: Scope = days.length > 1 ? 'local' : scope
+  const current: Selection = {
+    period,
+    provider,
+    days,
+    scope: effectiveScope,
+    claudeConfigSourceId,
+  }
   const selection = useRef(current)
   selection.current = current
 
@@ -107,6 +125,8 @@ export function App() {
         period: key.period,
         provider: key.provider,
         days: key.days,
+        scope: key.scope,
+        claudeConfigSource: key.claudeConfigSourceId,
         includeOptimize: opts.includeOptimize,
       })
       // A quiet (no-optimize) refresh must not wipe findings a previous full fetch had.
@@ -320,12 +340,39 @@ export function App() {
     invoke('open_claude_login').catch(err => setError(String(err)))
   }
 
+  // Combined pulls unfiltered totals from every paired device, so a provider filter or a
+  // Claude config would be a contradiction; the CLI rejects both. Picking a config is the
+  // mirror image: it scopes Claude on this machine, so it forces All and local.
+  const chooseScope = (next: Scope) => {
+    setScope(next)
+    if (next === 'combined') {
+      setProvider(ALL_PROVIDER)
+      setClaudeConfigSourceId(null)
+    }
+  }
+
+  const chooseClaudeConfig = (id: string | null) => {
+    setClaudeConfigSourceId(id)
+    if (id !== null) {
+      setProvider(ALL_PROVIDER)
+      setScope('local')
+    }
+  }
+
+  const chooseProvider = (next: Provider) => {
+    setProvider(next)
+    if (next !== ALL_PROVIDER && next !== 'claude') setClaudeConfigSourceId(null)
+  }
+
   const selectInsight = (mode: InsightMode) => {
     setInsight(mode)
     writeSetting('insight', mode)
   }
 
   const tabs = providerTabs(todayPayload)
+  // The selector is worth showing only when there is a choice, so the CLI emits the block
+  // only past one config. Today's payload is the fallback while the selected key loads.
+  const claudeConfigs = payload?.claudeConfigs?.options ?? todayPayload?.claudeConfigs?.options ?? []
   // The Plan pill is offered exactly when there is one plan to show. All aggregates several
   // providers and so has no plan of its own, as on the mac.
   const planVisible = planTarget(quota, provider) !== null
@@ -359,7 +406,7 @@ export function App() {
       />
 
       {!cliBlocked && !showSettings && (
-        <AgentTabStrip selected={provider} onSelect={setProvider} payload={todayPayload} currency={currency} quota={quota} />
+        <AgentTabStrip selected={provider} onSelect={chooseProvider} payload={todayPayload} currency={currency} quota={quota} />
       )}
 
       <div className="main-content">
@@ -389,12 +436,20 @@ export function App() {
               periodLabel={daySelectionLabel(days) ?? PERIOD_LABELS[period]}
               isToday={days.length === 0 && period === 'today'}
               dailyBudget={dailyBudget}
+              combinedScope={effectiveScope === 'combined'}
             />
             <PeriodTabs
               selected={period}
               days={days}
               onSelect={p => { setDays([]); setPeriod(p) }}
               onSelectDays={setDays}
+            />
+            <ScopeControl
+              scope={effectiveScope}
+              onScope={chooseScope}
+              configs={claudeConfigs}
+              selectedConfigId={claudeConfigSourceId}
+              onConfig={chooseClaudeConfig}
             />
 
             {isFilteredEmpty ? (

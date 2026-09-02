@@ -4,16 +4,19 @@
 /// mac: two selections that would send different arguments to the CLI are different entries.
 
 import type { Period } from '../components/PeriodTabs'
+import type { Scope } from '../components/ScopeControl'
 
 export type Selection = {
   period: Period
   provider: string
   /// Picked days, sorted. Non-empty means the day picker governs and the period is ignored.
   days: string[]
+  scope: Scope
+  claudeConfigSourceId: string | null
 }
 
 export function selectionKey(s: Selection): string {
-  return [s.period, s.provider, s.days.join(',')].join('|')
+  return [s.scope, s.period, s.provider, s.days.join(','), s.claudeConfigSourceId ?? ''].join('|')
 }
 
 export function sameSelection(a: Selection, b: Selection): boolean {

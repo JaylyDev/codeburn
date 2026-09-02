@@ -52,6 +52,25 @@ export function RouteIcon(p: IconProps) {
   )
 }
 
+export function PersonCircleIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <circle cx="8" cy="8" r="6" />
+      <circle cx="8" cy="6.5" r="2" />
+      <path d="M4 13a4.2 4.2 0 0 1 8 0" />
+    </Svg>
+  )
+}
+
+export function MonitorIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <rect x="2" y="3" width="12" height="8" rx="1.5" />
+      <path d="M6 13.5h4" />
+    </Svg>
+  )
+}
+
 export function LeafIcon(p: IconProps) {
   return (
     <Svg {...p}>

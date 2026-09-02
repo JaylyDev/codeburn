@@ -565,6 +565,7 @@ code { font-family: var(--font-mono); }
 }
 .hero-note-warn { color: var(--sev-critical-ink); }
 .hero-note-saved { color: var(--sev-normal-ink); }
+.hero-note-muted { color: var(--label-2); }
 .hero-calls { font-size: 11px; color: var(--label-2); }
 .hero-sessions { font-size: 10.5px; color: var(--label-3); }
 
@@ -734,6 +735,96 @@ code { font-family: var(--font-mono); }
   cursor: pointer;
 }
 .calendar-done.is-idle { background: var(--fill-18); color: var(--label-2); }
+
+
+/* Scope: Local / Combined, with the Claude config picker beside it when there is more than
+   one config to choose from. Shares the segment styling with the period strip. */
+.scope-wrap { display: flex; align-items: center; gap: 8px; padding: 0 12px 10px; }
+.scope-tabs {
+  display: flex;
+  flex: 1;
+  gap: 1px;
+  padding: 2px;
+  border-radius: var(--radius-track);
+  background: var(--fill-08);
+}
+.config-picker { position: relative; flex: 0 0 auto; }
+.config-button {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 118px;
+  height: 26px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--radius-track);
+  background: var(--fill-08);
+  color: var(--label);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.config-label {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.config-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  min-width: 160px;
+  padding: 4px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--control-border);
+  background: var(--menu-bg);
+  box-shadow: var(--menu-shadow);
+}
+.config-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: var(--radius-util);
+  background: transparent;
+  color: var(--label);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+.config-item:hover { background: var(--brand-accent); color: #fff; }
+.config-check { display: inline-flex; width: 10px; flex: 0 0 10px; }
+.config-sep { height: 1px; margin: 4px 0; background: var(--separator); }
+
+/* Combined-scope device list under the hero. */
+.device-breakdown { display: flex; flex-direction: column; gap: 3px; margin-top: 6px; }
+.device-row { display: flex; align-items: center; gap: 6px; }
+.device-dot {
+  flex: 0 0 5px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--label-2);
+}
+.device-dot.is-error { background: var(--sev-critical-ink); }
+.device-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--label);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.device-cost { font-size: 10.5px; color: var(--label-2); font-variant-numeric: tabular-nums; }
+.device-tokens { font-size: 10px; color: var(--label-3); font-variant-numeric: tabular-nums; }
 
 /* ---- insight area -------------------------------------------------------------- */
 

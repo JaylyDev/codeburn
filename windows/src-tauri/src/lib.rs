@@ -639,11 +639,20 @@ mod commands {
         period: String,
         provider: String,
         days: Vec<String>,
+        scope: String,
+        claude_config_source: Option<String>,
         include_optimize: bool,
         state: State<'_, AppState>,
     ) -> Result<Value, String> {
         let cli = state.cli.lock().map_err(|e| e.to_string())?.clone();
-        cli.fetch_menubar_payload(&period, &provider, &days, include_optimize)
+        cli.fetch_menubar_payload(
+            &period,
+            &provider,
+            &days,
+            &scope,
+            claude_config_source.as_deref(),
+            include_optimize,
+        )
             .await
             .map_err(|e| e.to_string())
     }
