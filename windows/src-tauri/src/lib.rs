@@ -5,6 +5,7 @@ mod dock;
 mod fx;
 mod plan;
 mod refresh;
+mod session;
 mod settings;
 /// The spend-in-the-tray badge is a second tray icon, which only the Tauri tray backend
 /// provides; Linux runs its own SNI tray (`tray_linux`) and has no equivalent, so the
@@ -78,6 +79,10 @@ pub fn run() {
 
             #[cfg(all(debug_assertions, target_os = "windows"))]
             warn_if_window_station_hidden();
+
+            // Session lock, display sleep and wake, which the background refresh loop reads
+            // before it spends a Node process nobody could see the result of.
+            session::start(app.handle());
 
             #[cfg(not(target_os = "linux"))]
             {
@@ -586,6 +591,9 @@ fn show_popover(app: &AppHandle, anchor: Option<(i32, i32)>) {
     let _ = window.show();
     let _ = window.unminimize();
     position_popover(&window, anchor);
+    // A popover on screen is proof the session is unlocked and the displays are on, so a
+    // notification this process never received cannot latch the refresh loop off.
+    session::note_attended();
     let _ = window.set_focus();
     let _ = window.emit("codeburn://shown", ());
 }

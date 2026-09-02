@@ -11,6 +11,10 @@ export type RefreshPlan = {
   /// `null` is Manual: nothing spawns on a timer, so the loop stops until the setting or the
   /// popover changes.
   intervalMs: number | null
+  /// True when this tick should re-arm the timer and fetch nothing: the session is locked
+  /// or the displays are off, so nobody could see the answer.
+  skip: boolean
+  skipReason: string | null
   power: { onBattery: boolean; batterySaver: boolean }
 }
 

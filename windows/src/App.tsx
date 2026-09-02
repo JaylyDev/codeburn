@@ -145,6 +145,10 @@ export function App() {
   const selection = useRef(current)
   selection.current = current
 
+  // The wake listener is armed once and must still see the cadence as it stands then.
+  const cadence = useRef(settings.usageRefreshSeconds)
+  cadence.current = settings.usageRefreshSeconds
+
   const menubarKey = menubarSelection(settings)
   const menubarRef = useRef(menubarKey)
   menubarRef.current = menubarKey
@@ -240,8 +244,10 @@ export function App() {
   // The background loop. Rust is asked on every tick how long to wait for the next one,
   // because the answer follows the machine: Auto is 30 s with the popover open, 120 s hidden,
   // and backs off on battery and further in battery saver, all of which can change under a
-  // timer that has already been armed. Manual answers null and the loop stops; usage then
-  // refreshes only when the popover opens or Refresh is pressed.
+  // timer that has already been armed. The same answer says whether this tick is worth
+  // spawning at all: a locked session or sleeping displays get the timer back and no CLI
+  // run. Manual answers null and the loop stops; usage then refreshes only when the popover
+  // opens, on wake, or when Refresh is pressed.
   useEffect(() => {
     if (!cliReady) return
     let stopped = false
@@ -254,7 +260,7 @@ export function App() {
         return
       }
       if (stopped) return
-      if (refresh) {
+      if (refresh && !plan.skip) {
         if (popoverVisible) refreshAll({ includeOptimize: true, showOverlay: false })
         // Hidden, the tray figure is the only thing anyone can see, so only its key is
         // refreshed and the optimize pass is skipped.
@@ -294,6 +300,13 @@ export function App() {
       }
     })
     const unlistenHidden = listen('codeburn://hidden', () => setPopoverVisible(false))
+    // Waking, unlocking or the screens coming back: whatever is on the tray is as old as the
+    // sleep was long. Manual is the one mode that stays silent, as it is on the mac, where
+    // the wake path passes forcePayload only outside Manual.
+    const unlistenWake = listen('codeburn://wake', () => {
+      if (cadence.current === 0) return
+      refreshAll({ includeOptimize: false, showOverlay: false })
+    })
     const unlistenTheme = listen('codeburn://toggle-theme', () => toggleTheme())
     const unlistenBudget = listen<Budgets>('codeburn://budget-changed', event => {
       if (event.payload) setBudgets(event.payload)
@@ -305,6 +318,7 @@ export function App() {
       unlistenRefresh.then(fn => fn())
       unlistenShown.then(fn => fn())
       unlistenHidden.then(fn => fn())
+      unlistenWake.then(fn => fn())
       unlistenTheme.then(fn => fn())
       unlistenBudget.then(fn => fn())
       unlistenCurrency.then(fn => fn())

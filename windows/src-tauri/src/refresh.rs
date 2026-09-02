@@ -89,25 +89,46 @@ pub fn power_state() -> PowerState {
     PowerState::default()
 }
 
-/// What the page's refresh loop is told on every tick: how long to wait for the next one.
+/// What the page's refresh loop is told on every tick: how long to wait for the next one,
+/// and whether this one is worth spawning at all.
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RefreshPlan {
     /// `null` in Manual mode, which stops the loop until the setting or the popover changes.
     pub interval_ms: Option<u64>,
     pub power: PowerState,
+    /// True when this tick should re-arm the timer without fetching anything.
+    pub skip: bool,
+    /// Why, for the log and for nothing else.
+    pub skip_reason: Option<&'static str>,
 }
 
 pub fn plan(mode: i64, popover_open: bool) -> RefreshPlan {
     let power = power_state();
+    // The timer keeps running while the machine is unattended: it costs nothing, and the
+    // first tick after the screens come back then finds fresh numbers without waiting for a
+    // notification that may never have been delivered.
+    let skip_reason = if popover_open {
+        None
+    } else {
+        crate::session::state().reason()
+    };
     let plan = RefreshPlan {
         interval_ms: interval_secs(mode, popover_open, power).map(|secs| secs * 1000),
         power,
+        skip: skip_reason.is_some(),
+        skip_reason,
     };
     #[cfg(debug_assertions)]
     eprintln!(
-        "codeburn: refresh plan mode={mode} popover={popover_open} battery={} saver={} interval={:?}",
-        power.on_battery, power.battery_saver, plan.interval_ms
+        "codeburn: refresh plan mode={mode} popover={popover_open} battery={} saver={} interval={:?} {}",
+        power.on_battery,
+        power.battery_saver,
+        plan.interval_ms,
+        match plan.skip_reason {
+            Some(reason) => format!("skipped ({reason})"),
+            None => "taken".to_string(),
+        }
     );
     plan
 }
