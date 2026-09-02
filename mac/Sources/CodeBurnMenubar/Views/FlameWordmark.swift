@@ -10,7 +10,7 @@ struct FlameWordmark: View {
     // `flameShift 3s ease infinite` (keyframes 0%/100% at position 0%, 50% at
     // 100%). Here that's a 3x-wide gradient sweeping from its left edge aligned
     // with the text to its right edge aligned with the text (a 2x-width shift)
-    // and back — a 1.5s ease-in-out each way, autoreversing.
+    // and back, slowed to a 4s ease-in-out each way, autoreversing.
     private static let flameColors: [Color] = [
         Color(red: 0xFF / 255.0, green: 0x6A / 255.0, blue: 0x00 / 255.0), // #ff6a00
         Color(red: 0xFF / 255.0, green: 0xDA / 255.0, blue: 0x44 / 255.0), // #ffda44
@@ -27,8 +27,12 @@ struct FlameWordmark: View {
     }
 
     var body: some View {
+        // The letters keep a static flame fill of their own, so the sweep can only
+        // ever brighten them; a mask that is a frame late no longer blanks the name.
         wordmark
-            .hidden()
+            .foregroundStyle(
+                LinearGradient(colors: Self.flameColors, startPoint: .leading, endPoint: .trailing)
+            )
             .overlay {
                 GeometryReader { geo in
                     LinearGradient(
@@ -41,7 +45,7 @@ struct FlameWordmark: View {
                     .animation(
                         reduceMotion || !store.menuPopoverVisible
                             ? nil
-                            : .easeInOut(duration: 1.5).repeatForever(autoreverses: true),
+                            : .easeInOut(duration: 4).repeatForever(autoreverses: true),
                         value: sweeping
                     )
                 }
