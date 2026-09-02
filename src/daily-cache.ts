@@ -27,7 +27,7 @@ import type { DateRange, ProjectSummary } from './types.js'
 // again here. 26 is the first free number on main's ladder — and it is load
 // bearing beyond the collision: the branch's own validators already hold
 // daily-cache.v21.json files whose copilot slices were carried stale by the
-// bug PENDING_REDERIVE_PROVIDERS fixes below, and only a number those files
+// bug PENDING_REDERIVE_PROVIDER_VERSIONS fixes below, and only a number those files
 // cannot claim gets them re-derived. isMigratableCache/adoptOlderDailyCaches
 // carry a same-or-newer version forward as FINALIZED without re-deriving it,
 // so a number can never mean two accountings. (feat/core-extraction also sits
@@ -174,7 +174,10 @@ import type { DateRange, ProjectSummary } from './types.js'
 // but optimize added reasoning again. Re-derive so report matches the live parse.
 // v29: #1118 OrcaRouter route pricing (fusion aliases + peel; auto stays unpriced).
 // v28 on main already shipped #1115.
-export const DAILY_CACHE_VERSION = 29
+// v30: Hermes cost provenance. Subscription-included sessions stay $0,
+// explicit estimates retain their status, and surviving Hermes sources replace
+// v29 slices produced by the old API-equivalent fallback.
+export const DAILY_CACHE_VERSION = 30
 const MIN_SUPPORTED_VERSION = 28
 
 /// Providers whose per-day CALL COUNT means something different at
@@ -197,7 +200,16 @@ const MIN_SUPPORTED_VERSION = 28
 /// for the (day, provider). A day whose copilot sources are gone yields no
 /// fresh slice at all, so it still carries forward whole — the #1033 bar is
 /// untouched, in both directions, and every other provider keeps the guard.
-const PENDING_REDERIVE_PROVIDERS: readonly string[] = ['copilot']
+const PENDING_REDERIVE_PROVIDER_VERSIONS: Readonly<Record<string, number>> = {
+  copilot: 26,
+  hermes: 30,
+}
+
+function providersPendingRederiveFrom(fromVersion: number): string[] {
+  return Object.entries(PENDING_REDERIVE_PROVIDER_VERSIONS)
+    .filter(([, contractVersion]) => fromVersion < contractVersion)
+    .map(([provider]) => provider)
+}
 // Version-suffixed so different binaries each own a distinct file and never
 // clobber an incompatible schema. Bumping the version mints a fresh filename;
 // adoptOlderDailyCaches then unions days out of every previous file (including
@@ -299,7 +311,7 @@ export type DailyCache = {
   watermarkTrusted?: boolean
   /// Providers still owed the one re-derivation that a migration from a
   /// pre-`DAILY_CACHE_VERSION` cache entitles them to, despite a shrinking
-  /// call count (see PENDING_REDERIVE_PROVIDERS). Set by the migration,
+  /// call count (see PENDING_REDERIVE_PROVIDER_VERSIONS). Set by the migration,
   /// cleared by the first COMPLETE re-derive — persisted rather than computed
   /// so a partial parse in between does not silently spend the entitlement.
   pendingRederive?: string[]
@@ -453,7 +465,10 @@ function migrateDays(days: Record<string, unknown>[]): DailyEntry[] {
 /// an unspent entitlement out of the parsed file so a same-version reload does
 /// not drop it.
 function pendingRederiveFor(fromVersion: number, parsed: unknown): string[] | undefined {
-  if (fromVersion < DAILY_CACHE_VERSION) return [...PENDING_REDERIVE_PROVIDERS]
+  if (fromVersion < DAILY_CACHE_VERSION) {
+    const pending = providersPendingRederiveFrom(fromVersion)
+    return pending.length > 0 ? pending : undefined
+  }
   const raw = (parsed as { pendingRederive?: unknown } | null)?.pendingRederive
   if (!Array.isArray(raw)) return undefined
   const kept = raw.filter((p): p is string => typeof p === 'string')
@@ -578,9 +593,17 @@ async function adoptOlderDailyCaches(): Promise<DailyCache> {
     days,
     // Anything adopted out of an OLDER file was derived under an older
     // accounting, so the providers whose call counts changed meaning get their
-    // one guarded-shrink-exempt re-derivation (see PENDING_REDERIVE_PROVIDERS).
-    pendingRederive: base.pendingRederive
-      ?? (rest.some(c => c.parsed.version < DAILY_CACHE_VERSION) ? [...PENDING_REDERIVE_PROVIDERS] : undefined),
+    // one guarded-shrink-exempt re-derivation (see
+    // PENDING_REDERIVE_PROVIDER_VERSIONS).
+    pendingRederive: (() => {
+      const pending = new Set(base.pendingRederive ?? [])
+      for (const candidate of rest) {
+        for (const provider of providersPendingRederiveFrom(candidate.parsed.version)) {
+          pending.add(provider)
+        }
+      }
+      return pending.size > 0 ? [...pending] : undefined
+    })(),
     // An untrusted base means nothing here was derived under the current
     // accounting: leave complete unset so the next hydration re-derives every
     // day whose sources survive (the merge keeps the rest).
@@ -1091,7 +1114,7 @@ export function mergeDayEntries(
   guardPartialSurvival = false,
   /// Providers whose baseline slices were recorded under an accounting where a
   /// call meant something else, so a shrink is not evidence of source loss for
-  /// this one re-derivation (see PENDING_REDERIVE_PROVIDERS). Only consulted
+  /// this one re-derivation (see PENDING_REDERIVE_PROVIDER_VERSIONS). Only consulted
   /// where the fresh parse actually produced a slice for the (date, provider);
   /// a slice it could not produce at all is carried by the branch above,
   /// exactly as before.

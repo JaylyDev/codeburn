@@ -388,30 +388,29 @@ function AppMain() {
   }, [])
 
   useEffect(() => {
-    if (!overview.data) return
+    // Only the all-provider payload is authoritative for the picker. A scoped
+    // payload contains just the selected provider; merging it forever also
+    // leaked idle providers across period changes.
+    if (!overview.data || provider !== 'all') return
     const details = overview.data.current.providerDetails
     // Prefer providerDetails (internal id + display label); fall back to the
-    // providers map keys (lowercased display names) for older CLIs. The CLI
-    // only emits detected providers, so keep every entry (including ones with
-    // no spend this period) and sort by cost so zero-cost ones sit at the
-    // bottom of the picker.
+    // providers map keys (lowercased display names) for older CLIs. Explicit
+    // `hasUsage` preserves subscription-backed zero-cost activity while idle
+    // discovery rows stay out of the selected-period picker.
     const found = details
       ? [...details]
+          .filter(entry => entry.hasUsage ?? entry.cost > 0)
           .sort((a, b) => b.cost - a.cost)
           .map(entry => ({ id: entry.id, label: entry.label }))
       : Object.entries(overview.data.current.providers)
           // Fallback map keys are lowercased display names; ones with spaces
           // ("grok build") cannot round-trip as --provider, so exclude them
           // rather than offer a filter that is guaranteed to error.
-          .filter(([key]) => /^[a-z0-9-]+$/.test(key))
+          .filter(([key, cost]) => cost > 0 && /^[a-z0-9-]+$/.test(key))
           .sort(([, a], [, b]) => b - a)
           .map(([key]) => ({ id: key, label: providerName(key) }))
-    setDetectedProviders(current => {
-      const next = [...current]
-      for (const item of found) if (!next.some(entry => entry.id === item.id)) next.push(item)
-      return next.length === current.length ? current : next
-    })
-  }, [overview.data])
+    setDetectedProviders(found)
+  }, [overview.data, provider])
 
   useEffect(() => {
     const currency = overview.data?.currency

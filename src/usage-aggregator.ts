@@ -585,10 +585,14 @@ export async function buildDurablePeriod(periodInfo: PeriodInfo, opts: Aggregate
         : aggregateProjectsIntoDays(fp(await parseAllSessions(todayRange, 'all'))).filter(d => d.date === todayStr)
     }
   } else {
-    // Provider-filtered: today's all-provider parse feeds the union (sliced
-    // below); the provider-scoped parse feeds the detail/enrichment fields.
-    todayAllDays = aggregateProjectsIntoDays(fp(await parseAllSessions(todayRange, 'all'))).filter(d => d.date === todayStr)
+    // Provider-filtered: one provider-scoped parse feeds both today's union
+    // slice and the detail/enrichment fields. Scanning every unrelated provider
+    // here made a first hover deserialize the entire multi-gigabyte cache even
+    // though the returned payload contains only `pf`.
     const rawProv = fp(await parseAllSessions(isTodayOnly ? todayRange : periodInfo.range, pf))
+    todayAllDays = rangeEndStr >= todayStr
+      ? aggregateProjectsIntoDays(filterProjectsByDays(rawProv, new Set([todayStr]))).filter(d => d.date === todayStr)
+      : []
     liveProjects = daysSelection && !isTodayOnly ? filterProjectsByDays(rawProv, daysSelection.days) : rawProv
     scanRange = isTodayOnly ? todayRange : periodInfo.range
   }

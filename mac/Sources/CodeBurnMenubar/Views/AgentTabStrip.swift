@@ -16,6 +16,7 @@ struct AgentTabStrip: View {
     @State private var stripViewportWidth: CGFloat = 0
     @State private var stripContentWidth: CGFloat = 0
     @State private var scrollWheelMonitor: Any?
+    @State private var viewportAnchor: ProviderFilter?
 
     var body: some View {
         GeometryReader { viewportGeo in
@@ -23,7 +24,7 @@ struct AgentTabStrip: View {
                 HStack(spacing: 4) {
                     if isOverflowing {
                         Button {
-                            selectAdjacentProvider(direction: -1, proxy: proxy)
+                            pageProviderStrip(direction: -1, proxy: proxy)
                         } label: {
                             Image(systemName: "chevron.left")
                                 .font(.system(size: 10, weight: .semibold))
@@ -44,6 +45,7 @@ struct AgentTabStrip: View {
                                     isActive: store.selectedProvider == filter,
                                     quota: store.quotaSummary(for: filter)
                                 ) {
+                                    viewportAnchor = filter
                                     store.switchTo(provider: filter)
                                     withAnimation(.easeInOut(duration: 0.18)) {
                                         proxy.scrollTo(filter.id, anchor: .center)
@@ -73,7 +75,7 @@ struct AgentTabStrip: View {
 
                     if isOverflowing {
                         Button {
-                            selectAdjacentProvider(direction: 1, proxy: proxy)
+                            pageProviderStrip(direction: 1, proxy: proxy)
                         } label: {
                             Image(systemName: "chevron.right")
                                 .font(.system(size: 10, weight: .semibold))
@@ -88,16 +90,30 @@ struct AgentTabStrip: View {
                 .onAppear {
                     stripViewportWidth = viewportGeo.size.width
                     installScrollWheelMonitorIfNeeded()
+                    viewportAnchor = pagingState.viewportAnchor
                     withAnimation(.easeInOut(duration: 0.18)) {
-                        proxy.scrollTo(store.selectedProvider.id, anchor: .center)
+                        if let viewportAnchor {
+                            proxy.scrollTo(viewportAnchor.id, anchor: .center)
+                        }
                     }
                 }
                 .onChange(of: viewportGeo.size.width) { _, newWidth in
                     stripViewportWidth = newWidth
                 }
                 .onChange(of: store.selectedProvider) { _, newProvider in
+                    viewportAnchor = visibleFilters.contains(newProvider) ? newProvider : pagingState.viewportAnchor
                     withAnimation(.easeInOut(duration: 0.18)) {
-                        proxy.scrollTo(newProvider.id, anchor: .center)
+                        if let viewportAnchor {
+                            proxy.scrollTo(viewportAnchor.id, anchor: .center)
+                        }
+                    }
+                }
+                .onChange(of: visibleFilters) { _, _ in
+                    viewportAnchor = pagingState.viewportAnchor
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        if let viewportAnchor {
+                            proxy.scrollTo(viewportAnchor.id, anchor: .center)
+                        }
                     }
                 }
                 .onDisappear {
@@ -149,19 +165,22 @@ struct AgentTabStrip: View {
         }
     }
 
-    private var currentFilterIndex: Int {
-        visibleFilters.firstIndex(of: store.selectedProvider) ?? 0
+    private var pagingState: ProviderStripPagingState {
+        ProviderStripPagingState(
+            filters: visibleFilters,
+            selectedProvider: store.selectedProvider,
+            viewportAnchor: viewportAnchor
+        )
     }
 
-    private var canMoveBackward: Bool { currentFilterIndex > 0 }
-    private var canMoveForward: Bool { currentFilterIndex < visibleFilters.count - 1 }
+    private var canMoveBackward: Bool { pagingState.canMoveBackward }
+    private var canMoveForward: Bool { pagingState.canMoveForward }
     private var isOverflowing: Bool { stripContentWidth > (stripViewportWidth - 30) }
 
-    private func selectAdjacentProvider(direction: Int, proxy: ScrollViewProxy) {
-        guard !visibleFilters.isEmpty else { return }
-        let targetIndex = min(max(currentFilterIndex + direction, 0), visibleFilters.count - 1)
-        let target = visibleFilters[targetIndex]
-        store.switchTo(provider: target)
+    private func pageProviderStrip(direction: Int, proxy: ScrollViewProxy) {
+        var state = pagingState
+        guard let target = state.move(direction: direction) else { return }
+        viewportAnchor = target
         withAnimation(.easeInOut(duration: 0.18)) {
             proxy.scrollTo(target.id, anchor: .center)
         }
@@ -410,38 +429,21 @@ private struct QuotaDetailPopover: View {
 
     private func terminalFailureCard(reason: String?) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(reconnectTitle)
+            Text(reconnectPresentation.title)
                 .font(.system(size: 11.5, weight: .semibold))
                 .foregroundStyle(.red)
-            Text(reason ?? defaultReconnectReason)
+            Text(reason ?? reconnectPresentation.defaultReason)
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
-            Text(reconnectInstruction)
+            Text(reconnectPresentation.instruction)
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
         }
     }
 
-    private var reconnectTitle: String {
-        switch quota.providerFilter {
-        case .codex:  return "Reconnect Codex"
-        default:      return "Reconnect Claude"
-        }
-    }
-
-    private var defaultReconnectReason: String {
-        switch quota.providerFilter {
-        case .codex:  return "Refresh token rejected by OpenAI."
-        default:      return "Refresh token rejected by Anthropic."
-        }
-    }
-
-    private var reconnectInstruction: String {
-        switch quota.providerFilter {
-        case .codex:  return "Run `codex login` in your terminal, then click Reconnect."
-        default:      return "Open Claude Code in your terminal and type `/login`, then click Reconnect."
-        }
+    private var reconnectPresentation: ProviderReconnectPresentation {
+        ProviderReconnectPresentation(provider: quota.providerFilter)
     }
 }
 

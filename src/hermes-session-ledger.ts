@@ -22,10 +22,10 @@ import type { CachedCall, ProviderSection } from './session-cache.js'
 //   dropped: sealed days are not re-read. This slice does not bump
 //   DAILY_CACHE_VERSION (one cold re-parse for every user) to recover history.
 
-export const HERMES_SESSION_LEDGER_FILENAME = 'hermes-session-ledger.v1.json'
-export const HERMES_SESSION_LEDGER_VERSION = 1 as const
+export const HERMES_SESSION_LEDGER_FILENAME = 'hermes-session-ledger.v2.json'
+export const HERMES_SESSION_LEDGER_VERSION = 2 as const
 
-export type HermesCostBasis = 'actual' | 'estimated' | 'calculated'
+export type HermesCostBasis = 'actual' | 'estimated' | 'calculated' | 'included'
 
 export type HermesTokenTotals = {
   inputTokens: number
@@ -299,7 +299,7 @@ function isNum(v: unknown): v is number {
 }
 
 function isCostBasis(v: unknown): v is HermesCostBasis {
-  return v === 'actual' || v === 'estimated' || v === 'calculated'
+  return v === 'actual' || v === 'estimated' || v === 'calculated' || v === 'included'
 }
 
 function validateTokens(o: Record<string, unknown>): o is Record<string, unknown> & HermesTokenTotals {

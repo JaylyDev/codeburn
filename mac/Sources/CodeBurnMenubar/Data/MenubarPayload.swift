@@ -317,9 +317,9 @@ struct ProviderDetail: Codable, Sendable {
         id = try c.decode(String.self, forKey: .id)
         label = try c.decode(String.self, forKey: .label)
         cost = try c.decode(Double.self, forKey: .cost)
-        // Older CLIs emitted providerDetails without calls/hasUsage. When calls
-        // exists, derive activity from calls/cost; with neither signal, keep the
-        // detected provider visible rather than hiding valid $0 subscriptions.
+        // Older CLIs emitted providerDetails without calls/hasUsage. Those
+        // payloads cannot distinguish period activity from a provider merely
+        // discovered on disk, so cost is the only safe activity signal.
         let decodedCalls = try c.decodeIfPresent(Int.self, forKey: .calls)
         calls = decodedCalls ?? 0
         if let decodedUsage = try c.decodeIfPresent(Bool.self, forKey: .hasUsage) {
@@ -327,7 +327,7 @@ struct ProviderDetail: Codable, Sendable {
         } else if decodedCalls != nil {
             hasUsage = cost > 0 || calls > 0
         } else {
-            hasUsage = true
+            hasUsage = cost > 0
         }
     }
 }
@@ -342,7 +342,9 @@ enum ProviderVisibility {
                 .filter(\.hasUsage)
                 .flatMap { [$0.id.lowercased(), $0.label.lowercased()] })
         }
-        return Set(legacyProviders.keys.map { $0.lowercased() })
+        return Set(legacyProviders.compactMap { key, cost in
+            cost > 0 ? key.lowercased() : nil
+        })
     }
 }
 

@@ -1,10 +1,11 @@
-import { mkdir, mkdtemp, rm } from 'fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import {
   applyHermesSnapshot,
+  HERMES_SESSION_LEDGER_VERSION,
   hermesBaselineKey,
   hermesObservationKey,
   hermesSessionLedgerPath,
@@ -237,10 +238,36 @@ describe('hermes session ledger unit', () => {
     await mkdir(hermesSessionLedgerPath())
     let caught: unknown
     try {
-      await persistHermesSessionLedger({ version: 1, cursors: {} })
+      await persistHermesSessionLedger({ version: HERMES_SESSION_LEDGER_VERSION, cursors: {} })
     } catch (err) {
       caught = err
     }
     expect(isHermesLedgerPublicationError(caught)).toBe(true)
+  })
+
+  it('does not adopt a v1 ledger after the cost-provenance contract changes', async () => {
+    await writeFile(join(cacheDir, 'hermes-session-ledger.v1.json'), JSON.stringify({
+      version: 1,
+      cursors: {
+        default: {
+          corrupt: {
+            profile: 'default',
+            sessionId: 'corrupt',
+            lastSeen: {
+              inputTokens: 1,
+              outputTokens: 0,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+              reasoningTokens: 0,
+              costUSD: 4603,
+              costBasis: 'calculated',
+            },
+            observations: [],
+          },
+        },
+      },
+    }))
+
+    expect(loadHermesSessionLedger().cursors).toEqual({})
   })
 })

@@ -4,6 +4,11 @@ import Testing
 
 @Suite("Agent tab provider visibility")
 struct AgentTabProviderVisibilityTests {
+    @Test func clineFilterRecognizesBothNativeAndCLIProviderIds() {
+        #expect(ProviderFilter.cline.providerKeys.contains("cline"))
+        #expect(ProviderFilter.cline.providerKeys.contains("cline-cli"))
+    }
+
     @Test("zero-cost providers with usage remain active while idle providers stay hidden")
     func zeroCostProvidersWithUsageRemainActive() {
         let details = [
@@ -22,28 +27,33 @@ struct AgentTabProviderVisibilityTests {
         #expect(!keys.contains("claude"))
     }
 
-    @Test("legacy payloads keep detected providers visible when activity is unknowable")
-    func legacyDetectedProviderFallback() {
+    @Test("legacy payloads show only providers with period spend")
+    func legacyProviderCostFallback() {
         let keys = ProviderVisibility.activeKeys(
             providerDetails: [],
             legacyProviders: ["codex": 3.25, "hermes agent": 0]
         )
 
-        #expect(keys == ["codex", "hermes agent"])
+        #expect(keys == ["codex"])
     }
 
-    @Test("legacy provider details without activity fields fail open, while calls remain authoritative")
+    @Test("legacy provider details require a positive cost or call signal")
     func legacyProviderDetailDecoding() throws {
         let noSignal = try JSONDecoder().decode(
             ProviderDetail.self,
             from: Data(#"{"id":"hermes","label":"Hermes Agent","cost":0}"#.utf8)
+        )
+        let positiveLegacyCost = try JSONDecoder().decode(
+            ProviderDetail.self,
+            from: Data(#"{"id":"codex","label":"Codex","cost":1.25}"#.utf8)
         )
         let explicitIdleCalls = try JSONDecoder().decode(
             ProviderDetail.self,
             from: Data(#"{"id":"hermes","label":"Hermes Agent","cost":0,"calls":0}"#.utf8)
         )
 
-        #expect(noSignal.hasUsage)
+        #expect(!noSignal.hasUsage)
+        #expect(positiveLegacyCost.hasUsage)
         #expect(!explicitIdleCalls.hasUsage)
     }
 }
