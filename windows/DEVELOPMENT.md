@@ -162,6 +162,12 @@ npm run tauri build
 - **FX fetches**: Frankfurter response is parsed as JSON and the rate is clamped to
   `[0.0001, 1_000_000]` before it touches displayed numbers. Stale cache preferred over poisoned
   fresh data.
+- **Update check**: the GitHub releases request is HTTPS-only (redirects included), carries a
+  30 s timeout and a response cap, and runs in Rust, so the webview never reaches
+  api.github.com and the CSP does not have to let it. Nothing is downloaded or executed
+  here: `codeburn menubar --force` does the install, which is what verifies the sha256.
+  Subprocess stderr is capped at 64 KB and scrubbed of API keys, JWTs and bearer tokens
+  before any of it is shown.
 - **CSP**: `connect-src` restricted to `self`, `ipc:`, and `https://api.frankfurter.app`. No
   inline scripts.
 
@@ -180,6 +186,26 @@ npm run tauri build
   `%SystemRoot%\System32\msiexec.exe /i <msi> /passive /norestart` and launches the exe named by
   the product's Uninstall registry key. Renaming the bundle or the MSI asset breaks that lookup —
   `WINDOWS_RELEASE` and `WINDOWS_PRODUCT_NAME` in the installer have to move with it.
+
+## Updates
+
+`src-tauri/src/update.rs` is the port of `mac/.../Data/UpdateChecker.swift`.
+
+- Every two days it reads the releases API and looks for the newest `windows-v*` release
+  carrying both a `CodeBurn.Menubar_<version>_x64_en-US.msi` and its `.sha256`, and for the
+  newest CLI release, whose tags are a bare `v*`. The answer is cached in
+  `%LOCALAPPDATA%\codeburn-menubar\update.json`, so a relaunch inside the interval costs no
+  request and a failed check keeps whatever the cache held.
+- The surfaces are the header update badge, the CLI update banner under the footer, and
+  Check for Updates in the tray menu and in About. The tray item opens About on the
+  `about#check` anchor, which is where the up to date / update available / check failed
+  result is shown, and where the button that installs it lives.
+- One click updates both: `npm install -g codeburn@latest --force` through the npm beside the
+  launcher, then `codeburn menubar --force`. Each stage gets 120 s and is killed past it.
+  `MIN_CLI_VERSION_FOR_UPDATE` is **0.9.21**, the first CLI whose `menubar` can install a
+  Windows app at all; an older one is refused with the manual command instead.
+- Renaming the MSI asset breaks the version lookup here as well as in the installer:
+  `MSI_PREFIX` / `MSI_SUFFIX` have to move with `WINDOWS_RELEASE`.
 
 ## Pending work
 
