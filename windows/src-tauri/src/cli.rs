@@ -11,13 +11,81 @@ use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
 /// Hard bounds mirror the macOS CodeburnCLI / DataClient design. A malicious or stuck CLI
-/// cannot pin the Tauri process: stdout is capped, stderr is bounded, total wall time is
-/// 60s. A hostile CODEBURN_BIN is rejected before any shell-resembling path is taken.
+/// cannot pin the Tauri process: stdout is capped, stderr is bounded, and a child that stops
+/// talking is reaped. A hostile CODEBURN_BIN is rejected before any shell-resembling path is
+/// taken.
 const MAX_PAYLOAD_BYTES: usize = 20 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 256 * 1024;
-const FETCH_TIMEOUT_SECS: u64 = 60;
-const VERSION_TIMEOUT_SECS: u64 = 20;
-const QUOTA_TIMEOUT_SECS: u64 = 45;
+
+/// The watchdog, ported from `mac/.../Data/CLIWatchdog.swift`. What is bounded is SILENCE,
+/// not runtime: every byte the child writes on stdout or stderr restarts the clock. Read
+/// spawns set `CODEBURN_PROGRESS=1`, under which the CLI's parser heartbeats every 10 s for
+/// the whole of a parse (`PROGRESS_KEEPALIVE_MS` in `src/parser.ts`), so a legitimately slow
+/// cold parse of a large corpus is never killed while a genuinely wedged child still is.
+/// A flat wall-clock timeout could only ever be one of those two things.
+///
+/// Silence a live child cannot produce: 4.5x the CLI's keepalive cadence.
+const SILENCE_SECS: u64 = 45;
+/// Until one payload has come back, the on-disk session cache may be empty and a full
+/// hydration has genuinely silent stretches before the first keepalive is armed. Finite on
+/// purpose: a child that never emits a byte still dies here, it just gets the cold budget to
+/// prove itself first.
+const COLD_SILENCE_SECS: u64 = 10 * 60;
+/// Backstop: a livelocked child that chatters forever without finishing is still reaped.
+const CEILING_SECS: u64 = 15 * 60;
+/// A stop request is asked for first, so the CLI can unlink its own refresh lock; only a
+/// child that ignores it is killed.
+const KILL_GRACE_SECS: u64 = 5;
+/// A `--version` probe that says nothing for this long is not slow, it is broken, and the
+/// setup screen is waiting on it.
+const VERSION_SILENCE_SECS: u64 = 20;
+
+/// Wire marker for the CLI's scan-progress lines (`PROGRESS_LINE_PREFIX`, `src/parser.ts`).
+/// They share stderr with real diagnostics, so they must never become the error message.
+const PROGRESS_LINE_PREFIX: &str = "CODEBURN_PROGRESS ";
+
+/// Set once a payload has come back, which is what lifts the cold silence budget. Process
+/// wide, as the mac's is: the corpus is the same for every window asking.
+static PAYLOAD_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The silence window for a request: the cold floor applies until this app has completed one
+/// payload, exactly as the mac floors every request admitted before its client is warm.
+fn silence_window(warm: bool) -> u64 {
+    if warm {
+        SILENCE_SECS
+    } else {
+        SILENCE_SECS.max(COLD_SILENCE_SECS)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    Wait,
+    Silent,
+    Ceiling,
+}
+
+/// Pure so the arithmetic is testable without spawning a child and waiting minutes for a
+/// real ceiling. All three arguments are seconds on one monotonic scale.
+fn verdict(since_start: f64, since_output: f64, silence_secs: f64) -> Verdict {
+    if since_output >= silence_secs {
+        return Verdict::Silent;
+    }
+    if since_start >= CEILING_SECS as f64 {
+        return Verdict::Ceiling;
+    }
+    Verdict::Wait
+}
+
+fn without_progress_lines(stderr: &str) -> String {
+    stderr
+        .lines()
+        .filter(|line| !line.starts_with(PROGRESS_LINE_PREFIX))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
 
 /// Oldest CLI this app can talk to. 0.9.9 is the first release whose
 /// `status --format menubar-json` accepts `--no-optimize`, which every quiet background
@@ -147,7 +215,7 @@ impl CodeburnCli {
             compatible: false,
             error: None,
         };
-        match self.run_capture(&["--version"], VERSION_TIMEOUT_SECS).await {
+        match self.run_capture(&["--version"], VERSION_SILENCE_SECS).await {
             Ok(out) => {
                 let version = out.trim().to_string();
                 status.found = true;
@@ -211,9 +279,13 @@ impl CodeburnCli {
             args.push("--no-optimize");
         }
 
-        let stdout = self.run_capture(&args, FETCH_TIMEOUT_SECS).await?;
+        // Cold, the session cache can be empty and a full hydration has silent stretches
+        // before the first keepalive; warm, 45 s of silence is a wedged child.
+        let warm = PAYLOAD_SEEN.load(std::sync::atomic::Ordering::Relaxed);
+        let stdout = self.run_capture(&args, silence_window(warm)).await?;
         let payload: Value =
             serde_json::from_str(&stdout).with_context(|| "CLI returned invalid JSON")?;
+        PAYLOAD_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(payload)
     }
 
@@ -228,7 +300,7 @@ impl CodeburnCli {
         let stdout = match self
             .run_capture_with_env(
                 &["quota", "--format", "json"],
-                QUOTA_TIMEOUT_SECS,
+                SILENCE_SECS,
                 &crate::settings::quota_environment(),
             )
             .await
@@ -257,14 +329,16 @@ impl CodeburnCli {
         }
     }
 
-    async fn run_capture(&self, args: &[&str], timeout_secs: u64) -> Result<String> {
-        self.run_capture_with_env(args, timeout_secs, &[]).await
+    async fn run_capture(&self, args: &[&str], silence_secs: u64) -> Result<String> {
+        self.run_capture_with_env(args, silence_secs, &[]).await
     }
 
+    /// Spawns the CLI and drains both pipes, watching for silence rather than for elapsed
+    /// time. `silence_secs` is how long the child may say nothing before it is stopped.
     async fn run_capture_with_env(
         &self,
         args: &[&str],
-        timeout_secs: u64,
+        silence_secs: u64,
         env: &[(String, String)],
     ) -> Result<String> {
         let mut full_args = self.extra_args.clone();
@@ -275,6 +349,9 @@ impl CodeburnCli {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // The heartbeat that gives a silence window its meaning: under this the CLI's
+            // parser writes a keepalive line every 10 s for the whole of a scan.
+            .env("CODEBURN_PROGRESS", "1")
             .kill_on_drop(true);
         for (name, value) in env {
             cmd.env(name, value);
@@ -282,7 +359,10 @@ impl CodeburnCli {
         #[cfg(windows)]
         {
             const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+            // Its own process group, so the stop request below reaches the child and what it
+            // spawned, and nothing else.
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
         }
         let mut child = cmd.spawn().map_err(|err| {
             anyhow!(
@@ -291,35 +371,167 @@ impl CodeburnCli {
             )
         })?;
 
-        let mut stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-        let mut stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+        let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
 
-        let stdout_task = tokio::spawn(async move {
-            let mut buf = Vec::with_capacity(64 * 1024);
-            let mut limited = (&mut stdout).take(MAX_PAYLOAD_BYTES as u64);
-            limited.read_to_end(&mut buf).await.ok();
-            buf
-        });
-        let stderr_task = tokio::spawn(async move {
-            let mut buf = Vec::with_capacity(4 * 1024);
-            let mut limited = (&mut stderr).take(MAX_STDERR_BYTES as u64);
-            limited.read_to_end(&mut buf).await.ok();
-            buf
-        });
+        // One monotonic marker shared by the two drain tasks and the watchdog below. Every
+        // byte either pipe produces restarts the clock, which is the whole point: what is
+        // bounded is silence, not work.
+        let activity = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+        let stdout_task = tokio::spawn(drain(stdout, MAX_PAYLOAD_BYTES, activity.clone()));
+        let stderr_task = tokio::spawn(drain(stderr, MAX_STDERR_BYTES, activity.clone()));
 
-        let status = timeout(Duration::from_secs(timeout_secs), child.wait())
-            .await
-            .map_err(|_| anyhow!("codeburn CLI timed out after {}s", timeout_secs))??;
+        let started = std::time::Instant::now();
+        let status = loop {
+            tokio::select! {
+                finished = child.wait() => break finished?,
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                    let quiet = activity
+                        .lock()
+                        .map(|at| at.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
+                    match verdict(started.elapsed().as_secs_f64(), quiet, silence_secs as f64) {
+                        Verdict::Wait => continue,
+                        Verdict::Silent => {
+                            stop_child(&mut child).await;
+                            bail!(
+                                "codeburn CLI produced no output for {}s and was stopped",
+                                silence_secs
+                            );
+                        }
+                        Verdict::Ceiling => {
+                            stop_child(&mut child).await;
+                            bail!(
+                                "codeburn CLI ran for {}s without finishing and was stopped",
+                                CEILING_SECS
+                            );
+                        }
+                    }
+                }
+            }
+        };
 
         let stdout_bytes = stdout_task.await.unwrap_or_default();
         let stderr_bytes = stderr_task.await.unwrap_or_default();
 
         if !status.success() {
-            let msg = String::from_utf8_lossy(&stderr_bytes);
-            bail!("codeburn CLI exited {}: {}", status, msg.trim());
+            let msg = without_progress_lines(&String::from_utf8_lossy(&stderr_bytes));
+            bail!("codeburn CLI exited {}: {}", status, msg);
         }
         Ok(String::from_utf8_lossy(&stdout_bytes).into_owned())
     }
+}
+
+/// Reads until the pipe closes, capping what is kept and touching the activity marker on
+/// every chunk. Reading in chunks rather than to the end is what makes the marker possible.
+async fn drain<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    mut pipe: R,
+    cap: usize,
+    activity: std::sync::Arc<std::sync::Mutex<std::time::Instant>>,
+) -> Vec<u8> {
+    let mut kept: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut chunk = vec![0u8; 32 * 1024];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                if let Ok(mut at) = activity.lock() {
+                    *at = std::time::Instant::now();
+                }
+                if kept.len() < cap {
+                    let room = cap - kept.len();
+                    kept.extend_from_slice(&chunk[..read.min(room)]);
+                }
+            }
+        }
+    }
+    kept
+}
+
+/// Ask, then insist. The CLI unlinks its own refresh lock when it is asked to stop
+/// (`armSignalCleanup` in `src/session-cache.ts`), so a child that can be asked is asked
+/// first and only one that ignores the request inside the grace is killed.
+async fn stop_child(child: &mut tokio::process::Child) {
+    let Some(pid) = child.id() else {
+        let _ = child.kill().await;
+        return;
+    };
+    let asked = request_stop(pid);
+    if asked {
+        if let Ok(Ok(_)) = timeout(Duration::from_secs(KILL_GRACE_SECS), child.wait()).await {
+            #[cfg(debug_assertions)]
+            eprintln!("codeburn: silent CLI child {pid} stopped on request");
+            return;
+        }
+    }
+    kill_tree(pid);
+    let _ = child.kill().await;
+    #[cfg(debug_assertions)]
+    eprintln!("codeburn: silent CLI child {pid} killed (stop request accepted: {asked})");
+}
+
+/// What this app spawns on Windows is `codeburn.cmd`, so the process that does the work is
+/// node, a generation below. Killing the handle we hold ends the shim and orphans the parse,
+/// which is the opposite of the point, and there is no process group to end in one call once
+/// the console request has been refused. `taskkill /T` is the tool Windows gives for that;
+/// the same System32-anchored spawn the PATH lookup already uses.
+#[cfg(windows)]
+fn kill_tree(pid: u32) {
+    let _ = system_command("taskkill.exe")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(windows))]
+fn kill_tree(_pid: u32) {}
+
+/// Ctrl+Break to the child's own process group, which is what a console process on Windows
+/// has instead of SIGTERM: node delivers it as SIGBREAK, which the CLI's cleanup handler
+/// runs on. The child's console has to be borrowed to send it, so a handler of our own is
+/// installed for the moment that takes, and the lock keeps two watchdogs from borrowing at
+/// once.
+///
+/// A process may own only one console, so this is refused in a debug build, which is a
+/// console subsystem app and already has one. The shipped build has none and can borrow;
+/// either way a child that is not stopped is killed, tree and all, a few seconds later.
+#[cfg(windows)]
+fn request_stop(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::BOOL;
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
+        CTRL_BREAK_EVENT,
+    };
+
+    static CONSOLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    unsafe extern "system" fn swallow(_event: u32) -> BOOL {
+        1
+    }
+
+    let Ok(_borrowed) = CONSOLE.lock() else {
+        return false;
+    };
+    unsafe {
+        if AttachConsole(pid) == 0 {
+            return false;
+        }
+        SetConsoleCtrlHandler(Some(swallow), 1);
+        let sent = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0;
+        FreeConsole();
+        SetConsoleCtrlHandler(Some(swallow), 0);
+        sent
+    }
+}
+
+/// There is no SIGTERM here without a libc dependency this app does not otherwise need, so
+/// the Linux build goes straight to the kill; the CLI's lock has its own staleness timeout
+/// for that case.
+#[cfg(not(windows))]
+fn request_stop(_pid: u32) -> bool {
+    false
 }
 
 fn spawn_error_summary(program: &str, err: &std::io::Error) -> String {
@@ -870,5 +1082,65 @@ mod tests {
         assert!(parse_version("0.9.9").unwrap() >= MIN_CLI_VERSION);
         assert!(parse_version("0.9.20").unwrap() >= MIN_CLI_VERSION);
         assert!(parse_version("0.10.0").unwrap() >= MIN_CLI_VERSION);
+    }
+
+    /// A long run that keeps talking is the normal case for a cold parse of a large corpus,
+    /// and killing it was the whole reason the flat timeout had to go.
+    #[test]
+    fn a_chatty_child_is_left_alone_however_long_it_runs() {
+        assert_eq!(
+            verdict(600.0, 1.0, SILENCE_SECS as f64),
+            Verdict::Wait,
+            "ten minutes of work with output a second ago is a healthy parse"
+        );
+    }
+
+    #[test]
+    fn a_silent_child_is_stopped_at_the_window_and_not_before() {
+        let window = SILENCE_SECS as f64;
+        assert_eq!(verdict(60.0, window - 0.5, window), Verdict::Wait);
+        assert_eq!(verdict(60.0, window, window), Verdict::Silent);
+    }
+
+    /// The backstop: a child that chatters forever without finishing is still reaped, and
+    /// silence wins when both apply, since it is the more specific diagnosis.
+    #[test]
+    fn the_ceiling_catches_a_child_that_never_finishes() {
+        let window = SILENCE_SECS as f64;
+        assert_eq!(
+            verdict(CEILING_SECS as f64 - 1.0, 1.0, window),
+            Verdict::Wait
+        );
+        assert_eq!(verdict(CEILING_SECS as f64, 1.0, window), Verdict::Ceiling);
+        assert_eq!(
+            verdict(CEILING_SECS as f64, window, window),
+            Verdict::Silent
+        );
+    }
+
+    #[test]
+    fn the_cold_budget_applies_until_one_payload_has_come_back() {
+        assert_eq!(silence_window(false), COLD_SILENCE_SECS);
+        assert_eq!(silence_window(true), SILENCE_SECS);
+        assert!(silence_window(false) > silence_window(true));
+    }
+
+    /// Progress lines share stderr with real diagnostics, and every read spawn now turns
+    /// them on, so they must never become the error a window shows.
+    #[test]
+    fn progress_heartbeats_are_not_an_error_message() {
+        let stderr = format!(
+            "{}{}\nreal failure\n{}{}\n",
+            PROGRESS_LINE_PREFIX,
+            "{\"kind\":\"keepalive\"}",
+            PROGRESS_LINE_PREFIX,
+            "{\"kind\":\"scan\"}"
+        );
+        assert_eq!(without_progress_lines(&stderr), "real failure");
+        assert_eq!(
+            without_progress_lines(&format!("{PROGRESS_LINE_PREFIX}x\n")),
+            ""
+        );
+        assert_eq!(without_progress_lines("  plain error  "), "plain error");
     }
 }

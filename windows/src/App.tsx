@@ -85,10 +85,12 @@ const STALE_MS = 60_000
 const RECOVERY_FIRST_MS = 8_000
 const RECOVERY_MAX_MS = 60_000
 const RECOVERY_ATTEMPTS = 6
-/// A fetch older than the Rust side's own 60 s timeout is an orphan, not a slow run: its
-/// in-flight mark can be cleared. A younger one is left alone so recovery never kills a
-/// fetch that is still going to answer.
-const FLIGHT_WATCHDOG_MS = 65_000
+/// A fetch this old is an orphan, not a slow run: its in-flight mark can be cleared. Rust
+/// stops a child that has gone quiet for 45 s, so anything still running past two minutes is
+/// either a genuinely large first parse, which will answer, or a promise lost across sleep,
+/// which will not. A younger mark is left alone so recovery never races a fetch that is
+/// still going to answer.
+const FLIGHT_WATCHDOG_MS = 120_000
 
 type FetchOptions = {
   includeOptimize: boolean
