@@ -684,12 +684,37 @@ describe('MenubarCompanion', () => {
       cliCalls = []
       cliNotice = ''
 
-      const companion = new MenubarCompanion(deps())
+      // Windows has started since the install, which is what finished the file replacement.
+      const companion = new MenubarCompanion(deps({ bootedAtMs: () => Date.now() + 1_000 }))
       await companion.bootstrap()
 
       expect(cliCalls).toEqual([])
       expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--reload-settings'] }])
       expect(companion.status().restartRequired).toBe(false)
+      // The pending mark is spent, so a later launch does not have to derive it again.
+      expect(readCompanionSettings(stateDir).restartRequiredSince).toBeNull()
+      log.mockRestore()
+    })
+
+    // Quitting the desktop app and opening it again is not the restart being waited for. The
+    // flag used to live only in memory, so the second launch started the old binary under the
+    // new version's name, which is the confusion this whole path exists to avoid.
+    it('keeps waiting when the app is restarted but Windows is not', async () => {
+      stageMsi()
+      cliNotice = REBOOT_LINE
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+      await new MenubarCompanion(deps()).bootstrap()
+      cliCalls = []
+      cliNotice = ''
+      launches = []
+
+      // The machine last booted a day before the install, so nothing has finished it.
+      const companion = new MenubarCompanion(deps({ bootedAtMs: () => Date.now() - 86_400_000 }))
+      await companion.bootstrap()
+
+      expect(launches).toEqual([])
+      expect(companion.status().restartRequired).toBe(true)
+      expect(readCompanionSettings(stateDir).restartRequiredSince).not.toBeNull()
       log.mockRestore()
     })
   })

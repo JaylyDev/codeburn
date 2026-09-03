@@ -27,7 +27,7 @@
 
 import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, uptime } from 'node:os'
 import { join, win32 } from 'node:path'
 
 import { spawnCliAction, type ActionResult } from './cli'
@@ -101,6 +101,12 @@ export type CompanionSettings = {
    *  is their decision rather than something to re-ask until they give in. Cleared when a
    *  newer version is staged, or when they turn Menu bar on themselves. */
   installDeclinedVersion: string | null
+  /** When an install left Windows a file replacement it can only finish at the next restart,
+   *  as an ISO timestamp. Saved rather than kept in memory: restarting the desktop app is not
+   *  the restart being waited for, and forgetting it there would start the old tray app under
+   *  the new version name, which is what the flag exists to prevent. Cleared once the machine
+   *  has booted since that moment. */
+  restartRequiredSince: string | null
   /** False until the first launch has applied the defaults, which is what keeps a later
    *  manual "dock off" from being seeded back on at every launch. */
   seeded: boolean
@@ -112,6 +118,7 @@ export const DEFAULT_COMPANION_SETTINGS: CompanionSettings = {
   trayExePath: null,
   trayExeVersion: null,
   installDeclinedVersion: null,
+  restartRequiredSince: null,
   seeded: false,
 }
 
@@ -137,6 +144,9 @@ export type MenubarDeps = {
   /** Whether a path is on disk. Injected so the stale-path handling is testable. */
   exists?: (path: string) => boolean
   home?: string
+  /** When Windows last started, in epoch milliseconds. Injected by tests so the pending
+   *  restart boundary can be crossed without rebooting. */
+  bootedAtMs?: () => number
 }
 
 // Where things are ----------------------------------------------------------------------------
@@ -271,6 +281,7 @@ export function readCompanionSettings(stateDir: string): CompanionSettings {
       trayExePath: typeof raw.trayExePath === 'string' ? raw.trayExePath : null,
       trayExeVersion: typeof raw.trayExeVersion === 'string' ? raw.trayExeVersion : null,
       installDeclinedVersion: typeof raw.installDeclinedVersion === 'string' ? raw.installDeclinedVersion : null,
+      restartRequiredSince: typeof raw.restartRequiredSince === 'string' ? raw.restartRequiredSince : null,
       seeded: raw.seeded === true,
     }
   } catch {
@@ -474,8 +485,28 @@ export class MenubarCompanion {
   /** When `--quit` was last sent, so a launch right after it can wait for the exit. */
   private quitAskedAt = 0
   /** Set by an install msiexec could only half apply; see {@link MenubarCompanion.launchTray}.
-   *  Not saved: the restart it is waiting for also clears it. */
-  private restartRequired = false
+   *  Read from the saved timestamp rather than a field, so quitting the desktop app and
+   *  opening it again is not mistaken for the Windows restart that actually finishes the
+   *  install. It clears itself once the machine has booted since the install. */
+  private get restartRequired(): boolean {
+    const since = this.settings.restartRequiredSince
+    if (!since) return false
+    const at = Date.parse(since)
+    // An unreadable timestamp counts as still pending: not launching is the safe side, since
+    // the worst it costs is a tray app that starts one session late.
+    if (Number.isNaN(at)) return true
+    if (this.bootedAtMs() > at) {
+      this.save({ restartRequiredSince: null })
+      return false
+    }
+    return true
+  }
+
+  /** When Windows last started, which is what tells a finished file replacement from one
+   *  still pending. Injectable so the boundary is testable without rebooting. */
+  private bootedAtMs(): number {
+    return this.deps.bootedAtMs?.() ?? Date.now() - uptime() * 1000
+  }
   /** The launcher written for the tray app this run, or null when there is no bundled CLI
    *  to point one at. Handed to every tray app this side starts. */
   private cliLauncher: string | null = null
@@ -722,7 +753,7 @@ export class MenubarCompanion {
     // version while the binary on disk is still the old one, so launching it would start the
     // old tray app under the new version's name. Nothing is launched until the restart.
     if (parsed.rebootRequired === true || REBOOT_NOTICE.test(result.stdout)) {
-      this.restartRequired = true
+      this.save({ restartRequiredSince: new Date().toISOString() })
       console.log('CodeBurn Menubar was installed; Windows needs a restart to finish it.')
     }
     const exePath = parsed.exePath || this.settings.trayExePath
