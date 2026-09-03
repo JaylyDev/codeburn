@@ -398,6 +398,25 @@ describe('MenubarCompanion', () => {
     expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toEqual({ enabled: true, scale: 1.2 })
   })
 
+  it('seeds launch at login again after this app reinstalls the tray', async () => {
+    stageMsi()
+    await new MenubarCompanion(deps()).bootstrap()
+    expect(regCalls).toEqual([runKeyArgs(true, TRAY_EXE)])
+
+    // The tray app went away with an uninstall that took its Run value along; the exe is
+    // back only once the CLI has installed it again. Seeded once is no reason to leave a
+    // freshly placed tray app without launch at login.
+    regCalls = []
+    present.delete(TRAY_EXE)
+    installResult = result({ action: 'installed' })
+    await new MenubarCompanion(deps({
+      exists: (path: string) => (path === TRAY_EXE ? cliCalls.length > 1 : present.has(path)),
+    })).bootstrap()
+
+    expect(cliCalls).toHaveLength(2)
+    expect(regCalls).toEqual([runKeyArgs(true, TRAY_EXE)])
+  })
+
   it('leaves an existing launch-at-login value alone', async () => {
     stageMsi()
     existingRunKey = `"${TRAY_EXE}"`

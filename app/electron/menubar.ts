@@ -581,20 +581,27 @@ export class MenubarCompanion {
     this.save({ trayExePath: exePath })
 
     if (firstRun && existingDock === undefined && this.settings.sidebar) this.applyDockSetting(true)
-    await this.reconcileRunKey(firstRun)
+    // A tray app this launch just put on the machine has no Run value yet: the previous
+    // one's uninstall took it, and that was the installer's doing, not the person's choice.
+    await this.reconcileRunKey(firstRun || this.placedTray)
+    this.placedTray = false
     this.launch(exePath, ['--reload-settings'], this.launchEnv())
   }
+
+  /** True between an install that placed a tray app and the seeding that follows it. */
+  private placedTray = false
 
   /**
    * Launch at login, without overriding a choice. An existing Run value was written by the
    * tray app's own toggle or by an earlier launch of this one, so it is left alone; only a
-   * first run seeds one. The exception is a value pointing at a file that is not there, which
-   * is not a preference but the old wrong path, and would fail silently at every login.
+   * first run, or a tray app freshly installed by this launch, seeds one. The exception is a
+   * value pointing at a file that is not there, which is not a preference but the old wrong
+   * path, and would fail silently at every login.
    */
-  private async reconcileRunKey(firstRun: boolean): Promise<void> {
+  private async reconcileRunKey(seed: boolean): Promise<void> {
     const existing = await this.existingRunKey()
     if (existing === null) {
-      if (firstRun) await this.setRunKey(true)
+      if (seed) await this.setRunKey(true)
       return
     }
     if (!this.exists(runKeyTarget(existing))) await this.setRunKey(true)
@@ -674,6 +681,7 @@ export class MenubarCompanion {
       return null
     }
     const exePath = parsed.exePath || this.settings.trayExePath
+    this.placedTray = parsed.action === 'installed'
     this.save({
       installDeclinedVersion: null,
       // What is actually on disk now, which is the staged version except under
