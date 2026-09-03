@@ -26,14 +26,15 @@
 // module writes.
 
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import { spawnCliAction, type ActionResult } from './cli'
 import {
+  DEFAULT_TRAY_APP_PREFS, DEFAULT_TRAY_DOCK_PREFS,
   normalizedPreferred, parseTrayAppPrefs, parseTrayDockPrefs, patchTrayFile, readTrayFile,
-  sanitizeAppPatch, sanitizeDockPatch, type TrayAppPrefs, type TrayDockPrefs,
+  sanitizeAppPatch, sanitizeDockPatch, writeFileAtomic, type TrayAppPrefs, type TrayDockPrefs,
 } from './tray-settings'
 
 /** Env var the CLI's Windows installer reads; the source of truth is src/menubar-installer.ts. */
@@ -49,6 +50,17 @@ const RUN_VALUE = 'CodeBurn'
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'
 /** A `/passive` msiexec run waits on a UAC prompt, which is a person, not a process. */
 const INSTALL_TIMEOUT_MS = 5 * 60_000
+/** The env var the tray app honours before anything else it looks at (windows/src-tauri/src/cli.rs). */
+export const TRAY_CLI_ENV = 'CODEBURN_BIN'
+/** Where the desktop app records the launcher in the tray app's own settings file, so an
+ *  autostarted tray app finds it with no desktop app running to tell it. */
+export const TRAY_CLI_PATH_KEY = 'desktopCliPath'
+/** Where main.ts points at the CLI copy shipped inside a packaged build. */
+const BUNDLED_CLI_ENV = 'CODEBURN_BUNDLED_CLI'
+/** The tray app's own data directory, which already holds its install marker. */
+const COMPANION_DIR = 'codeburn-menubar'
+/** A `.cmd`, because that is the one kind of script the tray app can start directly. */
+const CLI_LAUNCHER_NAME = 'codeburn-cli.cmd'
 /** How long a launch that follows a `--quit` waits for the old process to be gone. */
 const QUIT_SETTLE_MS = 4_000
 
@@ -68,6 +80,15 @@ export type CompanionSettings = {
   sidebar: boolean
   /** Where the tray app ended up, so starting and stopping it costs no registry read. */
   trayExePath: string | null
+  /** The tray app version the last install reported at `trayExePath`. A launch whose staged
+   *  .msi carries that same version has nothing to install and nothing to ask, so it skips
+   *  the probe entirely rather than spawning a CLI to be told so. */
+  trayExeVersion: string | null
+  /** The staged .msi version whose install was declined or failed. The same file put in
+   *  front of the same person at the next launch is the same admin prompt, and answering it
+   *  is their decision rather than something to re-ask until they give in. Cleared when a
+   *  newer version is staged, or when they turn Menu bar on themselves. */
+  installDeclinedVersion: string | null
   /** False until the first launch has applied the defaults, which is what keeps a later
    *  manual "dock off" from being seeded back on at every launch. */
   seeded: boolean
@@ -77,6 +98,8 @@ export const DEFAULT_COMPANION_SETTINGS: CompanionSettings = {
   menuBar: true,
   sidebar: true,
   trayExePath: null,
+  trayExeVersion: null,
+  installDeclinedVersion: null,
   seeded: false,
 }
 
@@ -89,9 +112,11 @@ export type MenubarDeps = {
   store: boolean
   platform: string
   env: NodeJS.ProcessEnv
+  /** The desktop app's own executable, which is also the Node that runs the bundled CLI. */
+  execPath?: string
   /** Injected so tests never spawn: the CLI action, a detached launch, and a `reg.exe` run. */
   runCli?: (args: string[], opts: { timeoutMs?: number; extraEnv?: NodeJS.ProcessEnv }) => Promise<ActionResult>
-  launch?: (exePath: string, args: string[]) => void
+  launch?: (exePath: string, args: string[], extraEnv?: NodeJS.ProcessEnv) => void
   runReg?: (args: string[]) => Promise<void>
   /** The tray app's existing Run value, or null when there is none. */
   readRunKey?: () => Promise<string | null>
@@ -138,6 +163,87 @@ function companionSettingsPath(stateDir: string): string {
   return join(stateDir, 'companion.v1.json')
 }
 
+// The CLI the tray app runs -----------------------------------------------------------------
+
+// The tray app gets everything it shows by spawning `codeburn`, which it looks for on PATH
+// and in the usual npm, pnpm, Volta, fnm, scoop and bun locations. Someone who installed only
+// the desktop app never ran `npm install -g codeburn`, so there is nothing in any of them, and
+// the tray app they were just given has no data to show.
+//
+// The desktop app has a CLI: the version-matched copy under `resources/cli`, which it runs
+// through its own executable with `ELECTRON_RUN_AS_NODE=1` (app/electron/cli.ts). That is not
+// something the tray app could spawn on its own, so this side writes a one-line `.cmd` that
+// does it and forwards every argument, and records where it put it.
+//
+// A file rather than an environment variable because the tray app is also started at login, by
+// a Run value or the package's startup task, with no desktop app anywhere to hand it an
+// environment. The recorded path is consulted last (windows/src-tauri/src/cli.rs), so a real
+// global install still wins.
+
+/** `%LOCALAPPDATA%\codeburn-menubar`, the directory the tray app's install marker is in. */
+export function companionDataDir(env: NodeJS.ProcessEnv, home: string): string {
+  const local = env.LOCALAPPDATA
+  const base = local && /^[a-zA-Z]:[\\/]/.test(local) ? local.replace(/[\\/]+$/, '') : join(home, 'AppData', 'Local')
+  return join(base, COMPANION_DIR)
+}
+
+export function cliLauncherPath(env: NodeJS.ProcessEnv, home: string): string {
+  return join(companionDataDir(env, home), CLI_LAUNCHER_NAME)
+}
+
+/**
+ * Anything `cmd.exe` would read rather than pass along. Both paths come from the app's own
+ * install location, so this never fires in practice; it is here because the alternative to
+ * failing is writing a batch file that means something other than what it says.
+ */
+const CMD_UNQUOTABLE = /["%\r\n]/
+
+/** The launcher's contents. `%*` forwards the arguments verbatim, stdio is inherited, and
+ *  the CLI's exit code becomes the launcher's. */
+export function cliLauncherScript(execPath: string, entry: string): string | null {
+  if (!execPath || !entry || CMD_UNQUOTABLE.test(execPath) || CMD_UNQUOTABLE.test(entry)) return null
+  return [
+    '@echo off',
+    'rem Written by the CodeBurn desktop app, and rewritten at every one of its launches.',
+    'rem It runs the CLI the desktop app carries, through the desktop app\'s own executable.',
+    'setlocal',
+    'set "ELECTRON_RUN_AS_NODE=1"',
+    `"${execPath}" "${entry}" %*`,
+    'exit /b %ERRORLEVEL%',
+    '',
+  ].join('\r\n')
+}
+
+/**
+ * Write the launcher and hand back its path, or null when there is nothing to point it at:
+ * off Windows, or in a dev build, where `CODEBURN_BUNDLED_CLI` is unset because the repo's
+ * own CLI is used instead and is already on the machine.
+ */
+export function writeCliLauncher(opts: {
+  platform: string
+  env: NodeJS.ProcessEnv
+  home: string
+  execPath: string
+  exists?: (path: string) => boolean
+}): string | null {
+  if (opts.platform !== 'win32') return null
+  const entry = opts.env[BUNDLED_CLI_ENV]
+  const exists = opts.exists ?? existsSync
+  if (!entry || !exists(entry)) return null
+  const script = cliLauncherScript(opts.execPath, entry)
+  if (!script) return null
+
+  const path = cliLauncherPath(opts.env, opts.home)
+  try {
+    // Rewritten at every launch while an autostarted tray app may be reading it.
+    writeFileAtomic(path, script)
+    return path
+  } catch (err) {
+    console.error('the tray app could not be given a CLI to run:', err)
+    return null
+  }
+}
+
 // Settings -------------------------------------------------------------------------------------
 
 export function readCompanionSettings(stateDir: string): CompanionSettings {
@@ -151,6 +257,8 @@ export function readCompanionSettings(stateDir: string): CompanionSettings {
       menuBar: raw.menuBar ?? DEFAULT_COMPANION_SETTINGS.menuBar,
       sidebar: raw.sidebar ?? DEFAULT_COMPANION_SETTINGS.sidebar,
       trayExePath: typeof raw.trayExePath === 'string' ? raw.trayExePath : null,
+      trayExeVersion: typeof raw.trayExeVersion === 'string' ? raw.trayExeVersion : null,
+      installDeclinedVersion: typeof raw.installDeclinedVersion === 'string' ? raw.installDeclinedVersion : null,
       seeded: raw.seeded === true,
     }
   } catch {
@@ -160,8 +268,7 @@ export function readCompanionSettings(stateDir: string): CompanionSettings {
 
 export function writeCompanionSettings(stateDir: string, settings: CompanionSettings): void {
   try {
-    mkdirSync(stateDir, { recursive: true })
-    writeFileSync(companionSettingsPath(stateDir), `${JSON.stringify(settings, null, 2)}\n`)
+    writeFileAtomic(companionSettingsPath(stateDir), `${JSON.stringify(settings, null, 2)}\n`)
   } catch (err) {
     console.error('companion settings could not be saved:', err)
   }
@@ -191,8 +298,7 @@ export function writeDockEnabled(enabled: boolean, home = homedir()): void {
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) prefs = parsed as Record<string, unknown>
   } catch { /* a missing or unreadable file simply starts from nothing */ }
   prefs.enabled = enabled
-  mkdirSync(join(path, '..'), { recursive: true })
-  writeFileSync(path, `${JSON.stringify(prefs, null, 2)}\n`)
+  writeFileAtomic(path, `${JSON.stringify(prefs, null, 2)}\n`)
 }
 
 // Talking to the tray app ----------------------------------------------------------------------
@@ -236,9 +342,14 @@ export function system32Path(exe: string, env: NodeJS.ProcessEnv): string {
   return `${base}\\System32\\${exe}`
 }
 
-function detachedLaunch(exePath: string, args: string[]): void {
+function detachedLaunch(exePath: string, args: string[], extraEnv?: NodeJS.ProcessEnv): void {
   try {
-    const child = spawn(exePath, args, { detached: true, stdio: 'ignore', windowsHide: true })
+    const child = spawn(exePath, args, {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      ...(extraEnv ? { env: { ...process.env, ...extraEnv } } : {}),
+    })
     child.on('error', err => console.error(`could not launch ${exePath}: ${err.message}`))
     child.unref()
   } catch (err) {
@@ -300,6 +411,37 @@ export type TrayPrefs = {
   app: TrayAppPrefs
   dock: TrayDockPrefs
   launchAtLogin: boolean
+  /**
+   * True where launch at login is not this app's to set. The Store package declares it as a
+   * `windows.startupTask` (app/build/appx-extensions.xml) and Windows owns both the state and
+   * the switch, in Settings > Apps > Startup. Reaching a startup task from here would take
+   * the WinRT `Windows.ApplicationModel.StartupTask` API, which Electron has no binding for
+   * and which this app ships no native code to reach; and a Run value written beside the
+   * startup task would start the tray app twice. So the pane names the owner and points at
+   * that page rather than offering a switch that moves nothing.
+   */
+  launchAtLoginManaged: boolean
+}
+
+/** The Windows Settings page listing every startup app, the Store package's own included.
+ *  Named here because the desktop app's external-open guard allows it by exact value. */
+export const STARTUP_APPS_SETTINGS_URL = 'ms-settings:startupapps'
+
+/**
+ * What the four tray-preference methods answer where there is no tray app. Every one of them
+ * reads or writes `~/.config/codeburn/windows-*.json` or `reg.exe`, all of which belong to a
+ * Windows tray app that a macOS or Linux build has never installed; their IPC handlers are
+ * registered on every platform, so the guard has to be here rather than at the call site.
+ * The defaults are what the same files parse to when they are not there, so a pane rendering
+ * this shows the same thing it would on a Windows machine with nothing written yet.
+ */
+export function unsupportedTrayPrefs(): TrayPrefs {
+  return {
+    app: { ...DEFAULT_TRAY_APP_PREFS },
+    dock: { ...DEFAULT_TRAY_DOCK_PREFS },
+    launchAtLogin: false,
+    launchAtLoginManaged: false,
+  }
 }
 
 export type CompanionStatus = {
@@ -315,13 +457,48 @@ export class MenubarCompanion {
   private settings: CompanionSettings
   /** When `--quit` was last sent, so a launch right after it can wait for the exit. */
   private quitAskedAt = 0
+  /** The launcher written for the tray app this run, or null when there is no bundled CLI
+   *  to point one at. Handed to every tray app this side starts. */
+  private cliLauncher: string | null = null
 
   constructor(private readonly deps: MenubarDeps) {
     this.settings = readCompanionSettings(deps.stateDir)
   }
 
   private get home(): string { return this.deps.home ?? homedir() }
-  private get launch(): (exe: string, args: string[]) => void { return this.deps.launch ?? detachedLaunch }
+  private get launch(): (exe: string, args: string[], extraEnv?: NodeJS.ProcessEnv) => void {
+    return this.deps.launch ?? detachedLaunch
+  }
+
+  /**
+   * What a tray app started from here inherits. The recorded path in the settings file is
+   * what an autostarted tray app reads, and it is read after PATH; this makes the very first
+   * launch work too, before the tray app has read anything at all.
+   */
+  private launchEnv(): NodeJS.ProcessEnv | undefined {
+    return this.cliLauncher ? { [TRAY_CLI_ENV]: this.cliLauncher } : undefined
+  }
+
+  /**
+   * Rewrite the launcher and record where it is. Runs at every bootstrap, so a desktop app
+   * that has been updated points the tray app at its new copy of the CLI rather than at the
+   * one the previous version installed.
+   */
+  private refreshCliLauncher(): void {
+    this.cliLauncher = writeCliLauncher({
+      platform: this.deps.platform,
+      env: this.deps.env,
+      home: this.home,
+      execPath: this.deps.execPath ?? process.execPath,
+      exists: this.exists,
+    })
+    if (!this.cliLauncher) return
+    try {
+      patchTrayFile('app', { [TRAY_CLI_PATH_KEY]: this.cliLauncher }, this.home)
+    } catch (err) {
+      console.error('the tray app could not be told where its CLI is:', err)
+    }
+  }
   private get isRunning(): () => Promise<boolean> {
     return this.deps.isRunning ?? (() => trayHasProcess(this.deps.env))
   }
@@ -369,10 +546,15 @@ export class MenubarCompanion {
    * Put the tray app on the machine and bring both surfaces in line with the switches. Runs
    * at every launch, which is also what covers a desktop-app update: the staged .msi moves
    * with the app, and the installer decides for itself whether it is newer than what is
-   * installed.
+   * installed. The install itself is not re-run at every launch; see
+   * {@link MenubarCompanion.installIfNeeded}.
    */
   async bootstrap(): Promise<void> {
     if (!this.supported()) return
+
+    // Before anything else, and whether or not the switch is on: a tray app started at the
+    // next login has to find a CLI without this process being there to tell it.
+    this.refreshCliLauncher()
 
     // The defaults are seeded once, and only onto a machine that has made no choice. A tray
     // app someone installed by hand has preferences of its own, and a default that overrode
@@ -387,11 +569,9 @@ export class MenubarCompanion {
 
     if (!this.settings.menuBar) return
 
-    // The install runs on every launch, not only when a path is missing: it is what carries a
-    // desktop-app update forward, and it costs nothing when the versions already match.
     const exePath = this.deps.store
       ? findPackagedTrayExe(menubarResourcesDir(this.deps))
-      : await this.install()
+      : await this.installIfNeeded()
     if (!exePath) return
     if (!this.exists(exePath)) {
       // Storing a path to nothing is what made the switches send arguments into the void.
@@ -402,7 +582,7 @@ export class MenubarCompanion {
 
     if (firstRun && existingDock === undefined && this.settings.sidebar) this.applyDockSetting(true)
     await this.reconcileRunKey(firstRun)
-    this.launch(exePath, ['--reload-settings'])
+    this.launch(exePath, ['--reload-settings'], this.launchEnv())
   }
 
   /**
@@ -441,16 +621,41 @@ export class MenubarCompanion {
     if (this.deps.store) return findPackagedTrayExe(menubarResourcesDir(this.deps))
     const stored = this.settings.trayExePath
     if (stored && this.exists(stored)) return stored
-    const resolved = await this.install()
+    const resolved = await this.installIfNeeded()
     return resolved && this.exists(resolved) ? resolved : null
   }
 
-  /** The install itself belongs to the CLI: it owns the registry read, the checksum, the
-   *  msiexec call and the never-downgrade rule, and this side only stages the file. */
-  private async install(): Promise<string | null> {
+  /**
+   * The install, minus the launches that have nothing to install.
+   *
+   * `codeburn menubar` is not free and it is not quiet: a real install runs msiexec
+   * `/passive`, which puts an admin prompt in front of the person. Two launches are skipped
+   * outright:
+   *
+   *   - the tray app recorded on this machine is already the version this build stages, and
+   *     it is still on disk, so the CLI would read the registry and answer "up to date";
+   *   - this exact staged version was already declined or failed. Putting the same prompt up
+   *     again at every launch is asking the same question until the answer changes, and the
+   *     first answer was theirs to give.
+   *
+   * A newer staged version is a different question and is always asked. So is the Menu bar
+   * switch going on by hand, which clears the record before it gets here.
+   */
+  private async installIfNeeded(): Promise<string | null> {
     const staged = findStagedMsi(menubarResourcesDir(this.deps))
     if (!staged) return null
 
+    const stored = this.settings.trayExePath
+    if (stored && this.settings.trayExeVersion === staged.version && this.exists(stored)) return stored
+    if (this.settings.installDeclinedVersion === staged.version) return stored
+
+    return this.install(staged)
+  }
+
+  /** The install itself belongs to the CLI: it owns the registry read, the checksum, the
+   *  msiexec call and the never-downgrade rule, and this side only stages the file and
+   *  records what came back. */
+  private async install(staged: { path: string; version: string }): Promise<string | null> {
     const result = await this.runCli(['menubar'], {
       timeoutMs: INSTALL_TIMEOUT_MS,
       extraEnv: { [BUNDLED_MSI_ENV]: staged.path },
@@ -458,11 +663,24 @@ export class MenubarCompanion {
     const parsed = parseInstallResult(result.stdout)
     if (!parsed) {
       console.error(`menubar install did not report a result: ${result.stderr.trim() || `exit ${String(result.code)}`}`)
+      // A failure is remembered the same way a refusal is: whatever went wrong will go wrong
+      // again with the same file, and retrying it at every launch only repeats the prompt.
+      this.save({ installDeclinedVersion: staged.version })
       // A failed install must not orphan a working tray app that was already there.
       return this.settings.trayExePath
     }
-    if (parsed.action === 'cancelled') return null
-    return parsed.exePath || this.settings.trayExePath
+    if (parsed.action === 'cancelled') {
+      this.save({ installDeclinedVersion: staged.version })
+      return null
+    }
+    const exePath = parsed.exePath || this.settings.trayExePath
+    this.save({
+      installDeclinedVersion: null,
+      // What is actually on disk now, which is the staged version except under
+      // 'kept-newer', where a newer tray app was left alone.
+      trayExeVersion: exePath ? (parsed.action === 'kept-newer' ? parsed.previousVersion : staged.version) : null,
+    })
+    return exePath
   }
 
   /**
@@ -490,6 +708,9 @@ export class MenubarCompanion {
       return this.status()
     }
 
+    // Turning the switch on by hand is the retry: an install that was declined or failed is
+    // offered again, because this time they asked for it rather than being asked.
+    this.save({ installDeclinedVersion: null })
     const exePath = await this.resolveTrayExe()
     if (!exePath) {
       // Nothing to turn on. The switch says so rather than claiming a tray app that is not
@@ -500,7 +721,7 @@ export class MenubarCompanion {
     this.save({ trayExePath: exePath })
     await this.setRunKey(true)
     await this.awaitQuit()
-    this.launch(exePath, ['--reload-settings'])
+    this.launch(exePath, ['--reload-settings'], this.launchEnv())
     return this.status()
   }
 
@@ -530,7 +751,7 @@ export class MenubarCompanion {
     const exePath = await this.resolveTrayExe()
     if (exePath) {
       this.save({ trayExePath: exePath })
-      this.launch(exePath, ['--reload-settings'])
+      this.launch(exePath, ['--reload-settings'], this.launchEnv())
     }
     return this.status()
   }
@@ -540,16 +761,22 @@ export class MenubarCompanion {
   /** Everything the two tray panes render from, read straight out of the files the tray app
    *  reads them from, so the panes and the tray app can never be showing different answers. */
   async trayPrefs(): Promise<TrayPrefs> {
+    if (!this.supported()) return unsupportedTrayPrefs()
     return {
       app: parseTrayAppPrefs(readTrayFile('app', this.home)),
       dock: parseTrayDockPrefs(readTrayFile('dock', this.home)),
+      // On the Store route there is no Run value and no way to ask Windows about the
+      // package's startup task, so this is not a state to render: `launchAtLoginManaged`
+      // is what the pane goes by there.
       launchAtLogin: (await this.existingRunKey()) !== null,
+      launchAtLoginManaged: this.deps.store,
     }
   }
 
   /** A setting the tray app keeps in `windows-settings.json`. Every other key in that file
    *  is left alone, and the running tray app is told to re-read it. */
   async setTrayAppPref(patch: Record<string, unknown>): Promise<TrayPrefs> {
+    if (!this.supported()) return unsupportedTrayPrefs()
     const clean = sanitizeAppPatch(patch)
     if (Object.keys(clean).length > 0) {
       try {
@@ -568,6 +795,7 @@ export class MenubarCompanion {
    * A provider set that no longer holds the resting provider moves it, as the rail would.
    */
   async setTrayDockPref(patch: Record<string, unknown>): Promise<TrayPrefs> {
+    if (!this.supported()) return unsupportedTrayPrefs()
     if ('enabled' in patch) {
       await this.setSidebarEnabled(patch.enabled === true)
       return this.trayPrefs()
@@ -589,9 +817,11 @@ export class MenubarCompanion {
   }
 
   /** Launch at login is the one tray setting that is not in a file: it is the Run value, and
-   *  this app owns it, so the pane writes it here rather than through the tray app. */
+   *  this app owns it, so the pane writes it here rather than through the tray app. Not on
+   *  the Store route, where Windows owns it: see {@link TrayPrefs.launchAtLoginManaged}. */
   async setLaunchAtLogin(enabled: boolean): Promise<TrayPrefs> {
-    await this.setRunKey(enabled)
+    if (!this.supported()) return unsupportedTrayPrefs()
+    if (!this.deps.store) await this.setRunKey(enabled)
     return this.trayPrefs()
   }
 
@@ -600,7 +830,7 @@ export class MenubarCompanion {
   private async nudgeTray(): Promise<void> {
     if (!this.settings.menuBar) return
     const exePath = this.settings.trayExePath
-    if (exePath && this.exists(exePath)) this.launch(exePath, ['--reload-settings'])
+    if (exePath && this.exists(exePath)) this.launch(exePath, ['--reload-settings'], this.launchEnv())
   }
 
   private applyDockSetting(enabled: boolean): void {

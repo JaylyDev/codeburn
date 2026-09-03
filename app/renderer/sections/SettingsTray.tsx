@@ -18,6 +18,10 @@ import { codeburn } from '../lib/ipc'
 import { PROVIDER_NAMES, QUOTA_PROVIDERS } from '../lib/providers'
 import type { QuotaProvider, TrayPrefs } from '../lib/types'
 
+/** The Windows Settings page that owns launch at login for the Store build. The same value
+ *  is the one exception in the main process's external-open guard (app/electron/main.ts). */
+const STARTUP_APPS_SETTINGS_URL = 'ms-settings:startupapps'
+
 /// The nine presets from the tray app's Theme/ThemeState.swift port
 /// (windows/src/lib/accent.ts). Only the base shade is needed to draw a swatch.
 const ACCENTS: Array<{ id: string; label: string; base: string }> = [
@@ -200,9 +204,24 @@ export function MenuBarPane() {
           <div className="about-row"><label className="tx" htmlFor="tray-terminal">Terminal<small>Where Open Full Report runs.</small></label><span className="r">
             <Dropdown id="tray-terminal" ariaLabel="Terminal" value={app.terminal} options={TERMINALS} onChange={value => setApp({ terminal: value })} width={168} />
           </span></div>
-          <div className="about-row"><span className="tx">Launch at login<small>Starts the menu bar app when you sign in.</small></span><span className="r">
-            <Switch on={prefs.launchAtLogin} label="Launch at login" onToggle={() => setLaunchAtLogin(!prefs.launchAtLogin)} />
-          </span></div>
+          {prefs.launchAtLoginManaged ? (
+            // The Store package declares launch at login as its own startup task, which only
+            // Windows can turn on and off. A switch here would move nothing, so this says who
+            // owns it and opens the page that does.
+            <div className="about-row"><span className="tx">Launch at login<small>Managed by Windows for this build, in Settings &gt; Apps &gt; Startup.</small></span><span className="r">
+              <button
+                type="button"
+                className="set-text-button"
+                onClick={() => { void codeburn.openExternal(STARTUP_APPS_SETTINGS_URL) }}
+              >
+                Open Startup Apps
+              </button>
+            </span></div>
+          ) : (
+            <div className="about-row"><span className="tx">Launch at login<small>Starts the menu bar app when you sign in.</small></span><span className="r">
+              <Switch on={prefs.launchAtLogin} label="Launch at login" onToggle={() => setLaunchAtLogin(!prefs.launchAtLogin)} />
+            </span></div>
+          )}
         </div>
       </div>
     </section>

@@ -12,4 +12,12 @@
   DetailPrint "Checking whether CodeBurn installed the tray app..."
   nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$marker = Join-Path $$env:LOCALAPPDATA (Join-Path ''codeburn-menubar'' ''installed-by.json''); if (Test-Path $$marker) { $$record = Get-Content -Raw $$marker | ConvertFrom-Json; if ($$record.installedBy -eq ''desktop'') { Get-Process -Name ''codeburn-menubar'' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; if ($$record.uninstallString -match ''\{[0-9A-Fa-f-]{36}\}'') { Start-Process -Wait -FilePath ''msiexec.exe'' -ArgumentList ''/x'', $$Matches[0], ''/passive'', ''/norestart'' }; Remove-Item -Force -ErrorAction SilentlyContinue $$marker } }"'
   Pop $0
+
+  ; The launcher this app writes so the tray app has a CLI to run at all
+  ; (app/electron/menubar.ts). It names this app's own executable, which is about
+  ; to be gone, and unlike the tray app itself there is no copy of it anybody
+  ; else could have put there, so it goes unconditionally. The directory follows
+  ; only if the tray app left nothing else in it.
+  Delete "$LOCALAPPDATA\codeburn-menubar\codeburn-cli.cmd"
+  RMDir "$LOCALAPPDATA\codeburn-menubar"
 !macroend

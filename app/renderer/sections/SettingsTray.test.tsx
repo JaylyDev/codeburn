@@ -37,6 +37,7 @@ const PREFS = {
     manualSelection: true,
   },
   launchAtLogin: false,
+  launchAtLoginManaged: false,
 }
 
 const connected = (...ids: string[]) => ids.map(id => ({
@@ -114,6 +115,28 @@ describe('MenuBarPane', () => {
 
     expect(bridge.setLaunchAtLogin).toHaveBeenCalledWith(true)
     await waitFor(() => expect(screen.getByRole('switch', { name: 'Launch at login' })).toHaveAttribute('aria-checked', 'true'))
+  })
+
+  // The Store package declares launch at login as its own startup task, which only Windows
+  // can turn on and off. A switch there would move nothing, so there is not one.
+  describe('where Windows owns launch at login', () => {
+    beforeEach(() => { bridge.trayPrefs.mockResolvedValue({ ...PREFS, launchAtLoginManaged: true }) })
+
+    it('says who owns it instead of showing a switch', async () => {
+      render(<MenuBarPane />)
+
+      expect(await screen.findByText(/Managed by Windows/)).toBeInTheDocument()
+      expect(screen.queryByRole('switch', { name: 'Launch at login' })).toBeNull()
+    })
+
+    it('opens the Windows page that does own it', async () => {
+      render(<MenuBarPane />)
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Open Startup Apps' }))
+
+      expect(bridge.openExternal).toHaveBeenCalledWith('ms-settings:startupapps')
+      expect(bridge.setLaunchAtLogin).not.toHaveBeenCalled()
+    })
   })
 
   // The main process decides what a value ends up as, so the pane renders its answer.

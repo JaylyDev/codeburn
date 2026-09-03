@@ -177,13 +177,17 @@ impl CodeburnCli {
                 };
             }
         }
-        eprintln!("codeburn-menubar: refusing unsafe CODEBURN_BIN; falling back to `codeburn`");
+        crate::log_line!("codeburn-menubar: refusing unsafe CODEBURN_BIN; falling back to `codeburn`");
         Self::default_program()
     }
 
+    /// PATH and the usual install prefixes first, then the CLI the CodeBurn desktop app
+    /// leaves behind, so a global `codeburn` still wins wherever there is one.
     fn default_program() -> Self {
         CodeburnCli {
-            program: locate_cli().unwrap_or_else(default_program_name),
+            program: locate_cli()
+                .or_else(recorded_desktop_cli)
+                .unwrap_or_else(default_program_name),
             extra_args: vec![],
         }
     }
@@ -379,12 +383,9 @@ impl CodeburnCli {
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
             cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
         }
-        let mut child = cmd.spawn().map_err(|err| {
-            anyhow!(
-                "CodeBurn CLI not found ({}). Install it with `npm install -g codeburn`.",
-                spawn_error_summary(&self.program, &err)
-            )
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| anyhow!("{}", spawn_failure_message(&self.program, &err)))?;
 
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
@@ -475,14 +476,14 @@ async fn stop_child(child: &mut tokio::process::Child) {
     if asked {
         if let Ok(Ok(_)) = timeout(Duration::from_secs(KILL_GRACE_SECS), child.wait()).await {
             #[cfg(debug_assertions)]
-            eprintln!("codeburn: silent CLI child {pid} stopped on request");
+            crate::log_line!("codeburn: silent CLI child {pid} stopped on request");
             return;
         }
     }
     kill_tree(pid);
     let _ = child.kill().await;
     #[cfg(debug_assertions)]
-    eprintln!("codeburn: silent CLI child {pid} killed (stop request accepted: {asked})");
+    crate::log_line!("codeburn: silent CLI child {pid} killed (stop request accepted: {asked})");
 }
 
 /// What this app spawns on Windows is `codeburn.cmd`, so the process that does the work is
@@ -556,6 +557,22 @@ fn spawn_error_summary(program: &str, err: &std::io::Error) -> String {
     }
 }
 
+/// What a failed spawn tells the setup screen. A program still named `codeburn.cmd` is one
+/// nothing resolved: not PATH, not the npm and node prefixes, and not the desktop app's
+/// recorded launcher either. Saying it is "not on PATH" would name one of the two ways to
+/// have a CLI and leave out the other, so that case says both.
+fn spawn_failure_message(program: &str, err: &std::io::Error) -> String {
+    if program == default_program_name() && err.kind() == std::io::ErrorKind::NotFound {
+        return "No CodeBurn CLI found: nothing on PATH, and no CodeBurn desktop app to \
+                borrow one from. Install the desktop app, or run `npm install -g codeburn`."
+            .to_string();
+    }
+    format!(
+        "CodeBurn CLI not found ({}). Install it with `npm install -g codeburn`.",
+        spawn_error_summary(program, err)
+    )
+}
+
 fn default_program_name() -> String {
     #[cfg(windows)]
     {
@@ -594,6 +611,43 @@ fn locate_cli() -> Option<String> {
 /// instead of letting the console shell resolve a bare `claude`.
 fn locate_claude() -> Option<String> {
     find_in_search_dirs(&CLAUDE_NAMES)
+}
+
+/// The key the CodeBurn desktop app writes into `windows-settings.json` (the same file this
+/// app keeps its own preferences in, app/electron/menubar.ts). Its value is a `.cmd` the
+/// desktop app generates, which runs the CLI copy shipped inside the desktop app through the
+/// desktop app's own executable. On a machine where someone installed the desktop app and
+/// never ran `npm install -g codeburn`, that is the only CLI there is.
+#[cfg(windows)]
+const DESKTOP_CLI_KEY: &str = "desktopCliPath";
+
+/// The recorded launcher, or nothing. Last in the search on purpose: a real global install is
+/// what the user chose, and the desktop app's copy is what a machine has when nobody chose.
+#[cfg(windows)]
+fn recorded_desktop_cli() -> Option<String> {
+    let path = recorded_cli_candidate(&crate::settings::read())?;
+    std::path::Path::new(&path).is_file().then_some(path)
+}
+
+#[cfg(not(windows))]
+fn recorded_desktop_cli() -> Option<String> {
+    None
+}
+
+/// The shape check, apart from the disk check so it can be tested without one. A resolved
+/// program reaches a console command line through `spawn_program_in_terminal`, so a recorded
+/// path passes the same allowlist a `CODEBURN_BIN` does; and it has to be absolute for the
+/// same reason every search directory does, since a relative one would resolve against
+/// whatever directory this app was handed at login.
+#[cfg(windows)]
+fn recorded_cli_candidate(settings: &serde_json::Map<String, Value>) -> Option<String> {
+    let raw = settings.get(DESKTOP_CLI_KEY)?.as_str()?.trim();
+    if raw.is_empty() || !is_safe_arg(raw) {
+        return None;
+    }
+    std::path::Path::new(raw)
+        .is_absolute()
+        .then(|| raw.to_string())
 }
 
 /// The npm that owns this CLI install, for the update's first stage. A global npm install
@@ -1109,6 +1163,50 @@ mod tests {
         assert_eq!(find_in_dirs(&mixed, &[name]), Some(found));
 
         std::fs::remove_file(&planted).ok();
+    }
+
+    /// The lookup that lets a machine with only the CodeBurn desktop app on it have a CLI.
+    /// The disk check is the caller's; what is worth pinning is which recorded values are
+    /// allowed to become the program this app spawns.
+    #[cfg(windows)]
+    #[test]
+    fn the_desktop_apps_recorded_cli_is_taken_only_when_it_looks_like_one() {
+        fn recorded(value: Value) -> Option<String> {
+            let mut settings = serde_json::Map::new();
+            settings.insert(DESKTOP_CLI_KEY.to_string(), value);
+            recorded_cli_candidate(&settings)
+        }
+
+        let launcher = r"C:\Users\a\AppData\Local\codeburn-menubar\codeburn-cli.cmd";
+        assert_eq!(recorded(Value::from(launcher)), Some(launcher.to_string()));
+        // A path under Program Files has a space in it and is still fine.
+        let spaced = r"C:\Program Files\CodeBurn\codeburn-cli.cmd";
+        assert_eq!(recorded(Value::from(spaced)), Some(spaced.to_string()));
+
+        // The CODEBURN_BIN allowlist, for the same reason: a resolved program reaches a
+        // console command line, and nothing here may be reinterpreted there.
+        assert_eq!(recorded(Value::from(r"C:\a\codeburn.cmd & calc.exe")), None);
+        assert_eq!(recorded(Value::from("C:\\a\\\"codeburn.cmd\"")), None);
+        // A relative entry resolves against whatever directory Explorer handed this app.
+        assert_eq!(recorded(Value::from("codeburn-cli.cmd")), None);
+        assert_eq!(recorded(Value::from("")), None);
+        assert_eq!(recorded(Value::from(42)), None);
+        assert_eq!(recorded_cli_candidate(&serde_json::Map::new()), None);
+    }
+
+    /// Nothing resolved at all is a different message from a CLI that is there and would not
+    /// start, because the two have different answers.
+    #[test]
+    fn a_machine_with_no_cli_anywhere_is_told_about_both_ways_to_get_one() {
+        let missing = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        let nothing = spawn_failure_message(&default_program_name(), &missing);
+        assert!(nothing.contains("desktop app"), "{}", nothing);
+        assert!(nothing.contains("npm install -g codeburn"), "{}", nothing);
+
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let named = spawn_failure_message("/usr/local/bin/codeburn", &denied);
+        assert!(named.contains("/usr/local/bin/codeburn"), "{}", named);
+        assert!(!named.contains("desktop app"), "{}", named);
     }
 
     #[test]

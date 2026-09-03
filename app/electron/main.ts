@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell, type Men
 import path from 'node:path'
 
 import { CliError, DESKTOP_COLD_TIMEOUT_MS, PROGRESS_LINE_PREFIX, reapOrphanServe, resolveCodeburnPath, shutdownAll, spawnCli, spawnCliAction, startServe, type ActionResult, type SpawnPriority } from './cli'
-import { MenubarCompanion, type CompanionStatus } from './menubar'
+import { MenubarCompanion, STARTUP_APPS_SETTINGS_URL, type CompanionStatus } from './menubar'
 import { getQuota, sanitizeError } from './quota'
 import { Telemetry } from './telemetry'
 import { createUpdateChecker, type UpdateChecker, type UpdateStatus } from './updates'
@@ -495,12 +495,24 @@ function registerHandlers(): void {
     return { ok: true, value: res.canceled ? null : (res.filePaths[0] ?? null) }
   })
   ipcMain.handle('open-external', (_event, url: string) => {
-    try {
-      const { protocol } = new URL(url)
-      if (protocol === 'https:' || protocol === 'http:') return shell.openExternal(url)
-    } catch { /* malformed URL — refuse to open */ }
-    return
+    const allowed = externalUrlToOpen(url)
+    return allowed === null ? undefined : shell.openExternal(allowed)
   })
+}
+
+/**
+ * What the renderer may hand the shell, or null for anything else. The web is http(s) only.
+ * The one exception is the Windows Settings page for startup apps, allowed by exact value:
+ * on the Store route launch at login is the package's own startup task, so the tray pane
+ * points at that page instead of offering a switch it cannot move (app/electron/menubar.ts).
+ */
+export function externalUrlToOpen(url: string, platform: string = process.platform): string | null {
+  if (platform === 'win32' && url === STARTUP_APPS_SETTINGS_URL) return url
+  try {
+    const { protocol } = new URL(url)
+    if (protocol === 'https:' || protocol === 'http:') return url
+  } catch { /* malformed URL, refuse to open */ }
+  return null
 }
 
 export function createApplicationMenuTemplate(isDev = Boolean(process.env.VITE_DEV_SERVER_URL)): MenuItemConstructorOptions[] {

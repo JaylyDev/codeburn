@@ -76,6 +76,25 @@ The two routes need different things staged, which is why there are two scripts:
 - `npm run stage-menubar:store` (run by `package:store`) stages
   `codeburn-menubar.exe` itself, plus any sidecar DLL beside it.
 
+**The staged tray app is not the released one, even at the same version.**
+`build-windows-installer.yml` runs `npm run tauri build` itself and stages the
+MSI that run produced. `release-menubar-windows.yml` runs its own
+`npm run tauri build` on a `windows-v*` tag and uploads that MSI as the release
+asset. Two builds, two binaries: a Tauri MSI is not byte-reproducible (build
+timestamps, the package GUID and the PDB signature differ per run), so the
+`CodeBurn.Menubar_<version>_x64_en-US.msi` inside a desktop installer and the
+`windows-v<version>` release asset of the same name are different files with
+different `.sha256` digests, even off the same commit.
+
+Nothing in the install path depends on them matching: the CLI's installer
+verifies the digest of the file it was handed, and the upgrade rules go by the
+`DisplayVersion` in the uninstall registry rather than by a hash. What it does
+mean is that a version number is not a statement about which binary is on a
+machine, and the release asset is not a way to reproduce or verify what a
+desktop installer carries. So cut both from one commit when releasing, and say
+"built by the desktop installer" or "the windows-v asset" rather than treating
+the version as an identifier for either.
+
 ### The NSIS route: install through the CLI, never downgrade
 
 `app/electron/menubar.ts` runs at every launch (which is also what covers a
@@ -86,6 +105,14 @@ Electron side: `src/menubar-installer.ts` owns the uninstall-registry read, the
 checksum verification, the `msiexec /i ... /passive /norestart` call and the
 rules that go with a bundled copy. It prints one `CODEBURN_MENUBAR_RESULT <json>`
 line that the desktop app reads.
+
+The spawn itself is not made at every launch. `msiexec /passive` puts an admin
+prompt in front of the user, so `companion.v1.json` records the version of the
+tray app that is on disk and the version of any staged MSI whose install was
+declined (exit 1602) or failed. A launch skips the probe when the recorded tray
+app is the staged version and is still there, and skips it when this exact
+staged version was already refused. A newer staged version is always offered,
+and so is turning the "Menu bar" switch on by hand, which clears the refusal.
 
 Two of those rules matter here:
 
@@ -119,6 +146,15 @@ launches it from `app\resources\menubar\`. Launch at login is a
 **Settings > Apps > Startup**; no Run value is written. The tray app detects the
 package with `GetCurrentPackageFullName` and skips its own update checker
 entirely, since Store updates cover it.
+
+The startup task is Windows' to set, not this app's: reaching one would take the
+WinRT `Windows.ApplicationModel.StartupTask` API, which Electron has no binding
+for and which this app ships no native code to reach, and a Run value written
+beside it would start the tray app twice. So `trayPrefs()` reports
+`launchAtLoginManaged: true` on this route and the Menu bar pane renders that row
+as text plus a button that opens `ms-settings:startupapps`, rather than a switch
+that would silently move nothing. That URL is the one exception in the main
+process's external-open guard, which is otherwise http(s) only.
 
 ### Talking to a running tray app
 

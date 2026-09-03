@@ -15,7 +15,7 @@
 // After a write the tray app is nudged with `--reload-settings`, which makes it re-read both
 // files and broadcast to its own windows. That is done by the caller, which owns the process.
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -23,6 +23,32 @@ export type TraySettingsFile = 'app' | 'dock'
 
 function filePath(file: TraySettingsFile, home: string): string {
   return join(home, '.config', 'codeburn', file === 'app' ? 'windows-settings.json' : 'windows-dock.json')
+}
+
+/**
+ * Write a file the tray app reads, without ever showing it a half-written one.
+ *
+ * `writeFileSync` truncates the target and then fills it, and the tray app reads these files
+ * on a schedule of its own and again on every `--reload-settings`. A read landing between the
+ * two sees an empty or cut-off file, parses it as no preferences at all, and every setting in
+ * it collapses to a default. So the bytes go to a temp file in the same directory first, and
+ * the rename over the target is the only step a reader can observe: it gets the whole old
+ * file or the whole new one. The same directory matters, because a rename across volumes is
+ * a copy, and a copy is not atomic.
+ *
+ * Nothing is left behind when the rename cannot happen, and the failure is passed on rather
+ * than swallowed: a settings write that did not land must not read as one that did.
+ */
+export function writeFileAtomic(path: string, contents: string): void {
+  mkdirSync(dirname(path), { recursive: true })
+  const temp = `${path}.${process.pid}.${Date.now()}.tmp`
+  try {
+    writeFileSync(temp, contents)
+    renameSync(temp, path)
+  } catch (err) {
+    try { unlinkSync(temp) } catch { /* nothing to clean up */ }
+    throw err
+  }
 }
 
 export function readTrayFile(file: TraySettingsFile, home = homedir()): Record<string, unknown> {
@@ -42,9 +68,7 @@ export function patchTrayFile(
   home = homedir(),
 ): Record<string, unknown> {
   const merged = { ...readTrayFile(file, home), ...patch }
-  const path = filePath(file, home)
-  mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`)
+  writeFileAtomic(filePath(file, home), `${JSON.stringify(merged, null, 2)}\n`)
   return merged
 }
 

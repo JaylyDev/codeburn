@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -7,6 +7,12 @@ import {
   BUNDLED_MSI_ENV,
   BUNDLED_RESULT_PREFIX,
   MenubarCompanion,
+  TRAY_CLI_ENV,
+  TRAY_CLI_PATH_KEY,
+  DEFAULT_COMPANION_SETTINGS,
+  cliLauncherPath,
+  cliLauncherScript,
+  companionDataDir,
   dockPrefsPath,
   findPackagedTrayExe,
   findStagedMsi,
@@ -16,11 +22,12 @@ import {
   readDockEnabled,
   runKeyArgs,
   system32Path,
+  writeCliLauncher,
   writeCompanionSettings,
   writeDockEnabled,
   type MenubarInstallResult,
 } from './menubar'
-import { readTrayFile } from './tray-settings'
+import { DEFAULT_TRAY_APP_PREFS, DEFAULT_TRAY_DOCK_PREFS, readTrayFile } from './tray-settings'
 
 const VERSION = '0.9.23'
 const MSI_NAME = `CodeBurn.Menubar_${VERSION}_x64_en-US.msi`
@@ -158,12 +165,12 @@ describe('companion settings', () => {
   afterEach(() => { rmSync(stateDir, { recursive: true, force: true }) })
 
   it('defaults both switches on before anything has been written', () => {
-    expect(readCompanionSettings(stateDir)).toEqual({ menuBar: true, sidebar: true, trayExePath: null, seeded: false })
+    expect(readCompanionSettings(stateDir)).toEqual(DEFAULT_COMPANION_SETTINGS)
   })
 
   it('round-trips, and falls back to the defaults on an unreadable file', () => {
-    writeCompanionSettings(stateDir, { menuBar: false, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
-    expect(readCompanionSettings(stateDir)).toEqual({ menuBar: false, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+    writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: false, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+    expect(readCompanionSettings(stateDir)).toEqual({ ...DEFAULT_COMPANION_SETTINGS, menuBar: false, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
 
     writeFileSync(join(stateDir, 'companion.v1.json'), '{ broken')
     expect(readCompanionSettings(stateDir).menuBar).toBe(true)
@@ -173,10 +180,84 @@ describe('companion settings', () => {
   // re-enables the rail. A byte order mark, which anything editing this file by hand on
   // Windows tends to leave, is not a good enough reason for that.
   it('reads a file that was saved with a byte order mark', () => {
-    const settings = { menuBar: false, sidebar: false, trayExePath: TRAY_EXE, seeded: true }
+    const settings = { ...DEFAULT_COMPANION_SETTINGS, menuBar: false, sidebar: false, trayExePath: TRAY_EXE, seeded: true }
     writeFileSync(join(stateDir, 'companion.v1.json'), `﻿${JSON.stringify(settings)}`)
 
     expect(readCompanionSettings(stateDir)).toEqual(settings)
+  })
+})
+
+// The launcher the desktop app leaves for the tray app, which is the only CLI a machine with
+// no global `npm install -g codeburn` has.
+describe('the tray app\u2019s CLI launcher', () => {
+  const EXEC = 'C:\\Program Files\\CodeBurn\\CodeBurn.exe'
+  let sandbox: string
+  let home: string
+  let entry: string
+
+  function opts(overrides: Record<string, unknown> = {}) {
+    return {
+      platform: 'win32',
+      env: { LOCALAPPDATA: join(sandbox, 'Local'), CODEBURN_BUNDLED_CLI: entry },
+      home,
+      execPath: EXEC,
+      ...overrides,
+    }
+  }
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), 'companion-launcher-'))
+    home = join(sandbox, 'home')
+    entry = join(sandbox, 'resources', 'cli', 'dist', 'launch.js')
+    mkdirSync(join(sandbox, 'resources', 'cli', 'dist'), { recursive: true })
+    writeFileSync(entry, '// the bundled CLI')
+  })
+
+  afterEach(() => { rmSync(sandbox, { recursive: true, force: true }) })
+
+  it('sits beside the tray app\u2019s own install marker', () => {
+    expect(companionDataDir({ LOCALAPPDATA: 'D:\\Local' }, home)).toBe('D:\\Local\\codeburn-menubar')
+    // A Windows session without the variable is not a session without the directory.
+    expect(companionDataDir({}, home)).toBe(join(home, 'AppData', 'Local', 'codeburn-menubar'))
+    expect(cliLauncherPath({ LOCALAPPDATA: 'D:\\Local' }, home)).toBe('D:\\Local\\codeburn-menubar\\codeburn-cli.cmd')
+  })
+
+  it('runs the bundled CLI through the desktop app\u2019s executable, forwarding everything', () => {
+    const path = writeCliLauncher(opts())
+
+    expect(path).toBe(join(sandbox, 'Local', 'codeburn-menubar', 'codeburn-cli.cmd'))
+    const script = readFileSync(path as string, 'utf8')
+    expect(script).toContain('set "ELECTRON_RUN_AS_NODE=1"')
+    expect(script).toContain(`"${EXEC}" "${entry}" %*`)
+    // The tray app reads the exit code of everything it spawns.
+    expect(script).toContain('exit /b %ERRORLEVEL%')
+  })
+
+  it('is rewritten by an updated desktop app rather than left pointing at the old one', () => {
+    writeCliLauncher(opts())
+    const path = writeCliLauncher(opts({ execPath: 'C:\\Program Files\\CodeBurn\\CodeBurn2.exe' }))
+
+    expect(readFileSync(path as string, 'utf8')).toContain('CodeBurn2.exe')
+  })
+
+  it('writes nothing off Windows, or in a build that carries no CLI', () => {
+    expect(writeCliLauncher(opts({ platform: 'darwin' }))).toBeNull()
+    expect(existsSync(join(sandbox, 'Local'))).toBe(false)
+
+    // Dev: CODEBURN_BUNDLED_CLI is unset because the repo's own build is used instead.
+    expect(writeCliLauncher(opts({ env: { LOCALAPPDATA: join(sandbox, 'Local') } }))).toBeNull()
+    // A packaged build whose resources were not staged.
+    expect(writeCliLauncher(opts({
+      env: { LOCALAPPDATA: join(sandbox, 'Local'), CODEBURN_BUNDLED_CLI: join(sandbox, 'missing.js') },
+    }))).toBeNull()
+  })
+
+  // The alternative to refusing is writing a batch file that means something other than
+  // what it says, which is worse than having no launcher at all.
+  it('refuses a path cmd.exe would read rather than pass along', () => {
+    expect(cliLauncherScript('C:\\App\\Code"Burn.exe', 'C:\\App\\launch.js')).toBeNull()
+    expect(cliLauncherScript('C:\\App\\CodeBurn.exe', 'C:\\App\\%PATH%\\launch.js')).toBeNull()
+    expect(cliLauncherScript('', 'C:\\App\\launch.js')).toBeNull()
   })
 })
 
@@ -186,6 +267,8 @@ describe('MenubarCompanion', () => {
   let stateDir: string
   let home: string
   let launches: Array<{ exe: string; args: string[] }>
+  /** The env each launch was given, in step with `launches`. */
+  let launchEnvs: Array<NodeJS.ProcessEnv | undefined>
   let regCalls: string[][]
   let cliCalls: Array<{ args: string[]; env: NodeJS.ProcessEnv | undefined }>
   let installResult: MenubarInstallResult | null
@@ -202,7 +285,10 @@ describe('MenubarCompanion', () => {
       platform: 'win32',
       env: { SystemRoot: 'C:\\Windows' },
       home,
-      launch: (exe: string, args: string[]) => { launches.push({ exe, args }) },
+      launch: (exe: string, args: string[], extraEnv?: NodeJS.ProcessEnv) => {
+        launches.push({ exe, args })
+        launchEnvs.push(extraEnv)
+      },
       runReg: async (args: string[]) => { regCalls.push(args) },
       readRunKey: async () => existingRunKey,
       isRunning: async () => trayRunning,
@@ -220,9 +306,12 @@ describe('MenubarCompanion', () => {
     }
   }
 
-  function stageMsi(): void {
+  function stageMsi(version = VERSION): void {
     mkdirSync(join(resources, 'menubar'), { recursive: true })
-    writeFileSync(join(resources, 'menubar', MSI_NAME), 'msi')
+    for (const name of readdirSync(join(resources, 'menubar'))) {
+      if (name.endsWith('.msi')) rmSync(join(resources, 'menubar', name))
+    }
+    writeFileSync(join(resources, 'menubar', `CodeBurn.Menubar_${version}_x64_en-US.msi`), 'msi')
   }
 
   function stageExe(): string {
@@ -240,6 +329,7 @@ describe('MenubarCompanion', () => {
     home = join(sandbox, 'home')
     mkdirSync(resources, { recursive: true })
     launches = []
+    launchEnvs = []
     regCalls = []
     cliCalls = []
     installResult = result()
@@ -332,7 +422,7 @@ describe('MenubarCompanion', () => {
 
   it('does nothing at all with the Menu bar switch off', async () => {
     stageMsi()
-    writeCompanionSettings(stateDir, { menuBar: false, sidebar: true, trayExePath: null, seeded: true })
+    writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: false, sidebar: true, trayExePath: null, seeded: true })
 
     await new MenubarCompanion(deps()).bootstrap()
 
@@ -364,7 +454,7 @@ describe('MenubarCompanion', () => {
 
   it('keeps a working tray app when the installer reports nothing at all', async () => {
     stageMsi()
-    writeCompanionSettings(stateDir, { menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+    writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
     installResult = null
     const error = vi.spyOn(console, 'error').mockImplementation(() => {})
 
@@ -374,13 +464,150 @@ describe('MenubarCompanion', () => {
     error.mockRestore()
   })
 
+
+  // The install probe used to run at every launch. A real install runs msiexec /passive,
+  // which is an admin prompt, so a launch with nothing to install must not spawn one and a
+  // person who said no must not be asked again for the same file.
+  describe('not asking again', () => {
+    it('skips the probe entirely once the staged version is the one on disk', async () => {
+      stageMsi()
+      await new MenubarCompanion(deps()).bootstrap()
+      expect(cliCalls).toHaveLength(1)
+      expect(readCompanionSettings(stateDir)).toMatchObject({ trayExeVersion: VERSION })
+
+      cliCalls = []
+      await new MenubarCompanion(deps()).bootstrap()
+
+      expect(cliCalls).toEqual([])
+      // Everything downstream of the install still happens.
+      expect(launches).toEqual([
+        { exe: TRAY_EXE, args: ['--reload-settings'] },
+        { exe: TRAY_EXE, args: ['--reload-settings'] },
+      ])
+    })
+
+    it('probes again when the recorded tray app is no longer on disk', async () => {
+      stageMsi()
+      await new MenubarCompanion(deps()).bootstrap()
+      cliCalls = []
+      present.delete(TRAY_EXE)
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      await new MenubarCompanion(deps()).bootstrap()
+
+      expect(cliCalls).toHaveLength(1)
+      error.mockRestore()
+    })
+
+    it('probes again when the desktop app brings a newer tray app with it', async () => {
+      stageMsi()
+      await new MenubarCompanion(deps()).bootstrap()
+      cliCalls = []
+      stageMsi('0.9.24')
+      installResult = result({ bundledVersion: '0.9.24' })
+
+      await new MenubarCompanion(deps()).bootstrap()
+
+      expect(cliCalls).toHaveLength(1)
+      expect(readCompanionSettings(stateDir).trayExeVersion).toBe('0.9.24')
+    })
+
+    it('does not put the admin prompt up again after it was declined', async () => {
+      stageMsi()
+      installResult = result({ action: 'cancelled', exePath: '', installedBy: null })
+      await new MenubarCompanion(deps()).bootstrap()
+      expect(cliCalls).toHaveLength(1)
+      expect(readCompanionSettings(stateDir).installDeclinedVersion).toBe(VERSION)
+
+      cliCalls = []
+      await new MenubarCompanion(deps()).bootstrap()
+
+      expect(cliCalls).toEqual([])
+      expect(launches).toEqual([])
+    })
+
+    it('remembers an install that failed outright the same way', async () => {
+      stageMsi()
+      installResult = null
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+      await new MenubarCompanion(deps()).bootstrap()
+      expect(readCompanionSettings(stateDir).installDeclinedVersion).toBe(VERSION)
+
+      cliCalls = []
+      await new MenubarCompanion(deps()).bootstrap()
+
+      expect(cliCalls).toEqual([])
+      error.mockRestore()
+    })
+
+    it('asks again when a declined version is superseded by a newer one', async () => {
+      stageMsi()
+      installResult = result({ action: 'cancelled', exePath: '', installedBy: null })
+      await new MenubarCompanion(deps()).bootstrap()
+      cliCalls = []
+      stageMsi('0.9.24')
+      installResult = result({ bundledVersion: '0.9.24' })
+
+      await new MenubarCompanion(deps()).bootstrap()
+
+      expect(cliCalls).toHaveLength(1)
+      expect(readCompanionSettings(stateDir).installDeclinedVersion).toBeNull()
+    })
+
+    // The one retry left: this time the person asked, rather than being asked.
+    it('offers a declined install again when Menu bar is switched on by hand', async () => {
+      stageMsi()
+      installResult = result({ action: 'cancelled', exePath: '', installedBy: null })
+      const companion = new MenubarCompanion(deps())
+      await companion.bootstrap()
+      cliCalls = []
+      installResult = result()
+
+      const status = await companion.setMenuBarEnabled(true)
+
+      expect(cliCalls).toHaveLength(1)
+      expect(status.menuBar).toBe(true)
+      expect(readCompanionSettings(stateDir)).toMatchObject({
+        installDeclinedVersion: null,
+        trayExePath: TRAY_EXE,
+      })
+    })
+  })
+
+  // Launch at login on the Store route is the package manifest's own startup task
+  // (app/build/appx-extensions.xml), which only Windows can turn on and off.
+  describe('launch at login', () => {
+    it('is this app’s to set on the NSIS route', async () => {
+      stageMsi()
+      existingRunKey = `"${TRAY_EXE}"`
+      const companion = new MenubarCompanion(deps())
+
+      expect(await companion.trayPrefs()).toMatchObject({ launchAtLogin: true, launchAtLoginManaged: false })
+
+      await companion.setLaunchAtLogin(false)
+      expect(regCalls).toContainEqual(runKeyArgs(false, TRAY_EXE))
+    })
+
+    it('is Windows’ to set on the Store route, and this app writes no Run value for it', async () => {
+      stageExe()
+      const companion = new MenubarCompanion(deps({ store: true }))
+
+      const prefs = await companion.trayPrefs()
+      expect(prefs.launchAtLoginManaged).toBe(true)
+
+      // The switch is not rendered there, but the method must not half-do it either.
+      expect(await companion.setLaunchAtLogin(true)).toMatchObject({ launchAtLoginManaged: true })
+      expect(regCalls).toEqual([])
+    })
+  })
+
   // A stored path can be wrong: written by a build that derived the binary name from the
   // product name, or left behind by a tray app that has since been uninstalled.
   const STALE_EXE = 'C:\\Program Files\\CodeBurn Menubar\\CodeBurn Menubar.exe'
 
   it('re-resolves a stored path that is not on disk rather than launching it', async () => {
     stageMsi()
-    writeCompanionSettings(stateDir, { menuBar: false, sidebar: true, trayExePath: STALE_EXE, seeded: true })
+    writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: false, sidebar: true, trayExePath: STALE_EXE, seeded: true })
 
     await new MenubarCompanion(deps()).setMenuBarEnabled(true)
 
@@ -392,7 +619,7 @@ describe('MenubarCompanion', () => {
 
   it('does not send --quit into the void when the stored path is stale', async () => {
     stageMsi()
-    writeCompanionSettings(stateDir, { menuBar: true, sidebar: true, trayExePath: STALE_EXE, seeded: true })
+    writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: true, sidebar: true, trayExePath: STALE_EXE, seeded: true })
 
     await new MenubarCompanion(deps()).setMenuBarEnabled(false)
 
@@ -417,7 +644,7 @@ describe('MenubarCompanion', () => {
   it('repairs a Run value that points at a file which is not there', async () => {
     stageMsi()
     // Not a first run, so the seed rule would normally leave an existing value alone.
-    writeCompanionSettings(stateDir, { menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+    writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
     existingRunKey = `"${STALE_EXE}"`
 
     await new MenubarCompanion(deps()).bootstrap()
@@ -427,7 +654,7 @@ describe('MenubarCompanion', () => {
 
   it('still leaves a Run value alone when it points at something real', async () => {
     stageMsi()
-    writeCompanionSettings(stateDir, { menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+    writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
     const other = 'C:\\Somewhere\\else.exe'
     present.add(other)
     existingRunKey = `"${other}"`
@@ -439,7 +666,7 @@ describe('MenubarCompanion', () => {
 
   it('Menu bar off quits the tray app and drops the Run value', async () => {
     stageMsi()
-    writeCompanionSettings(stateDir, { menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+    writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
     const companion = new MenubarCompanion(deps())
 
     const status = await companion.setMenuBarEnabled(false)
@@ -451,7 +678,7 @@ describe('MenubarCompanion', () => {
 
   it('Menu bar on right after off waits for the old process before starting again', async () => {
     stageMsi()
-    writeCompanionSettings(stateDir, { menuBar: true, sidebar: false, trayExePath: TRAY_EXE, seeded: true })
+    writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: true, sidebar: false, trayExePath: TRAY_EXE, seeded: true })
     const companion = new MenubarCompanion(deps())
     await companion.setMenuBarEnabled(false)
     trayRunning = true
@@ -470,7 +697,7 @@ describe('MenubarCompanion', () => {
 
   it('Menu bar on installs if it has to, then starts the tray app again', async () => {
     stageMsi()
-    writeCompanionSettings(stateDir, { menuBar: false, sidebar: true, trayExePath: null, seeded: true })
+    writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: false, sidebar: true, trayExePath: null, seeded: true })
 
     const status = await new MenubarCompanion(deps()).setMenuBarEnabled(true)
 
@@ -483,7 +710,7 @@ describe('MenubarCompanion', () => {
   // The rail is a window of the tray app, so the two switches cannot disagree.
   it('Menu bar off turns Sidebar off with it, writing the preference before the quit', async () => {
     stageMsi()
-    writeCompanionSettings(stateDir, { menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+    writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
     writeDockEnabled(true, home)
     const companion = new MenubarCompanion(deps())
 
@@ -498,7 +725,7 @@ describe('MenubarCompanion', () => {
 
   it('Sidebar on with Menu bar off turns the tray app on first', async () => {
     stageMsi()
-    writeCompanionSettings(stateDir, { menuBar: false, sidebar: false, trayExePath: null, seeded: true })
+    writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: false, sidebar: false, trayExePath: null, seeded: true })
 
     const status = await new MenubarCompanion(deps()).setSidebarEnabled(true)
 
@@ -515,7 +742,7 @@ describe('MenubarCompanion', () => {
 
   it('leaves both switches off when the tray app cannot be turned on', async () => {
     stageMsi()
-    writeCompanionSettings(stateDir, { menuBar: false, sidebar: false, trayExePath: null, seeded: true })
+    writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: false, sidebar: false, trayExePath: null, seeded: true })
     installResult = result({ action: 'cancelled', exePath: '', installedBy: null })
 
     const status = await new MenubarCompanion(deps()).setSidebarEnabled(true)
@@ -527,7 +754,7 @@ describe('MenubarCompanion', () => {
 
   it('Sidebar off writes the preference and asks a running tray app to notice', async () => {
     stageMsi()
-    writeCompanionSettings(stateDir, { menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+    writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
 
     const status = await new MenubarCompanion(deps()).setSidebarEnabled(false)
 
@@ -542,7 +769,7 @@ describe('MenubarCompanion', () => {
 
     function running(): MenubarCompanion {
       stageMsi()
-      writeCompanionSettings(stateDir, { menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+      writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
       return new MenubarCompanion(deps())
     }
 
@@ -625,9 +852,122 @@ describe('MenubarCompanion', () => {
     })
   })
 
+  // A machine with only the desktop app on it has no `codeburn` anywhere the tray app looks,
+  // so the desktop app leaves it one and says where.
+  describe('the CLI it leaves for the tray app', () => {
+    const EXEC = 'C:\\Program Files\\CodeBurn\\CodeBurn.exe'
+    let entry: string
+
+    function withCli(overrides: Record<string, unknown> = {}) {
+      return deps({
+        execPath: EXEC,
+        env: { SystemRoot: 'C:\\Windows', LOCALAPPDATA: join(sandbox, 'Local'), CODEBURN_BUNDLED_CLI: entry },
+        ...overrides,
+      })
+    }
+
+    beforeEach(() => {
+      entry = join(sandbox, 'resources', 'cli', 'dist', 'launch.js')
+      mkdirSync(join(sandbox, 'resources', 'cli', 'dist'), { recursive: true })
+      writeFileSync(entry, '// the bundled CLI')
+      present.add(entry)
+    })
+
+    it('writes the launcher and records it where an autostarted tray app will read it', async () => {
+      stageMsi()
+      // A key the tray app owns, which the record must not cost it.
+      mkdirSync(join(home, '.config', 'codeburn'), { recursive: true })
+      writeFileSync(join(home, '.config', 'codeburn', 'windows-settings.json'), JSON.stringify({ accent: 'green' }))
+
+      await new MenubarCompanion(withCli()).bootstrap()
+
+      const launcher = cliLauncherPath({ LOCALAPPDATA: join(sandbox, 'Local') }, home)
+      expect(readFileSync(launcher, 'utf8')).toContain(`"${EXEC}" "${entry}" %*`)
+      expect(readTrayFile('app', home)).toEqual({ accent: 'green', [TRAY_CLI_PATH_KEY]: launcher })
+    })
+
+    // Reading the file is what covers a login start; this is what covers the very first
+    // launch, before the tray app has read anything at all.
+    it('hands the launcher to every tray app it starts', async () => {
+      stageMsi()
+      const companion = new MenubarCompanion(withCli())
+
+      await companion.bootstrap()
+      await companion.setSidebarEnabled(false)
+
+      const launcher = cliLauncherPath({ LOCALAPPDATA: join(sandbox, 'Local') }, home)
+      expect(launches).toHaveLength(2)
+      expect(launchEnvs).toEqual([{ [TRAY_CLI_ENV]: launcher }, { [TRAY_CLI_ENV]: launcher }])
+    })
+
+    it('leaves the switch off out of it: a login start needs the launcher either way', async () => {
+      stageMsi()
+      writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: false, sidebar: false, trayExePath: null, seeded: true })
+
+      await new MenubarCompanion(withCli()).bootstrap()
+
+      expect(launches).toEqual([])
+      expect(readTrayFile('app', home)[TRAY_CLI_PATH_KEY])
+        .toBe(cliLauncherPath({ LOCALAPPDATA: join(sandbox, 'Local') }, home))
+    })
+
+    it('writes nothing and records nothing in a build that carries no CLI', async () => {
+      stageMsi()
+
+      await new MenubarCompanion(deps({ execPath: EXEC })).bootstrap()
+
+      expect(readTrayFile('app', home)).toEqual({})
+      expect(launchEnvs).toEqual([undefined])
+    })
+  })
+
+  // These four are registered as IPC handlers on every platform, and every one of them
+  // reads or writes a file, or a registry value, that only a Windows tray app owns.
+  describe('the tray preference methods where there is no tray app', () => {
+    const NEUTRAL = { app: DEFAULT_TRAY_APP_PREFS, dock: DEFAULT_TRAY_DOCK_PREFS, launchAtLogin: false, launchAtLoginManaged: false }
+
+    function unsupported(): MenubarCompanion {
+      stageMsi()
+      writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+      existingRunKey = `"${TRAY_EXE}"`
+      return new MenubarCompanion(deps({ platform: 'darwin' }))
+    }
+
+    it('trayPrefs reads no file and answers with the defaults', async () => {
+      const companion = unsupported()
+      mkdirSync(join(home, '.config', 'codeburn'), { recursive: true })
+      writeFileSync(join(home, '.config', 'codeburn', 'windows-settings.json'), JSON.stringify({ metric: 'tokens' }))
+      writeDockEnabled(true, home)
+
+      expect(await companion.trayPrefs()).toEqual(NEUTRAL)
+    })
+
+    it('setTrayAppPref writes nothing', async () => {
+      expect(await unsupported().setTrayAppPref({ metric: 'iconOnly' })).toEqual(NEUTRAL)
+      expect(readTrayFile('app', home)).toEqual({})
+      expect(launches).toEqual([])
+    })
+
+    it('setTrayDockPref writes nothing, and cannot reach the Sidebar switch either', async () => {
+      const companion = unsupported()
+
+      expect(await companion.setTrayDockPref({ scale: 1.1 })).toEqual(NEUTRAL)
+      expect(await companion.setTrayDockPref({ enabled: false })).toEqual(NEUTRAL)
+
+      expect(readDockEnabled(home)).toBeUndefined()
+      expect(companion.status().sidebar).toBe(true)
+      expect(launches).toEqual([])
+    })
+
+    it('setLaunchAtLogin runs no reg.exe', async () => {
+      expect(await unsupported().setLaunchAtLogin(true)).toEqual(NEUTRAL)
+      expect(regCalls).toEqual([])
+    })
+  })
+
   it('Sidebar off with the tray app off writes the preference and tells nobody', async () => {
     stageMsi()
-    writeCompanionSettings(stateDir, { menuBar: false, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+    writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: false, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
     writeDockEnabled(true, home)
 
     await new MenubarCompanion(deps()).setSidebarEnabled(false)

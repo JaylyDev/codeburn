@@ -708,6 +708,10 @@ export type TrayPrefs = {
     manualSelection: boolean
   }
   launchAtLogin: boolean
+  /** True where launch at login belongs to Windows rather than to this app: the Store
+   *  package declares it as its own startup task, so the pane points at Settings > Apps >
+   *  Startup instead of showing a switch (app/electron/menubar.ts). */
+  launchAtLoginManaged: boolean
 }
 
 export interface CodeburnBridge {

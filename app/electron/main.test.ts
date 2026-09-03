@@ -14,7 +14,7 @@ vi.mock('electron', () => ({
   shell: { openExternal: vi.fn() },
 }))
 
-import { createApplicationMenuTemplate, createBeforeQuitHandler, createBridgeHandlers } from './main'
+import { createApplicationMenuTemplate, createBeforeQuitHandler, createBridgeHandlers, externalUrlToOpen } from './main'
 import { CliError } from './cli'
 import { Telemetry } from './telemetry'
 
@@ -759,5 +759,27 @@ describe('createBridgeHandlers (telemetry wiring)', () => {
     expect(props).toEqual({ cmd: 'sessions', kind: 'not-found', detail: 'spawn-error' })
     expect(JSON.stringify(props)).not.toContain('secret')
     expect(JSON.stringify(props)).not.toContain('C:\\')
+  })
+})
+
+// The renderer hands this a URL and the main process hands it to the shell, so the guard is
+// what keeps a page from opening anything but the web. See app/electron/main.ts.
+describe('externalUrlToOpen', () => {
+  it('allows the web and nothing else', () => {
+    expect(externalUrlToOpen('https://github.com/getagentseal/codeburn')).toBe('https://github.com/getagentseal/codeburn')
+    expect(externalUrlToOpen('http://localhost:5173/')).toBe('http://localhost:5173/')
+    expect(externalUrlToOpen('file:///etc/passwd')).toBeNull()
+    expect(externalUrlToOpen('javascript:alert(1)')).toBeNull()
+    expect(externalUrlToOpen('not a url')).toBeNull()
+    expect(externalUrlToOpen('')).toBeNull()
+  })
+
+  // The one exception, by exact value: the Store build's Menu bar pane opens the Windows page
+  // that owns launch at login there.
+  it('allows the Windows startup-apps page on Windows, by exact value', () => {
+    expect(externalUrlToOpen('ms-settings:startupapps', 'win32')).toBe('ms-settings:startupapps')
+    expect(externalUrlToOpen('ms-settings:startupapps', 'darwin')).toBeNull()
+    expect(externalUrlToOpen('ms-settings:privacy-webcam', 'win32')).toBeNull()
+    expect(externalUrlToOpen('ms-settings:startupapps&more', 'win32')).toBeNull()
   })
 })
