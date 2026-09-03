@@ -20,6 +20,7 @@ import { PROVIDER_NAMES, QUOTA_PROVIDERS, readDisabledProviders, writeDisabledPr
 import { REFRESH_OPTIONS, useRefreshCadence } from '../lib/refreshCadence'
 import { reportMemoKey } from '../lib/reportMemoKey'
 import { showToast } from '../lib/toast'
+import { trackEvent } from '../lib/track'
 import { ToastHost } from '../components/ToastHost'
 import { rateLimitedNote } from './Plans'
 import { SharingPane } from './SettingsSharing'
@@ -214,6 +215,7 @@ function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, 
   const chooseTheme = (next: Theme) => {
     setTheme(next)
     writeSetting('codeburn.theme', next)
+    trackEvent('settings_change', { setting: 'theme', value: next })
   }
   const finishCurrency = (result: ActionResult) => {
     showToast(result.ok ? 'Updated' : result.stderr || 'Unable to update currency', result.ok ? 'ok' : 'error')
@@ -245,10 +247,10 @@ function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, 
         <div className="about-sec">
           <div className="about-sec-h">Display</div>
           <div className="about-row"><label className="tx" htmlFor="settings-currency">Currency</label><span className="r">
-            {plans.data ? <Dropdown id="settings-currency" ariaLabel="Currency" value={plans.data.currency} options={currencies.map(code => ({ value: code, label: code }))} onChange={value => void codeburn.setCurrency(value).then(finishCurrency)} width={92} /> : plans.error ? <SettingsErrorText error={plans.error} /> : <span className="set-cap">Loading…</span>}
-            <button className="set-text-button" onClick={() => void codeburn.resetCurrency().then(finishCurrency)}>Reset to USD</button>
+            {plans.data ? <Dropdown id="settings-currency" ariaLabel="Currency" value={plans.data.currency} options={currencies.map(code => ({ value: code, label: code }))} onChange={value => { trackEvent('settings_change', { setting: 'currency', value }); void codeburn.setCurrency(value).then(finishCurrency) }} width={92} /> : plans.error ? <SettingsErrorText error={plans.error} /> : <span className="set-cap">Loading…</span>}
+            <button className="set-text-button" onClick={() => { trackEvent('settings_change', { setting: 'currency', value: 'USD' }); void codeburn.resetCurrency().then(finishCurrency) }}>Reset to USD</button>
           </span></div>
-          <div className="about-row"><label className="tx" htmlFor="settings-period">Default period<small>Applied on next launch.</small></label><span className="r"><Dropdown id="settings-period" ariaLabel="Default period" value={defaultPeriod} options={[{ value: 'today', label: 'Today' }, { value: 'week', label: '7d' }, { value: '30days', label: '30d' }, { value: 'month', label: 'Month' }, { value: 'all', label: 'All' }]} onChange={value => { setDefaultPeriod(value); writeSetting('codeburn.defaultPeriod', value) }} width={92} /></span></div>
+          <div className="about-row"><label className="tx" htmlFor="settings-period">Default period<small>Applied on next launch.</small></label><span className="r"><Dropdown id="settings-period" ariaLabel="Default period" value={defaultPeriod} options={[{ value: 'today', label: 'Today' }, { value: 'week', label: '7d' }, { value: '30days', label: '30d' }, { value: 'month', label: 'Month' }, { value: 'all', label: 'All' }]} onChange={value => { setDefaultPeriod(value); writeSetting('codeburn.defaultPeriod', value); trackEvent('settings_change', { setting: 'defaultPeriod', value }) }} width={92} /></span></div>
           <div className="about-row"><label className="tx" htmlFor="settings-scope">Scope<small>Combined aggregates usage across every paired device, like the menubar. Local shows this device only.</small></label><span className="r"><Dropdown id="settings-scope" ariaLabel="Scope" value={scope} options={[{ value: 'local', label: 'Local' }, { value: 'combined', label: 'Combined' }]} onChange={value => onScopeChange?.(value)} width={110} /></span></div>
           <div className="about-row"><label className="tx" htmlFor="settings-refresh">Refresh every<small>Runs automatically at this interval. Press {shortcutLabel('R')} to refresh sooner.</small></label><span className="r"><Dropdown id="settings-refresh" ariaLabel="Refresh every" value={cadence.value} options={REFRESH_OPTIONS.map(option => ({ value: option.value, label: option.label }))} onChange={cadence.setValue} width={124} /></span></div>
           <div className="about-row"><label className="tx" htmlFor="settings-budget">Daily budget<small>Warns at 80%, alerts at 100%.</small></label><span className="r"><Dropdown id="settings-budget" ariaLabel="Daily budget" value={budgetKind} options={[{ value: 'off', label: 'Off' }, { value: 'usd', label: 'USD amount' }, { value: 'tokens', label: 'Tokens' }]} onChange={value => { const kind = value as 'off' | 'usd' | 'tokens'; setBudgetKind(kind); persistBudget(kind, budgetInput) }} width={120} />{budgetKind !== 'off' && <input className="set-input" type="text" inputMode="decimal" aria-label="Daily budget amount" placeholder={budgetKind === 'usd' ? 'USD' : 'tokens'} value={budgetInput} onChange={event => { setBudgetInput(event.target.value); persistBudget(budgetKind, event.target.value) }} style={{ width: 90 }} />}</span></div>
@@ -429,6 +431,7 @@ function PlansPane({ period, refreshToken, onNavigate, onConfigMutated }: { peri
   }
   const add = () => {
     const preset = MANUAL_PLAN_PRESETS.find(item => item.id === presetId)!
+    trackEvent('plan_set', { provider: preset.provider, plan: preset.id })
     void codeburn.setPlan(preset.id, preset.provider).then(finish)
   }
 
@@ -479,6 +482,9 @@ function ExportPane({ period, refreshToken }: { period: Period; refreshToken: nu
     if (!destination) return
     setExporting(true)
     try {
+      // Format and provider only. The destination is a real path on this
+      // machine and never leaves it.
+      trackEvent('export', { format, provider })
       const result = await codeburn.exportData(format, provider, destination)
       showToast(result.ok ? `Exported to ${destination}` : (result.stderr || 'Export failed'), result.ok ? 'ok' : 'error')
     } finally {
@@ -534,6 +540,9 @@ function TelemetryClaim() {
   if (!status) return null
   const toggle = () => {
     if (typeof codeburn.setTelemetryEnabled !== 'function') return
+    // Only the opt-IN is reportable: turning telemetry off mints a fresh install
+    // id and drops the queue, so an opt-out event would never be sent anyway.
+    if (!status.enabled) trackEvent('settings_change', { setting: 'telemetry', value: true })
     codeburn.setTelemetryEnabled(!status.enabled).then(value => setStatus(value)).catch(() => {})
   }
   return <div className="set-claim"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19v-5M9 19V9M14 19v-8M19 19V5" /></svg><div style={{ flex: 1 }}><div className="set-claim-t">Anonymous telemetry</div><div className="set-claim-d">Optional usage statistics: model mix, task success, performance and errors. Never prompts, code or anything identifying.</div></div>

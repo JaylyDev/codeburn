@@ -19,6 +19,7 @@ import { formatCompact, formatUsd, setActiveCurrency } from './lib/format'
 import { motionClass } from './lib/motion'
 import { clearOverviewHeadlines, readOverviewHeadline, writeOverviewHeadline } from './lib/overviewSnapshot'
 import { codeburn } from './lib/ipc'
+import { trackEvent } from './lib/track'
 import { isModifierChord, shortcutLabel } from './lib/platform'
 import { localDateKey, PERIOD_LABELS } from './lib/period'
 import { readDisabledProviders } from './lib/providers'
@@ -71,7 +72,11 @@ export function topCategoryByModel(rows: ModelReportRow[]): Map<string, string> 
   return map
 }
 
-/** The once-per-day anonymous aggregate (main process dedups by calendar day). */
+/** The once-per-day anonymous aggregate, built in the renderer.
+ * Fallback only: current CLIs compute the richer `payload.telemetrySnapshot`
+ * (src/telemetry-snapshot.ts) so the desktop app and the Windows tray send the
+ * identical shape. This builder covers a CLI that predates that field.
+ * The main process dedups the event by calendar day either way. */
 export function usageSnapshotProps(payload: MenubarPayload, modelCategories?: Map<string, string>): Record<string, unknown> {
   return {
     period: payload.current.label,
@@ -354,16 +359,13 @@ function AppMain() {
     if (typeof codeburn.completeOnboarding === 'function') void codeburn.completeOnboarding(enabled).catch(() => {})
   }, [])
 
-  const trackEvent = useCallback((name: string, props?: Record<string, unknown>) => {
-    if (typeof codeburn.telemetryTrack === 'function') void codeburn.telemetryTrack(name, props).catch(() => {})
-  }, [])
-
   // Once-per-day anonymous usage aggregate, only from the canonical view
   // (all providers, standard period, no config scope) so buckets are stable.
-  // Gated to the first qualifying render per calendar day so the extra by-model
-  // report fetch runs at most once/day, not on every poll (main also dedups the
-  // event). The fetch enriches each model with its dominant task category; if it
-  // fails we still emit the snapshot, just without the model x category cross.
+  // Gated to the first qualifying render per calendar day (main also dedups the
+  // event). Current CLIs hand us the finished, already-bucketed snapshot and we
+  // forward it verbatim; only an older CLI falls back to the renderer builder,
+  // which needs an extra by-model report fetch to get the model x category cross
+  // and still emits without it if that fetch fails.
   const snapshotDayRef = useRef<string | null>(null)
   useEffect(() => {
     if (!overview.data || provider !== 'all' || customRange || claudeConfigSource || scope !== 'local') return
@@ -371,6 +373,11 @@ function AppMain() {
     if (snapshotDayRef.current === today) return
     snapshotDayRef.current = today
     const payload = overview.data
+    const fromCli = payload.telemetrySnapshot
+    if (fromCli && typeof fromCli === 'object') {
+      trackEvent('usage_snapshot', fromCli)
+      return
+    }
     void (async () => {
       let modelCategories: Map<string, string> | undefined
       try {
@@ -378,7 +385,7 @@ function AppMain() {
       } catch { /* degrade: emit the snapshot without per-model topCategory */ }
       trackEvent('usage_snapshot', usageSnapshotProps(payload, modelCategories))
     })()
-  }, [overview.data, provider, customRange, claudeConfigSource, scope, period, trackEvent])
+  }, [overview.data, provider, customRange, claudeConfigSource, scope, period])
 
   useEffect(() => {
     let saved: string | null = null
@@ -589,7 +596,7 @@ function AppMain() {
     setSettingsPane(pane)
     setSection(next)
     trackEvent('section_view', { section: next })
-  }, [trackEvent])
+  }, [])
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {

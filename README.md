@@ -76,7 +76,7 @@ You pay for Claude, Codex, Cursor, and a stack of other AI tools. The bill tells
 
 CodeBurn does. It reads the session files your tools already write to disk and breaks down every token and dollar by **task, model, tool, and project**, across **41 AI tools**.
 
-Everything runs locally. No wrapper, no proxy, no API keys, nothing leaves your machine. Pricing comes from [LiteLLM](https://github.com/BerriAI/litellm), refreshed daily.
+Everything runs locally. No wrapper, no proxy, no API keys, nothing leaves your machine. Pricing comes from [LiteLLM](https://github.com/BerriAI/litellm), refreshed daily. The optional desktop app can send an anonymous, bucketed usage report if you say yes to it; see [Telemetry](#telemetry).
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
@@ -89,7 +89,8 @@ Everything runs locally. No wrapper, no proxy, no API keys, nothing leaves your 
   <a href="#supported-tools">Supported tools</a> ·
   <a href="#commands">Commands</a> ·
   <a href="#features">Features</a> ·
-  <a href="#how-it-reads-your-data">How it reads data</a>
+  <a href="#how-it-reads-your-data">How it reads data</a> ·
+  <a href="#telemetry">Telemetry</a>
 </p>
 
 ## Quick start
@@ -775,6 +776,64 @@ These are starting points, not verdicts. A 60% cache hit on a single experimenta
 | **Vercel AI Gateway** | [Vercel AI Gateway reporting API](https://vercel.com/docs/ai-gateway/capabilities/custom-reporting) (cloud, not local logs) | Set `AI_GATEWAY_API_KEY` or `VERCEL_OIDC_TOKEN` (from `vercel env pull` / `vercel dev`); requires a Vercel plan with Custom Reporting. Without credentials, it's skipped silently in the combined dashboard. |
 
 CodeBurn deduplicates messages (by API message ID for Claude, by cumulative token cross-check for Codex, by conversation/timestamp for Cursor, by session ID for Gemini, by session+message ID for OpenCode, by responseId for Pi/OMP, by chat folder + message ID for Codebuff, by session+message ID for Kimi), filters by date range per entry, and classifies each turn.
+
+</details>
+
+## Telemetry
+
+<details>
+<summary><strong>What the desktop app sends, and how to turn it off</strong></summary>
+
+The **CLI sends nothing.** No wrapper, no proxy, no phoning home.
+
+The **desktop app and the Windows tray** can send an anonymous usage report, and only after you
+decide on the first-launch consent screen. The toggle defaults to **off** in the EU, EEA, UK and
+Switzerland, and anywhere the region is unknown; **on** elsewhere. Either way it is your call, and
+you can change it any time in **Settings > Privacy & data > Anonymous telemetry**. Turning it off
+stops all sending, clears anything queued, and mints a fresh install id so past and future reports
+cannot be linked.
+
+The only identifier is a random id generated on your machine. Events carry the calendar day, never
+a clock time. Alongside each batch go the app version, platform, architecture and country.
+
+**`usage_snapshot`** goes out at most once per calendar day. It is computed by the CLI so the app
+and the tray report the identical shape, and every magnitude in it is a bucket, never an exact
+figure:
+
+| Field | What it carries |
+|-------|-----------------|
+| `schema`, `period` | Snapshot version, and the period label you were looking at (for example `30 Days`) |
+| `providerCount`, `costBucket` | How many providers had usage, and total spend as a range: `<1`, `1-10`, `10-50`, `50-200`, `200-1k`, `1k+` USD |
+| `models` | Up to 8 model names, each with its cost bucket, turn-count bucket, one-shot rate, and up to 6 task categories with a turn bucket and share of that model's turns |
+| `categories` | Up to 12 task category names (Coding, Debugging, Planning, …) with a turn bucket, one-shot rate, and up to 3 model names |
+| `providers` | Up to 8 provider names with a cost bucket each |
+| `mcpServers`, `skills`, `tools` | Up to 12 names each with a call-count bucket: `1-10`, `10-100`, `100-1k`, `1k+` |
+| `sessions` | Session count bucket, and median session length as a bucket: `<5`, `5-15`, `15-60`, `60-240`, `240+` minutes |
+| `efficiency` | Cache hit rate and retry tax as shares of the total, to two decimals |
+
+The other events are name-only:
+
+| Event | Fields |
+|-------|--------|
+| `app_open`, `app_close` | Session length in whole minutes |
+| `section_view` | Which section you opened (`overview`, `spend`, …) |
+| `cold_start` | Milliseconds to the first painted overview, and whether it timed out |
+| `cli_error` | Error kind and the command name, capped at 20 per kind per day |
+| `optimize_apply` | The finding id you took a fix for (`unused-mcp`, `claude-md-too-long`, …) and the fix type |
+| `plan_set` | Provider and plan preset id |
+| `export` | Format (`csv` or `json`) and provider |
+| `compare_view` | The two model names being compared |
+| `settings_change` | Setting name and its new boolean or enum value |
+
+**Never collected:** prompts, code, file contents, file or folder names, project names, branch names,
+working directories, session titles, PR links, API keys, exact dollar amounts, exact counts, clock
+times, IP-based location beyond the country, or anything that could identify you or your employer.
+The snapshot is built from bucket labels and configuration identifiers only, and a whitelist
+sanitizer drops anything that is not a short string, a finite number or a boolean before it leaves
+the machine.
+
+**To turn it off:** decline on the consent screen, or open **Settings > Privacy & data** and switch
+**Anonymous telemetry** off.
 
 </details>
 

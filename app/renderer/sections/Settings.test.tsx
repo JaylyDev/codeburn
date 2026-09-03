@@ -32,6 +32,7 @@ const mocks = vi.hoisted(() => ({
   setTrayAppPref: vi.fn(),
   setTrayDockPref: vi.fn(),
   setLaunchAtLogin: vi.fn(),
+  telemetryTrack: vi.fn<(name: string, props?: Record<string, unknown>) => Promise<boolean>>(),
 }))
 vi.mock('../lib/ipc', async orig => {
   const actual = await orig<typeof import('../lib/ipc')>()
@@ -91,6 +92,7 @@ describe('Settings', () => {
     mocks.resetPlan.mockResolvedValue(actionOk)
     mocks.chooseDirectory.mockResolvedValue('/Users/toruk/Exports')
     mocks.exportData.mockResolvedValue(actionOk)
+    mocks.telemetryTrack.mockResolvedValue(true)
     // No bundled tray app unless a test says otherwise, which is every platform but Windows.
     mocks.companionStatus.mockResolvedValue({ supported: false, menuBar: false, sidebar: false, store: false })
     mocks.trayPrefs.mockResolvedValue(trayPrefs)
@@ -117,6 +119,35 @@ describe('Settings', () => {
     await user.click(screen.getByRole('option', { name: 'CNY' }))
     expect(mocks.setCurrency).toHaveBeenCalledWith('CNY')
     expect(await screen.findByText('Updated')).toBeInTheDocument()
+  })
+
+  it('reports settings, plan and export interactions as name-only events', async () => {
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+
+    await user.click(screen.getByRole('button', { name: 'Dark' }))
+    expect(mocks.telemetryTrack).toHaveBeenCalledWith('settings_change', { setting: 'theme', value: 'dark' })
+
+    await user.click(await screen.findByLabelText('Currency'))
+    await user.click(screen.getByRole('option', { name: 'CNY' }))
+    expect(mocks.telemetryTrack).toHaveBeenCalledWith('settings_change', { setting: 'currency', value: 'CNY' })
+
+    await user.click(screen.getByRole('button', { name: 'Plans' }))
+    await user.click(await screen.findByLabelText('Add a plan'))
+    await user.click(screen.getByRole('option', { name: 'Cursor Pro' }))
+    await user.click(screen.getByRole('button', { name: 'Add' }))
+    expect(mocks.telemetryTrack).toHaveBeenCalledWith('plan_set', { provider: 'cursor', plan: 'cursor-pro' })
+
+    await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
+    await user.click(screen.getByRole('button', { name: 'Choose folder…' }))
+    await screen.findByText('/Users/toruk/Exports')
+    await user.click(screen.getByRole('button', { name: 'JSON' }))
+    await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
+    expect(mocks.telemetryTrack).toHaveBeenCalledWith('export', { format: 'json', provider: 'all' })
+
+    // The chosen folder is a real path on this machine and never travels.
+    const sent = JSON.stringify(mocks.telemetryTrack.mock.calls)
+    expect(sent).not.toContain('/Users/toruk')
   })
 
   it('persists theme choices and applies forced themes to the root', async () => {

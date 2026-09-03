@@ -299,6 +299,12 @@ export type MenubarPayload = {
   currency?: { code: string; symbol: string; rate: number }
   combined?: CombinedUsage
   claudeConfigs?: ClaudeConfigSelector
+  // The CLI's anonymised, fully bucketed daily aggregate (src/telemetry-snapshot.ts).
+  // Sent verbatim as the `usage_snapshot` telemetry event, so the desktop app and
+  // the Windows tray report identical shapes. Opaque here: the renderer never reads
+  // inside it. Absent on CLIs that predate the field, which is when the renderer's
+  // own fallback builder takes over.
+  telemetrySnapshot?: Record<string, unknown> | null
 }
 
 // ————— src/types.ts + src/models-report.ts —————

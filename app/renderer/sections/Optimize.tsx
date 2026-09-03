@@ -11,6 +11,7 @@ import { type Polled, usePolled } from '../hooks/usePolled'
 import { formatCompact, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import { reportMemoKey } from '../lib/reportMemoKey'
+import { trackEvent } from '../lib/track'
 import type { DateRange, FindingClass, MenubarPayload, OptimizeJsonReport, Period, SessionYieldJson, WasteAction, YieldJsonReport } from '../lib/types'
 
 type OptimizeTab = 'waste' | 'reverts' | 'abandoned' | 'fixes'
@@ -179,6 +180,10 @@ function ActionableFindingRows({ findings, byClass }: { findings: OptimizeFindin
 
   const copyFix = async (finding: OptimizeFinding) => {
     await navigator.clipboard.writeText(actionText(finding.fix))
+    // Taking a fix is the closest thing the app has to applying one. The id is a
+    // fixed detector name (`claude-md-too-long`, `unused-mcp`, ...), never text
+    // from the finding.
+    trackEvent('optimize_apply', { kind: finding.id, fixType: finding.fix.type })
     setCopiedId(finding.id)
     window.setTimeout(() => setCopiedId(current => current === finding.id ? null : current), 1_500)
   }
