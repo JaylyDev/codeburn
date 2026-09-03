@@ -13,7 +13,7 @@ afterEach(async () => {
 function runCli(args: string[], home: string) {
   return spawnSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', ...args], {
     cwd: process.cwd(),
-    env: { ...process.env, HOME: home, CODEX_HOME: join(home, '.codex'), TZ: 'UTC' },
+    env: { ...process.env, HOME: home, USERPROFILE: home, CODEX_HOME: join(home, '.codex'), TZ: 'UTC' },
     encoding: 'utf-8',
     timeout: 30_000,
   })

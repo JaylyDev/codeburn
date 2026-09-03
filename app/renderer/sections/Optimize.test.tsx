@@ -5,14 +5,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { MenubarPayload, OptimizeJsonReport, YieldJsonReport } from '../lib/types'
 import { Optimize, OptimizeContent } from './Optimize'
 
-const { getOverview, getOptimizeReport, getYield } = vi.hoisted(() => ({
+const { getOverview, getOptimizeReport, getYield, telemetryTrack } = vi.hoisted(() => ({
   getOverview: vi.fn(),
   getOptimizeReport: vi.fn(),
   getYield: vi.fn(),
+  telemetryTrack: vi.fn<(name: string, props?: Record<string, unknown>) => Promise<boolean>>(),
 }))
 vi.mock('../lib/ipc', async orig => {
   const actual = await orig<typeof import('../lib/ipc')>()
-  return { ...actual, codeburn: { getOverview, getOptimizeReport, getYield } }
+  return { ...actual, codeburn: { getOverview, getOptimizeReport, getYield, telemetryTrack } }
 })
 
 function makePayload(): MenubarPayload {
@@ -126,6 +127,7 @@ describe('Optimize', () => {
     getOptimizeReport.mockReset().mockResolvedValue(makeOptimizeReport())
     getYield.mockReset().mockResolvedValue(makeYield())
     writeText.mockReset().mockResolvedValue(undefined)
+    telemetryTrack.mockReset().mockResolvedValue(true)
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
   })
 
@@ -167,6 +169,18 @@ describe('Optimize', () => {
       'Habits · 17.4K tokens · $8.70 · 1 finding',
       'FYI · 4.8K tokens · $2.40 · 1 finding',
     ])
+  })
+
+  it('reports taking a fix as a name-only optimize_apply event', async () => {
+    render(<Optimize period="30days" provider="all" />)
+    fireEvent.click(await screen.findByRole('button', { name: /Opus is doing your small talk/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Copy' }))
+
+    await waitFor(() => expect(telemetryTrack).toHaveBeenCalledWith('optimize_apply', { kind: 'unused-mcp', fixType: 'paste' }))
+    // The finding's own text never travels with it.
+    const props = JSON.stringify(telemetryTrack.mock.calls[0]![1])
+    expect(props).not.toContain('Use Sonnet')
+    expect(props).not.toContain('small talk')
   })
 
   it('renders tabs and actionable Waste findings with impact, savings, explanation, and copy-paste fix', async () => {

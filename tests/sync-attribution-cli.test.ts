@@ -17,6 +17,7 @@ import { Command } from 'commander'
 
 import { startMockIdp, type MockIdp } from './fixtures/mock-idp.js'
 import type { ProjectSummary, SessionSummary, ParsedApiCall, TokenUsage } from '../src/types.js'
+import { setHome } from './setup/home.js'
 
 const { parseAllSessionsMock } = vi.hoisted(() => ({ parseAllSessionsMock: vi.fn() }))
 vi.mock('../src/parser.js', () => ({ parseAllSessions: parseAllSessionsMock }))
@@ -90,7 +91,7 @@ afterAll(async () => {
 
 beforeEach(async () => {
   tmpHome = await mkdtemp(join(tmpdir(), 'codeburn-attr-cli-'))
-  process.env.HOME = tmpHome
+  setHome(tmpHome)
   process.env.XDG_CACHE_HOME = join(tmpHome, '.cache')
   idp.tracesRequests.length = 0
 
@@ -118,7 +119,7 @@ beforeEach(async () => {
 afterEach(async () => {
   vi.restoreAllMocks()
   process.exitCode = 0
-  process.env.HOME = originalHome
+  setHome(originalHome)
   if (originalXdg === undefined) delete process.env.XDG_CACHE_HOME
   else process.env.XDG_CACHE_HOME = originalXdg
   await rm(tmpHome, { recursive: true, force: true })

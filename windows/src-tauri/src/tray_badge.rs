@@ -49,15 +49,34 @@ fn text_width(text: &str) -> usize {
 /// Draws `text` centred in a `size` x `size` RGBA icon. Prefers anti-aliased bold system
 /// text (far more legible at 16px than 1px pixel strokes); falls back to the pixel font
 /// when no usable font file is present.
-pub fn render(text: &str, size: u32, dark_taskbar: bool) -> Image<'static> {
-    let color = if dark_taskbar { ACCENT_DARK_TASKBAR } else { ACCENT_LIGHT_TASKBAR };
+///
+/// `muted` is the combined-scope shortfall: a paired device did not report, so the figure is
+/// smaller than the reader's machines actually spent. The mac appends a dimmed
+/// "reachable/total" beside its menubar title; a 16 px bitmap with room for four glyphs has
+/// nowhere to put that, so the figure itself is drawn dimmed here and the counts go to the
+/// tooltip and the menu's usage row, which have room for words.
+pub fn render(text: &str, size: u32, dark_taskbar: bool, muted: bool) -> Image<'static> {
+    let base = if dark_taskbar { ACCENT_DARK_TASKBAR } else { ACCENT_LIGHT_TASKBAR };
+    let color = if muted { toward_panel(base, dark_taskbar) } else { base };
     if let Some(image) = render_with_font(text, size, color) {
         return image;
     }
     // The pixel font cannot shrink, so trim from the right until the string fits.
     let mut trimmed: String = text.to_string();
     while !fits(&trimmed) && trimmed.pop().is_some() {}
-    render_pixel_font(&trimmed, size, dark_taskbar)
+    render_pixel_font(&trimmed, size, color)
+}
+
+/// Half way to the panel behind it, which is what dimmed has to mean on a tray icon: still
+/// the brand colour, plainly quieter than a figure that counted every device.
+fn toward_panel(color: [u8; 3], dark_taskbar: bool) -> [u8; 3] {
+    let ground: [u8; 3] = if dark_taskbar { [0x20, 0x20, 0x20] } else { [0xF3, 0xF3, 0xF3] };
+    let mix = |a: u8, b: u8| ((a as u16 + b as u16) / 2) as u8;
+    [
+        mix(color[0], ground[0]),
+        mix(color[1], ground[1]),
+        mix(color[2], ground[2]),
+    ]
 }
 
 /// Bold sans faces shipped with Windows, best first. Bahnschrift's condensed numerals fit
@@ -166,11 +185,10 @@ fn render_with_font(text: &str, size: u32, color: [u8; 3]) -> Option<Image<'stat
     Some(Image::new_owned(rgba, size, size))
 }
 
-fn render_pixel_font(text: &str, size: u32, dark_taskbar: bool) -> Image<'static> {
+fn render_pixel_font(text: &str, size: u32, color: [u8; 3]) -> Image<'static> {
     let size = size.max(BASE_ICON_SIZE);
     let scale = (size / BASE_ICON_SIZE).max(1) as usize;
     let mut rgba = vec![0u8; (size * size * 4) as usize];
-    let color = if dark_taskbar { ACCENT_DARK_TASKBAR } else { ACCENT_LIGHT_TASKBAR };
 
     let width = text_width(text) * scale;
     let height = GLYPH_HEIGHT * scale;

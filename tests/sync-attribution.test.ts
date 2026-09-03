@@ -33,6 +33,7 @@ import {
   COMMIT_ATTRIBUTION_SPAN_NAME,
   type OtlpAttribute,
 } from '../src/sync/otlp.js'
+import { setHome } from './setup/home.js'
 
 // ── Git fixtures (mirrors yield-repo-grouping.test.ts) ────────────────
 
@@ -700,12 +701,12 @@ const originalXdgCache = process.env.XDG_CACHE_HOME
 
 beforeEach(async () => {
   tmpDir = await mkdtemp(join(tmpdir(), 'codeburn-attr-push-'))
-  process.env.HOME = tmpDir
+  setHome(tmpDir)
   process.env.XDG_CACHE_HOME = join(tmpDir, '.cache')
 })
 
 afterEach(async () => {
-  process.env.HOME = originalHome
+  setHome(originalHome)
   if (originalXdgCache === undefined) delete process.env.XDG_CACHE_HOME
   else process.env.XDG_CACHE_HOME = originalXdgCache
   await rm(tmpDir, { recursive: true, force: true })

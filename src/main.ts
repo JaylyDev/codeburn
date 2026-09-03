@@ -55,7 +55,7 @@ const { version } = require('../package.json')
 // Bump when the menubar payload's rendering semantics change without a package
 // release or daily-cache version change. The envelope version in session-cache
 // protects record shape; this protects the meaning of an otherwise valid one.
-const STATUS_SNAPSHOT_RENDER_VERSION = 2
+const STATUS_SNAPSHOT_RENDER_VERSION = 4
 const STATUS_SNAPSHOT_SEMANTIC_KEY = `${version}:render-${STATUS_SNAPSHOT_RENDER_VERSION}:daily-${DAILY_CACHE_VERSION}`
 import { loadCurrency, getCurrency, isValidCurrencyCode } from './currency.js'
 import { CodexThroughputReader, newestCodexSession, renderCodexThroughput } from './codex-throughput.js'
@@ -63,9 +63,18 @@ import { CodexThroughputReader, newestCodexSession, renderCodexThroughput } from
 // A downstream reader that closes the pipe early (`| head`, quitting `less`, or
 // a missing command) makes stdout writes fail with EPIPE. Exit cleanly rather
 // than crashing with an unhandled error event.
+//
+// The exit still drains outstanding credential rotations first. `codeburn quota
+// | head` is the ordinary way to read that command, and a token grant the
+// server has already accepted must reach disk whichever door the process
+// leaves through. The drain resolves immediately when nothing is outstanding,
+// which is every other command.
 process.stdout.on('error', (err: NodeJS.ErrnoException) => {
-  if (err.code === 'EPIPE') process.exit(0)
-  throw err
+  if (err.code !== 'EPIPE') throw err
+  void import('./quota/security.js')
+    .then(({ awaitCredentialWrites }) => awaitCredentialWrites())
+    .catch(() => undefined)
+    .then(() => process.exit(0))
 })
 
 function collect(val: string, acc: string[]): string[] {
@@ -1401,9 +1410,10 @@ program
   .command('menubar')
   .description('Install and launch the menubar app on macOS and Windows (one command, no clone)')
   .option('--force', 'Reinstall even if a copy is already installed')
-  .action(async (opts: { force?: boolean }) => {
+  .option('--staged-msi <path>', 'Windows: install the CodeBurn.Menubar .msi staged inside an installed CodeBurn desktop app, by absolute path')
+  .action(async (opts: { force?: boolean; stagedMsi?: string }) => {
     try {
-      const result = await installMenubarApp({ force: opts.force, cliVersion: version })
+      const result = await installMenubarApp({ force: opts.force, cliVersion: version, stagedMsi: opts.stagedMsi })
       // A cancelled Windows installer leaves nothing to point at.
       if (result.installedPath) console.log(`\n  Ready. ${result.installedPath}\n`)
     } catch (err) {
@@ -2607,6 +2617,34 @@ program
       return
     }
     process.stdout.write(renderDoctorTable(report, { color: opts.color }))
+  })
+
+program
+  .command('quota')
+  .description('Live provider capacity: quota windows for each signed-in coding tool on this machine')
+  .option('--format <format>', 'Output format: table, json', 'table')
+  .option('--no-color', 'Disable ANSI colors')
+  .action(async (opts) => {
+    const { collectQuota, renderQuotaTable } = await import('./quota/index.js')
+    const { awaitCredentialWrites } = await import('./quota/security.js')
+    try {
+      const report = await collectQuota()
+      const out = opts.format === 'json'
+        ? JSON.stringify(report, null, 2) + '\n'
+        : renderQuotaTable(report, { color: opts.color }) + '\n'
+      await new Promise<void>(resolve => { process.stdout.write(out, () => resolve()) })
+    } finally {
+      // A provider the per-provider timeout gave up on may still be between an
+      // accepted token grant and the credential file it has to rewrite. That
+      // token is already dead on disk, so exiting through it signs the user out.
+      // In a finally because a throw anywhere above leaves through the same
+      // door: one provider failing must not strand another's rotation.
+      await awaitCredentialWrites()
+    }
+    // A keychain lookup or local-server probe abandoned by the per-provider
+    // timeout keeps its child alive long past the output, so leave on purpose
+    // once the output has flushed and nothing is mid-rotation.
+    process.exit(0)
   })
 
 registerActCommands(program)

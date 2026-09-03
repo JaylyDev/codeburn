@@ -1,0 +1,112 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { mkdir, rm, writeFile } from 'fs/promises'
+import { join } from 'path'
+import { createRequire } from 'node:module'
+
+import { clearSessionCache, parseAllSessions } from '../src/parser.js'
+import { isSqliteAvailable } from '../src/sqlite.js'
+
+// The exported Hermes provider resolves HERMES_HOME when its singleton is
+// created, at import time. Point it at the fixture during module hoisting so the
+// provider reads the temp DB instead of the real ~/.hermes.
+const testRoot = vi.hoisted(() => {
+  const root = `${process.env['TMPDIR'] || '/tmp'}/hermes-cost-fallback-${process.pid}-${Date.now()}`
+  process.env['HERMES_HOME'] = `${root}/hermes`
+  return root
+})
+const HERMES_HOME = join(testRoot, 'hermes')
+const CACHE_DIR = join(testRoot, 'cache')
+
+const requireForTest = createRequire(import.meta.url)
+
+function seedDb(): void {
+  const { DatabaseSync: Database } = requireForTest('node:sqlite')
+  const db = new Database(join(HERMES_HOME, 'state.db'))
+  db.exec(`
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY, source TEXT, model TEXT, cwd TEXT, git_repo_root TEXT,
+      input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+      cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0,
+      reasoning_tokens INTEGER DEFAULT 0, estimated_cost_usd REAL, actual_cost_usd REAL,
+      cost_status TEXT, cost_source TEXT,
+      api_call_count INTEGER DEFAULT 0, tool_call_count INTEGER DEFAULT 0,
+      started_at REAL, title TEXT
+    )
+  `)
+  db.exec(`
+    CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL,
+      content TEXT, tool_calls TEXT, timestamp REAL NOT NULL
+    )
+  `)
+  const startedAt = Date.now() / 1000 - 3600
+  const insert = db.prepare(
+    `INSERT INTO sessions (id, source, model, input_tokens, output_tokens,
+      estimated_cost_usd, actual_cost_usd, cost_status, cost_source, api_call_count, started_at)
+     VALUES (?, 'cli', ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+  )
+  // Subscription-included usage is recorded $0 spend even though it carries
+  // real tokens. API-equivalent pricing must not overwrite that provenance.
+  insert.run('included-zero', 'gpt-5.6-sol', 100000, 10000, 0.0, null, 'included', 'none', startedAt)
+  // Unknown cost with no usable estimate falls back to token pricing.
+  insert.run('unknown-zero', 'claude-opus-4-6', 100000, 10000, 0.0, null, 'unknown', 'none', startedAt)
+  // An unknown row may retain a partial estimate from earlier priced calls.
+  // It is not a complete session total and must still be recalculated.
+  insert.run('unknown-partial', 'claude-opus-4-6', 100000, 10000, 0.25, null, 'unknown', 'official_docs_snapshot', startedAt)
+  // A positive recorded estimate stays authoritative.
+  insert.run('positive-estimate', 'claude-opus-4-6', 100000, 10000, 0.5, null, 'estimated', 'official_docs_snapshot', startedAt)
+  // An explicitly estimated free value remains zero.
+  insert.run('estimated-zero', 'free-model', 100000, 10000, 0.0, null, 'estimated', 'provider_models_api', startedAt)
+  // An explicit $0 *actual* invoice amount is recorded fact and stays $0.
+  insert.run('zero-actual', 'claude-opus-4-6', 100000, 10000, null, 0.0, 'actual', 'invoice', startedAt)
+  for (const id of ['included-zero', 'unknown-zero', 'unknown-partial', 'positive-estimate', 'estimated-zero', 'zero-actual']) {
+    db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+      .run(id, 'user', `session ${id}`, startedAt)
+    db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+      .run(id, 'assistant', 'ok', startedAt + 1)
+  }
+  db.close()
+}
+
+beforeEach(async () => {
+  clearSessionCache()
+  await rm(testRoot, { recursive: true, force: true })
+  await mkdir(HERMES_HOME, { recursive: true })
+  process.env['HERMES_HOME'] = HERMES_HOME
+  process.env['CODEBURN_CACHE_DIR'] = CACHE_DIR
+})
+
+afterEach(async () => {
+  clearSessionCache()
+  await rm(testRoot, { recursive: true, force: true })
+})
+
+const skipUnlessSqlite = isSqliteAvailable() ? describe : describe.skip
+
+skipUnlessSqlite('hermes recorded-cost fallback', () => {
+  it('preserves included and recorded zeroes while estimating unknown cost', async () => {
+    seedDb()
+    const projects = await parseAllSessions(undefined, 'hermes')
+    const sessions = projects.flatMap(project => project.sessions)
+    const byId = new Map(sessions.map(s => [s.sessionId, s]))
+
+    const included = byId.get('included-zero')!
+    expect(included.totalCostUSD).toBe(0)
+
+    const unknown = byId.get('unknown-zero')!
+    expect(unknown.totalCostUSD).toBeGreaterThan(0)
+
+    const unknownPartial = byId.get('unknown-partial')!
+    expect(unknownPartial.totalCostUSD).toBeGreaterThan(0)
+    expect(unknownPartial.totalCostUSD).not.toBe(0.25)
+
+    const positive = byId.get('positive-estimate')!
+    expect(positive.totalCostUSD).toBe(0.5)
+
+    const estimatedZero = byId.get('estimated-zero')!
+    expect(estimatedZero.totalCostUSD).toBe(0)
+
+    const zeroActual = byId.get('zero-actual')!
+    expect(zeroActual.totalCostUSD).toBe(0)
+  })
+})

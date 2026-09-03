@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { App, overviewMemoKey, refreshedLabel, selectedReportMemoKeys, topCategoryByModel, usageSnapshotProps } from './App'
@@ -40,6 +40,7 @@ const mocks = vi.hoisted(() => ({
   getAliases: vi.fn(),
   setCurrency: vi.fn(),
   resetCurrency: vi.fn(),
+  telemetryTrack: vi.fn<(name: string, props?: Record<string, unknown>) => Promise<boolean>>(),
 }))
 
 vi.mock('./lib/ipc', async orig => {
@@ -191,6 +192,7 @@ function installDefaultMocks() {
   mocks.getAliases.mockResolvedValue([])
   mocks.setCurrency.mockResolvedValue({ ok: true, stdout: '', stderr: '' })
   mocks.resetCurrency.mockResolvedValue({ ok: true, stdout: '', stderr: '' })
+  mocks.telemetryTrack.mockResolvedValue(true)
 }
 
 describe('App shortcuts', () => {
@@ -498,9 +500,28 @@ describe('App shortcuts', () => {
     await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'grok'))
   })
 
-  it('lists a detected provider with no spend this period and sorts it last', async () => {
-    // Hermes has usage only outside the current period: the CLI still emits it
-    // as a detected provider (cost 0), so the picker must show it, at the bottom.
+  it('hides idle providers while preserving explicit zero-cost activity', async () => {
+    const payload = overviewPayload()
+    payload.current.providers = { claude: 10, hermes: 0, cursor: 0 }
+    payload.current.providerDetails = [
+      { id: 'claude', label: 'Claude', cost: 10, hasUsage: true },
+      { id: 'hermes', label: 'Hermes', cost: 0, hasUsage: false },
+      { id: 'cursor', label: 'Cursor', cost: 0, hasUsage: true },
+    ]
+    mocks.getOverview.mockResolvedValue(payload)
+
+    render(<App />)
+    expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('All providers'))
+    expect(await screen.findByRole('option', { name: 'Claude' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'Cursor' })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: 'Hermes' })).not.toBeInTheDocument()
+  })
+
+  it('keeps zero-cost providers in the picker when the CLI omits hasUsage', async () => {
+    // Every released CLI omits the field. Falling back to cost > 0 there hid
+    // subscription-backed providers whose period spend is $0.
     const payload = overviewPayload()
     payload.current.providers = { claude: 10, hermes: 0 }
     payload.current.providerDetails = [
@@ -513,14 +534,36 @@ describe('App shortcuts', () => {
     expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
 
     fireEvent.click(screen.getByText('All providers'))
-    const claudeOption = await screen.findByRole('option', { name: 'Claude' })
-    const hermesOption = screen.getByRole('option', { name: 'Hermes' })
-    const options = screen.getAllByRole('option')
-    // Zero-cost Hermes appears, and sorts after the provider that has spend.
-    expect(options.indexOf(hermesOption)).toBeGreaterThan(options.indexOf(claudeOption))
+    expect(await screen.findByRole('option', { name: 'Claude' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'Hermes' })).toBeInTheDocument()
+  })
 
-    fireEvent.click(hermesOption)
-    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'hermes'))
+  it('does not carry another period provider catalog into a scoped period view', async () => {
+    const payload = overviewPayload()
+    payload.current.providerDetails = [
+      { id: 'claude', label: 'Claude', cost: 10, hasUsage: true },
+      { id: 'hermes', label: 'Hermes', cost: 5, hasUsage: true },
+    ]
+    mocks.getOverview.mockResolvedValue(payload)
+
+    render(<App />)
+    expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('Providers'))
+    fireEvent.click(await screen.findByRole('option', { name: 'Claude' }))
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'claude'))
+
+    fireEvent.click(screen.getByText('Today'))
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('today', 'claude'))
+
+    fireEvent.click(screen.getByLabelText('Providers'))
+    expect(screen.getByRole('option', { name: 'Claude' })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: 'Hermes' })).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /^Sessions/ }))
+    const sessionFilters = await screen.findByRole('group', { name: 'Filter sessions by provider' })
+    expect(within(sessionFilters).getByRole('button', { name: 'Claude' })).toBeInTheDocument()
+    expect(within(sessionFilters).queryByRole('button', { name: 'Hermes' })).not.toBeInTheDocument()
   })
 
   it('hides the Claude config picker when the payload carries no claudeConfigs', async () => {
@@ -1077,6 +1120,53 @@ describe('currency correctness', () => {
   })
 })
 
+describe('usage_snapshot dispatch', () => {
+  beforeEach(() => {
+    installDefaultMocks()
+    localStorage.clear()
+    localStorage.setItem('codeburn.defaultPeriod', '30days')
+  })
+
+  it('forwards the CLI-computed snapshot verbatim, with no by-model join', async () => {
+    const payload = overviewPayload()
+    // Opaque to the renderer: whatever the CLI put here is what goes out.
+    payload.telemetrySnapshot = { schema: 2, period: 'Last 30 days', costBucket: '10-50', models: [] }
+    mocks.getOverview.mockResolvedValue(payload)
+
+    render(<App />)
+
+    await waitFor(() => expect(mocks.telemetryTrack).toHaveBeenCalledWith('usage_snapshot', payload.telemetrySnapshot))
+    expect(mocks.getModels).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the renderer builder when an older CLI omits the field', async () => {
+    const payload = overviewPayload()
+    payload.current.topModels = [{ name: 'claude-opus-4-8', cost: 30, savingsUSD: 0, savingsBaselineModel: '', calls: 400 }]
+    mocks.getOverview.mockResolvedValue(payload)
+    mocks.getModels.mockResolvedValue([])
+
+    render(<App />)
+
+    await waitFor(() => expect(mocks.telemetryTrack).toHaveBeenCalledWith('usage_snapshot', expect.objectContaining({
+      period: 'Last 30 days',
+      costBucket: '10-50',
+    })))
+    expect(mocks.getModels).toHaveBeenCalled()
+  })
+
+  it('sends nothing when the snapshot field is explicitly null and the payload is empty', async () => {
+    const payload = overviewPayload()
+    payload.telemetrySnapshot = null
+    mocks.getOverview.mockResolvedValue(payload)
+    mocks.getModels.mockResolvedValue([])
+
+    render(<App />)
+
+    // A null snapshot is an older/failed CLI, not a reason to skip the event.
+    await waitFor(() => expect(mocks.telemetryTrack).toHaveBeenCalledWith('usage_snapshot', expect.objectContaining({ period: 'Last 30 days' })))
+  })
+})
+
 describe('usage_snapshot telemetry props', () => {
   // The renderer builds these props; the main-process sanitizer (sanitizeProps)
   // is the last gate before the wire. Test the composition, which is what ships.
@@ -1146,7 +1236,8 @@ describe('usage_snapshot telemetry props', () => {
     return {
       provider: 'claude', providerDisplayName: 'Claude', category: null,
       inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, totalTokens: 0,
-      costUSD: 0, savingsUSD: 0, savingsBaselineModel: '', calls: 0, credits: null, ...over,
+      costUSD: 0, savingsUSD: 0, savingsBaselineModel: '', calls: 0, credits: null,
+      rawModels: [over.model], ...over,
     }
   }
 

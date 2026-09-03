@@ -262,14 +262,40 @@ describe('buildMenubarPayload', () => {
     const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
     // providerDetails carries the internal id (round-trips as --provider) + label.
     expect(payload.current.providerDetails).toEqual([
-      { id: 'grok', label: 'Grok Build', cost: 12.5 },
-      { id: 'cursor-agent', label: 'Cursor Agent', cost: 3.4 },
+      { id: 'grok', label: 'Grok Build', cost: 12.5, calls: 0, hasUsage: true },
+      { id: 'cursor-agent', label: 'Cursor Agent', cost: 3.4, calls: 0, hasUsage: true },
     ])
     // ... while the existing providers map keys stay the lowercased display names.
     expect(payload.current.providers).toEqual({ 'grok build': 12.5, 'cursor agent': 3.4 })
   })
 
-  it('keeps zero-cost providers in the dict so installed-but-unused providers still render as tabs', () => {
+  it('preserves zero-cost provider usage counts for menubar provider visibility', () => {
+    const providers = [
+      { name: 'hermes', displayName: 'Hermes Agent', cost: 0, calls: 7 },
+      { name: 'claude', displayName: 'Claude', cost: 0, calls: 0 },
+    ] satisfies Array<ProviderCost & { calls: number }>
+
+    const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
+
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'hermes', label: 'Hermes Agent', cost: 0, calls: 7, hasUsage: true },
+      { id: 'claude', label: 'Claude', cost: 0, calls: 0, hasUsage: false },
+    ])
+  })
+
+  it('preserves token-only provider activity even when cost and behavioral calls are zero', () => {
+    const providers = [
+      { name: 'hermes', displayName: 'Hermes Agent', cost: 0, calls: 0, hasUsage: true },
+    ] satisfies Array<ProviderCost & { calls: number; hasUsage: boolean }>
+
+    const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
+
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'hermes', label: 'Hermes Agent', cost: 0, calls: 0, hasUsage: true },
+    ])
+  })
+
+  it('keeps the legacy provider dict additive while providerDetails remains the activity authority', () => {
     const providers: ProviderCost[] = [
       { name: 'claude', displayName: 'Claude', cost: 76.45 },
       { name: 'codex', displayName: 'Codex', cost: 0 },
@@ -277,6 +303,11 @@ describe('buildMenubarPayload', () => {
     ]
     const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
     expect(payload.current.providers).toEqual({ claude: 76.45, codex: 0, cursor: 2.18 })
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'claude', label: 'Claude', cost: 76.45, calls: 0, hasUsage: true },
+      { id: 'codex', label: 'Codex', cost: 0, calls: 0, hasUsage: false },
+      { id: 'cursor', label: 'Cursor', cost: 2.18, calls: 0, hasUsage: true },
+    ])
   })
 
   it('includes up to 365 daily history entries sorted ascending by date', () => {
@@ -349,7 +380,7 @@ describe('buildMenubarPayload', () => {
     ]
     const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
     expect(payload.current.providers).toEqual({ claude: 76.45 })
-    expect(payload.current.providerDetails).toEqual([{ id: 'claude', label: 'Claude', cost: 76.45 }])
+    expect(payload.current.providerDetails).toEqual([{ id: 'claude', label: 'Claude', cost: 76.45, calls: 0, hasUsage: true }])
   })
 
   it('omits combined usage by default and accepts the documented combined shape when attached', () => {

@@ -1,4 +1,5 @@
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
@@ -43,8 +44,8 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  chmodSync(sourceRoot, 0o755)
-  chmodSync(cacheRoot, 0o755)
+  allowDirectoryWrites(sourceRoot)
+  allowDirectoryWrites(cacheRoot)
   for (const writer of openWriters.splice(0)) writer.close()
   await rm(sourceRoot, { recursive: true, force: true })
   await rm(cacheRoot, { recursive: true, force: true })
@@ -113,18 +114,58 @@ function createDiscoveryDatabase(dbPath: string): void {
   db.close()
 }
 
+const system32 = join(process.env['SystemRoot'] ?? 'C:\\Windows', 'System32')
+
+/// Windows has no mode bits: chmod there only toggles the read-only attribute,
+/// which directories ignore, so a chmod 0555 parent still accepts new files.
+/// The ACL is where a Windows directory says no, and dropping inheritance in
+/// favour of a read-and-execute grant for the current user is the equivalent of
+/// 0555. Both halves are reversed by allowDirectoryWrites before the fixture is
+/// removed, since a directory nothing may write to is also one nothing may
+/// delete out of.
+function denyDirectoryWrites(dir: string): void {
+  if (process.platform !== 'win32') {
+    chmodSync(dir, 0o555)
+    return
+  }
+  const user = execFileSync(join(system32, 'whoami.exe'), { encoding: 'utf-8' }).trim()
+  execFileSync(join(system32, 'icacls.exe'), [dir, '/inheritance:r', '/grant', `${user}:(OI)(CI)(RX)`], { stdio: 'ignore' })
+}
+
+function allowDirectoryWrites(dir: string): void {
+  if (process.platform !== 'win32') {
+    chmodSync(dir, 0o755)
+    return
+  }
+  execFileSync(join(system32, 'icacls.exe'), [dir, '/reset'], { stdio: 'ignore' })
+}
+
+/// Ask the filesystem rather than the metadata. root ignores 0555, and a
+/// sandboxed or ACL-less filesystem can ignore the Windows deny, so the only
+/// answer worth acting on is whether a file can actually be created.
+function acceptsNewFiles(dir: string): boolean {
+  const probe = join(dir, '.codeburn-write-probe')
+  try {
+    writeFileSync(probe, '')
+  } catch {
+    return false
+  }
+  unlinkSync(probe)
+  return true
+}
+
 function makeSourceParentReadOnly(skip: (reason?: string) => void): boolean {
-  chmodSync(sourceRoot, 0o555)
-  const mode = statSync(sourceRoot).mode & 0o777
-  if ((mode & 0o222) !== 0) {
-    skip(`SKIP: chmod 0555 did not make the fixture parent non-writable (mode ${mode.toString(8)})`)
+  denyDirectoryWrites(sourceRoot)
+  if (acceptsNewFiles(sourceRoot)) {
+    allowDirectoryWrites(sourceRoot)
+    skip('SKIP: the fixture parent still accepts new files after being made read-only')
     return false
   }
   return true
 }
 
 function makeSourceParentWritable(): void {
-  chmodSync(sourceRoot, 0o755)
+  allowDirectoryWrites(sourceRoot)
 }
 
 function cachedDatabaseFiles(): string[] {
@@ -278,7 +319,12 @@ describe('SQLite read-only parent fallback', () => {
     const dbPath = join(sourceRoot, 'state.vscdb')
     writeUncheckpointedWalDatabase(dbPath)
     if (!makeSourceParentReadOnly(skip)) return
-    chmodSync(cacheRoot, 0o555)
+    denyDirectoryWrites(cacheRoot)
+    if (acceptsNewFiles(cacheRoot)) {
+      allowDirectoryWrites(cacheRoot)
+      skip('SKIP: the cache root still accepts new files after being made read-only')
+      return
+    }
 
     const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true)
     try {
@@ -288,7 +334,7 @@ describe('SQLite read-only parent fallback', () => {
       expect(String(notices[0]?.[0])).toContain(dbPath)
     } finally {
       stderr.mockRestore()
-      chmodSync(cacheRoot, 0o755)
+      allowDirectoryWrites(cacheRoot)
     }
   })
 

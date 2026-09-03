@@ -154,7 +154,8 @@ try {
   const modelsHelp = execFileSync(electronPath, [launchPath, 'models', '--help'], {
     env: electronEnv,
     encoding: 'utf8',
-    timeout: 5_000,
+    // An x64 Electron under emulation on an ARM64 machine takes several seconds to start.
+    timeout: 30_000,
   })
   if (!/^Usage: codeburn models\b/m.test(modelsHelp)) {
     throw new Error('stage-cli: Electron launch shim lost ordinary CLI arguments')

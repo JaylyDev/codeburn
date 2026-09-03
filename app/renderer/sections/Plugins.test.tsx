@@ -1,6 +1,29 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi } from 'vitest'
-import { render } from '@testing-library/react'
+import { afterEach, describe, it, expect, vi } from 'vitest'
+import { render, screen, waitFor } from '@testing-library/react'
+
+// The section reads the preload bridge at module load, so it is mocked rather than
+// assigned onto window after the fact. isWindowsPlatform reads window.codeburn.platform.
+const bridge = vi.hoisted(() => ({
+  pluginList: vi.fn(),
+  pluginInfo: vi.fn(),
+  pluginAdd: vi.fn(),
+  pluginRemove: vi.fn(),
+  pluginVerify: vi.fn(),
+  syncAutoStatus: vi.fn(),
+}))
+vi.mock('../lib/ipc', () => ({ codeburn: bridge, normalizeCliError: (err: unknown) => err }))
+
+const { PluginsSection } = await import('./Plugins')
+
+afterEach(() => {
+  delete (window as unknown as { codeburn?: unknown }).codeburn
+  vi.clearAllMocks()
+})
+
+function setPlatform(platform: string): void {
+  ;(window as unknown as { codeburn?: { platform?: string } }).codeburn = { platform }
+}
 
 describe('PluginsSection', () => {
   it('renders row actions for loaded plugins', () => {
@@ -126,5 +149,33 @@ describe('PluginsSection', () => {
     const cancelButton = Array.from(container.querySelectorAll('button'))
       .find(b => b.textContent.includes('Cancel'))
     expect(cancelButton?.disabled).toBe(true)
+  })
+})
+
+describe('PluginsSection on Windows', () => {
+  // The plugin runtime has not shipped for Windows, so the CLI never answers and the page
+  // used to sit on "Loading plugins..." for good.
+  it('renders the coming-soon panel and never asks the CLI for anything', async () => {
+    setPlatform('win32')
+
+    render(<PluginsSection />)
+
+    expect(screen.getByText(/Plugins are coming to Windows/)).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Plugins' })).toBeInTheDocument()
+    expect(screen.queryByText(/Loading plugins/)).toBeNull()
+    // No CLI call, so no spinner to wait on and no timer to unwind.
+    expect(bridge.pluginList).not.toHaveBeenCalled()
+    await Promise.resolve()
+    expect(bridge.pluginList).not.toHaveBeenCalled()
+  })
+
+  it('still loads on every other platform', async () => {
+    setPlatform('darwin')
+    bridge.pluginList.mockResolvedValue([])
+
+    render(<PluginsSection />)
+
+    await waitFor(() => expect(bridge.pluginList).toHaveBeenCalled())
+    expect(screen.queryByText(/Plugins are coming to Windows/)).toBeNull()
   })
 })

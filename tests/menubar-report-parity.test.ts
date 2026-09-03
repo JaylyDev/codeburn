@@ -68,10 +68,12 @@ async function seedFixture(): Promise<void> {
   process.env['CODEBURN_CACHE_DIR'] = cacheDir
 }
 
-/** Everything but the per-call wall-clock `generated` stamp. */
+/** Everything but the wall-clock fields: the `generated` stamp and each live session's
+ *  `idleSeconds`, which ticks between two builds that straddle a second boundary. */
 function stableShape(payload: unknown): unknown {
-  const clone = structuredClone(payload) as { generated?: string }
+  const clone = structuredClone(payload) as { generated?: string; liveSessions?: { sessions: { idleSeconds: number }[] } }
   clone.generated = ''
+  for (const session of clone.liveSessions?.sessions ?? []) session.idleSeconds = 0
   return clone
 }
 

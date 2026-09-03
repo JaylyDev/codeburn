@@ -110,7 +110,7 @@ describe('events', () => {
     telemetry.track('totally_made_up', { a: 1 })
     telemetry.track('section_view', {
       section: 'x'.repeat(500),
-      junk: { nested: 'object' },
+      junk: new Date(),
       fn: () => {},
       nan: NaN,
       ok: 42,
@@ -126,6 +126,46 @@ describe('events', () => {
     expect(props.ok).toBe(42)
     // Day-granularity timestamps only.
     expect(body.events[0]!.day).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+  })
+
+  it('keeps the daily snapshot shape but drops anything deeper or bigger', async () => {
+    const { telemetry, posts } = make()
+    telemetry.completeOnboarding(true)
+    telemetry.track('usage_snapshot', {
+      schema: 2,
+      models: [{ name: 'Sonnet 4.5', tasks: [{ name: 'Coding', share: 0.75 }] }],
+      categories: [{ name: 'Coding', topModels: ['Sonnet 4.5', 'Opus 4.6'] }],
+      sessions: { countBucket: '100-1k' },
+      // One container deeper than the snapshot's own deepest shape.
+      tooDeep: [{ a: [{ b: [{ c: 1 }] }] }],
+      wide: Array.from({ length: 40 }, (_, i) => ({ name: `n${i}` })),
+    })
+    await telemetry.flush()
+    const props = (posts[0]!.body as { events: Array<{ name: string; props: Record<string, unknown> }> }).events[1]!.props
+
+    expect(props.models).toEqual([{ name: 'Sonnet 4.5', tasks: [{ name: 'Coding', share: 0.75 }] }])
+    expect(props.categories).toEqual([{ name: 'Coding', topModels: ['Sonnet 4.5', 'Opus 4.6'] }])
+    expect(props.sessions).toEqual({ countBucket: '100-1k' })
+    expect(props.tooDeep).toBeUndefined()
+    expect(props.wide).toHaveLength(12)
+  })
+
+  it('accepts the name-only interaction events', async () => {
+    const { telemetry, posts } = make()
+    telemetry.completeOnboarding(true)
+    telemetry.track('optimize_apply', { kind: 'claude-md-too-long', fixType: 'file-content' })
+    telemetry.track('plan_set', { provider: 'cursor', plan: 'cursor-pro' })
+    telemetry.track('export', { format: 'json', provider: 'all' })
+    telemetry.track('compare_view', { modelA: 'Sonnet 4.5', modelB: 'Opus 4.6' })
+    telemetry.track('settings_change', { setting: 'theme', value: 'dark' })
+    await telemetry.flush()
+    const events = (posts[0]!.body as { events: Array<{ name: string; props: Record<string, unknown> }> }).events
+
+    expect(events.map(event => event.name)).toEqual([
+      'app_open', 'optimize_apply', 'plan_set', 'export', 'compare_view', 'settings_change',
+    ])
+    expect(events[1]!.props).toEqual({ kind: 'claude-md-too-long', fixType: 'file-content' })
+    expect(events[5]!.props).toEqual({ setting: 'theme', value: 'dark' })
   })
 
   it('stamps events with the LOCAL calendar day, not the UTC day', async () => {

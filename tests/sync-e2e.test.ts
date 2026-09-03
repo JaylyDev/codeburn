@@ -25,6 +25,7 @@ import {
 } from '../src/sync/auth.js'
 import { createCredentialStore } from '../src/sync/credentials.js'
 import { writeSyncConfig, readSyncConfig, deleteSyncConfig } from '../src/sync/config.js'
+import { setHome } from './setup/home.js'
 
 let idp: MockIdp
 let tmpHome: string
@@ -47,11 +48,11 @@ afterAll(async () => {
 
 beforeEach(async () => {
   tmpHome = await mkdtemp(join(tmpdir(), 'codeburn-sync-e2e-'))
-  process.env.HOME = tmpHome
+  setHome(tmpHome)
 })
 
 afterEach(async () => {
-  process.env.HOME = originalHome
+  setHome(originalHome)
   await rm(tmpHome, { recursive: true, force: true })
 })
 

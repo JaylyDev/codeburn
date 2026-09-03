@@ -56,6 +56,9 @@ export type DailyModelBreakdown = {
   calls: number
   inputTokens: number
   outputTokens: number
+  // Raw provider/model ids that collapsed into this display name. Present
+  // only when more than one folded in; absent for an older CLI (#1239).
+  rawModels?: string[]
 }
 
 export type DailyHistoryEntry = {
@@ -174,8 +177,9 @@ export type MenubarPayload = {
     localModelSavings: LocalModelSavings
     providers: Record<string, number>
     // Optional: older CLIs omit it. `id` is the internal provider name (round-trips
-    // as --provider), `label` the display name. Fall back to `providers` when absent.
-    providerDetails?: Array<{ id: string; label: string; cost: number }>
+    // as --provider), `label` the display name. `hasUsage` distinguishes active $0
+    // providers from detected-but-idle providers when present.
+    providerDetails?: Array<{ id: string; label: string; cost: number; calls?: number; hasUsage?: boolean }>
     topProjects: Array<{
       name: string
       cost: number
@@ -298,6 +302,12 @@ export type MenubarPayload = {
   currency?: { code: string; symbol: string; rate: number }
   combined?: CombinedUsage
   claudeConfigs?: ClaudeConfigSelector
+  // The CLI's anonymised, fully bucketed daily aggregate (src/telemetry-snapshot.ts).
+  // Sent verbatim as the `usage_snapshot` telemetry event, so the desktop app and
+  // the Windows tray report identical shapes. Opaque here: the renderer never reads
+  // inside it. Absent on CLIs that predate the field, which is when the renderer's
+  // own fallback builder takes over.
+  telemetrySnapshot?: Record<string, unknown> | null
 }
 
 // ————— src/types.ts + src/models-report.ts —————
@@ -322,6 +332,9 @@ export type ModelReportRow = {
   providerDisplayName: string
   model: string
   modelDisplayName: string
+  // Raw provider/model ids folded into this row (e.g. two routes of the same
+  // model). Length 1 when nothing merged.
+  rawModels: string[]
   category: TaskCategory | null
   inputTokens: number
   outputTokens: number
@@ -675,6 +688,48 @@ export type UpdateStatus = {
   tag: string | null
 }
 
+/** The tray app and the Capacity Dock the Windows desktop app bundles (app/electron/menubar.ts).
+ *  `supported` is false everywhere else, and on a Windows build with nothing staged. */
+export type CompanionStatus = {
+  supported: boolean
+  menuBar: boolean
+  sidebar: boolean
+  /** The Store route, where launch at login is the package's own startup task. */
+  store: boolean
+  /** True when this run installed a tray app that Windows can only finish putting in place at
+   *  the next restart. Nothing is started until then, so the corner says so rather than
+   *  showing two switches on with nothing running. */
+  restartRequired?: boolean
+}
+
+/** The tray app's own settings, from the two files it reads them from
+ *  (windows-settings.json, windows-dock.json) plus the HKCU Run value. */
+export type TrayPrefs = {
+  app: {
+    metric: string
+    menubarPeriod: string
+    accent: string
+    trayBadge: boolean
+    usageRefreshSeconds: number
+    quotaCadenceSeconds: number
+    terminal: string
+  }
+  dock: {
+    enabled: boolean
+    preferred: string | null
+    scale: number
+    theme: string
+    gaugeShape: string
+    providers: string[]
+    manualSelection: boolean
+  }
+  launchAtLogin: boolean
+  /** True where launch at login belongs to Windows rather than to this app: the Store
+   *  package declares it as its own startup task, so the pane points at Settings > Apps >
+   *  Startup instead of showing a switch (app/electron/menubar.ts). */
+  launchAtLoginManaged: boolean
+}
+
 export interface CodeburnBridge {
   /** Subscribe to cold-start scan progress; returns an unsubscribe fn. */
   onProgress(cb: (event: ScanProgressEvent) => void): () => void
@@ -727,6 +782,16 @@ export interface CodeburnBridge {
   completeOnboarding(enabled: boolean): Promise<TelemetryStatus | null>
   telemetryTrack(name: string, props?: Record<string, unknown>): Promise<boolean>
   openExternal(url: string): Promise<void>
+  /** The bundled tray app and Capacity Dock (Windows). Optional so a preload that
+   *  predates them degrades to "not supported" rather than throwing. */
+  companionStatus?(): Promise<CompanionStatus>
+  setMenuBarEnabled?(enabled: boolean): Promise<CompanionStatus>
+  setSidebarEnabled?(enabled: boolean): Promise<CompanionStatus>
+  /** The tray app's own settings. Null when there is no tray app to have any. */
+  trayPrefs?(): Promise<TrayPrefs | null>
+  setTrayAppPref?(patch: Record<string, unknown>): Promise<TrayPrefs | null>
+  setTrayDockPref?(patch: Record<string, unknown>): Promise<TrayPrefs | null>
+  setLaunchAtLogin?(enabled: boolean): Promise<TrayPrefs | null>
   // Plugin management
   pluginList(): Promise<unknown>
   pluginInfo(name: string): Promise<unknown>

@@ -373,7 +373,11 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // replays (double-counted before), takes the model from the reporting
   // assistant/message, and keeps agent-injected context out of the preview.
   dsh: 'seed-aware-v1',
-  hermes: 'reasoning-output-accounting-v1-est-cost-routed-ids-workspace-pr-v5',
+  // cost-provenance-v3: preserve Hermes included/estimated/actual status and
+  // rebuild the provider section alongside the v3 lifetime ledger. The parse
+  // bump is required with the ledger bump: seeding a new ledger from a section
+  // produced under v2 can turn historical accounting deltas into today's use.
+  hermes: 'reasoning-output-accounting-v1-est-cost-routed-ids-workspace-pr-v5-cost-provenance-v3',
   'lingtai-tui': 'token-ledger-registry-activity-v3',
   'ibm-bob': 'worktree-project-grouping-v1',
   // project-path-v1: the parser now records the session's full working
@@ -1842,7 +1846,9 @@ const STATUS_SNAPSHOT_FILE = 'status-snapshot'
 // resolution time at which its corpus scan began. The latter is the ordering
 // fence for competing writers: max(file mtime) is not monotonic because
 // deleting the newest file legitimately makes it decrease.
-const STATUS_SNAPSHOT_VERSION = 3
+//
+// v4: the payload carries `telemetrySnapshot`, which a v3 record predates.
+const STATUS_SNAPSHOT_VERSION = 4
 
 type StatusSnapshotRecord = {
   version: number

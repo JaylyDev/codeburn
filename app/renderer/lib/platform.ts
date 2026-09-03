@@ -24,6 +24,14 @@ export function isMacPlatform(): boolean {
   return userAgentPlatform() === 'darwin'
 }
 
+/** True when the Electron preload reports win32 (or the UA names Windows). */
+export function isWindowsPlatform(): boolean {
+  const platform = bridgePlatform()
+  if (platform) return platform === 'win32'
+  if (typeof navigator === 'undefined') return false
+  return /windows/i.test(navigator.userAgent)
+}
+
 /** The modifier keycap label: '⌘' on mac, 'Ctrl+' elsewhere. */
 export function modKeyLabel(): string {
   return isMacPlatform() ? '⌘' : 'Ctrl+'

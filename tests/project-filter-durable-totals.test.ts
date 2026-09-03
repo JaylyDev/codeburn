@@ -10,6 +10,7 @@ import { buildDurablePeriod, buildMenubarPayloadForRange, buildPeriodData, getDa
 import { parseAllSessions, filterProjectsByName, clearSessionCache } from '../src/parser.js'
 import { renderOverview } from '../src/overview.js'
 import type { DateRange } from '../src/types.js'
+import { setHome } from './setup/home.js'
 
 // The durable headline (overview / report Overview panel / menubar current) is
 // built from the carry-forward daily cache unioned with today's live parse, so
@@ -164,7 +165,7 @@ beforeEach(async () => {
   savedEnv = Object.fromEntries(ENV_KEYS.map(k => [k, process.env[k]]))
   await mkdir(join(ROOT, 'home', '.claude'), { recursive: true })
   await mkdir(join(ROOT, 'cache'), { recursive: true })
-  process.env['HOME'] = join(ROOT, 'home')
+  setHome(join(ROOT, 'home'))
   process.env['CODEBURN_CACHE_DIR'] = join(ROOT, 'cache')
   process.env['CLAUDE_CONFIG_DIR'] = join(ROOT, 'home', '.claude')
   delete process.env['CLAUDE_CONFIG_DIRS']

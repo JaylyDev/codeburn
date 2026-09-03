@@ -108,8 +108,9 @@ struct CapacityDockPresentationTests {
                 #expect(expanded.height.rounded() == expanded.height)
 
                 #expect(model.detailWidth.rounded() == model.detailWidth)
-                let detailHeight = CapacityDockMetrics.detailHeight(quota: nil, scale: model.detailScale)
-                #expect(detailHeight.rounded() == detailHeight)
+                // The glance popover's own height is asserted whole across scales by
+                // CapacityDockGlanceTests.heightIsAlwaysWhole, against the signature it
+                // grew when the glance replaced the old row-counted popover.
             }
         }
     }
@@ -325,7 +326,21 @@ struct CapacityDockPresentationTests {
             footerLines: [reason]
         )
 
-        #expect(CapacityDockMetrics.detailHeight(quota: quota, scale: 1) >= 216)
+        let height = CapacityDockMetrics.detailHeight(
+            quota: quota,
+            sessionCount: nil,
+            hasToday: false,
+            tailEdge: .right,
+            scale: 1
+        )
+        // Worst case the card must not clip: the provider header, the guidance
+        // block at full wrap ("Reconnect required", a 2-line reason and a 3-line
+        // instruction at ~13pt each, plus their spacing), and the action button.
+        // The windows row is absent, since a disconnected provider has no quota.
+        let guidance: CGFloat = 84
+        let actionButton: CGFloat = 38
+        let floor: CGFloat = CapacityDockGlance.headerHeight + guidance + actionButton
+        #expect(height >= floor)
     }
 
     @MainActor
@@ -399,6 +414,18 @@ struct CapacityDockPresentationTests {
         let provider = CapacityDockProvider(rawValue: "commandcode")!
         #expect(ProviderConnectionGuidance.instruction(for: provider) ==
             "Sign in to Command Code in a supported browser, then click Retry.")
+    }
+
+    @Test("Grok Build offers direct one-click local login discovery")
+    func grokBuildConnectionGuidance() {
+        let provider = CapacityDockProvider(rawValue: "grok")!
+        #expect(ProviderConnectionGuidance.instruction(for: provider) ==
+            "Sign in with the Grok app or CLI, then click Retry.")
+        #expect(ProviderConnectionSubmissionPolicy.resolve(
+            credential: CapacityDockProviderCredential(),
+            savedCredential: CapacityDockProviderCredential(),
+            requiresExplicitCredential: false
+        ) == .connect)
     }
 
     @Test("Connect saves edited credentials before fetching")

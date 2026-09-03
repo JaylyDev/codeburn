@@ -84,6 +84,26 @@ async function seedCarriedCache(): Promise<string> {
   return day
 }
 
+/** Sources for the settled day still exist but explain only a fraction of what
+ *  the cache finalized there, which is what source aging looks like in the
+ *  window before a transcript is deleted outright. */
+async function seedPartialSourcesFor(date: string): Promise<void> {
+  const projectDir = join(ROOT, 'home', '.claude', 'projects', 'p')
+  await mkdir(projectDir, { recursive: true })
+  const [y, m, d] = date.split('-').map(Number)
+  const line = JSON.stringify({
+    type: 'assistant',
+    timestamp: new Date(y!, m! - 1, d!, 12, 0, 0).toISOString(),
+    sessionId: 's-partial',
+    message: {
+      type: 'message', role: 'assistant', model: 'claude-3-5-sonnet-20241022', id: 'm-partial',
+      content: [],
+      usage: { input_tokens: 1000, output_tokens: 200, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    },
+  })
+  await writeFile(join(projectDir, 's-partial.jsonl'), line + '\n', 'utf-8')
+}
+
 /** Seed a real, priced Claude session dated TODAY (the live, surviving half). */
 async function seedLiveTodaySession(): Promise<void> {
   const projectDir = join(ROOT, 'home', '.claude', 'projects', 'p')
@@ -209,6 +229,25 @@ describe('CLI totals ↔ menubar parity through the durable daily cache', () => 
     expect(codexMenubar.current.cost).toBe(codexDurable.data.cost)
     expect(codexDurable.data.cost).toBe(0)
     expect(codexDurable.carriedCostUSD).toBe(0)
+  })
+
+  it('keeps the scoped view equal to the all-provider slice when a settled day only partially survives', async () => {
+    const day = await seedCarriedCache()
+    await seedPartialSourcesFor(day)
+    await seedLiveTodaySession()
+    const range = getDateRange('all').range
+
+    clearSessionCache()
+    const all = await buildMenubarPayloadForRange({ range, label: 'p' }, { provider: 'all', optimize: false, timeline: false })
+    clearSessionCache()
+    const scoped = await buildMenubarPayloadForRange({ range, label: 'p' }, { provider: 'claude', optimize: false, timeline: false })
+
+    // The corpus is entirely Claude, so the scoped headline IS the all-provider
+    // Claude slice. The scoped path used to overlay the shrunken re-parse over
+    // the settled day and report a fraction of the all-provider total.
+    expect(all.current.calls).toBeGreaterThan(40)
+    expect(scoped.current.calls).toBe(all.current.calls)
+    expect(scoped.current.cost).toBeCloseTo(all.current.cost, 6)
   })
 
   it('holds the equality in the plain live regime with no carried days', async () => {

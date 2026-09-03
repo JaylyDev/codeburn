@@ -538,7 +538,7 @@ let input = '';
 for await (const line of rl) {
   input += line;
 }
-fs.writeFileSync('${echoFile}', input);
+fs.writeFileSync(${JSON.stringify(echoFile)}, input);
 process.stdout.write(JSON.stringify({ perCall: {}, spans: [] }));
 `
     )
@@ -592,7 +592,7 @@ let input = '';
 for await (const line of rl) {
   input += line;
 }
-fs.writeFileSync('${echoFile}', input);
+fs.writeFileSync(${JSON.stringify(echoFile)}, input);
 process.stdout.write(JSON.stringify({ perCall: {}, spans: [] }));
 `
     )
@@ -631,7 +631,7 @@ const envCheck = {
   stateDirPath: stateDir || null,
   pluginDir: process.env.CODEBURN_PLUGIN_DIR
 };
-fs.writeFileSync('${checkFile}', JSON.stringify(envCheck));
+fs.writeFileSync(${JSON.stringify(checkFile)}, JSON.stringify(envCheck));
 process.stdout.write(JSON.stringify({ perCall: {}, spans: [] }));
 `
     )
@@ -646,7 +646,8 @@ process.stdout.write(JSON.stringify({ perCall: {}, spans: [] }));
     // Check env var was set
     const envCheck = JSON.parse(await readFile(checkFile, 'utf-8'))
     expect(envCheck.hasStateDir).toBe(true)
-    expect(envCheck.stateDirPath).toContain('codeburn/plugin-state/state-dir-plugin')
+    // The state dir is a real path, so the separator is the platform's.
+    expect(envCheck.stateDirPath).toContain(join('codeburn', 'plugin-state', 'state-dir-plugin'))
     expect(envCheck.stateDirPath).toContain(homedir())
 
     // Verify directory exists

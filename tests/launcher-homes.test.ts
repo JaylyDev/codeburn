@@ -1,12 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtemp, mkdir, writeFile, rm, symlink } from 'fs/promises'
-import { join } from 'path'
+import { basename, join } from 'path'
 import { tmpdir } from 'os'
 
 import { collectLauncherNotes, isNestedLauncherCodexHome } from '../src/launcher-homes.js'
 import { collectDoctorReport, renderDoctorTable } from '../src/doctor.js'
 import { createCodexProvider } from '../src/providers/codex.js'
 import { emptyCache } from '../src/session-cache.js'
+import { setHome } from './setup/home.js'
 
 function sessionMeta(sessionId: string, extra: Record<string, unknown> = {}): string {
   return JSON.stringify({
@@ -29,7 +30,7 @@ async function writeCodexSession(codexDir: string, name: string, sessionId?: str
 }
 
 function names(sources: { path: string }[]): string[] {
-  return sources.map(s => s.path.split('/').pop()!)
+  return sources.map(s => basename(s.path))
 }
 
 describe('isNestedLauncherCodexHome', () => {
@@ -112,7 +113,7 @@ describe('Codex discover overlap-only nest filter', () => {
     await writeCodexSession(nested, 'rollout-buzz.jsonl')
     const prevHome = process.env.HOME
     const prevCodex = process.env.CODEX_HOME
-    process.env.HOME = home
+    setHome(home)
     process.env.CODEX_HOME = nested
     try {
       const provider = createCodexProvider()
@@ -125,8 +126,8 @@ describe('Codex discover overlap-only nest filter', () => {
         join(nested, 'archived_sessions'),
       ])
     } finally {
-      if (prevHome === undefined) delete process.env.HOME
-      else process.env.HOME = prevHome
+      if (prevHome === undefined) setHome(undefined)
+      else setHome(prevHome)
       if (prevCodex === undefined) delete process.env.CODEX_HOME
       else process.env.CODEX_HOME = prevCodex
     }
@@ -142,7 +143,7 @@ describe('Codex discover overlap-only nest filter', () => {
     await writeCodexSession(nested, 'rollout-buzz-only.jsonl', 'sess-buzz')
     const prevHome = process.env.HOME
     const prevCodex = process.env.CODEX_HOME
-    process.env.HOME = home
+    setHome(home)
     process.env.CODEX_HOME = nested
     try {
       const provider = createCodexProvider()
@@ -152,8 +153,8 @@ describe('Codex discover overlap-only nest filter', () => {
         'rollout-buzz-only.jsonl',
       ])
     } finally {
-      if (prevHome === undefined) delete process.env.HOME
-      else process.env.HOME = prevHome
+      if (prevHome === undefined) setHome(undefined)
+      else setHome(prevHome)
       if (prevCodex === undefined) delete process.env.CODEX_HOME
       else process.env.CODEX_HOME = prevCodex
     }
@@ -168,7 +169,7 @@ describe('Codex discover overlap-only nest filter', () => {
     await writeCodexSession(nested, 'rollout-buzz-only.jsonl', 'sess-buzz')
     const prevHome = process.env.HOME
     const prevCodex = process.env.CODEX_HOME
-    process.env.HOME = home
+    setHome(home)
     process.env.CODEX_HOME = nested
     vi.resetModules()
     try {
@@ -178,8 +179,8 @@ describe('Codex discover overlap-only nest filter', () => {
         'rollout-buzz-only.jsonl',
       ])
     } finally {
-      if (prevHome === undefined) delete process.env.HOME
-      else process.env.HOME = prevHome
+      if (prevHome === undefined) setHome(undefined)
+      else setHome(prevHome)
       if (prevCodex === undefined) delete process.env.CODEX_HOME
       else process.env.CODEX_HOME = prevCodex
     }
@@ -200,7 +201,7 @@ describe('Codex discover overlap-only nest filter', () => {
     await writeCodexSession(nested, 'rollout-nest-B-long.jsonl', 'sess-B', nestB)
     const prevHome = process.env.HOME
     const prevCodex = process.env.CODEX_HOME
-    process.env.HOME = home
+    setHome(home)
     process.env.CODEX_HOME = nested
     vi.resetModules()
     try {
@@ -214,8 +215,8 @@ describe('Codex discover overlap-only nest filter', () => {
         'rollout-nest-B-long.jsonl',
       ])
     } finally {
-      if (prevHome === undefined) delete process.env.HOME
-      else process.env.HOME = prevHome
+      if (prevHome === undefined) setHome(undefined)
+      else setHome(prevHome)
       if (prevCodex === undefined) delete process.env.CODEX_HOME
       else process.env.CODEX_HOME = prevCodex
     }
@@ -242,13 +243,13 @@ describe('Codex discover overlap-only nest filter', () => {
     await writeCodexSession(nested, 'rollout-renamed.jsonl', 'sess-shared')
     await writeCodexSession(nested, 'rollout-buzz.jsonl', 'sess-buzz')
     const prevHome = process.env.HOME
-    process.env.HOME = home
+    setHome(home)
     try {
       const provider = createCodexProvider(nested)
       expect(names(await provider.discoverSessions())).toEqual(['rollout-buzz.jsonl'])
     } finally {
-      if (prevHome === undefined) delete process.env.HOME
-      else process.env.HOME = prevHome
+      if (prevHome === undefined) setHome(undefined)
+      else setHome(prevHome)
     }
   })
 })

@@ -164,7 +164,10 @@ async function resolveCanonicalProjectPathUncached(cwd: string): Promise<{ path:
       const worktreeMarker = '/.git/worktrees/'
       const markerIndex = normalizedGitDir.lastIndexOf(worktreeMarker)
       if (markerIndex === -1) return { path: dir === trimmed ? dir : cwd, isWorktree: false }
-      return { path: normalizedGitDir.slice(0, markerIndex), isWorktree: true }
+      // The separator scan runs on a slash-normalized copy so a Windows gitdir
+      // matches too, but the slice comes off the original: the main repo path is
+      // compared against session cwds and displayed, so it must stay native.
+      return { path: gitDir.slice(0, markerIndex), isWorktree: true }
     }
     const parent = dirname(dir)
     if (parent === dir) return { path: cwd, isWorktree: false }

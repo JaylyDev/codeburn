@@ -2296,6 +2296,9 @@ describe.skipIf(!isSqliteAvailable())('copilot provider - session-store parsing'
     // suppression keeps holding from previously cached rows — and its parse
     // raises the busy shape parseProviderSources skips-and-retries. The
     // session-state file parses normally either way.
+    // Windows has no POSIX mode denial: chmod only toggles the read-only
+    // attribute, so the store stays readable and there is nothing to observe.
+    if (process.platform === 'win32') return
     if (typeof process.getuid === 'function' && process.getuid() === 0) return // root ignores modes
     const deniedDir = join(tmpDir, 'denied')
     await mkdir(deniedDir, { recursive: true })
@@ -2337,6 +2340,9 @@ describe.skipIf(!isSqliteAvailable())('copilot provider - session-store parsing'
     // fall through to the generic parse-failure path — that would cache a
     // failed marker at the current fingerprint and zero the covered
     // sessions until the file next changes.
+    // Windows has no POSIX mode denial: chmod only toggles the read-only
+    // attribute, so the store stays readable and there is nothing to observe.
+    if (process.platform === 'win32') return
     if (typeof process.getuid === 'function' && process.getuid() === 0) return // root ignores modes
     createSessionStoreDb(dbPath)
     insertUsageRow(dbPath, { sessionId: 'sess-open', model: 'gpt-5', inputTokens: 1000, cacheReadTokens: 400 })
@@ -2595,6 +2601,13 @@ describe('copilot provider - JetBrains parsing', () => {
   // Build an assistant response blob in the real nested-escaped shape:
   // {"__first__":{"type":"Subgraph","value":"{\"<uuid>\":{\"type\":\"Value\",
   //   \"value\":\"{\\\"type\\\":\\\"Markdown\\\",\\\"data\\\":\\\"{\\\\\\\"text\\\\\\\":...}\"}"}}
+  // JetBrains records VirtualFile URLs: forward slashes throughout, and a
+  // leading slash ahead of a Windows drive letter (file:///C:/repo/One.ts).
+  function jbFileUrl(filePath: string): string {
+    const slashed = filePath.replace(/\\/g, '/')
+    return `file://${slashed.startsWith('/') ? '' : '/'}${slashed}`
+  }
+
   function jbAssistantBlob(text: string, opts: { model?: string; errored?: boolean; files?: string[] } = {}) {
     const innerMd = { type: 'Markdown', data: JSON.stringify({ text, annotations: [] }) }
     const valueMap: Record<string, unknown> = {
@@ -2605,7 +2618,7 @@ describe('copilot provider - JetBrains parsing', () => {
     if (opts.files) {
       valueMap['__refs__'] = {
         type: 'Value',
-        value: JSON.stringify({ type: 'References', data: opts.files.map((f) => `file://${f}`).join(' ') }),
+        value: JSON.stringify({ type: 'References', data: opts.files.map(jbFileUrl).join(' ') }),
       }
     }
     const outer: Record<string, unknown> = {

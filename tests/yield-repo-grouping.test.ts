@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
@@ -162,7 +162,7 @@ describe('yield repo grouping by canonical repository identity (issue #713)', ()
       commitAt(repoDir, 'feat: shipped once', '2026-01-01T10:30:00Z')
 
       // Linked worktree on a different branch, sharing the same object store.
-      wtDir = join(repoDir, '..', `${repoDir.split('/').pop()}-wt`)
+      wtDir = join(repoDir, '..', `${basename(repoDir)}-wt`)
       git(repoDir, ['worktree', 'add', wtDir, '-b', 'feature'])
 
       const sessionMain = makeSession({ sessionId: 'wt-main', project: 'app', ...tightWindow, totalCostUSD: 5 })

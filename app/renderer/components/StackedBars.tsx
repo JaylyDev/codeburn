@@ -59,12 +59,13 @@ export function StackedBars({ daily, fallbackLabel = 'All models', animateKey = 
                   (a, b) => SERIES_ORDER.indexOf(seriesKeyForModel(a.name)) - SERIES_ORDER.indexOf(seriesKeyForModel(b.name)),
                 ).map(model => {
                   const pct = Math.max(1, (Math.max(0, model.cost) / maxTotal) * 100)
+                  const routes = model.rawModels && model.rawModels.length > 1 ? ` (${model.rawModels.join(', ')})` : ''
                   return (
                     <span
                       key={`${day.date}-${model.name}`}
                       className={`s ${seriesClassForModel(model.name)}`}
                       style={{ height: `${pct}%` }}
-                      title={`${model.name} · ${formatUsd(model.cost)}`}
+                      title={`${model.name}${routes} · ${formatUsd(model.cost)}`}
                     />
                   )
                 })

@@ -208,6 +208,16 @@ XDG rules: `$XDG_CONFIG_HOME/github-copilot` when set, else
 `~/.config/github-copilot` (macOS / Linux) or `%LOCALAPPDATA%\github-copilot`
 (Windows).
 
+**Not available on the Linux Snap build.** `~/.config/github-copilot` also
+holds the Copilot OAuth credential files (`hosts.json`, `apps.json`) directly
+under that root, alongside the per-IDE nitrite stores at a variable
+`<ide>/<kind>/<storeId>/` depth. The strict-confinement snap's personal-files
+grant is a fixed list of literal paths, so it cannot reach the variable-depth
+`.db` files without also granting the credential files sitting beside them.
+JetBrains Copilot sessions are therefore not discovered when CodeBurn runs as
+a snap; every other Copilot source (CLI, VS Code core chat, VS Code extension
+transcripts, OTel) is unaffected.
+
 **Storage: the Nitrite `.db`.** An H2 MVStore file (header
 `H:2,block:9,…format:3`) of Java-serialized Nitrite documents (`NtAgentSession`,
 `NtAgentTurn`). It is read as `latin1` (byte-offset-stable, lossless) and scanned

@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  What uninstall leaves behind, and what it should not.
+
+  The generated main.wxs removes the install directory, the shortcuts and this app's own
+  HKCU\Software\AgentSeal key. It knows nothing about the Run value, because the app writes
+  that one at runtime when the user turns on "Launch at login" (src/autostart.rs), long after
+  the installer has finished. Uninstalling therefore used to leave
+  HKCU\...\CurrentVersion\Run\CodeBurn pointing at an executable that is no longer there, and
+  Windows would go on trying to start it at every login.
+
+  Removing exactly one value of a key the installer does not own has no declarative form in
+  WiX v3: RemoveRegistryValue removes on install only, and RemoveRegistryKey would take the
+  whole Run key with every other application's autostart in it. So this is reg.exe, deferred
+  and impersonated so that it runs against the HKCU of the user doing the uninstall rather
+  than against SYSTEM's, conditioned on a full uninstall so that an upgrade (which uninstalls
+  the old product mid-sequence) does not switch off a setting the user asked for, and with
+  Return="ignore" so that the exit code 1 from a value that was never written cannot fail the
+  uninstall.
+
+  Data files are deliberately left alone. The settings and the daily budget under
+  ~/.config/codeburn are shared with the codeburn CLI, which is a separate install and usually
+  stays; the caches and the tray status under %LOCALAPPDATA%\codeburn-menubar rebuild
+  themselves in one refresh and cost a few kilobytes. Removing either would mean an uninstall
+  that silently takes a user's own configuration with it, including one performed by an
+  upgrade. The provider keys in %LOCALAPPDATA%\codeburn\provider-keys.dat are the one item
+  with a case for removal; they are DPAPI-sealed to this account, useless to anyone else, and
+  removing them would sign a user out of a reinstall, so they stay too.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <!-- Referenced from tauri.conf.json (bundle.windows.wix.componentGroupRefs), which is
+         what pulls this whole fragment, custom action and sequencing included, into the
+         package. The marker value is here to give the component a key path; it lives under
+         the key main.wxs already creates and removes. -->
+    <ComponentGroup Id="CodeBurnUninstallCleanup" Directory="INSTALLDIR">
+      <Component Id="CodeBurnUninstallCleanupMarker" Guid="*">
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\AgentSeal\CodeBurn Menubar"
+          Name="UninstallCleanup"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <CustomAction
+      Id="CodeBurnRemoveRunValue"
+      Directory="INSTALLDIR"
+      ExeCommand="&quot;[System64Folder]reg.exe&quot; delete &quot;HKCU\Software\Microsoft\Windows\CurrentVersion\Run&quot; /v CodeBurn /f"
+      Execute="deferred"
+      Impersonate="yes"
+      Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- Before RemoveFiles, so the value goes while the install is still whole and can be
+           rolled back as one thing. REMOVE="ALL" is the uninstall; the extra test excludes
+           the removal half of a major upgrade. -->
+      <Custom Action="CodeBurnRemoveRunValue" Before="RemoveFiles">
+        REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE
+      </Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

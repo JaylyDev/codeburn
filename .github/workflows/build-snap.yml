@@ -55,4 +55,7 @@ jobs:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
         run: |
           sudo snap install snapcraft --classic
-          snapcraft upload --release=stable app/release/codeburn_*.snap
+          # snapcraft exits 1 when the store queues the revision for manual review,
+          # which every personal-files snap does; the upload itself succeeded.
+          snapcraft upload --release=stable app/release/codeburn_*.snap 2>&1 | tee upload.log
+          test "${PIPESTATUS[0]}" -eq 0 || grep -q 'will need manual review' upload.log

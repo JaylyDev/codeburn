@@ -1238,7 +1238,9 @@ function inferJetBrainsProject(raw: string): string | undefined {
     let p = m[1]
     try { p = decodeURIComponent(p) } catch { /* leave as-is */ }
     const dir = p.slice(0, p.lastIndexOf('/'))
-    if (dir.startsWith('/')) seen.add(dir)
+    // A Windows URL is file:///C:/repo/One.ts, so the captured path carries a
+    // leading slash that is part of the URL, not of the drive path.
+    if (dir.startsWith('/')) seen.add(dir.replace(/^\/(?=[a-zA-Z]:\/)/, ''))
   }
   if (seen.size === 0) return undefined
 
