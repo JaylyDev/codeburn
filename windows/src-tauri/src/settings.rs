@@ -41,6 +41,292 @@ const MIN_HEIGHT: f64 = 520.0;
 /// mount, because an event emitted while the webview is still loading has nobody to hear it.
 static PENDING_SECTION: Mutex<Option<String>> = Mutex::new(None);
 
+// Cross-process preference lock ---------------------------------------------------------
+//
+// windows-settings.json and windows-dock.json are each owned by two processes at once: this
+// tray app and the Electron desktop app. Both do a read / modify / write to merge their own
+// keys into whatever the other last stored. The atomic rename each already does stops a torn
+// file, but not a lost update: two writers read the same state, change different keys, and the
+// later rename erases the earlier writer's key. The user watches a dock placement, an enabled
+// switch, a provider choice or a scale silently revert. This lock serializes the whole cycle
+// so that never happens. It is the one place the protocol is written down; `dock.rs` and
+// `app/electron/tray-settings.ts` point here rather than restating it.
+//
+// PROTOCOL (honoured identically by app/electron/tray-settings.ts):
+//
+//   Lock file:  sibling of the target named `.<stem>.lock` (windows-dock.json ->
+//               `.windows-dock.lock`), the same `.config.lock` shape config.rs uses.
+//   Body:       one line of JSON, `{"pid":<os pid>,"at":<unix ms>}`.
+//   Acquire:    exclusive create (create_new / 'wx'). On success the holder keeps the handle
+//               open for the whole cycle and returns a guard. On collision the existing lock
+//               is taken over only if abandoned; otherwise the contender polls until a short
+//               wait budget runs out and then FAILS loudly rather than writing behind the
+//               holder, so a contended write is reported to the caller, never silently lost.
+//   Abandoned:  its mtime is older than the stale window (a crashed holder never refreshes
+//               it), OR its recorded pid is not our own and no longer alive. The pid probe is
+//               the fast path for a crash: a dead holder is recovered on the first poll, well
+//               inside the wait budget. The age gate is the backstop for a pid we cannot probe
+//               or a reused one. A live holder is neither, which is the safety argument: a
+//               fresh mtime plus a live pid are never taken, and the read/modify/write it
+//               guards finishes in milliseconds, orders of magnitude inside the stale window.
+//   Release:    close the handle and unlink the lock, unless it now carries a different pid
+//               (a successor's), which is left alone.
+//
+// Reads take no lock: every writer renames a whole file into place, so a reader sees the old
+// file or the new one, never a torn one (the same reason config::read is lock-free).
+//
+// Lessons borrowed from src/cache-refresh-lock.ts: exclusive create as the arbiter, a pid +
+// timestamp record, a staleness window so a dead holder cannot wedge the file forever, and a
+// bounded wait that never blocks indefinitely.
+pub(crate) mod prefs_lock {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::thread::sleep;
+    use std::time::{Duration, SystemTime};
+
+    use anyhow::{anyhow, Result};
+
+    const POLL: Duration = Duration::from_millis(50);
+    const WAIT_BUDGET: Duration = Duration::from_millis(2_000);
+    const STALE: Duration = Duration::from_secs(30);
+
+    /// Held for the whole read/modify/write cycle. Dropping it closes the handle and removes
+    /// the lock file, so a normal return, an early `?`, or a panic all release it.
+    pub struct Guard {
+        path: PathBuf,
+        file: Option<fs::File>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // Close our handle first: Windows will not unlink a file that is still open.
+            self.file.take();
+            // A lock that now carries someone else's pid has been taken over from us (only
+            // ever possible if we outlived the stale window); leave the successor's alone.
+            match holder_pid(&self.path) {
+                Some(pid) if pid != std::process::id() => {}
+                _ => {
+                    let _ = fs::remove_file(&self.path);
+                }
+            }
+        }
+    }
+
+    fn lock_path(target: &Path) -> PathBuf {
+        let stem = target.file_stem().and_then(|s| s.to_str()).unwrap_or("prefs");
+        target.with_file_name(format!(".{stem}.lock"))
+    }
+
+    fn body() -> String {
+        let at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        format!("{{\"pid\":{},\"at\":{}}}", std::process::id(), at)
+    }
+
+    fn holder_pid(path: &Path) -> Option<u32> {
+        let text = fs::read_to_string(path).ok()?;
+        serde_json::from_str::<serde_json::Value>(&text)
+            .ok()?
+            .get("pid")?
+            .as_u64()
+            .map(|pid| pid as u32)
+    }
+
+    fn abandoned(path: &Path, stale: Duration) -> bool {
+        match fs::metadata(path).and_then(|m| m.modified()) {
+            Ok(mtime) => {
+                if SystemTime::now().duration_since(mtime).map(|age| age > stale).unwrap_or(false) {
+                    return true;
+                }
+            }
+            // The file vanished between the failed create and this check; not abandoned, the
+            // caller simply retries the create.
+            Err(_) => return false,
+        }
+        match holder_pid(path) {
+            Some(pid) if pid != std::process::id() => !pid_alive(pid),
+            // Our own pid, or a body too young to be stale that we cannot parse a pid from.
+            _ => false,
+        }
+    }
+
+    /// Signal-0 style liveness. A false "alive" (a reused pid) only delays recovery to the age
+    /// gate; a false "dead" would be the dangerous direction and is what the conservative
+    /// branches below avoid.
+    #[cfg(not(windows))]
+    fn pid_alive(pid: u32) -> bool {
+        // Declared directly rather than pulling in a crate, the same way config.rs externs
+        // flock. `kill(pid, 0)` probes existence without delivering a signal.
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        let ret = unsafe { kill(pid as i32, 0) };
+        // 0 => alive; EPERM (1) => alive under another user; ESRCH => gone.
+        ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
+    }
+
+    #[cfg(windows)]
+    fn pid_alive(pid: u32) -> bool {
+        // Declared directly so this needs no extra windows-sys feature. kernel32 is always
+        // linked, so the symbols resolve without a `#[link]` attribute.
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+            fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+            fn GetLastError() -> u32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const ERROR_INVALID_PARAMETER: u32 = 87;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if !handle.is_null() {
+                CloseHandle(handle);
+                return true;
+            }
+            // Access-denied and the like mean the process exists under a token we cannot open;
+            // only a clearly invalid pid is proof it is gone.
+            GetLastError() != ERROR_INVALID_PARAMETER
+        }
+    }
+
+    pub fn acquire(target: &Path) -> Result<Guard> {
+        acquire_with(target, WAIT_BUDGET, POLL, STALE)
+    }
+
+    /// The timing is a parameter only so the tests can prove the wait and the takeover without
+    /// sleeping for whole seconds; every caller in the app uses [`acquire`].
+    pub fn acquire_with(
+        target: &Path,
+        wait: Duration,
+        poll: Duration,
+        stale: Duration,
+    ) -> Result<Guard> {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let path = lock_path(target);
+        let deadline = SystemTime::now() + wait;
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    // The body is advisory; even if this write fails we still hold the lock the
+                    // exclusive create just won.
+                    let _ = file.write_all(body().as_bytes());
+                    let _ = file.flush();
+                    return Ok(Guard { path, file: Some(file) });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // A successful unlink means the holder was genuinely abandoned; retry the
+                    // create at once. A failed one (a live holder still has it open on Windows,
+                    // or a contender got there first) falls through to the wait.
+                    if abandoned(&path, stale) && fs::remove_file(&path).is_ok() {
+                        continue;
+                    }
+                    if SystemTime::now() >= deadline {
+                        return Err(anyhow!(
+                            "could not lock {} within {:?}; another process is writing these \
+                             preferences, so nothing was changed",
+                            path.display(),
+                            wait
+                        ));
+                    }
+                    sleep(poll);
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn temp_target() -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "codeburn-prefs-lock-{}-{}",
+                std::process::id(),
+                SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            dir.join("windows-dock.json")
+        }
+
+        #[test]
+        fn a_lock_is_taken_then_released() {
+            let target = temp_target();
+            let lock = lock_path(&target);
+            {
+                let _guard = acquire(&target).unwrap();
+                assert!(lock.exists(), "the lock file exists while it is held");
+                assert_eq!(holder_pid(&lock), Some(std::process::id()));
+            }
+            assert!(!lock.exists(), "the lock file is gone once the guard drops");
+            let _ = fs::remove_dir_all(target.parent().unwrap());
+        }
+
+        #[test]
+        fn a_stale_lock_is_taken_over() {
+            let target = temp_target();
+            let lock = lock_path(&target);
+            // A live pid (our own), so only the age gate can free it. A tiny stale window plus a
+            // sleep past it makes the lock look abandoned without touching its mtime by hand.
+            fs::write(&lock, format!("{{\"pid\":{},\"at\":1}}", std::process::id())).unwrap();
+            let stale = Duration::from_millis(40);
+            sleep(Duration::from_millis(80));
+            let guard = acquire_with(&target, Duration::from_millis(500), Duration::from_millis(20), stale);
+            assert!(guard.is_ok(), "an abandoned lock older than the stale window is taken over");
+            assert_eq!(holder_pid(&lock), Some(std::process::id()));
+            drop(guard);
+            let _ = fs::remove_dir_all(target.parent().unwrap());
+        }
+
+        #[test]
+        fn a_dead_holders_lock_is_taken_over_without_waiting_for_the_age_gate() {
+            let target = temp_target();
+            let lock = lock_path(&target);
+            // A pid far above anything the OS hands out, so it is not a live process: on Windows
+            // OpenProcess reports it invalid, on Unix kill(0) reports ESRCH. With a fresh mtime
+            // only the pid probe, not the age gate, can free it inside the wait budget.
+            fs::write(&lock, "{\"pid\":2147483646,\"at\":1}").unwrap();
+            let started = SystemTime::now();
+            let guard = acquire_with(
+                &target,
+                Duration::from_millis(500),
+                Duration::from_millis(20),
+                Duration::from_secs(60),
+            );
+            assert!(guard.is_ok(), "a dead holder's lock is recovered by the pid probe");
+            assert!(
+                started.elapsed().unwrap() < Duration::from_millis(400),
+                "recovery did not wait out the whole budget"
+            );
+            drop(guard);
+            let _ = fs::remove_dir_all(target.parent().unwrap());
+        }
+
+        #[test]
+        fn a_live_lock_is_waited_for_then_fails_loudly() {
+            let target = temp_target();
+            // Our own pid reads as alive and a fresh mtime is inside a long window, so the lock
+            // is never abandoned and the contender must give up rather than write behind it.
+            let _held = acquire(&target).unwrap();
+            let started = SystemTime::now();
+            let err = acquire_with(
+                &target,
+                Duration::from_millis(200),
+                Duration::from_millis(20),
+                Duration::from_secs(60),
+            );
+            assert!(err.is_err(), "a live lock is not stolen; the contender fails");
+            assert!(started.elapsed().unwrap() >= Duration::from_millis(180), "it waited the budget");
+            drop(_held);
+            let _ = fs::remove_dir_all(target.parent().unwrap());
+        }
+    }
+}
+
 // Preferences ---------------------------------------------------------------------------
 
 fn settings_path() -> PathBuf {
@@ -62,6 +348,10 @@ pub fn read() -> Map<String, Value> {
 /// key, so the page can reset a preference to its default without knowing what that default
 /// is.
 pub fn patch(values: Map<String, Value>) -> Result<Map<String, Value>> {
+    let path = settings_path();
+    // Serialize the whole read/modify/write against the desktop app, which owns this file too.
+    // The guard is held until the rename lands. See `prefs_lock` for the shared protocol.
+    let _lock = prefs_lock::acquire(&path)?;
     let mut stored = read();
     for (key, value) in values {
         if value.is_null() {
@@ -70,7 +360,6 @@ pub fn patch(values: Map<String, Value>) -> Result<Map<String, Value>> {
             stored.insert(key, value);
         }
     }
-    let path = settings_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

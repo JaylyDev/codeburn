@@ -15,9 +15,11 @@
 // After a write the tray app is nudged with `--reload-settings`, which makes it re-read both
 // files and broadcast to its own windows. That is done by the caller, which owns the process.
 
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import {
+  closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 export type TraySettingsFile = 'app' | 'dock'
 
@@ -61,15 +63,135 @@ export function readTrayFile(file: TraySettingsFile, home = homedir()): Record<s
   }
 }
 
+// Cross-process preference lock -------------------------------------------------------------
+//
+// windows-settings.json and windows-dock.json are each owned by two processes at once: this
+// desktop app and the Windows tray app. Both do a read / modify / write to merge their own keys
+// into whatever the other last stored. The atomic rename each already does stops a torn file,
+// but not a lost update: two writers read the same state, change different keys, and the later
+// rename erases the earlier writer's key, so a dock placement, an enabled switch, a provider
+// choice or a scale silently reverts. This lock serializes the whole cycle so that never
+// happens. The tray app runs the same protocol from Rust; the single write-up lives in
+// windows/src-tauri/src/settings.rs (`prefs_lock`). The essentials, so both sides stay in step:
+//
+//   Lock file:  sibling of the target named `.<stem>.lock` (windows-dock.json ->
+//               `.windows-dock.lock`).
+//   Body:       one line of JSON, `{"pid":<os pid>,"at":<unix ms>}`.
+//   Acquire:    exclusive create ('wx'). On success keep the handle open for the whole cycle.
+//               On collision take the lock over only if abandoned, else poll until a short wait
+//               budget runs out and then throw rather than write behind the holder.
+//   Abandoned:  its mtime is older than the stale window (a crashed holder never refreshes it),
+//               OR its recorded pid is not ours and no longer alive. A live holder is neither.
+//   Release:    close the handle and unlink, unless it now carries a different pid.
+
+const LOCK_POLL_MS = 50
+const LOCK_WAIT_MS = 2_000
+const LOCK_STALE_MS = 30_000
+
+export type TrayLockOptions = { waitMs?: number; pollMs?: number; staleMs?: number }
+
+function lockPathFor(target: string): string {
+  const stem = basename(target).replace(/\.json$/, '')
+  return join(dirname(target), `.${stem}.lock`)
+}
+
+// A synchronous sleep, so the whole lock stays synchronous and callers of patchTrayFile do not
+// have to become async. Atomics.wait blocks this thread without spinning the CPU.
+const lockSleepBuffer = new Int32Array(new SharedArrayBuffer(4))
+function sleepSync(ms: number): void {
+  Atomics.wait(lockSleepBuffer, 0, 0, ms)
+}
+
+// Signal-0 style liveness. A false "alive" (a reused pid) only delays recovery to the age gate;
+// a false "dead" is the dangerous direction, so our own pid and anything unprobeable read alive.
+function holderAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  if (pid === process.pid) return true
+  try { process.kill(pid, 0); return true }
+  catch (err) { return (err as NodeJS.ErrnoException).code === 'EPERM' }
+}
+
+function lockAbandoned(lockPath: string, staleMs: number): boolean {
+  let mtimeMs: number
+  try { mtimeMs = statSync(lockPath).mtimeMs }
+  catch { return false } // vanished between the failed create and this check; just retry create
+  if (Date.now() - mtimeMs > staleMs) return true
+  let pid: number | undefined
+  try {
+    const parsed = JSON.parse(readFileSync(lockPath, 'utf8')) as { pid?: unknown }
+    if (typeof parsed?.pid === 'number') pid = parsed.pid
+  } catch { /* empty or unparseable body: only the age gate can free it */ }
+  return pid !== undefined && pid !== process.pid && !holderAlive(pid)
+}
+
+/**
+ * Take the cross-process lock for `target`, returning the open descriptor to release. Throws if
+ * the lock stays held past the wait budget rather than writing behind the holder, so a contended
+ * write is reported to the caller instead of being silently lost.
+ */
+export function acquireTrayFileLock(target: string, options: TrayLockOptions = {}): number {
+  const waitMs = options.waitMs ?? LOCK_WAIT_MS
+  const pollMs = options.pollMs ?? LOCK_POLL_MS
+  const staleMs = options.staleMs ?? LOCK_STALE_MS
+  mkdirSync(dirname(target), { recursive: true })
+  const lockPath = lockPathFor(target)
+  const body = JSON.stringify({ pid: process.pid, at: Date.now() })
+  const deadline = Date.now() + waitMs
+  for (;;) {
+    let fd: number
+    try {
+      fd = openSync(lockPath, 'wx', 0o600)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+      // A successful unlink means the holder was genuinely abandoned; retry the create at once.
+      // A failed one (a live holder still has it open on Windows, or a contender got there
+      // first) falls through to the wait.
+      if (lockAbandoned(lockPath, staleMs)) {
+        try { unlinkSync(lockPath); continue } catch { /* held or already gone; wait it out */ }
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `could not lock ${basename(lockPath)} within ${waitMs}ms; another process is writing ` +
+          `${basename(target)}, so nothing was changed`,
+        )
+      }
+      sleepSync(pollMs)
+      continue
+    }
+    // The body is advisory; even if this write fails we still hold the lock the create just won.
+    try { writeSync(fd, body) } catch { /* body is advisory */ }
+    return fd
+  }
+}
+
+/** Close the descriptor and remove the lock, unless it now carries a successor's pid. */
+export function releaseTrayFileLock(target: string, fd: number): void {
+  const lockPath = lockPathFor(target)
+  try { closeSync(fd) } catch { /* already closed */ }
+  try {
+    const parsed = JSON.parse(readFileSync(lockPath, 'utf8')) as { pid?: unknown }
+    // A different pid means we were taken over (only possible past the stale window); leave it.
+    if (typeof parsed?.pid === 'number' && parsed.pid !== process.pid) return
+  } catch { /* empty or unparseable: it is the one we just made, so remove it */ }
+  try { unlinkSync(lockPath) } catch { /* already gone */ }
+}
+
 /** Merge the given keys into the file, leaving every other key the tray app owns alone. */
 export function patchTrayFile(
   file: TraySettingsFile,
   patch: Record<string, unknown>,
   home = homedir(),
 ): Record<string, unknown> {
-  const merged = { ...readTrayFile(file, home), ...patch }
-  writeFileAtomic(filePath(file, home), `${JSON.stringify(merged, null, 2)}\n`)
-  return merged
+  const target = filePath(file, home)
+  // The whole read/modify/write is serialized against the tray app. See the protocol above.
+  const fd = acquireTrayFileLock(target)
+  try {
+    const merged = { ...readTrayFile(file, home), ...patch }
+    writeFileAtomic(target, `${JSON.stringify(merged, null, 2)}\n`)
+    return merged
+  } finally {
+    releaseTrayFileLock(target, fd)
+  }
 }
 
 // What each setting may be -----------------------------------------------------------------
