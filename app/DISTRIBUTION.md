@@ -147,6 +147,12 @@ launches it from `app\resources\menubar\`. Launch at login is a
 package with `GetCurrentPackageFullName` and skips its own update checker
 entirely, since Store updates cover it.
 
+That is why the Store is the recommended Windows install: it is the only
+Windows route with a signed artifact (Microsoft signs the package at
+submission) and a real update path. The GitHub downloads stay a developer
+preview, unsigned and without self-update, until an Authenticode certificate
+exists.
+
 The startup task is Windows' to set, not this app's: reaching one would take the
 WinRT `Windows.ApplicationModel.StartupTask` API, which Electron has no binding
 for and which this app ships no native code to reach, and a Run value written
@@ -306,6 +312,15 @@ no-op — the `.exe` ships without a signature. On first run, Windows SmartScree
 shows **"Windows protected your PC"**. Users click **"More info" → "Run
 anyway"** to launch it. This is expected for an unsigned build; the only fix is
 a purchased code-signing (Authenticode/EV) certificate.
+
+**Distribution policy.** The Microsoft Store build (Store ID `9P0R4ZL5XMB8`) is
+the recommended Windows install. This NSIS setup `.exe` and the tray `.msi`
+under the `windows-v*` releases are a developer preview: unsigned, SmartScreen
+warns on first run, and neither route updates itself. The tray app still
+reports that a newer version exists and points at the GitHub release; taking it
+means re-running `codeburn menubar --force` or downloading the build by hand.
+One-click updating comes back once an Authenticode certificate signs the
+artifacts.
 
 ### Microsoft Store (`package:store`)
 

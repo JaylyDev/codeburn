@@ -55,7 +55,8 @@
       <strong>Menubar</strong><br/>
       <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/menubar-app.jpg" alt="CodeBurn macOS menubar" /><br/>
       <code>codeburn menubar</code><br/>
-      <a href="https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.23"><img src="https://img.shields.io/badge/Windows-Tray_app_(.msi)-F97316?logo=windows&logoColor=white" alt="Download the CodeBurn Windows menubar" /></a>
+      <a href="https://apps.microsoft.com/detail/9P0R4ZL5XMB8"><img src="https://img.shields.io/badge/Windows-Microsoft_Store-F97316?logo=microsoft&logoColor=white" alt="Get CodeBurn from the Microsoft Store" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.23"><img src="https://img.shields.io/badge/Windows-Tray_app_.msi_(preview)-F97316?logo=windows&logoColor=white" alt="Download the CodeBurn Windows tray app developer preview (.msi)" /></a>
     </td>
   </tr>
   <tr>
@@ -348,6 +349,8 @@ Allowed values are `terminal` (macOS Terminal.app, the default) and `iterm2`. An
 
 ### Windows
 
+The recommended install is the [Microsoft Store](https://apps.microsoft.com/detail/9P0R4ZL5XMB8) (Store ID `9P0R4ZL5XMB8`), which ships the desktop app with the tray app inside it. Microsoft signs that package at submission, and the Store keeps it up to date, so the tray app leaves its own update checker switched off there.
+
 Windows gets the same ambient view from the system tray, from the same one command:
 
 ```powershell
@@ -358,7 +361,9 @@ It downloads the `.msi` for your CLI version, verifies its sha256, runs it throu
 
 Today's spend sits in the tray as a number beside the flame icon (turn it off in Settings, and the tooltip always carries it). Click for the same popover the macOS app shows: agent tabs, period switcher, Trend, Forecast, Pulse, Stats and Plan insights, activity and model breakdowns, optimize findings, and CSV/JSON export. Settings covers launch at login, the tray number, theme, and currency. It refreshes every 60 seconds while the popover is open and every 2 minutes while it is closed.
 
-The tray app reads everything through the CLI, so install that first (`npm install -g codeburn`) — it needs **codeburn 0.9.9 or newer**, and shows a setup screen with the install command until it finds one. Source and build instructions are in [`windows/`](windows/) ([windows/DEVELOPMENT.md](windows/DEVELOPMENT.md)). The `.msi` is unsigned for now, so SmartScreen prompts on first run.
+The tray app reads everything through the CLI, so install that first (`npm install -g codeburn`). It needs **codeburn 0.9.9 or newer**, and shows a setup screen with the install command until it finds one. Source and build instructions are in [`windows/`](windows/) ([windows/DEVELOPMENT.md](windows/DEVELOPMENT.md)).
+
+The `.msi` under the `windows-v*` releases and the desktop setup `.exe` are a developer preview. Both are unsigned, so SmartScreen prompts on first run: click "More info", then "Run anyway". The preview builds also do not update themselves. The tray app still tells you when a newer version exists and links to the release; taking it means re-running `codeburn menubar --force` or downloading the new build yourself.
 
 ### Linux (GNOME)
 

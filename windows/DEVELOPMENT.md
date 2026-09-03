@@ -201,10 +201,13 @@ npm run tauri build
   Check for Updates in the tray menu and in About. The tray item opens About on the
   `about#check` anchor, which is where the up to date / update available / check failed
   result is shown, and where the button that installs it lives.
-- One click updates both: `npm install -g codeburn@latest --force` through the npm beside the
-  launcher, then `codeburn menubar --force`. Each stage gets 120 s and is killed past it.
-  `MIN_CLI_VERSION_FOR_UPDATE` is **0.9.21**, the first CLI whose `menubar` can install a
-  Windows app at all; an older one is refused with the manual command instead.
+- There is no install button. Outside a Store package the app only reports that a newer
+  version exists, opens the `windows-v*` release page, and shows `codeburn menubar --force`
+  as the manual command, because the MSI is unsigned and its checksum comes from the same
+  release (the module doc in `update.rs` has the reasoning). Inside a Store package the
+  checker stands down, since Store updates cover it. `MIN_CLI_VERSION_FOR_UPDATE` is
+  **0.9.21**, the first CLI whose `menubar` can install a Windows app at all; an older one
+  is told to update the CLI first.
 - Renaming the MSI asset breaks the version lookup here as well as in the installer:
   `MSI_PREFIX` / `MSI_SUFFIX` have to move with `WINDOWS_RELEASE`.
 
