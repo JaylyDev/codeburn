@@ -6,10 +6,14 @@ private func window(_ label: String, _ percent: Double, resetsAt: Date? = nil) -
     QuotaSummary.Window(label: label, percent: percent, resetsAt: resetsAt)
 }
 
-private func quota(_ details: [QuotaSummary.Window], primary: QuotaSummary.Window? = nil) -> QuotaSummary {
+private func quota(
+    _ details: [QuotaSummary.Window],
+    primary: QuotaSummary.Window? = nil,
+    connection: QuotaSummary.Connection = .connected
+) -> QuotaSummary {
     QuotaSummary(
         providerFilter: .all,
-        connection: .connected,
+        connection: connection,
         primary: primary,
         details: details,
         planLabel: "Max 20x",
@@ -27,6 +31,42 @@ struct CapacityDockGlanceTests {
         #expect(CapacityDockGlance.windows(quota([five, weekly, fable])) == [five, weekly, fable])
         let many = (0..<6).map { window("w\($0)", Double($0) / 10) }
         #expect(CapacityDockGlance.windows(quota(many)).count == CapacityDockGlance.maxWindowColumns)
+    }
+
+    @Test("The staleness notice is a section the panel reserves height for")
+    func noticeIsReserved() {
+        let windows = [window("5-hour", 0.2), window("Weekly", 0.95)]
+        func height(_ connection: QuotaSummary.Connection) -> CGFloat {
+            CapacityDockMetrics.detailHeight(
+                quota: quota(windows, connection: connection),
+                sessionCount: 2,
+                hasToday: true,
+                tailEdge: .right,
+                scale: 1
+            )
+        }
+        // The line is drawn between the header and the sections below it. Without its
+        // own reserved height it squeezed every block under it, because the panel frame
+        // is computed rather than fitted.
+        let connected = height(.connected)
+        for stale in [QuotaSummary.Connection.stale, .transientFailure, .loading] {
+            #expect(CapacityDockGlance.drawsNotice(stale))
+            #expect(height(stale) == connected + CapacityDockGlance.noticeHeight)
+        }
+        // Disconnected and reconnect draw their own blocks with an action button.
+        #expect(!CapacityDockGlance.drawsNotice(.disconnected))
+        // Reconnect draws its own block and is accounted for separately.
+        #expect(height(.terminalFailure(reason: nil)) > connected)
+        for scale in [0.9, 1.0, 1.25] {
+            let h = CapacityDockMetrics.detailHeight(
+                quota: quota(windows, connection: .stale),
+                sessionCount: 2,
+                hasToday: true,
+                tailEdge: .right,
+                scale: CGFloat(scale)
+            )
+            #expect(h == h.rounded())
+        }
     }
 
     @Test("A provider with only a primary window still draws one column")
