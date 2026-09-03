@@ -124,6 +124,19 @@ describe('codeburn status --format menubar-json', () => {
 
       const history = payload['history'] as { daily: unknown[] }
       expect(Array.isArray(history.daily)).toBe(true)
+
+      // The consent-gated telemetry aggregate the desktop app and the tray both
+      // send verbatim. Bucketed and name-only, so it must never echo a cost.
+      const snapshot = payload['telemetrySnapshot'] as Record<string, unknown>
+      expect(snapshot).toBeTruthy()
+      expect(snapshot['schema']).toBe(2)
+      // The same period label the payload shows, date suffix and all: the event
+      // it rides on is already stamped with the calendar day.
+      expect(snapshot['period']).toBe(current['label'])
+      expect(snapshot['costBucket']).toBe('<1')
+      expect((snapshot['models'] as Array<{ name: string; tasks: unknown[] }>)[0]!.tasks.length).toBeGreaterThan(0)
+      expect(JSON.stringify(snapshot)).not.toContain('myapp')
+      expect(JSON.stringify(snapshot)).not.toContain(String(current['cost']))
     } finally {
       await rm(home, { recursive: true, force: true })
     }

@@ -12,6 +12,7 @@ import { stat } from 'node:fs/promises'
 import { aggregateProjectsIntoDays, buildPeriodDataFromDays, dateKeyInTz } from './day-aggregator.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
 import { aggregateModels } from './models-report.js'
+import { aggregateModelTaskTurns, sessionDurationMinutes } from './telemetry-snapshot.js'
 import { scanUserCorrections, medianTimeToFirstEditMs, aggregateFileChurn, computePricingCoverage } from './workflow-insights.js'
 import { buildPrAttribution, aggregateByBranch } from './sessions-report.js'
 import { scanAndDetect } from './optimize.js'
@@ -1155,6 +1156,12 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
       })),
     ]
     return {
+      // Telemetry-only inputs: the model x task cross and session lengths, which
+      // the payload itself does not carry. Bucketed inside the snapshot builder.
+      telemetry: {
+        modelTasks: aggregateModelTaskTurns(scanProjects),
+        sessionMinutes: sessionDurationMinutes(scanProjects),
+      },
       tools: Object.entries(toolMap).sort(([, a], [, b]) => b - a).slice(0, 10).map(([name, calls]) => ({ name, calls })),
       skills: Object.entries(skillMap).sort(([, a], [, b]) => b.cost - a.cost).slice(0, 10).map(([name, d]) => ({ name, ...d })),
       subagents: subagents.sort((a, b) => b.cost - a.cost || (b.totalTokens ?? 0) - (a.totalTokens ?? 0)),

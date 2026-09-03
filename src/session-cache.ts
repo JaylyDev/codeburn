@@ -1842,7 +1842,9 @@ const STATUS_SNAPSHOT_FILE = 'status-snapshot'
 // resolution time at which its corpus scan began. The latter is the ordering
 // fence for competing writers: max(file mtime) is not monotonic because
 // deleting the newest file legitimately makes it decrease.
-const STATUS_SNAPSHOT_VERSION = 3
+//
+// v4: the payload carries `telemetrySnapshot`, which a v3 record predates.
+const STATUS_SNAPSHOT_VERSION = 4
 
 type StatusSnapshotRecord = {
   version: number
