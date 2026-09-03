@@ -128,7 +128,7 @@ describe('scanTranscript', () => {
 
   it('flags a sidechain and degrades with no usage at all', async () => {
     const scan = await scanTranscript(await transcript([
-      { type: 'user', sessionId: 'parent-1', isSidechain: true, cwd: '/Users/x/eywa' },
+      { type: 'user', sessionId: 'parent-1', isSidechain: true, cwd: '/Users/x/atlas' },
     ]))
     expect(scan.isSidechain).toBe(true)
     expect(scan.sessionId).toBe('parent-1')

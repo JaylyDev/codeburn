@@ -41,12 +41,12 @@ vi.mock('../lib/ipc', async orig => {
   return { ...actual, codeburn: mocks }
 })
 
-const identity: Identity = { name: 'Toruk MacBook Pro', fingerprint: 'AA:11:22:33:44:55:66:77' }
+const identity: Identity = { name: 'Studio MacBook Pro', fingerprint: 'AA:11:22:33:44:55:66:77' }
 const actionOk: ActionResult = { ok: true, stdout: 'updated', stderr: '', code: 0 }
 const devices: CombinedUsage = {
   perDevice: [
-    { id: 'local', name: 'Toruk MacBook Pro', local: true, cost: 120.1, calls: 100, sessions: 10, inputTokens: 1, outputTokens: 2, cacheCreateTokens: 3, cacheReadTokens: 4, totalTokens: 10 },
-    { id: 'mini', name: 'toruk-mini', local: false, cost: 41.2, calls: 680, sessions: 34, inputTokens: 11, outputTokens: 12, cacheCreateTokens: 13, cacheReadTokens: 14, totalTokens: 50 },
+    { id: 'local', name: 'Studio MacBook Pro', local: true, cost: 120.1, calls: 100, sessions: 10, inputTokens: 1, outputTokens: 2, cacheCreateTokens: 3, cacheReadTokens: 4, totalTokens: 10 },
+    { id: 'mini', name: 'studio-mini', local: false, cost: 41.2, calls: 680, sessions: 34, inputTokens: 11, outputTokens: 12, cacheCreateTokens: 13, cacheReadTokens: 14, totalTokens: 50 },
   ],
   combined: { cost: 161.3, calls: 780, sessions: 44, inputTokens: 12, outputTokens: 14, cacheCreateTokens: 16, cacheReadTokens: 18, totalTokens: 60, deviceCount: 2, reachableCount: 2 },
 }
@@ -80,7 +80,7 @@ describe('Settings', () => {
     mocks.getIdentity.mockResolvedValue(identity)
     mocks.getDevices.mockResolvedValue(devices)
     mocks.getDevicesScan.mockResolvedValue(scan)
-    mocks.getShareStatus.mockResolvedValue({ sharing: true, name: 'Toruk MacBook Pro', port: 9732, always: false, peers: 1, pending: [] })
+    mocks.getShareStatus.mockResolvedValue({ sharing: true, name: 'Studio MacBook Pro', port: 9732, always: false, peers: 1, pending: [] })
     mocks.getQuota.mockResolvedValue(quotaProviders)
     mocks.getPlans.mockResolvedValue({ currency: 'EUR', today: { cost: 0, savings: 0, calls: 0 }, month: { cost: 0, savings: 0, calls: 0 }, plans: { claude: { id: 'claude-max', provider: 'claude', budget: 200, spent: 48, percentUsed: 24, status: 'under', projectedMonthEnd: 120, daysUntilReset: 19, periodStart: '2026-07-01', periodEnd: '2026-08-01' } } })
     mocks.getOverview.mockResolvedValue(overview)
@@ -95,7 +95,7 @@ describe('Settings', () => {
     mocks.removeDevice.mockResolvedValue(actionOk)
     mocks.setPlan.mockResolvedValue(actionOk)
     mocks.resetPlan.mockResolvedValue(actionOk)
-    mocks.chooseDirectory.mockResolvedValue('/Users/toruk/Exports')
+    mocks.chooseDirectory.mockResolvedValue('/Users/x/Exports')
     mocks.exportData.mockResolvedValue(actionOk)
     mocks.telemetryTrack.mockResolvedValue(true)
     mocks.telemetryStatus.mockResolvedValue(telemetryOff)
@@ -147,14 +147,14 @@ describe('Settings', () => {
 
     await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
     await user.click(screen.getByRole('button', { name: 'Choose folder…' }))
-    await screen.findByText('/Users/toruk/Exports')
+    await screen.findByText('/Users/x/Exports')
     await user.click(screen.getByRole('button', { name: 'JSON' }))
     await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
     expect(mocks.telemetryTrack).toHaveBeenCalledWith('export', { format: 'json', provider: 'all' })
 
     // The chosen folder is a real path on this machine and never travels.
     const sent = JSON.stringify(mocks.telemetryTrack.mock.calls)
-    expect(sent).not.toContain('/Users/toruk')
+    expect(sent).not.toContain('/Users/x')
   })
 
   // The main process drops any event raised while telemetry is off, so an opt-in tracked
@@ -407,24 +407,24 @@ describe('Settings', () => {
     await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
     await user.click(screen.getByRole('button', { name: 'Choose folder…' }))
     expect(mocks.chooseDirectory).toHaveBeenCalledOnce()
-    expect(await screen.findByText('/Users/toruk/Exports')).toBeInTheDocument()
+    expect(await screen.findByText('/Users/x/Exports')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'JSON' }))
     await user.click(screen.getByLabelText('Provider'))
     await user.click(screen.getByRole('option', { name: 'Claude' }))
     await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
-    expect(mocks.exportData).toHaveBeenCalledWith('json', 'claude', '/Users/toruk/Exports')
-    expect(await screen.findByText('Exported to /Users/toruk/Exports')).toBeInTheDocument()
+    expect(mocks.exportData).toHaveBeenCalledWith('json', 'claude', '/Users/x/Exports')
+    expect(await screen.findByText('Exported to /Users/x/Exports')).toBeInTheDocument()
   })
 
   it('renders real device status and removes paired devices without fake pairing controls', async () => {
     const user = userEvent.setup()
     render(<Settings period="month" />)
     await user.click(screen.getByRole('button', { name: 'Devices' }))
-    expect(await screen.findByText('Toruk MacBook Pro')).toBeInTheDocument()
-    expect(screen.getByText('Local device name: Toruk MacBook Pro')).toBeInTheDocument()
+    expect(await screen.findByText('Studio MacBook Pro')).toBeInTheDocument()
+    expect(screen.getByText('Local device name: Studio MacBook Pro')).toBeInTheDocument()
     expect(await screen.findByText('Mac Studio')).toBeInTheDocument()
     expect(screen.getByText('fingerprint 7F:2A:…:C4')).toBeInTheDocument()
-    expect(await screen.findByText('toruk-mini')).toBeInTheDocument()
+    expect(await screen.findByText('studio-mini')).toBeInTheDocument()
     expect(screen.getByText('34 sessions · $41.20 this month')).toBeInTheDocument()
     expect(screen.getByText('Visible')).toBeInTheDocument()
     expect(screen.getByText(/Pairing is interactive/)).toBeInTheDocument()
@@ -432,7 +432,7 @@ describe('Settings', () => {
     expect(screen.queryByText('Pull now')).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Remove' }))
     await user.click(screen.getByRole('button', { name: 'Confirm' }))
-    expect(mocks.removeDevice).toHaveBeenCalledWith('toruk-mini')
+    expect(mocks.removeDevice).toHaveBeenCalledWith('studio-mini')
     expect(screen.getByText('Combined view active · 2 devices')).toBeInTheDocument()
   })
 
