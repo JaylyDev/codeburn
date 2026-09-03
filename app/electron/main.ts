@@ -449,10 +449,12 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     // The tray app's own settings, which live in the files it reads them from. Every setter
     // answers with the whole set, so the panes render what landed rather than what was sent.
     'codeburn:trayPrefs': async () => ({ ok: true, value: deps.companion ? await deps.companion.trayPrefs() : null }),
-    'codeburn:setTrayAppPref': async (patch?: Record<string, unknown>) =>
-      ({ ok: true, value: deps.companion ? await deps.companion.setTrayAppPref(patch ?? {}) : null }),
-    'codeburn:setTrayDockPref': async (patch?: Record<string, unknown>) =>
-      ({ ok: true, value: deps.companion ? await deps.companion.setTrayDockPref(patch ?? {}) : null }),
+    // A patch is whatever came over the channel, so it is typed as that and checked where it
+    // is read (tray-settings.ts, isPatchObject) rather than asserted into a shape here.
+    'codeburn:setTrayAppPref': async (patch?: unknown) =>
+      ({ ok: true, value: deps.companion ? await deps.companion.setTrayAppPref(patch) : null }),
+    'codeburn:setTrayDockPref': async (patch?: unknown) =>
+      ({ ok: true, value: deps.companion ? await deps.companion.setTrayDockPref(patch) : null }),
     'codeburn:setLaunchAtLogin': async (enabled?: boolean) =>
       ({ ok: true, value: deps.companion ? await deps.companion.setLaunchAtLogin(Boolean(enabled)) : null }),
     // Plugin management reads (all return parsed JSON)

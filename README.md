@@ -798,7 +798,8 @@ a clock time. Alongside each batch go the app version, platform, architecture an
 
 **`usage_snapshot`** goes out at most once per calendar day. It is computed by the CLI so the app
 and the tray report the identical shape, and every magnitude in it is a bucket, never an exact
-figure:
+figure. The daily report includes the names of the models, tools, skills and MCP servers you use,
+alongside those bucketed counts.
 
 | Field | What it carries |
 |-------|-----------------|
@@ -807,7 +808,7 @@ figure:
 | `models` | Up to 8 model names, each with its cost bucket, turn-count bucket, one-shot rate, and up to 6 task categories with a turn bucket and share of that model's turns |
 | `categories` | Up to 12 task category names (Coding, Debugging, Planning, …) with a turn bucket, one-shot rate, and up to 3 model names |
 | `providers` | Up to 8 provider names with a cost bucket each |
-| `mcpServers`, `skills`, `tools` | Up to 12 names each with a call-count bucket: `1-10`, `10-100`, `100-1k`, `1k+` |
+| `mcpServers`, `skills`, `tools` | Up to 12 names each with a call-count bucket: `0`, `1-10`, `10-100`, `100-1k`, `1k+` |
 | `sessions` | Session count bucket, and median session length as a bucket: `<5`, `5-15`, `15-60`, `60-240`, `240+` minutes |
 | `efficiency` | Cache hit rate and retry tax as shares of the total, to two decimals |
 
@@ -828,9 +829,9 @@ The other events are name-only:
 **Never collected:** prompts, code, file contents, file or folder names, project names, branch names,
 working directories, session titles, PR links, API keys, exact dollar amounts, exact counts, clock
 times, IP-based location beyond the country, or anything that could identify you or your employer.
-The snapshot is built from bucket labels and configuration identifiers only, and a whitelist
-sanitizer drops anything that is not a short string, a finite number or a boolean before it leaves
-the machine.
+The names of the models, tools, skills and MCP servers you use are collected, as the table above
+sets out, and a whitelist sanitizer drops anything that is not a short string, a finite number or a
+boolean before it leaves the machine.
 
 **To turn it off:** decline on the consent screen, or open **Settings > Privacy & data** and switch
 **Anonymous telemetry** off.

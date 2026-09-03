@@ -51,6 +51,7 @@ function costBucket(usd: number): string {
 // Bucket occurrence counts (MCP-server / skill invocations) the same way costBucket
 // coarsens dollars: telemetry carries usage magnitude, never an exact tally.
 function countBucket(n: number): string {
+  if (!(n > 0)) return '0'
   if (n < 10) return '1-10'
   if (n < 100) return '10-100'
   if (n < 1000) return '100-1k'

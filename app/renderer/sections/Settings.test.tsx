@@ -3,7 +3,7 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { ActionResult, AliasRow, CombinedUsage, DeviceScanResult, Identity, MenubarPayload, PriceOverrideList, PriceRates, QuotaProvider, ShareStatus, StatusJson } from '../lib/types'
+import type { ActionResult, AliasRow, CombinedUsage, DeviceScanResult, Identity, MenubarPayload, PriceOverrideList, PriceRates, QuotaProvider, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
 import { Settings } from './Settings'
 
 const mocks = vi.hoisted(() => ({
@@ -33,6 +33,8 @@ const mocks = vi.hoisted(() => ({
   setTrayDockPref: vi.fn(),
   setLaunchAtLogin: vi.fn(),
   telemetryTrack: vi.fn<(name: string, props?: Record<string, unknown>) => Promise<boolean>>(),
+  telemetryStatus: vi.fn<() => Promise<TelemetryStatus | null>>(),
+  setTelemetryEnabled: vi.fn<(enabled: boolean) => Promise<TelemetryStatus | null>>(),
 }))
 vi.mock('../lib/ipc', async orig => {
   const actual = await orig<typeof import('../lib/ipc')>()
@@ -58,6 +60,9 @@ const trayPrefs = {
   app: { metric: 'cost', menubarPeriod: 'today', accent: 'ember', trayBadge: false, usageRefreshSeconds: -1, quotaCadenceSeconds: 120, terminal: 'windowsTerminal' },
   dock: { enabled: true, preferred: 'claude', scale: 0.6, theme: 'graphite', gaugeShape: 'circle', providers: ['claude'], manualSelection: true },
   launchAtLogin: false,
+}
+const telemetryOff: TelemetryStatus = {
+  installId: '8f1c2b4d', country: 'DE', enabled: false, defaultEnabled: false, onboarded: true,
 }
 const stored = new Map<string, string>()
 vi.stubGlobal('localStorage', {
@@ -93,6 +98,8 @@ describe('Settings', () => {
     mocks.chooseDirectory.mockResolvedValue('/Users/toruk/Exports')
     mocks.exportData.mockResolvedValue(actionOk)
     mocks.telemetryTrack.mockResolvedValue(true)
+    mocks.telemetryStatus.mockResolvedValue(telemetryOff)
+    mocks.setTelemetryEnabled.mockImplementation(async enabled => ({ ...telemetryOff, enabled }))
     // No bundled tray app unless a test says otherwise, which is every platform but Windows.
     mocks.companionStatus.mockResolvedValue({ supported: false, menuBar: false, sidebar: false, store: false })
     mocks.trayPrefs.mockResolvedValue(trayPrefs)
@@ -148,6 +155,45 @@ describe('Settings', () => {
     // The chosen folder is a real path on this machine and never travels.
     const sent = JSON.stringify(mocks.telemetryTrack.mock.calls)
     expect(sent).not.toContain('/Users/toruk')
+  })
+
+  // The main process drops any event raised while telemetry is off, so an opt-in tracked
+  // before the write lands is one that can never be sent. It goes out after the toggle takes.
+  it('reports the telemetry opt-in only once the toggle has taken', async () => {
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+
+    await user.click(await screen.findByRole('switch', { name: 'Anonymous telemetry' }))
+
+    expect(mocks.setTelemetryEnabled).toHaveBeenCalledWith(true)
+    await waitFor(() => {
+      expect(mocks.telemetryTrack).toHaveBeenCalledWith('settings_change', { setting: 'telemetry', value: true })
+    })
+    const tracked = mocks.telemetryTrack.mock.invocationCallOrder.at(-1)!
+    expect(tracked).toBeGreaterThan(mocks.setTelemetryEnabled.mock.invocationCallOrder[0]!)
+  })
+
+  it('sends nothing when the write does not take, and nothing on the way out', async () => {
+    const user = userEvent.setup()
+    // A settings write that failed leaves telemetry off, so there is no opt-in to report.
+    mocks.setTelemetryEnabled.mockResolvedValue(telemetryOff)
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+    await user.click(await screen.findByRole('switch', { name: 'Anonymous telemetry' }))
+    await waitFor(() => expect(mocks.setTelemetryEnabled).toHaveBeenCalled())
+
+    // Turning it off mints a fresh install id and drops the queue, so an opt-out event would
+    // never arrive anywhere either.
+    mocks.telemetryStatus.mockResolvedValue({ ...telemetryOff, enabled: true })
+    mocks.setTelemetryEnabled.mockResolvedValue(telemetryOff)
+    render(<Settings period="month" />)
+    await user.click(screen.getAllByRole('button', { name: 'Privacy & data' }).at(-1)!)
+    await user.click((await screen.findAllByRole('switch', { name: 'Anonymous telemetry' })).at(-1)!)
+    await waitFor(() => expect(mocks.setTelemetryEnabled).toHaveBeenCalledWith(false))
+
+    const telemetryEvents = mocks.telemetryTrack.mock.calls.filter(([, props]) => props?.setting === 'telemetry')
+    expect(telemetryEvents).toEqual([])
   })
 
   it('persists theme choices and applies forced themes to the root', async () => {

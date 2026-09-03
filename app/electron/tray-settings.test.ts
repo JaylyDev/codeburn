@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   DEFAULT_TRAY_APP_PREFS,
   canDeselect,
+  isPatchObject,
   normalizeScale,
   normalizedPreferred,
   parseTrayAppPrefs,
@@ -185,6 +186,27 @@ describe('sanitizeDockPatch', () => {
     expect(sanitizeDockPatch({ preferred: '../../etc' })).toEqual({ preferred: null })
     expect(sanitizeDockPatch({ providers: ['claude', 'Bad Id', 42] }))
       .toEqual({ providers: ['claude'], manualSelection: true })
+  })
+})
+
+// Both patches arrive over IPC, so the argument is whatever the renderer sent rather than the
+// object the signature promises. `'metric' in patch` throws a TypeError on a string, a number
+// and null, and on an array it answers about indices, so the shape is settled first.
+describe('a patch that is not an object at all', () => {
+  const notObjects: unknown[] = [null, undefined, 'metric', 42, ['metric'], [], true]
+
+  it('is dropped whole by isPatchObject', () => {
+    for (const value of notObjects) expect(isPatchObject(value)).toBe(false)
+    expect(isPatchObject({})).toBe(true)
+    expect(isPatchObject({ metric: 'cost' })).toBe(true)
+  })
+
+  it('writes nothing through sanitizeAppPatch, and does not throw', () => {
+    for (const value of notObjects) expect(sanitizeAppPatch(value)).toEqual({})
+  })
+
+  it('writes nothing through sanitizeDockPatch, and does not throw', () => {
+    for (const value of notObjects) expect(sanitizeDockPatch(value)).toEqual({})
   })
 })
 

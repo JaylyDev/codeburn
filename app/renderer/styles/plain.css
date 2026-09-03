@@ -142,6 +142,9 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
 .companion-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
 .companion-label { color: var(--mut); font-size: 12px; font-weight: 480; }
 .companion-row .switch { margin-left: auto; }
+/* The one line the corner ever says out loud: an install Windows can only finish at the next
+   restart, which is why neither switch has started anything. */
+.companion-note { margin: 2px 0 4px; color: var(--mut); font-size: 11px; line-height: 1.35; }
 /* Sidebar while the menu bar app is off: the rail is one of its windows, so there is nothing
    to switch. Dimmed rather than hidden, so the row does not appear and vanish under a pointer
    on its way to About. */

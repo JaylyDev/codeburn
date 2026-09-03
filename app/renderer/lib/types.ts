@@ -690,6 +690,10 @@ export type CompanionStatus = {
   sidebar: boolean
   /** The Store route, where launch at login is the package's own startup task. */
   store: boolean
+  /** True when this run installed a tray app that Windows can only finish putting in place at
+   *  the next restart. Nothing is started until then, so the corner says so rather than
+   *  showing two switches on with nothing running. */
+  restartRequired?: boolean
 }
 
 /** The tray app's own settings, from the two files it reads them from

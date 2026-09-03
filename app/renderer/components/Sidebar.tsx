@@ -183,6 +183,11 @@ function CompanionSwitches() {
     <div className="companion">
       {row('menuBar', 'Menu bar', 'Show CodeBurn in the Windows notification area')}
       {row('sidebar', 'Sidebar', 'Show the Capacity Dock rail on the screen edge')}
+      {/* Windows finishes an install it could not complete at the next restart, and until
+          then the old tray app is what is on disk, so nothing was started. */}
+      {status.restartRequired ? (
+        <p className="companion-note">Restart Windows to finish installing the menu bar app.</p>
+      ) : null}
     </div>
   )
 }

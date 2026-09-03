@@ -10,10 +10,10 @@
 //
 //   NSIS   the staged `CodeBurn.Menubar_<version>_x64_en-US.msi` is installed
 //          through the CLI's own installer (src/menubar-installer.ts, reached
-//          with CODEBURN_MENUBAR_MSI). The MSI carries a fixed WiX upgrade
-//          code, so a manual `codeburn menubar` install is upgraded in place
-//          rather than duplicated, and a newer one is left alone. Launch at
-//          login is an HKCU Run value.
+//          with `codeburn menubar --staged-msi <path>`). The MSI carries a fixed
+//          WiX upgrade code, so a manual `codeburn menubar` install is upgraded
+//          in place rather than duplicated, and a newer one is left alone.
+//          Launch at login is an HKCU Run value.
 //
 //   AppX   msiexec is not available to a packaged app and would fight the
 //          package manager anyway. The tray exe ships inside the package and
@@ -33,14 +33,22 @@ import { join, win32 } from 'node:path'
 import { spawnCliAction, type ActionResult } from './cli'
 import {
   DEFAULT_TRAY_APP_PREFS, DEFAULT_TRAY_DOCK_PREFS,
-  normalizedPreferred, parseTrayAppPrefs, parseTrayDockPrefs, patchTrayFile, readTrayFile,
-  sanitizeAppPatch, sanitizeDockPatch, writeFileAtomic, type TrayAppPrefs, type TrayDockPrefs,
+  isPatchObject, normalizedPreferred, parseTrayAppPrefs, parseTrayDockPrefs, patchTrayFile,
+  readTrayFile, sanitizeAppPatch, sanitizeDockPatch, writeFileAtomic,
+  type TrayAppPrefs, type TrayDockPrefs,
 } from './tray-settings'
 
-/** Env var the CLI's Windows installer reads; the source of truth is src/menubar-installer.ts. */
-export const BUNDLED_MSI_ENV = 'CODEBURN_MENUBAR_MSI'
+/** How the staged file is named to the CLI's Windows installer: an option on the command
+ *  rather than an environment variable, so nothing a stray variable in the environment names
+ *  ever reaches msiexec. The source of truth is src/menubar-installer.ts, which rejects the
+ *  variable this flag replaced. */
+export const STAGED_MSI_FLAG = '--staged-msi'
 /** One machine-readable line the same installer prints, so this side need not read its prose. */
 export const BUNDLED_RESULT_PREFIX = 'CODEBURN_MENUBAR_RESULT '
+/** The one line the installer prints for msiexec exit 3010, which its machine-readable result
+ *  does not carry a field for. A deferred file replacement leaves the old binary in place, so
+ *  this is read from the prose until the CLI reports it in {@link MenubarInstallResult}. */
+const REBOOT_NOTICE = /Windows wants a restart to finish the install/i
 /** The release asset name, which is also the only version statement that cannot lie. */
 const MSI_PATTERN = /^CodeBurn\.Menubar_(.+)_x64_en-US\.msi$/
 /** What the Tauri bundle names its executable. */
@@ -72,6 +80,10 @@ export type MenubarInstallResult = {
   exePath: string
   uninstallString: string | null
   installedBy: 'desktop' | 'manual' | null
+  /** Whether msiexec exited 3010 and deferred the file replacement to the next restart. The
+   *  CLI does not report this field today, so it is read from the installer's own notice
+   *  line instead; when the CLI starts sending it, this is what is believed. */
+  rebootRequired?: boolean
 }
 
 /** The desktop app's own record of the two switches, in its userData directory. */
@@ -451,12 +463,19 @@ export type CompanionStatus = {
   sidebar: boolean
   /** The Store route, where launch at login is the package's own startup task. */
   store: boolean
+  /** True when this run installed a tray app that Windows can only finish putting in place
+   *  at the next restart. Nothing is started until then, so the switches say why rather than
+   *  looking on with nothing running. Absent on a preload that predates it. */
+  restartRequired?: boolean
 }
 
 export class MenubarCompanion {
   private settings: CompanionSettings
   /** When `--quit` was last sent, so a launch right after it can wait for the exit. */
   private quitAskedAt = 0
+  /** Set by an install msiexec could only half apply; see {@link MenubarCompanion.launchTray}.
+   *  Not saved: the restart it is waiting for also clears it. */
+  private restartRequired = false
   /** The launcher written for the tray app this run, or null when there is no bundled CLI
    *  to point one at. Handed to every tray app this side starts. */
   private cliLauncher: string | null = null
@@ -477,6 +496,20 @@ export class MenubarCompanion {
    */
   private launchEnv(): NodeJS.ProcessEnv | undefined {
     return this.cliLauncher ? { [TRAY_CLI_ENV]: this.cliLauncher } : undefined
+  }
+
+  /**
+   * Start the tray app, or say nothing at all when a restart is owed.
+   *
+   * An install that could not replace a running binary is finished by Windows at the next
+   * restart, and until then the file at that path is the previous tray app. Starting it would
+   * put the old one in the notification area under the new version's name, which is the exact
+   * confusion the install path takes trouble to avoid elsewhere. Stopping one is still fine,
+   * so `--quit` does not come through here.
+   */
+  private launchTray(exePath: string): void {
+    if (this.restartRequired) return
+    this.launch(exePath, ['--reload-settings'], this.launchEnv())
   }
 
   /**
@@ -534,6 +567,7 @@ export class MenubarCompanion {
       menuBar: this.settings.menuBar,
       sidebar: this.settings.sidebar,
       store: this.deps.store,
+      restartRequired: this.restartRequired,
     }
   }
 
@@ -585,7 +619,7 @@ export class MenubarCompanion {
     // one's uninstall took it, and that was the installer's doing, not the person's choice.
     await this.reconcileRunKey(firstRun || this.placedTray)
     this.placedTray = false
-    this.launch(exePath, ['--reload-settings'], this.launchEnv())
+    this.launchTray(exePath)
   }
 
   /** True between an install that placed a tray app and the seeding that follows it. */
@@ -663,22 +697,33 @@ export class MenubarCompanion {
    *  msiexec call and the never-downgrade rule, and this side only stages the file and
    *  records what came back. */
   private async install(staged: { path: string; version: string }): Promise<string | null> {
-    const result = await this.runCli(['menubar'], {
+    const result = await this.runCli(['menubar', STAGED_MSI_FLAG, staged.path], {
       timeoutMs: INSTALL_TIMEOUT_MS,
-      extraEnv: { [BUNDLED_MSI_ENV]: staged.path },
     })
     const parsed = parseInstallResult(result.stdout)
     if (!parsed) {
       console.error(`menubar install did not report a result: ${result.stderr.trim() || `exit ${String(result.code)}`}`)
-      // A failure is remembered the same way a refusal is: whatever went wrong will go wrong
-      // again with the same file, and retrying it at every launch only repeats the prompt.
-      this.save({ installDeclinedVersion: staged.version })
+      // Not remembered as a refusal. Nothing was put in front of anyone here: the spawn timed
+      // out, the CLI was not there, or it died before it could say anything, and all three are
+      // the kind of thing that comes right on its own. Writing the version down would turn one
+      // bad launch into a tray app that is never installed again.
       // A failed install must not orphan a working tray app that was already there.
       return this.settings.trayExePath
     }
     if (parsed.action === 'cancelled') {
+      // This one is a decision, and it was theirs. The same file put in front of the same
+      // person at the next launch is the same admin prompt, so it is not offered again until
+      // a newer version is staged or they turn the switch on themselves.
       this.save({ installDeclinedVersion: staged.version })
       return null
+    }
+    // Windows Installer does not fail on a file that is in use: it installs what it can and
+    // leaves the rest to the next restart. The uninstall registry then reports the new
+    // version while the binary on disk is still the old one, so launching it would start the
+    // old tray app under the new version's name. Nothing is launched until the restart.
+    if (parsed.rebootRequired === true || REBOOT_NOTICE.test(result.stdout)) {
+      this.restartRequired = true
+      console.log('CodeBurn Menubar was installed; Windows needs a restart to finish it.')
     }
     const exePath = parsed.exePath || this.settings.trayExePath
     this.placedTray = parsed.action === 'installed'
@@ -729,7 +774,7 @@ export class MenubarCompanion {
     this.save({ trayExePath: exePath })
     await this.setRunKey(true)
     await this.awaitQuit()
-    this.launch(exePath, ['--reload-settings'], this.launchEnv())
+    this.launchTray(exePath)
     return this.status()
   }
 
@@ -759,7 +804,7 @@ export class MenubarCompanion {
     const exePath = await this.resolveTrayExe()
     if (exePath) {
       this.save({ trayExePath: exePath })
-      this.launch(exePath, ['--reload-settings'], this.launchEnv())
+      this.launchTray(exePath)
     }
     return this.status()
   }
@@ -783,7 +828,7 @@ export class MenubarCompanion {
 
   /** A setting the tray app keeps in `windows-settings.json`. Every other key in that file
    *  is left alone, and the running tray app is told to re-read it. */
-  async setTrayAppPref(patch: Record<string, unknown>): Promise<TrayPrefs> {
+  async setTrayAppPref(patch: unknown): Promise<TrayPrefs> {
     if (!this.supported()) return unsupportedTrayPrefs()
     const clean = sanitizeAppPatch(patch)
     if (Object.keys(clean).length > 0) {
@@ -802,8 +847,11 @@ export class MenubarCompanion {
    * through the same path and keeps the rule that the rail cannot outlive the tray app.
    * A provider set that no longer holds the resting provider moves it, as the rail would.
    */
-  async setTrayDockPref(patch: Record<string, unknown>): Promise<TrayPrefs> {
+  async setTrayDockPref(patch: unknown): Promise<TrayPrefs> {
     if (!this.supported()) return unsupportedTrayPrefs()
+    // The `in` below is the first thing that reads the argument, and it reaches here straight
+    // off an IPC message, so what it is has to be settled before it is asked about a key.
+    if (!isPatchObject(patch)) return this.trayPrefs()
     if ('enabled' in patch) {
       await this.setSidebarEnabled(patch.enabled === true)
       return this.trayPrefs()
@@ -838,7 +886,7 @@ export class MenubarCompanion {
   private async nudgeTray(): Promise<void> {
     if (!this.settings.menuBar) return
     const exePath = this.settings.trayExePath
-    if (exePath && this.exists(exePath)) this.launch(exePath, ['--reload-settings'], this.launchEnv())
+    if (exePath && this.exists(exePath)) this.launchTray(exePath)
   }
 
   private applyDockSetting(enabled: boolean): void {

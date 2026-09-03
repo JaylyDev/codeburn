@@ -542,10 +542,16 @@ function TelemetryClaim() {
     if (typeof codeburn.setTelemetryEnabled !== 'function') return
     // Only the opt-IN is reportable: turning telemetry off mints a fresh install
     // id and drops the queue, so an opt-out event would never be sent anyway.
-    if (!status.enabled) trackEvent('settings_change', { setting: 'telemetry', value: true })
-    codeburn.setTelemetryEnabled(!status.enabled).then(value => setStatus(value)).catch(() => {})
+    // And it is tracked after the switch has taken, never before: telemetry that is
+    // still off drops the event on the floor, so an opt-in recorded ahead of the
+    // write was one that could never be sent.
+    const optingIn = !status.enabled
+    codeburn.setTelemetryEnabled(optingIn).then(value => {
+      setStatus(value)
+      if (optingIn && value?.enabled) trackEvent('settings_change', { setting: 'telemetry', value: true })
+    }).catch(() => {})
   }
-  return <div className="set-claim"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19v-5M9 19V9M14 19v-8M19 19V5" /></svg><div style={{ flex: 1 }}><div className="set-claim-t">Anonymous telemetry</div><div className="set-claim-d">Optional usage statistics: model mix, task success, performance and errors. Never prompts, code or anything identifying.</div></div>
+  return <div className="set-claim"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19v-5M9 19V9M14 19v-8M19 19V5" /></svg><div style={{ flex: 1 }}><div className="set-claim-t">Anonymous telemetry</div><div className="set-claim-d">Optional usage statistics: model mix, task success, performance and errors. The daily report includes the names of the models, tools, skills and MCP servers you use, alongside bucketed counts of how often each one came up. Never prompts, code or anything identifying.</div></div>
     <button type="button" role="switch" aria-checked={status.enabled} aria-label="Anonymous telemetry" className={status.enabled ? 'switch on' : 'switch'} onClick={toggle}><span className="switch-knob" /></button>
   </div>
 }

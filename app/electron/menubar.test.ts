@@ -4,9 +4,9 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
-  BUNDLED_MSI_ENV,
   BUNDLED_RESULT_PREFIX,
   MenubarCompanion,
+  STAGED_MSI_FLAG,
   TRAY_CLI_ENV,
   TRAY_CLI_PATH_KEY,
   DEFAULT_COMPANION_SETTINGS,
@@ -272,6 +272,9 @@ describe('MenubarCompanion', () => {
   let launchEnvs: Array<NodeJS.ProcessEnv | undefined>
   let regCalls: string[][]
   let cliCalls: Array<{ args: string[]; env: NodeJS.ProcessEnv | undefined }>
+  /** Prose the installer prints before its machine-readable line, which is where the
+   *  reboot-pending state is reported: `BundledInstallResult` has no field for it. */
+  let cliNotice: string
   let installResult: MenubarInstallResult | null
   let existingRunKey: string | null
   let trayRunning: boolean
@@ -296,9 +299,10 @@ describe('MenubarCompanion', () => {
       exists: (path: string) => present.has(path),
       runCli: async (args: string[], opts: { extraEnv?: NodeJS.ProcessEnv }) => {
         cliCalls.push({ args, env: opts.extraEnv })
+        const prose = `Installing...\n${cliNotice}`
         return {
           ok: true,
-          stdout: installResult ? `Installing...\n${BUNDLED_RESULT_PREFIX}${JSON.stringify(installResult)}\n` : 'Installing...\n',
+          stdout: installResult ? `${prose}${BUNDLED_RESULT_PREFIX}${JSON.stringify(installResult)}\n` : prose,
           stderr: '',
           code: 0,
         }
@@ -333,6 +337,7 @@ describe('MenubarCompanion', () => {
     launchEnvs = []
     regCalls = []
     cliCalls = []
+    cliNotice = ''
     installResult = result()
     existingRunKey = null
     trayRunning = false
@@ -350,13 +355,16 @@ describe('MenubarCompanion', () => {
     expect(new MenubarCompanion(deps({ store: true })).status().supported).toBe(false)
   })
 
-  it('installs through the CLI, naming the staged file in the environment', async () => {
+  // The path is an argument rather than an environment variable, so nothing a stray variable
+  // in the inherited environment names can reach msiexec. The CLI rejects the variable this
+  // flag replaced (src/menubar-installer.ts).
+  it('installs through the CLI, naming the staged file on the command line', async () => {
     stageMsi()
     await new MenubarCompanion(deps()).bootstrap()
 
     expect(cliCalls).toEqual([{
-      args: ['menubar'],
-      env: { [BUNDLED_MSI_ENV]: join(resources, 'menubar', MSI_NAME) },
+      args: ['menubar', STAGED_MSI_FLAG, join(resources, 'menubar', MSI_NAME)],
+      env: undefined,
     }])
     expect(regCalls).toEqual([runKeyArgs(true, TRAY_EXE)])
     expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--reload-settings'] }])
@@ -546,17 +554,20 @@ describe('MenubarCompanion', () => {
       expect(launches).toEqual([])
     })
 
-    it('remembers an install that failed outright the same way', async () => {
+    // A refusal is a decision; a run that said nothing is not. A spawn that timed out, a CLI
+    // that was not there and a run that died before printing its result are all things that
+    // come right on their own, so the next launch tries again rather than never installing.
+    it('tries again after an install that reported nothing at all', async () => {
       stageMsi()
       installResult = null
       const error = vi.spyOn(console, 'error').mockImplementation(() => {})
       await new MenubarCompanion(deps()).bootstrap()
-      expect(readCompanionSettings(stateDir).installDeclinedVersion).toBe(VERSION)
+      expect(readCompanionSettings(stateDir).installDeclinedVersion).toBeNull()
 
       cliCalls = []
       await new MenubarCompanion(deps()).bootstrap()
 
-      expect(cliCalls).toEqual([])
+      expect(cliCalls).toHaveLength(1)
       error.mockRestore()
     })
 
@@ -591,6 +602,95 @@ describe('MenubarCompanion', () => {
         installDeclinedVersion: null,
         trayExePath: TRAY_EXE,
       })
+    })
+  })
+
+  // msiexec exit 3010: the install is real but Windows could not replace a file that was in
+  // use, so the binary at that path is still the previous tray app until the next restart.
+  // Starting it would put the old one in the notification area under the new version's name.
+  describe('an install Windows can only finish at the next restart', () => {
+    const REBOOT_LINE = 'Windows wants a restart to finish the install.\n'
+
+    it('does not launch the old binary, and says a restart is needed', async () => {
+      stageMsi()
+      cliNotice = REBOOT_LINE
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+      const companion = new MenubarCompanion(deps())
+
+      await companion.bootstrap()
+
+      expect(cliCalls).toHaveLength(1)
+      expect(launches).toEqual([])
+      expect(companion.status().restartRequired).toBe(true)
+      log.mockRestore()
+    })
+
+    // The version is not the question; a field on the result is, so a CLI that grows one is
+    // believed without this side having to keep reading prose.
+    it('believes a rebootRequired field on the result', async () => {
+      stageMsi()
+      installResult = result({ rebootRequired: true })
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+      const companion = new MenubarCompanion(deps())
+
+      await companion.bootstrap()
+
+      expect(launches).toEqual([])
+      expect(companion.status().restartRequired).toBe(true)
+      log.mockRestore()
+    })
+
+    // The install did happen, so it is not offered again and the switch is not turned off:
+    // the only thing missing is the restart.
+    it('records the install and leaves the switch on', async () => {
+      stageMsi()
+      cliNotice = REBOOT_LINE
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+      const status = await new MenubarCompanion(deps()).setMenuBarEnabled(true)
+
+      expect(status.menuBar).toBe(true)
+      expect(readCompanionSettings(stateDir)).toMatchObject({
+        installDeclinedVersion: null,
+        trayExePath: TRAY_EXE,
+        trayExeVersion: VERSION,
+      })
+      log.mockRestore()
+    })
+
+    // Nothing was started, so there is nothing to nudge either: a settings write still lands
+    // in the file, and the tray app reads it when the restart finally starts it.
+    it('writes tray settings without nudging a tray app that is not running', async () => {
+      stageMsi()
+      cliNotice = REBOOT_LINE
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+      const companion = new MenubarCompanion(deps())
+      await companion.bootstrap()
+
+      await companion.setTrayAppPref({ accent: 'blue' })
+
+      expect(launches).toEqual([])
+      expect(readTrayFile('app', home).accent).toBe('blue')
+      log.mockRestore()
+    })
+
+    // A launch after the restart has an ordinary install ahead of it: the recorded version is
+    // the staged one and the exe is there, so nothing is spawned and the tray app starts.
+    it('starts the tray app at the launch after the restart', async () => {
+      stageMsi()
+      cliNotice = REBOOT_LINE
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+      await new MenubarCompanion(deps()).bootstrap()
+      cliCalls = []
+      cliNotice = ''
+
+      const companion = new MenubarCompanion(deps())
+      await companion.bootstrap()
+
+      expect(cliCalls).toEqual([])
+      expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--reload-settings'] }])
+      expect(companion.status().restartRequired).toBe(false)
+      log.mockRestore()
     })
   })
 
@@ -691,7 +791,7 @@ describe('MenubarCompanion', () => {
 
     const status = await companion.setMenuBarEnabled(false)
 
-    expect(status).toEqual({ supported: true, menuBar: false, sidebar: false, store: false })
+    expect(status).toEqual({ supported: true, menuBar: false, sidebar: false, store: false, restartRequired: false })
     expect(regCalls).toEqual([runKeyArgs(false, TRAY_EXE)])
     expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--quit'] }])
   })
@@ -736,7 +836,7 @@ describe('MenubarCompanion', () => {
 
     const status = await companion.setMenuBarEnabled(false)
 
-    expect(status).toEqual({ supported: true, menuBar: false, sidebar: false, store: false })
+    expect(status).toEqual({ supported: true, menuBar: false, sidebar: false, store: false, restartRequired: false })
     // Written before --quit, so what the tray app finds next time is what the switches show.
     expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toEqual({ enabled: false })
     expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--quit'] }])
@@ -824,6 +924,22 @@ describe('MenubarCompanion', () => {
 
       expect(launches).toEqual([])
       expect(readTrayFile('app', home)).toEqual({})
+    })
+
+    // Both setters take whatever the renderer sent over IPC. `'enabled' in patch` is the
+    // first thing setTrayDockPref reads, and it throws a TypeError on a primitive, so the
+    // shape is settled before anything looks inside it.
+    it('answers a patch that is not an object without writing or throwing', async () => {
+      const companion = running()
+
+      for (const patch of [null, undefined, 'enabled', 42, ['enabled'], true]) {
+        expect(await companion.setTrayDockPref(patch)).toEqual(await companion.trayPrefs())
+        expect(await companion.setTrayAppPref(patch)).toEqual(await companion.trayPrefs())
+      }
+
+      expect(launches).toEqual([])
+      expect(readTrayFile('app', home)).toEqual({})
+      expect(readTrayFile('dock', home)).toEqual({})
     })
 
     it('keeps the rail placement while writing a dock setting', async () => {

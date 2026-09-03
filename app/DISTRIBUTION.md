@@ -99,20 +99,39 @@ the version as an identifier for either.
 
 `app/electron/menubar.ts` runs at every launch (which is also what covers a
 desktop-app update, since the staged MSI travels with the app) and hands the
-staged file to the CLI's own Windows installer by setting `CODEBURN_MENUBAR_MSI`
-on a `codeburn menubar` spawn. The install itself is not reimplemented on the
-Electron side: `src/menubar-installer.ts` owns the uninstall-registry read, the
-checksum verification, the `msiexec /i ... /passive /norestart` call and the
-rules that go with a bundled copy. It prints one `CODEBURN_MENUBAR_RESULT <json>`
-line that the desktop app reads.
+staged file to the CLI's own Windows installer by spawning
+`codeburn menubar --staged-msi <absolute path>`. The path is an argument of the
+command rather than an environment variable, so nothing a variable in the
+inherited environment happens to name can reach msiexec; the
+`CODEBURN_MENUBAR_MSI` variable this replaced is now rejected by the CLI. The
+install itself is not reimplemented on the Electron side:
+`src/menubar-installer.ts` owns the uninstall-registry read, the checksum
+verification, the `msiexec /i ... /passive /norestart` call and the rules that
+go with a bundled copy. It prints one `CODEBURN_MENUBAR_RESULT <json>` line that
+the desktop app reads.
 
 The spawn itself is not made at every launch. `msiexec /passive` puts an admin
 prompt in front of the user, so `companion.v1.json` records the version of the
-tray app that is on disk and the version of any staged MSI whose install was
-declined (exit 1602) or failed. A launch skips the probe when the recorded tray
-app is the staged version and is still there, and skips it when this exact
-staged version was already refused. A newer staged version is always offered,
-and so is turning the "Menu bar" switch on by hand, which clears the refusal.
+tray app that is on disk and the version of any staged MSI whose install the
+user declined at that prompt (exit 1602). A launch skips the probe when the
+recorded tray app is the staged version and is still there, and skips it when
+this exact staged version was already refused. A newer staged version is always
+offered, and so is turning the "Menu bar" switch on by hand, which clears the
+refusal.
+
+Only a refusal is remembered. A spawn that timed out, a CLI that was not there
+and a run that died before printing its result are all transient, so nothing is
+written down and the install is attempted again at the next launch; recording
+them would turn one bad launch into a tray app that is never installed.
+
+When msiexec exits 3010 the install is real but unfinished: Windows could not
+replace a file that was in use and has deferred it to the next restart, so the
+binary on disk is still the previous tray app while the uninstall registry
+already reports the new version. The desktop app starts nothing in that state
+and the sidebar corner says "Restart Windows to finish installing the menu bar
+app." instead. `BundledInstallResult` carries no field for this, so the desktop
+side reads the installer's own notice line; the optional `rebootRequired` in
+`MenubarInstallResult` is believed first, for when the CLI starts sending it.
 
 Two of those rules matter here:
 
@@ -321,6 +340,29 @@ every .exe and .dll while the data files land, leaving an install with no progra
 The x64 build is unaffected because its default filter is one the decoder knows. The
 per-architecture archives inside a universal installer get the same treatment, so an
 installer built with both `--x64` and `--arm64` needs the variable too.
+
+**The ARM64 installer carries the x64 tray app.** `package:win:arm64` runs the same
+`npm run stage-menubar` as `package:win`, and there is no ARM64 tray app for it to stage:
+
+- `tauri build` builds for the host, so an ARM64 Windows machine produces
+  `CodeBurn Menubar_<version>_arm64_en-US.msi`, and `stage-menubar.mjs` matches only
+  `CodeBurn[ .]Menubar_<version>_x64_en-US.msi`. Staging on an ARM64 host therefore fails
+  outright with `no CodeBurn.Menubar_<version>_x64_en-US.msi` rather than staging the arm64
+  bundle. What `package:win:arm64` actually ships is the x64 MSI, from an x64 host build or
+  from the `windows-v*` release assets passed with `--from`.
+- Teaching the staging script the arm64 name would not help on its own. The CLI is what runs
+  the install, and `src/menubar-installer.ts` accepts only the x64 name: its release-asset
+  pattern, `parseWindowsMsiVersion` and the staged-install path all require
+  `_x64_en-US.msi`, and a file named anything else is rejected before msiexec sees it. An
+  ARM64 tray app would need a matching change there and in the tray's own updater, which is a
+  larger piece of work than the packaging script.
+- What it means in practice: on ARM64 Windows the desktop app installs the x64 tray app, and
+  Windows runs it under x64 emulation. It works, and it is slower and heavier than a native
+  build would be. Nothing misreports its architecture, because the tray app's version and the
+  uninstall-registry entry are both the x64 MSI's own.
+
+`build-windows-installer.yml` builds `package:win` on `windows-latest` only, so no released
+artifact is affected: `package:win:arm64` is a local build today.
 
 **Distribution policy.** The Microsoft Store build (Store ID `9P0R4ZL5XMB8`) is
 the recommended Windows install. This NSIS setup `.exe` and the tray `.msi`

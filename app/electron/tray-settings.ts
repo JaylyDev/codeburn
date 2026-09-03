@@ -168,12 +168,25 @@ export function parseTrayDockPrefs(raw: Record<string, unknown>): TrayDockPrefs 
 const PROVIDER_ID = /^[a-z0-9][a-z0-9-]{0,63}$/
 
 /**
+ * Whether a patch is a shape the key checks below can be run against at all.
+ *
+ * These patches arrive over IPC, so what turns up is whatever the renderer sent rather than
+ * what the type says. `'metric' in patch` throws a TypeError on a string, a number or null,
+ * and on an array it answers about indices, so the shape is settled before any key is read
+ * out of it. Nothing but a plain object can carry a setting, so everything else is dropped.
+ */
+export function isPatchObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
  * Keep only the keys this pane is allowed to write, each checked against what the tray app
  * can read back. Anything else in the patch is dropped rather than merged, so a renderer
  * cannot reach the rail's placement or any other key the tray app owns.
  */
-export function sanitizeAppPatch(patch: Record<string, unknown>): Record<string, unknown> {
+export function sanitizeAppPatch(patch: unknown): Record<string, unknown> {
   const out: Record<string, unknown> = {}
+  if (!isPatchObject(patch)) return out
   if ('metric' in patch) out.metric = oneOf(patch.metric, DISPLAY_METRICS, DEFAULT_TRAY_APP_PREFS.metric)
   if ('menubarPeriod' in patch) out.menubarPeriod = oneOf(patch.menubarPeriod, MENUBAR_PERIODS, DEFAULT_TRAY_APP_PREFS.menubarPeriod)
   if ('accent' in patch) out.accent = oneOf(patch.accent, ACCENTS, DEFAULT_TRAY_APP_PREFS.accent)
@@ -184,8 +197,9 @@ export function sanitizeAppPatch(patch: Record<string, unknown>): Record<string,
   return out
 }
 
-export function sanitizeDockPatch(patch: Record<string, unknown>): Record<string, unknown> {
+export function sanitizeDockPatch(patch: unknown): Record<string, unknown> {
   const out: Record<string, unknown> = {}
+  if (!isPatchObject(patch)) return out
   if ('enabled' in patch) out.enabled = patch.enabled === true
   if ('scale' in patch) out.scale = normalizeScale(patch.scale)
   if ('theme' in patch) out.theme = patch.theme === 'glass' ? 'glass' : 'graphite'
