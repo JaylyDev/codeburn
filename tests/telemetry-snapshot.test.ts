@@ -139,7 +139,7 @@ describe('telemetry snapshot buckets', () => {
   })
 
   it('coarsens counts and durations', () => {
-    expect(countBucket(0)).toBe('1-10')
+    expect(countBucket(1)).toBe('1-10')
     expect(countBucket(9)).toBe('1-10')
     expect(countBucket(10)).toBe('10-100')
     expect(countBucket(100)).toBe('100-1k')
@@ -149,6 +149,14 @@ describe('telemetry snapshot buckets', () => {
     expect(minutesBucket(15)).toBe('15-60')
     expect(minutesBucket(60)).toBe('60-240')
     expect(minutesBucket(240)).toBe('240+')
+  })
+
+  // A count bucket is a claim about what the user did. Nothing is its own claim.
+  it('reports no activity as no activity rather than as one to ten', () => {
+    expect(countBucket(0)).toBe('0')
+    expect(countBucket(-1)).toBe('0')
+    expect(countBucket(Number.NaN)).toBe('0')
+    expect(countBucket(0.4)).toBe('1-10')
   })
 })
 
@@ -245,6 +253,33 @@ describe('buildTelemetrySnapshot', () => {
       topModels: ['Sonnet 4.5', 'Opus 4.6'],
     })
     expect(snapshot.categories[1]!.topModels).toEqual(['Sonnet 4.5'])
+  })
+
+  // topModels comes from the cost breakdown, so a model can be listed there
+  // with no behavioural turn behind it at all. Reporting that as "1-10" would
+  // invent turns the user never took.
+  it('reports a model with no behavioural turns as an empty bucket', () => {
+    const payload = richPayload()
+    payload.current.topModels = [
+      { name: 'Sonnet 4.5', cost: 200, savingsUSD: 0, savingsBaselineModel: '', calls: 3000 },
+      { name: 'Haiku 4.5', cost: 2, savingsUSD: 0, savingsBaselineModel: '', calls: 30 },
+    ]
+    const snapshot = buildTelemetrySnapshot(payload, { modelTasks })
+
+    expect(snapshot.models[1]).toEqual({
+      name: 'Haiku 4.5',
+      costBucket: '1-10',
+      turnBucket: '0',
+      oneShotRate: -1,
+      tasks: [],
+    })
+    expect(snapshot.models[0]!.turnBucket).toBe('100-1k')
+  })
+
+  it('reports an idle period as no sessions rather than as one to ten', () => {
+    const snapshot = buildTelemetrySnapshot(richPayload({ sessions: 0 }))
+
+    expect(snapshot.sessions.countBucket).toBe('0')
   })
 
   it('marks a rate it cannot compute as -1 rather than zero', () => {

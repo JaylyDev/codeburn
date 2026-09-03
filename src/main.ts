@@ -1401,9 +1401,10 @@ program
   .command('menubar')
   .description('Install and launch the menubar app on macOS and Windows (one command, no clone)')
   .option('--force', 'Reinstall even if a copy is already installed')
-  .action(async (opts: { force?: boolean }) => {
+  .option('--staged-msi <path>', 'Windows: install the CodeBurn.Menubar .msi staged inside an installed CodeBurn desktop app, by absolute path')
+  .action(async (opts: { force?: boolean; stagedMsi?: string }) => {
     try {
-      const result = await installMenubarApp({ force: opts.force, cliVersion: version })
+      const result = await installMenubarApp({ force: opts.force, cliVersion: version, stagedMsi: opts.stagedMsi })
       // A cancelled Windows installer leaves nothing to point at.
       if (result.installedPath) console.log(`\n  Ready. ${result.installedPath}\n`)
     } catch (err) {
@@ -2616,14 +2617,20 @@ program
   .option('--no-color', 'Disable ANSI colors')
   .action(async (opts) => {
     const { collectQuota, renderQuotaTable } = await import('./quota/index.js')
+    const { awaitCredentialWrites } = await import('./quota/security.js')
     const report = await collectQuota()
     const out = opts.format === 'json'
       ? JSON.stringify(report, null, 2) + '\n'
       : renderQuotaTable(report, { color: opts.color }) + '\n'
+    await new Promise<void>(resolve => { process.stdout.write(out, () => resolve()) })
+    // A provider the per-provider timeout gave up on may still be between an
+    // accepted token grant and the credential file it has to rewrite. That
+    // token is already dead on disk, so exiting through it signs the user out.
+    await awaitCredentialWrites()
     // A keychain lookup or local-server probe abandoned by the per-provider
     // timeout keeps its child alive long past the output, so leave on purpose
-    // once the write has flushed.
-    process.stdout.write(out, () => process.exit(0))
+    // once the output has flushed and nothing is mid-rotation.
+    process.exit(0)
   })
 
 registerActCommands(program)

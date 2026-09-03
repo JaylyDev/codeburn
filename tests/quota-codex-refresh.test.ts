@@ -5,7 +5,9 @@ import path from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { collectQuota } from '../src/quota/index.js'
 import { fetchCodexQuota } from '../src/quota/codex.js'
+import { awaitCredentialWrites, pendingCredentialWrites } from '../src/quota/security.js'
 
 const NOW = Date.parse('2026-09-02T12:00:00.000Z')
 const OLD_REFRESH = 'refresh-token-that-the-grant-retires'
@@ -99,6 +101,116 @@ describe('Codex quota credential rotation', () => {
 
     expect(result.quota.connection).toBe('transientFailure')
     expect((await readAuth()).tokens.refresh_token).toBe(NEW_REFRESH)
+  })
+
+  // Two ways `codeburn quota` could throw a rotation away: the per-provider
+  // abort cancelling the grant, and the command's process.exit landing between
+  // the grant and the file. Neither may lose it.
+  it('completes a rotation the caller has already aborted', async () => {
+    await writeAuth(authDoc())
+    const controller = new AbortController()
+    let grantStarted = (): void => {}
+    const reachedGrant = new Promise<void>(resolve => { grantStarted = resolve })
+    let releaseGrant = (): void => {}
+    const heldGrant = new Promise<void>(resolve => { releaseGrant = resolve })
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+
+    const pending = fetchCodexQuota({
+      authPath,
+      now: () => NOW,
+      signal: controller.signal,
+      fetch: routes({
+        token: async () => {
+          grantStarted()
+          await heldGrant
+          return rotatedGrant()
+        },
+        // The quota read itself honours the abort; only the grant is exempt.
+        usage: () => { throw Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' }) },
+      }),
+    })
+
+    await reachedGrant
+    controller.abort()
+    releaseGrant()
+    const result = await pending
+
+    expect(result.quota.connection).toBe('transientFailure')
+    expect((await readAuth()).tokens.refresh_token).toBe(NEW_REFRESH)
+  })
+
+  it('holds the exit drain open until an abandoned rotation reaches disk', async () => {
+    await writeAuth(authDoc())
+    let grantStarted = (): void => {}
+    const reachedGrant = new Promise<void>(resolve => { grantStarted = resolve })
+    let releaseGrant = (): void => {}
+    const heldGrant = new Promise<void>(resolve => { releaseGrant = resolve })
+
+    // What the `quota` command does: race the provider, print, then exit.
+    const report = await collectQuota({
+      timeoutMs: 5,
+      readers: [{
+        id: 'codex',
+        name: 'Codex',
+        read: async signal => (await fetchCodexQuota({
+          signal,
+          authPath,
+          now: () => NOW,
+          fetch: routes({
+            token: async () => {
+              grantStarted()
+              await heldGrant
+              return rotatedGrant()
+            },
+            usage: usagePayload,
+          }),
+        })).quota,
+      }],
+    })
+
+    expect(report.providers[0]).toMatchObject({ id: 'codex', error: 'Timed out.' })
+    await reachedGrant
+    expect(pendingCredentialWrites()).toBe(1)
+    // The token on disk is the one the grant is in the middle of retiring, so
+    // an exit taken here is what signs the user out.
+    expect((await readAuth()).tokens.refresh_token).toBe(OLD_REFRESH)
+
+    let drained = false
+    const drain = awaitCredentialWrites().then(() => { drained = true })
+    await new Promise(resolve => { setImmediate(resolve) })
+    expect(drained).toBe(false)
+
+    releaseGrant()
+    await drain
+
+    expect((await readAuth()).tokens.refresh_token).toBe(NEW_REFRESH)
+    expect(pendingCredentialWrites()).toBe(0)
+  })
+
+  it('drains instantly when no rotation is outstanding', async () => {
+    expect(pendingCredentialWrites()).toBe(0)
+    await awaitCredentialWrites(0)
+  })
+
+  it('stops waiting on a grant that never answers', async () => {
+    await writeAuth(authDoc())
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    let releaseGrant = (): void => {}
+    const heldGrant = new Promise<void>(resolve => { releaseGrant = resolve })
+
+    const pending = fetchCodexQuota({
+      authPath,
+      now: () => NOW,
+      fetch: routes({
+        token: async () => { await heldGrant; return rotatedGrant() },
+        usage: usagePayload,
+      }),
+    })
+    // Bounded, so a wedged endpoint cannot keep the command from ever exiting.
+    await awaitCredentialWrites(10)
+
+    releaseGrant()
+    await pending
   })
 
   it('has the rotated refresh token on disk before it makes another request', async () => {

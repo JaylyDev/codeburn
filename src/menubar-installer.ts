@@ -1,9 +1,9 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
-import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir, platform, tmpdir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
 import { ProxyAgent, fetch as undiciFetch } from 'undici'
@@ -49,6 +49,10 @@ export type InstallOptions = {
   force?: boolean
   cliVersion?: string
   platform?: string
+  /// An absolute path to a `CodeBurn.Menubar_<version>_x64_en-US.msi` staged inside an
+  /// installed CodeBurn desktop app, from `codeburn menubar --staged-msi`. Validated by
+  /// assertStagedMsiPath before anything is run on it.
+  stagedMsi?: string
   windows?: WindowsInstallHooks
 }
 
@@ -543,8 +547,9 @@ async function killRunningApp(): Promise<void> {
 /// Windows mirror of the mac install below: pin the release to the CLI's own version, fall back
 /// to the newest windows-v* release, verify the sha256 before anything executes the file, hand
 /// the .msi to msiexec, then launch what it installed. Two routes come before that one: an .msi
-/// another installer already staged (BUNDLED_MSI_ENV), and a Microsoft Store install of the
-/// desktop app, which carries the tray app inside its own package (findStoreMenubar).
+/// the desktop app already staged and named with `--staged-msi` (assertStagedMsiPath), and a
+/// Microsoft Store install of the desktop app, which carries the tray app inside its own
+/// package (findStoreMenubar).
 const WINDOWS_UNINSTALL_KEYS = [
   'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
   'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
@@ -593,15 +598,81 @@ export type InstalledWindowsMenubar = {
 
 // The bundled .msi route ---------------------------------------------------------------------
 
-/// Names a `CodeBurn.Menubar_<version>_x64_en-US.msi` already on disk, with its `.sha256`
-/// beside it. The Electron desktop app ships the matching MSI in its own resources and sets
-/// this so `codeburn menubar` installs from that file instead of downloading a release. The
-/// MSI carries a fixed WiX upgrade code, so it upgrades a manual install in place rather than
-/// standing a second copy beside it.
+/// How the Electron desktop app used to name the `CodeBurn.Menubar_<version>_x64_en-US.msi` it
+/// ships in its own resources. It is no longer a route, only a refusal: an environment variable
+/// is settable by anything that can start this process, and this one decided which file msiexec
+/// would run, with the `.sha256` it is checked against written by whoever wrote the file. The
+/// desktop app passes `--staged-msi <path>` instead, which is validated (assertStagedMsiPath).
 export const BUNDLED_MSI_ENV = 'CODEBURN_MENUBAR_MSI'
+/// The flag that replaced it.
+export const STAGED_MSI_FLAG = '--staged-msi'
 /// One line on stdout so the caller that staged the MSI learns what happened without reading
-/// prose. Everything else the install prints stays human-readable.
+/// prose. Everything else the install prints stays human-readable. Unchanged by the move from
+/// the environment variable to the flag: it is the desktop app's only parse of this command.
 export const BUNDLED_RESULT_PREFIX = 'CODEBURN_MENUBAR_RESULT '
+
+/// Where a packaged desktop app keeps the tray installer, relative to the directory holding
+/// `CodeBurn.exe`: electron-builder puts extraResources under `resources`, and the tray build
+/// is staged into `resources\menubar` (app/electron/menubar.ts, menubarResourcesDir).
+export const STAGED_MSI_DIR_SEGMENTS = ['resources', 'menubar'] as const
+/// The desktop app's own binary, which is what makes the directory above an installed CodeBurn
+/// rather than a directory anyone happened to name `resources\menubar`.
+export const DESKTOP_APP_EXE = 'CodeBurn.exe'
+
+async function isRegularFile(path: string): Promise<boolean> {
+  try {
+    // lstat, not stat: a symbolic link standing in for any of these is a way to point a
+    // validated shape at an unvalidated file.
+    return (await lstat(path)).isFile()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Decides whether a `--staged-msi` path may be handed to msiexec, and refuses if not.
+ *
+ * Whatever this returns is executed as the installing user, so the path has to prove it came
+ * from an installed CodeBurn desktop app rather than from anyone who could put a file on this
+ * machine and name it. It must be absolute, it must be the release asset by name, it must carry
+ * the `.sha256` it will be checked against, and it must sit in the one place a packaged desktop
+ * app stages it: `<app>\resources\menubar`, with `<app>\CodeBurn.exe` beside those. A path that
+ * fails any of that is refused here, before anything runs it.
+ *
+ * The digest beside the file is not by itself a guarantee - the party that writes one writes the
+ * other - which is why the location check, and not the checksum, is what this route trusts.
+ */
+export async function assertStagedMsiPath(msiPath: string): Promise<string> {
+  const refuse = (reason: string): never => {
+    throw new Error(`Refusing ${STAGED_MSI_FLAG} ${msiPath}: ${reason}`)
+  }
+  if (typeof msiPath !== 'string' || msiPath.trim() === '') refuse('no path was given.')
+  if (!isAbsolute(msiPath)) refuse('the path is not absolute.')
+  // Resolved before every other check, so `..` cannot walk out of the directory the checks
+  // below are about to confirm.
+  const resolved = resolve(msiPath)
+
+  if (!parseWindowsMsiVersion(basename(resolved))) {
+    refuse('the file is not named like a CodeBurn.Menubar_<version>_x64_en-US.msi release asset.')
+  }
+
+  const stagedDir = dirname(resolved)
+  const [expectedParent, expectedDir] = STAGED_MSI_DIR_SEGMENTS
+  // Case-insensitive because Windows paths are, so a `Resources\Menubar` from a caller that
+  // built the path by hand is the same directory rather than a different one.
+  const named = (dir: string, expected: string) => basename(dir).toLowerCase() === expected
+  if (!named(stagedDir, expectedDir!) || !named(dirname(stagedDir), expectedParent!)) {
+    refuse(`the file is not inside a ${STAGED_MSI_DIR_SEGMENTS.join('\\')} directory.`)
+  }
+
+  const appDir = dirname(dirname(stagedDir))
+  if (!(await isRegularFile(join(appDir, DESKTOP_APP_EXE)))) {
+    refuse(`there is no ${DESKTOP_APP_EXE} in ${appDir}, so this is not an installed CodeBurn desktop app.`)
+  }
+  if (!(await isRegularFile(resolved))) refuse('there is no regular file at that path.')
+  if (!(await isRegularFile(`${resolved}.sha256`))) refuse('there is no .sha256 file beside it.')
+  return resolved
+}
 
 export type BundledInstallAction = 'installed' | 'up-to-date' | 'kept-newer' | 'cancelled'
 
@@ -1029,12 +1100,24 @@ async function installWindowsMenubarApp(options: InstallOptions): Promise<Instal
   const launch = hooks.launch ?? launchWindowsApp
   const cliVersion = options.cliVersion ? normalizeCliVersion(options.cliVersion) : ''
 
+  // Refused rather than honoured, and before anything else, so a machine carrying the old
+  // variable is told why instead of quietly taking the safe route and looking like it worked.
+  if (env[BUNDLED_MSI_ENV]) {
+    throw new Error(
+      `${BUNDLED_MSI_ENV} is no longer honoured: an environment variable chose which installer ran, `
+      + `and the checksum it was verified against was written by whoever wrote that installer. `
+      + `Pass ${STAGED_MSI_FLAG} <absolute path> instead; it is accepted only for a release-named .msi `
+      + `staged in an installed CodeBurn desktop app's ${STAGED_MSI_DIR_SEGMENTS.join('\\')} directory.`,
+    )
+  }
+
   // An MSI already on disk short-circuits the whole release lookup: the desktop app ships the
   // matching build and points at it rather than sending every install of the desktop app to
   // GitHub for a file it already has. This stays ahead of the Store lookup because it is an
-  // explicit instruction from whoever staged the file, and the Store build never sets it.
-  const bundledMsi = env[BUNDLED_MSI_ENV]
-  if (bundledMsi) return installStagedWindowsMenubar(bundledMsi, options)
+  // explicit instruction from whoever staged the file, and the Store build never passes it.
+  if (options.stagedMsi) {
+    return installStagedWindowsMenubar(await assertStagedMsiPath(options.stagedMsi), options)
+  }
 
   // The Store package is looked for before the uninstall registry, because it is the one install
   // the registry cannot see at all (findStoreMenubar).
@@ -1124,6 +1207,9 @@ async function installWindowsMenubarApp(options: InstallOptions): Promise<Instal
 
 export async function installMenubarApp(options: InstallOptions = {}): Promise<InstallResult> {
   if ((options.platform ?? platform()) === 'win32') return installWindowsMenubarApp(options)
+  // There is no staged .msi anywhere but Windows, so a path here is a caller that thinks it is
+  // on another platform. Say so rather than ignoring the argument and installing something else.
+  if (options.stagedMsi) throw new Error(`${STAGED_MSI_FLAG} is a Windows option; this is ${options.platform ?? platform()}.`)
   await ensureSupportedPlatform()
   await persistCodeburnPath()
 

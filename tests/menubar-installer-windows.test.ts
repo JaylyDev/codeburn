@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -7,8 +8,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   BUNDLED_MSI_ENV,
   BUNDLED_RESULT_PREFIX,
+  DESKTOP_APP_EXE,
+  STAGED_MSI_FLAG,
   STORE_IDENTITY_NAME,
   WINDOWS_RELEASE,
+  assertStagedMsiPath,
   compareMenubarVersions,
   decideBundledInstall,
   decideWindowsMenubarSource,
@@ -543,12 +547,13 @@ describe('installMenubarApp from a staged msi', () => {
   })
 
   let sandbox: string
+  let appDir: string
   let msiPath: string
   let logs: string[]
   let installerCalls: Array<{ exe: string; args: string[] }>
 
   function env(): NodeJS.ProcessEnv {
-    return { SystemRoot: 'C:\\Windows', LOCALAPPDATA: join(sandbox, 'Local'), [BUNDLED_MSI_ENV]: msiPath }
+    return { SystemRoot: 'C:\\Windows', LOCALAPPDATA: join(sandbox, 'Local') }
   }
 
   function hooks(overrides: Record<string, unknown> = {}) {
@@ -573,11 +578,16 @@ describe('installMenubarApp from a staged msi', () => {
     return JSON.parse(await readFile(menubarMarkerPath(env()), 'utf8')) as Record<string, unknown>
   }
 
+  // The layout a packaged desktop app has on disk, which is the only one --staged-msi accepts:
+  // the installer under the app's resources/menubar, with the desktop binary two levels up.
   beforeEach(async () => {
     sandbox = await mkdtemp(join(tmpdir(), 'menubar-staged-'))
-    msiPath = join(sandbox, MSI_NAME)
+    appDir = join(sandbox, 'CodeBurn')
+    msiPath = join(appDir, 'resources', 'menubar', MSI_NAME)
     logs = []
     installerCalls = []
+    await mkdir(dirname(msiPath), { recursive: true })
+    await writeFile(join(appDir, DESKTOP_APP_EXE), 'desktop')
     await writeFile(msiPath, MSI_BYTES)
     await writeFile(`${msiPath}.sha256`, `${sha256(MSI_BYTES)}  ${MSI_NAME}\n`)
   })
@@ -590,6 +600,7 @@ describe('installMenubarApp from a staged msi', () => {
     let queries = 0
     const result = await installMenubarApp({
       platform: 'win32',
+      stagedMsi: msiPath,
       windows: hooks({ queryRegistry: async () => (queries++ === 0 ? '' : INSTALLED_0_9_23) }),
     })
 
@@ -614,6 +625,7 @@ describe('installMenubarApp from a staged msi', () => {
     let queries = 0
     await installMenubarApp({
       platform: 'win32',
+      stagedMsi: msiPath,
       windows: hooks({ queryRegistry: async () => (queries++ === 0 ? INSTALLED_0_9_20 : INSTALLED_0_9_23) }),
     })
 
@@ -625,6 +637,7 @@ describe('installMenubarApp from a staged msi', () => {
   it('keeps a newer install and runs no installer', async () => {
     await installMenubarApp({
       platform: 'win32',
+      stagedMsi: msiPath,
       windows: hooks({ queryRegistry: async () => INSTALLED_0_9_30 }),
     })
 
@@ -636,6 +649,7 @@ describe('installMenubarApp from a staged msi', () => {
   it('does nothing when the bundled version is already installed', async () => {
     await installMenubarApp({
       platform: 'win32',
+      stagedMsi: msiPath,
       windows: hooks({ queryRegistry: async () => INSTALLED_0_9_23 }),
     })
 
@@ -647,11 +661,13 @@ describe('installMenubarApp from a staged msi', () => {
     let queries = 0
     await installMenubarApp({
       platform: 'win32',
+      stagedMsi: msiPath,
       windows: hooks({ queryRegistry: async () => (queries++ === 0 ? '' : INSTALLED_0_9_23) }),
     })
     logs = []
     await installMenubarApp({
       platform: 'win32',
+      stagedMsi: msiPath,
       windows: hooks({ queryRegistry: async () => INSTALLED_0_9_23 }),
     })
 
@@ -661,14 +677,16 @@ describe('installMenubarApp from a staged msi', () => {
   it('refuses a staged file whose digest does not match', async () => {
     await writeFile(`${msiPath}.sha256`, `${sha256('other-bytes')}  ${MSI_NAME}\n`)
 
-    await expect(installMenubarApp({ platform: 'win32', windows: hooks() })).rejects.toThrow(/Checksum mismatch/)
+    await expect(installMenubarApp({ platform: 'win32', stagedMsi: msiPath, windows: hooks() })).rejects.toThrow(/Checksum mismatch/)
     expect(installerCalls).toEqual([])
   })
 
+  // Refused by the path check now, before the route starts; verifyStagedChecksum still guards
+  // the same thing for a digest that goes missing after that.
   it('refuses a staged file with no digest beside it', async () => {
     await rm(`${msiPath}.sha256`)
 
-    await expect(installMenubarApp({ platform: 'win32', windows: hooks() })).rejects.toThrow(/Missing checksum file/)
+    await expect(installMenubarApp({ platform: 'win32', stagedMsi: msiPath, windows: hooks() })).rejects.toThrow(/no .sha256 file beside it/)
     expect(installerCalls).toEqual([])
   })
 
@@ -681,6 +699,7 @@ describe('installMenubarApp from a staged msi', () => {
 
     await installMenubarApp({
       platform: 'win32',
+      stagedMsi: msiPath,
       windows: hooks({
         queryRegistry: async () => (queries++ === 0 ? INSTALLED_0_9_20 : INSTALLED_0_9_23),
         isTrayRunning: async () => running,
@@ -708,6 +727,7 @@ describe('installMenubarApp from a staged msi', () => {
 
     await expect(installMenubarApp({
       platform: 'win32',
+      stagedMsi: msiPath,
       windows: hooks({ isTrayRunning: async () => { consulted++; return true } }),
     })).rejects.toThrow(/Checksum mismatch/)
 
@@ -717,11 +737,157 @@ describe('installMenubarApp from a staged msi', () => {
   it('reports a cancelled install rather than failing', async () => {
     const result = await installMenubarApp({
       platform: 'win32',
+      stagedMsi: msiPath,
       windows: hooks({ runInstaller: async () => 1602 }),
     })
 
     expect(result).toEqual({ installedPath: '', launched: false })
     expect(reported()).toMatchObject({ action: 'cancelled', installedBy: null })
+  })
+
+  // The route the flag replaced. An environment variable is set by anything that can start this
+  // process, so honouring it at all is the finding; it is answered, not obeyed.
+  it('refuses the legacy environment variable and names the flag instead', async () => {
+    const failure = installMenubarApp({
+      platform: 'win32',
+      windows: hooks({ env: { ...env(), [BUNDLED_MSI_ENV]: msiPath } }),
+    })
+
+    await expect(failure).rejects.toThrow(new RegExp(`${BUNDLED_MSI_ENV}.+no longer honoured`))
+    await expect(failure).rejects.toThrow(new RegExp(STAGED_MSI_FLAG))
+    expect(installerCalls).toEqual([])
+  })
+
+  it('refuses the legacy environment variable even beside a valid flag', async () => {
+    await expect(installMenubarApp({
+      platform: 'win32',
+      stagedMsi: msiPath,
+      windows: hooks({ env: { ...env(), [BUNDLED_MSI_ENV]: msiPath } }),
+    })).rejects.toThrow(new RegExp(BUNDLED_MSI_ENV))
+    expect(installerCalls).toEqual([])
+  })
+
+  it('refuses a staged path that is not in an installed desktop app, before msiexec', async () => {
+    const loose = join(sandbox, MSI_NAME)
+    await writeFile(loose, MSI_BYTES)
+    await writeFile(`${loose}.sha256`, `${sha256(MSI_BYTES)}  ${MSI_NAME}\n`)
+
+    await expect(installMenubarApp({
+      platform: 'win32',
+      stagedMsi: loose,
+      windows: hooks(),
+    })).rejects.toThrow(/Refusing --staged-msi/)
+    expect(installerCalls).toEqual([])
+  })
+
+  it('is a Windows option only', async () => {
+    await expect(installMenubarApp({ platform: 'darwin', stagedMsi: msiPath })).rejects.toThrow(/Windows option/)
+  })
+})
+
+/// Every one of these is a path that reaches msiexec if it is not refused here.
+describe('assertStagedMsiPath', () => {
+  const MSI_NAME = 'CodeBurn.Menubar_0.9.23_x64_en-US.msi'
+
+  let sandbox: string
+  let appDir: string
+  let msiPath: string
+
+  async function stage(
+    parts: { dir?: string[]; name?: string; file?: boolean; checksum?: boolean; exe?: boolean } = {},
+  ): Promise<string> {
+    const dir = join(appDir, ...(parts.dir ?? ['resources', 'menubar']))
+    const target = join(dir, parts.name ?? MSI_NAME)
+    await mkdir(dir, { recursive: true })
+    if (parts.exe !== false) await writeFile(join(appDir, DESKTOP_APP_EXE), 'desktop')
+    if (parts.file !== false) await writeFile(target, MSI_BYTES)
+    if (parts.checksum !== false) await writeFile(`${target}.sha256`, `${sha256(MSI_BYTES)}  ${MSI_NAME}\n`)
+    return target
+  }
+
+  beforeEach(async () => {
+    sandbox = await mkdtemp(join(tmpdir(), 'menubar-staged-path-'))
+    appDir = join(sandbox, 'CodeBurn')
+    msiPath = join(appDir, 'resources', 'menubar', MSI_NAME)
+  })
+
+  afterEach(async () => {
+    await rm(sandbox, { recursive: true, force: true })
+  })
+
+  it('accepts an installer staged inside an installed desktop app', async () => {
+    await stage()
+
+    expect(await assertStagedMsiPath(msiPath)).toBe(msiPath)
+  })
+
+  // Windows paths do not distinguish case, so a caller that built the path with different
+  // capitals named the same directory.
+  it('accepts the staging directory whatever its capitals', async () => {
+    const staged = await stage({ dir: ['Resources', 'Menubar'] })
+
+    expect(await assertStagedMsiPath(staged)).toBe(staged)
+  })
+
+  it('refuses an empty path', async () => {
+    await expect(assertStagedMsiPath('')).rejects.toThrow(/no path was given/)
+    await expect(assertStagedMsiPath('   ')).rejects.toThrow(/no path was given/)
+  })
+
+  it('refuses a relative path', async () => {
+    await stage()
+
+    await expect(assertStagedMsiPath(join('resources', 'menubar', MSI_NAME))).rejects.toThrow(/not absolute/)
+  })
+
+  it('refuses a file that is not named like the release asset', async () => {
+    const staged = await stage({ name: 'payload.msi' })
+
+    await expect(assertStagedMsiPath(staged)).rejects.toThrow(/release asset/)
+  })
+
+  it('refuses a file outside a resources/menubar directory', async () => {
+    const staged = await stage({ dir: ['resources'] })
+
+    await expect(assertStagedMsiPath(staged)).rejects.toThrow(/resources\\menubar directory/)
+  })
+
+  // The directory name alone is anyone's to write; the desktop binary beside it is what makes
+  // this an installed app rather than a folder someone shaped like one.
+  it('refuses a staging directory with no desktop app above it', async () => {
+    const staged = await stage({ exe: false })
+
+    await expect(assertStagedMsiPath(staged)).rejects.toThrow(new RegExp(`no ${DESKTOP_APP_EXE}`))
+  })
+
+  it('refuses a path with nothing at it', async () => {
+    const staged = await stage({ file: false })
+
+    await expect(assertStagedMsiPath(staged)).rejects.toThrow(/no regular file/)
+  })
+
+  it('refuses a directory standing where the installer should be', async () => {
+    await stage({ file: false })
+    await mkdir(msiPath, { recursive: true })
+
+    await expect(assertStagedMsiPath(msiPath)).rejects.toThrow(/no regular file/)
+  })
+
+  it('refuses an installer with no digest beside it', async () => {
+    const staged = await stage({ checksum: false })
+
+    await expect(assertStagedMsiPath(staged)).rejects.toThrow(/no .sha256 file beside it/)
+  })
+
+  // Otherwise a path shaped like the accepted one walks out of it before it is used.
+  it('refuses a path that traverses out of the staging directory', async () => {
+    await stage()
+    const outside = join(sandbox, MSI_NAME)
+    await writeFile(outside, MSI_BYTES)
+    await writeFile(`${outside}.sha256`, `${sha256(MSI_BYTES)}  ${MSI_NAME}\n`)
+
+    const traversal = join(appDir, 'resources', 'menubar', '..', '..', '..', MSI_NAME)
+    await expect(assertStagedMsiPath(traversal)).rejects.toThrow(/resources\\menubar directory/)
   })
 })
 
@@ -735,6 +901,22 @@ describe('the microsoft store identity', () => {
     }
 
     expect(STORE_IDENTITY_NAME).toBe(appPackage.build?.appx?.identityName)
+  })
+})
+
+/// The desktop app spawns this command and passes the staged installer by flag, so the flag's
+/// spelling is an interface between two trees rather than an implementation detail.
+describe('the codeburn menubar command line', () => {
+  // A CLI spawn through tsx costs several seconds on a slow machine; the file default is not
+  // enough for it.
+  it('takes the staged installer as --staged-msi <path>', { timeout: 30_000 }, () => {
+    const help = spawnSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'menubar', '--help'], {
+      cwd: join(dirname(fileURLToPath(import.meta.url)), '..'),
+      encoding: 'utf8',
+    })
+
+    expect(help.status).toBe(0)
+    expect(`${help.stdout}${help.stderr}`).toContain(`${STAGED_MSI_FLAG} <path>`)
   })
 })
 

@@ -199,6 +199,57 @@ export function quotaRequestSignal(parent?: AbortSignal): AbortSignal {
   return parent ? AbortSignal.any([parent, timeout]) : timeout
 }
 
+/// Refreshes that have left this machine and whose result is not yet on disk.
+///
+/// A token grant retires the refresh token in the credential file the instant
+/// the server accepts it, so the window between the POST and the rewritten file
+/// is one where quitting costs the user their login. Nothing cancels that
+/// window - the request deliberately ignores the caller's abort signal - but a
+/// `process.exit` will still cut through it, so any command that exits outright
+/// has to drain this first.
+const outstandingCredentialWrites = new Set<Promise<void>>()
+
+/// Past this an exit stops waiting. A grant that has not answered in this long
+/// is not going to, and a command that never returns the shell is worse than
+/// the rotation it was protecting.
+export const CREDENTIAL_DRAIN_TIMEOUT_MS = 15_000
+
+/** Registers a rotation for {@link awaitCredentialWrites} to wait on. Returns
+ * the same promise, so a caller can keep awaiting it exactly as before. */
+export function trackCredentialWrite<T>(work: Promise<T>): Promise<T> {
+  // Swallowed here only: the tracked copy exists to be waited on, and the
+  // caller still sees the original promise's rejection.
+  const settled = work.then(() => undefined, () => undefined)
+  outstandingCredentialWrites.add(settled)
+  void settled.then(() => { outstandingCredentialWrites.delete(settled) })
+  return work
+}
+
+export function pendingCredentialWrites(): number {
+  return outstandingCredentialWrites.size
+}
+
+/** Waits for every registered rotation to reach disk, up to `timeoutMs`. Safe
+ * to call when there is nothing outstanding, which is the usual case. */
+export async function awaitCredentialWrites(timeoutMs = CREDENTIAL_DRAIN_TIMEOUT_MS): Promise<void> {
+  if (outstandingCredentialWrites.size === 0) return
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expired = new Promise<'timeout'>(resolve => {
+    timer = setTimeout(() => resolve('timeout'), timeoutMs)
+    timer.unref?.()
+  })
+  try {
+    // Looped rather than snapshotted once: a 401 retry can start a second
+    // rotation while the first is still draining.
+    while (outstandingCredentialWrites.size > 0) {
+      const drained = Promise.all([...outstandingCredentialWrites]).then(() => 'drained' as const)
+      if (await Promise.race([drained, expired]) === 'timeout') return
+    }
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 export function fraction(value: unknown): number | null {
   if (typeof value !== 'number' || !Number.isFinite(value)) return null
   return Math.min(1, Math.max(0, value / 100))

@@ -1,7 +1,7 @@
 import os from 'node:os'
 import path from 'node:path'
 
-import { atomicWriteSecureFileSync, fraction, quotaRequestSignal, readKeychainPassword, readSecureFile, readSecureFileSync, sanitizeError } from './security.js'
+import { atomicWriteSecureFileSync, fraction, quotaRequestSignal, readKeychainPassword, readSecureFile, readSecureFileSync, sanitizeError, trackCredentialWrite } from './security.js'
 import type { KeychainOutcome } from './security.js'
 import type { QuotaProvider, QuotaWindow } from './types.js'
 
@@ -307,9 +307,24 @@ function persistRotated(auth: AuthDoc, rotated: RotatedTokens, deps: CodexDeps):
   return merged
 }
 
+/**
+ * The read-only `codeburn quota` path still refreshes, because the endpoint it
+ * reads rejects an expired access token: a ChatGPT access token lasts hours,
+ * the 401 branch below exists for exactly that, and a quota read that never
+ * refreshed would report Codex as unavailable for anyone who had not used the
+ * Codex CLI in the last few hours. What is removed instead is the way the
+ * rotation could be lost: the POST ignores the caller's abort signal, the write
+ * that follows it is synchronous, and the whole thing is registered with
+ * {@link trackCredentialWrite} so a command that ends in `process.exit` drains
+ * it first (src/main.ts, the `quota` action).
+ */
 async function refresh(auth: AuthDoc, deps: CodexDeps): Promise<AuthDoc | null> {
   const refreshToken = auth.tokens?.refresh_token
   if (!refreshToken) return null
+  return trackCredentialWrite(rotate(auth, refreshToken, deps))
+}
+
+async function rotate(auth: AuthDoc, refreshToken: string, deps: CodexDeps): Promise<AuthDoc | null> {
   // Deliberately not the caller's abort signal, only this request's own
   // timeout: the grant retires the refresh token on disk the moment the
   // endpoint accepts it, so a per-provider timeout firing while the response
