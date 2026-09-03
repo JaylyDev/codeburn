@@ -64,11 +64,32 @@ describe('Sidebar', () => {
     expect(container.querySelector('.fm-flicker')).toBeNull()
   })
 
-  it('keeps About in the corner and the social glyphs out of it', async () => {
+  it('keeps About and the social glyphs in the corner off Windows', () => {
+    setPlatform('darwin')
     const { container } = render(<Sidebar active="overview" onNavigate={() => {}} />)
+
     expect(screen.getByRole('link', { name: 'About' })).toBeInTheDocument()
+    expect([...container.querySelectorAll('.foot .social a')].map(a => a.getAttribute('aria-label')))
+      .toEqual(['GitHub', 'Discord', 'X', 'YouTube', 'LinkedIn'])
+  })
+
+  it('opens a glyph through the shell rather than navigating the window', () => {
+    setPlatform('linux')
+    render(<Sidebar active="overview" onNavigate={() => {}} />)
+
+    fireEvent.click(screen.getByRole('link', { name: 'GitHub' }))
+
+    expect(bridge.openExternal).toHaveBeenCalledWith('https://github.com/getagentseal/codeburn')
+  })
+
+  // Windows is the one platform that gives that corner to something else: the two companion
+  // switches sit above About, and a 186px sidebar has no room for both.
+  it('gives the corner to the companion switches on Windows', async () => {
+    setPlatform('win32')
+    const { container } = render(<Sidebar active="overview" onNavigate={() => {}} />)
+
     expect(container.querySelector('.foot .social')).toBeNull()
-    // They moved into the About modal, which lists them under Links.
+    // About still lists every one of them under Links, on every platform.
     fireEvent.click(screen.getByRole('link', { name: 'About' }))
     expect(await screen.findByRole('link', { name: /GitHub/ })).toBeInTheDocument()
     expect(screen.getByRole('link', { name: /LinkedIn/ })).toBeInTheDocument()

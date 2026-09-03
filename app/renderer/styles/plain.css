@@ -130,6 +130,12 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
 .foot { display: flex; align-items: center; gap: 10px; margin-top: 4px; padding: 11px 8px 2px; border-top: 1px solid var(--line); }
 .foot .about { color: var(--mut); text-decoration: none; font-size: 12px; font-weight: 520; cursor: pointer; }
 .foot .about:hover { color: var(--ink); }
+/* On every platform but Windows, where the corner above About carries the two companion
+   switches instead and a 186px sidebar has no room for both. */
+.foot .social { display: flex; gap: 2px; margin-left: auto; }
+.foot .social a { color: var(--mut2); display: flex; padding: 5px; border-radius: 6px; cursor: pointer; }
+.foot .social a:hover { color: var(--accent); background: var(--hover); }
+.foot .social svg { width: 15px; height: 15px; fill: currentColor; stroke: none; }
 /* Windows only: the tray app and the Capacity Dock rail, above About. Same 8px gutter and
    12.5px type as a nav item, so the corner reads as one column rather than two. */
 .companion { padding: 8px 8px 2px; border-top: 1px solid var(--line); }

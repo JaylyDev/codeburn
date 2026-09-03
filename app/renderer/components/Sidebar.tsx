@@ -1,9 +1,9 @@
 import { useEffect, useState, type ReactNode } from 'react'
 
 import { codeburn } from '../lib/ipc'
-import { shortcutLabel } from '../lib/platform'
+import { isWindowsPlatform, shortcutLabel } from '../lib/platform'
 import type { CompanionStatus } from '../lib/types'
-import { AboutModal } from './AboutModal'
+import { AboutModal, SOCIALS } from './AboutModal'
 import { FlameMark } from './FlameMark'
 
 export type Section = 'overview' | 'sessions' | 'pullRequests' | 'spend' | 'optimize' | 'models' | 'compare' | 'plans' | 'settings' | 'plugins'
@@ -79,6 +79,7 @@ export function Sidebar({
         <CompanionSwitches />
         <div className="foot">
           <a className="about" href="#about" onClick={event => { event.preventDefault(); setAboutOpen(true) }}>About</a>
+          <SocialGlyphs />
         </div>
       </nav>
       {aboutOpen ? <AboutModal onClose={() => setAboutOpen(false)} /> : null}
@@ -87,9 +88,36 @@ export function Sidebar({
 }
 
 /**
+ * The row of brand glyphs in the corner, beside About.
+ *
+ * Windows is the one platform that gives that corner to something else: the two companion
+ * switches sit above About, and a 186px sidebar has no room for both. Every other platform
+ * keeps the glyphs it always had, since nothing replaced them there. About lists the same
+ * links under Links on every platform.
+ */
+function SocialGlyphs() {
+  if (isWindowsPlatform()) return null
+  return (
+    <div className="social">
+      {SOCIALS.map(social => (
+        <a
+          key={social.label}
+          href={social.url}
+          title={social.label}
+          aria-label={social.label}
+          onClick={event => { event.preventDefault(); void codeburn.openExternal(social.url) }}
+        >
+          {social.icon}
+        </a>
+      ))}
+    </div>
+  )
+}
+
+/**
  * The two surfaces the Windows desktop app carries besides its own window: the tray app
  * ("Menu bar") and the Capacity Dock rail it draws ("Sidebar"). Both are on by default and
- * live above About, where the social glyphs used to be.
+ * live above About, in the corner the social glyphs share on every other platform.
  *
  * Nothing renders until the main process says this build has a tray app staged, which is why
  * there is no placeholder row and no disabled switch: on macOS, on Linux, and in a dev build
