@@ -559,6 +559,10 @@ final class CapacityDockController {
         model.detailHeight = glanceDetailHeight(for: provider)
         ensureDetailPanel()
         layoutDetail(for: provider, transaction: wasShowingDetail ? .detailFollow : .detailPresent)
+        // A panel that lost its all-spaces membership returns to the desktop space alone,
+        // so hovering inside a full-screen app presented the popover where it could not be
+        // seen. The rail escapes this by never being ordered out.
+        detailPanel?.reassertSpaceMembership()
         detailPanel?.orderFrontRegardless()
     }
 
@@ -1384,11 +1388,21 @@ private final class CapacityDockPanel: NSPanel {
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
         isMovable = false
-        isFloatingPanel = true
         isExcludedFromWindowsMenu = true
         becomesKeyOnlyIfNeeded = true
         animationBehavior = .none
-        collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        collectionBehavior = Self.spaceBehavior
+    }
+
+    /// Membership of every space, including the one a full-screen app owns. The window
+    /// server drops it from a panel across a display sleep or a display reconfiguration,
+    /// and writing it again is what re-registers the window, so this is re-asserted
+    /// before each presentation rather than only at init.
+    static let spaceBehavior: NSWindow.CollectionBehavior =
+        [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+
+    func reassertSpaceMembership() {
+        collectionBehavior = Self.spaceBehavior
     }
 
     override var canBecomeKey: Bool { false }
