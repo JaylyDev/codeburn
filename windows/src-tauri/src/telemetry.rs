@@ -23,6 +23,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -59,6 +60,15 @@ const EVENT_NAMES: [&str; 11] = [
 ];
 
 const MAX_QUEUE: usize = 200;
+/// The queue is a file this app rewrites, so it is bounded by size as well as by count: two
+/// hundred daily snapshots would be tens of megabytes on disk, and the oldest of them are
+/// the least worth keeping. Whichever cap is reached first drops from the front.
+const MAX_QUEUE_BYTES: usize = 512 * 1_024;
+/// An event nobody could send for a week is history: the day it carries has long since been
+/// aggregated, and holding it only crowds out what happened since. The cutoff is computed in
+/// UTC while the Windows day key is local, so an event can outlive the mark by a few hours,
+/// which is well inside what a day-granularity metric can tell apart.
+const MAX_EVENT_AGE_DAYS: i64 = 7;
 const MAX_STRING: usize = 64;
 const MAX_ARRAY: usize = 12;
 const MAX_KEYS: usize = 16;
@@ -70,11 +80,19 @@ const MAX_DEPTH: usize = 5;
 /// many leaf values, whatever shape it arrives in.
 const MAX_LEAVES: usize = 1_000;
 
-/// How often the queue is offered to the endpoint. The same beat the desktop app keeps.
+/// How often the queue is offered to the endpoint while sends are landing. The same beat the
+/// desktop app keeps.
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// The ceiling the doubling stops at, so an endpoint that has been down all day is still
+/// asked twice an hour rather than never again.
+const BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Quit waits for the last batch, so it gets a timeout somebody would not notice.
 const QUIT_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// How long a burst of events is allowed to settle before the queue file is rewritten. Long
+/// enough that a drag or a window opening pays for one write rather than a dozen, short
+/// enough that a crash in between loses at most the last second or two.
+pub const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 
 // Settings keys ---------------------------------------------------------------------------
 
@@ -363,33 +381,57 @@ struct PersistedQueue {
     last_snapshot_day: Option<String>,
 }
 
-/// The queue, and the file behind it. Written after every change so a quit, a crash or a
-/// sign-out loses nothing that was already recorded.
+/// The queue, and the file behind it. Every change marks it dirty rather than rewriting the
+/// file on the spot: the write is debounced (see `SAVE_DEBOUNCE`) so a burst of events costs
+/// one write, and quit and the flush beat both make sure a dirty queue reaches the disk.
 #[derive(Debug)]
 pub struct Queue {
     path: Option<PathBuf>,
     events: Vec<QueuedEvent>,
+    /// The batch a flush is posting right now. It is out of `events`, so nothing queued in
+    /// the meantime joins it, but it is still written to the file: a save or a quit while a
+    /// POST is in flight used to overwrite the file with everything that batch was missing.
+    in_flight: Vec<QueuedEvent>,
+    /// Running total of `events` as serialized, which is what `MAX_QUEUE_BYTES` bounds.
+    bytes: usize,
     last_snapshot_day: Option<String>,
+    dirty: bool,
+    /// Set when the queue is emptied while a batch is out. That batch was recorded under the
+    /// id being retired, so it is dropped when it comes back rather than restored and later
+    /// sent under the fresh one.
+    abandon_in_flight: bool,
 }
 
 impl Queue {
     pub fn load(path: Option<PathBuf>) -> Self {
+        Self::load_at(path, now_secs())
+    }
+
+    /// `now` is a parameter so the age cutoff can be exercised without moving the clock.
+    fn load_at(path: Option<PathBuf>, now: i64) -> Self {
         let persisted = path
             .as_deref()
             .and_then(|path| fs::read(path).ok())
             .and_then(|bytes| serde_json::from_slice::<PersistedQueue>(&bytes).ok())
             .unwrap_or_default();
         let mut events = persisted.events;
-        // A hand-edited or truncated file must not put this run over the cap.
-        if events.len() > MAX_QUEUE {
-            let excess = events.len() - MAX_QUEUE;
-            events.drain(0..excess);
-        }
-        Queue {
+        let cutoff = day_key_utc(now - MAX_EVENT_AGE_DAYS * 86_400);
+        // Day keys are `YYYY-MM-DD`, so they sort as dates. Anything shorter is junk from a
+        // hand-edited file and sorts below every real day, which drops it too.
+        events.retain(|event| event.day.as_str() >= cutoff.as_str());
+        let mut queue = Queue {
             path,
+            bytes: events.iter().map(event_bytes).sum(),
             events,
+            in_flight: Vec::new(),
             last_snapshot_day: persisted.last_snapshot_day,
-        }
+            dirty: false,
+            abandon_in_flight: false,
+        };
+        // A file from an older build, or one that has been hand-edited, must not put this
+        // run over either cap.
+        queue.trim();
+        queue
     }
 
     #[cfg(test)]
@@ -408,47 +450,101 @@ impl Queue {
             return false;
         }
         self.last_snapshot_day = Some(day.to_owned());
+        self.dirty = true;
         true
     }
 
-    /// The oldest event gives way at the cap, so the queue always carries the most recent
+    /// The oldest event gives way at either cap, so the queue always carries the most recent
     /// window rather than freezing at whatever filled it first.
     pub fn push(&mut self, event: QueuedEvent) {
-        if self.events.len() >= MAX_QUEUE {
-            self.events.remove(0);
-        }
+        self.bytes += event_bytes(&event);
         self.events.push(event);
+        self.trim();
+        self.dirty = true;
     }
 
-    /// The batch to send. It leaves the queue here and comes back through `restore` if the
-    /// send failed in a way worth retrying.
+    /// Drops from the front until the queue is inside both caps. The newest event is always
+    /// kept, even if it is oversized on its own: dropping it would lose the only thing the
+    /// caller just asked to record.
+    fn trim(&mut self) {
+        while self.events.len() > MAX_QUEUE
+            || (self.bytes > MAX_QUEUE_BYTES && self.events.len() > 1)
+        {
+            let dropped = self.events.remove(0);
+            self.bytes = self.bytes.saturating_sub(event_bytes(&dropped));
+        }
+    }
+
+    /// The batch to send. It leaves the queue here, stays in the file while it is in flight,
+    /// and comes back through `restore` if the send failed in a way worth retrying.
     pub fn take(&mut self) -> Vec<QueuedEvent> {
-        std::mem::take(&mut self.events)
+        self.in_flight = std::mem::take(&mut self.events);
+        self.bytes = 0;
+        self.abandon_in_flight = false;
+        self.in_flight.clone()
     }
 
     /// Puts a failed batch back in front of whatever was queued while it was in flight, and
-    /// drops the oldest of the two if together they overflow.
+    /// drops the oldest of the two if together they overflow. A batch the toggle retired
+    /// while it was out is dropped instead.
     pub fn restore(&mut self, mut batch: Vec<QueuedEvent>) {
-        batch.append(&mut self.events);
-        if batch.len() > MAX_QUEUE {
-            let excess = batch.len() - MAX_QUEUE;
-            batch.drain(0..excess);
+        self.in_flight = Vec::new();
+        if self.abandon_in_flight {
+            self.abandon_in_flight = false;
+            self.dirty = true;
+            return;
         }
+        batch.append(&mut self.events);
+        self.bytes = batch.iter().map(event_bytes).sum();
         self.events = batch;
+        self.trim();
+        self.dirty = true;
+    }
+
+    /// The batch was accepted (or refused outright): it is gone from the queue and from the
+    /// file with it.
+    pub fn settle(&mut self) {
+        self.in_flight = Vec::new();
+        self.abandon_in_flight = false;
+        self.dirty = true;
     }
 
     pub fn clear(&mut self) {
+        // Only a batch that is actually out is disowned: the flag has to be off again for the
+        // next one, or a later retry would be dropped for no reason.
+        self.abandon_in_flight = !self.in_flight.is_empty();
         self.events.clear();
+        self.in_flight.clear();
+        self.bytes = 0;
+        self.dirty = true;
     }
 
-    pub fn save(&self) {
+    #[cfg(test)]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// The debounced write. A clean queue is already on disk, so this is the call every
+    /// timer, the flush beat and quit can make without costing anything.
+    pub fn save_if_dirty(&mut self) {
+        if self.dirty {
+            self.save();
+        }
+    }
+
+    pub fn save(&mut self) {
+        self.dirty = false;
         let Some(path) = self.path.as_deref() else {
             return;
         };
+        // The batch in flight is written in front of the queue, where it came from, so a
+        // process that dies mid-POST retries it on the next launch.
+        let mut events = self.in_flight.clone();
+        events.extend(self.events.iter().cloned());
         if let Err(err) = write_atomic(
             path,
             &PersistedQueue {
-                events: self.events.clone(),
+                events,
                 last_snapshot_day: self.last_snapshot_day.clone(),
             },
         ) {
@@ -457,14 +553,43 @@ impl Queue {
     }
 }
 
+fn event_bytes(event: &QueuedEvent) -> usize {
+    serde_json::to_vec(event).map(|bytes| bytes.len()).unwrap_or(0)
+}
+
 fn write_atomic(path: &Path, queue: &PersistedQueue) -> std::io::Result<()> {
+    use std::io::Write;
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let serialized = serde_json::to_vec(queue)?;
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serialized)?;
+    let mut file = create_private(&tmp)?;
+    file.write_all(&serialized)?;
+    file.sync_all()?;
+    drop(file);
     fs::rename(&tmp, path)
+}
+
+/// The queue holds an install id and a week of activity, so it is the owner's to read.
+/// Windows inherits the ACL of `%LOCALAPPDATA%\codeburn-menubar`, which is already
+/// user-only; Unix has to ask for the same thing.
+#[cfg(unix)]
+fn create_private(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private(path: &Path) -> std::io::Result<fs::File> {
+    fs::File::create(path)
 }
 
 fn queue_path() -> Option<PathBuf> {
@@ -588,12 +713,23 @@ fn fill_random(bytes: &mut [u8; 16]) {
 
 #[cfg(not(target_os = "windows"))]
 fn fill_random(bytes: &mut [u8; 16]) {
-    match fs::read("/dev/urandom") {
-        Ok(from_kernel) if from_kernel.len() >= bytes.len() => {
-            bytes.copy_from_slice(&from_kernel[..bytes.len()]);
-        }
-        _ => fill_random_fallback(bytes),
+    if !fill_from_device(Path::new("/dev/urandom"), bytes) {
+        fill_random_fallback(bytes);
     }
+}
+
+/// `/dev/urandom` is a character device: it never reaches an end, so reading the whole
+/// "file" never returns. Take exactly the bytes wanted and stop.
+///
+/// Compiled on Windows as well, where nothing calls it outside the tests, so the reader the
+/// Linux build depends on is exercised by the run that happens on this machine.
+#[cfg(any(not(target_os = "windows"), test))]
+fn fill_from_device(path: &Path, bytes: &mut [u8; 16]) -> bool {
+    use std::io::Read;
+
+    std::fs::File::open(path)
+        .and_then(|mut device| device.read_exact(bytes))
+        .is_ok()
 }
 
 /// Only reached when the OS refused to hand over randomness, which it does not do in
@@ -618,6 +754,35 @@ fn fill_random_fallback(bytes: &mut [u8; 16]) {
     }
 }
 
+// Backoff ---------------------------------------------------------------------------------------
+
+/// How long to wait before the next attempt after `failures` consecutive failed sends: the
+/// flush beat, doubled per failure up to `BACKOFF_MAX`, spread by up to a quarter of itself.
+/// A dead endpoint used to be re-POSTed on a fixed five-minute beat forever, by every install
+/// at once.
+///
+/// `jitter` is a fraction in `0.0..1.0`, handed in so the schedule can be read back exactly.
+pub fn backoff_delay(failures: u32, jitter: f64) -> Duration {
+    if failures == 0 {
+        return FLUSH_INTERVAL;
+    }
+    let doubled = FLUSH_INTERVAL
+        .as_secs()
+        .saturating_mul(1u64 << failures.saturating_sub(1).min(16));
+    let base = doubled.min(BACKOFF_MAX.as_secs());
+    let spread = (base as f64 * 0.25 * jitter.clamp(0.0, 1.0)) as u64;
+    Duration::from_secs(base + spread)
+}
+
+/// A fraction in `0.0..1.0` from the clock. No cryptographic claim here: this only has to
+/// stop a fleet of trays from coming back in lockstep.
+fn jitter_fraction() -> f64 {
+    let mut bytes = [0u8; 16];
+    fill_random_fallback(&mut bytes);
+    let sample = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or_default());
+    (sample >> 11) as f64 / (1u64 << 53) as f64
+}
+
 // The client ------------------------------------------------------------------------------------
 
 pub struct Telemetry {
@@ -629,6 +794,13 @@ pub struct Telemetry {
     /// the wiring can be exercised, but nothing leaves the machine.
     may_send: bool,
     opened_at: SystemTime,
+    /// Consecutive failed sends, which is what the retry delay is computed from.
+    failures: AtomicU32,
+    /// One POST at a time. The beat and the quit flush can land together, and two takes
+    /// would put one batch out of reach of the other's restore.
+    flushing: AtomicBool,
+    /// Set while a debounced save is already on its way, so a burst of events schedules one.
+    save_scheduled: AtomicBool,
 }
 
 struct Inner {
@@ -661,7 +833,16 @@ impl Telemetry {
             may_send: !cfg!(debug_assertions)
                 || std::env::var("CODEBURN_TELEMETRY_DEV").as_deref() == Ok("1"),
             opened_at: SystemTime::now(),
+            failures: AtomicU32::new(0),
+            flushing: AtomicBool::new(false),
+            save_scheduled: AtomicBool::new(false),
         }
+    }
+
+    /// How long the flush beat waits before offering the queue again. Steady while sends are
+    /// landing, and backing off once they are not.
+    pub fn next_flush_delay(&self) -> Duration {
+        backoff_delay(self.failures.load(Ordering::Relaxed), jitter_fraction())
     }
 
     pub fn status(&self) -> TelemetryStatus {
@@ -777,7 +958,34 @@ impl Telemetry {
             day: day.to_owned(),
             props: sanitize_props(props),
         });
-        inner.queue.save();
+        drop(inner);
+        self.schedule_save();
+    }
+
+    /// A save rewrites the whole file, so an event marks the queue dirty and the write is
+    /// left to the timer below, to the flush beat or to quit. One timer at a time: a burst
+    /// of events extends nothing and costs one write.
+    fn schedule_save(&self) {
+        // Only the process-wide instance has a timer to hang this on. A `Telemetry` built
+        // for a test writes when its owner asks it to.
+        if instance().is_none() || self.save_scheduled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        tauri::async_runtime::spawn(async {
+            tokio::time::sleep(SAVE_DEBOUNCE).await;
+            if let Some(telemetry) = instance() {
+                telemetry.save_scheduled.store(false, Ordering::SeqCst);
+                telemetry.save_if_dirty();
+            }
+        });
+    }
+
+    /// Writes the queue if anything has changed since the last write. Cheap enough for the
+    /// flush beat and for quit to call unconditionally.
+    pub fn save_if_dirty(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.queue.save_if_dirty();
+        }
     }
 
     /// Session length, in whole minutes, for the last flush before the process goes.
@@ -800,6 +1008,17 @@ impl Telemetry {
         // Also where a decision made elsewhere is picked up: the desktop app can be
         // installed, or answer its consent screen, while this app is already running.
         self.reresolve();
+        // The beat and the quit flush can arrive together, and a second take would put the
+        // first batch out of reach of its own restore. One at a time.
+        if self.flushing.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        let sent = self.flush_batch(timeout).await;
+        self.flushing.store(false, Ordering::SeqCst);
+        sent
+    }
+
+    async fn flush_batch(&self, timeout: Duration) -> bool {
         let (install_id, batch) = {
             let Ok(mut inner) = self.inner.lock() else {
                 return false;
@@ -821,7 +1040,9 @@ impl Telemetry {
         };
         match outcome {
             Outcome::Sent => {
+                inner.queue.settle();
                 inner.queue.save();
+                self.failures.store(0, Ordering::Relaxed);
                 true
             }
             Outcome::Rejected => {
@@ -829,12 +1050,17 @@ impl Telemetry {
                     "codeburn: the telemetry endpoint refused a batch of {} events; dropping it",
                     batch.len()
                 );
+                inner.queue.settle();
                 inner.queue.save();
+                // The endpoint answered, so it is up: only the payload was refused, and the
+                // next batch is a different payload. Nothing to back off from.
+                self.failures.store(0, Ordering::Relaxed);
                 false
             }
             Outcome::Retry => {
                 inner.queue.restore(batch);
                 inner.queue.save();
+                self.failures.fetch_add(1, Ordering::Relaxed);
                 false
             }
         }
@@ -855,18 +1081,24 @@ enum Outcome {
     Retry,
 }
 
-async fn post(endpoint: &str, body: &Value, timeout: Duration) -> Outcome {
+/// One client for the life of the process: building one per POST threw away the connection
+/// pool and the TLS session with it, so every five-minute beat paid for a fresh handshake.
+/// The timeout is per request instead, because quit asks for a shorter one.
+static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+
+fn client() -> Option<&'static reqwest::Client> {
     // Plain HTTP is refused outright, redirect included, as everywhere else this app talks
     // to the network: see fx.rs and update.rs.
-    let client = match reqwest::Client::builder()
-        .timeout(timeout)
-        .https_only(true)
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return Outcome::Retry,
+    CLIENT
+        .get_or_init(|| reqwest::Client::builder().https_only(true).build().ok())
+        .as_ref()
+}
+
+async fn post(endpoint: &str, body: &Value, timeout: Duration) -> Outcome {
+    let Some(client) = client() else {
+        return Outcome::Retry;
     };
-    match client.post(endpoint).json(body).send().await {
+    match client.post(endpoint).timeout(timeout).json(body).send().await {
         Ok(response) => {
             let status = response.status();
             if status.is_success() {
@@ -952,15 +1184,30 @@ pub fn track(name: &str, props: Value) {
     }
 }
 
+/// Writes the queue if the debounce timer has not got to it yet. The flush beat calls this
+/// before every send, so a dirty queue reaches the disk within the beat even if the process
+/// dies before the next event.
+pub fn save_pending() {
+    if let Some(telemetry) = instance() {
+        telemetry.save_if_dirty();
+    }
+}
+
 /// The last flush, on the way out. Bounded so quitting never waits on a slow network.
+///
+/// The order matters. `app_close` is recorded, then everything on hand is written, and only
+/// then is the batch offered: a POST that is still in flight when the process goes is on
+/// disk either way, where the next launch picks it up.
 pub fn flush_on_quit() {
     let Some(telemetry) = instance() else {
         return;
     };
     telemetry.track_close();
+    telemetry.save_if_dirty();
     tauri::async_runtime::block_on(async {
         telemetry.flush(QUIT_TIMEOUT).await;
     });
+    telemetry.save_if_dirty();
 }
 
 #[cfg(test)]
@@ -979,6 +1226,11 @@ mod tests {
             .join("codeburn-telemetry-tests")
             .join(name)
     }
+
+    /// The day every queue fixture is written for, and a clock reading on that day, so the
+    /// age cutoff is measured against the fixture rather than against the machine's date.
+    const FIXTURE_DAY: &str = "2026-09-03";
+    const FIXTURE_NOW: i64 = 1_788_393_600;
 
     // Consent -----------------------------------------------------------------------------
 
@@ -1100,10 +1352,28 @@ mod tests {
     // The queue ---------------------------------------------------------------------------
 
     fn event(name: &str) -> QueuedEvent {
+        on_day(name, FIXTURE_DAY)
+    }
+
+    fn on_day(name: &str, day: &str) -> QueuedEvent {
         QueuedEvent {
             name: name.to_owned(),
-            day: "2026-09-03".into(),
+            day: day.to_owned(),
             props: Map::new(),
+        }
+    }
+
+    /// An event at the sanitizer's ceiling: a thousand leaves of sixty-four characters, which
+    /// is the largest thing `track` can put in the queue.
+    fn fat_event() -> QueuedEvent {
+        let mut props = Map::new();
+        for key in 0..MAX_LEAVES {
+            props.insert(format!("k{key:04}"), Value::String("x".repeat(MAX_STRING)));
+        }
+        QueuedEvent {
+            name: "usage_snapshot".into(),
+            day: FIXTURE_DAY.into(),
+            props,
         }
     }
 
@@ -1111,11 +1381,7 @@ mod tests {
     fn the_queue_is_capped_and_keeps_the_most_recent_events() {
         let mut queue = Queue::load(None);
         for index in 0..(MAX_QUEUE + 10) {
-            queue.push(QueuedEvent {
-                name: format!("popover_open{index}"),
-                day: "2026-09-03".into(),
-                props: Map::new(),
-            });
+            queue.push(on_day(&format!("popover_open{index}"), FIXTURE_DAY));
         }
         assert_eq!(queue.len(), MAX_QUEUE);
         assert_eq!(queue.events[0].name, "popover_open10");
@@ -1152,15 +1418,15 @@ mod tests {
     fn the_queue_survives_a_restart() {
         let path = temp_queue("queue-roundtrip.json");
         let _ = fs::remove_file(&path);
-        let mut queue = Queue::load(Some(path.clone()));
+        let mut queue = Queue::load_at(Some(path.clone()), FIXTURE_NOW);
         queue.push(event("app_open"));
-        assert!(queue.claim_snapshot_day("2026-09-03"));
+        assert!(queue.claim_snapshot_day(FIXTURE_DAY));
         queue.save();
 
-        let reloaded = Queue::load(Some(path.clone()));
+        let reloaded = Queue::load_at(Some(path.clone()), FIXTURE_NOW);
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded.events[0].name, "app_open");
-        assert_eq!(reloaded.last_snapshot_day.as_deref(), Some("2026-09-03"));
+        assert_eq!(reloaded.last_snapshot_day.as_deref(), Some(FIXTURE_DAY));
         let _ = fs::remove_file(&path);
     }
 
@@ -1169,11 +1435,7 @@ mod tests {
         let path = temp_queue("queue-oversized.json");
         let _ = fs::remove_file(&path);
         let events: Vec<QueuedEvent> = (0..(MAX_QUEUE + 5))
-            .map(|index| QueuedEvent {
-                name: format!("popover_open{index}"),
-                day: "2026-09-03".into(),
-                props: Map::new(),
-            })
+            .map(|index| on_day(&format!("popover_open{index}"), FIXTURE_DAY))
             .collect();
         write_atomic(
             &path,
@@ -1184,9 +1446,167 @@ mod tests {
         )
         .unwrap();
 
-        let queue = Queue::load(Some(path.clone()));
+        let queue = Queue::load_at(Some(path.clone()), FIXTURE_NOW);
         assert_eq!(queue.len(), MAX_QUEUE);
         assert_eq!(queue.events[0].name, "popover_open5");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_queue_is_bounded_by_bytes_as_well_as_by_count() {
+        let fat = fat_event();
+        let each = event_bytes(&fat);
+        assert!(each > 0 && each * 10 > MAX_QUEUE_BYTES, "the fixture has to reach the cap");
+
+        let mut queue = Queue::load(None);
+        for _ in 0..10 {
+            queue.push(fat.clone());
+        }
+        assert!(queue.len() < 10, "the byte cap bites long before the count cap");
+        assert!(queue.bytes <= MAX_QUEUE_BYTES);
+
+        // One event larger than the whole cap is still kept: dropping it would lose the very
+        // thing the caller just recorded, and the next push will drop it in turn.
+        let mut huge = fat_event();
+        for key in 0..40_000 {
+            huge.props
+                .insert(format!("k{key:05}"), Value::String("x".repeat(MAX_STRING)));
+        }
+        assert!(event_bytes(&huge) > MAX_QUEUE_BYTES);
+        let mut lone = Queue::load(None);
+        lone.push(huge);
+        assert_eq!(lone.len(), 1);
+        lone.push(event("app_open"));
+        assert_eq!(lone.len(), 1);
+        assert_eq!(lone.events[0].name, "app_open");
+    }
+
+    #[test]
+    fn a_file_left_over_the_byte_cap_is_trimmed_on_load() {
+        let path = temp_queue("queue-oversized-bytes.json");
+        let _ = fs::remove_file(&path);
+        write_atomic(
+            &path,
+            &PersistedQueue {
+                events: (0..10).map(|_| fat_event()).collect(),
+                last_snapshot_day: None,
+            },
+        )
+        .unwrap();
+
+        let queue = Queue::load_at(Some(path.clone()), FIXTURE_NOW);
+        assert!(queue.len() < 10);
+        assert!(queue.bytes <= MAX_QUEUE_BYTES);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn events_older_than_a_week_are_dropped_on_load() {
+        let a_week_on = FIXTURE_NOW + MAX_EVENT_AGE_DAYS * 86_400;
+        assert_eq!(day_key_utc(a_week_on), "2026-09-10");
+
+        let path = temp_queue("queue-stale.json");
+        let _ = fs::remove_file(&path);
+        write_atomic(
+            &path,
+            &PersistedQueue {
+                events: vec![
+                    on_day("app_open", "2026-08-20"),
+                    on_day("popover_open", "2026-09-02"),
+                    // The cutoff day itself is inside the week and stays.
+                    on_day("settings_open", FIXTURE_DAY),
+                    on_day("glance_open", "2026-09-10"),
+                    // Junk from a hand-edited file sorts below every real day and goes.
+                    on_day("update_click", ""),
+                ],
+                last_snapshot_day: None,
+            },
+        )
+        .unwrap();
+
+        let queue = Queue::load_at(Some(path.clone()), a_week_on);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.events[0].name, "settings_open");
+        assert_eq!(queue.events[1].name, "glance_open");
+        // Nothing has changed since the read, so a load does not schedule a write of its own.
+        assert!(!queue.is_dirty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_batch_in_flight_stays_in_the_file_until_it_lands() {
+        let path = temp_queue("queue-in-flight.json");
+        let _ = fs::remove_file(&path);
+        let mut queue = Queue::load_at(Some(path.clone()), FIXTURE_NOW);
+        queue.push(event("popover_open"));
+        queue.save();
+
+        // The beat takes the batch, and quit records app_close and writes while the POST is
+        // still out. The write used to be the whole file, batch and all, gone.
+        let batch = queue.take();
+        assert_eq!(batch.len(), 1);
+        assert!(queue.is_empty());
+        queue.push(event("app_close"));
+        queue.save();
+        let reloaded = Queue::load_at(Some(path.clone()), FIXTURE_NOW);
+        assert_eq!(reloaded.len(), 2);
+        assert_eq!(reloaded.events[0].name, "popover_open");
+        assert_eq!(reloaded.events[1].name, "app_close");
+
+        // The send lands: the batch leaves the file, what came after it stays.
+        queue.settle();
+        queue.save();
+        let after = Queue::load_at(Some(path.clone()), FIXTURE_NOW);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after.events[0].name, "app_close");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_batch_out_when_the_toggle_went_off_is_dropped_rather_than_requeued() {
+        let mut queue = Queue::load(None);
+        queue.push(event("popover_open"));
+        let batch = queue.take();
+        // The settings toggle goes off while the POST is out: the id it was recorded under is
+        // being retired, so the batch must not come back under the new one.
+        queue.clear();
+        queue.restore(batch);
+        assert!(queue.is_empty());
+        assert!(queue.in_flight.is_empty());
+
+        // The next batch is not affected by the one before it.
+        queue.push(event("app_open"));
+        let next = queue.take();
+        queue.restore(next);
+        assert_eq!(queue.len(), 1);
+
+        // Nor is a batch taken after a clear that had nothing in flight to disown.
+        queue.clear();
+        queue.push(event("popover_open"));
+        let later = queue.take();
+        queue.restore(later);
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn a_save_only_writes_when_something_changed() {
+        let path = temp_queue("queue-dirty.json");
+        let _ = fs::remove_file(&path);
+        let mut queue = Queue::load_at(Some(path.clone()), FIXTURE_NOW);
+        assert!(!queue.is_dirty());
+        queue.save_if_dirty();
+        assert!(!path.exists(), "a clean queue is already on disk");
+
+        queue.push(event("app_open"));
+        assert!(queue.is_dirty());
+        queue.save_if_dirty();
+        assert!(!queue.is_dirty());
+        assert_eq!(Queue::load_at(Some(path.clone()), FIXTURE_NOW).len(), 1);
+
+        // A second save with nothing in between must not touch the file at all.
+        fs::remove_file(&path).unwrap();
+        queue.save_if_dirty();
+        assert!(!path.exists());
         let _ = fs::remove_file(&path);
     }
 
@@ -1388,6 +1808,9 @@ mod tests {
             endpoint: TELEMETRY_ENDPOINT.to_owned(),
             may_send: false,
             opened_at: SystemTime::now(),
+            failures: AtomicU32::new(0),
+            flushing: AtomicBool::new(false),
+            save_scheduled: AtomicBool::new(false),
         }
     }
 
@@ -1474,5 +1897,109 @@ mod tests {
             telemetry.flush(Duration::from_millis(1))
         ));
         assert_eq!(telemetry.queue_len(), 1);
+    }
+
+    #[test]
+    fn a_burst_of_events_costs_one_write_rather_than_one_each() {
+        let path = temp_queue("queue-burst.json");
+        let _ = fs::remove_file(&path);
+        let telemetry = client(consented(ConsentSource::App), Some(path.clone()));
+        telemetry.track_on("popover_open", &Value::Null, FIXTURE_DAY);
+        telemetry.track_on("settings_open", &Value::Null, FIXTURE_DAY);
+        telemetry.track_on("glance_open", &Value::Null, FIXTURE_DAY);
+        assert_eq!(telemetry.queue_len(), 3);
+        // Nothing on disk yet: the write is the debounce timer's, or quit's.
+        assert!(!path.exists());
+
+        // What `flush_on_quit` does before it offers the batch, and what the timer does when
+        // the burst settles.
+        telemetry.save_if_dirty();
+        let saved = Queue::load_at(Some(path.clone()), FIXTURE_NOW);
+        assert_eq!(saved.len(), 3);
+        assert_eq!(saved.events[0].name, "popover_open");
+        assert_eq!(saved.events[2].name, "glance_open");
+        let _ = fs::remove_file(&path);
+    }
+
+    // Randomness -----------------------------------------------------------------------------
+
+    #[test]
+    fn the_device_read_takes_sixteen_bytes_and_stops() {
+        // A regular file stands in for the character device, which is what a Windows run has
+        // to use: the point of the test is that a longer source is read exactly once, up to
+        // the sixteen bytes wanted, rather than to its end.
+        let path = temp_queue("urandom-stand-in.bin");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, vec![0xABu8; 4_096]).unwrap();
+        let mut bytes = [0u8; 16];
+        assert!(fill_from_device(&path, &mut bytes));
+        assert_eq!(bytes, [0xABu8; 16]);
+
+        // A source that cannot fill the buffer, and one that is not there at all, both say so
+        // rather than leaving a half-filled id behind.
+        fs::write(&path, b"short").unwrap();
+        assert!(!fill_from_device(&path, &mut bytes));
+        fs::remove_file(&path).unwrap();
+        assert!(!fill_from_device(&path, &mut bytes));
+    }
+
+    /// The Linux and macOS path in full, `/dev/urandom` included. It has to return at all,
+    /// which is the bug this replaced, and it has to give a different answer each time.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn the_unix_fill_returns_and_varies() {
+        let mut first = [0u8; 16];
+        let mut second = [0u8; 16];
+        fill_random(&mut first);
+        fill_random(&mut second);
+        assert_ne!(first, second);
+        assert!(first.iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn the_install_id_is_a_v4_uuid() {
+        let id = new_install_id();
+        assert_eq!(id.len(), 36);
+        assert_eq!(id.as_bytes()[14], b'4');
+        assert!(matches!(id.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
+    }
+
+    // Backoff ---------------------------------------------------------------------------------
+
+    #[test]
+    fn a_failing_endpoint_is_asked_less_and_less_often() {
+        // No failure is the plain beat, and the first retry still gets it.
+        assert_eq!(backoff_delay(0, 0.0), FLUSH_INTERVAL);
+        assert_eq!(backoff_delay(1, 0.0), FLUSH_INTERVAL);
+        assert_eq!(backoff_delay(2, 0.0), FLUSH_INTERVAL * 2);
+        assert_eq!(backoff_delay(3, 0.0), FLUSH_INTERVAL * 4);
+        // Doubling stops at the ceiling rather than walking off to never.
+        assert_eq!(backoff_delay(4, 0.0), BACKOFF_MAX);
+        assert_eq!(backoff_delay(1_000, 0.0), BACKOFF_MAX);
+    }
+
+    #[test]
+    fn the_backoff_is_spread_so_a_fleet_does_not_come_back_in_lockstep() {
+        // Jitter only ever adds, and never more than a quarter of the wait.
+        assert_eq!(backoff_delay(2, 1.0), FLUSH_INTERVAL * 2 + FLUSH_INTERVAL / 2);
+        assert!(backoff_delay(3, 0.5) > backoff_delay(3, 0.0));
+        assert!(backoff_delay(3, 0.5) < backoff_delay(3, 1.0));
+        // An out-of-range fraction is clamped rather than trusted.
+        assert_eq!(backoff_delay(2, -1.0), backoff_delay(2, 0.0));
+        assert_eq!(backoff_delay(2, 9.0), backoff_delay(2, 1.0));
+        for _ in 0..64 {
+            assert!((0.0..1.0).contains(&jitter_fraction()));
+        }
+    }
+
+    #[test]
+    fn a_send_that_could_not_be_made_lengthens_the_wait_and_a_send_that_lands_resets_it() {
+        let telemetry = client(consented(ConsentSource::App), None);
+        assert_eq!(telemetry.failures.load(Ordering::Relaxed), 0);
+        telemetry.failures.store(3, Ordering::Relaxed);
+        assert!(telemetry.next_flush_delay() >= FLUSH_INTERVAL * 4);
+        telemetry.failures.store(0, Ordering::Relaxed);
+        assert!(telemetry.next_flush_delay() >= FLUSH_INTERVAL);
+        assert!(telemetry.next_flush_delay() < FLUSH_INTERVAL * 2);
     }
 }

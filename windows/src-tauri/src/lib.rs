@@ -146,7 +146,7 @@ pub fn run() {
                 glance: glance::GlanceCache::new(),
             });
 
-            #[cfg(all(debug_assertions, target_os = "windows"))]
+            #[cfg(target_os = "windows")]
             warn_if_window_station_hidden();
 
             // Consent-gated anonymous telemetry. Nothing transmits until a decision has been
@@ -155,12 +155,17 @@ pub fn run() {
             telemetry::init(app.package_info().version.to_string());
             telemetry::track("app_open", serde_json::Value::Null);
             tauri::async_runtime::spawn(async {
-                let mut beat = tokio::time::interval(telemetry::FLUSH_INTERVAL);
-                // The first tick is immediate: the queue is offered on the beat rather than
-                // at launch, so starting up never costs a request on its own.
-                beat.tick().await;
+                // The queue is offered on the beat rather than at launch, so starting up
+                // never costs a request on its own. After a failed send the wait is the
+                // backoff instead, so a dead endpoint is not hammered on a fixed beat.
                 loop {
-                    beat.tick().await;
+                    let wait = telemetry::instance()
+                        .map(|telemetry| telemetry.next_flush_delay())
+                        .unwrap_or(telemetry::FLUSH_INTERVAL);
+                    tokio::time::sleep(wait).await;
+                    // The debounced save has usually run by now; this is what covers the
+                    // case where it did not.
+                    telemetry::save_pending();
                     if let Some(telemetry) = telemetry::instance() {
                         telemetry.flush(telemetry::HTTP_TIMEOUT).await;
                     }
@@ -484,8 +489,9 @@ fn parse_click(payload: &str) -> Option<(i32, i32)> {
 /// A process started from a service session (the QEMU guest agent's guest-exec, SSH, a
 /// scheduled task) gets a window station nobody is looking at: the tray icon and every window,
 /// dock included, report success and never reach the desktop. That exact trace cost a full
-/// debugging round on the VM, so debug builds now say so on startup.
-#[cfg(all(debug_assertions, target_os = "windows"))]
+/// debugging round on the VM, and a release build launched that way is just as invisible, so
+/// the line goes to the log on every startup rather than only in a debug build.
+#[cfg(target_os = "windows")]
 fn warn_if_window_station_hidden() {
     use windows_sys::Win32::System::StationsAndDesktops::{
         GetProcessWindowStation, GetUserObjectInformationW, UOI_FLAGS, USEROBJECTFLAGS,
@@ -992,9 +998,15 @@ mod commands {
         Ok(applied)
     }
 
+    /// Opens one of the CLI's read-only reports in a console. The argv is not the page's to
+    /// choose: only the subcommands the UI has buttons for are forwarded, so a compromised
+    /// page cannot turn this into "run codeburn with whatever arguments I like".
     #[tauri::command]
     pub fn open_terminal_command(app: AppHandle, args: Vec<String>) -> Result<(), String> {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        if !crate::cli::is_allowed_subcommand(&args) {
+            return Err("unsupported command".into());
+        }
         crate::cli::spawn_in_terminal(&app, &args).map_err(|e| e.to_string())
     }
 
@@ -1414,8 +1426,12 @@ mod commands {
     /// One event from a page. The module decides whether it may be recorded at all: an
     /// unknown name, junk props or a missing consent decision are dropped there, so a page
     /// never has to know what the current decision is before it reports something.
+    ///
+    /// Async, like the three below it: a synchronous command runs on the thread that drives
+    /// the windows, and these read the settings file, the desktop app's state file and
+    /// (before the save was debounced) rewrote the queue, all while the UI waited.
     #[tauri::command]
-    pub fn telemetry_track(name: String, props: Option<Value>) {
+    pub async fn telemetry_track(name: String, props: Option<Value>) {
         crate::telemetry::track(&name, props.unwrap_or(Value::Null));
     }
 
@@ -1423,19 +1439,19 @@ mod commands {
     /// it. A `desktop` source means this app is reading the desktop app's file and the
     /// toggle is a readout rather than a control.
     #[tauri::command]
-    pub fn telemetry_status() -> Option<crate::telemetry::TelemetryStatus> {
+    pub async fn telemetry_status() -> Option<crate::telemetry::TelemetryStatus> {
         crate::telemetry::instance().map(|telemetry| telemetry.status())
     }
 
     #[tauri::command]
-    pub fn telemetry_set_enabled(enabled: bool) -> Option<crate::telemetry::TelemetryStatus> {
+    pub async fn telemetry_set_enabled(enabled: bool) -> Option<crate::telemetry::TelemetryStatus> {
         crate::telemetry::instance().map(|telemetry| telemetry.set_enabled(enabled))
     }
 
     /// The one-time consent notice's Accept or Decline. Records that the question was asked
     /// either way, which is what unlocks sending.
     #[tauri::command]
-    pub fn telemetry_consent(enabled: bool) -> Option<crate::telemetry::TelemetryStatus> {
+    pub async fn telemetry_consent(enabled: bool) -> Option<crate::telemetry::TelemetryStatus> {
         crate::telemetry::instance().map(|telemetry| telemetry.complete_consent(enabled))
     }
 }

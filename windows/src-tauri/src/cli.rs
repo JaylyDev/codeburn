@@ -846,6 +846,26 @@ pub fn reveal_in_file_manager(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// The codeburn subcommands a page is allowed to open a console for. Every one of them reads
+/// what is already on disk and prints it; none takes a destination, a path or a credential.
+const TERMINAL_SUBCOMMANDS: [&str; 7] = [
+    "report",
+    "optimize",
+    "doctor",
+    "quota",
+    "models",
+    "sessions",
+    "compare",
+];
+
+/// The argv a page hands `open_terminal_command` is a name from this list and nothing else.
+/// `is_safe_arg` only keeps shell metacharacters out; it would still forward
+/// `["sync", "--push", "https://elsewhere"]`, which is not a report anybody asked for. An
+/// option the UI needs later is added here deliberately, with its value checked.
+pub fn is_allowed_subcommand(args: &[&str]) -> bool {
+    matches!(args, [name] if TERMINAL_SUBCOMMANDS.contains(name))
+}
+
 /// Runs a codeburn subcommand in the user's terminal emulator so they can see the output.
 /// Linux: tries `x-terminal-emulator`, `gnome-terminal`, `konsole`, then falls back to a
 /// detached headless spawn. Windows: opens a console via `cmd /C start`. Never
@@ -1119,6 +1139,26 @@ mod which {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_named_read_only_subcommand_opens_a_terminal() {
+        assert!(is_allowed_subcommand(&["report"]));
+        assert!(is_allowed_subcommand(&["optimize"]));
+        assert!(is_allowed_subcommand(&["doctor"]));
+
+        // Nothing at all, and a subcommand that is not on the list.
+        assert!(!is_allowed_subcommand(&[]));
+        assert!(!is_allowed_subcommand(&["serve"]));
+        assert!(!is_allowed_subcommand(&["login"]));
+        // Matching is exact: no case folding, no path, no repeat.
+        assert!(!is_allowed_subcommand(&["Report"]));
+        assert!(!is_allowed_subcommand(&["./report"]));
+        assert!(!is_allowed_subcommand(&["report", "report"]));
+        // Arguments alongside an allowed name are what the allowlist exists to stop: each of
+        // these passes `is_safe_arg` on its own.
+        assert!(!is_allowed_subcommand(&["report", "--json"]));
+        assert!(!is_allowed_subcommand(&["sync", "--push", "https://elsewhere.example"]));
+    }
 
     /// The `;;` / trailing-`;` case: an empty PATH entry must not turn into a
     /// current-directory lookup, which is how a planted binary would win at login.
