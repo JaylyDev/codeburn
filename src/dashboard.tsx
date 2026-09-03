@@ -711,8 +711,14 @@ function DailyActivity({ projects, days = 14, pw, bw, scrollable = false, cursor
   )
 }
 
-const _home = homedir()
+// homedir() returns backslashes and an arbitrarily cased drive letter on Windows
+// while project paths arrive in either separator, so the home prefix is compared
+// against a normalized, case-folded copy there.
+const _home = homedir().replace(/\\/g, '/')
 const _homePrefix = _home.endsWith('/') ? _home : _home + '/'
+const _foldPath = (value: string): string => (process.platform === 'win32' ? value.toLowerCase() : value)
+const _homeFolded = _foldPath(_home)
+const _homePrefixFolded = _foldPath(_homePrefix)
 
 function ellipsizeEnd(value: string, width: number): string {
   if (value.length <= width) return value
@@ -723,9 +729,10 @@ function ellipsizeEnd(value: string, width: number): string {
 
 export function shortProject(absPath: string, width = Infinity): string {
   const normalized = absPath.replace(/\\/g, '/')
+  const folded = _foldPath(normalized)
   let path: string
-  if (normalized === _home) path = ''
-  else if (normalized.startsWith(_homePrefix)) path = normalized.slice(_homePrefix.length)
+  if (folded === _homeFolded) path = ''
+  else if (folded.startsWith(_homePrefixFolded)) path = normalized.slice(_homePrefix.length)
   else path = normalized
   path = path.replace(/^\/+/, '')
   path = path.replace(/^private\/tmp\/[^/]+\/[^/]+\//, '').replace(/^private\/tmp\//, '').replace(/^tmp\//, '')

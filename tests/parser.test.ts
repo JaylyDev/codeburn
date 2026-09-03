@@ -21,6 +21,7 @@ import { clearSessionCache, isSessionHydrationComplete, parseAllSessions, setPar
 import { CACHE_VERSION, clearLoadCacheMemo, computeEnvFingerprint, loadCache, PROVIDER_PARSE_VERSIONS, saveCache } from '../src/session-cache.js'
 import { cacheDirSnapshot, readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 import type { SessionSource, SessionParser, ParsedProviderCall } from '../src/providers/types.js'
+import { setHome } from './setup/home.js'
 
 // ── Synthetic provider state ───────────────────────────────────────────────
 // Module-level so the vi.mock factory closure captures them by reference and
@@ -192,7 +193,7 @@ beforeEach(async () => {
   tmpHome  = await mkdtemp(join(tmpdir(), 'cb-parser-test-home-'))
   tmpCache = await mkdtemp(join(tmpdir(), 'cb-parser-test-cache-'))
 
-  process.env['HOME']               = tmpHome
+  setHome(tmpHome)
   process.env['CODEBURN_CACHE_DIR'] = tmpCache
 
   // Reset synthetic provider state
@@ -1277,6 +1278,55 @@ function insertStoreRow(
      VALUES (?, 'claude-sonnet-4-5', ?, 0, ?, ?, ?, ?)`
   ).run(sessionId, inputTokens, cacheRead, cacheWrite, reasoning, createdAt)
   db.close()
+}
+
+/**
+ * Make the store's rows unreadable until the returned callback runs.
+ *
+ * On Windows chmod only toggles the read-only attribute, so mode 0 still
+ * reads; the equivalent there is SQLite's own exclusive lock, which the store
+ * parser classifies as the same retryable deferral shape as EACCES.
+ */
+async function blockStoreReads(dbPath: string): Promise<() => Promise<void>> {
+  if (process.platform !== 'win32') {
+    const { chmod } = await import('fs/promises')
+    await chmod(dbPath, 0o000)
+    return async () => { await chmod(dbPath, 0o644) }
+  }
+  const { DatabaseSync } = requireForTest('node:sqlite') as { DatabaseSync: new (path: string) => TestDb }
+  const holder = new DatabaseSync(dbPath)
+  holder.exec('BEGIN EXCLUSIVE')
+  return async () => {
+    holder.exec('ROLLBACK')
+    holder.close()
+  }
+}
+
+/**
+ * Make the store's own path fail to stat - present, but unreadable - until the
+ * returned callback runs.
+ *
+ * The POSIX form drops traversal on the parent directory. Windows has no
+ * equivalent, so the path becomes a self-referencing junction instead: it
+ * stats as ELOOP, which is the "not absent, not readable" shape under test.
+ */
+async function blockStoreStat(dbPath: string, storeDir: string): Promise<() => Promise<void>> {
+  const { chmod, rename, rmdir } = await import('fs/promises')
+  if (process.platform !== 'win32') {
+    await chmod(storeDir, 0o000)
+    return async () => { await chmod(storeDir, 0o755) }
+  }
+  const { execFileSync } = await import('child_process')
+  const hidden = dbPath + '.blocked'
+  const loop = dbPath + '.loop'
+  await rename(dbPath, hidden)
+  execFileSync('cmd', ['/c', 'mklink', '/J', dbPath, loop], { stdio: 'pipe' })
+  execFileSync('cmd', ['/c', 'mklink', '/J', loop, dbPath], { stdio: 'pipe' })
+  return async () => {
+    await rmdir(dbPath)
+    await rmdir(loop)
+    await rename(hidden, dbPath)
+  }
 }
 
 describe.skipIf(!isSqliteAvailable())('(i) growing session-store DB durable merge', () => {
@@ -2639,7 +2689,6 @@ describe.skipIf(!isSqliteAvailable())('(s) behavioral weight of store rows and r
 // finalize history without it. The fence must hold until the read lands.
 describe.skipIf(!isSqliteAvailable())('(t) deferred store read marks hydration incomplete', () => {
   it.skipIf(process.getuid?.() === 0)('holds the fence while the changed store is unreadable, then recovers', async () => {
-    const { chmod } = await import('fs/promises')
     const { dbPath, at, writeSession, sumUsage } = await setupCopilotStoreEnv()
     createStoreDb(dbPath)
     insertStoreRow(dbPath, 'sess-h', 12000, 10000, 1500, at(12)) // input 500
@@ -2652,7 +2701,7 @@ describe.skipIf(!isSqliteAvailable())('(t) deferred store read marks hydration i
     // The store grows, then becomes unreadable before the refresh reads it.
     clearSessionCache()
     insertStoreRow(dbPath, 'sess-h', 8000, 7000, 900, at(20))    // input 100
-    await chmod(dbPath, 0o000)
+    const unblock = await blockStoreReads(dbPath)
     try {
       const second = sumUsage(await parseAllSessions(undefined, 'copilot'))
       // Cached rows keep serving — the deferral is invisible in totals...
@@ -2660,7 +2709,7 @@ describe.skipIf(!isSqliteAvailable())('(t) deferred store read marks hydration i
       // ...but the pass must not claim full hydration: a row is missing.
       expect(isSessionHydrationComplete()).toBe(false)
     } finally {
-      await chmod(dbPath, 0o644)
+      await unblock()
     }
 
     // Readable again: the deferred row lands and the fence lifts.
@@ -2681,7 +2730,6 @@ describe.skipIf(!isSqliteAvailable())('(t) deferred store read marks hydration i
 // the daily cache refuses to finalize while the store's re-read is deferred.
 describe.skipIf(!isSqliteAvailable())('(t2) deferred store holds the daily watermark', () => {
   it.skipIf(process.getuid?.() === 0)('leaves the daily cache incomplete until the store is readable', async () => {
-    const { chmod } = await import('fs/promises')
     const { dbPath, at, writeSession } = await setupCopilotStoreEnv()
     createStoreDb(dbPath)
     insertStoreRow(dbPath, 'sess-wm', 12000, 10000, 1500, at(12))
@@ -2724,7 +2772,7 @@ describe.skipIf(!isSqliteAvailable())('(t2) deferred store holds the daily water
     // The store grows and turns unreadable before the refresh reads it.
     await seedDailyCache()
     insertStoreRow(dbPath, 'sess-wm', 8000, 7000, 900, at(20))
-    await chmod(dbPath, 0o000)
+    const unblock = await blockStoreReads(dbPath)
     let degraded: Awaited<ReturnType<typeof hydrate>>
     try {
       degraded = await hydrate()
@@ -2735,7 +2783,7 @@ describe.skipIf(!isSqliteAvailable())('(t2) deferred store holds the daily water
       expect(degraded.complete).toBe(false)
       expect(degraded.lastComputedDate).toBe(seededWatermark)
     } finally {
-      await chmod(dbPath, 0o644)
+      await unblock()
     }
 
     // Readable again — and healing must happen IN PLACE, against the same
@@ -3174,7 +3222,6 @@ describe.skipIf(!isSqliteAvailable())('(z) hydration verdict integrity', () => {
   // complete parse inherited the later parse's `true`, letting the daily
   // backfill seal history around the deferred data.
   it.skipIf(process.getuid?.() === 0)('a memo hit restores the verdict its data was parsed under', async () => {
-    const { chmod } = await import('fs/promises')
     const { dbPath, at, writeSession } = await setupCopilotStoreEnv()
     createStoreDb(dbPath)
     insertStoreRow(dbPath, 'sess-memo', 12000, 10000, 1500, at(12))
@@ -3186,7 +3233,7 @@ describe.skipIf(!isSqliteAvailable())('(z) hydration verdict integrity', () => {
     // and that verdict is memoized with the result.
     clearSessionCache()
     insertStoreRow(dbPath, 'sess-memo', 8000, 7000, 900, at(20))
-    await chmod(dbPath, 0o000)
+    const unblock = await blockStoreReads(dbPath)
     try {
       await parseAllSessions(undefined, 'copilot')
       expect(isSessionHydrationComplete()).toBe(false)
@@ -3200,7 +3247,7 @@ describe.skipIf(!isSqliteAvailable())('(z) hydration verdict integrity', () => {
       await parseAllSessions(undefined, 'copilot')
       expect(isSessionHydrationComplete()).toBe(false)
     } finally {
-      await chmod(dbPath, 0o644)
+      await unblock()
     }
   })
 
@@ -3208,7 +3255,6 @@ describe.skipIf(!isSqliteAvailable())('(z) hydration verdict integrity', () => {
   // skipped before any parser could raise the deferral shape, leaving the
   // fence open while the cached (stale) rows served.
   it.skipIf(process.getuid?.() === 0)('an unreadable fingerprint defers instead of silently skipping', async () => {
-    const { chmod } = await import('fs/promises')
     const sessionStateDir = join(tmpHome, 'session-state')
     await mkdir(sessionStateDir, { recursive: true })
     const storeDir = join(tmpHome, 'store-dir')
@@ -3234,13 +3280,13 @@ describe.skipIf(!isSqliteAvailable())('(z) hydration verdict integrity', () => {
     // and the pass must report incomplete hydration — the new row is missing.
     clearSessionCache()
     insertStoreRow(dbPath, 'sess-fp', 8000, 7000, 900, at(20))
-    await chmod(storeDir, 0o000)
+    const unblock = await blockStoreStat(dbPath, storeDir)
     try {
       const second = await parseAllSessions(undefined, 'copilot')
       expect(second.flatMap(p => p.sessions).find(s => s.sessionId === 'sess-fp')!.totalInputTokens).toBe(500)
       expect(isSessionHydrationComplete()).toBe(false)
     } finally {
-      await chmod(storeDir, 0o755)
+      await unblock()
     }
 
     clearSessionCache()
@@ -3511,7 +3557,8 @@ describe.skipIf(!isSqliteAvailable())('(sc) month-sharded cache integration for 
 
     const snapshot = await cacheDirSnapshot()
     const shardSections = snapshot.split('\n').filter(s => s.length > 0 && !s.startsWith('envelope.json:'))
-    const holding = shardSections.filter(s => s.includes(dbPath))
+    // The shards are JSON, so a Windows path appears with its separators escaped.
+    const holding = shardSections.filter(s => s.includes(JSON.stringify(dbPath).slice(1, -1)))
     expect(holding).toHaveLength(1)
     const disk = await readCacheOnDisk()
     expect(disk.providers['copilot']!.files[dbPath]!.turns.flatMap(t => t.calls)).toHaveLength(3)
@@ -3522,7 +3569,6 @@ describe.skipIf(!isSqliteAvailable())('(sc) month-sharded cache integration for 
     await mkdir(sessionStateDir, { recursive: true })
     const dbPath = join(tmpHome, 'session-store-sc4.db')
     stubCopilotEnv(sessionStateDir, dbPath)
-    const { chmod } = await import('fs/promises')
 
     const recent = new Date(Date.now() - 3600 * 1000).toISOString()
     createStoreDb(dbPath)
@@ -3532,7 +3578,7 @@ describe.skipIf(!isSqliteAvailable())('(sc) month-sharded cache integration for 
     // parse defers and memoizes an INCOMPLETE result.
     await parseAllSessions(undefined, 'copilot')
     insertStoreRow(dbPath, 'sess-vc', 100, 0, 0, recent)
-    await chmod(dbPath, 0o000)
+    const unblock = await blockStoreReads(dbPath)
     clearSessionCache()
     await parseAllSessions(undefined, 'copilot')
     expect(isSessionHydrationComplete()).toBe(false)
@@ -3541,7 +3587,7 @@ describe.skipIf(!isSqliteAvailable())('(sc) month-sharded cache integration for 
     // 'clean' validator would extend a COMPLETE memo to five minutes — but an
     // incomplete one promised a retry, so the same call must RE-PARSE, pick
     // up the deferred row, and report complete.
-    await chmod(dbPath, 0o644)
+    await unblock()
     setParseReuseValidator(() => 'clean')
     vi.useFakeTimers({ now: Date.now(), toFake: ['Date'] })
     vi.setSystemTime(Date.now() + 4 * 60 * 1000)

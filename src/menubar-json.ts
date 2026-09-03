@@ -92,6 +92,7 @@ import { getShortModelName } from './models.js'
 import type { ReworkedFile } from './workflow-insights.js'
 import type { PrRow, BranchRow } from './sessions-report.js'
 import type { LiveSessionsBlock } from './live-sessions.js'
+import { buildTelemetrySnapshot, type TelemetrySnapshot, type TelemetrySnapshotInput } from './telemetry-snapshot.js'
 
 const TOP_ACTIVITIES_LIMIT = 20
 const TOP_MODELS_LIMIT = 20
@@ -392,6 +393,12 @@ export type MenubarPayload = {
   currency: { code: string; symbol: string; rate: number }
   combined?: CombinedUsage
   claudeConfigs?: ClaudeConfigSelector
+  /// Anonymised, fully bucketed daily aggregate for consent-gated product
+  /// telemetry: the `usage_snapshot` event that the desktop app and the Windows
+  /// tray both send verbatim, so the two surfaces cannot drift apart. Opaque to
+  /// every other consumer. `null` when it could not be computed. See
+  /// src/telemetry-snapshot.ts for the privacy contract it holds.
+  telemetrySnapshot: TelemetrySnapshot | null
 }
 
 function oneShotRateFor(editTurns: number, oneShotTurns: number): number | null {
@@ -558,6 +565,10 @@ export type BreakdownArrays = {
   /// menubar payload defaults to an empty savings block — keeping the
   /// schema stable for consumers that don't care about local savings.
   localModelSavings?: LocalModelSavings
+  /// Inputs the telemetry snapshot needs that the payload itself does not
+  /// carry: the per-(model, task category) turn cross and session wall-clock
+  /// durations. The raw values never enter the payload, only their buckets.
+  telemetry?: TelemetrySnapshotInput
 }
 
 export function buildMenubarPayload(
@@ -618,7 +629,11 @@ export function buildMenubarPayload(
       const c = getCurrency()
       return { code: c.code, symbol: c.symbol, rate: c.rate }
     })(),
+    telemetrySnapshot: null,
   }
+  // Derived from the payload that was just assembled, so the snapshot can never
+  // report something the payload does not already say.
+  payload.telemetrySnapshot = buildTelemetrySnapshot(payload, breakdowns?.telemetry)
   if (claudeConfigs && claudeConfigs.options.length > 1) {
     payload.claudeConfigs = claudeConfigs
   }

@@ -40,6 +40,7 @@ const mocks = vi.hoisted(() => ({
   getAliases: vi.fn(),
   setCurrency: vi.fn(),
   resetCurrency: vi.fn(),
+  telemetryTrack: vi.fn<(name: string, props?: Record<string, unknown>) => Promise<boolean>>(),
 }))
 
 vi.mock('./lib/ipc', async orig => {
@@ -191,6 +192,7 @@ function installDefaultMocks() {
   mocks.getAliases.mockResolvedValue([])
   mocks.setCurrency.mockResolvedValue({ ok: true, stdout: '', stderr: '' })
   mocks.resetCurrency.mockResolvedValue({ ok: true, stdout: '', stderr: '' })
+  mocks.telemetryTrack.mockResolvedValue(true)
 }
 
 describe('App shortcuts', () => {
@@ -1115,6 +1117,53 @@ describe('currency correctness', () => {
     const todayKey = overviewMemoKey('all', 'today', null, null)
     expect(hasPolledMemo(todayKey)).toBe(false)
     expect(readOverviewHeadline(todayKey)).toBeNull()
+  })
+})
+
+describe('usage_snapshot dispatch', () => {
+  beforeEach(() => {
+    installDefaultMocks()
+    localStorage.clear()
+    localStorage.setItem('codeburn.defaultPeriod', '30days')
+  })
+
+  it('forwards the CLI-computed snapshot verbatim, with no by-model join', async () => {
+    const payload = overviewPayload()
+    // Opaque to the renderer: whatever the CLI put here is what goes out.
+    payload.telemetrySnapshot = { schema: 2, period: 'Last 30 days', costBucket: '10-50', models: [] }
+    mocks.getOverview.mockResolvedValue(payload)
+
+    render(<App />)
+
+    await waitFor(() => expect(mocks.telemetryTrack).toHaveBeenCalledWith('usage_snapshot', payload.telemetrySnapshot))
+    expect(mocks.getModels).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the renderer builder when an older CLI omits the field', async () => {
+    const payload = overviewPayload()
+    payload.current.topModels = [{ name: 'claude-opus-4-8', cost: 30, savingsUSD: 0, savingsBaselineModel: '', calls: 400 }]
+    mocks.getOverview.mockResolvedValue(payload)
+    mocks.getModels.mockResolvedValue([])
+
+    render(<App />)
+
+    await waitFor(() => expect(mocks.telemetryTrack).toHaveBeenCalledWith('usage_snapshot', expect.objectContaining({
+      period: 'Last 30 days',
+      costBucket: '10-50',
+    })))
+    expect(mocks.getModels).toHaveBeenCalled()
+  })
+
+  it('sends nothing when the snapshot field is explicitly null and the payload is empty', async () => {
+    const payload = overviewPayload()
+    payload.telemetrySnapshot = null
+    mocks.getOverview.mockResolvedValue(payload)
+    mocks.getModels.mockResolvedValue([])
+
+    render(<App />)
+
+    // A null snapshot is an older/failed CLI, not a reason to skip the event.
+    await waitFor(() => expect(mocks.telemetryTrack).toHaveBeenCalledWith('usage_snapshot', expect.objectContaining({ period: 'Last 30 days' })))
   })
 })
 

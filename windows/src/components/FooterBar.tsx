@@ -18,12 +18,11 @@ type Props = {
   trayBadge: boolean
   onToggleTrayBadge: () => void
   onOpenSettings: () => void
-  settingsOpen: boolean
 }
 
 export function FooterBar({
   currency, onCurrency, loading, onRefresh, onExport, onOpenReport, onToggleTheme, onQuit, themeLabel, footnote,
-  trayBadge, onToggleTrayBadge, onOpenSettings, settingsOpen,
+  trayBadge, onToggleTrayBadge, onOpenSettings,
 }: Props) {
   return (
     <footer className="footer">
@@ -64,7 +63,7 @@ export function FooterBar({
         label={<EllipsisIcon size={12} />}
         className="dropmenu-more"
         items={[
-          { id: 'settings', label: settingsOpen ? 'Back to overview' : 'Settings…' },
+          { id: 'settings', label: 'Settings...' },
           ...(TRAY_BADGE_SUPPORTED
             ? [{ id: 'badge', label: "Show today's cost in tray", checked: trayBadge, separatorBefore: true }]
             : []),

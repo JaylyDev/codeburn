@@ -248,7 +248,7 @@ function runCli(args: string[], home: string, extraEnv: Record<string, string>) 
       CLAUDE_CONFIG_DIR: join(home, '.claude'),
       CODEX_HOME: join(home, '.codex'),
       CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'),
-      HOME: home,
+      HOME: home, USERPROFILE: home,
       TZ: 'UTC',
       ...extraEnv,
     },

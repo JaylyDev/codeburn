@@ -3,7 +3,7 @@ import { dirname, join } from 'path'
 import { randomUUID } from 'crypto'
 import type { ActionPlan, ActionRecord, FileChange } from './types.js'
 import { appendRecord, defaultActionsDir, withLock } from './journal.js'
-import { backupDirFor, relBackupPath, revertChange, sha256File, snapshotFile } from './backup.js'
+import { backupDirFor, pathExists, relBackupPath, revertChange, sha256File, snapshotFile } from './backup.js'
 
 // The only mutation path. Order: back up every file the plan touches, apply
 // the mutations, hash the results, then journal. If a mutation or the journal
@@ -58,11 +58,16 @@ export async function runAction(plan: ActionPlan, actionsDir: string = defaultAc
           try {
             await rename(pc.path, pc.movedTo)
           } catch (err) {
-            // rename cannot replace a directory destination. It is already
-            // snapshotted (destBackup), so clear it and retry. Other codes
-            // (e.g. a missing source) rethrow before any destination damage.
-            const code = (err as NodeJS.ErrnoException).code
-            if (code !== 'ENOTEMPTY' && code !== 'EEXIST' && code !== 'EISDIR' && code !== 'ENOTDIR') throw err
+            // rename cannot replace a directory destination. POSIX reports
+            // that as ENOTEMPTY/EEXIST/EISDIR/ENOTDIR; Windows reports EPERM
+            // or EACCES. The destination is already snapshotted (destBackup),
+            // so clear it and retry. Requiring the destination to exist keeps
+            // the broader Windows codes from turning an unrelated permission
+            // failure into a delete; other codes (e.g. a missing source)
+            // rethrow before any destination damage.
+            const code = (err as NodeJS.ErrnoException).code ?? ''
+            const occupied = ['ENOTEMPTY', 'EEXIST', 'EISDIR', 'ENOTDIR', 'EPERM', 'EACCES'].includes(code)
+            if (!occupied || !(await pathExists(pc.movedTo))) throw err
             await rm(pc.movedTo, { recursive: true, force: true })
             await rename(pc.path, pc.movedTo)
           }

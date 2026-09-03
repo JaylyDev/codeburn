@@ -20,12 +20,14 @@ import { PROVIDER_NAMES, QUOTA_PROVIDERS, readDisabledProviders, writeDisabledPr
 import { REFRESH_OPTIONS, useRefreshCadence } from '../lib/refreshCadence'
 import { reportMemoKey } from '../lib/reportMemoKey'
 import { showToast } from '../lib/toast'
+import { trackEvent } from '../lib/track'
 import { ToastHost } from '../components/ToastHost'
 import { rateLimitedNote } from './Plans'
 import { SharingPane } from './SettingsSharing'
-import type { ActionResult, AliasRow, ClaudeConfigSelector, CliError, CombinedUsage, DeviceScanResult, Identity, JsonPlanSummary, MenubarPayload, Period, PlanId, PlanProvider, PriceOverrideList, PriceOverrideRow, PriceRates, ProviderName, QuotaProvider, Scope, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
+import { CapacityDockPane, MenuBarPane } from './SettingsTray'
+import type { ActionResult, AliasRow, ClaudeConfigSelector, CompanionStatus, CliError, CombinedUsage, DeviceScanResult, Identity, JsonPlanSummary, MenubarPayload, Period, PlanId, PlanProvider, PriceOverrideList, PriceOverrideRow, PriceRates, ProviderName, QuotaProvider, Scope, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
 
-export type SettingsPane = 'general' | 'providers' | 'aliases' | 'pricing' | 'plans' | 'devices' | 'export' | 'privacy' | 'sharing'
+export type SettingsPane = 'general' | 'providers' | 'aliases' | 'pricing' | 'plans' | 'devices' | 'export' | 'privacy' | 'sharing' | 'menubar' | 'dock'
 type Pane = SettingsPane
 type Theme = 'system' | 'light' | 'dark'
 
@@ -69,6 +71,27 @@ const RAIL_ITEMS: Array<{ id: Pane; label: string; icon: React.ReactNode }> = [
   { id: 'privacy', label: 'Privacy & data', icon: <path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z" /> },
 ]
 
+/// Appended to the rail only while the matching switch in the sidebar corner is on.
+const TRAY_RAIL_ITEMS: Record<'menubar' | 'dock', { id: Pane; label: string; icon: React.ReactNode }> = {
+  menubar: { id: 'menubar', label: 'Menu bar', icon: <><rect x="2" y="4" width="20" height="5" rx="1.5" /><circle cx="18" cy="6.5" r="1" /><path d="M5 14h6M5 18h10" /></> },
+  dock: { id: 'dock', label: 'Capacity Dock', icon: <><rect x="16" y="4" width="5" height="16" rx="2.5" /><circle cx="18.5" cy="9" r="1.4" /><circle cx="18.5" cy="15" r="1.4" /><path d="M3 12h8" /></> },
+}
+
+/// The sidebar's two switches decide which tray panes exist, so this reads the same status
+/// the corner does. Null until the main process answers, and on any platform without a
+/// bundled tray app it stays unsupported and neither pane appears.
+function useCompanionStatus(): CompanionStatus | null {
+  const [status, setStatus] = useState<CompanionStatus | null>(null)
+  useEffect(() => {
+    let live = true
+    void codeburn?.companionStatus?.()
+      .then(next => { if (live) setStatus(next) })
+      .catch(() => {})
+    return () => { live = false }
+  }, [])
+  return status
+}
+
 function periodLabel(period: Period): string {
   if (period === 'today') return 'today'
   if (period === 'week') return 'last 7 days'
@@ -105,6 +128,20 @@ function ConfirmButton({ label, prompt, onConfirm }: { label: string; prompt: st
 
 export function Settings({ period, refreshToken = 0, onNavigate, initialPane, claudeConfigs, claudeConfigSource = null, onConfigMutated, scope = 'local', onScopeChange }: { period: Period; refreshToken?: number; onNavigate?: (section: Section) => void; initialPane?: SettingsPane; claudeConfigs?: ClaudeConfigSelector; claudeConfigSource?: string | null; onConfigMutated?: () => void; scope?: Scope; onScopeChange?: (scope: string) => void }) {
   const [pane, setPane] = useState<Pane>(initialPane ?? 'general')
+  // The tray app's own two panes, Windows only, each shown only while its switch in the
+  // sidebar corner is on: there is nothing to configure about a tray app that is not running,
+  // and the rail is one of its windows.
+  const companion = useCompanionStatus()
+  const railItems = [
+    ...RAIL_ITEMS,
+    ...(companion?.supported && companion.menuBar ? [TRAY_RAIL_ITEMS.menubar] : []),
+    ...(companion?.supported && companion.sidebar ? [TRAY_RAIL_ITEMS.dock] : []),
+  ]
+  // A pane whose switch has just been turned off cannot stay on screen.
+  const paneExists = railItems.some(item => item.id === pane)
+  useEffect(() => {
+    if (!paneExists) setPane('general')
+  }, [paneExists])
 
   return (
     <>
@@ -112,7 +149,7 @@ export function Settings({ period, refreshToken = 0, onNavigate, initialPane, cl
       <ToastHost />
       <div className={motionClass('body set-body', 'section-fade')}>
         <nav className="set-rail" aria-label="Settings sections">
-          {RAIL_ITEMS.map(item => (
+          {railItems.map(item => (
             <button key={item.id} className={pane === item.id ? 'set-rail-item on' : 'set-rail-item'} aria-current={pane === item.id ? 'page' : undefined} onClick={() => setPane(item.id)}>
               <svg viewBox="0 0 24 24" aria-hidden="true">{item.icon}</svg>{item.label}
             </button>
@@ -128,6 +165,8 @@ export function Settings({ period, refreshToken = 0, onNavigate, initialPane, cl
           {pane === 'export' && <ExportPane period={period} refreshToken={refreshToken} />}
           {pane === 'sharing' && <SharingPane />}
           {pane === 'privacy' && <PrivacyPane />}
+          {pane === 'menubar' && <MenuBarPane />}
+          {pane === 'dock' && <CapacityDockPane refreshToken={refreshToken} />}
         </main>
       </div>
       <Hint items={[{ k: shortcutLabel('1-8'), label: 'Navigate' }, { k: shortcutLabel('R'), label: 'Refresh' }]} right="pairing uses mutual TLS · approve-style, no PIN" />
@@ -176,6 +215,7 @@ function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, 
   const chooseTheme = (next: Theme) => {
     setTheme(next)
     writeSetting('codeburn.theme', next)
+    trackEvent('settings_change', { setting: 'theme', value: next })
   }
   const finishCurrency = (result: ActionResult) => {
     showToast(result.ok ? 'Updated' : result.stderr || 'Unable to update currency', result.ok ? 'ok' : 'error')
@@ -207,10 +247,10 @@ function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, 
         <div className="about-sec">
           <div className="about-sec-h">Display</div>
           <div className="about-row"><label className="tx" htmlFor="settings-currency">Currency</label><span className="r">
-            {plans.data ? <Dropdown id="settings-currency" ariaLabel="Currency" value={plans.data.currency} options={currencies.map(code => ({ value: code, label: code }))} onChange={value => void codeburn.setCurrency(value).then(finishCurrency)} width={92} /> : plans.error ? <SettingsErrorText error={plans.error} /> : <span className="set-cap">Loading…</span>}
-            <button className="set-text-button" onClick={() => void codeburn.resetCurrency().then(finishCurrency)}>Reset to USD</button>
+            {plans.data ? <Dropdown id="settings-currency" ariaLabel="Currency" value={plans.data.currency} options={currencies.map(code => ({ value: code, label: code }))} onChange={value => { trackEvent('settings_change', { setting: 'currency', value }); void codeburn.setCurrency(value).then(finishCurrency) }} width={92} /> : plans.error ? <SettingsErrorText error={plans.error} /> : <span className="set-cap">Loading…</span>}
+            <button className="set-text-button" onClick={() => { trackEvent('settings_change', { setting: 'currency', value: 'USD' }); void codeburn.resetCurrency().then(finishCurrency) }}>Reset to USD</button>
           </span></div>
-          <div className="about-row"><label className="tx" htmlFor="settings-period">Default period<small>Applied on next launch.</small></label><span className="r"><Dropdown id="settings-period" ariaLabel="Default period" value={defaultPeriod} options={[{ value: 'today', label: 'Today' }, { value: 'week', label: '7d' }, { value: '30days', label: '30d' }, { value: 'month', label: 'Month' }, { value: 'all', label: 'All' }]} onChange={value => { setDefaultPeriod(value); writeSetting('codeburn.defaultPeriod', value) }} width={92} /></span></div>
+          <div className="about-row"><label className="tx" htmlFor="settings-period">Default period<small>Applied on next launch.</small></label><span className="r"><Dropdown id="settings-period" ariaLabel="Default period" value={defaultPeriod} options={[{ value: 'today', label: 'Today' }, { value: 'week', label: '7d' }, { value: '30days', label: '30d' }, { value: 'month', label: 'Month' }, { value: 'all', label: 'All' }]} onChange={value => { setDefaultPeriod(value); writeSetting('codeburn.defaultPeriod', value); trackEvent('settings_change', { setting: 'defaultPeriod', value }) }} width={92} /></span></div>
           <div className="about-row"><label className="tx" htmlFor="settings-scope">Scope<small>Combined aggregates usage across every paired device, like the menubar. Local shows this device only.</small></label><span className="r"><Dropdown id="settings-scope" ariaLabel="Scope" value={scope} options={[{ value: 'local', label: 'Local' }, { value: 'combined', label: 'Combined' }]} onChange={value => onScopeChange?.(value)} width={110} /></span></div>
           <div className="about-row"><label className="tx" htmlFor="settings-refresh">Refresh every<small>Runs automatically at this interval. Press {shortcutLabel('R')} to refresh sooner.</small></label><span className="r"><Dropdown id="settings-refresh" ariaLabel="Refresh every" value={cadence.value} options={REFRESH_OPTIONS.map(option => ({ value: option.value, label: option.label }))} onChange={cadence.setValue} width={124} /></span></div>
           <div className="about-row"><label className="tx" htmlFor="settings-budget">Daily budget<small>Warns at 80%, alerts at 100%.</small></label><span className="r"><Dropdown id="settings-budget" ariaLabel="Daily budget" value={budgetKind} options={[{ value: 'off', label: 'Off' }, { value: 'usd', label: 'USD amount' }, { value: 'tokens', label: 'Tokens' }]} onChange={value => { const kind = value as 'off' | 'usd' | 'tokens'; setBudgetKind(kind); persistBudget(kind, budgetInput) }} width={120} />{budgetKind !== 'off' && <input className="set-input" type="text" inputMode="decimal" aria-label="Daily budget amount" placeholder={budgetKind === 'usd' ? 'USD' : 'tokens'} value={budgetInput} onChange={event => { setBudgetInput(event.target.value); persistBudget(budgetKind, event.target.value) }} style={{ width: 90 }} />}</span></div>
@@ -391,6 +431,7 @@ function PlansPane({ period, refreshToken, onNavigate, onConfigMutated }: { peri
   }
   const add = () => {
     const preset = MANUAL_PLAN_PRESETS.find(item => item.id === presetId)!
+    trackEvent('plan_set', { provider: preset.provider, plan: preset.id })
     void codeburn.setPlan(preset.id, preset.provider).then(finish)
   }
 
@@ -441,6 +482,9 @@ function ExportPane({ period, refreshToken }: { period: Period; refreshToken: nu
     if (!destination) return
     setExporting(true)
     try {
+      // Format and provider only. The destination is a real path on this
+      // machine and never leaves it.
+      trackEvent('export', { format, provider })
       const result = await codeburn.exportData(format, provider, destination)
       showToast(result.ok ? `Exported to ${destination}` : (result.stderr || 'Export failed'), result.ok ? 'ok' : 'error')
     } finally {
@@ -496,9 +540,18 @@ function TelemetryClaim() {
   if (!status) return null
   const toggle = () => {
     if (typeof codeburn.setTelemetryEnabled !== 'function') return
-    codeburn.setTelemetryEnabled(!status.enabled).then(value => setStatus(value)).catch(() => {})
+    // Only the opt-IN is reportable: turning telemetry off mints a fresh install
+    // id and drops the queue, so an opt-out event would never be sent anyway.
+    // And it is tracked after the switch has taken, never before: telemetry that is
+    // still off drops the event on the floor, so an opt-in recorded ahead of the
+    // write was one that could never be sent.
+    const optingIn = !status.enabled
+    codeburn.setTelemetryEnabled(optingIn).then(value => {
+      setStatus(value)
+      if (optingIn && value?.enabled) trackEvent('settings_change', { setting: 'telemetry', value: true })
+    }).catch(() => {})
   }
-  return <div className="set-claim"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19v-5M9 19V9M14 19v-8M19 19V5" /></svg><div style={{ flex: 1 }}><div className="set-claim-t">Anonymous telemetry</div><div className="set-claim-d">Optional usage statistics: model mix, task success, performance and errors. Never prompts, code or anything identifying.</div></div>
+  return <div className="set-claim"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19v-5M9 19V9M14 19v-8M19 19V5" /></svg><div style={{ flex: 1 }}><div className="set-claim-t">Anonymous telemetry</div><div className="set-claim-d">Optional usage statistics: model mix, task success, performance and errors. The daily report includes the names of the models, tools, skills and MCP servers you use, alongside bucketed counts of how often each one came up. Never your prompts, your code, or your project and file names.</div></div>
     <button type="button" role="switch" aria-checked={status.enabled} aria-label="Anonymous telemetry" className={status.enabled ? 'switch on' : 'switch'} onClick={toggle}><span className="switch-knob" /></button>
   </div>
 }

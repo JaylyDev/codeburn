@@ -28,7 +28,7 @@ function runCli(args: string[], home: string, extraEnv: Record<string, string | 
       ...process.env,
       CLAUDE_CONFIG_DIR: join(home, '.claude'),
       CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'),
-      HOME: home,
+      HOME: home, USERPROFILE: home,
       TZ: 'UTC',
       ...extraEnv,
     },
@@ -124,6 +124,19 @@ describe('codeburn status --format menubar-json', () => {
 
       const history = payload['history'] as { daily: unknown[] }
       expect(Array.isArray(history.daily)).toBe(true)
+
+      // The consent-gated telemetry aggregate the desktop app and the tray both
+      // send verbatim. Bucketed and name-only, so it must never echo a cost.
+      const snapshot = payload['telemetrySnapshot'] as Record<string, unknown>
+      expect(snapshot).toBeTruthy()
+      expect(snapshot['schema']).toBe(2)
+      // The same period label the payload shows, date suffix and all: the event
+      // it rides on is already stamped with the calendar day.
+      expect(snapshot['period']).toBe(current['label'])
+      expect(snapshot['costBucket']).toBe('<1')
+      expect((snapshot['models'] as Array<{ name: string; tasks: unknown[] }>)[0]!.tasks.length).toBeGreaterThan(0)
+      expect(JSON.stringify(snapshot)).not.toContain('myapp')
+      expect(JSON.stringify(snapshot)).not.toContain(String(current['cost']))
     } finally {
       await rm(home, { recursive: true, force: true })
     }
@@ -791,7 +804,9 @@ describe('codeburn status --format menubar-json', () => {
       // paths, so it must land group/world-unreadable regardless of umask.
       const snapshotFiles = findSnapshotFiles(join(home, '.cache', 'codeburn'))
       expect(snapshotFiles).toHaveLength(1)
-      expect(statSync(snapshotFiles[0]!).mode & 0o777).toBe(0o600)
+      // Windows has no POSIX mode bits: NTFS reports 0o666 whatever mode open()
+      // was handed, so owner-only permission is only assertable on POSIX.
+      if (process.platform !== 'win32') expect(statSync(snapshotFiles[0]!).mode & 0o777).toBe(0o600)
 
       // Identical query against an unchanged corpus: served from the
       // snapshot, byte-identical to the first call.

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { classifyProcessLine, decodeAntigravityStatus, decodeAntigravitySummary, fetchAntigravityQuota } from './antigravity'
+import { classifyProcessLine, decodeAntigravityStatus, decodeAntigravitySummary, fetchAntigravityQuota, parseNetstatPorts } from './antigravity'
 
 afterEach(() => vi.restoreAllMocks())
 
@@ -86,7 +86,7 @@ describe('Antigravity local probe', () => {
     const execFile = vi.fn(async (_file: string, args: string[]) => args[0] === '-ax'
       ? { stdout: psOutput }
       : { stdout: `python 1234 user 12u IPv4 0x1 0t0 TCP 127.0.0.1:60123 (LISTEN)\n` })
-    const quota = await fetchAntigravityQuota({ execFile, request })
+    const quota = await fetchAntigravityQuota({ execFile, request, platform: "darwin" })
     expect(quota.connection).toBe('connected')
     expect(quota.primary?.percent).toBeCloseTo(0.3)
     expect(quota.primary?.label).toBe('Gemini Models · Weekly limit')
@@ -107,7 +107,7 @@ describe('Antigravity local probe', () => {
     const execFile = vi.fn(async (_file: string, args: string[]) => args[0] === '-ax'
       ? { stdout: cliLine }
       : { stdout: `agy 1237 user 5u IPv4 0x1 0t0 TCP *:60555 (LISTEN)\n` })
-    const quota = await fetchAntigravityQuota({ execFile, request })
+    const quota = await fetchAntigravityQuota({ execFile, request, platform: "darwin" })
     expect(quota.connection).toBe('connected')
     expect(quota.planLabel).toBeNull()
     expect(headers[0]).toBeUndefined()
@@ -120,7 +120,7 @@ describe('Antigravity local probe', () => {
     const execFile = vi.fn(async (_file: string, args: string[]) => args[0] === '-ax'
       ? { stdout: cliLine }
       : { stdout: `agy 1237 user 5u IPv4 0x1 0t0 TCP *:60555 (LISTEN)\n` })
-    const quota = await fetchAntigravityQuota({ execFile, request })
+    const quota = await fetchAntigravityQuota({ execFile, request, platform: "darwin" })
     expect(quota.planLabel).toBe('AI Pro')
     expect(quota.details.map(row => row.label)).toEqual(['gemini-2.5-pro'])
   })
@@ -128,7 +128,7 @@ describe('Antigravity local probe', () => {
   it('reports disconnected when nothing local is listening', async () => {
     const request = vi.fn()
     const execFile = vi.fn(async () => ({ stdout: '' }))
-    const quota = await fetchAntigravityQuota({ execFile, request })
+    const quota = await fetchAntigravityQuota({ execFile, request, platform: "darwin" })
     expect(quota.connection).toBe('disconnected')
     expect(request).not.toHaveBeenCalled()
   })
@@ -138,17 +138,73 @@ describe('Antigravity local probe', () => {
     const execFile = vi.fn(async (_file: string, args: string[]) => args[0] === '-ax'
       ? { stdout: cliLine }
       : { stdout: `agy 1237 user 5u IPv4 0x1 0t0 TCP *:60555 (LISTEN)\n` })
-    const quota = await fetchAntigravityQuota({ execFile, request })
+    const quota = await fetchAntigravityQuota({ execFile, request, platform: "darwin" })
     expect(quota.connection).toBe('disconnected')
   })
 
   it('degrades an unexpected ps failure to transientFailure with sanitized diagnostics', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
     const execFile = vi.fn(async () => { throw new Error('ps exploded Bearer sk-secret eyJabc.def\0tail') })
-    const quota = await fetchAntigravityQuota({ execFile })
+    const quota = await fetchAntigravityQuota({ execFile, platform: "darwin" })
     expect(quota.connection).toBe('transientFailure')
     const logged = warn.mock.calls.flat().join(' ')
     expect(logged).not.toMatch(/sk-secret|eyJabc|\0/)
     expect(logged).toContain('[REDACTED]')
+  })
+
+  // The desktop app's own stderr on Windows carried "ps: unknown option -- x" on every quota
+  // poll: `ps` there is not a spawn that comes back empty, it is a spawn that fails.
+  it('never asks Windows for ps or lsof', async () => {
+    const asked: string[] = []
+    const request = vi.fn(async () => { throw new Error('the test must not probe a port') })
+    const quota = await fetchAntigravityQuota({
+      platform: 'win32',
+      execFile: async (file, args) => {
+        asked.push(file)
+        expect(file).not.toMatch(/(^|[\\/])(ps|lsof)(\.exe)?$/i)
+        expect(args).not.toContain('-ax')
+        return { stdout: '' }
+      },
+      request,
+    })
+
+    expect(quota.connection).toBe('disconnected')
+    expect(asked[0]).toMatch(/powershell\.exe$/i)
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('finds a language server through the Windows process listing', async () => {
+    const line = '4321 C:\\Users\\x\\AppData\\Local\\antigravity\\language_server_windows_x64.exe'
+      + ' --app_data_dir=antigravity --csrf_token=abc --extension_server_port=51234'
+    const quota = await fetchAntigravityQuota({
+      platform: 'win32',
+      execFile: async file => /powershell\.exe$/i.test(file)
+        ? { stdout: `${line}\r\n` }
+        : { stdout: '  TCP    127.0.0.1:51234   0.0.0.0:0   LISTENING   4321\r\n' },
+      request: async (port, _tls, _path, _body, csrf) => {
+        expect(port).toBe(51234)
+        expect(csrf).toBe('abc')
+        return {
+          status: 200,
+          text: JSON.stringify({ groups: [{ displayName: 'Weekly', buckets: [{ displayName: 'Sonnet', remaining: { remainingFraction: 0.25 } }] }] }),
+        }
+      },
+    })
+
+    expect(quota.connection).toBe('connected')
+    expect(quota.primary?.label).toBe('Weekly · Sonnet')
+  })
+
+  it('reads only this pid out of a netstat listing', () => {
+    const stdout = [
+      '  Proto  Local Address          Foreign Address        State           PID',
+      '  TCP    127.0.0.1:51234        0.0.0.0:0              LISTENING       4321',
+      '  TCP    127.0.0.1:60000        0.0.0.0:0              LISTENING       9999',
+      '  TCP    [::]:51999             [::]:0                 LISTENING       4321',
+      '  UDP    127.0.0.1:5353         *:*                                    4321',
+    ].join('\r\n')
+
+    expect(parseNetstatPorts(stdout, '4321')).toEqual([51234, 51999])
+    expect(parseNetstatPorts(stdout, '1')).toEqual([])
   })
 })

@@ -147,5 +147,7 @@ describe('codeburn models --unpriced public CLI', () => {
       expect(json.status, json.stderr).toBe(0)
       expect((JSON.parse(json.stdout) as Array<{ model: string }>)[0]?.model).toBe(hostile)
     })
-  }, 15_000)
+    // Four CLI spawns in one test, and a cold tsx spawn costs several seconds,
+    // so this one needs more headroom than the 30s config default.
+  }, 60_000)
 })

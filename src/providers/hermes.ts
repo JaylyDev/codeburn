@@ -417,8 +417,15 @@ function collectTools(messages: HermesMessageRow[]): { tools: string[]; toolSequ
 function isRealWorkspace(cwd: string | null | undefined): cwd is string {
   if (!cwd?.trim()) return false
   const trimmed = cwd.trim()
+  // A state.db is only ever read from this machine's own Hermes home
+  // (`HERMES_HOME` or `~/.hermes`), so the shapes it can hold are the host's.
+  // A Windows host also takes a POSIX-rooted path, which its own tooling
+  // produces (WSL, MSYS); a POSIX host takes only a POSIX-rooted path, so a
+  // literal `C:\...` string stays the non-workspace it has always been there.
+  // Slash-UNC (//server/share) stays out: it is not a local workspace.
   const isAbsolute = process.platform === 'win32'
     ? /^[a-zA-Z]:[\\/]/.test(trimmed) || /^\\\\[^\\/]+\\/.test(trimmed)
+      || (trimmed.startsWith('/') && !trimmed.startsWith('//'))
     : trimmed.startsWith('/') && !trimmed.startsWith('//')
   if (!isAbsolute) return false
   const normalized = trimmed.replace(/\\/g, '/').replace(/\/+$/, '')

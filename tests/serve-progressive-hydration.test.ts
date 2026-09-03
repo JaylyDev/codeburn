@@ -58,7 +58,7 @@ describe('codeburn serve --stdio progressive cold start', () => {
       stdio: ['pipe', 'pipe', 'ignore'],
       env: {
         ...process.env,
-        HOME: home,
+        HOME: home, USERPROFILE: home,
         CLAUDE_CONFIG_DIR: join(home, '.claude'),
         CODEBURN_CACHE_DIR: join(home, 'cache'),
         CODEBURN_DESKTOP_SESSIONS_DIR: join(home, 'desktop-sessions'),

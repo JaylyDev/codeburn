@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtemp, mkdir, writeFile, rm, stat } from 'fs/promises'
-import { join } from 'path'
+import { basename, join } from 'path'
 import { tmpdir } from 'os'
 
 import { createCodexProvider } from '../../src/providers/codex.js'
@@ -369,7 +369,7 @@ describe('codex provider - session discovery', () => {
 
     expect(sessions).toHaveLength(badCwds.length + 1)
     for (const s of sessions) expect(typeof s.project).toBe('string')
-    const byName = new Map(sessions.map(s => [s.path.split('/').pop()!, s.project]))
+    const byName = new Map(sessions.map(s => [basename(s.path), s.project]))
     for (const [label] of badCwds) {
       expect(byName.get(`rollout-badcwd-${label}.jsonl`)).toBe('unknown')
     }

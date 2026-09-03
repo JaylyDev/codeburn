@@ -6,6 +6,7 @@ import { describe, it, expect } from 'vitest'
 
 import { clearPlan, readPlan, readPlans, saveConfig, savePlan } from '../src/config.js'
 import { getPresetPlan, isPlanId, isPlanProvider } from '../src/plans.js'
+import { setHome } from './setup/home.js'
 
 describe('plan presets', () => {
   it('resolves builtin presets', () => {
@@ -34,7 +35,7 @@ describe('plan presets', () => {
 describe('plan config persistence', () => {
   it('round-trips per-provider plans and clears one provider at a time', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'codeburn-plan-test-'))
-    process.env['HOME'] = dir
+    setHome(dir)
 
     try {
       await savePlan({
@@ -84,7 +85,7 @@ describe('plan config persistence', () => {
 
   it('reads legacy single-plan config as a provider-keyed plan map', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'codeburn-plan-test-'))
-    process.env['HOME'] = dir
+    setHome(dir)
 
     try {
       await saveConfig({
@@ -111,7 +112,7 @@ describe('plan config persistence', () => {
 
   it('drops a hand-edited all plan when provider-specific plans are present', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'codeburn-plan-test-'))
-    process.env['HOME'] = dir
+    setHome(dir)
 
     try {
       await saveConfig({
@@ -142,7 +143,7 @@ describe('plan config persistence', () => {
 
   it('does not allow an all-provider plan to overlap provider-specific plans', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'codeburn-plan-test-'))
-    process.env['HOME'] = dir
+    setHome(dir)
 
     try {
       await savePlan({

@@ -937,7 +937,7 @@ describe('models CLI breakdown flags', () => {
       const res = spawnSync(
         process.execPath,
         ['--import', 'tsx', 'src/cli.ts', 'models', '--unpriced', '--from', '2026-05-09', '--to', '2026-05-09', '--provider', 'claude', '--format', 'json'],
-        { cwd: process.cwd(), env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'), TZ: 'UTC' }, encoding: 'utf-8', timeout: 30_000 },
+        { cwd: process.cwd(), env: { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'), TZ: 'UTC' }, encoding: 'utf-8', timeout: 30_000 },
       )
 
       expect(res.status, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0)
@@ -985,7 +985,7 @@ describe('models CLI breakdown flags', () => {
       const res = spawnSync(
         process.execPath,
         ['--import', 'tsx', 'src/cli.ts', 'models', '--unpriced', '--top', '2', '--from', '2026-05-09', '--to', '2026-05-09', '--provider', 'claude', '--format', 'json'],
-        { cwd: process.cwd(), env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'), TZ: 'UTC' }, encoding: 'utf-8', timeout: 30_000 },
+        { cwd: process.cwd(), env: { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'), TZ: 'UTC' }, encoding: 'utf-8', timeout: 30_000 },
       )
 
       expect(res.status, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0)
