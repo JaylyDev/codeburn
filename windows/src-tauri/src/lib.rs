@@ -252,7 +252,6 @@ pub fn run() {
             commands::set_provider_key,
             commands::usage_refresh_plan,
             commands::check_updates,
-            commands::perform_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -1359,8 +1358,9 @@ mod commands {
         crate::refresh::plan(mode, popover_open)
     }
 
-    /// Whether there is a newer app or CLI. Without `force` a cached answer inside the
-    /// two-day interval is returned without touching the network, so every mount can ask.
+    /// Whether there is a newer app or CLI, and how the reader installs it. Without `force`
+    /// a cached answer inside the two-day interval is returned without touching the network,
+    /// so every mount can ask. Nothing here installs anything: see `update.rs`.
     #[tauri::command]
     pub async fn check_updates(
         app: AppHandle,
@@ -1369,17 +1369,6 @@ mod commands {
     ) -> Result<crate::update::UpdateStatus, String> {
         let cli = state.cli.lock().map_err(|e| e.to_string())?.clone();
         Ok(crate::update::check(&app, &cli, force).await)
-    }
-
-    /// The CLI first, then the app, each reporting its own failure. Returns the status the
-    /// sequence ended on, so the caller renders the outcome rather than guessing at it.
-    #[tauri::command]
-    pub async fn perform_update(
-        app: AppHandle,
-        state: State<'_, AppState>,
-    ) -> Result<crate::update::UpdateStatus, String> {
-        let cli = state.cli.lock().map_err(|e| e.to_string())?.clone();
-        Ok(crate::update::perform_update(&app, &cli).await)
     }
 }
 

@@ -5,12 +5,24 @@
 /// Port of the observable half of mac/.../Data/UpdateChecker.swift. The check itself lives
 /// in Rust (`src-tauri/src/update.rs`): it talks to GitHub, keeps the answer on disk and
 /// only spends a request once the two-day interval is up, so asking on every mount is free.
+///
+/// There is no install here. Outside the Microsoft Store package the app is unsigned and so
+/// is its installer, so what an available update buys the reader is a release page and a
+/// command to run, not a button that installs behind their back. The reasoning is in the
+/// Rust module's doc comment.
 
 import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { openUrl } from '@tauri-apps/plugin-opener'
 
-/// UpdateFailureStage: which half of the sequence failed, or which one is running.
-export type UpdateStage = 'check' | 'cliUpdate' | 'menubarUpdate'
+/// UpdateFailureStage, down to the one stage that still runs: the check.
+export type UpdateStage = 'check'
+
+/// Where an update comes from on this install. Inside the Store package the Store installs
+/// it and nothing is offered here; everywhere else the reader installs it by hand.
+export type InstallRoute = 'store' | 'manual'
+
+/// The releases index, for a status that has not arrived yet.
+const RELEASES_URL = 'https://github.com/getagentseal/codeburn/releases'
 
 export type UpdateStatus = {
   currentVersion: string
@@ -22,6 +34,11 @@ export type UpdateStatus = {
   /// Too old to install the app, whether or not it is also behind the latest release.
   cliTooOld: boolean
   cliUpdateCommand: string
+  /// What the reader runs to install the newer tray app.
+  appUpdateCommand: string
+  installRoute: InstallRoute
+  /// The windows-v* release page for the version on offer, or the releases index.
+  releaseUrl: string
   checkedAt: number | null
   failureStage: UpdateStage | null
   error: string | null
@@ -33,16 +50,11 @@ export type UpdateStatus = {
 export type UpdateState = {
   status: UpdateStatus | null
   checking: boolean
-  updating: boolean
-  /// The stage the running update is on, for the label while it works.
-  stage: UpdateStage | null
 }
 
 export const EMPTY_UPDATE: UpdateState = {
   status: null,
   checking: false,
-  updating: false,
-  stage: null,
 }
 
 /// Rust decides whether a check costs a request; this only decides how often it is offered
@@ -58,7 +70,6 @@ let listeners: Listener[] = []
 let timer: number | undefined
 let inFlight: Promise<void> | null = null
 let inFlightForced = false
-let stageListener: Promise<() => void> | null = null
 
 function publish(next: Partial<UpdateState>) {
   state = { ...state, ...next }
@@ -96,25 +107,10 @@ export async function checkUpdates(force: boolean): Promise<void> {
   return inFlight
 }
 
-/// One click, both updates: Rust runs the CLI update and then the app install, and reports
-/// the status the sequence ended on.
-export async function performUpdate(): Promise<void> {
-  if (state.updating) return
-  publish({ updating: true, stage: 'cliUpdate' })
-  try {
-    const status = await invoke<UpdateStatus>('perform_update')
-    publish({ status, updating: false, stage: null })
-  } catch (err) {
-    publish({
-      updating: false,
-      stage: null,
-      status: {
-        ...(state.status ?? blankStatus()),
-        failureStage: 'menubarUpdate',
-        error: err instanceof Error ? err.message : String(err),
-      },
-    })
-  }
+/// What a click on an available update does: opens the release page in the browser, where
+/// the reader downloads the installer and Windows gets its say before anything runs.
+export async function openReleasePage(status: UpdateStatus | null): Promise<void> {
+  await openUrl(status?.releaseUrl ?? RELEASES_URL)
 }
 
 function blankStatus(): UpdateStatus {
@@ -127,6 +123,9 @@ function blankStatus(): UpdateStatus {
     cliUpdateAvailable: false,
     cliTooOld: false,
     cliUpdateCommand: 'npm update -g codeburn',
+    appUpdateCommand: 'codeburn menubar --force',
+    installRoute: 'manual',
+    releaseUrl: RELEASES_URL,
     checkedAt: null,
     failureStage: null,
     error: null,
@@ -140,58 +139,52 @@ export function subscribeUpdate(listener: Listener): () => void {
   if (listeners.length === 1) {
     if (state.status === null) void checkUpdates(false)
     timer = window.setInterval(() => { void checkUpdates(false) }, ASK_INTERVAL_MS)
-    // The running stage is what turns "Updating..." into something that says which half.
-    stageListener = listen<UpdateStage>('codeburn://update-stage', event => {
-      if (state.updating) publish({ stage: event.payload })
-    })
   }
   return () => {
     listeners = listeners.filter(l => l !== listener)
-    if (listeners.length === 0) {
-      window.clearInterval(timer)
-      stageListener?.then(fn => fn())
-      stageListener = null
-    }
+    if (listeners.length === 0) window.clearInterval(timer)
   }
 }
 
-/// UpdateChecker.updateBadgeLabel.
+/// UpdateChecker.updateBadgeLabel, saying what the click will do rather than promising an
+/// install the app no longer performs.
 export function badgeLabel(state: UpdateState): string {
-  if (state.updating) return 'Updating...'
-  switch (state.status?.failureStage) {
-    case 'check': return 'Update Check Failed'
-    case 'cliUpdate': return 'CLI Update Failed'
-    case 'menubarUpdate': return 'Menubar Update Failed'
-    default: return 'Update'
-  }
+  const status = state.status
+  if (status?.failureStage === 'check') return 'Update Check Failed'
+  if (status?.updateAvailable) return 'Download from GitHub'
+  if (status?.cliUpdateAvailable) return 'CLI Update Available'
+  return 'Update'
 }
 
-const STAGE_SUMMARY: Record<UpdateStage, string> = {
-  check: 'CodeBurn could not check GitHub for updates.',
-  cliUpdate: 'CodeBurn could not update the CLI.',
-  menubarUpdate: 'CodeBurn could not update the tray app.',
-}
-
-const STAGE_RETRY: Record<UpdateStage, string> = {
-  check: 'Click to retry the update check.',
-  cliUpdate: 'Click to retry the update.',
-  menubarUpdate: 'Click to retry the update.',
-}
-
-/// UpdateChecker.updateHelpText.
+/// UpdateChecker.updateHelpText: the whole story in the tooltip, since the pill has room for
+/// three words.
 export function helpText(state: UpdateState): string {
-  const stage = state.status?.failureStage
-  const error = state.status?.error
-  if (!stage || !error) return 'Update the CLI and the tray app to the latest release'
-  return `${STAGE_SUMMARY[stage]}\n\n${error}\n\n${STAGE_RETRY[stage]}`
+  const status = state.status
+  if (status?.failureStage === 'check' && status.error) {
+    return [
+      'CodeBurn could not check GitHub for updates.',
+      status.error,
+      'Click to retry the update check.',
+    ].join('\n\n')
+  }
+  if (status?.updateAvailable) {
+    const version = status.latestVersion ? `Version ${status.latestVersion}` : 'A newer version'
+    return [
+      `${version} is on GitHub. Click to open the release page.`,
+      `These builds do not update themselves. Download the installer there, or run ${status.appUpdateCommand} in a terminal.`,
+    ].join('\n\n')
+  }
+  if (status?.cliUpdateAvailable) {
+    const version = status.latestCliVersion ?? 'A newer CLI'
+    return `CLI ${version} is available. Run ${status.cliUpdateCommand} in a terminal.`
+  }
+  return 'Check GitHub for a newer release'
 }
 
-/// What a click on the badge does, from the mac's UpdateBadge: a failed check retries the
-/// check, an offered update installs it, and anything else asks again.
-export function badgeAction(state: UpdateState): 'check' | 'update' {
-  if (state.status?.failureStage === 'check') return 'check'
-  if (state.status?.updateAvailable || state.status?.cliUpdateAvailable) return 'update'
-  return 'check'
+/// What a click on the badge does: an offered app update opens its release page, and
+/// anything else asks GitHub again.
+export function badgeAction(state: UpdateState): 'check' | 'download' {
+  return state.status?.updateAvailable ? 'download' : 'check'
 }
 
 export function badgeVisible(state: UpdateState): boolean {

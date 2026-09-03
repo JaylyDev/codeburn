@@ -1,28 +1,30 @@
-//! Is there a newer tray app, is there a newer CLI, and the one click that installs both.
+//! Is there a newer tray app, is there a newer CLI, and where the reader gets it.
 //!
 //! Port of `mac/Sources/CodeBurnMenubar/Data/UpdateChecker.swift`, with the Windows release
 //! line in place of the mac one: the app ships as an `.msi` under a `windows-v*` tag rather
-//! than a zip under `mac-v*`, and the CLI's own `codeburn menubar --force` is what installs
-//! it (`src/menubar-installer.ts`, which verifies the `.sha256` before handing the file to
-//! `msiexec /i <msi> /passive /norestart`). So this module never downloads or executes
-//! anything itself: it reads GitHub to know whether there is something newer, and asks the
-//! CLI to do the install.
+//! than a zip under `mac-v*`. The check is the same on every route. The install is not.
+//!
+//! Outside a Store package this module installs nothing and offers no button that would. The
+//! MSI is unsigned and its `.sha256` is published in the same GitHub release, so an automated
+//! install has no authenticity to check: whoever can replace the one file replaces the other
+//! with it. A manual install at least passes through SmartScreen, where the reader is told
+//! who signed the thing they are about to run, which today is nobody. So an available update
+//! is answered with a release page to open and a command to run by hand. One-click install
+//! comes back once the MSI is signed and the installer verifies that signature.
+//!
+//! Inside a Store package nothing is offered at all: the Store owns the update, and an .msi
+//! install underneath it would be undone by the next one.
 //!
 //! The check runs here rather than in the page for two reasons: the answer has to survive a
 //! popover that is closed most of the time, and the webview's CSP has no business reaching
 //! api.github.com when the fetch can be made from a place that already talks HTTPS.
 
 use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
-use tokio::time::timeout;
+use tauri::AppHandle;
 
 use crate::cli::CodeburnCli;
 
@@ -38,16 +40,28 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// not the GitHub API answering, and the body is read in chunks so an endless one is dropped
 /// rather than buffered.
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-/// The mac's updateTimeoutSeconds: an install that has not finished in two minutes is stuck,
-/// not slow. Applied per stage, so the CLI update and the app install get one each.
-const UPDATE_TIMEOUT_SECS: u64 = 120;
-const MAX_UPDATE_STDERR_BYTES: usize = 64 * 1024;
-/// The longest scrubbed subprocess output worth putting in front of a reader.
+/// The longest scrubbed message worth putting in front of a reader.
 const MAX_DISPLAYED_CHARS: usize = 1_000;
 
 /// What the reader is told to run by hand. Windows installs the CLI from npm; there is no
 /// Homebrew branch to mirror.
 pub const CLI_UPDATE_COMMAND: &str = "npm update -g codeburn";
+
+/// The manual app install. `codeburn menubar --force` is `src/menubar-installer.ts`: it
+/// resolves the release, verifies the `.sha256` and hands the file to
+/// `msiexec /i <msi> /passive /norestart`. The reader runs it; this app does not.
+pub const APP_UPDATE_COMMAND: &str = "codeburn menubar --force";
+
+/// Where "Download from GitHub" goes. The `windows-v*` tag page carries the `.msi` and its
+/// checksum; the index is the fallback for a check that never named a version.
+const RELEASES_PAGE: &str = "https://github.com/getagentseal/codeburn/releases";
+
+fn release_page(version: Option<&str>) -> String {
+    match version {
+        Some(version) => format!("{RELEASES_PAGE}/tag/windows-v{version}"),
+        None => RELEASES_PAGE.to_owned(),
+    }
+}
 
 /// The Windows MSI asset name, from `WINDOWS_RELEASE` in `src/menubar-installer.ts`. GitHub
 /// rewrites the spaces in the product name to dots when it stores the asset, so the version
@@ -57,14 +71,9 @@ const MSI_SUFFIX: &str = "_x64_en-US.msi";
 
 /// The oldest CLI whose `menubar --force` can install the Windows app at all: the Windows
 /// branch of the installer landed in 0.9.21 (commit 527e5807). An older one downloads a mac
-/// zip on a machine that cannot open it, so we refuse to run it and ask for the CLI first,
-/// exactly as the mac refuses anything below 0.9.9.
+/// zip on a machine that cannot open it, so the page asks for the CLI first, exactly as the
+/// mac refuses anything below 0.9.9.
 const MIN_CLI_VERSION_FOR_UPDATE: (u32, u32, u32) = (0, 9, 21);
-
-/// Only one update may be in flight: the badge, the CLI banner and the About pane can all
-/// start one, and two npm installs racing each other on the same global prefix is how a
-/// half-installed CLI happens.
-static UPDATING: AtomicBool = AtomicBool::new(false);
 
 // The GitHub payload ---------------------------------------------------------------------
 
@@ -171,14 +180,23 @@ pub fn is_packaged_app() -> bool {
 
 // What the page renders -------------------------------------------------------------------
 
-/// Which stage failed, so the badge can say so. The mac's UpdateFailureStage; the labels and
-/// the help text live in the page, since that is where they are read.
+/// Which stage failed, so the badge can say so. The mac's UpdateFailureStage, down to the
+/// one stage that still runs here: with no install of our own there is nothing else to fail.
+/// The labels and the help text live in the page, since that is where they are read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FailureStage {
     Check,
-    CliUpdate,
-    MenubarUpdate,
+}
+
+/// Where an update comes from on this install. The page switches its copy on it: a Store
+/// package is told nothing is needed, everywhere else is offered the release page and the
+/// command rather than a button that installs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InstallRoute {
+    Store,
+    Manual,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -193,6 +211,13 @@ pub struct UpdateStatus {
     /// Too old to install the app even though it may not be the newest release.
     pub cli_too_old: bool,
     pub cli_update_command: &'static str,
+    /// The command that installs the newer app, for the reader to run in a terminal.
+    pub app_update_command: &'static str,
+    /// How an update is installed here, and so what the surfaces offer.
+    pub install_route: InstallRoute,
+    /// The `windows-v*` release page for the version on offer, or the releases index when
+    /// the check has not named one.
+    pub release_url: String,
     /// Unix seconds of the last answer GitHub gave, cached or fresh.
     pub checked_at: Option<u64>,
     pub failure_stage: Option<FailureStage>,
@@ -213,6 +238,9 @@ impl UpdateStatus {
             cli_update_available: false,
             cli_too_old: false,
             cli_update_command: CLI_UPDATE_COMMAND,
+            app_update_command: APP_UPDATE_COMMAND,
+            install_route: InstallRoute::Manual,
+            release_url: release_page(None),
             checked_at: None,
             failure_stage: None,
             error: None,
@@ -224,11 +252,16 @@ impl UpdateStatus {
     /// offered, and the surfaces read `store_managed` rather than a silence they would
     /// otherwise show as "up to date" with a Check for Updates button beside it.
     fn store_managed(current_version: String) -> Self {
-        UpdateStatus { store_managed: true, ..UpdateStatus::new(current_version) }
+        UpdateStatus {
+            store_managed: true,
+            install_route: InstallRoute::Store,
+            ..UpdateStatus::new(current_version)
+        }
     }
 
-    /// The three derived answers, recomputed wherever a version moves: after a check, and
-    /// again after the CLI update replaces the installed one.
+    /// Everything derived from the versions: what is on offer, whether the installed CLI
+    /// can install it, and where the reader is sent to get it. Run at the end of a check,
+    /// which is the only place a version moves now.
     fn recompute(&mut self) {
         self.update_available = self
             .latest_version
@@ -242,6 +275,13 @@ impl UpdateStatus {
             _ => false,
         };
         self.cli_too_old = is_cli_too_old(self.installed_cli_version.as_deref());
+        // Only a version actually on offer gets a tag page; anything else would send the
+        // reader to a release that has nothing newer in it.
+        self.release_url = release_page(if self.update_available {
+            self.latest_version.as_deref()
+        } else {
+            None
+        });
     }
 }
 
@@ -300,8 +340,8 @@ fn is_fresh(checked_at: u64) -> bool {
 async fn fetch_releases() -> Result<Vec<GitHubRelease>> {
     let client = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
-        // Plain HTTP is refused outright, redirect included: this answer decides what the
-        // one-click update installs.
+        // Plain HTTP is refused outright, redirect included: this answer decides which
+        // release the reader is sent to.
         .https_only(true)
         .build()?;
     let mut response = client
@@ -327,8 +367,9 @@ async fn installed_cli_version(cli: &CodeburnCli) -> Option<String> {
     cli.status().await.version
 }
 
-/// The current answer. `force` skips the two-day gate; without it a cached answer inside the
-/// interval is returned untouched, which is what makes this cheap to call on every mount.
+/// The current answer, and the only thing this module does about an update. `force` skips
+/// the two-day gate; without it a cached answer inside the interval is returned untouched,
+/// which is what makes this cheap to call on every mount.
 pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateStatus {
     // Inside a package the Store is the updater. Running this one there would offer an .msi
     // install that MSIX would either refuse or quietly undo on its next update, so the check
@@ -375,192 +416,6 @@ pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateSta
         }
     }
     status.recompute();
-    status
-}
-
-// The one-click update ------------------------------------------------------------------------
-
-/// What one stage of the update did. `code` is None when the process was killed for running
-/// past the timeout.
-struct Run {
-    code: Option<i32>,
-    stderr: String,
-    spawn_error: Option<String>,
-    timed_out: bool,
-}
-
-impl Run {
-    fn succeeded(&self) -> bool {
-        self.code == Some(0) && self.spawn_error.is_none()
-    }
-
-    /// The one line the reader gets. The subprocess said whatever it said, so it is scrubbed
-    /// before it is quoted.
-    fn failure_message(&self, what: &str) -> String {
-        if let Some(err) = &self.spawn_error {
-            return format!("{what} could not be started: {err}");
-        }
-        if self.timed_out {
-            return format!("{what} did not finish within {UPDATE_TIMEOUT_SECS}s and was stopped.");
-        }
-        if !self.stderr.is_empty() {
-            return self.stderr.clone();
-        }
-        match self.code {
-            Some(code) => format!("{what} failed (exit {code})."),
-            None => format!("{what} failed."),
-        }
-    }
-}
-
-/// Spawn, cap and time-bound one update stage. stdout goes nowhere (npm and the installer
-/// narrate on it and nobody reads that), stderr is capped, and a process still alive after
-/// the timeout is killed rather than waited on forever.
-async fn run_captured(program: &str, args: &[&str]) -> Run {
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            return Run {
-                code: None,
-                stderr: String::new(),
-                spawn_error: Some(scrub(&format!("{program}: {err}"))),
-                timed_out: false,
-            }
-        }
-    };
-
-    let stderr_task = child.stderr.take().map(|mut stderr| {
-        tokio::spawn(async move {
-            let mut buf = Vec::with_capacity(4 * 1024);
-            let mut limited = (&mut stderr).take(MAX_UPDATE_STDERR_BYTES as u64);
-            limited.read_to_end(&mut buf).await.ok();
-            buf
-        })
-    });
-
-    let mut timed_out = false;
-    let status = match timeout(Duration::from_secs(UPDATE_TIMEOUT_SECS), child.wait()).await {
-        Ok(status) => status.ok(),
-        Err(_) => {
-            timed_out = true;
-            crate::log_line!(
-                "codeburn: update subprocess timed out after {UPDATE_TIMEOUT_SECS}s - terminating"
-            );
-            let _ = child.kill().await;
-            None
-        }
-    };
-
-    let stderr_bytes = match stderr_task {
-        Some(task) => task.await.unwrap_or_default(),
-        None => Vec::new(),
-    };
-    Run {
-        code: status.and_then(|status| status.code()),
-        stderr: scrub(&String::from_utf8_lossy(&stderr_bytes)),
-        spawn_error: None,
-        timed_out,
-    }
-}
-
-fn emit_stage(app: &AppHandle, stage: FailureStage) {
-    let _ = app.emit("codeburn://update-stage", stage);
-}
-
-/// One click, both updates, in the mac's order: the CLI first, so the installer that puts the
-/// app on this machine is the one that ships with the new CLI, then the app itself. Either
-/// stage stops the sequence and reports which one it was.
-pub async fn perform_update(app: &AppHandle, cli: &CodeburnCli) -> UpdateStatus {
-    let mut status = check(app, cli, false).await;
-    // Belt and braces: no surface offers this inside a package, and nothing here runs if one
-    // ever does.
-    if status.store_managed {
-        return status;
-    }
-    if UPDATING.swap(true, Ordering::SeqCst) {
-        status.failure_stage = Some(FailureStage::Check);
-        status.error = Some("An update is already running.".into());
-        return status;
-    }
-    let result = run_update(app, cli, status).await;
-    UPDATING.store(false, Ordering::SeqCst);
-    result
-}
-
-async fn run_update(app: &AppHandle, cli: &CodeburnCli, mut status: UpdateStatus) -> UpdateStatus {
-    if status.cli_update_available || status.cli_too_old {
-        emit_stage(app, FailureStage::CliUpdate);
-        let Some(npm) = crate::cli::locate_npm(cli.program()) else {
-            status.failure_stage = Some(FailureStage::CliUpdate);
-            status.error = Some(format!(
-                "Could not find npm beside {}. Run \u{201C}{CLI_UPDATE_COMMAND}\u{201D} yourself, then try again.",
-                cli.program()
-            ));
-            return status;
-        };
-        let run = run_captured(&npm, &["install", "-g", "codeburn@latest", "--force"]).await;
-        if !run.succeeded() {
-            status.failure_stage = Some(FailureStage::CliUpdate);
-            status.error = Some(run.failure_message("The CLI update"));
-            return status;
-        }
-        // A fresh handle: the update may have moved the launcher, and the version has to be
-        // re-read from whatever is installed now rather than assumed to be the latest.
-        let updated = CodeburnCli::resolve();
-        status.installed_cli_version = installed_cli_version(&updated).await;
-        status.recompute();
-        if status.cli_too_old {
-            status.failure_stage = Some(FailureStage::CliUpdate);
-            status.error = Some(format!(
-                "The CLI is still {} after the update, which cannot install the app. Run \u{201C}{CLI_UPDATE_COMMAND}\u{201D} yourself, then try again.",
-                status.installed_cli_version.as_deref().unwrap_or("unknown")
-            ));
-            return status;
-        }
-    }
-
-    if !status.update_available {
-        return status;
-    }
-
-    emit_stage(app, FailureStage::MenubarUpdate);
-    // The CLI does the whole install: it resolves the release, verifies the .sha256, runs
-    // msiexec and launches what it installed. Re-resolved for the same reason as above.
-    let installer = CodeburnCli::resolve();
-    let argv = installer.argv();
-    let args: Vec<&str> = argv[1..]
-        .iter()
-        .map(String::as_str)
-        .chain(["menubar", "--force"])
-        .collect();
-    let run = run_captured(&argv[0], &args).await;
-    if !run.succeeded() {
-        status.failure_stage = Some(FailureStage::MenubarUpdate);
-        status.error = Some(run.failure_message("The app update"));
-        return status;
-    }
-    // Installed: the version on disk is the one that was on offer, so the badge has nothing
-    // left to say until the next check.
-    status.latest_version = None;
-    status.recompute();
-    let _ = write_cache(&Cached {
-        checked_at: now_secs(),
-        latest: None,
-        latest_cli: status.latest_cli_version.clone(),
-    });
     status
 }
 
@@ -629,9 +484,9 @@ fn secret_at(text: &str, start: usize) -> Option<(&'static str, usize)> {
     None
 }
 
-/// Whatever a subprocess printed, made safe to show. npm and the installer echo their whole
-/// environment on some failures, and this app's own child processes carry provider API keys
-/// in theirs, so the four shapes the mac redacts are redacted here too before anything
+/// Whatever the failure said, made safe to show. A transport error quotes the request it
+/// failed on, and this app's own child processes carry provider API keys in their
+/// environment, so the four shapes the mac redacts are redacted here too before anything
 /// reaches a window. Same order as `sanitizeForDisplay`, longest prefix first.
 pub fn scrub(value: &str) -> String {
     let cleaned: String = value.chars().filter(|c| *c != '\0').collect();
@@ -664,6 +519,7 @@ mod tests {
     fn a_store_managed_status_offers_nothing() {
         let status = UpdateStatus::store_managed("0.9.23".into());
 
+        assert_eq!(status.install_route, InstallRoute::Store);
         assert!(status.store_managed);
         assert!(!status.update_available);
         assert!(!status.cli_update_available);
@@ -678,6 +534,64 @@ mod tests {
     #[test]
     fn an_unpackaged_process_is_not_store_managed() {
         assert!(!is_packaged_app());
+    }
+
+    /// Outside a Store package an available update is answered with a page and a command,
+    /// and nothing is installed. The second half of that is an absence, and an absence has
+    /// no seam to record a call on now that the spawns are gone, so it is read off the
+    /// module's own source: wiring an installer back in fails here first, which is where the
+    /// module doc explaining why it must not be wired back in is read.
+    #[test]
+    fn outside_a_store_package_the_route_is_manual_and_nothing_is_spawned() {
+        let mut status = UpdateStatus::new("0.9.23".into());
+        status.latest_version = Some("0.9.24".into());
+        status.installed_cli_version = Some("0.9.20".into());
+        status.latest_cli_version = Some("0.9.24".into());
+        status.recompute();
+
+        assert_eq!(status.install_route, InstallRoute::Manual);
+        assert!(!status.store_managed);
+        assert!(status.update_available);
+        assert_eq!(status.app_update_command, "codeburn menubar --force");
+        assert_eq!(status.cli_update_command, "npm update -g codeburn");
+        assert_eq!(
+            status.release_url,
+            "https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.24"
+        );
+
+        // Assembled rather than written out, so the test does not match itself in the source
+        // it is reading.
+        let source = include_str!("update.rs");
+        for needle in [
+            format!("{}::{}", "Command", "new"),
+            format!(".{}(", "spawn"),
+            format!("codeburn{}latest", "@"),
+        ] {
+            assert!(
+                !source.contains(&needle),
+                "update.rs starts an install again ({needle}); see the module doc"
+            );
+        }
+    }
+
+    /// Nothing on offer sends nobody anywhere in particular: the index, not a tag page for a
+    /// release the reader already has.
+    #[test]
+    fn the_release_page_is_the_index_until_a_newer_version_is_named() {
+        let mut status = UpdateStatus::new("0.9.23".into());
+        status.recompute();
+        assert_eq!(
+            status.release_url,
+            "https://github.com/getagentseal/codeburn/releases"
+        );
+
+        status.latest_version = Some("0.9.23".into());
+        status.recompute();
+        assert!(!status.update_available);
+        assert_eq!(
+            status.release_url,
+            "https://github.com/getagentseal/codeburn/releases"
+        );
     }
 
     fn release(tag: &str, assets: &[&str]) -> GitHubRelease {
@@ -809,32 +723,4 @@ mod tests {
         assert!(scrubbed.ends_with("..."));
     }
 
-    #[test]
-    fn a_failed_stage_says_which_one_and_why() {
-        let timed_out = Run {
-            code: None,
-            stderr: String::new(),
-            spawn_error: None,
-            timed_out: true,
-        };
-        assert!(timed_out.failure_message("The CLI update").contains("120s"));
-        let refused = Run {
-            code: Some(1),
-            stderr: "npm ERR! code EACCES".into(),
-            spawn_error: None,
-            timed_out: false,
-        };
-        assert_eq!(refused.failure_message("The CLI update"), "npm ERR! code EACCES");
-        let quiet = Run {
-            code: Some(3),
-            stderr: String::new(),
-            spawn_error: None,
-            timed_out: false,
-        };
-        assert_eq!(
-            quiet.failure_message("The app update"),
-            "The app update failed (exit 3)."
-        );
-        assert!(!quiet.succeeded());
-    }
 }

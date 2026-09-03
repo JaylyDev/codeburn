@@ -6,12 +6,13 @@ import { Group, Note, Pane, Row } from './controls'
 import { ArrowUpRight, FLAME_PATH } from '../components/Icons'
 import { relativePast } from '../lib/dates'
 import {
-  EMPTY_UPDATE, checkUpdates, performUpdate, subscribeUpdate, type UpdateState,
+  EMPTY_UPDATE, checkUpdates, openReleasePage, subscribeUpdate, type UpdateState,
 } from '../lib/update'
 
 /// The mac's AboutSettingsTab: a brand hero, the version with a Check for Updates button,
-/// the three links, and the licence line. Unlike the mac, which sends the reader back to the
-/// menu to install what the check found, the button that installs it is right here.
+/// the three links, and the licence line. What the check finds is not installed from here:
+/// outside the Microsoft Store the build is unsigned, so the reader is sent to the release
+/// page and given the command that installs it. See src-tauri/src/update.rs.
 
 const LINKS = [
   { title: 'GitHub', url: 'https://github.com/getagentseal/codeburn' },
@@ -39,8 +40,8 @@ export function AboutPane({ anchor }: Props) {
 
   const status = update.status
   const storeManaged = status?.storeManaged ?? false
-  const canInstall = (status?.updateAvailable || status?.cliUpdateAvailable) ?? false
-  const busy = update.checking || update.updating
+  const appUpdate = (status?.updateAvailable ?? false) && !storeManaged
+  const cliUpdate = (status?.cliUpdateAvailable ?? false) && !storeManaged
 
   return (
     <Pane>
@@ -68,20 +69,19 @@ export function AboutPane({ anchor }: Props) {
           hint={lastChecked(update)}
           control={storeManaged ? null : (
             <>
-              {canInstall && (
+              {appUpdate && (
                 <button
                   type="button"
                   className="btn btn-prominent"
-                  disabled={busy}
-                  onClick={() => { void performUpdate() }}
+                  onClick={() => { void openReleasePage(status) }}
                 >
-                  {update.updating ? 'Updating...' : 'Update Now'}
+                  Download from GitHub
                 </button>
               )}
               <button
                 type="button"
                 className="btn"
-                disabled={busy}
+                disabled={update.checking}
                 onClick={() => { void checkUpdates(true) }}
               >
                 {update.checking ? 'Checking...' : 'Check for Updates'}
@@ -89,6 +89,16 @@ export function AboutPane({ anchor }: Props) {
             </>
           )}
         />
+        {appUpdate && status && (
+          <CommandRow
+            label="Or install it from a terminal"
+            hint="Downloads the same release, checks it and runs the installer."
+            command={status.appUpdateCommand}
+          />
+        )}
+        {cliUpdate && status && (
+          <CommandRow label="Update the CLI" command={status.cliUpdateCommand} />
+        )}
         <Note>{resultNote(update)}</Note>
       </Group>
 
@@ -112,24 +122,50 @@ export function AboutPane({ anchor }: Props) {
   )
 }
 
+/// A command the reader runs themselves, selectable and one click from the clipboard. The
+/// same furniture the setup screen uses for the install command it cannot run either.
+function CommandRow({ label, hint, command }: { label: string; hint?: string; command: string }) {
+  const [copied, setCopied] = useState(false)
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(command)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      setCopied(false)
+    }
+  }
+  return (
+    <Row
+      stacked
+      label={label}
+      hint={hint}
+      control={(
+        <div className="setup-command">
+          <code>{command}</code>
+          <button
+            type="button"
+            className="btn"
+            aria-label={`Copy ${command} to the clipboard`}
+            onClick={copy}
+          >
+            {copied ? 'Copied' : 'Copy'}
+          </button>
+        </div>
+      )}
+    />
+  )
+}
+
 /// The three answers the mac's Check for Updates alert gives, in the pane rather than a
 /// modal: up to date, an update is available, or the check failed and why.
 function resultNote(update: UpdateState): string {
   const status = update.status
-  if (update.updating) {
-    return update.stage === 'cliUpdate'
-      ? 'Updating the codeburn CLI...'
-      : 'Installing the tray app. Windows will ask to run the installer.'
-  }
   if (!status) return update.checking ? 'Checking GitHub for a newer release...' : ''
   if (status.storeManaged) {
     return 'This copy came from the Microsoft Store, which keeps it up to date. There is nothing to check here.'
   }
-  if (status.error) {
-    return status.failureStage === 'check'
-      ? `Check failed. ${status.error}`
-      : `Update failed. ${status.error}`
-  }
+  if (status.error) return `Check failed. ${status.error}`
   const parts: string[] = []
   if (status.updateAvailable && status.latestVersion) {
     parts.push(`Version ${status.latestVersion} is available.`)
@@ -140,7 +176,14 @@ function resultNote(update: UpdateState): string {
   if (parts.length === 0) {
     return `You are on the latest version (${status.currentVersion}).`
   }
-  parts.push('Update Now installs the CLI first, then the app.')
+  if (status.updateAvailable) {
+    parts.push(
+      'These builds are unsigned and do not update themselves, so CodeBurn will not install one for you. Download it from GitHub and Windows will vet it before it runs.',
+    )
+    if (status.cliTooOld) {
+      parts.push('Update the CLI first: the installed one is too old to install this app.')
+    }
+  }
   return parts.join(' ')
 }
 
