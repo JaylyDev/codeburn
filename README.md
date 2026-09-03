@@ -828,7 +828,7 @@ The other events are name-only:
 
 **Never collected:** prompts, code, file contents, file or folder names, project names, branch names,
 working directories, session titles, PR links, API keys, exact dollar amounts, exact counts, clock
-times, IP-based location beyond the country, or anything that could identify you or your employer.
+times, or IP-based location beyond the country.
 The names of the models, tools, skills and MCP servers you use are collected, as the table above
 sets out, and a whitelist sanitizer drops anything that is not a short string, a finite number or a
 boolean before it leaves the machine.
