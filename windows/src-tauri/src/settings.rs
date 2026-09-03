@@ -69,6 +69,10 @@ static PENDING_SECTION: Mutex<Option<String>> = Mutex::new(None);
 //               or a reused one. A live holder is neither, which is the safety argument: a
 //               fresh mtime plus a live pid are never taken, and the read/modify/write it
 //               guards finishes in milliseconds, orders of magnitude inside the stale window.
+//   Takeover:   removing an abandoned lock is itself arbitrated, by an exclusive create of
+//               `<lock>.takeover`. Only its winner may unlink the lock, and only after
+//               re-checking that the lock is still abandoned, so two contenders racing the
+//               same stale lock cannot both end up holding it. See `reclaim`.
 //   Release:    close the handle and unlink the lock, unless it now carries a different pid
 //               (a successor's), which is left alone.
 //
@@ -191,6 +195,51 @@ pub(crate) mod prefs_lock {
         }
     }
 
+    fn takeover_path(lock: &Path) -> PathBuf {
+        let mut name = lock.as_os_str().to_owned();
+        name.push(".takeover");
+        PathBuf::from(name)
+    }
+
+    /// Remove an abandoned lock, but only as the one process entitled to. Two contenders that
+    /// both find the same stale lock would otherwise both unlink it: the first has already
+    /// replaced it with a lock of its own, and the second's unlink deletes that fresh one, so
+    /// both walk away holding the file. Windows usually hides this, because a lock a live
+    /// holder still has open will not unlink at all, but this crate also builds for Linux and
+    /// macOS, where the unlink always succeeds.
+    ///
+    /// So the removal is arbitrated by the same primitive the lock itself uses: an exclusive
+    /// create of `<lock>.takeover`. Its winner alone may unlink, and only after re-checking
+    /// staleness under that right, because a rival may have reclaimed already and now hold a
+    /// lock that is not abandoned and not ours to remove. The takeover file is dropped on every
+    /// path out, and never held across the wait; one left behind by a reclaimer that died is
+    /// freed by the same staleness rule as the lock.
+    ///
+    /// Returns whether the caller should retry the exclusive create at once.
+    fn reclaim(lock: &Path, stale: Duration) -> bool {
+        let takeover = takeover_path(lock);
+        match OpenOptions::new().write(true).create_new(true).open(&takeover) {
+            Ok(mut file) => {
+                let _ = file.write_all(body().as_bytes());
+                let _ = file.flush();
+                drop(file);
+                let reclaimed = abandoned(lock, stale) && fs::remove_file(lock).is_ok();
+                let _ = fs::remove_file(&takeover);
+                reclaimed
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Somebody else is reclaiming, or a dead reclaimer left this behind. The lock
+                // itself is never touched from here; the most this does is free the takeover
+                // file for a later try.
+                if abandoned(&takeover, stale) {
+                    let _ = fs::remove_file(&takeover);
+                }
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
     pub fn acquire(target: &Path) -> Result<Guard> {
         acquire_with(target, WAIT_BUDGET, POLL, STALE)
     }
@@ -218,10 +267,11 @@ pub(crate) mod prefs_lock {
                     return Ok(Guard { path, file: Some(file) });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // A successful unlink means the holder was genuinely abandoned; retry the
-                    // create at once. A failed one (a live holder still has it open on Windows,
-                    // or a contender got there first) falls through to the wait.
-                    if abandoned(&path, stale) && fs::remove_file(&path).is_ok() {
+                    // A successful reclaim means the holder was genuinely abandoned and this
+                    // process won the right to remove its lock; retry the create at once.
+                    // Anything else (a live holder, a contender already reclaiming, an unlink
+                    // that failed) falls through to the wait.
+                    if abandoned(&path, stale) && reclaim(&path, stale) {
                         continue;
                     }
                     if SystemTime::now() >= deadline {
@@ -243,11 +293,17 @@ pub(crate) mod prefs_lock {
     mod tests {
         use super::*;
 
+        /// Two tests starting in the same microsecond would otherwise share a directory, and
+        /// whichever finished first would delete the other's out from under it: SystemTime is
+        /// only microsecond-resolution on macOS, so the clock alone does not separate them.
+        static TEMP_SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
         fn temp_target() -> PathBuf {
             let dir = std::env::temp_dir().join(format!(
-                "codeburn-prefs-lock-{}-{}",
+                "codeburn-prefs-lock-{}-{}-{}",
                 std::process::id(),
-                SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+                SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos(),
+                TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             fs::create_dir_all(&dir).unwrap();
             dir.join("windows-dock.json")
@@ -302,6 +358,34 @@ pub(crate) mod prefs_lock {
                 started.elapsed().unwrap() < Duration::from_millis(400),
                 "recovery did not wait out the whole budget"
             );
+            drop(guard);
+            let _ = fs::remove_dir_all(target.parent().unwrap());
+        }
+
+        /// The takeover right, from the losing side: a lock that IS abandoned still may not be
+        /// removed while another process holds the right to reclaim it, because that process may
+        /// already have replaced it with a lock of its own.
+        #[test]
+        fn a_stale_lock_is_left_alone_while_someone_else_holds_the_takeover_right() {
+            let target = temp_target();
+            let lock = lock_path(&target);
+            fs::write(&lock, format!("{{\"pid\":{},\"at\":1}}", std::process::id())).unwrap();
+            let stale = Duration::from_millis(200);
+            sleep(Duration::from_millis(220));
+            // A takeover file with our own live pid and a fresh mtime: a reclaim in progress.
+            // The wait below is kept well inside the stale window, so it is the takeover right
+            // and not the takeover file's own age that decides this.
+            fs::write(takeover_path(&lock), format!("{{\"pid\":{},\"at\":1}}", std::process::id()))
+                .unwrap();
+
+            let blocked = acquire_with(&target, Duration::from_millis(60), Duration::from_millis(10), stale);
+            assert!(blocked.is_err(), "the stale lock is not stolen out from under the reclaimer");
+            assert!(lock.exists(), "and it is still there for the reclaimer to replace");
+
+            // Once the reclaimer is gone the same lock is taken over as it always was.
+            fs::remove_file(takeover_path(&lock)).unwrap();
+            let guard = acquire_with(&target, Duration::from_millis(500), Duration::from_millis(10), stale);
+            assert!(guard.is_ok(), "with nobody reclaiming, the abandoned lock is taken over");
             drop(guard);
             let _ = fs::remove_dir_all(target.parent().unwrap());
         }

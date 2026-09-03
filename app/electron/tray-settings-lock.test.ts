@@ -1,8 +1,9 @@
 // @vitest-environment node
 // The cross-process lock that serializes the read/modify/write of the tray app's files. These
 // are the single-process unit tests (taken and released, a stale lock taken over, a dead
-// holder's lock taken over, a live lock waited for, and the merge preserving the other side's
-// keys); the real Node-against-Rust contention test lives in windows/src-tauri/src/dock.rs.
+// holder's lock taken over, a live lock waited for, an abandoned lock left alone while someone
+// else holds the right to reclaim it, and the merge preserving the other side's keys); the real
+// Node-against-Rust contention test lives in windows/src-tauri/src/dock.rs.
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -60,6 +61,31 @@ describe('the cross-process preference lock', () => {
       .toThrow(/could not lock/)
     expect(Date.now() - started).toBeGreaterThanOrEqual(130)
     releaseTrayFileLock(dockTarget(), held)
+  })
+
+  it('leaves an abandoned lock alone while another process holds the takeover right', () => {
+    // Abandoned by the age gate, so without the takeover right any contender would remove it.
+    writeFileSync(lockPath(), JSON.stringify({ pid: process.pid, at: 1 }))
+    const old = new Date(Date.now() - 60_000)
+    utimesSync(lockPath(), old, old)
+    // A reclaim already in progress: a fresh mtime and a live pid, so the takeover file is not
+    // itself abandoned. The contender that finds it must not touch the lock, because the
+    // reclaimer may already have replaced it with a fresh lock of its own, and removing that
+    // would leave the two of them holding the file at once.
+    const takeover = `${lockPath()}.takeover`
+    writeFileSync(takeover, JSON.stringify({ pid: process.pid, at: Date.now() }))
+
+    expect(() => acquireTrayFileLock(dockTarget(), { staleMs: 30_000, waitMs: 100, pollMs: 20 }))
+      .toThrow(/could not lock/)
+    expect(existsSync(lockPath())).toBe(true)
+
+    // With nobody reclaiming, the same abandoned lock is taken over as it always was, and the
+    // takeover file is not left behind.
+    rmSync(takeover)
+    const fd = acquireTrayFileLock(dockTarget(), { staleMs: 30_000, waitMs: 500, pollMs: 20 })
+    expect(JSON.parse(readFileSync(lockPath(), 'utf8')).pid).toBe(process.pid)
+    expect(existsSync(takeover)).toBe(false)
+    releaseTrayFileLock(dockTarget(), fd)
   })
 
   it('leaves a successor lock alone on release', () => {

@@ -920,7 +920,13 @@ pub fn apply_layout(window: &tauri::WebviewWindow, request: LayoutRequest) -> Op
 /// Re-homes the rail after a drop or a menu choice and tells the page where it came from so
 /// it can glide into place.
 fn settle(app: &AppHandle, window: &tauri::WebviewWindow, placement: Placement, from_rail: Rect) {
-    let _ = save_placement(&placement);
+    if let Err(err) = save_placement(&placement) {
+        // The rail still moves: the placement below is what this run lays out from. What is
+        // lost is the next launch, which reads the file and puts the rail back where it was.
+        // Losing the cross-process lock to the desktop app is a new way for this to happen, and
+        // it happens silently, so it is worth a line in the log.
+        crate::log_line!("codeburn dock: placement not saved, the rail will revert at next launch: {err:#}");
+    }
     {
         let mut state = lock();
         state.placement = Some(placement);
@@ -2009,10 +2015,18 @@ mod tests {
     /// shared lock the two read/modify/write cycles interleave and the later rename erases the
     /// other side's key; run it with CB_TRAY_XPROC_NOLOCK=1 to see exactly that failure. It is
     /// two processes, not two threads, which is the only way to exercise the cross-process lock.
+    ///
+    /// What is asserted is monotonicity, not finality. Each side's key holds a counter that only
+    /// ever rises, and a reader thread watches the file throughout: a lost update resurrects a
+    /// stale value, so a counter falls. Comparing only the two FINAL values, as this test first
+    /// did, catches a lost update only when the last writes happen to collide, which let it pass
+    /// on a deliberately broken lock about one run in three: weak evidence for the one property
+    /// it exists to prove.
     #[test]
     fn concurrent_node_and_rust_patches_to_the_dock_file_both_survive() {
         use std::io::Read;
         use std::process::{Command, Stdio};
+        use std::sync::Arc;
         use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
@@ -2080,8 +2094,40 @@ mod tests {
         }
         fs::write(barriers.join("go"), b"").unwrap();
 
+        // The watcher: a third party that only ever reads. It has to be a separate reader,
+        // because neither writer can see its own counter rolled back. In the unlocked cycle each
+        // one carries the other side's value forward itself, so what it reads back is never
+        // older than what it last read, whatever the file did in between. A pure observer sees
+        // the file as it really is, and the property under test is exactly what it watches for:
+        // with the lock both counters only ever rise in the file, and a counter that falls is a
+        // write that was erased, wherever in the run it happened.
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (dock_file, stop) = (dock_file.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let (mut high_node, mut high_rust) = (0u64, 0u64);
+                let mut regression: Option<String> = None;
+                while !stop.load(Ordering::Relaxed) {
+                    let state = read_state_at(&dock_file);
+                    for (key, high) in [("fromNode", &mut high_node), ("fromRust", &mut high_rust)] {
+                        let Some(value) = state.get(key).and_then(serde_json::Value::as_u64) else {
+                            continue;
+                        };
+                        if value < *high {
+                            regression.get_or_insert(format!(
+                                "{key} went backwards ({} -> {value}): a write was lost",
+                                *high
+                            ));
+                        }
+                        *high = (*high).max(value);
+                    }
+                }
+                regression
+            })
+        };
+
         for i in 0..iters {
-            let value = serde_json::Value::String(format!("r{i}"));
+            let value = serde_json::Value::from(i);
             if nolock {
                 // The demonstration path: the same cycle without the lock, i.e. the bug.
                 let mut state = read_state_at(&dock_file);
@@ -2101,26 +2147,26 @@ mod tests {
 
         let status = child.wait().unwrap();
         let stderr = read_stderr(&mut child);
-        assert!(status.success(), "node worker failed: {stderr}");
-
+        stop.store(true, Ordering::Relaxed);
+        let regression = watcher.join().unwrap();
         let final_state = read_state_at(&dock_file);
-        let node_final = format!("n{}", iters - 1);
-        let rust_final = format!("r{}", iters - 1);
+        let _ = fs::remove_dir_all(&root);
+        assert!(status.success(), "node worker failed: {stderr}");
+        assert!(regression.is_none(), "{}", regression.unwrap_or_default());
         assert_eq!(
             final_state.get("other").and_then(|v| v.as_str()),
             Some("keep"),
             "the key neither side wrote survived"
         );
         assert_eq!(
-            final_state.get("fromNode").and_then(|v| v.as_str()),
-            Some(node_final.as_str()),
+            final_state.get("fromNode").and_then(serde_json::Value::as_u64),
+            Some(u64::from(iters - 1)),
             "the desktop app's final write survived the tray app's writes"
         );
         assert_eq!(
-            final_state.get("fromRust").and_then(|v| v.as_str()),
-            Some(rust_final.as_str()),
+            final_state.get("fromRust").and_then(serde_json::Value::as_u64),
+            Some(u64::from(iters - 1)),
             "the tray app's final write survived the desktop app's writes"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 }

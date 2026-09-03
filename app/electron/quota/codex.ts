@@ -264,7 +264,10 @@ function idTokenSubject(token: unknown): string | null {
  * mismatch only when it is a non-empty string on both sides and the two values
  * differ: a document that merely omits account_id, refresh_token or id_token is
  * not proof of a different login, and treating it as one would drop a rotated
- * refresh token and sign the user out. */
+ * refresh token and sign the user out. Taken to its limit that means a document
+ * carrying NONE of the three reads as the same login and is written over. That
+ * is the deliberate side to err on: the alternative discards a live credential
+ * every time the file on disk cannot identify itself. */
 function sameLogin(held: AuthDoc, latest: AuthDoc): boolean {
   const differs = (a: unknown, b: unknown): boolean =>
     typeof a === 'string' && a !== '' && typeof b === 'string' && b !== '' && a !== b

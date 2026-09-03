@@ -82,6 +82,9 @@ export function readTrayFile(file: TraySettingsFile, home = homedir()): Record<s
 //               budget runs out and then throw rather than write behind the holder.
 //   Abandoned:  its mtime is older than the stale window (a crashed holder never refreshes it),
 //               OR its recorded pid is not ours and no longer alive. A live holder is neither.
+//   Takeover:   removing an abandoned lock is itself arbitrated, by an exclusive create of
+//               `<lock>.takeover`. Only its winner may unlink the lock, and only after
+//               re-checking that the lock is still abandoned. See `reclaimAbandoned`.
 //   Release:    close the handle and unlink, unless it now carries a different pid.
 
 const LOCK_POLL_MS = 50
@@ -125,6 +128,48 @@ function lockAbandoned(lockPath: string, staleMs: number): boolean {
 }
 
 /**
+ * Remove an abandoned lock, but only as the one process entitled to. Two contenders that both
+ * find the same stale lock would otherwise both unlink it: the first has already replaced it
+ * with a lock of its own, and the second's unlink deletes that fresh one, so both walk away
+ * holding the file. Windows usually hides this, because a lock a live holder still has open
+ * will not unlink at all, but this protocol is also run on Linux and macOS, where the unlink
+ * always succeeds.
+ *
+ * So the removal is arbitrated by the same primitive the lock itself uses: an exclusive create
+ * of `<lock>.takeover`. Its winner alone may unlink, and only after re-checking staleness under
+ * that right, because a rival may have reclaimed already and now hold a lock that is not
+ * abandoned and not ours to remove. The takeover file is dropped on every path out, and never
+ * held across the wait; one left behind by a reclaimer that died is freed by the same staleness
+ * rule as the lock.
+ *
+ * Returns whether the caller should retry the exclusive create at once.
+ */
+function reclaimAbandoned(lockPath: string, staleMs: number): boolean {
+  const takeoverPath = `${lockPath}.takeover`
+  let fd: number
+  try {
+    fd = openSync(takeoverPath, 'wx', 0o600)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+    // Somebody else is reclaiming, or a dead reclaimer left this behind. The lock itself is
+    // never touched from here; the most this does is free the takeover file for a later try.
+    if (lockAbandoned(takeoverPath, staleMs)) {
+      try { unlinkSync(takeoverPath) } catch { /* already gone */ }
+    }
+    return false
+  }
+  try {
+    try { writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() })) } catch { /* advisory */ }
+    if (!lockAbandoned(lockPath, staleMs)) return false
+    try { unlinkSync(lockPath) } catch { return false }
+    return true
+  } finally {
+    try { closeSync(fd) } catch { /* already closed */ }
+    try { unlinkSync(takeoverPath) } catch { /* already gone */ }
+  }
+}
+
+/**
  * Take the cross-process lock for `target`, returning the open descriptor to release. Throws if
  * the lock stays held past the wait budget rather than writing behind the holder, so a contended
  * write is reported to the caller instead of being silently lost.
@@ -143,12 +188,10 @@ export function acquireTrayFileLock(target: string, options: TrayLockOptions = {
       fd = openSync(lockPath, 'wx', 0o600)
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
-      // A successful unlink means the holder was genuinely abandoned; retry the create at once.
-      // A failed one (a live holder still has it open on Windows, or a contender got there
-      // first) falls through to the wait.
-      if (lockAbandoned(lockPath, staleMs)) {
-        try { unlinkSync(lockPath); continue } catch { /* held or already gone; wait it out */ }
-      }
+      // A successful reclaim means the holder was genuinely abandoned and this process won the
+      // right to remove its lock; retry the create at once. Anything else (a live holder, a
+      // contender already reclaiming, an unlink that failed) falls through to the wait.
+      if (lockAbandoned(lockPath, staleMs) && reclaimAbandoned(lockPath, staleMs)) continue
       if (Date.now() >= deadline) {
         throw new Error(
           `could not lock ${basename(lockPath)} within ${waitMs}ms; another process is writing ` +
