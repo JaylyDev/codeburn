@@ -52,6 +52,27 @@ describe('provider-scoped menubar aggregation', () => {
       .toEqual(['hermes'])
   })
 
+  it('scopes the single-provider row to that provider period totals', async () => {
+    const payload = await buildMenubarPayloadForRange(getDateRange('today'), {
+      provider: 'hermes',
+      optimize: false,
+      timeline: false,
+    })
+
+    // The whole period IS this provider here, so its providerDetails row must
+    // mirror the period block rather than leave the dock glance without one.
+    expect(payload.current.providerDetails).toEqual([
+      expect.objectContaining({
+        id: 'hermes',
+        cost: payload.current.cost,
+        calls: payload.current.calls,
+        inputTokens: payload.current.inputTokens,
+        outputTokens: payload.current.outputTokens,
+        sessions: payload.current.sessions,
+      }),
+    ])
+  })
+
   it('overlays today without letting a shrunken parse rewrite settled history', () => {
     const slice = (cost: number, calls: number): ProviderDaySlice => ({ cost, calls, savingsUSD: 0, sessions: calls })
     const day = (date: string, providers: Record<string, ProviderDaySlice>): DailyEntry => ({

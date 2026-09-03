@@ -51,6 +51,13 @@ struct CapacityDockProvider: RawRepresentable, CaseIterable, Identifiable, Hasha
 
     var displayName: String { catalogEntry.displayName }
 
+    /// The CLI's provider id for this dock provider, used to find its row in the
+    /// payload's `providerDetails`. Catalog ids and CLI ids agree everywhere the
+    /// dock has no legacy bridge; where it has one the bridge is the authority,
+    /// because the dock's `kimi` entry is Kimi Code, which the CLI calls
+    /// `kimicode` (its `kimi` is a different provider).
+    var payloadProviderID: String { legacyFilter?.cliArg ?? rawValue }
+
     var iconName: String {
         switch rawValue {
         case Self.codex.rawValue, "openai", "azureopenai": "codex"

@@ -718,7 +718,7 @@ struct CapacityDockDetailView: View {
             if let sessions = store.capacityDockLiveSessions(for: provider) {
                 sessionsSection(sessions).dividerBelow()
             }
-            if let today = store.capacityDockToday {
+            if let today = store.capacityDockToday(for: provider) {
                 todaySection(today).dividerBelow()
             }
             if CapacityDockGlance.drawsWindows(quota) { windowsSection(quota) }
@@ -919,7 +919,11 @@ struct CapacityDockDetailView: View {
     }
 
     @ViewBuilder
-    private func todaySection(_ today: CurrentBlock) -> some View {
+    /// Provider scoped: the row belongs to the hovered provider, not the machine.
+    /// Its height is the same whether or not the payload carried that provider's
+    /// tokens — the column drops out of a fixed frame, so the panel's reserved
+    /// `todayHeight` keeps matching what is drawn.
+    private func todaySection(_ today: ProviderDetail) -> some View {
         let s = model.detailScale
         VStack(alignment: .leading, spacing: 0) {
             sectionCaption("Today", trailing: nil)
@@ -935,8 +939,11 @@ struct CapacityDockDetailView: View {
                 }
                 Spacer(minLength: 8)
                 VStack(alignment: .trailing, spacing: 3 * s) {
-                    tokenLine("arrow.down", Double(today.inputTokens))
-                    tokenLine("arrow.up", Double(today.outputTokens))
+                    // Absent on a CLI that predates per-provider tokens. Showing
+                    // the machine-wide pair here would be a wrong number, so the
+                    // arrows drop out instead.
+                    if let input = today.inputTokens { tokenLine("arrow.down", Double(input)) }
+                    if let output = today.outputTokens { tokenLine("arrow.up", Double(output)) }
                     Text("\(today.calls.asThousandsSeparated()) calls")
                         .font(.system(size: 10))
                         .monospacedDigit()

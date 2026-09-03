@@ -142,7 +142,7 @@ final class CapacityDockController {
         return CapacityDockMetrics.detailHeight(
             quota: store.capacityDockQuotaSummary(for: provider),
             sessionCount: store.capacityDockLiveSessions(for: provider)?.count,
-            hasToday: store.capacityDockToday != nil,
+            hasToday: store.capacityDockToday(for: provider) != nil,
             tailEdge: model.detailTailEdge,
             scale: model.detailScale
         )

@@ -2001,6 +2001,22 @@ final class AppStore {
         return todayPayload?.current
     }
 
+    /// Today's totals for ONE provider's glance card. The card is provider
+    /// scoped, so the machine-wide `capacityDockToday` block is the wrong number
+    /// in it; `providerDetails` carries the per-provider row.
+    ///
+    /// Nil when the payload has no provider breakdown at all (a CLI old enough
+    /// to omit `providerDetails`), which hides the section rather than showing a
+    /// figure that belongs to every other provider too. A provider simply absent
+    /// from a breakdown that IS present had no usage today, which is a real
+    /// zero, not missing data.
+    func capacityDockToday(for provider: CapacityDockProvider) -> ProviderDetail? {
+        guard let current = capacityDockToday, !current.providerDetails.isEmpty else { return nil }
+        let id = provider.payloadProviderID
+        return current.providerDetails.first { $0.id == id }
+            ?? ProviderDetail(id: id, label: provider.displayName, cost: 0, calls: 0, hasUsage: false)
+    }
+
     func capacityDockQuotaSummary(for provider: CapacityDockProvider) -> QuotaSummary? {
         if let filter = provider.legacyFilter {
             return quotaSummary(for: filter)
