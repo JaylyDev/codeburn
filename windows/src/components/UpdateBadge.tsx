@@ -5,6 +5,7 @@ import {
   subscribeUpdate, type UpdateState,
 } from '../lib/update'
 import { DownloadIcon, WarningIcon } from './Icons'
+import { track } from '../lib/telemetry'
 
 /// Port of UpdateBadge in mac/.../Views/MenuBarContent.swift: a small prominent pill in the
 /// header, there only when there is something to say. A failed check retries the check, an
@@ -28,7 +29,9 @@ export function UpdateBadge() {
       title={help}
       aria-label={label}
       onClick={() => {
-        if (badgeAction(update) === 'download') void openReleasePage(update.status)
+        const action = badgeAction(update)
+        track('update_click', { action })
+        if (action === 'download') void openReleasePage(update.status)
         else void checkUpdates(true)
       }}
     >

@@ -12,6 +12,7 @@ mod plan;
 mod refresh;
 mod session;
 mod settings;
+mod telemetry;
 /// The spend-in-the-tray badge is a second tray icon, which only the Tauri tray backend
 /// provides; Linux runs its own SNI tray (`tray_linux`) and has no equivalent, so the
 /// whole module is compiled out there rather than sitting unused.
@@ -148,6 +149,24 @@ pub fn run() {
             #[cfg(all(debug_assertions, target_os = "windows"))]
             warn_if_window_station_hidden();
 
+            // Consent-gated anonymous telemetry. Nothing transmits until a decision has been
+            // made, and the decision is the desktop app's whenever that app is installed.
+            // `track` is silent until this has run, so it comes before anything that reports.
+            telemetry::init(app.package_info().version.to_string());
+            telemetry::track("app_open", serde_json::Value::Null);
+            tauri::async_runtime::spawn(async {
+                let mut beat = tokio::time::interval(telemetry::FLUSH_INTERVAL);
+                // The first tick is immediate: the queue is offered on the beat rather than
+                // at launch, so starting up never costs a request on its own.
+                beat.tick().await;
+                loop {
+                    beat.tick().await;
+                    if let Some(telemetry) = telemetry::instance() {
+                        telemetry.flush(telemetry::HTTP_TIMEOUT).await;
+                    }
+                }
+            });
+
             // Session lock, display sleep and wake, which the background refresh loop reads
             // before it spends a Node process nobody could see the result of.
             session::start(app.handle());
@@ -252,6 +271,10 @@ pub fn run() {
             commands::set_provider_key,
             commands::usage_refresh_plan,
             commands::check_updates,
+            commands::telemetry_track,
+            commands::telemetry_status,
+            commands::telemetry_set_enabled,
+            commands::telemetry_consent,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -262,7 +285,12 @@ pub fn run() {
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
                 if code.is_none() {
                     api.prevent_exit();
+                    return;
                 }
+                // The exit is going ahead, so this is the last chance to record how long the
+                // session lasted and to offer the queue. Bounded, and it keeps whatever it
+                // could not send for the next launch either way.
+                telemetry::flush_on_quit();
             }
         });
 }
@@ -707,6 +735,12 @@ fn set_dock_enabled(app: &AppHandle, enabled: bool) {
     if let Some(item) = DOCK_MENU_ITEM.get() {
         let _ = item.set_checked(enabled);
     }
+    // Reported here rather than from the settings pane because this is the one funnel: the
+    // tray item, the settings toggle and the dock's own Hide item all arrive through it.
+    telemetry::track(
+        if enabled { "dock_enabled" } else { "dock_disabled" },
+        dock::telemetry_props(),
+    );
 }
 
 /// Brings every surface in line with what is on disk, for a preference this process did not
@@ -870,6 +904,12 @@ mod commands {
         let is_today = crate::glance::is_today_key(&period, &provider, &days, &scope);
         if let Some(glance) = state.glance.record(&payload, is_today) {
             let _ = app.emit("codeburn://glance", &glance);
+        }
+        // The CLI computes the daily aggregate; this app only forwards it, at most once a
+        // day, and only when the desktop app is not the one that decided (it sends its own
+        // from the same payload). An older CLI carries no such field and nothing is sent.
+        if let Some(snapshot) = crate::telemetry::snapshot_from_payload(&payload) {
+            crate::telemetry::track("usage_snapshot", snapshot.clone());
         }
         Ok(payload)
     }
@@ -1369,6 +1409,34 @@ mod commands {
     ) -> Result<crate::update::UpdateStatus, String> {
         let cli = state.cli.lock().map_err(|e| e.to_string())?.clone();
         Ok(crate::update::check(&app, &cli, force).await)
+    }
+
+    /// One event from a page. The module decides whether it may be recorded at all: an
+    /// unknown name, junk props or a missing consent decision are dropped there, so a page
+    /// never has to know what the current decision is before it reports something.
+    #[tauri::command]
+    pub fn telemetry_track(name: String, props: Option<Value>) {
+        crate::telemetry::track(&name, props.unwrap_or(Value::Null));
+    }
+
+    /// What the settings pane's toggle renders: the decision in effect and which app made
+    /// it. A `desktop` source means this app is reading the desktop app's file and the
+    /// toggle is a readout rather than a control.
+    #[tauri::command]
+    pub fn telemetry_status() -> Option<crate::telemetry::TelemetryStatus> {
+        crate::telemetry::instance().map(|telemetry| telemetry.status())
+    }
+
+    #[tauri::command]
+    pub fn telemetry_set_enabled(enabled: bool) -> Option<crate::telemetry::TelemetryStatus> {
+        crate::telemetry::instance().map(|telemetry| telemetry.set_enabled(enabled))
+    }
+
+    /// The one-time consent notice's Accept or Decline. Records that the question was asked
+    /// either way, which is what unlocks sending.
+    #[tauri::command]
+    pub fn telemetry_consent(enabled: bool) -> Option<crate::telemetry::TelemetryStatus> {
+        crate::telemetry::instance().map(|telemetry| telemetry.complete_consent(enabled))
     }
 }
 

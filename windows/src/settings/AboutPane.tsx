@@ -8,6 +8,7 @@ import { relativePast } from '../lib/dates'
 import {
   EMPTY_UPDATE, checkUpdates, openReleasePage, subscribeUpdate, type UpdateState,
 } from '../lib/update'
+import { track } from '../lib/telemetry'
 
 /// The mac's AboutSettingsTab: a brand hero, the version with a Check for Updates button,
 /// the three links, and the licence line. What the check finds is not installed from here:
@@ -73,7 +74,7 @@ export function AboutPane({ anchor }: Props) {
                 <button
                   type="button"
                   className="btn btn-prominent"
-                  onClick={() => { void openReleasePage(status) }}
+                  onClick={() => { track('update_click', { action: 'download' }); void openReleasePage(status) }}
                 >
                   Download from GitHub
                 </button>
@@ -82,7 +83,7 @@ export function AboutPane({ anchor }: Props) {
                 type="button"
                 className="btn"
                 disabled={update.checking}
-                onClick={() => { void checkUpdates(true) }}
+                onClick={() => { track('update_click', { action: 'check' }); void checkUpdates(true) }}
               >
                 {update.checking ? 'Checking...' : 'Check for Updates'}
               </button>

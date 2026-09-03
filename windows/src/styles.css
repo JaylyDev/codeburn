@@ -2234,3 +2234,44 @@ code { font-family: var(--font-mono); }
 /* The native popup is painted by the OS in its own colours, so an option that only inherits
    the select's colour is white on white in the dark theme. Both are stated here. */
 .stg-select option { background: var(--surface-window); color: var(--label); }
+
+/* ---- Anonymous telemetry consent ------------------------------------------------- */
+
+/* Shown once, in the popover and in the settings window, so it is sized from tokens
+   rather than from either surface's own spacing. */
+.consent {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 10px 12px;
+  background: var(--fill-06);
+  box-shadow: inset 0 0.5px 0 var(--fill-18);
+}
+.consent-title {
+  margin: 0;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--label);
+}
+.consent-body {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--label-2);
+}
+.consent-link {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--brand-accent);
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 500;
+  text-decoration: underline;
+}
+.consent-actions {
+  display: flex;
+  gap: 8px;
+  align-self: flex-end;
+}

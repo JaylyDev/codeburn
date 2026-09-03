@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { openUrl } from '@tauri-apps/plugin-opener'
 
 import type { CurrencyState } from '../lib/currency'
 import { CURRENCY_CODES, CURRENCY_NAMES, USD } from '../lib/currency'
@@ -17,6 +18,10 @@ import {
   writeDockPrefs, type DockPrefs,
 } from '../lib/dockPrefs'
 import { ProviderGlyph } from '../providerIcons'
+import { TelemetryNotice } from '../components/TelemetryNotice'
+import {
+  TELEMETRY_DOCS_URL, setTelemetryEnabled, telemetryStatus, type TelemetryStatus,
+} from '../lib/telemetry'
 import { Field, Group, Note, Pane, Row, Select, Slider, Switch } from './controls'
 
 /// The mac's GeneralSettingsTab. Display first, because it is what the reader came for; the
@@ -226,7 +231,71 @@ export function GeneralPane({ quota, anchor }: Props) {
           />
         )}
       </Group>
+
+      <TelemetrySection />
     </Pane>
+  )
+}
+
+/// The anonymous-telemetry decision, the counterpart of the desktop app's Privacy & data
+/// pane. Which app the decision belongs to is what decides whether this is a control or a
+/// readout: installed beside the desktop app, that app answers for both and this toggle is
+/// disabled with a line saying where to change it.
+function TelemetrySection() {
+  const [status, setStatus] = useState<TelemetryStatus | null>(null)
+
+  useEffect(() => {
+    let live = true
+    void telemetryStatus().then(next => { if (live) setStatus(next) })
+    return () => { live = false }
+  }, [])
+
+  if (!status) return null
+
+  const fromDesktop = status.source === 'desktop'
+
+  // Undecided and on its own: the question comes before the toggle, because nothing is
+  // recorded or sent until it is answered.
+  if (!status.onboarded && !fromDesktop) {
+    return (
+      <Group title="Privacy">
+        <TelemetryNotice onDecided={setStatus} />
+      </Group>
+    )
+  }
+
+  const toggle = () => {
+    void setTelemetryEnabled(!status.enabled).then(next => { if (next) setStatus(next) })
+  }
+
+  return (
+    <Group title="Privacy">
+      <Row
+        label="Anonymous telemetry"
+        hint="Which parts of the app get opened, how the Capacity Dock is used, and errors. Never your prompts, your code, project or file names, or anything that identifies you."
+        control={
+          <Switch
+            ariaLabel="Anonymous telemetry"
+            on={status.enabled}
+            disabled={fromDesktop}
+            onToggle={toggle}
+          />
+        }
+      />
+      <Note>
+        {fromDesktop ? (
+          "This is the CodeBurn desktop app's setting and it covers both apps. Change it there, under Privacy and data."
+        ) : (
+          <>
+            Switching this off gives this install a new anonymous id, so nothing recorded
+            before can be tied to anything after.{' '}
+            <button type="button" className="consent-link" onClick={() => { void openUrl(TELEMETRY_DOCS_URL) }}>
+              What data we collect
+            </button>
+          </>
+        )}
+      </Note>
+    </Group>
   )
 }
 

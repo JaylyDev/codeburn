@@ -70,6 +70,7 @@ import {
   type QuotaWindow,
   type Severity,
 } from './dockGeometry'
+import { track } from './lib/telemetry'
 import './dock.css'
 
 const PROVIDER_NAMES: Record<string, string> = {
@@ -714,6 +715,9 @@ export function Dock() {
         if (phaseRef.current === 'dismissing') setDetailPhase('shown')
         return
       }
+      // Past the guard above, so a bubble already on screen for this provider is not a
+      // second opening of it.
+      track('glance_open')
       setHovered(id)
       setDetailPhase(hoveredRef.current && phaseRef.current === 'shown' ? 'shown' : 'entering')
     },
@@ -889,6 +893,7 @@ export function Dock() {
       }),
       listen<{ from: Rect; frame: DockFrame }>('codeburn://dock-settled', (event) => {
         const { from, frame: next } = event.payload
+        track('dock_drag_end', { edge: next.edge })
         setFrame(next)
         setDrag(null)
         // Glide from centre to centre: the rail may have changed orientation on the way.
@@ -953,6 +958,7 @@ export function Dock() {
     cancel('expand')
     cancel('collapse')
     if (provider.id !== resolvedPreferredId) {
+      track('dock_provider_switch', { provider: provider.id })
       setPrefs((current) => ({ ...current, preferred: provider.id }))
       void invoke('dock_set_preferred', { id: provider.id })
       setInteraction((i) => (i.pinned ? i : { ...i, pinned: true }))

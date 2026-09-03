@@ -35,6 +35,7 @@ import { EmptyProviderState } from './components/EmptyProviderState'
 import { NoDataState } from './components/NoDataState'
 import { SetupState, type CliStatus } from './components/SetupState'
 import { StarBanner } from './components/StarBanner'
+import { TelemetryNotice } from './components/TelemetryNotice'
 import { HeroSection } from './components/HeroSection'
 import { PeriodTabs, PERIOD_LABELS, daySelectionLabel } from './components/PeriodTabs'
 import { ScopeControl, type Scope } from './components/ScopeControl'
@@ -45,6 +46,7 @@ import { FetchErrorOverlay } from './components/FetchErrorOverlay'
 import { Header } from './components/Header'
 import { CLIUpdateBanner } from './components/CLIUpdateBanner'
 import { accentById, applyAccent, type AccentPreset } from './lib/accent'
+import { track } from './lib/telemetry'
 
 const payloadCache = new PayloadCache<MenubarPayload>()
 
@@ -306,6 +308,9 @@ export function App() {
     const unlistenRefresh = listen('codeburn://refresh', () => userRefresh())
     const unlistenShown = listen('codeburn://shown', () => {
       setPopoverVisible(true)
+      // The popover is hidden rather than closed, so it mounts once a launch: an open is
+      // this event, not this component appearing.
+      track('popover_open')
       readDailyBudget()
       // The reader is looking at the bars now, so the quota gets an answer the cadence had
       // not earned yet, down to the interactive floor.
@@ -520,6 +525,9 @@ export function App() {
 
   /// Settings left the popover for a window of their own; what is left here is the link.
   const openSettingsWindow = (section = 'general') => {
+    // The pane name only; a deep link's anchor is dropped, since it names a row rather than
+    // a section anyone is choosing between.
+    track('settings_open', { pane: section.split('#')[0] || 'general' })
     invoke('open_settings_window', { section }).catch(err => setError(String(err)))
   }
 
@@ -706,6 +714,8 @@ export function App() {
         onOpenSettings={openSettingsWindow}
         footnote={footnote}
       />
+
+      <TelemetryNotice />
 
       <CLIUpdateBanner />
 

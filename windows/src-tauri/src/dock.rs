@@ -525,6 +525,17 @@ pub fn is_enabled() -> bool {
             .unwrap_or(false)
 }
 
+/// Where the rail sits and how big it is, as the two buckets the dock telemetry events
+/// carry. The edge is the one it is docked to, or the orientation it keeps while floating.
+pub fn telemetry_props() -> serde_json::Value {
+    let placement = load_placement();
+    let edge = placement.docked.unwrap_or(placement.attachment);
+    serde_json::json!({
+        "edge": serde_json::to_value(edge).unwrap_or(serde_json::Value::Null),
+        "scaleBucket": crate::telemetry::scale_bucket(prefs_scale()),
+    })
+}
+
 pub fn set_enabled(enabled: bool) -> Result<()> {
     let mut state = read_state();
     state.insert("enabled".into(), serde_json::Value::Bool(enabled));
