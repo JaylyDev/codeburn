@@ -222,6 +222,88 @@ describe('Codex quota credential rotation', () => {
     expect((await readAuth()).tokens.refresh_token).toBe(NEW_REFRESH)
   })
 
+  it('discards a rotation when the login on disk changes while the grant is in flight', async () => {
+    await writeAuth(authDoc())
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    let grantStarted = (): void => {}
+    const reachedGrant = new Promise<void>(resolve => { grantStarted = resolve })
+    let releaseGrant = (): void => {}
+    const heldGrant = new Promise<void>(resolve => { releaseGrant = resolve })
+
+    const pending = fetchCodexQuota({
+      authPath,
+      now: () => NOW,
+      fetch: routes({
+        token: async () => { grantStarted(); await heldGrant; return rotatedGrant() },
+        usage: usagePayload,
+      }),
+    })
+
+    // The user ran `codex login` and switched accounts while our grant was open.
+    await reachedGrant
+    await writeAuth({
+      auth_mode: 'chatgpt',
+      tokens: {
+        access_token: 'access-other',
+        refresh_token: 'refresh-other-account',
+        id_token: 'id-other',
+        account_id: 'account-2',
+      },
+      last_refresh: new Date(NOW).toISOString(),
+    })
+    releaseGrant()
+    await pending
+
+    // The new account's document is left exactly as the CLI wrote it: our grant
+    // spent account-1's refresh token, so writing it back here would splice
+    // account-1's token onto account-2's identity.
+    const saved = await readAuth()
+    expect(saved.tokens.account_id).toBe('account-2')
+    expect(saved.tokens.refresh_token).toBe('refresh-other-account')
+    expect(saved.tokens.refresh_token).not.toBe(NEW_REFRESH)
+    expect(errors).toHaveBeenCalledTimes(1)
+  })
+
+  it('still writes the rotation when the login on disk is unchanged', async () => {
+    await writeAuth(authDoc())
+    let grantStarted = (): void => {}
+    const reachedGrant = new Promise<void>(resolve => { grantStarted = resolve })
+    let releaseGrant = (): void => {}
+    const heldGrant = new Promise<void>(resolve => { releaseGrant = resolve })
+
+    const pending = fetchCodexQuota({
+      authPath,
+      now: () => NOW,
+      fetch: routes({
+        token: async () => { grantStarted(); await heldGrant; return rotatedGrant() },
+        usage: usagePayload,
+      }),
+    })
+
+    // Same account, same refresh token: an unrelated rewrite is not a lineage change.
+    await reachedGrant
+    await writeAuth({ ...authDoc(), extra_field: 'harmless' })
+    releaseGrant()
+    await pending
+
+    expect((await readAuth()).tokens.refresh_token).toBe(NEW_REFRESH)
+  })
+
+  it('keeps the rotated refresh token when the reread file merely omits lineage keys', async () => {
+    await writeAuth(authDoc())
+
+    await fetchCodexQuota({
+      authPath,
+      now: () => NOW,
+      // A cleanly parsed ChatGPT document that simply lacks account_id and
+      // refresh_token is not proof of a different login.
+      readFileSync: () => JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: 'access-old' } }),
+      fetch: routes({ token: rotatedGrant, usage: usagePayload }),
+    })
+
+    expect((await readAuth()).tokens.refresh_token).toBe(NEW_REFRESH)
+  })
+
   // POSIX mode bits do not exist on Windows, where the ACL carries the privacy.
   it.skipIf(process.platform === 'win32')('rewrites the credential with the permissions it already had', async () => {
     for (const mode of [0o600, 0o400]) {

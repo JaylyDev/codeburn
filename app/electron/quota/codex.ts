@@ -245,12 +245,44 @@ function str(value: unknown): string | null {
   return typeof value === 'string' && value ? value : null
 }
 
+/** The `sub` claim of a JWT id_token, or null when it is absent or does not
+ * decode. Defensive at every step: a malformed id_token is evidence of nothing,
+ * so it must never itself read as a login mismatch. */
+function idTokenSubject(token: unknown): string | null {
+  if (typeof token !== 'string') return null
+  const payload = token.split('.')[1]
+  if (!payload) return null
+  try {
+    const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as { sub?: unknown }
+    return typeof claims.sub === 'string' && claims.sub ? claims.sub : null
+  } catch {
+    return null
+  }
+}
+
+/** Whether two documents belong to the same Codex login. A field counts as a
+ * mismatch only when it is a non-empty string on both sides and the two values
+ * differ: a document that merely omits account_id, refresh_token or id_token is
+ * not proof of a different login, and treating it as one would drop a rotated
+ * refresh token and sign the user out. */
+function sameLogin(held: AuthDoc, latest: AuthDoc): boolean {
+  const differs = (a: unknown, b: unknown): boolean =>
+    typeof a === 'string' && a !== '' && typeof b === 'string' && b !== '' && a !== b
+  if (differs(held.tokens?.account_id, latest.tokens?.account_id)) return false
+  if (differs(held.tokens?.refresh_token, latest.tokens?.refresh_token)) return false
+  return !differs(idTokenSubject(held.tokens?.id_token), idTokenSubject(latest.tokens?.id_token))
+}
+
 /** The document the rotated tokens are merged into: whatever the Codex CLI has
  * on disk right now, so a login it wrote since our own read is not clobbered.
- * `null` means the login this rotation belongs to is gone (file removed, or no
- * longer ChatGPT mode) and writing would resurrect it. An unreadable or
- * unparseable file is NOT one of those cases: it falls back to the document we
- * already hold, because dropping a rotated refresh token signs the user out. */
+ * `null` means writing would be wrong: the login this rotation belongs to is
+ * gone (file removed, or no longer ChatGPT mode), or the file now holds a
+ * different login (the user ran `codex login` and switched accounts, or another
+ * process rotated the credential while our grant was in flight) and merging our
+ * tokens in would splice one account's account_id onto another's refresh token.
+ * An unreadable or unparseable file is NOT one of those cases: it falls back to
+ * the document we already hold, because a lineage check may only fire on a file
+ * that reads cleanly, and dropping a rotated refresh token signs the user out. */
 function mergeBase(auth: AuthDoc, deps: CodexDeps): AuthDoc | null {
   let raw: string | null
   try {
@@ -267,7 +299,11 @@ function mergeBase(auth: AuthDoc, deps: CodexDeps): AuthDoc | null {
   }
   if (!latest || typeof latest !== 'object') return auth
   const doc = latest as AuthDoc
-  return doc.auth_mode === 'chatgpt' ? doc : null
+  if (doc.auth_mode !== 'chatgpt') return null
+  // Serializing refreshes across processes with a file lock would also stop the
+  // wasted double grant, but the lineage check is what closes the corrupt-write
+  // hole on its own, so the lock is left out as more than the minimum here.
+  return sameLogin(auth, doc) ? doc : null
 }
 
 type RotatedTokens = { access: string | null; refresh: string | null; id: string | null }
@@ -283,7 +319,7 @@ type RotatedTokens = { access: string | null; refresh: string | null; id: string
 function persistRotated(auth: AuthDoc, rotated: RotatedTokens, deps: CodexDeps): AuthDoc | null {
   const base = mergeBase(auth, deps)
   if (!base) {
-    console.error(`Codex refreshed its login but the credential at ${deps.authPath} no longer holds that ChatGPT login, so the new token was discarded. Run \`codex login\` if Codex signs you out.`)
+    console.error(`Codex refreshed its login but the credential at ${deps.authPath} no longer holds the ChatGPT login this rotation belongs to, so the new token was discarded. Run \`codex login\` if Codex signs you out.`)
     return null
   }
   const merged: AuthDoc = {
