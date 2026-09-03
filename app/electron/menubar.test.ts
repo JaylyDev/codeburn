@@ -216,10 +216,11 @@ describe('the tray app\u2019s CLI launcher', () => {
   afterEach(() => { rmSync(sandbox, { recursive: true, force: true }) })
 
   it('sits beside the tray app\u2019s own install marker', () => {
-    expect(companionDataDir({ LOCALAPPDATA: 'D:\\Local' }, home)).toBe('D:\\Local\\codeburn-menubar')
+    // Joined with the host's separator: the helper runs on Windows, the suite everywhere.
+    expect(companionDataDir({ LOCALAPPDATA: 'D:\\Local' }, home)).toBe(join('D:\\Local', 'codeburn-menubar'))
     // A Windows session without the variable is not a session without the directory.
     expect(companionDataDir({}, home)).toBe(join(home, 'AppData', 'Local', 'codeburn-menubar'))
-    expect(cliLauncherPath({ LOCALAPPDATA: 'D:\\Local' }, home)).toBe('D:\\Local\\codeburn-menubar\\codeburn-cli.cmd')
+    expect(cliLauncherPath({ LOCALAPPDATA: 'D:\\Local' }, home)).toBe(join('D:\\Local', 'codeburn-menubar', 'codeburn-cli.cmd'))
   })
 
   it('runs the bundled CLI through the desktop app\u2019s executable, forwarding everything', () => {

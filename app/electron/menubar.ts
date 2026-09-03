@@ -28,7 +28,7 @@
 import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, win32 } from 'node:path'
 
 import { spawnCliAction, type ActionResult } from './cli'
 import {
@@ -183,7 +183,7 @@ function companionSettingsPath(stateDir: string): string {
 /** `%LOCALAPPDATA%\codeburn-menubar`, the directory the tray app's install marker is in. */
 export function companionDataDir(env: NodeJS.ProcessEnv, home: string): string {
   const local = env.LOCALAPPDATA
-  const base = local && /^[a-zA-Z]:[\\/]/.test(local) ? local.replace(/[\\/]+$/, '') : join(home, 'AppData', 'Local')
+  const base = local && win32.isAbsolute(local) ? local.replace(/[\\/]+$/, '') : join(home, 'AppData', 'Local')
   return join(base, COMPANION_DIR)
 }
 
