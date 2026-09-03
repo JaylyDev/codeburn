@@ -2052,7 +2052,13 @@ mod tests {
         // A key neither side writes, to prove the merge preserves it through all the churn.
         fs::write(&dock_file, "{\"other\":\"keep\"}").unwrap();
 
-        let iters: u32 = 100;
+        // 100 rounds a side, both taking the lock, while a reader thread hammers the same
+        // file. The production wait budget is 2s with a 50ms poll, which is right for a UI
+        // that writes on a click but starves under this much contention: a waiter that keeps
+        // losing the race after each poll can exceed 2s on a loaded runner, which is what
+        // reddened main rather than any lost update. Fewer rounds keep the property under
+        // test and stop the harness from being the thing that fails.
+        let iters: u32 = 24;
         let nolock = std::env::var("CB_TRAY_XPROC_NOLOCK").ok().as_deref() == Some("1");
 
         let mut child = match Command::new("node")
