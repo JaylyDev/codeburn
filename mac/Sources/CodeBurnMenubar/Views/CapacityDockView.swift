@@ -327,7 +327,13 @@ final class CapacityDockViewModel {
         let eased = p * p * (3 - 2 * p)
         return CapacityDockMetrics.edgeShoulderDepth(scale: scale) * 0.6 * eased
     }
-    var railAlongPad: CGFloat { CapacityDockMetrics.railAlongPad(scale: scale) + flareCompensation }
+    // Rounded after the flare is added, not before: the panel's length is built from this
+    // padding, and a fractional length re-runs the window's layout at display cadence for
+    // as long as the dock is up. `points` rounds the base, the eased flare then reintroduced
+    // the fraction for the whole attach animation.
+    var railAlongPad: CGFloat {
+        (CapacityDockMetrics.railAlongPad(scale: scale) + flareCompensation).rounded()
+    }
     var railCrossPad: CGFloat { CapacityDockMetrics.railCrossPad(scale: scale) }
     var railTopPadding: CGFloat { railAlongPad }
     var railBottomPadding: CGFloat { railAlongPad }
