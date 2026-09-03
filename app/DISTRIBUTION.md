@@ -313,6 +313,15 @@ shows **"Windows protected your PC"**. Users click **"More info" → "Run
 anyway"** to launch it. This is expected for an unsigned build; the only fix is
 a purchased code-signing (Authenticode/EV) certificate.
 
+**ARM64 builds.** `npm --prefix app run package:win:arm64` builds the installer for ARM64
+Windows. It sets `ELECTRON_BUILDER_7Z_FILTER=BCJ`, and that is not optional: 7-Zip
+compresses ARM64 executables with its ARM64 branch filter by default, the 7-Zip decoder
+inside the NSIS installer predates that filter, and the installer then silently drops
+every .exe and .dll while the data files land, leaving an install with no program in it.
+The x64 build is unaffected because its default filter is one the decoder knows. The
+per-architecture archives inside a universal installer get the same treatment, so an
+installer built with both `--x64` and `--arm64` needs the variable too.
+
 **Distribution policy.** The Microsoft Store build (Store ID `9P0R4ZL5XMB8`) is
 the recommended Windows install. This NSIS setup `.exe` and the tray `.msi`
 under the `windows-v*` releases are a developer preview: unsigned, SmartScreen
