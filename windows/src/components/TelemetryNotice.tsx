@@ -34,8 +34,9 @@ export function TelemetryNotice({ onDecided }: { onDecided?: (status: TelemetryS
       <h3 className="consent-title">Help improve CodeBurn</h3>
       <p className="consent-body">
         Share anonymous usage statistics: which parts of the app get opened, how the Capacity
-        Dock is used, and errors. Never your prompts, your code, project or file names, or
-        anything that identifies you.
+        Dock is used, and errors. The daily report includes the names of the models, tools,
+        skills and MCP servers you use alongside the bucketed counts. Never your prompts, your
+        code, or your project and file names.
       </p>
       <button type="button" className="consent-link" onClick={() => { void openUrl(TELEMETRY_DOCS_URL) }}>
         What data we collect

@@ -283,6 +283,29 @@ fn normalize(value: i32, low: i32, high: i32) -> f64 {
     }
 }
 
+/// Which end of a rail resting at `rest_start` stays put while it grows: whichever side of the
+/// work area has the room for it. The layout and the drop both read this, and they have to
+/// agree about it, or a rail released while expanded is stored against a travel range that
+/// means something else.
+fn anchor_for(area_along: i32, area_along_len: i32, rest_start: i32, rest_len: i32) -> Anchor {
+    let room_after = area_along + area_along_len - (rest_start + rest_len);
+    let room_before = rest_start - area_along;
+    if room_after >= room_before {
+        Anchor::Start
+    } else {
+        Anchor::End
+    }
+}
+
+/// The travel a resting rail of `rest_len` has along the axis: the range every stored offset is
+/// normalized over, whatever length the rail happens to be showing at the time.
+fn resting_travel(area_along: i32, area_along_len: i32, rest_len: i32) -> (i32, i32) {
+    (
+        area_along + EDGE_INSET,
+        area_along + area_along_len - EDGE_INSET - rest_len,
+    )
+}
+
 /// Pure layout in logical pixels. `area` is the monitor work area.
 pub fn layout(area: Rect, placement: &Placement, request: &LayoutRequest, m: &Metrics) -> DockFrame {
     let edge = placement.attachment;
@@ -298,7 +321,7 @@ pub fn layout(area: Rect, placement: &Placement, request: &LayoutRequest, m: &Me
     } else {
         (area.x, area.w, area.y, area.h)
     };
-    let along_low = area_along + EDGE_INSET;
+    let (along_low, rest_high) = resting_travel(area_along, area_along_len, rest_len);
     let cross_pos = match placement.docked {
         Some(Edge::Left) | Some(Edge::Top) => area_cross,
         Some(Edge::Right) | Some(Edge::Bottom) => area_cross + area_cross_len - cross,
@@ -310,7 +333,6 @@ pub fn layout(area: Rect, placement: &Placement, request: &LayoutRequest, m: &Me
         }
     };
     let along_norm = if vertical { placement.y } else { placement.x };
-    let rest_high = area_along + area_along_len - EDGE_INSET - rest_len;
     let rest_fallback = if vertical {
         area_along + DEFAULT_TOP_OFFSET
     } else {
@@ -318,13 +340,7 @@ pub fn layout(area: Rect, placement: &Placement, request: &LayoutRequest, m: &Me
     };
     let rest_start = denormalize(along_norm, along_low, rest_high, rest_fallback);
 
-    let room_after = area_along + area_along_len - (rest_start + rest_len);
-    let room_before = rest_start - area_along;
-    let anchor = if room_after >= room_before {
-        Anchor::Start
-    } else {
-        Anchor::End
-    };
+    let anchor = anchor_for(area_along, area_along_len, rest_start, rest_len);
     let rail_along = |rows: u32| -> (i32, i32) {
         let len = rail_length(m, rows, pad);
         let high = (area_along + area_along_len - EDGE_INSET - len).max(along_low);
@@ -440,19 +456,55 @@ fn attachment_candidate(rail: &Rect, area: &Rect) -> Option<(Edge, f64)> {
 
 /// Placement for a rail released at `rail`: docked when an edge is in reach, else floating
 /// where it was dropped.
-fn placement_for_drop(rail: &Rect, screen: &Screen, current: &Placement) -> Placement {
+///
+/// `rest_len` is how long that same rail is at rest, which is what the along offset has to be
+/// normalized against: `layout` denormalizes it over the resting travel and grows the rail from
+/// there. A rail let go while expanded is up to several rows longer than that, so its start is
+/// walked back to the resting start it grew from first. Reading the live length instead is what
+/// made a rail dropped expanded reappear a couple of hundred pixels from the hand that let go
+/// of it.
+fn placement_for_drop(rail: &Rect, rest_len: i32, screen: &Screen, current: &Placement) -> Placement {
     let area = &screen.area;
     let docked = attachment_candidate(rail, area).map(|(edge, _)| edge);
     let attachment = docked.unwrap_or(current.attachment);
-    let x_low = area.x + EDGE_INSET;
-    let x_high = area.right() - EDGE_INSET - rail.w;
-    let y_low = area.y + EDGE_INSET;
-    let y_high = area.bottom() - EDGE_INSET - rail.h;
+    let vertical = attachment.is_vertical();
+
+    let (area_along, area_along_len, along_start, live_len) = if vertical {
+        (area.y, area.h, rail.y, rail.h)
+    } else {
+        (area.x, area.w, rail.x, rail.w)
+    };
+    let rest_len = rest_len.clamp(1, live_len.max(1));
+    // An End-anchored rail grew upward (or leftward) from its resting start, so the drop is that
+    // much further along than the offset it has to be stored as. The anchor the layout will pick
+    // is the one the candidate itself predicts, and the predicate only ever moves from Start to
+    // End as the start grows, so testing the Start candidate first settles it in one step.
+    let rest_start = if anchor_for(area_along, area_along_len, along_start, rest_len) == Anchor::Start {
+        along_start
+    } else {
+        along_start + live_len - rest_len
+    };
+    let (along_low, along_high) = resting_travel(area_along, area_along_len, rest_len);
+    let along = normalize(rest_start, along_low, along_high);
+
+    // The cross axis does not move with the rows, so it is read straight off the drop.
+    let (area_cross, area_cross_len, cross_start, cross_len) = if vertical {
+        (area.x, area.w, rail.x, rail.w)
+    } else {
+        (area.y, area.h, rail.y, rail.h)
+    };
+    let cross = normalize(
+        cross_start,
+        area_cross + EDGE_INSET,
+        area_cross + area_cross_len - EDGE_INSET - cross_len,
+    );
+
+    let (x, y) = if vertical { (cross, along) } else { (along, cross) };
     Placement {
         docked,
         attachment,
-        x: Some(normalize(rail.x, x_low, x_high)),
-        y: Some(normalize(rail.y, y_low, y_high)),
+        x: Some(x),
+        y: Some(y),
         monitor: screen.name.clone(),
     }
 }
@@ -474,12 +526,31 @@ fn read_state() -> serde_json::Map<String, serde_json::Value> {
         .unwrap_or_default()
 }
 
+/// Names one temp file per write. The desktop app writes this file too, and so do the settings
+/// window and the cursor thread on this side, so two writes can be in flight at once and each
+/// needs its own scratch name.
+static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// The desktop app reads this file as well, and a plain write is not one step: a reader that
+/// arrives partway through it gets truncated JSON, falls back to an empty state, and the
+/// placement and the dock's own switch are gone. Writing beside it and renaming over is.
 fn write_state(state: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
     let path = state_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, serde_json::to_vec_pretty(state)?)?;
+    let bytes = serde_json::to_vec_pretty(state)?;
+    let temp = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&temp, &bytes)?;
+    if let Err(err) = fs::rename(&temp, &path) {
+        // Nothing is left behind for the next launch to trip over.
+        let _ = fs::remove_file(&temp);
+        return Err(err.into());
+    }
     Ok(())
 }
 
@@ -595,7 +666,11 @@ struct DockState {
     area: Rect,
     scale: f64,
     pointer: Pointer,
+    /// What the window is known to be set to, rather than what it was last asked for: `None`
+    /// until a `set_ignore_cursor_events` has actually come back clean.
     ignoring: Option<bool>,
+    /// The primary button while it is held, and whether the press began on the dock.
+    press: Option<bool>,
     drag: Option<Drag>,
 }
 
@@ -622,6 +697,7 @@ static STATE: Mutex<DockState> = Mutex::new(DockState {
     scale: 1.0,
     pointer: Pointer { rail_hovered: false, row: None, detail_hovered: false },
     ignoring: None,
+    press: None,
     drag: None,
 });
 
@@ -880,7 +956,10 @@ pub fn begin_drag(app: &AppHandle, anchor: (i32, i32)) {
     });
     state.request.detail = None;
     drop(state);
-    let _ = window.set_ignore_cursor_events(false);
+    // Recorded the same way the tick does it, so a call that fails here leaves the state unknown
+    // and the next tick asks again rather than trusting a window that never took the change.
+    let ok = window.set_ignore_cursor_events(false).is_ok();
+    lock().ignoring = ignore_after_call(false, ok);
     let _ = app.emit_to(
         DOCK_LABEL,
         "codeburn://dock-drag",
@@ -920,9 +999,36 @@ fn distance_to(rect: &Rect, x: i32, y: i32) -> i32 {
     dx.max(dy)
 }
 
+/// Whether a tick that wants click-through set to `wanted` still owes the window a call.
+/// `applied` is what the window is known to be set to, and `None` means that is not known: no
+/// call has landed yet, or the last one failed. Either way the tick asks again.
+fn ignore_needs_call(applied: Option<bool>, wanted: bool) -> bool {
+    applied != Some(wanted)
+}
+
+/// What `applied` becomes once that call has been made. Only a call that succeeded is recorded;
+/// a failure records nothing, so the next tick retries. Recording the intent up front is what
+/// left one failed call turning an always-on-top window into a rectangle of desktop that
+/// swallowed every click in it, for as long as the dock was up.
+fn ignore_after_call(wanted: bool, ok: bool) -> Option<bool> {
+    ok.then_some(wanted)
+}
+
+/// A primary button held down, and whether the press that started it landed on the dock.
+/// `None` is the button up. Only a press that began on the dock is the dock's business: one
+/// that began anywhere else is somebody dragging a window or selecting text, and it must not
+/// take the dock's input or its fast poll with it.
+fn press_state(previous: Option<bool>, down: bool, on_dock: bool) -> Option<bool> {
+    match (down, previous) {
+        (false, _) => None,
+        (true, Some(started)) => Some(started),
+        (true, None) => Some(on_dock),
+    }
+}
+
 /// How long to wait before reading the cursor again. `engaged` covers everything that needs the
-/// fast rate whatever the distance says: a drag, a button held down, and a pointer already on
-/// the rail or in the bubble, whose next move decides whether the hover ends.
+/// fast rate whatever the distance says: a drag, a press that began on the dock, and a pointer
+/// already on the rail or in the bubble, whose next move decides whether the hover ends.
 fn poll_interval_ms(distance: i32, engaged: bool) -> u64 {
     if engaged || distance <= POLL_NEAR_DISTANCE {
         POLL_NEAR_MS
@@ -958,7 +1064,11 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
         state.area = area;
         if !primary_button_down() {
             let rail = frame.rail.offset(frame.window.x, frame.window.y);
-            let placement = placement_for_drop(&rail, &screen, &state.placement.clone().unwrap_or_default());
+            // The padding the frame was laid out with, so the resting length is the one this
+            // very rail collapses to rather than one for a docking it has not made yet.
+            let rest_len = rail_length(&state.metrics, 1, frame.along_pad);
+            let placement =
+                placement_for_drop(&rail, rest_len, &screen, &state.placement.clone().unwrap_or_default());
             drop(state);
             settle(app, window, placement, rail);
             return POLL_NEAR_MS;
@@ -1051,23 +1161,28 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
     let pointer_changed = pointer != state.pointer;
     state.pointer = pointer;
     // A press that began on the rail keeps the window's input while the button is held, so
-    // the page sees the moves that decide whether it became a drag.
-    let ignore = !(rail_hovered || detail_hovered) && !primary_button_down();
-    let ignore_changed = state.ignoring != Some(ignore);
-    state.ignoring = Some(ignore);
+    // the page sees the moves that decide whether it became a drag. A press that began
+    // anywhere else on the desktop is none of this window's business.
+    let on_dock = rail_hovered || detail_hovered;
+    let press = press_state(state.press, primary_button_down(), on_dock);
+    state.press = press;
+    let engaged = on_dock || press == Some(true);
+    let ignore = !engaged;
+    let needs_call = ignore_needs_call(state.ignoring, ignore);
     // Measured against the window rather than the rail: the window is the whole region the
     // dock can paint into, bubble included, so a pointer outside it cannot be hovering
     // anything and one just inside it is about to be.
     let distance = distance_to(&frame.window, cursor.0, cursor.1);
     drop(state);
 
-    if ignore_changed {
-        let _ = window.set_ignore_cursor_events(ignore);
+    if needs_call {
+        let ok = window.set_ignore_cursor_events(ignore).is_ok();
+        lock().ignoring = ignore_after_call(ignore, ok);
     }
     if pointer_changed {
         let _ = app.emit_to(DOCK_LABEL, "codeburn://dock-pointer", pointer);
     }
-    poll_interval_ms(distance, !ignore)
+    poll_interval_ms(distance, engaged)
 }
 
 /// A fingerprint of the desktop: how many displays there are, how large the virtual screen is,
@@ -1607,12 +1722,12 @@ mod tests {
     fn a_drop_near_an_edge_docks_and_elsewhere_floats() {
         let current = Placement::default();
         let here = screen(AREA, "one");
-        let near_left = placement_for_drop(&Rect { x: 20, y: 300, w: 53, h: 112 }, &here, &current);
+        let near_left = placement_for_drop(&Rect { x: 20, y: 300, w: 53, h: 112 }, 112, &here, &current);
         assert_eq!(near_left.docked, Some(Edge::Left));
         assert_eq!(near_left.attachment, Edge::Left);
-        let near_top = placement_for_drop(&Rect { x: 700, y: 10, w: 53, h: 112 }, &here, &current);
+        let near_top = placement_for_drop(&Rect { x: 700, y: 10, w: 53, h: 112 }, 112, &here, &current);
         assert_eq!(near_top.docked, Some(Edge::Top));
-        let middle = placement_for_drop(&Rect { x: 700, y: 300, w: 53, h: 112 }, &here, &current);
+        let middle = placement_for_drop(&Rect { x: 700, y: 300, w: 53, h: 112 }, 112, &here, &current);
         assert_eq!(middle.docked, None);
         assert_eq!(middle.attachment, Edge::Right);
         assert!((middle.x.unwrap() - 0.45).abs() < 0.05);
@@ -1628,6 +1743,7 @@ mod tests {
         };
         let dropped = placement_for_drop(
             &Rect { x: 1600 + 1280 - 53, y: 300, w: 53, h: 112 },
+            112,
             &second,
             &Placement::default(),
         );
@@ -1639,6 +1755,108 @@ mod tests {
         // And the rail lays out inside that display rather than back on the first one.
         let frame = layout(second.area, &dropped, &request(1, false, None), &small());
         assert_eq!(rail_on_screen(&frame).right(), second.area.right());
+    }
+
+    /// The rail is dragged expanded, because the page holds it open for as long as the drag
+    /// runs. What is stored is the offset of the *resting* rail, so the drop has to walk the
+    /// tall rail back to the short one it grew from; reading the tall one straight off put the
+    /// rail a long way from the hand that let go of it.
+    #[test]
+    fn a_rail_dropped_while_expanded_lands_where_it_was_released() {
+        let m = small();
+        let here = screen(AREA, "one");
+        let floating =
+            Placement { docked: None, attachment: Edge::Right, x: Some(0.5), y: Some(0.2), monitor: None };
+        let showing = request(4, true, None);
+
+        // What the pointer is holding: four rows of rail, not the one row it rests at.
+        let held = layout(AREA, &floating, &showing, &m);
+        let rest_len = rail_length(&m, 1, held.along_pad);
+        assert_eq!((held.anchor, held.rail.h, rest_len), (Anchor::Start, 245, 74));
+
+        // Carried well clear of every edge and let go there.
+        let released = rail_on_screen(&held).offset(-260, 90);
+        let dropped = placement_for_drop(&released, rest_len, &here, &floating);
+        assert_eq!(dropped.docked, None);
+        let landed = rail_on_screen(&layout(AREA, &dropped, &showing, &m));
+        assert_eq!(landed, released);
+
+        // And again low enough that the rail grows upward instead, where the drop has to add
+        // the difference back rather than subtract nothing.
+        let released = Rect { x: released.x, y: 450, ..released };
+        let dropped = placement_for_drop(&released, rest_len, &here, &floating);
+        let settled = layout(AREA, &dropped, &showing, &m);
+        assert_eq!(settled.anchor, Anchor::End);
+        assert_eq!(rail_on_screen(&settled), released);
+    }
+
+    #[test]
+    fn a_failed_click_through_call_is_retried_rather_than_recorded() {
+        // Nothing known about the window yet, so the first tick calls whatever it wants.
+        assert!(ignore_needs_call(None, true));
+        assert!(ignore_needs_call(None, false));
+
+        // A call that lands is recorded, and the same want costs nothing after that.
+        let applied = ignore_after_call(true, true);
+        assert_eq!(applied, Some(true));
+        assert!(!ignore_needs_call(applied, true));
+        assert!(ignore_needs_call(applied, false));
+
+        // A call that fails records nothing at all, so every tick after it tries again until
+        // one lands. Recording the wanted value here is what left the window hit-testable
+        // across its whole rectangle with nothing left to put it back.
+        let applied = ignore_after_call(false, false);
+        assert_eq!(applied, None);
+        assert!(ignore_needs_call(applied, false));
+        assert!(ignore_needs_call(applied, true));
+        let applied = ignore_after_call(false, true);
+        assert_eq!(applied, Some(false));
+        assert!(!ignore_needs_call(applied, false));
+    }
+
+    #[test]
+    fn only_a_press_that_began_on_the_dock_holds_the_window() {
+        // Button up: nothing is held, wherever the pointer happens to be.
+        assert_eq!(press_state(None, false, true), None);
+        assert_eq!(press_state(Some(true), false, true), None);
+
+        // A press that landed on the dock stays the dock's while the button is held, which is
+        // what keeps the window's input through the moves that decide whether it is a drag.
+        let on_dock = press_state(None, true, true);
+        assert_eq!(on_dock, Some(true));
+        assert_eq!(press_state(on_dock, true, false), Some(true));
+
+        // A press that began anywhere else stays somebody else's even when it is dragged over
+        // the rail, so an unrelated drag no longer pins the poll at the fast rate.
+        let elsewhere = press_state(None, true, false);
+        assert_eq!(elsewhere, Some(false));
+        assert_eq!(press_state(elsewhere, true, true), Some(false));
+        let far = POLL_MID_DISTANCE + 1;
+        assert_eq!(poll_interval_ms(far, elsewhere == Some(true)), POLL_FAR_MS);
+        assert_eq!(poll_interval_ms(far, on_dock == Some(true)), POLL_NEAR_MS);
+    }
+
+    /// Runs against the real state file, so what goes back is exactly what was found there:
+    /// the swap is the thing under test, not the contents.
+    #[test]
+    fn a_state_write_swaps_a_whole_file_in_and_leaves_no_scratch_behind() {
+        let before = read_state();
+        let Ok(()) = write_state(&before) else { return };
+        assert_eq!(read_state(), before);
+
+        // The scratch name carries this process's id, so only this test's own leavings count
+        // and a tmp file from something else running beside it cannot fail the check.
+        let Some(dir) = state_path().parent().map(|p| p.to_path_buf()) else { return };
+        let mine = format!(".{}.", std::process::id());
+        let leftovers = fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.file_name().to_string_lossy().contains(&mine))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(leftovers, 0);
     }
 
     #[test]

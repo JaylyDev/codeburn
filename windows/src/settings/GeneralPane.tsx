@@ -272,7 +272,7 @@ function TelemetrySection() {
     <Group title="Privacy">
       <Row
         label="Anonymous telemetry"
-        hint="Which parts of the app get opened, how the Capacity Dock is used, and errors. Never your prompts, your code, project or file names, or anything that identifies you."
+        hint="Which parts of the app get opened, how the Capacity Dock is used, and errors. The daily report includes the names of the models, tools, skills and MCP servers you use alongside the bucketed counts. Never your prompts, your code, or your project and file names."
         control={
           <Switch
             ariaLabel="Anonymous telemetry"
