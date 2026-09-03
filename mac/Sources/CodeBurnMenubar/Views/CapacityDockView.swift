@@ -105,7 +105,10 @@ enum CapacityDockMetrics {
         let connectionExtra: CGFloat = switch quota.connection {
         case .terminalFailure: 90
         case .disconnected: 18
-        case .loading, .stale, .transientFailure: 16
+        // The staleness line is a section like any other, so it needs a section's
+        // height. It used to get 16, a bare 10pt line box with no padding, which is
+        // why it sat crammed against the header with the blocks below pushed into it.
+        case .loading, .stale, .transientFailure: CapacityDockGlance.noticeHeight
         case .connected: 0
         }
         height += connectionExtra
@@ -139,6 +142,20 @@ enum CapacityDockGlance {
     static let windowsHeight: CGFloat = 77
     /// 8 top + one secondary line + 16 bottom.
     static let windowsEmptyHeight: CGFloat = 37
+    /// The staleness or reconnect line under the header. It is a section like any
+    /// other, so the panel has to reserve its height: the frame is computed, not
+    /// fitted, and an unreserved line squeezes every block below it.
+    /// 6 top + a 10pt line box + 8 bottom.
+    static let noticeHeight: CGFloat = 27
+    /// Whether the band is drawn as its own padded section. Disconnected and
+    /// reconnect draw their own blocks with an action button instead.
+    static func drawsNotice(_ connection: QuotaSummary.Connection) -> Bool {
+        switch connection {
+        case .connected, .disconnected, .terminalFailure: return false
+        case .loading, .stale, .transientFailure: return true
+        }
+    }
+
     /// The list scrolls past this many pills rather than truncating.
     static let maxVisibleSessionRows = 4
     static let maxWindowColumns = 4
@@ -688,7 +705,10 @@ struct CapacityDockDetailView: View {
     private func glance(for provider: CapacityDockProvider, quota: QuotaSummary) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             headerSection(provider, plan: quota.planLabel).dividerBelow()
-            connectionLabel(quota.connection, provider: provider)
+            noticeSection(quota.connection, provider: provider)
+            if !CapacityDockGlance.drawsNotice(quota.connection) {
+                connectionLabel(quota.connection, provider: provider)
+            }
             if let sessions = store.capacityDockLiveSessions(for: provider) {
                 sessionsSection(sessions).dividerBelow()
             }
@@ -708,6 +728,25 @@ struct CapacityDockDetailView: View {
             .padding(.top, CapacityDockGlance.contentInset * s)
             .padding(.bottom, 8 * s)
             .padding(.horizontal, CapacityDockGlance.contentInset * s)
+    }
+
+    /// The notice carries the same horizontal inset as every other section, its own
+    /// vertical padding, and a divider, so it reads as a band rather than as text
+    /// crammed against the header.
+    @ViewBuilder
+    private func noticeSection(
+        _ connection: QuotaSummary.Connection,
+        provider: CapacityDockProvider
+    ) -> some View {
+        let s = model.detailScale
+        if CapacityDockGlance.drawsNotice(connection) {
+            connectionLabel(connection, provider: provider)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 6 * s)
+                .padding(.bottom, 8 * s)
+                .padding(.horizontal, CapacityDockGlance.contentInset * s)
+                .dividerBelow()
+        }
     }
 
     @ViewBuilder
