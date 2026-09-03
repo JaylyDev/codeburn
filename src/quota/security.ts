@@ -194,8 +194,11 @@ export function atomicWriteSecureFileSync(filePath: string, contents: string): v
   }
 }
 
+/// How long a quota request, including a token grant, is given to answer.
+export const QUOTA_REQUEST_TIMEOUT_MS = 30_000
+
 export function quotaRequestSignal(parent?: AbortSignal): AbortSignal {
-  const timeout = AbortSignal.timeout(30_000)
+  const timeout = AbortSignal.timeout(QUOTA_REQUEST_TIMEOUT_MS)
   return parent ? AbortSignal.any([parent, timeout]) : timeout
 }
 
@@ -209,10 +212,13 @@ export function quotaRequestSignal(parent?: AbortSignal): AbortSignal {
 /// has to drain this first.
 const outstandingCredentialWrites = new Set<Promise<void>>()
 
-/// Past this an exit stops waiting. A grant that has not answered in this long
-/// is not going to, and a command that never returns the shell is worse than
-/// the rotation it was protecting.
-export const CREDENTIAL_DRAIN_TIMEOUT_MS = 15_000
+/// Past this an exit stops waiting. It has to outlast the request it is waiting
+/// on, or the guard expires while the very case it was built for is still in
+/// flight: a grant answering at twenty seconds is exactly the slow reply that
+/// costs the user their login. Derived from the request timeout rather than
+/// written as a number, so the two cannot drift apart, plus a margin for the
+/// write that follows the reply.
+export const CREDENTIAL_DRAIN_TIMEOUT_MS = QUOTA_REQUEST_TIMEOUT_MS + 5_000
 
 /** Registers a rotation for {@link awaitCredentialWrites} to wait on. Returns
  * the same promise, so a caller can keep awaiting it exactly as before. */
@@ -243,7 +249,17 @@ export async function awaitCredentialWrites(timeoutMs = CREDENTIAL_DRAIN_TIMEOUT
     // rotation while the first is still draining.
     while (outstandingCredentialWrites.size > 0) {
       const drained = Promise.all([...outstandingCredentialWrites]).then(() => 'drained' as const)
-      if (await Promise.race([drained, expired]) === 'timeout') return
+      if (await Promise.race([drained, expired]) === 'timeout') {
+        // Giving up here can retire a login, so it is said out loud rather than
+        // left for the user to discover the next time a provider asks them to
+        // sign in again.
+        process.stderr.write(
+          'codeburn: a provider login was still being refreshed after '
+          + `${Math.round(timeoutMs / 1000)}s and was not saved. `
+          + 'If that provider signs you out, sign in again with its own CLI.\n',
+        )
+        return
+      }
     }
   } finally {
     if (timer) clearTimeout(timer)

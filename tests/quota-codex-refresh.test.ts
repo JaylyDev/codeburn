@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { collectQuota } from '../src/quota/index.js'
 import { fetchCodexQuota } from '../src/quota/codex.js'
-import { awaitCredentialWrites, pendingCredentialWrites } from '../src/quota/security.js'
+import { CREDENTIAL_DRAIN_TIMEOUT_MS, QUOTA_REQUEST_TIMEOUT_MS, awaitCredentialWrites, pendingCredentialWrites } from '../src/quota/security.js'
 
 const NOW = Date.parse('2026-09-02T12:00:00.000Z')
 const OLD_REFRESH = 'refresh-token-that-the-grant-retires'
@@ -190,6 +190,42 @@ describe('Codex quota credential rotation', () => {
   it('drains instantly when no rotation is outstanding', async () => {
     expect(pendingCredentialWrites()).toBe(0)
     await awaitCredentialWrites(0)
+  })
+
+  // A guard that expires before the thing it guards is no guard at all: a grant answering at
+  // twenty seconds is exactly the slow reply the drain exists for, and the old fifteen second
+  // wait gave up on it while it was still in flight.
+  it('waits longer than the request it is waiting on', () => {
+    expect(CREDENTIAL_DRAIN_TIMEOUT_MS).toBeGreaterThan(QUOTA_REQUEST_TIMEOUT_MS)
+  })
+
+  it('says so on stderr rather than losing a login in silence', async () => {
+    await writeAuth(authDoc())
+    const written: string[] = []
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      written.push(String(chunk))
+      return true
+    })
+    let grantStarted = (): void => {}
+    const reachedGrant = new Promise<void>(resolve => { grantStarted = resolve })
+    let releaseGrant = (): void => {}
+    const heldGrant = new Promise<void>(resolve => { releaseGrant = resolve })
+
+    const pending = fetchCodexQuota({
+      authPath,
+      now: () => NOW,
+      fetch: routes({
+        token: async () => { grantStarted(); await heldGrant; return rotatedGrant() },
+        usage: usagePayload,
+      }),
+    })
+    await reachedGrant
+    await awaitCredentialWrites(10)
+
+    expect(written.join('')).toMatch(/still being refreshed.*was not saved/s)
+    stderr.mockRestore()
+    releaseGrant()
+    await pending
   })
 
   it('stops waiting on a grant that never answers', async () => {
