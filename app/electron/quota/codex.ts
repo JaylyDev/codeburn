@@ -107,7 +107,7 @@ async function discoverSource(deps: CodexDeps, allowKeychain: boolean): Promise<
   if (fileAuth) return { name: 'authFile', auth: fileAuth, writable: true, reread: () => readAuth(deps) }
   // (c) com.openai.codex App Support, only if it holds a plaintext auth JSON
   // with a usable token. Tokens encrypted via "Codex Safe Storage" have no
-  // plaintext access_token here, so they fall through so we never decrypt.
+  // plaintext access_token here, so they fall through, and we never decrypt.
   const openaiAuth = await readAuth(deps, deps.openaiAuthPath).catch(() => null)
   if (openaiAuth?.tokens?.access_token) {
     return { name: 'openaiAppSupport', auth: openaiAuth, writable: false, reread: () => readAuth(deps, deps.openaiAuthPath).catch(() => null) }
