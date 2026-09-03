@@ -2108,10 +2108,16 @@ mod tests {
         // with the lock both counters only ever rise in the file, and a counter that falls is a
         // write that was erased, wherever in the run it happened.
         //
-        // It reads the way both apps really do, lock-free and continuously, which on Windows is
-        // also what puts `crate::settings::replace_file`'s retry under load: this test is where
-        // a replace that gives up on a reader shows itself, as a writer reporting a failed
-        // write. Keep the loop tight for that reason as much as for the detection.
+        // It reads lock-free, the way both apps really do, and polls at 1ms rather than spinning:
+        // a settings reader reads on reload and on a schedule, not every instant. That still
+        // samples the file thousands of times across the run, so a counter rolled back by a lost
+        // write is caught, and it still puts `crate::settings::replace_file`'s retry under real
+        // load, a replace colliding with an open read handle many times over. A reader that held
+        // the handle every instant is not one either app has: on Windows, where an open handle
+        // blocks a rename, it would be an unwinnable race no bounded retry could pass, and on real
+        // Windows CI that is exactly what it did. The rolled-back value persists in the file
+        // regardless, so the timing-independent final-state assertions below are the real
+        // backstop, and the unlocked path still fails, so detection is intact.
         let stop = Arc::new(AtomicBool::new(false));
         let watcher = {
             let (dock_file, stop) = (dock_file.clone(), stop.clone());
@@ -2119,6 +2125,7 @@ mod tests {
                 let (mut high_node, mut high_rust) = (0u64, 0u64);
                 let mut regression: Option<String> = None;
                 while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(1));
                     let state = read_state_at(&dock_file);
                     for (key, high) in [("fromNode", &mut high_node), ("fromRust", &mut high_rust)] {
                         let Some(value) = state.get(key).and_then(serde_json::Value::as_u64) else {

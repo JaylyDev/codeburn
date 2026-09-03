@@ -264,6 +264,49 @@ describe('Codex quota credential rotation', () => {
     expect(errors).toHaveBeenCalledTimes(1)
   })
 
+  // The id_token subject is the last of the three lineage fields and the only one the earlier
+  // account-switch case does not reach, since that one differs on account_id first. Here the
+  // account_id and refresh_token are identical on both documents and only the JWT subject
+  // moves, so a discard proves the subject check itself fires.
+  it('discards the rotation when only the id_token subject has changed', async () => {
+    const jwtWithSubject = (sub: string): string =>
+      `h.${Buffer.from(JSON.stringify({ sub })).toString('base64url')}.s`
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    await writeAuth({
+      auth_mode: 'chatgpt',
+      tokens: { access_token: 'access-old', refresh_token: OLD_REFRESH, id_token: jwtWithSubject('user-a'), account_id: 'account-1' },
+      last_refresh: new Date(NOW - 30 * 86_400_000).toISOString(),
+    })
+    let grantStarted = (): void => {}
+    const reachedGrant = new Promise<void>(resolve => { grantStarted = resolve })
+    let releaseGrant = (): void => {}
+    const heldGrant = new Promise<void>(resolve => { releaseGrant = resolve })
+
+    const pending = fetchCodexQuota({
+      authPath,
+      now: () => NOW,
+      fetch: routes({
+        token: async () => { grantStarted(); await heldGrant; return rotatedGrant() },
+        usage: usagePayload,
+      }),
+    })
+
+    // Same account_id and refresh_token, a different person behind the same slot.
+    await reachedGrant
+    await writeAuth({
+      auth_mode: 'chatgpt',
+      tokens: { access_token: 'access-b', refresh_token: OLD_REFRESH, id_token: jwtWithSubject('user-b'), account_id: 'account-1' },
+      last_refresh: new Date(NOW).toISOString(),
+    })
+    releaseGrant()
+    await pending
+
+    const saved = await readAuth()
+    expect(saved.tokens.id_token).toBe(jwtWithSubject('user-b'))
+    expect(saved.tokens.refresh_token).not.toBe(NEW_REFRESH)
+    expect(errors).toHaveBeenCalledTimes(1)
+  })
+
   it('still writes the rotation when the login on disk is unchanged', async () => {
     await writeAuth(authDoc())
     let grantStarted = (): void => {}
