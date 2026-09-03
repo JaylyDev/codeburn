@@ -107,21 +107,21 @@ describe('sessions JSON emitter', () => {
   it('hides home-directory slugs and renders compact agent/worktree names', () => {
     const rows = aggregateSessions([makeProject()])
     rows[0]!.sessionId = 'agent-a72cc958e305e4957'
-    rows[0]!.project = '-Users-torukmakto-Projects-eywa-eywa--claude-worktrees-issue-131'
+    rows[0]!.project = '-Users-devuser-Projects-eywa-eywa--claude-worktrees-issue-131'
     const output = renderTable(rows, { terminalWidth: 160 })
 
     expect(output).toContain('Agent a72cc958')
     expect(output).toContain('eywa · issue-131')
-    expect(output).not.toContain('Users-torukmakto')
+    expect(output).not.toContain('Users-devuser')
   })
 
   it('normalizes Claude dot-worktree slugs without exposing the home directory', () => {
     const rows = aggregateSessions([makeProject()])
-    rows[0]!.project = 'Users-torukmakto-codeburn-.claude-worktrees-agent-a213f7c77871f483f'
+    rows[0]!.project = 'Users-devuser-codeburn-.claude-worktrees-agent-a213f7c77871f483f'
     const output = renderTable(rows, { terminalWidth: 120 })
 
     expect(output).toContain('codeburn · agent a213f7c7')
-    expect(output).not.toContain('Users-torukmakto')
+    expect(output).not.toContain('Users-devuser')
     expect(output).not.toContain('.claude-worktrees')
   })
 

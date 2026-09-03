@@ -35,7 +35,7 @@ function session(overrides: Partial<SessionRow> & Pick<SessionRow, 'sessionId' |
 const rows: SessionRow[] = [
   session({
     sessionId: 'claude-session-123456789',
-    project: '-Users-torukmakto-Projects-codeburn',
+    project: '-Users-devuser-Projects-codeburn',
     provider: 'claude',
     models: ['Opus 4.8'],
     cost: 8.41,
@@ -136,7 +136,7 @@ describe('Sessions', () => {
     expect(screen.getByText('Codex').closest('.provider-h')).toHaveTextContent('Codex3 sessions$11.92')
     expect(container.querySelectorAll('.session-row')).toHaveLength(6)
     expect(screen.getByText('projects/codeburn')).toBeInTheDocument()
-    expect(screen.queryByText('-Users-torukmakto-Projects-codeburn')).not.toBeInTheDocument()
+    expect(screen.queryByText('-Users-devuser-Projects-codeburn')).not.toBeInTheDocument()
   })
 
   it('filters by project and offers to clear a search with no matches', async () => {
