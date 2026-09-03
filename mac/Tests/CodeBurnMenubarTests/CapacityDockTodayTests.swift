@@ -82,6 +82,105 @@ struct CapacityDockTodayTests {
         #expect(store.capacityDockToday(for: .codex)?.calls == 642)
     }
 
+    @Test("One Cursor tile sums the editor and the agent rows the CLI splits it into")
+    func tileCoveringSeveralRowsSums() {
+        let cursor = CapacityDockProvider(rawValue: "cursor")!
+        #expect(cursor.payloadProviderIDs == ["cursor", "cursor-agent"])
+        // Every other tile stands for exactly one row.
+        #expect(CapacityDockProvider.claude.payloadProviderIDs == ["claude"])
+        #expect(CapacityDockProvider.kimiCode.payloadProviderIDs == ["kimicode"])
+
+        let store = store(todayPayload(
+            cost: 292.52,
+            calls: 1_709,
+            inputTokens: 9_008,
+            outputTokens: 1_528_196,
+            providerDetails: [
+                ProviderDetail(id: "claude", label: "Claude", cost: 292.51, calls: 1_695,
+                               hasUsage: true, inputTokens: 7_510, outputTokens: 1_527_919, sessions: 30),
+                // The account was busy, but every session landed under the agent row,
+                // so a tile reading only "cursor" reported zero.
+                ProviderDetail(id: "cursor", label: "Cursor", cost: 0, calls: 0, hasUsage: false,
+                               inputTokens: nil, outputTokens: nil, sessions: nil),
+                ProviderDetail(id: "cursor-agent", label: "Cursor Agent", cost: 0.0086, calls: 14,
+                               hasUsage: true, inputTokens: 1_498, outputTokens: 277, sessions: 2),
+            ]
+        ))
+
+        let row = store.capacityDockToday(for: cursor)
+        #expect(row?.cost == 0.0086)
+        #expect(row?.calls == 14)
+        #expect(row?.inputTokens == 1_498)
+        #expect(row?.outputTokens == 277)
+        #expect(row?.sessions == 2)
+        #expect(row?.hasUsage == true)
+        // The tile keeps its own identity rather than borrowing a row's.
+        #expect(row?.id == "cursor")
+    }
+
+    @Test("The Droid tile reads the CLI's droid rows, not its own catalog id")
+    func factoryTileReadsDroid() {
+        let droid = CapacityDockProvider(rawValue: "factory")!
+        #expect(droid.payloadProviderIDs == ["droid"])
+        let store = store(todayPayload(
+            cost: 5,
+            calls: 20,
+            inputTokens: 100,
+            outputTokens: 200,
+            providerDetails: [
+                ProviderDetail(id: "droid", label: "Droid", cost: 5, calls: 20,
+                               hasUsage: true, inputTokens: 100, outputTokens: 200, sessions: 3),
+            ]
+        ))
+        #expect(store.capacityDockToday(for: droid)?.calls == 20)
+        #expect(store.capacityDockToday(for: droid)?.cost == 5)
+    }
+
+    @Test("ClinePass covers both Cline surfaces the CLI records separately")
+    func clinePassCoversBothClineRows() {
+        let pass = CapacityDockProvider(rawValue: "clinepass")!
+        #expect(pass.payloadProviderIDs == ["cline", "cline-cli"])
+        let store = store(todayPayload(
+            cost: 9,
+            calls: 30,
+            inputTokens: 900,
+            outputTokens: 90,
+            providerDetails: [
+                ProviderDetail(id: "cline", label: "Cline", cost: 6, calls: 20,
+                               hasUsage: true, inputTokens: 600, outputTokens: 60, sessions: 4),
+                ProviderDetail(id: "cline-cli", label: "Cline CLI", cost: 3, calls: 10,
+                               hasUsage: true, inputTokens: 300, outputTokens: 30, sessions: 1),
+            ]
+        ))
+        let row = store.capacityDockToday(for: pass)
+        #expect(row?.cost == 9)
+        #expect(row?.calls == 30)
+        #expect(row?.inputTokens == 900)
+        #expect(row?.sessions == 5)
+    }
+
+    @Test("A tile whose rows carry no token breakdown reports none rather than zero")
+    func combinedTileKeepsTokensAbsent() {
+        let cursor = CapacityDockProvider(rawValue: "cursor")!
+        let store = store(todayPayload(
+            cost: 1,
+            calls: 4,
+            inputTokens: 0,
+            outputTokens: 0,
+            providerDetails: [
+                ProviderDetail(id: "cursor", label: "Cursor", cost: 0.5, calls: 2, hasUsage: true,
+                               inputTokens: nil, outputTokens: nil, sessions: nil),
+                ProviderDetail(id: "cursor-agent", label: "Cursor Agent", cost: 0.5, calls: 2, hasUsage: true,
+                               inputTokens: nil, outputTokens: nil, sessions: nil),
+            ]
+        ))
+        let row = store.capacityDockToday(for: cursor)
+        #expect(row?.cost == 1)
+        #expect(row?.calls == 4)
+        #expect(row?.inputTokens == nil)
+        #expect(row?.outputTokens == nil)
+    }
+
     @Test("Kimi Code reads its CLI row rather than the CLI's separate kimi provider")
     func dockIDMapsToTheCLIProviderID() {
         #expect(CapacityDockProvider.kimiCode.payloadProviderID == "kimicode")

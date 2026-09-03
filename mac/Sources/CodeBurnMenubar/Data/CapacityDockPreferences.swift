@@ -58,6 +58,25 @@ struct CapacityDockProvider: RawRepresentable, CaseIterable, Identifiable, Hasha
     /// `kimicode` (its `kimi` is a different provider).
     var payloadProviderID: String { legacyFilter?.cliArg ?? rawValue }
 
+    /// Every payload provider this one tile stands for. A tile is an account the
+    /// user recognises; the CLI splits some accounts across more than one provider
+    /// row, and a tile that reads only the first row reports zero while the account
+    /// was busy. Cursor is the case in hand: one subscription, but sessions land
+    /// under `cursor` for the editor and `cursor-agent` for the agent.
+    var payloadProviderIDs: [String] {
+        switch payloadProviderID {
+        // One subscription, two rows: the editor and the agent.
+        case "cursor": ["cursor", "cursor-agent"]
+        // The tile is the Factory account, which the CLI records under its
+        // product name. Without this the Droid tile reads zero while Droid works.
+        case "factory": ["droid"]
+        // The ClinePass plan pays for both Cline surfaces, and the CLI records
+        // the extension and the command line tool as separate rows.
+        case "clinepass": ["cline", "cline-cli"]
+        default: [payloadProviderID]
+        }
+    }
+
     var iconName: String {
         switch rawValue {
         case Self.codex.rawValue, "openai", "azureopenai": "codex"
