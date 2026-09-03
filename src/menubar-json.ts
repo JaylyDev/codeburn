@@ -111,6 +111,11 @@ export type DailyModelBreakdown = {
   calls: number
   inputTokens: number
   outputTokens: number
+  /// Raw provider/model ids that collapsed into this display name (e.g.
+  /// `minimax/MiniMax-M3` and `MiniMaxAI/MiniMax-M3` both showing as "MiniMax
+  /// M3"). Present only when more than one raw id folded in, so a cached vs
+  /// uncached route can still be told apart (#1239).
+  rawModels?: string[]
 }
 
 export type DailyHistoryEntry = {

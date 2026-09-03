@@ -315,6 +315,20 @@ describe('aggregateModels', () => {
     expect(rows[0]!.calls).toBe(3)
   })
 
+  it('collapses two raw MiniMax routes into one row and keeps both visible as rawModels (#1239)', async () => {
+    const rows = await aggregateModels([makeProject([
+      makeTurn('feature', [makeCall({ provider: 'opencode', model: 'minimax/MiniMax-M3', input: 100, output: 50, costUSD: 0.05 })]),
+      makeTurn('feature', [makeCall({ provider: 'opencode', model: 'MiniMaxAI/MiniMax-M3', input: 200, output: 100, costUSD: 6.94 })]),
+    ])])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.modelDisplayName).toBe('MiniMax M3')
+    expect(rows[0]!.rawModels).toEqual(['minimax/MiniMax-M3', 'MiniMaxAI/MiniMax-M3'])
+    expect(rows[0]!.costUSD).toBeCloseTo(6.99, 6)
+
+    const parsed = JSON.parse(renderJson(rows))
+    expect(parsed[0].rawModels).toEqual(['minimax/MiniMax-M3', 'MiniMaxAI/MiniMax-M3'])
+  })
+
   it('does not merge the same display name across providers', async () => {
     const rows = await aggregateModels([makeProject([
       makeTurn('feature', [makeCall({ provider: 'cline-cli', model: 'glm-5p2', costUSD: 1 })]),

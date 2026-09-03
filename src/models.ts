@@ -1248,9 +1248,6 @@ const autoModelNames: Record<string, string> = {
 }
 
 const SHORT_NAMES: Record<string, string> = {
-  // claude-fable-5 and claude-mythos-5 are outside the opus/sonnet/haiku families deriveClaudeShortName covers.
-  'claude-fable-5': 'Fable 5',
-  'claude-mythos-5': 'Mythos 5',
   // Modern claude-<family>-<major>-<minor> ids are derived in deriveClaudeShortName.
   // Only the legacy 3.x ids (family-last) need explicit mapping.
   'claude-3-7-sonnet': 'Sonnet 3.7',
@@ -1363,9 +1360,15 @@ const SORTED_SHORT_NAMES: [string, string][] = Object.entries(SHORT_NAMES)
 // Anthropic's id scheme is `claude-<family>-<major>[-<minor>]`, so every new
 // version is derivable — no hand-maintained entry per release. (Legacy 3.x ids
 // put the family last, e.g. `claude-3-5-sonnet`, and stay in SHORT_NAMES.)
-const CLAUDE_FAMILY: Record<string, string> = { opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku' }
+const CLAUDE_FAMILY: Record<string, string> = {
+  opus: 'Opus',
+  sonnet: 'Sonnet',
+  haiku: 'Haiku',
+  fable: 'Fable',
+  mythos: 'Mythos',
+}
 function deriveClaudeShortName(canonical: string): string | undefined {
-  const m = canonical.match(/^claude-(opus|sonnet|haiku)-(\d+)(?:-(\d+))?/)
+  const m = canonical.match(/^claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d+))?/)
   if (!m) return undefined
   const [, family, major, minor] = m
   return `${CLAUDE_FAMILY[family]} ${major}${minor ? `.${minor}` : ''}`

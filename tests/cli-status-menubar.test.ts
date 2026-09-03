@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter as pathDelimiter, join } from 'node:path'
@@ -837,6 +837,52 @@ describe('codeburn status --format menubar-json', () => {
       expect(settled.status, `stderr: ${settled.stderr}`).toBe(0)
       const settledPayload = JSON.parse(settled.stdout) as { current: { calls: number } }
       expect(settledPayload.current.calls).toBe(2)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a provider payload cached under the previous render contract', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-provider-render-'))
+
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'myapp')
+      await mkdir(projectDir, { recursive: true })
+      const now = new Date()
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
+      const ts = (offset: number) => new Date(base.getTime() + offset).toISOString().replace(/\.\d+Z$/, 'Z')
+      await writeFile(
+        join(projectDir, 'session.jsonl'),
+        [userLine('s1', ts(0)), assistantLine('s1', ts(60_000), 'msg-1')].join('\n'),
+      )
+
+      const args = ['status', '--format', 'menubar-json', '--period', 'today', '--provider', 'all', '--no-optimize']
+      const first = runCli(args, home)
+      expect(first.status, `stderr: ${first.stderr}`).toBe(0)
+
+      const snapshotFiles = findSnapshotFiles(join(home, '.cache', 'codeburn'))
+      expect(snapshotFiles).toHaveLength(1)
+      const record = JSON.parse(await readFile(snapshotFiles[0]!, 'utf-8')) as {
+        semanticKey: string
+        payload: { current: { providerDetails: unknown[] } }
+      }
+      record.semanticKey = record.semanticKey.replace(/:render-\d+:/, ':render-2:')
+      record.payload.current.providerDetails = [
+        { id: 'legacy-idle', label: 'Legacy Idle', cost: 0 },
+      ]
+      await writeFile(snapshotFiles[0]!, JSON.stringify(record))
+
+      const second = runCli(args, home)
+      expect(second.status, `stderr: ${second.stderr}`).toBe(0)
+      const payload = JSON.parse(second.stdout) as {
+        current: { providerDetails: Array<{ id: string; calls: number; hasUsage: boolean }> }
+      }
+      expect(payload.current.providerDetails.map(provider => provider.id)).not.toContain('legacy-idle')
+      expect(payload.current.providerDetails.find(provider => provider.id === 'claude')).toMatchObject({
+        calls: 1,
+        hasUsage: true,
+      })
     } finally {
       await rm(home, { recursive: true, force: true })
     }

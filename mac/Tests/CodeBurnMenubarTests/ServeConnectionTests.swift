@@ -1057,6 +1057,29 @@ struct ServeConnectionTests {
         #expect(await fallback.snapshot() == 1)
     }
 
+    @Test("a verified-fresh request can bypass the resident worker")
+    func verifiedFreshRequestBypassesResident() async throws {
+        let resident = FallbackRecorder()
+        let fallback = FallbackRecorder()
+
+        let result = try await DataClient.runCLI(
+            subcommand: ["status", "--format", "menubar-json", "--provider", "hermes"],
+            bypassResident: true,
+            serveRequest: { _ in
+                await resident.record()
+                return Data("stale".utf8)
+            },
+            spawnFallback: {
+                await fallback.record()
+                return DataClient.ProcessResult(stdout: Data("fresh".utf8), stderr: "", exitCode: 0)
+            }
+        )
+
+        #expect(String(decoding: result.stdout, as: UTF8.self) == "fresh")
+        #expect(await resident.snapshot() == 0)
+        #expect(await fallback.snapshot() == 1)
+    }
+
     @Test("the first real request is the only cold-start query")
     func firstRequestIsTheWarmup() async throws {
         let dir = NSTemporaryDirectory() + "serve-connection-test-" + UUID().uuidString

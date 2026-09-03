@@ -736,11 +736,16 @@ describe('#946: a migration re-derives copilot instead of carrying it', () => {
 
   /// Seeds an older-version daily cache (what a 0.9.20 install leaves behind)
   /// so `loadDailyCache` takes the adoption path.
+  /// Pinned, not derived from DAILY_CACHE_VERSION: this fixture is the
+  /// pre-copilot-contract era, which is a fixed point in history.
+  /// `DAILY_CACHE_VERSION - 5` drifted across the copilot boundary (26) on the
+  /// next bump and silently stopped seeding the entitlement these tests check.
+  const PRE_COPILOT_CONTRACT_VERSION = 25
   const seedOlderCache = async (days: DailyEntry[]) => {
     await writeFile(
-      join(TMP_CACHE_ROOT, `daily-cache.v${DAILY_CACHE_VERSION - 4}.json`),
+      join(TMP_CACHE_ROOT, `daily-cache.v${PRE_COPILOT_CONTRACT_VERSION}.json`),
       JSON.stringify({
-        version: DAILY_CACHE_VERSION - 4,
+        version: PRE_COPILOT_CONTRACT_VERSION,
         savingsConfigHash: 'cfg-A',
         tzKey: currentTzKey(),
         lastComputedDate: daysAgoStr(1),
@@ -761,6 +766,61 @@ describe('#946: a migration re-derives copilot instead of carrying it', () => {
     expect(got.calls).toBe(27)
     // Spent by this re-derivation, so the guard is back on for every later run.
     expect(out.pendingRederive).toBeUndefined()
+  })
+
+  it('re-derives a Hermes slice after the cost-provenance contract changes', async () => {
+    const corrupt = slice(4603, 6764, { sessions: 6764 })
+    const corrected = slice(0.438, 6, { sessions: 6 })
+    await seedOlderCache([day(settled, { hermes: corrupt })])
+
+    const out = await ensureCacheHydrated(
+      noSessions,
+      () => [day(settled, { hermes: corrected })],
+      'cfg-A',
+    )
+
+    expect(out.days.find(d => d.date === settled)!.providers['hermes'])
+      .toMatchObject({ cost: 0.438, calls: 6, sessions: 6 })
+    expect(out.pendingRederive).toBeUndefined()
+  })
+
+  it('does not re-open Copilot re-derivation for a cache already past its contract change', async () => {
+    await writeFile(
+      join(TMP_CACHE_ROOT, `daily-cache.v${DAILY_CACHE_VERSION - 1}.json`),
+      JSON.stringify({
+        version: DAILY_CACHE_VERSION - 1,
+        savingsConfigHash: 'cfg-A',
+        tzKey: currentTzKey(),
+        lastComputedDate: daysAgoStr(1),
+        days: [day(settled, { copilot: PRE_STORE, hermes: slice(4603, 6764) })],
+        complete: true,
+        watermarkTrusted: true,
+      }),
+      'utf-8',
+    )
+
+    const loaded = await loadDailyCache()
+    expect(loaded.pendingRederive).toEqual(['hermes'])
+  })
+
+  it('preserves an older cache pending repair while adding a newer provider repair', async () => {
+    await writeFile(
+      join(TMP_CACHE_ROOT, `daily-cache.v${DAILY_CACHE_VERSION - 1}.json`),
+      JSON.stringify({
+        version: DAILY_CACHE_VERSION - 1,
+        savingsConfigHash: 'cfg-A',
+        tzKey: currentTzKey(),
+        lastComputedDate: daysAgoStr(1),
+        days: [day(settled, { copilot: PRE_STORE, hermes: slice(4603, 6764) })],
+        complete: true,
+        watermarkTrusted: true,
+        pendingRederive: ['copilot'],
+      }),
+      'utf-8',
+    )
+
+    const loaded = await loadDailyCache()
+    expect(loaded.pendingRederive).toEqual(['copilot', 'hermes'])
   })
 
   it('still carries the slice whole when the sources are gone (never-lose, #1033)', async () => {
@@ -794,7 +854,7 @@ describe('#946: a migration re-derives copilot instead of carrying it', () => {
   it('a PARTIAL parse does not spend the entitlement', async () => {
     await seedOlderCache([day(settled, { copilot: PRE_STORE })])
     const partial = await ensureCacheHydrated(noSessions, () => [], 'cfg-A', () => false)
-    expect(partial.pendingRederive).toEqual(['copilot'])
+    expect(partial.pendingRederive).toEqual(['copilot', 'hermes'])
     // The next COMPLETE run still gets to re-derive.
     const out = await ensureCacheHydrated(noSessions, () => [day(settled, { copilot: STORE_BACKED })], 'cfg-A')
     expect(out.days.find(d => d.date === settled)!.providers['copilot'])

@@ -272,7 +272,7 @@ function ProvidersPane({ period, refreshToken }: { period: Period; refreshToken:
   // the internal id. Fall back to the providers map keys (lowercased display
   // names) for older CLIs that omit providerDetails.
   const providers = details
-    ? details.filter(entry => entry.hasUsage ?? entry.cost > 0).map(entry => ({ id: entry.id, label: entry.label, cost: entry.cost }))
+    ? details.filter(entry => entry.hasUsage ?? true).map(entry => ({ id: entry.id, label: entry.label, cost: entry.cost }))
     : Object.entries(overview.data?.current.providers ?? {}).map(([id, cost]) => ({ id, label: id.charAt(0).toUpperCase() + id.slice(1), cost }))
   return <section className="set-p on">
     <div><h3 className="set-h">Providers</h3><p className="set-sub">codeburn auto-detects coding tools from local session files. No setup needed.</p></div>
