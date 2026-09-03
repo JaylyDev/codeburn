@@ -24,8 +24,8 @@ There is no separate build step required to run the dev CLI. `npm run dev` runs 
 
 | Command | What it does |
 |---|---|
-| `npm test` | Runs the vitest suite under `tests/` (189 of the 192 files, 2,494 tests). |
-| `npm run test:locks` | Runs the three parallelism-sensitive `cache-refresh-lock` suites serially. |
+| `npm test` | Runs the vitest suite under `tests/`, excluding the four serial lock suites. |
+| `npm run test:locks` | Runs the four parallelism-sensitive `cache-refresh-lock` suites serially. |
 | `npm run test:watch` | Same scope as `npm test`, in watch mode. |
 | `npm run dev -- status` | Runs the CLI in dev mode against your real data. |
 | `npm run build` | Builds the CLI and dashboard from the checked-in pricing catalogs without mutating tracked source files. |
@@ -83,7 +83,7 @@ See `docs/architecture.md` for a fuller map.
 
 ### The full suite is the gate
 
-Before opening or updating a PR, run `npx vitest run` on your branch and on `main`, and compare. Your branch must introduce zero new failures. Listing only your own new tests as verification is not verification; the regressions we catch are almost always in tests the author never ran. For `mac/` changes the same applies to `swift test`.
+Before opening or updating a PR, run `npm test` on your branch and on `main`, and compare (`cd app && npm test` if your change touches the Electron app). Your branch must introduce zero new failures. Listing only your own new tests as verification is not verification; the regressions we catch are almost always in tests the author never ran. For `mac/` changes the same applies to `swift test` run from `mac/`.
 
 ## Commit Message Format
 
