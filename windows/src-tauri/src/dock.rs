@@ -522,6 +522,10 @@ fn read_state() -> serde_json::Map<String, serde_json::Value> {
     read_state_at(&state_path())
 }
 
+/// Lock-free by design: the writer renames a whole file into place, so this sees the old file or
+/// the new one and never a torn one. What it costs is paid on the writer's side, where a read
+/// overlapping a replace is a failure Windows reports rather than waits out; see
+/// `crate::settings::replace_file`.
 fn read_state_at(path: &Path) -> serde_json::Map<String, serde_json::Value> {
     fs::read(path)
         .ok()
@@ -549,7 +553,9 @@ fn write_state_at(path: &Path, state: &serde_json::Map<String, serde_json::Value
         WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     fs::write(&temp, &bytes)?;
-    if let Err(err) = fs::rename(&temp, path) {
+    // Not a plain rename: on Windows a reader that has the target open can make the replace fail
+    // outright, and reads of this file take no lock. See `crate::settings::replace_file`.
+    if let Err(err) = crate::settings::replace_file(&temp, path) {
         // Nothing is left behind for the next launch to trip over.
         let _ = fs::remove_file(&temp);
         return Err(err.into());
@@ -2101,6 +2107,11 @@ mod tests {
         // the file as it really is, and the property under test is exactly what it watches for:
         // with the lock both counters only ever rise in the file, and a counter that falls is a
         // write that was erased, wherever in the run it happened.
+        //
+        // It reads the way both apps really do, lock-free and continuously, which on Windows is
+        // also what puts `crate::settings::replace_file`'s retry under load: this test is where
+        // a replace that gives up on a reader shows itself, as a writer reporting a failed
+        // write. Keep the loop tight for that reason as much as for the detection.
         let stop = Arc::new(AtomicBool::new(false));
         let watcher = {
             let (dock_file, stop) = (dock_file.clone(), stop.clone());

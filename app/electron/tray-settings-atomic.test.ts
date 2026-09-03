@@ -96,6 +96,47 @@ describe('writing a file the tray app reads', () => {
     expect(readdirSync(dirname(dockPath()))).toEqual(['windows-dock.json'])
   })
 
+  // Windows refuses to rename over a file another process has open, so a lock-free read on
+  // either side can fail a write on the other. The retry is Windows-only and this machine is
+  // not Windows, so the platform is what is faked here; the real API behaviour is CI's to prove.
+  describe('on Windows, where a rename over an open file is refused', () => {
+    const real = process.platform
+    const failWith = (code: string) => Object.assign(new Error(code), { code })
+    beforeEach(() => { Object.defineProperty(process, 'platform', { value: 'win32', configurable: true }) })
+    afterEach(() => { Object.defineProperty(process, 'platform', { value: real, configurable: true }) })
+
+    it('waits out a reader and lands the write', () => {
+      let refusals = 2
+      renameMock.mockImplementation((...args: Parameters<typeof actualFs.renameSync>) => {
+        if (refusals-- > 0) throw failWith('EPERM')
+        return actualFs.renameSync(...args)
+      })
+
+      writeFileAtomic(dockPath(), 'landed')
+
+      expect(renameMock).toHaveBeenCalledTimes(3)
+      expect(readFileSync(dockPath(), 'utf8')).toBe('landed')
+    })
+
+    it('gives up with the same error once the budget is out, leaving nothing behind', () => {
+      writeFileSync(dockPath(), 'old')
+      renameMock.mockImplementation(() => { throw failWith('EACCES') })
+
+      expect(() => writeFileAtomic(dockPath(), 'new')).toThrow('EACCES')
+
+      expect(renameMock).toHaveBeenCalledTimes(10)
+      expect(readFileSync(dockPath(), 'utf8')).toBe('old')
+      expect(readdirSync(dirname(dockPath()))).toEqual(['windows-dock.json'])
+    })
+
+    it('does not wait out an error a reader cannot cause', () => {
+      renameMock.mockImplementation(() => { throw failWith('ENOSPC') })
+
+      expect(() => writeFileAtomic(dockPath(), 'new')).toThrow('ENOSPC')
+      expect(renameMock).toHaveBeenCalledTimes(1)
+    })
+  })
+
   it('reports a failed write rather than letting it read as a save', () => {
     writeMock.mockImplementation(() => { throw new Error('ENOSPC') })
 

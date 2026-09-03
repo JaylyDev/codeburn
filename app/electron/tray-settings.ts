@@ -46,13 +46,51 @@ export function writeFileAtomic(path: string, contents: string): void {
   const temp = `${path}.${process.pid}.${Date.now()}.tmp`
   try {
     writeFileSync(temp, contents)
-    renameSync(temp, path)
+    renameOnto(temp, path)
   } catch (err) {
     try { unlinkSync(temp) } catch { /* nothing to clean up */ }
     throw err
   }
 }
 
+/** How long a replace may spend waiting out a reader before the write is reported as failed:
+ *  ten tries about 20ms apart, so roughly 200ms in the worst case. A read of one of these files
+ *  is a few microseconds of open file, so anything near this budget is not a reader at all. */
+const RENAME_ATTEMPTS = 10
+const RENAME_RETRY_MS = 20
+
+/**
+ * The rename half of the write, retried briefly on a Windows sharing violation.
+ *
+ * Readers of these files take no lock, on this side or the tray app's, and on POSIX that costs
+ * nothing: a rename over a file somebody has open always succeeds, and the reader keeps reading
+ * the file it opened. Windows refuses instead, with EPERM or EACCES, whenever something else
+ * holds the target open without having agreed to its deletion, and a scanner that opened the
+ * file behind our back does it just as well as one of our own processes. That is transient by
+ * nature, so it is waited out rather than reported as a write that did not land, which would be
+ * the very lost update the lock around this exists to prevent. The lock is already held here, so
+ * the wait can only ever be on a reader, never on another writer.
+ *
+ * Once the budget is out the original error is thrown, unchanged, and the caller cleans up.
+ */
+function renameOnto(temp: string, path: string): void {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      renameSync(temp, path)
+      return
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      const sharingViolation = code === 'EPERM' || code === 'EACCES' || code === 'EBUSY'
+      if (process.platform !== 'win32' || !sharingViolation || attempt >= RENAME_ATTEMPTS) throw err
+      sleepSync(RENAME_RETRY_MS)
+    }
+  }
+}
+
+/** Lock-free by design: the writer renames a whole file into place, so this sees the old file
+ *  or the new one and never a torn one. What it costs is paid on the writer's side, where a read
+ *  overlapping a replace is a failure Windows reports rather than waits out; see
+ *  {@link writeFileAtomic}. */
 export function readTrayFile(file: TraySettingsFile, home = homedir()): Record<string, unknown> {
   try {
     const parsed: unknown = JSON.parse(readFileSync(filePath(file, home), 'utf8').replace(/^﻿/, ''))

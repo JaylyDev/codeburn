@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
@@ -77,7 +77,10 @@ static PENDING_SECTION: Mutex<Option<String>> = Mutex::new(None);
 //               (a successor's), which is left alone.
 //
 // Reads take no lock: every writer renames a whole file into place, so a reader sees the old
-// file or the new one, never a torn one (the same reason config::read is lock-free).
+// file or the new one, never a torn one (the same reason config::read is lock-free). That is
+// still the right trade, but it is not free on Windows: a rename over a file some other process
+// has open can fail outright there rather than wait, so a read on either side can make a write
+// on the other fail. `replace_file` is where that is absorbed.
 //
 // Lessons borrowed from src/cache-refresh-lock.ts: exclusive create as the arbiter, a pid +
 // timestamp record, a staleness window so a dead holder cannot wedge the file forever, and a
@@ -411,6 +414,40 @@ pub(crate) mod prefs_lock {
     }
 }
 
+/// Rename `temp` over `target`, retrying briefly on a Windows sharing violation.
+///
+/// The rename is what makes a write atomic to a reader, and readers of these files take no lock
+/// on either side. On POSIX that costs nothing: a rename over an open file always succeeds, and
+/// whoever had it open keeps reading the file they opened. Windows refuses instead, with
+/// ERROR_ACCESS_DENIED or ERROR_SHARING_VIOLATION, whenever something else holds the target open
+/// without having agreed to its deletion, and a scanner opening the file behind our back does it
+/// just as well as one of our own processes. That failure is transient by nature, so it is
+/// retried for a short bounded time rather than reported as a write that did not land, which is
+/// the very lost update the lock around this exists to prevent.
+///
+/// The lock is already held by the time this runs, so the wait can only ever be on a reader,
+/// never on another writer, and readers hold the file for microseconds. Once the budget is out
+/// the error is returned unchanged. On POSIX this is a plain rename.
+pub(crate) fn replace_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        const RETRIES: u32 = 9;
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+        // ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION, as raw OS codes: the io::ErrorKind
+        // they map to is not stable enough to match on.
+        const SHARING: [i32; 2] = [5, 32];
+        for _ in 0..RETRIES {
+            match fs::rename(temp, target) {
+                Err(err) if err.raw_os_error().is_some_and(|code| SHARING.contains(&code)) => {
+                    std::thread::sleep(PAUSE);
+                }
+                result => return result,
+            }
+        }
+    }
+    fs::rename(temp, target)
+}
+
 // Preferences ---------------------------------------------------------------------------
 
 fn settings_path() -> PathBuf {
@@ -449,7 +486,7 @@ pub fn patch(values: Map<String, Value>) -> Result<Map<String, Value>> {
     }
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(&stored)?)?;
-    fs::rename(&tmp, &path)?;
+    replace_file(&tmp, &path)?;
     Ok(stored)
 }
 
