@@ -113,13 +113,6 @@ function ownsProcessGroup(): boolean {
   return platform() !== 'win32'
 }
 
-/**
- * Children spawned through `cmd.exe`. The shim exits the moment it has started node, and
- * the handle we hold is the shim's, so ending it leaves the parse running with nobody
- * reading it. `taskkill /T` is what reaches the generation below on Windows.
- */
-const shellChildren = new WeakSet<ChildProcess>()
-
 /** Everything but the stdio shape, which stays at the call site so its literal tuple keeps
  *  telling the type system which streams the child will have. */
 function spawnOptionsFor(spec: SpawnSpec) {
@@ -131,27 +124,63 @@ function spawnOptionsFor(spec: SpawnSpec) {
   }
 }
 
-/** Remember a child that runs behind `cmd.exe`, so ending it later ends the tree. */
-function trackSpawned<T extends ChildProcess>(spec: SpawnSpec, child: T): T {
-  if (spec.verbatim) shellChildren.add(child)
-  return child
+/** `taskkill.exe` out of System32, never by bare name: Windows searches the current
+ *  directory first, so anything dropped beside the app could answer for it. Same rule as
+ *  `comspecPath` below. */
+export function taskkillPath(env: NodeJS.ProcessEnv = process.env): string {
+  const root = env.SystemRoot
+  const base = root && /^[a-zA-Z]:[\\/]/.test(root) ? root.replace(/[\\/]+$/, '') : 'C:\\Windows'
+  return `${base}\\System32\\taskkill.exe`
 }
 
-/** Signal the CLI and every subprocess it created. POSIX children are spawned
- * as process-group leaders; on Windows only a child behind a `cmd.exe` shim has a tree
- * worth reaching, and `taskkill` is the only way to reach it. */
-function signalOwnedTree(child: ChildProcess, signal: NodeJS.Signals): boolean {
-  if (ownsProcessGroup() && child.pid) {
-    try { process.kill(-child.pid, signal); return true } catch { /* already gone or no group */ }
+/** The one taskkill argv, exported so a test can pin it: end this pid and everything
+ *  below it, without asking. */
+export function taskkillArgs(pid: number): string[] {
+  return ['/pid', String(pid), '/T', '/F']
+}
+
+/**
+ * End a Windows child and every process below it.
+ *
+ * `child.kill()` reaches one process. That is never the whole CLI: a `.cmd` shim runs node
+ * as its own child, and the CLI itself spawns provider subprocesses. `taskkill /T` walks
+ * the tree from this pid and is the only way to reach them.
+ *
+ * The handle is ended only once taskkill has finished, or could not run at all. Ending it
+ * first is what made the tree kill a no-op: the descendants are reparented the moment the
+ * top of the tree dies, and `taskkill /pid` on a pid that has already gone reports it as
+ * not found and reaps nothing.
+ *
+ * `/F` on every signal, including SIGTERM: Windows has no catchable termination signal, so
+ * `child.kill('SIGTERM')` is already an unconditional TerminateProcess. The graceful half
+ * of {@link killGracefully} exists for POSIX.
+ */
+function killWindowsTree(child: ChildProcess, signal: NodeJS.Signals): boolean {
+  const pid = child.pid
+  if (!pid) return false
+  const endHandle = () => { try { child.kill(signal) } catch { /* already gone */ } }
+  let killer: ChildProcess
+  try {
+    killer = spawn(taskkillPath(), taskkillArgs(pid), { stdio: 'ignore', windowsHide: true })
+  } catch {
+    endHandle()
+    return true
   }
-  if (!ownsProcessGroup() && child.pid && shellChildren.has(child)) {
-    // Best effort and fire-and-forget: the child handle is killed below either way, so a
-    // taskkill that cannot run leaves exactly the behaviour there was before.
-    try {
-      spawn(`${process.env.SystemRoot || 'C:\\Windows'}\\System32\\taskkill.exe`,
-        ['/pid', String(child.pid), '/T', '/F'],
-        { stdio: 'ignore', windowsHide: true }).on('error', () => {})
-    } catch { /* fall through to the direct kill */ }
+  // A non-zero exit means taskkill found nothing to end, which is the state we were after
+  // anyway; the direct kill then costs nothing. So a taskkill that cannot run at all leaves
+  // exactly the behaviour there was before.
+  killer.on('error', endHandle)
+  killer.on('exit', code => { if (code !== 0) endHandle() })
+  return true
+}
+
+/** Signal the CLI and every subprocess it created. POSIX children are spawned as
+ *  process-group leaders; Windows has no process group to signal, so the tree is walked
+ *  by pid instead. */
+function signalOwnedTree(child: ChildProcess, signal: NodeJS.Signals): boolean {
+  if (!ownsProcessGroup()) return killWindowsTree(child, signal)
+  if (child.pid) {
+    try { process.kill(-child.pid, signal); return true } catch { /* already gone or no group */ }
   }
   try { return child.kill(signal) } catch { return false }
 }
@@ -536,7 +565,7 @@ function withoutProgressLines(stderr: string): string {
 
 function runCli(spec: SpawnSpec, cmdLabel: string, timeoutMs: number, onStderr?: (chunk: string) => void): Promise<unknown> {
   return new Promise<unknown>((resolve, reject) => {
-    const child = trackSpawned(spec, spawn(spec.bin, spec.args, { stdio: ['ignore', 'pipe', 'pipe'], ...spawnOptionsFor(spec) }))
+    const child = spawn(spec.bin, spec.args, { stdio: ['ignore', 'pipe', 'pipe'], ...spawnOptionsFor(spec) })
     activeChildren.add(child)
     let stdout = ''
     let stderr = ''
@@ -690,7 +719,7 @@ class ServeClient {
 
   start(): void {
     if (this.child || this.disabled() || this.destroyed) return
-    const child = trackSpawned(this.spec, spawn(this.spec.bin, [...this.spec.args], { stdio: ['pipe', 'pipe', 'ignore'], ...spawnOptionsFor(this.spec) }))
+    const child = spawn(this.spec.bin, [...this.spec.args], { stdio: ['pipe', 'pipe', 'ignore'], ...spawnOptionsFor(this.spec) })
     this.child = child
     if (this.pidFile && child.pid) {
       const record = JSON.stringify({ pid: child.pid, cmd: [this.spec.bin, ...this.spec.args].join(' '), processGroup: ownsProcessGroup() })
@@ -1095,7 +1124,7 @@ export function spawnCliAction(args: string[], opts: { timeoutMs?: number; extra
 // no long silent stretch for a watchdog to misread.
 function runAction(spec: SpawnSpec, args: string[], timeoutMs: number): Promise<ActionResult> {
   return new Promise<ActionResult>(resolve => {
-    const child = trackSpawned(spec, spawn(spec.bin, spec.args, { stdio: ['ignore', 'pipe', 'pipe'], ...spawnOptionsFor(spec) }))
+    const child = spawn(spec.bin, spec.args, { stdio: ['ignore', 'pipe', 'pipe'], ...spawnOptionsFor(spec) })
     activeChildren.add(child)
     let stdout = ''
     let stderr = ''
