@@ -84,6 +84,13 @@ export type ProviderCost = {
   calls?: number
   /** True when the selected period contains cost, calls, sessions, savings, or tokens. */
   hasUsage?: boolean
+  /** Provider-scoped tokens for the period. Absent (not zero) when no day in the
+   *  period carried a per-provider token breakdown, so a consumer can tell
+   *  "no token data" from "no tokens". */
+  inputTokens?: number
+  outputTokens?: number
+  /** Provider-scoped session count for the period, absent under the same rule. */
+  sessions?: number
 }
 import type { OptimizeResult } from './optimize.js'
 import { getCurrency } from './currency.js'
@@ -276,7 +283,20 @@ export type MenubarPayload = {
     /// provider name (round-trips as `--provider`), `label` the display name,
     /// and `hasUsage` the period-activity signal used by provider pickers.
     /// The `providers` map keys stay lowercased display names for compatibility.
-    providerDetails: Array<{ id: string; label: string; cost: number; calls: number; hasUsage: boolean }>
+    /// `inputTokens`, `outputTokens` and `sessions` are add-only and optional:
+    /// they are omitted when the period carries no per-provider breakdown for
+    /// them, so a consumer must render the absence rather than substitute a
+    /// period-wide figure.
+    providerDetails: Array<{
+      id: string
+      label: string
+      cost: number
+      calls: number
+      hasUsage: boolean
+      inputTokens?: number
+      outputTokens?: number
+      sessions?: number
+    }>
     topProjects: Array<{
       name: string
       cost: number
@@ -490,6 +510,9 @@ function buildProviderDetails(providers: ProviderCost[]): MenubarPayload['curren
       cost: p.cost,
       calls: p.calls ?? 0,
       hasUsage: p.hasUsage ?? (p.cost > 0 || (p.calls ?? 0) > 0),
+      ...(p.inputTokens === undefined ? {} : { inputTokens: p.inputTokens }),
+      ...(p.outputTokens === undefined ? {} : { outputTokens: p.outputTokens }),
+      ...(p.sessions === undefined ? {} : { sessions: p.sessions }),
     }))
 }
 

@@ -24,6 +24,30 @@ import { buildGranularHistory } from './granular-history.js'
 const TOP_BRANCHES = 15
 type SubagentRow = NonNullable<BreakdownArrays['subagents']>[number]
 
+export type ProviderSliceTotal = {
+  cost: number
+  calls: number
+  hasUsage: boolean
+  inputTokens?: number
+  outputTokens?: number
+  sessions?: number
+}
+
+/// Folds one day's provider slice into the period total. Tokens and sessions are
+/// optional on the slice (a day finalized before they were cached carries
+/// neither), and stay absent in the total until some day actually reports them,
+/// so a consumer can tell "no breakdown" from "zero".
+export function addProviderSlice(totals: Record<string, ProviderSliceTotal>, name: string, slice: ProviderDaySlice): void {
+  const total = totals[name] ?? { cost: 0, calls: 0, hasUsage: false }
+  total.cost += slice.cost
+  total.calls += slice.calls
+  total.hasUsage ||= providerSliceHasUsage(slice)
+  if (slice.inputTokens !== undefined) total.inputTokens = (total.inputTokens ?? 0) + slice.inputTokens
+  if (slice.outputTokens !== undefined) total.outputTokens = (total.outputTokens ?? 0) + slice.outputTokens
+  if (slice.sessions !== undefined) total.sessions = (total.sessions ?? 0) + slice.sessions
+  totals[name] = total
+}
+
 export function providerSliceHasUsage(slice: ProviderDaySlice): boolean {
   return slice.cost > 0
     || slice.savingsUSD > 0
@@ -861,15 +885,9 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   const displayNameByName = new Map(allProviders.map(p => [p.name, p.displayName]))
   const providers: ProviderCost[] = []
   if (isClaudeConfigScoped) {
-    const providerTotals: Record<string, { cost: number; calls: number; hasUsage: boolean }> = {}
+    const providerTotals: Record<string, ProviderSliceTotal> = {}
     for (const d of aggregateProjectsIntoDays(scanProjects)) {
-      for (const [name, p] of Object.entries(d.providers)) {
-        const total = providerTotals[name] ?? { cost: 0, calls: 0, hasUsage: false }
-        total.cost += p.cost
-        total.calls += p.calls
-        total.hasUsage ||= providerSliceHasUsage(p)
-        providerTotals[name] = total
-      }
+      for (const [name, p] of Object.entries(d.providers)) addProviderSlice(providerTotals, name, p)
     }
     for (const [name, total] of Object.entries(providerTotals)) {
       providers.push({ name, displayName: displayNameByName.get(name) ?? name, ...total })
@@ -890,15 +908,9 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
     // implies !isClaudeConfigScoped, which forces the !effectivelyScoped path that
     // assigns it.
     const allDaysForProviders = cacheDaysForPeriod ?? []
-    const providerTotals: Record<string, { cost: number; calls: number; hasUsage: boolean }> = {}
+    const providerTotals: Record<string, ProviderSliceTotal> = {}
     for (const d of allDaysForProviders) {
-      for (const [name, p] of Object.entries(d.providers)) {
-        const total = providerTotals[name] ?? { cost: 0, calls: 0, hasUsage: false }
-        total.cost += p.cost
-        total.calls += p.calls
-        total.hasUsage ||= providerSliceHasUsage(p)
-        providerTotals[name] = total
-      }
+      for (const [name, p] of Object.entries(d.providers)) addProviderSlice(providerTotals, name, p)
     }
     for (const [name, total] of Object.entries(providerTotals)) {
       providers.push({ name, displayName: displayNameByName.get(name) ?? name, ...total })
@@ -914,6 +926,11 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
       displayName: displayNameByName.get(pf) ?? pf,
       cost: currentData.cost,
       calls: currentData.calls,
+      // The whole period is this one provider, so the period totals ARE its
+      // per-provider breakdown.
+      inputTokens: currentData.inputTokens,
+      outputTokens: currentData.outputTokens,
+      sessions: currentData.sessions,
       hasUsage: currentData.cost > 0
         || currentData.savingsUSD > 0
         || currentData.calls > 0

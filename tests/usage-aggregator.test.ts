@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeAll } from 'vitest'
-import { buildMenubarPayloadForRange, mergeDayModelsByDisplayName, providerSliceHasUsage } from '../src/usage-aggregator.js'
+import { addProviderSlice, buildMenubarPayloadForRange, mergeDayModelsByDisplayName, providerSliceHasUsage, type ProviderSliceTotal } from '../src/usage-aggregator.js'
 import { getDateRange } from '../src/cli-date.js'
 import { loadPricing } from '../src/models.js'
 import type { ModelDayStats } from '../src/daily-cache.js'
@@ -39,6 +39,42 @@ describe('buildMenubarPayloadForRange', () => {
     // optimize:false => scanAndDetect skipped => empty optimize block regardless of data
     expect(payload.optimize).toEqual({ findingCount: 0, savingsUSD: 0, topFindings: [] })
     expect(payload.stale).toBeUndefined()
+  })
+})
+
+// The fold both cache-backed provider branches use (claude-config-scoped and
+// all-providers). The dock's glance reads these per-provider figures, so a sum
+// that leaked across providers would print another provider's spend.
+describe('addProviderSlice', () => {
+  it('sums cost, calls, tokens and sessions per provider across days', () => {
+    const totals: Record<string, ProviderSliceTotal> = {}
+    addProviderSlice(totals, 'claude', { cost: 10, calls: 4, savingsUSD: 0, inputTokens: 100, outputTokens: 20, sessions: 2 })
+    addProviderSlice(totals, 'claude', { cost: 2.5, calls: 1, savingsUSD: 0, inputTokens: 50, outputTokens: 5, sessions: 1 })
+    addProviderSlice(totals, 'codex', { cost: 1, calls: 3, savingsUSD: 0, inputTokens: 7, outputTokens: 3, sessions: 1 })
+
+    expect(totals.claude).toEqual({ cost: 12.5, calls: 5, hasUsage: true, inputTokens: 150, outputTokens: 25, sessions: 3 })
+    expect(totals.codex).toEqual({ cost: 1, calls: 3, hasUsage: true, inputTokens: 7, outputTokens: 3, sessions: 1 })
+  })
+
+  it('leaves tokens absent (not zero) when no day carried a breakdown', () => {
+    const totals: Record<string, ProviderSliceTotal> = {}
+    // A day finalized before per-provider tokens were cached.
+    addProviderSlice(totals, 'claude', { cost: 3, calls: 2, savingsUSD: 0 })
+    expect(totals.claude).toEqual({ cost: 3, calls: 2, hasUsage: true })
+    expect(totals.claude!.inputTokens).toBeUndefined()
+    expect(totals.claude!.outputTokens).toBeUndefined()
+    expect(totals.claude!.sessions).toBeUndefined()
+
+    // One day that does report them makes the total reportable again, counting
+    // only what was actually reported.
+    addProviderSlice(totals, 'claude', { cost: 1, calls: 1, savingsUSD: 0, inputTokens: 9, outputTokens: 4 })
+    expect(totals.claude).toEqual({ cost: 4, calls: 3, hasUsage: true, inputTokens: 9, outputTokens: 4 })
+  })
+
+  it('keeps a token-only day visible as usage', () => {
+    const totals: Record<string, ProviderSliceTotal> = {}
+    addProviderSlice(totals, 'hermes', { cost: 0, calls: 0, savingsUSD: 0, inputTokens: 12, outputTokens: 0 })
+    expect(totals.hermes).toEqual({ cost: 0, calls: 0, hasUsage: true, inputTokens: 12, outputTokens: 0 })
   })
 })
 

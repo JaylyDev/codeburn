@@ -2001,6 +2001,42 @@ final class AppStore {
         return todayPayload?.current
     }
 
+    /// Today's totals for ONE provider's glance card. The card is provider
+    /// scoped, so the machine-wide `capacityDockToday` block is the wrong number
+    /// in it; `providerDetails` carries the per-provider row.
+    ///
+    /// Nil when the payload has no provider breakdown at all (a CLI old enough
+    /// to omit `providerDetails`), which hides the section rather than showing a
+    /// figure that belongs to every other provider too. A provider simply absent
+    /// from a breakdown that IS present had no usage today, which is a real
+    /// zero, not missing data.
+    func capacityDockToday(for provider: CapacityDockProvider) -> ProviderDetail? {
+        guard let current = capacityDockToday, !current.providerDetails.isEmpty else { return nil }
+        let ids = Set(provider.payloadProviderIDs)
+        let rows = current.providerDetails.filter { ids.contains($0.id) }
+        let id = provider.payloadProviderID
+        guard let first = rows.first else {
+            return ProviderDetail(id: id, label: provider.displayName, cost: 0, calls: 0, hasUsage: false)
+        }
+        guard rows.count > 1 else { return first }
+        // A token field stays absent until some row reports it, so that "an old CLI
+        // sent none" keeps reading differently from "this account used none".
+        func sum(_ value: (ProviderDetail) -> Int?) -> Int? {
+            let present = rows.compactMap(value)
+            return present.isEmpty ? nil : present.reduce(0, +)
+        }
+        return ProviderDetail(
+            id: id,
+            label: provider.displayName,
+            cost: rows.reduce(0) { $0 + $1.cost },
+            calls: rows.reduce(0) { $0 + $1.calls },
+            hasUsage: rows.contains { $0.hasUsage },
+            inputTokens: sum(\.inputTokens),
+            outputTokens: sum(\.outputTokens),
+            sessions: sum(\.sessions)
+        )
+    }
+
     func capacityDockQuotaSummary(for provider: CapacityDockProvider) -> QuotaSummary? {
         if let filter = provider.legacyFilter {
             return quotaSummary(for: filter)

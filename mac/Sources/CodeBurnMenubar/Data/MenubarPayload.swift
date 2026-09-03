@@ -371,17 +371,36 @@ struct ProviderDetail: Codable, Sendable {
     let cost: Double
     let calls: Int
     let hasUsage: Bool
+    /// Provider-scoped tokens and sessions for the period. Nil on every CLI up
+    /// to 0.9.23, which never emitted them: absent means "no breakdown", which
+    /// the glance renders as a missing column rather than as zero or as the
+    /// machine-wide figure.
+    let inputTokens: Int?
+    let outputTokens: Int?
+    let sessions: Int?
 
-    init(id: String, label: String, cost: Double, calls: Int, hasUsage: Bool) {
+    init(
+        id: String,
+        label: String,
+        cost: Double,
+        calls: Int,
+        hasUsage: Bool,
+        inputTokens: Int? = nil,
+        outputTokens: Int? = nil,
+        sessions: Int? = nil
+    ) {
         self.id = id
         self.label = label
         self.cost = cost
         self.calls = calls
         self.hasUsage = hasUsage
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.sessions = sessions
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, label, cost, calls, hasUsage
+        case id, label, cost, calls, hasUsage, inputTokens, outputTokens, sessions
     }
 
     init(from decoder: Decoder) throws {
@@ -397,6 +416,9 @@ struct ProviderDetail: Codable, Sendable {
         // is one the user has, so absent means visible; the strict signal
         // applies only when the field is actually present.
         hasUsage = try c.decodeIfPresent(Bool.self, forKey: .hasUsage) ?? true
+        inputTokens = try c.decodeIfPresent(Int.self, forKey: .inputTokens)
+        outputTokens = try c.decodeIfPresent(Int.self, forKey: .outputTokens)
+        sessions = try c.decodeIfPresent(Int.self, forKey: .sessions)
     }
 }
 
