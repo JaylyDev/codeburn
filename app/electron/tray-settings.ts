@@ -15,9 +15,11 @@
 // After a write the tray app is nudged with `--reload-settings`, which makes it re-read both
 // files and broadcast to its own windows. That is done by the caller, which owns the process.
 
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import {
+  closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 export type TraySettingsFile = 'app' | 'dock'
 
@@ -44,13 +46,51 @@ export function writeFileAtomic(path: string, contents: string): void {
   const temp = `${path}.${process.pid}.${Date.now()}.tmp`
   try {
     writeFileSync(temp, contents)
-    renameSync(temp, path)
+    renameOnto(temp, path)
   } catch (err) {
     try { unlinkSync(temp) } catch { /* nothing to clean up */ }
     throw err
   }
 }
 
+/** How long a replace may spend waiting out a reader before the write is reported as failed:
+ *  ten tries about 20ms apart, so roughly 200ms in the worst case. A read of one of these files
+ *  is a few microseconds of open file, so anything near this budget is not a reader at all. */
+const RENAME_ATTEMPTS = 10
+const RENAME_RETRY_MS = 20
+
+/**
+ * The rename half of the write, retried briefly on a Windows sharing violation.
+ *
+ * Readers of these files take no lock, on this side or the tray app's, and on POSIX that costs
+ * nothing: a rename over a file somebody has open always succeeds, and the reader keeps reading
+ * the file it opened. Windows refuses instead, with EPERM or EACCES, whenever something else
+ * holds the target open without having agreed to its deletion, and a scanner that opened the
+ * file behind our back does it just as well as one of our own processes. That is transient by
+ * nature, so it is waited out rather than reported as a write that did not land, which would be
+ * the very lost update the lock around this exists to prevent. The lock is already held here, so
+ * the wait can only ever be on a reader, never on another writer.
+ *
+ * Once the budget is out the original error is thrown, unchanged, and the caller cleans up.
+ */
+function renameOnto(temp: string, path: string): void {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      renameSync(temp, path)
+      return
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      const sharingViolation = code === 'EPERM' || code === 'EACCES' || code === 'EBUSY'
+      if (process.platform !== 'win32' || !sharingViolation || attempt >= RENAME_ATTEMPTS) throw err
+      sleepSync(RENAME_RETRY_MS)
+    }
+  }
+}
+
+/** Lock-free by design: the writer renames a whole file into place, so this sees the old file
+ *  or the new one and never a torn one. What it costs is paid on the writer's side, where a read
+ *  overlapping a replace is a failure Windows reports rather than waits out; see
+ *  {@link writeFileAtomic}. */
 export function readTrayFile(file: TraySettingsFile, home = homedir()): Record<string, unknown> {
   try {
     const parsed: unknown = JSON.parse(readFileSync(filePath(file, home), 'utf8').replace(/^﻿/, ''))
@@ -61,15 +101,178 @@ export function readTrayFile(file: TraySettingsFile, home = homedir()): Record<s
   }
 }
 
+// Cross-process preference lock -------------------------------------------------------------
+//
+// windows-settings.json and windows-dock.json are each owned by two processes at once: this
+// desktop app and the Windows tray app. Both do a read / modify / write to merge their own keys
+// into whatever the other last stored. The atomic rename each already does stops a torn file,
+// but not a lost update: two writers read the same state, change different keys, and the later
+// rename erases the earlier writer's key, so a dock placement, an enabled switch, a provider
+// choice or a scale silently reverts. This lock serializes the whole cycle so that never
+// happens. The tray app runs the same protocol from Rust; the single write-up lives in
+// windows/src-tauri/src/settings.rs (`prefs_lock`). The essentials, so both sides stay in step:
+//
+//   Lock file:  sibling of the target named `.<stem>.lock` (windows-dock.json ->
+//               `.windows-dock.lock`).
+//   Body:       one line of JSON, `{"pid":<os pid>,"at":<unix ms>}`.
+//   Acquire:    exclusive create ('wx'). On success keep the handle open for the whole cycle.
+//               On collision take the lock over only if abandoned, else poll until a short wait
+//               budget runs out and then throw rather than write behind the holder.
+//   Abandoned:  its mtime is older than the stale window (a crashed holder never refreshes it),
+//               OR its recorded pid is not ours and no longer alive. A live holder is neither.
+//   Takeover:   removing an abandoned lock is itself arbitrated, by an exclusive create of
+//               `<lock>.takeover`. Only its winner may unlink the lock, and only after
+//               re-checking that the lock is still abandoned. See `reclaimAbandoned`.
+//   Release:    close the handle and unlink, unless it now carries a different pid.
+
+const LOCK_POLL_MS = 50
+const LOCK_WAIT_MS = 2_000
+const LOCK_STALE_MS = 30_000
+
+export type TrayLockOptions = { waitMs?: number; pollMs?: number; staleMs?: number }
+
+function lockPathFor(target: string): string {
+  const stem = basename(target).replace(/\.json$/, '')
+  return join(dirname(target), `.${stem}.lock`)
+}
+
+// A synchronous sleep, so the whole lock stays synchronous and callers of patchTrayFile do not
+// have to become async. Atomics.wait blocks this thread without spinning the CPU.
+const lockSleepBuffer = new Int32Array(new SharedArrayBuffer(4))
+function sleepSync(ms: number): void {
+  Atomics.wait(lockSleepBuffer, 0, 0, ms)
+}
+
+// Signal-0 style liveness. A false "alive" (a reused pid) only delays recovery to the age gate;
+// a false "dead" is the dangerous direction, so our own pid and anything unprobeable read alive.
+function holderAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  if (pid === process.pid) return true
+  try { process.kill(pid, 0); return true }
+  catch (err) { return (err as NodeJS.ErrnoException).code === 'EPERM' }
+}
+
+function lockAbandoned(lockPath: string, staleMs: number): boolean {
+  let mtimeMs: number
+  try { mtimeMs = statSync(lockPath).mtimeMs }
+  catch { return false } // vanished between the failed create and this check; just retry create
+  if (Date.now() - mtimeMs > staleMs) return true
+  let pid: number | undefined
+  try {
+    const parsed = JSON.parse(readFileSync(lockPath, 'utf8')) as { pid?: unknown }
+    if (typeof parsed?.pid === 'number') pid = parsed.pid
+  } catch { /* empty or unparseable body: only the age gate can free it */ }
+  return pid !== undefined && pid !== process.pid && !holderAlive(pid)
+}
+
+/**
+ * Remove an abandoned lock, but only as the one process entitled to. Two contenders that both
+ * find the same stale lock would otherwise both unlink it: the first has already replaced it
+ * with a lock of its own, and the second's unlink deletes that fresh one, so both walk away
+ * holding the file. Windows usually hides this, because a lock a live holder still has open
+ * will not unlink at all, but this protocol is also run on Linux and macOS, where the unlink
+ * always succeeds.
+ *
+ * So the removal is arbitrated by the same primitive the lock itself uses: an exclusive create
+ * of `<lock>.takeover`. Its winner alone may unlink, and only after re-checking staleness under
+ * that right, because a rival may have reclaimed already and now hold a lock that is not
+ * abandoned and not ours to remove. The takeover file is dropped on every path out, and never
+ * held across the wait; one left behind by a reclaimer that died is freed by the same staleness
+ * rule as the lock.
+ *
+ * Returns whether the caller should retry the exclusive create at once.
+ */
+function reclaimAbandoned(lockPath: string, staleMs: number): boolean {
+  const takeoverPath = `${lockPath}.takeover`
+  let fd: number
+  try {
+    fd = openSync(takeoverPath, 'wx', 0o600)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+    // Somebody else is reclaiming, or a dead reclaimer left this behind. The lock itself is
+    // never touched from here; the most this does is free the takeover file for a later try.
+    if (lockAbandoned(takeoverPath, staleMs)) {
+      try { unlinkSync(takeoverPath) } catch { /* already gone */ }
+    }
+    return false
+  }
+  try {
+    try { writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() })) } catch { /* advisory */ }
+    if (!lockAbandoned(lockPath, staleMs)) return false
+    try { unlinkSync(lockPath) } catch { return false }
+    return true
+  } finally {
+    try { closeSync(fd) } catch { /* already closed */ }
+    try { unlinkSync(takeoverPath) } catch { /* already gone */ }
+  }
+}
+
+/**
+ * Take the cross-process lock for `target`, returning the open descriptor to release. Throws if
+ * the lock stays held past the wait budget rather than writing behind the holder, so a contended
+ * write is reported to the caller instead of being silently lost.
+ */
+export function acquireTrayFileLock(target: string, options: TrayLockOptions = {}): number {
+  const waitMs = options.waitMs ?? LOCK_WAIT_MS
+  const pollMs = options.pollMs ?? LOCK_POLL_MS
+  const staleMs = options.staleMs ?? LOCK_STALE_MS
+  mkdirSync(dirname(target), { recursive: true })
+  const lockPath = lockPathFor(target)
+  const body = JSON.stringify({ pid: process.pid, at: Date.now() })
+  const deadline = Date.now() + waitMs
+  for (;;) {
+    let fd: number
+    try {
+      fd = openSync(lockPath, 'wx', 0o600)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+      // A successful reclaim means the holder was genuinely abandoned and this process won the
+      // right to remove its lock; retry the create at once. Anything else (a live holder, a
+      // contender already reclaiming, an unlink that failed) falls through to the wait.
+      if (lockAbandoned(lockPath, staleMs) && reclaimAbandoned(lockPath, staleMs)) continue
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `could not lock ${basename(lockPath)} within ${waitMs}ms; another process is writing ` +
+          `${basename(target)}, so nothing was changed`,
+        )
+      }
+      sleepSync(pollMs)
+      continue
+    }
+    // The body is advisory; even if this write fails we still hold the lock the create just won.
+    try { writeSync(fd, body) } catch { /* body is advisory */ }
+    return fd
+  }
+}
+
+/** Close the descriptor and remove the lock, unless it now carries a successor's pid. */
+export function releaseTrayFileLock(target: string, fd: number): void {
+  const lockPath = lockPathFor(target)
+  try { closeSync(fd) } catch { /* already closed */ }
+  try {
+    const parsed = JSON.parse(readFileSync(lockPath, 'utf8')) as { pid?: unknown }
+    // A different pid means we were taken over (only possible past the stale window); leave it.
+    if (typeof parsed?.pid === 'number' && parsed.pid !== process.pid) return
+  } catch { /* empty or unparseable: it is the one we just made, so remove it */ }
+  try { unlinkSync(lockPath) } catch { /* already gone */ }
+}
+
 /** Merge the given keys into the file, leaving every other key the tray app owns alone. */
 export function patchTrayFile(
   file: TraySettingsFile,
   patch: Record<string, unknown>,
   home = homedir(),
 ): Record<string, unknown> {
-  const merged = { ...readTrayFile(file, home), ...patch }
-  writeFileAtomic(filePath(file, home), `${JSON.stringify(merged, null, 2)}\n`)
-  return merged
+  const target = filePath(file, home)
+  // The whole read/modify/write is serialized against the tray app. See the protocol above.
+  const fd = acquireTrayFileLock(target)
+  try {
+    const merged = { ...readTrayFile(file, home), ...patch }
+    writeFileAtomic(target, `${JSON.stringify(merged, null, 2)}\n`)
+    return merged
+  } finally {
+    releaseTrayFileLock(target, fd)
+  }
 }
 
 // What each setting may be -----------------------------------------------------------------

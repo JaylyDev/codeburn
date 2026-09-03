@@ -312,16 +312,13 @@ export function readDockEnabled(home = homedir()): boolean | undefined {
 }
 
 /** Read, change one key, write back. The tray app owns every other key in this file (the
- *  rail's placement, size and provider set), so the whole object is preserved. */
+ *  rail's placement, size and provider set), so the whole object is preserved. The cycle goes
+ *  through {@link patchTrayFile} rather than being done here, because the tray app writes this
+ *  same file: a read/modify/write outside the cross-process lock erases whatever the tray app
+ *  stored between this side's read and its rename, which is the rail's placement more often
+ *  than not. */
 export function writeDockEnabled(enabled: boolean, home = homedir()): void {
-  const path = dockPrefsPath(home)
-  let prefs: Record<string, unknown> = {}
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'))
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) prefs = parsed as Record<string, unknown>
-  } catch { /* a missing or unreadable file simply starts from nothing */ }
-  prefs.enabled = enabled
-  writeFileAtomic(path, `${JSON.stringify(prefs, null, 2)}\n`)
+  patchTrayFile('dock', { enabled }, home)
 }
 
 // Talking to the tray app ----------------------------------------------------------------------

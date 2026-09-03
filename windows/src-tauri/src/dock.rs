@@ -12,7 +12,7 @@
 //! into the frames it is handed.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -519,7 +519,15 @@ fn state_path() -> PathBuf {
 }
 
 fn read_state() -> serde_json::Map<String, serde_json::Value> {
-    fs::read(state_path())
+    read_state_at(&state_path())
+}
+
+/// Lock-free by design: the writer renames a whole file into place, so this sees the old file or
+/// the new one and never a torn one. What it costs is paid on the writer's side, where a read
+/// overlapping a replace is a failure Windows reports rather than waits out; see
+/// `crate::settings::replace_file`.
+fn read_state_at(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+    fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|value| value.as_object().cloned())
@@ -534,8 +542,7 @@ static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// The desktop app reads this file as well, and a plain write is not one step: a reader that
 /// arrives partway through it gets truncated JSON, falls back to an empty state, and the
 /// placement and the dock's own switch are gone. Writing beside it and renaming over is.
-fn write_state(state: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
-    let path = state_path();
+fn write_state_at(path: &Path, state: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -546,12 +553,38 @@ fn write_state(state: &serde_json::Map<String, serde_json::Value>) -> Result<()>
         WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     fs::write(&temp, &bytes)?;
-    if let Err(err) = fs::rename(&temp, &path) {
+    // Not a plain rename: on Windows a reader that has the target open can make the replace fail
+    // outright, and reads of this file take no lock. See `crate::settings::replace_file`.
+    if let Err(err) = crate::settings::replace_file(&temp, path) {
         // Nothing is left behind for the next launch to trip over.
         let _ = fs::remove_file(&temp);
         return Err(err.into());
     }
     Ok(())
+}
+
+/// The one write path for this file: take the cross-process lock, read the current state,
+/// apply `mutate`, and rename the whole thing back, all before the lock is released. The
+/// desktop app owns this file too and runs the same protocol from `tray-settings.ts`, so
+/// without the lock two writers that touch different keys lose each other's change even though
+/// the rename keeps the file whole. The rename is still what keeps a reader from seeing a torn
+/// file; the lock is what keeps a second writer from erasing this one. See
+/// `crate::settings::prefs_lock` for the protocol.
+fn patch_state(
+    mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    patch_state_at(&state_path(), mutate)
+}
+
+fn patch_state_at(
+    path: &Path,
+    mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let _lock = crate::settings::prefs_lock::acquire(path)?;
+    let mut state = read_state_at(path);
+    mutate(&mut state);
+    write_state_at(path, &state)?;
+    Ok(state)
 }
 
 /// What the stored state reads as from outside. The file is shared with the desktop app, which
@@ -576,15 +609,15 @@ pub fn read_prefs() -> serde_json::Map<String, serde_json::Value> {
 pub fn patch_prefs(
     values: serde_json::Map<String, serde_json::Value>,
 ) -> Result<serde_json::Map<String, serde_json::Value>> {
-    let mut state = read_state();
-    for (key, value) in values {
-        if value.is_null() {
-            state.remove(&key);
-        } else {
-            state.insert(key, value);
+    let state = patch_state(|state| {
+        for (key, value) in values {
+            if value.is_null() {
+                state.remove(&key);
+            } else {
+                state.insert(key, value);
+            }
         }
-    }
-    write_state(&state)?;
+    })?;
     Ok(normalized(state))
 }
 
@@ -608,17 +641,20 @@ pub fn telemetry_props() -> serde_json::Value {
 }
 
 pub fn set_enabled(enabled: bool) -> Result<()> {
-    let mut state = read_state();
-    state.insert("enabled".into(), serde_json::Value::Bool(enabled));
-    write_state(&state)
+    patch_state(|state| {
+        state.insert("enabled".into(), serde_json::Value::Bool(enabled));
+    })?;
+    Ok(())
 }
 
 /// The provider the resting rail shows. A click on another row makes it the preferred one;
 /// the page reads the current one out of the preferences with everything else.
 pub fn set_preferred_provider(id: &str) -> Result<()> {
-    let mut state = read_state();
-    state.insert("preferred".into(), serde_json::Value::String(id.to_owned()));
-    write_state(&state)
+    let id = id.to_owned();
+    patch_state(|state| {
+        state.insert("preferred".into(), serde_json::Value::String(id));
+    })?;
+    Ok(())
 }
 
 fn load_placement() -> Placement {
@@ -629,9 +665,11 @@ fn load_placement() -> Placement {
 }
 
 fn save_placement(placement: &Placement) -> Result<()> {
-    let mut state = read_state();
-    state.insert("placement".into(), serde_json::to_value(placement)?);
-    write_state(&state)
+    let value = serde_json::to_value(placement)?;
+    patch_state(|state| {
+        state.insert("placement".into(), value);
+    })?;
+    Ok(())
 }
 
 // Live state --------------------------------------------------------------------------------
@@ -888,7 +926,13 @@ pub fn apply_layout(window: &tauri::WebviewWindow, request: LayoutRequest) -> Op
 /// Re-homes the rail after a drop or a menu choice and tells the page where it came from so
 /// it can glide into place.
 fn settle(app: &AppHandle, window: &tauri::WebviewWindow, placement: Placement, from_rail: Rect) {
-    let _ = save_placement(&placement);
+    if let Err(err) = save_placement(&placement) {
+        // The rail still moves: the placement below is what this run lays out from. What is
+        // lost is the next launch, which reads the file and puts the rail back where it was.
+        // Losing the cross-process lock to the desktop app is a new way for this to happen, and
+        // it happens silently, so it is worth a line in the log.
+        crate::log_line!("codeburn dock: placement not saved, the rail will revert at next launch: {err:#}");
+    }
     {
         let mut state = lock();
         state.placement = Some(placement);
@@ -1841,7 +1885,7 @@ mod tests {
     #[test]
     fn a_state_write_swaps_a_whole_file_in_and_leaves_no_scratch_behind() {
         let before = read_state();
-        let Ok(()) = write_state(&before) else { return };
+        let Ok(()) = write_state_at(&state_path(), &before) else { return };
         assert_eq!(read_state(), before);
 
         // The scratch name carries this process's id, so only this test's own leavings count
@@ -1937,5 +1981,210 @@ mod tests {
             attachment_candidate(&Rect { x: 1600 - 53 - 22, y: 300, w: 53, h: 112 }, &AREA).unwrap();
         assert_eq!(edge, Edge::Right);
         assert!((progress - 0.5).abs() < 0.01);
+    }
+
+    /// The merge keeps a key the caller never touched, which is what lets each side write only
+    /// its own keys into a file the other side co-owns. Same shape as settings.rs's own
+    /// null-patch test, kept off the real state file so it never touches the developer's home.
+    #[test]
+    fn patching_one_key_leaves_the_other_sides_keys_alone() {
+        let dir = std::env::temp_dir().join(format!("cb-dock-merge-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("windows-dock.json");
+        // Keys this side does not own: the placement (written by dragging) and the tray app's
+        // own enabled switch.
+        fs::write(&file, "{\"placement\":{\"docked\":\"right\"},\"enabled\":true}").unwrap();
+
+        let merged = patch_state_at(&file, |state| {
+            state.insert("scale".into(), serde_json::json!(1.1));
+        })
+        .unwrap();
+
+        assert_eq!(merged.get("scale"), Some(&serde_json::json!(1.1)));
+        assert_eq!(merged.get("enabled"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            merged.get("placement"),
+            Some(&serde_json::json!({ "docked": "right" }))
+        );
+        // And a null value removes just that key, leaving the rest.
+        let after = patch_state_at(&file, |state| {
+            state.remove("scale");
+        })
+        .unwrap();
+        assert!(after.get("scale").is_none());
+        assert!(after.get("placement").is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The headline regression: a real Node process and this real Rust process patch DIFFERENT
+    /// keys of windows-dock.json at the same time, and both changes must survive. Without the
+    /// shared lock the two read/modify/write cycles interleave and the later rename erases the
+    /// other side's key; run it with CB_TRAY_XPROC_NOLOCK=1 to see exactly that failure. It is
+    /// two processes, not two threads, which is the only way to exercise the cross-process lock.
+    ///
+    /// What is asserted is monotonicity, not finality. Each side's key holds a counter that only
+    /// ever rises, and a reader thread watches the file throughout: a lost update resurrects a
+    /// stale value, so a counter falls. Comparing only the two FINAL values, as this test first
+    /// did, catches a lost update only when the last writes happen to collide, which let it pass
+    /// on a deliberately broken lock about one run in three: weak evidence for the one property
+    /// it exists to prove.
+    #[test]
+    fn concurrent_node_and_rust_patches_to_the_dock_file_both_survive() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let worker = repo.join("app").join("scripts").join("tray-settings-xproc-worker.ts");
+        if !worker.exists() {
+            eprintln!("skipping cross-process test: worker not found at {}", worker.display());
+            return;
+        }
+
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("cb-xproc-{}-{nanos}", std::process::id()));
+        let config_dir = root.join(".config").join("codeburn");
+        let barriers = root.join("barriers");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&barriers).unwrap();
+        let dock_file = config_dir.join("windows-dock.json");
+        // A key neither side writes, to prove the merge preserves it through all the churn.
+        fs::write(&dock_file, "{\"other\":\"keep\"}").unwrap();
+
+        let iters: u32 = 100;
+        let nolock = std::env::var("CB_TRAY_XPROC_NOLOCK").ok().as_deref() == Some("1");
+
+        let mut child = match Command::new("node")
+            .arg("--import")
+            .arg("tsx")
+            .arg(&worker)
+            .arg(&root)
+            .arg("fromNode")
+            .arg(iters.to_string())
+            .arg(&barriers)
+            .current_dir(&repo)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => {
+                eprintln!("skipping cross-process test: could not spawn node: {err}");
+                let _ = fs::remove_dir_all(&root);
+                return;
+            }
+        };
+
+        let read_stderr = |child: &mut std::process::Child| -> String {
+            let mut text = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        };
+
+        // Wait until the worker has finished starting (tsx can take several seconds on this VM)
+        // before releasing either loop, so the two really do write at the same time.
+        let ready = barriers.join("node.ready");
+        let start = Instant::now();
+        while !ready.exists() {
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("node worker exited early ({status}); stderr:\n{}", read_stderr(&mut child));
+            }
+            if start.elapsed() > Duration::from_secs(60) {
+                let _ = child.kill();
+                panic!("node worker never signalled ready; stderr:\n{}", read_stderr(&mut child));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        fs::write(barriers.join("go"), b"").unwrap();
+
+        // The watcher: a third party that only ever reads. It has to be a separate reader,
+        // because neither writer can see its own counter rolled back. In the unlocked cycle each
+        // one carries the other side's value forward itself, so what it reads back is never
+        // older than what it last read, whatever the file did in between. A pure observer sees
+        // the file as it really is, and the property under test is exactly what it watches for:
+        // with the lock both counters only ever rise in the file, and a counter that falls is a
+        // write that was erased, wherever in the run it happened.
+        //
+        // It reads lock-free, the way both apps really do, and polls at 1ms rather than spinning:
+        // a settings reader reads on reload and on a schedule, not every instant. That still
+        // samples the file thousands of times across the run, so a counter rolled back by a lost
+        // write is caught, and it still puts `crate::settings::replace_file`'s retry under real
+        // load, a replace colliding with an open read handle many times over. A reader that held
+        // the handle every instant is not one either app has: on Windows, where an open handle
+        // blocks a rename, it would be an unwinnable race no bounded retry could pass, and on real
+        // Windows CI that is exactly what it did. The rolled-back value persists in the file
+        // regardless, so the timing-independent final-state assertions below are the real
+        // backstop, and the unlocked path still fails, so detection is intact.
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (dock_file, stop) = (dock_file.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let (mut high_node, mut high_rust) = (0u64, 0u64);
+                let mut regression: Option<String> = None;
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(1));
+                    let state = read_state_at(&dock_file);
+                    for (key, high) in [("fromNode", &mut high_node), ("fromRust", &mut high_rust)] {
+                        let Some(value) = state.get(key).and_then(serde_json::Value::as_u64) else {
+                            continue;
+                        };
+                        if value < *high {
+                            regression.get_or_insert(format!(
+                                "{key} went backwards ({} -> {value}): a write was lost",
+                                *high
+                            ));
+                        }
+                        *high = (*high).max(value);
+                    }
+                }
+                regression
+            })
+        };
+
+        for i in 0..iters {
+            let value = serde_json::Value::from(i);
+            if nolock {
+                // The demonstration path: the same cycle without the lock, i.e. the bug.
+                let mut state = read_state_at(&dock_file);
+                std::thread::sleep(Duration::from_millis(1));
+                state.insert("fromRust".into(), value);
+                write_state_at(&dock_file, &state).unwrap();
+            } else {
+                patch_state_at(&dock_file, |state| {
+                    state.insert("fromRust".into(), value);
+                })
+                .unwrap();
+            }
+            if i % 7 == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let status = child.wait().unwrap();
+        let stderr = read_stderr(&mut child);
+        stop.store(true, Ordering::Relaxed);
+        let regression = watcher.join().unwrap();
+        let final_state = read_state_at(&dock_file);
+        let _ = fs::remove_dir_all(&root);
+        assert!(status.success(), "node worker failed: {stderr}");
+        assert!(regression.is_none(), "{}", regression.unwrap_or_default());
+        assert_eq!(
+            final_state.get("other").and_then(|v| v.as_str()),
+            Some("keep"),
+            "the key neither side wrote survived"
+        );
+        assert_eq!(
+            final_state.get("fromNode").and_then(serde_json::Value::as_u64),
+            Some(u64::from(iters - 1)),
+            "the desktop app's final write survived the tray app's writes"
+        );
+        assert_eq!(
+            final_state.get("fromRust").and_then(serde_json::Value::as_u64),
+            Some(u64::from(iters - 1)),
+            "the tray app's final write survived the desktop app's writes"
+        );
     }
 }

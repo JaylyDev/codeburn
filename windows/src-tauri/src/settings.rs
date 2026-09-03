@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
@@ -40,6 +40,413 @@ const MIN_HEIGHT: f64 = 520.0;
 /// Where a tray item or the popover asked the window to open. The page reads it once on
 /// mount, because an event emitted while the webview is still loading has nobody to hear it.
 static PENDING_SECTION: Mutex<Option<String>> = Mutex::new(None);
+
+// Cross-process preference lock ---------------------------------------------------------
+//
+// windows-settings.json and windows-dock.json are each owned by two processes at once: this
+// tray app and the Electron desktop app. Both do a read / modify / write to merge their own
+// keys into whatever the other last stored. The atomic rename each already does stops a torn
+// file, but not a lost update: two writers read the same state, change different keys, and the
+// later rename erases the earlier writer's key. The user watches a dock placement, an enabled
+// switch, a provider choice or a scale silently revert. This lock serializes the whole cycle
+// so that never happens. It is the one place the protocol is written down; `dock.rs` and
+// `app/electron/tray-settings.ts` point here rather than restating it.
+//
+// PROTOCOL (honoured identically by app/electron/tray-settings.ts):
+//
+//   Lock file:  sibling of the target named `.<stem>.lock` (windows-dock.json ->
+//               `.windows-dock.lock`), the same `.config.lock` shape config.rs uses.
+//   Body:       one line of JSON, `{"pid":<os pid>,"at":<unix ms>}`.
+//   Acquire:    exclusive create (create_new / 'wx'). On success the holder keeps the handle
+//               open for the whole cycle and returns a guard. On collision the existing lock
+//               is taken over only if abandoned; otherwise the contender polls until a short
+//               wait budget runs out and then FAILS loudly rather than writing behind the
+//               holder, so a contended write is reported to the caller, never silently lost.
+//   Abandoned:  its mtime is older than the stale window (a crashed holder never refreshes
+//               it), OR its recorded pid is not our own and no longer alive. The pid probe is
+//               the fast path for a crash: a dead holder is recovered on the first poll, well
+//               inside the wait budget. The age gate is the backstop for a pid we cannot probe
+//               or a reused one. A live holder is neither, which is the safety argument: a
+//               fresh mtime plus a live pid are never taken, and the read/modify/write it
+//               guards finishes in milliseconds, orders of magnitude inside the stale window.
+//   Takeover:   removing an abandoned lock is itself arbitrated, by an exclusive create of
+//               `<lock>.takeover`. Only its winner may unlink the lock, and only after
+//               re-checking that the lock is still abandoned, so two contenders racing the
+//               same stale lock cannot both end up holding it. See `reclaim`.
+//   Release:    close the handle and unlink the lock, unless it now carries a different pid
+//               (a successor's), which is left alone.
+//
+// Reads take no lock: every writer renames a whole file into place, so a reader sees the old
+// file or the new one, never a torn one (the same reason config::read is lock-free). That is
+// still the right trade, but it is not free on Windows: a rename over a file some other process
+// has open can fail outright there rather than wait, so a read on either side can make a write
+// on the other fail. `replace_file` is where that is absorbed.
+//
+// Lessons borrowed from src/cache-refresh-lock.ts: exclusive create as the arbiter, a pid +
+// timestamp record, a staleness window so a dead holder cannot wedge the file forever, and a
+// bounded wait that never blocks indefinitely.
+pub(crate) mod prefs_lock {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::thread::sleep;
+    use std::time::{Duration, SystemTime};
+
+    use anyhow::{anyhow, Result};
+
+    const POLL: Duration = Duration::from_millis(50);
+    const WAIT_BUDGET: Duration = Duration::from_millis(2_000);
+    const STALE: Duration = Duration::from_secs(30);
+
+    /// Held for the whole read/modify/write cycle. Dropping it closes the handle and removes
+    /// the lock file, so a normal return, an early `?`, or a panic all release it.
+    pub struct Guard {
+        path: PathBuf,
+        file: Option<fs::File>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // Close our handle first: Windows will not unlink a file that is still open.
+            self.file.take();
+            // A lock that now carries someone else's pid has been taken over from us (only
+            // ever possible if we outlived the stale window); leave the successor's alone.
+            match holder_pid(&self.path) {
+                Some(pid) if pid != std::process::id() => {}
+                _ => {
+                    let _ = fs::remove_file(&self.path);
+                }
+            }
+        }
+    }
+
+    fn lock_path(target: &Path) -> PathBuf {
+        let stem = target.file_stem().and_then(|s| s.to_str()).unwrap_or("prefs");
+        target.with_file_name(format!(".{stem}.lock"))
+    }
+
+    fn body() -> String {
+        let at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        format!("{{\"pid\":{},\"at\":{}}}", std::process::id(), at)
+    }
+
+    fn holder_pid(path: &Path) -> Option<u32> {
+        let text = fs::read_to_string(path).ok()?;
+        serde_json::from_str::<serde_json::Value>(&text)
+            .ok()?
+            .get("pid")?
+            .as_u64()
+            .map(|pid| pid as u32)
+    }
+
+    fn abandoned(path: &Path, stale: Duration) -> bool {
+        match fs::metadata(path).and_then(|m| m.modified()) {
+            Ok(mtime) => {
+                if SystemTime::now().duration_since(mtime).map(|age| age > stale).unwrap_or(false) {
+                    return true;
+                }
+            }
+            // The file vanished between the failed create and this check; not abandoned, the
+            // caller simply retries the create.
+            Err(_) => return false,
+        }
+        match holder_pid(path) {
+            Some(pid) if pid != std::process::id() => !pid_alive(pid),
+            // Our own pid, or a body too young to be stale that we cannot parse a pid from.
+            _ => false,
+        }
+    }
+
+    /// Signal-0 style liveness. A false "alive" (a reused pid) only delays recovery to the age
+    /// gate; a false "dead" would be the dangerous direction and is what the conservative
+    /// branches below avoid.
+    #[cfg(not(windows))]
+    fn pid_alive(pid: u32) -> bool {
+        // Declared directly rather than pulling in a crate, the same way config.rs externs
+        // flock. `kill(pid, 0)` probes existence without delivering a signal.
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        let ret = unsafe { kill(pid as i32, 0) };
+        // 0 => alive; EPERM (1) => alive under another user; ESRCH => gone.
+        ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
+    }
+
+    #[cfg(windows)]
+    fn pid_alive(pid: u32) -> bool {
+        // Declared directly so this needs no extra windows-sys feature. kernel32 is always
+        // linked, so the symbols resolve without a `#[link]` attribute.
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+            fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+            fn GetLastError() -> u32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const ERROR_INVALID_PARAMETER: u32 = 87;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if !handle.is_null() {
+                CloseHandle(handle);
+                return true;
+            }
+            // Access-denied and the like mean the process exists under a token we cannot open;
+            // only a clearly invalid pid is proof it is gone.
+            GetLastError() != ERROR_INVALID_PARAMETER
+        }
+    }
+
+    fn takeover_path(lock: &Path) -> PathBuf {
+        let mut name = lock.as_os_str().to_owned();
+        name.push(".takeover");
+        PathBuf::from(name)
+    }
+
+    /// Remove an abandoned lock, but only as the one process entitled to. Two contenders that
+    /// both find the same stale lock would otherwise both unlink it: the first has already
+    /// replaced it with a lock of its own, and the second's unlink deletes that fresh one, so
+    /// both walk away holding the file. Windows usually hides this, because a lock a live
+    /// holder still has open will not unlink at all, but this crate also builds for Linux and
+    /// macOS, where the unlink always succeeds.
+    ///
+    /// So the removal is arbitrated by the same primitive the lock itself uses: an exclusive
+    /// create of `<lock>.takeover`. Its winner alone may unlink, and only after re-checking
+    /// staleness under that right, because a rival may have reclaimed already and now hold a
+    /// lock that is not abandoned and not ours to remove. The takeover file is dropped on every
+    /// path out, and never held across the wait; one left behind by a reclaimer that died is
+    /// freed by the same staleness rule as the lock.
+    ///
+    /// Returns whether the caller should retry the exclusive create at once.
+    fn reclaim(lock: &Path, stale: Duration) -> bool {
+        let takeover = takeover_path(lock);
+        match OpenOptions::new().write(true).create_new(true).open(&takeover) {
+            Ok(mut file) => {
+                let _ = file.write_all(body().as_bytes());
+                let _ = file.flush();
+                drop(file);
+                let reclaimed = abandoned(lock, stale) && fs::remove_file(lock).is_ok();
+                let _ = fs::remove_file(&takeover);
+                reclaimed
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Somebody else is reclaiming, or a dead reclaimer left this behind. The lock
+                // itself is never touched from here; the most this does is free the takeover
+                // file for a later try.
+                if abandoned(&takeover, stale) {
+                    let _ = fs::remove_file(&takeover);
+                }
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub fn acquire(target: &Path) -> Result<Guard> {
+        acquire_with(target, WAIT_BUDGET, POLL, STALE)
+    }
+
+    /// The timing is a parameter only so the tests can prove the wait and the takeover without
+    /// sleeping for whole seconds; every caller in the app uses [`acquire`].
+    pub fn acquire_with(
+        target: &Path,
+        wait: Duration,
+        poll: Duration,
+        stale: Duration,
+    ) -> Result<Guard> {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let path = lock_path(target);
+        let deadline = SystemTime::now() + wait;
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    // The body is advisory; even if this write fails we still hold the lock the
+                    // exclusive create just won.
+                    let _ = file.write_all(body().as_bytes());
+                    let _ = file.flush();
+                    return Ok(Guard { path, file: Some(file) });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // A successful reclaim means the holder was genuinely abandoned and this
+                    // process won the right to remove its lock; retry the create at once.
+                    // Anything else (a live holder, a contender already reclaiming, an unlink
+                    // that failed) falls through to the wait.
+                    if abandoned(&path, stale) && reclaim(&path, stale) {
+                        continue;
+                    }
+                    if SystemTime::now() >= deadline {
+                        return Err(anyhow!(
+                            "could not lock {} within {:?}; another process is writing these \
+                             preferences, so nothing was changed",
+                            path.display(),
+                            wait
+                        ));
+                    }
+                    sleep(poll);
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Two tests starting in the same microsecond would otherwise share a directory, and
+        /// whichever finished first would delete the other's out from under it: SystemTime is
+        /// only microsecond-resolution on macOS, so the clock alone does not separate them.
+        static TEMP_SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+        fn temp_target() -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "codeburn-prefs-lock-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos(),
+                TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            dir.join("windows-dock.json")
+        }
+
+        #[test]
+        fn a_lock_is_taken_then_released() {
+            let target = temp_target();
+            let lock = lock_path(&target);
+            {
+                let _guard = acquire(&target).unwrap();
+                assert!(lock.exists(), "the lock file exists while it is held");
+                assert_eq!(holder_pid(&lock), Some(std::process::id()));
+            }
+            assert!(!lock.exists(), "the lock file is gone once the guard drops");
+            let _ = fs::remove_dir_all(target.parent().unwrap());
+        }
+
+        #[test]
+        fn a_stale_lock_is_taken_over() {
+            let target = temp_target();
+            let lock = lock_path(&target);
+            // A live pid (our own), so only the age gate can free it. A tiny stale window plus a
+            // sleep past it makes the lock look abandoned without touching its mtime by hand.
+            fs::write(&lock, format!("{{\"pid\":{},\"at\":1}}", std::process::id())).unwrap();
+            let stale = Duration::from_millis(40);
+            sleep(Duration::from_millis(80));
+            let guard = acquire_with(&target, Duration::from_millis(500), Duration::from_millis(20), stale);
+            assert!(guard.is_ok(), "an abandoned lock older than the stale window is taken over");
+            assert_eq!(holder_pid(&lock), Some(std::process::id()));
+            drop(guard);
+            let _ = fs::remove_dir_all(target.parent().unwrap());
+        }
+
+        #[test]
+        fn a_dead_holders_lock_is_taken_over_without_waiting_for_the_age_gate() {
+            let target = temp_target();
+            let lock = lock_path(&target);
+            // A pid far above anything the OS hands out, so it is not a live process: on Windows
+            // OpenProcess reports it invalid, on Unix kill(0) reports ESRCH. With a fresh mtime
+            // only the pid probe, not the age gate, can free it inside the wait budget.
+            fs::write(&lock, "{\"pid\":2147483646,\"at\":1}").unwrap();
+            let started = SystemTime::now();
+            let guard = acquire_with(
+                &target,
+                Duration::from_millis(500),
+                Duration::from_millis(20),
+                Duration::from_secs(60),
+            );
+            assert!(guard.is_ok(), "a dead holder's lock is recovered by the pid probe");
+            assert!(
+                started.elapsed().unwrap() < Duration::from_millis(400),
+                "recovery did not wait out the whole budget"
+            );
+            drop(guard);
+            let _ = fs::remove_dir_all(target.parent().unwrap());
+        }
+
+        /// The takeover right, from the losing side: a lock that IS abandoned still may not be
+        /// removed while another process holds the right to reclaim it, because that process may
+        /// already have replaced it with a lock of its own.
+        #[test]
+        fn a_stale_lock_is_left_alone_while_someone_else_holds_the_takeover_right() {
+            let target = temp_target();
+            let lock = lock_path(&target);
+            fs::write(&lock, format!("{{\"pid\":{},\"at\":1}}", std::process::id())).unwrap();
+            let stale = Duration::from_millis(200);
+            sleep(Duration::from_millis(220));
+            // A takeover file with our own live pid and a fresh mtime: a reclaim in progress.
+            // The wait below is kept well inside the stale window, so it is the takeover right
+            // and not the takeover file's own age that decides this.
+            fs::write(takeover_path(&lock), format!("{{\"pid\":{},\"at\":1}}", std::process::id()))
+                .unwrap();
+
+            let blocked = acquire_with(&target, Duration::from_millis(60), Duration::from_millis(10), stale);
+            assert!(blocked.is_err(), "the stale lock is not stolen out from under the reclaimer");
+            assert!(lock.exists(), "and it is still there for the reclaimer to replace");
+
+            // Once the reclaimer is gone the same lock is taken over as it always was.
+            fs::remove_file(takeover_path(&lock)).unwrap();
+            let guard = acquire_with(&target, Duration::from_millis(500), Duration::from_millis(10), stale);
+            assert!(guard.is_ok(), "with nobody reclaiming, the abandoned lock is taken over");
+            drop(guard);
+            let _ = fs::remove_dir_all(target.parent().unwrap());
+        }
+
+        #[test]
+        fn a_live_lock_is_waited_for_then_fails_loudly() {
+            let target = temp_target();
+            // Our own pid reads as alive and a fresh mtime is inside a long window, so the lock
+            // is never abandoned and the contender must give up rather than write behind it.
+            let _held = acquire(&target).unwrap();
+            let started = SystemTime::now();
+            let err = acquire_with(
+                &target,
+                Duration::from_millis(200),
+                Duration::from_millis(20),
+                Duration::from_secs(60),
+            );
+            assert!(err.is_err(), "a live lock is not stolen; the contender fails");
+            assert!(started.elapsed().unwrap() >= Duration::from_millis(180), "it waited the budget");
+            drop(_held);
+            let _ = fs::remove_dir_all(target.parent().unwrap());
+        }
+    }
+}
+
+/// Rename `temp` over `target`, retrying briefly on a Windows sharing violation.
+///
+/// The rename is what makes a write atomic to a reader, and readers of these files take no lock
+/// on either side. On POSIX that costs nothing: a rename over an open file always succeeds, and
+/// whoever had it open keeps reading the file they opened. Windows refuses instead, with
+/// ERROR_ACCESS_DENIED or ERROR_SHARING_VIOLATION, whenever something else holds the target open
+/// without having agreed to its deletion, and a scanner opening the file behind our back does it
+/// just as well as one of our own processes. That failure is transient by nature, so it is
+/// retried for a short bounded time rather than reported as a write that did not land, which is
+/// the very lost update the lock around this exists to prevent.
+///
+/// The lock is already held by the time this runs, so the wait can only ever be on a reader,
+/// never on another writer, and readers hold the file for microseconds. Once the budget is out
+/// the error is returned unchanged. On POSIX this is a plain rename.
+pub(crate) fn replace_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        const RETRIES: u32 = 9;
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+        // ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION, as raw OS codes: the io::ErrorKind
+        // they map to is not stable enough to match on.
+        const SHARING: [i32; 2] = [5, 32];
+        for _ in 0..RETRIES {
+            match fs::rename(temp, target) {
+                Err(err) if err.raw_os_error().is_some_and(|code| SHARING.contains(&code)) => {
+                    std::thread::sleep(PAUSE);
+                }
+                result => return result,
+            }
+        }
+    }
+    fs::rename(temp, target)
+}
 
 // Preferences ---------------------------------------------------------------------------
 
@@ -62,6 +469,10 @@ pub fn read() -> Map<String, Value> {
 /// key, so the page can reset a preference to its default without knowing what that default
 /// is.
 pub fn patch(values: Map<String, Value>) -> Result<Map<String, Value>> {
+    let path = settings_path();
+    // Serialize the whole read/modify/write against the desktop app, which owns this file too.
+    // The guard is held until the rename lands. See `prefs_lock` for the shared protocol.
+    let _lock = prefs_lock::acquire(&path)?;
     let mut stored = read();
     for (key, value) in values {
         if value.is_null() {
@@ -70,13 +481,12 @@ pub fn patch(values: Map<String, Value>) -> Result<Map<String, Value>> {
             stored.insert(key, value);
         }
     }
-    let path = settings_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(&stored)?)?;
-    fs::rename(&tmp, &path)?;
+    replace_file(&tmp, &path)?;
     Ok(stored)
 }
 
