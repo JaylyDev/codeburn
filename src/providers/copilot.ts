@@ -705,7 +705,7 @@ function parseLegacyChatSession(
       outputTokens + reasoningTokens,
       cacheCreationInputTokens,
       cacheReadInputTokens,
-      reasoningTokens,
+      0,
     )
 
     // The timestamp field on each request is a Unix ms epoch integer.
@@ -1415,21 +1415,6 @@ function createJsonlParser(
     async *parse(): AsyncGenerator<ParsedProviderCall> {
       const content = await readSessionFile(source.path)
       if (!content) return
-      // Legacy chatSessions/*.json — whole JSON object with a `requests` array.
-      if (isChatSessionJsonFormat(source.path, content)) {
-        const sessionId = basename(source.path, '.json')
-        let sessionObj: LegacyChatSession
-        try {
-          sessionObj = JSON.parse(content) as LegacyChatSession
-        } catch {
-          return
-        }
-        const calls = parseLegacyChatSession(sessionObj, sessionId, source.project, seenKeys)
-        for (const call of calls) {
-          yield call
-        }
-        return
-      }
 
       // CLI session-state files live at <sessionId>/events.jsonl; transcripts
       // at transcripts/<sessionId>.jsonl — keying the latter on the parent dir
@@ -1783,11 +1768,26 @@ function createChatSessionParser(
       const content = await readSessionFile(source.path)
       if (!content) return
 
-      const root = replayChatSessionJournal(content)
-      if (!isRecord(root)) return
+      let session: LegacyChatSession | null = null
+      const isJson = source.path.endsWith('.json') || isChatSessionJsonFormat(source.path, content)
+      const sessionId = basename(source.path, isJson ? '.json' : '.jsonl')
 
-      const sessionId = readString(root['sessionId']) || basename(source.path, '.jsonl')
-      const calls = parseLegacyChatSession(root as unknown as LegacyChatSession, sessionId, source.project, seenKeys)
+      if (isJson) {
+        try {
+          session = JSON.parse(content) as LegacyChatSession
+        } catch {
+          return
+        }
+      } else {
+        const root = replayChatSessionJournal(content)
+        if (!isRecord(root)) return
+        session = root as unknown as LegacyChatSession
+      }
+
+      if (!session) return
+
+      const resolvedSessionId = readString(session.sessionId) || sessionId
+      const calls = parseLegacyChatSession(session, resolvedSessionId, source.project, seenKeys)
       for (const call of calls) {
         yield call
       }
@@ -1811,17 +1811,11 @@ function createChatSessionParser(
 // Known JetBrains Copilot model tokens, longest-first so we match the most
 // specific name (e.g. "gpt-4.1-mini" before "gpt-4.1").
 const JETBRAINS_MODEL_TOKENS = [
-  'claude-opus-4.7',
-  'claude-opus-4.6',
   'claude-opus-4.5',
   'claude-opus-4.1',
   'claude-opus-4',
-  'claude-sonnet-4.6',
   'claude-sonnet-4.5',
   'claude-sonnet-4',
-  'claude-haiku-4.5',
-  'gpt-5.4-mini',
-  'gpt-5.4',
   'gpt-5.3-codex',
   'gpt-5.3',
   'gpt-5.2',
@@ -1833,8 +1827,6 @@ const JETBRAINS_MODEL_TOKENS = [
   'gpt-4.1',
   'gpt-4o-mini',
   'gpt-4o',
-  'gemini-3.1-pro',
-  'gemini-3-pro',
   'gemini-2.5-pro',
   'gemini-2.0-flash',
   'o3-mini',
@@ -1886,12 +1878,13 @@ function inferJetBrainsModel(raw: string): string {
  * that still exists on disk (caller then falls back to a generic bucket).
  */
 function inferJetBrainsProject(raw: string): string | undefined {
-  // Capture referenced paths (supports Linux / Unix / Windows paths in file:// URIs)
-  const re = /file:\/\/(?:localhost)?(?:\/)?([A-Za-z]:[\\/][^"'\x00\r\n]+|\/[^"'\x00\r\n]+?)(?=(?:["'\x00\r\n]|\s+file:\/\/|$))/g
+  // Capture referenced absolute paths (original case — we hit the real FS).
+  const re = /file:\/\/(\/[^"\\]+?)(?:\\|")/g
   const seen = new Set<string>()
   let m: RegExpExecArray | null
   while ((m = re.exec(raw))) {
-    let p = m[1].trim()
+    // Decode %20 etc. and strip a trailing .rej/.orig suffix noise; keep the dir.
+    let p = m[1]
     try { p = decodeURIComponent(p) } catch { /* leave as-is */ }
     const dir = p.slice(0, p.lastIndexOf('/'))
     // A Windows URL is file:///C:/repo/One.ts, so the captured path carries a
@@ -2981,9 +2974,7 @@ interface TranscriptSessionSource extends SessionSource {
 }
 
 interface ChatSessionSource extends SessionSource {
-  // Optional so legacy `.json` session sources (which route through
-  // createJsonlParser instead) can share this array type without lying.
-  sourceType?: 'chatsession'
+  sourceType: 'chatsession'
 }
 
 interface JetBrainsSessionSource extends SessionSource {
@@ -3012,7 +3003,7 @@ function isOtelSource(source: SessionSource): source is OTelSessionSource {
 }
 
 function isChatSessionSource(source: SessionSource): source is ChatSessionSource {
-  return (source as ChatSessionSource).sourceType === 'chatsession'
+  return (source as ChatSessionSource).sourceType === 'chatsession' || source.path.endsWith('.json')
 }
 
 function isJetBrainsSource(source: SessionSource): source is JetBrainsSessionSource {
@@ -3364,7 +3355,7 @@ async function hasChatSessionFiles(chatSessionsDir: string): Promise<boolean> {
   }
 
   for (const file of files) {
-    if (!file.endsWith('.jsonl')) continue
+    if (!file.endsWith('.jsonl') && !file.endsWith('.json')) continue
     const s = await stat(join(chatSessionsDir, file)).catch(() => null)
     if (s?.isFile()) return true
   }
@@ -3417,20 +3408,12 @@ async function discoverWorkspaceChatSessions(
           const path = join(chatSessionsDir, file)
           const s = await stat(path).catch(() => null)
           if (!s?.isFile()) continue
-          if (file.endsWith('.jsonl')) {
-            sources.push({
-              path,
-              project,
-              provider: 'copilot',
-              sourceType: 'chatsession',
-            })
-          } else {
-            sources.push({
-              path,
-              project,
-              provider: 'copilot',
-            })
-          }
+          sources.push({
+            path,
+            project,
+            provider: 'copilot',
+            sourceType: 'chatsession',
+          })
         }
       }
     }
@@ -3458,20 +3441,12 @@ async function discoverEmptyWindowChatSessions(
       const path = join(chatSessionsDir, file)
       const s = await stat(path).catch(() => null)
       if (!s?.isFile()) continue
-      if (file.endsWith('.jsonl')) {
-        sources.push({
-          path,
-          project: 'copilot-chat',
-          provider: 'copilot',
-          sourceType: 'chatsession',
-        })
-      } else {
-        sources.push({
-          path,
-          project: 'copilot-chat',
-          provider: 'copilot',
-        })
-      }
+      sources.push({
+        path,
+        project: 'copilot-chat',
+        provider: 'copilot',
+        sourceType: 'chatsession',
+      })
     }
   }
 

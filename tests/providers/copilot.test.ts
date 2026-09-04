@@ -2314,7 +2314,6 @@ describe.skipIf(!isSqliteAvailable())('copilot provider - session-store parsing'
       }),
     ])
 
-    if (process.platform === 'win32') return
     const { chmod } = await import('fs/promises')
     await chmod(deniedDir, 0o000)
     try {
