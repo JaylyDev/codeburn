@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from 'fs/promises'
+import { readFile, writeFile, mkdir, stat } from 'fs/promises'
 import { join } from 'path'
 import { createHash } from 'crypto'
 
@@ -6,6 +6,7 @@ import { getCodeburnCacheDir } from './cache-dir.js'
 import snapshotData from './data/litellm-snapshot.json' with { type: 'json' }
 import fallbackData from './data/pricing-fallback.json' with { type: 'json' }
 import { fetchWithTimeout } from './fetch-utils.js'
+import { readConfig } from './config.js'
 
 export type ModelCosts = {
   inputCostPerToken: number
@@ -63,17 +64,79 @@ export type LiteLLMEntry = {
 type SnapshotEntry = [number, number, number | null, number | null, (number | null)?]
 
 const LITELLM_URL = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json'
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/models'
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000
 // Bump whenever a ModelCosts field changes pricing behavior (cacheWriteCostIsExplicit,
 // added in #1075/#1078). A cache written under an older/missing version is treated as a
 // miss instead of read verbatim, so a stale on-disk file can't reintroduce a killed bug
-// for up to CACHE_TTL_MS after an upgrade.
-// Also folded into getPricingGenerationKey() below: a resident/snapshot-caching
+// for up to CACHE_TTL_MS after an upgrade.\n// Also folded into getPricingGenerationKey() below: a resident/snapshot-caching
 // consumer needs the same "pricing behavior changed" signal this already gives
 // the on-disk LiteLLM cache, not just the on-disk cache itself.
 export const CACHE_SCHEMA_VERSION = 3
 const WEB_SEARCH_COST = 0.01
 const ONE_HOUR_CACHE_WRITE_MULTIPLIER_FROM_FIVE_MINUTE_RATE = 1.6
+
+let openRouterPricing: Map<string, ModelCosts> = new Map()
+
+function getOpenRouterCachePath(): string {
+  return join(getCodeburnCacheDir(), 'openrouter-snapshot.json')
+}
+
+export type OpenRouterModel = {
+  id: string
+  pricing: {
+    prompt: string
+    completion: string
+  }
+}
+
+function parseOpenRouterPricing(data: OpenRouterModel[]): Map<string, ModelCosts> {
+  const pricing = new Map<string, ModelCosts>()
+  for (const m of data || []) {
+    const input = parseFloat(m.pricing?.prompt ?? '0')
+    const output = parseFloat(m.pricing?.completion ?? '0')
+    if (Number.isFinite(input) && Number.isFinite(output) && input >= 0 && output >= 0) {
+      const entry: ModelCosts = {
+        inputCostPerToken: input,
+        outputCostPerToken: output,
+        cacheWriteCostPerToken: input * 1.25,
+        cacheReadCostPerToken: input * 0.1,
+        webSearchCostPerRequest: WEB_SEARCH_COST,
+        fastMultiplier: 1,
+      }
+      pricing.set(m.id, entry)
+      const stripped = m.id.replace(/^[^/]+\//, '')
+      if (stripped !== m.id && !pricing.has(stripped)) {
+        pricing.set(stripped, entry)
+      }
+    }
+  }
+  return pricing
+}
+
+async function fetchAndCacheOpenRouterPricing(): Promise<Map<string, ModelCosts>> {
+  const response = await fetchWithTimeout(OPENROUTER_URL)
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  const rawText = await response.text()
+  const json = JSON.parse(rawText) as { data: OpenRouterModel[] }
+  const pricing = parseOpenRouterPricing(json.data)
+  await mkdir(getCodeburnCacheDir(), { recursive: true })
+  await writeFile(getOpenRouterCachePath(), rawText, 'utf-8')
+  return pricing
+}
+
+async function loadCachedOpenRouterPricing(): Promise<Map<string, ModelCosts> | null> {
+  try {
+    const path = getOpenRouterCachePath()
+    const stats = await stat(path)
+    if (Date.now() - stats.mtimeMs > CACHE_TTL_MS) return null
+    const raw = await readFile(path, 'utf-8')
+    const json = JSON.parse(raw) as { data: OpenRouterModel[] }
+    return parseOpenRouterPricing(json.data)
+  } catch {
+    return null
+  }
+}
 
 // Explicit USD/token prices that must override LiteLLM/cache data. Cursor
 // publishes house-model rates in the models table at cursor.com/docs/models
@@ -192,6 +255,10 @@ function getLowercasePricingIndex(): Map<string, ModelCosts> {
       const lk = key.toLowerCase()
       if (priced(costs) && !lowercasePricingIndex.has(lk)) lowercasePricingIndex.set(lk, costs)
     }
+    for (const [key, costs] of openRouterPricing) {
+      const lk = key.toLowerCase()
+      if (priced(costs) && !lowercasePricingIndex.has(lk)) lowercasePricingIndex.set(lk, costs)
+    }
     for (const [lk, costs] of fallbackCosts) {
       if (priced(costs) && !lowercasePricingIndex.has(lk)) lowercasePricingIndex.set(lk, costs)
     }
@@ -302,28 +369,51 @@ function setPricingCache(pricing: Map<string, ModelCosts>): void {
   knownNamespaces = null
 }
 
+async function applyLocalModelPricing(pricing: Map<string, ModelCosts>): Promise<Map<string, ModelCosts>> {
+  const config = await readConfig()
+  if (config.localModelPricing) {
+    for (const model of Object.keys(config.localModelPricing)) {
+      const entry: LiteLLMEntry = config.localModelPricing[model]!
+      const costs = parseLiteLLMEntry(entry)
+      if (costs) pricing.set(model, costs)
+    }
+  }
+  return applyBuiltinPriceOverrides(pricing)
+}
+
 export async function loadPricing(): Promise<void> {
   const cached = await loadCachedPricing()
   if (cached) {
     setPricingCache(mergeSnapshotFallbacks(cached))
-    return
-  }
-
-  // Test-only escape hatch, set for the whole suite in
-  // tests/setup/env-isolation.ts: skip the live LiteLLM fetch and price purely
-  // off the bundled snapshot, so an upstream reprice can't turn tests red.
-  if (process.env['CODEBURN_PRICING_SNAPSHOT_ONLY']) {
+  } else if (!process.env['CODEBURN_PRICING_SNAPSHOT_ONLY']) {
+    // Test-only escape hatch honored above; skip the live LiteLLM fetch and
+    // price purely off the bundled snapshot so an upstream reprice can't turn
+    // tests red.
+    try {
+      setPricingCache(mergeSnapshotFallbacks(await fetchAndCachePricing()))
+    } catch {
+      // snapshot already loaded at init; nothing more to do
+      livePricingTimestamp = null
+    }
+  } else {
     livePricingTimestamp = null
     setPricingCache(mergeSnapshotFallbacks(new Map()))
-    return
   }
 
-  try {
-    setPricingCache(mergeSnapshotFallbacks(await fetchAndCachePricing()))
-  } catch {
-    // snapshot already loaded at init; nothing more to do
-    livePricingTimestamp = null
+  const cachedOR = await loadCachedOpenRouterPricing()
+  if (cachedOR) {
+    openRouterPricing = cachedOR
+  } else {
+    try {
+      openRouterPricing = await fetchAndCacheOpenRouterPricing()
+    } catch {
+      // ignore — OpenRouter is a best-effort gap-fill
+    }
   }
+
+  await applyLocalModelPricing(pricingCache)
+  sortedPricingKeys = null
+  lowercasePricingIndex = null
 }
 
 // Content digest of the two bundled pricing files, computed once and memoized
@@ -375,6 +465,17 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'claude-opus-4.7':               'claude-opus-4-7',
   'claude-opus-4.6':               'claude-opus-4-6',
   'claude-opus-4.5':               'claude-opus-4-5',
+  // Antigravity tags reasoning-mode sessions onto the dot-version spelling;
+  // the SKU priced is the base model regardless of reasoning mode. The
+  // dash-spelled forms below are the wire ids Antigravity's own
+  // activeModelSpecs binds for those slots (claude-sonnet-4-6 → M35,
+  // claude-opus-4-6-thinking → M26; Antigravity Context Window Monitor
+  // models.ts@603e3ea); the opus form was observed verbatim in real
+  // gen_metadata #19 payloads.
+  'claude-sonnet-4.6-thinking':    'claude-sonnet-4-6',
+  'claude-opus-4.6-thinking':      'claude-opus-4-6',
+  'claude-sonnet-4-6-thinking':    'claude-sonnet-4-6',
+  'claude-opus-4-6-thinking':      'claude-opus-4-6',
   'cursor-auto':                    'claude-sonnet-4-5',
   'cursor-agent-auto':             'claude-sonnet-4-5',
   'copilot-auto':                  'claude-sonnet-4-5',
@@ -478,17 +579,45 @@ const BUILTIN_ALIASES: Record<string, string> = {
   // lower-latency endpoint; price as base GPT-5 until LiteLLM tracks it.
   'gpt-5-fast':                     'gpt-5',
   'gpt-4.1':                        'gpt-4.1',
+  'gpt-4-1':                        'gpt-4.1',
   'gpt-5.2-low':                    'gpt-5',
   'gpt-5.1-codex-high':             'gpt-5.3-codex',
+  // GitHub Copilot capacity pods wrap the upstream dated snapshot id in a
+  // capi-<site>-ptuc-<hw>-ib- envelope (observed: noe/h200, cus/h100).
+  // Exact-string aliases only — a generalized peel regex could swallow
+  // unrelated capi-* ids, so new pods must be added as they are observed.
+  'capi-noe-ptuc-h200-ib-gpt-5-mini-2025-08-07': 'gpt-5-mini-2025-08-07',
+  'capi-cus-ptuc-h100-ib-gpt-5-mini-2025-08-07': 'gpt-5-mini-2025-08-07',
   // Antigravity Gemini model IDs resolve to preview-priced entries.
   'gemini-3.1-pro':                 'gemini-3.1-pro-preview',
+  'gemini-3-1-pro-preview':         'gemini-3.1-pro-preview',
   'gemini-3-flash':                 'gemini-3-flash-preview',
   'gemini-3.1-pro-high':            'gemini-3.1-pro-preview',
   'gemini-3.1-pro-low':             'gemini-3.1-pro-preview',
-  'gemini-3-flash-agent':           'gemini-3-flash-preview',
+  // gemini-3-flash-a/-b/-agent are NOT the retired gemini-3-flash/M18 family:
+  // upstream responseModelAliases binds -a to MODEL_PLACEHOLDER_M132 and
+  // -b/-agent to M133, whose server display name is 'Gemini 3.5 Flash (High)'
+  // (Antigravity Context Window Monitor models.ts@603e3ea). The old
+  // gemini-3-flash-preview target for -agent misattributed ~56M observed
+  // tokens. Effort tiers collapse onto the priced base row, matching the
+  // gemini-3.5-flash-* entries below.
+  'gemini-3-flash-a':               'gemini-3.5-flash',
+  'gemini-3-flash-b':               'gemini-3.5-flash',
+  'gemini-3-flash-agent':           'gemini-3.5-flash',
+  // gemini-pro-default (legacy) and gemini-pro-agent (current model_id) are
+  // the two wire ids bound to MODEL_PLACEHOLDER_M16 = Gemini 3.1 Pro.
+  // The catalog prices that SKU under its -preview spelling.
+  'gemini-pro-default':             'gemini-3.1-pro-preview',
+  'gemini-pro-agent':               'gemini-3.1-pro-preview',
+  // gemini-pro-a/-c and gemini-default are opaque Antigravity gen_metadata
+  // wire names whose actual tier only the accompanying model_enum discloses.
+  'gemini-pro-a':                   'gemini-3.1-pro-preview',
+  'gemini-pro-c':                   'gemini-3.1-pro-preview',
+  'gemini-default':                 'gemini-3.5-flash',
   'gemini-3.5-flash-high':          'gemini-3.5-flash',
   'gemini-3.5-flash-medium':        'gemini-3.5-flash',
   'gemini-3.5-flash-low':           'gemini-3.5-flash',
+  'gemini-3.5-flash-extra-low':     'gemini-3.5-flash',
   'Gemini 3.5 Flash (High)':        'gemini-3.5-flash',
   'Gemini 3.5 Flash (Medium)':      'gemini-3.5-flash',
   'Gemini 3.5 Flash (Low)':         'gemini-3.5-flash',
@@ -506,6 +635,17 @@ const BUILTIN_ALIASES: Record<string, string> = {
   // released sibling (GLM-5.2 / glm-5p2). Hermes stores the id lowercased.
   'GLM-5.3':                        'glm-5p2',
   'glm-5.3':                        'glm-5p2',
+  // OpenCode free-tier tokens. Bare slug created by stripTerminalFreeSuffix.
+  // The 550b-a55b model is in LiteLLM already under its NVIDIA namespaced form
+  // and in the snapshot as the bare slug; this alias bridges the free-tier
+  // stripped form back to the priced row.
+  'nemotron-3-ultra':               'nemotron-3-ultra-550b-a55b',
+  // OpenCode's free tier serves Nemotron 3.5 Lightning under the bare slug;
+  // LiteLLM only indexes NVIDIA's namespaced row. Same model, published rate.
+  'nemotron-3.5-lightning':         'nvidia/nemotron-3.5-lightning',
+  // Local GGUF exports normalize to this bare slug (stripLocalGgufFilename);
+  // map it onto the A3B release the catalog prices.
+  'ornith-1.5-35b':                 'ornith-1.5-35b-a3b',
 }
 
 let userAliases: Record<string, string> = {}
@@ -856,6 +996,30 @@ function resolveAlias(model: string): string {
   if (lowercase !== model && Object.hasOwn(BUILTIN_ALIASES, lowercase)) return BUILTIN_ALIASES[lowercase]!
   return model
 }
+/// OpenCode's free tier serves otherwise-priced SKUs under a terminal `-free`
+/// suffix (`mimo-v2.5-free`, `nemotron-3-ultra-free`). Strip only when `-free`
+/// is the TERMINAL segment (`^(.+)-free$`), never a mid-name substring, so
+/// routing namespaces like `cline-free/` survive untouched.
+function stripTerminalFreeSuffix(model: string): string {
+  return model.replace(/^(.+)-free$/i, '$1')
+}
+
+/// Local GGUF runners record raw filenames (`Ornith-1.5-35B-Q4_K_M.gguf`).
+/// Drop the `.gguf` extension and one TRAILING llama.cpp quantization tag
+/// (`Q4_K_M`, `Q8_0`, `IQ4_XS`, `BF16`, …), then fold case, so a local export
+/// lands in the bucket of the cloud model it was quantized from. Case folding
+/// is scoped to ids we actually stripped rather than applied to every id:
+/// display names and case-sensitive alias keys elsewhere depend on the
+/// original spelling. Colon tags (ollama `qwen3:Q4_K_M`) are deliberately
+/// untouched — ':' is never treated as a quant separator, and LOCAL_NAMESPACES
+/// relies on unlisted local tags staying unpriced (#968).
+function stripLocalGgufFilename(model: string): string {
+  const stripped = model
+    .replace(/\.gguf$/i, '')
+    .replace(/[-_](?:q[2-8](?:_[a-z0-9]+)*|iq[1-4](?:_[a-z0-9]+)*|bf16|fp16|f16|f32)$/i, '')
+  return stripped === model ? model : stripped.toLowerCase()
+}
+
 function getCanonicalName(model: string): string {
   const cleaned = model
     .replace(/@.*$/, '')
@@ -871,7 +1035,11 @@ function getCanonicalName(model: string): string {
   if (lowercase !== cleaned && Object.hasOwn(BUILTIN_ALIASES, lowercase)) {
     return cleaned
   }
-  return stripKnownFirstNamespace(cleaned)
+  return stripKnownFirstNamespace(
+    stripLocalGgufFilename(
+      stripTerminalFreeSuffix(cleaned),
+    ),
+  )
 }
 
 /// Alias-resolved identity for report merge. Display names stay cosmetic —
@@ -1057,6 +1225,10 @@ export function getModelCosts(model: string): ModelCosts | null {
     const variantCosts = getModelCosts(canonicalVariant)
     if (variantCosts) return variantCosts
   }
+
+  const lowerCanonical = canonical.toLowerCase()
+  if (openRouterPricing.has(canonical)) return openRouterPricing.get(canonical)!
+  if (openRouterPricing.has(lowerCanonical)) return openRouterPricing.get(lowerCanonical)!
 
   return null
 }
