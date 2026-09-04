@@ -3703,11 +3703,15 @@ export function createCopilotProvider(
       source: SessionSource,
       seenKeys: Set<string>
     ): SessionParser {
-      if (isSessionStoreSource(source)) {
-        return createSessionStoreParser(source, seenKeys)
-      }
+      // Route to the correct parser based on source type.
+      // The dedup key set (seenKeys) is shared across both parsers,
+      // so if OTel already yielded a span, the JSONL parser will skip
+      // the matching assistant.message (and vice versa).
       if (isOtelSource(source)) {
         return createOtelParser(source, seenKeys)
+      }
+      if (isSessionStoreSource(source)) {
+        return createSessionStoreParser(source, seenKeys)
       }
       if (isChatSessionSource(source)) {
         return createChatSessionParser(source, seenKeys)
