@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter as pathDelimiter, join } from 'node:path'
@@ -28,7 +28,7 @@ function runCli(args: string[], home: string, extraEnv: Record<string, string | 
       ...process.env,
       CLAUDE_CONFIG_DIR: join(home, '.claude'),
       CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'),
-      HOME: home,
+      HOME: home, USERPROFILE: home,
       TZ: 'UTC',
       ...extraEnv,
     },
@@ -124,6 +124,19 @@ describe('codeburn status --format menubar-json', () => {
 
       const history = payload['history'] as { daily: unknown[] }
       expect(Array.isArray(history.daily)).toBe(true)
+
+      // The consent-gated telemetry aggregate the desktop app and the tray both
+      // send verbatim. Bucketed and name-only, so it must never echo a cost.
+      const snapshot = payload['telemetrySnapshot'] as Record<string, unknown>
+      expect(snapshot).toBeTruthy()
+      expect(snapshot['schema']).toBe(2)
+      // The same period label the payload shows, date suffix and all: the event
+      // it rides on is already stamped with the calendar day.
+      expect(snapshot['period']).toBe(current['label'])
+      expect(snapshot['costBucket']).toBe('<1')
+      expect((snapshot['models'] as Array<{ name: string; tasks: unknown[] }>)[0]!.tasks.length).toBeGreaterThan(0)
+      expect(JSON.stringify(snapshot)).not.toContain('myapp')
+      expect(JSON.stringify(snapshot)).not.toContain(String(current['cost']))
     } finally {
       await rm(home, { recursive: true, force: true })
     }
@@ -791,7 +804,9 @@ describe('codeburn status --format menubar-json', () => {
       // paths, so it must land group/world-unreadable regardless of umask.
       const snapshotFiles = findSnapshotFiles(join(home, '.cache', 'codeburn'))
       expect(snapshotFiles).toHaveLength(1)
-      expect(statSync(snapshotFiles[0]!).mode & 0o777).toBe(0o600)
+      // Windows has no POSIX mode bits: NTFS reports 0o666 whatever mode open()
+      // was handed, so owner-only permission is only assertable on POSIX.
+      if (process.platform !== 'win32') expect(statSync(snapshotFiles[0]!).mode & 0o777).toBe(0o600)
 
       // Identical query against an unchanged corpus: served from the
       // snapshot, byte-identical to the first call.
@@ -822,6 +837,52 @@ describe('codeburn status --format menubar-json', () => {
       expect(settled.status, `stderr: ${settled.stderr}`).toBe(0)
       const settledPayload = JSON.parse(settled.stdout) as { current: { calls: number } }
       expect(settledPayload.current.calls).toBe(2)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a provider payload cached under the previous render contract', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-provider-render-'))
+
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'myapp')
+      await mkdir(projectDir, { recursive: true })
+      const now = new Date()
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
+      const ts = (offset: number) => new Date(base.getTime() + offset).toISOString().replace(/\.\d+Z$/, 'Z')
+      await writeFile(
+        join(projectDir, 'session.jsonl'),
+        [userLine('s1', ts(0)), assistantLine('s1', ts(60_000), 'msg-1')].join('\n'),
+      )
+
+      const args = ['status', '--format', 'menubar-json', '--period', 'today', '--provider', 'all', '--no-optimize']
+      const first = runCli(args, home)
+      expect(first.status, `stderr: ${first.stderr}`).toBe(0)
+
+      const snapshotFiles = findSnapshotFiles(join(home, '.cache', 'codeburn'))
+      expect(snapshotFiles).toHaveLength(1)
+      const record = JSON.parse(await readFile(snapshotFiles[0]!, 'utf-8')) as {
+        semanticKey: string
+        payload: { current: { providerDetails: unknown[] } }
+      }
+      record.semanticKey = record.semanticKey.replace(/:render-\d+:/, ':render-2:')
+      record.payload.current.providerDetails = [
+        { id: 'legacy-idle', label: 'Legacy Idle', cost: 0 },
+      ]
+      await writeFile(snapshotFiles[0]!, JSON.stringify(record))
+
+      const second = runCli(args, home)
+      expect(second.status, `stderr: ${second.stderr}`).toBe(0)
+      const payload = JSON.parse(second.stdout) as {
+        current: { providerDetails: Array<{ id: string; calls: number; hasUsage: boolean }> }
+      }
+      expect(payload.current.providerDetails.map(provider => provider.id)).not.toContain('legacy-idle')
+      expect(payload.current.providerDetails.find(provider => provider.id === 'claude')).toMatchObject({
+        calls: 1,
+        hasUsage: true,
+      })
     } finally {
       await rm(home, { recursive: true, force: true })
     }

@@ -73,6 +73,48 @@ struct CapacityDockPresentationTests {
         #expect(horizontal.height == CapacityDockMetrics.horizontalRailWidth(scale: 1.2))
     }
 
+    @MainActor
+    @Test("Supported settled scales and edges compose integral panel dimensions")
+    func supportedSettledGeometryIsIntegral() {
+        let suite = "CodeBurnMenubarTests.CapacityDock.IntegralGeometry.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        CapacityDockPreferences.setSelectedProviders([.codex, .claude, .gemini], defaults: defaults)
+
+        for step in 0...12 {
+            let scale = 0.6 + Double(step) * 0.05
+            CapacityDockPreferences.setScale(scale, defaults: defaults)
+
+            for edge in CapacityDockEdge.allCases {
+                CapacityDockPreferences.setPlacement(
+                    dockedEdge: edge,
+                    attachmentEdge: edge,
+                    normalizedHorizontalOffset: 0.5,
+                    normalizedVerticalOffset: 0.5,
+                    defaults: defaults
+                )
+                let model = CapacityDockViewModel(
+                    preferences: CapacityDockPreferences.load(defaults: defaults)
+                )
+
+                let resting = model.targetPanelSize(forAttachmentProgress: 1)
+                #expect(resting.width.rounded() == resting.width)
+                #expect(resting.height.rounded() == resting.height)
+                #expect(model.railAlongPad.rounded() == model.railAlongPad)
+
+                model.interaction.setRailHovered(true)
+                let expanded = model.targetPanelSize(forAttachmentProgress: 1)
+                #expect(expanded.width.rounded() == expanded.width)
+                #expect(expanded.height.rounded() == expanded.height)
+
+                #expect(model.detailWidth.rounded() == model.detailWidth)
+                // The glance popover's own height is asserted whole across scales by
+                // CapacityDockGlanceTests.heightIsAlwaysWhole, against the signature it
+                // grew when the glance replaced the old row-counted popover.
+            }
+        }
+    }
+
     @Test("Docked silhouette flares smoothly into one flush contact chord without horns")
     func dockedRailSilhouette() {
         let path = CapacityDockRailShape(bodyWidth: 88, bodyLength: 356, attachmentProgress: 1, edge: .right)
@@ -284,7 +326,21 @@ struct CapacityDockPresentationTests {
             footerLines: [reason]
         )
 
-        #expect(CapacityDockMetrics.detailHeight(quota: quota, scale: 1) >= 216)
+        let height = CapacityDockMetrics.detailHeight(
+            quota: quota,
+            sessionCount: nil,
+            hasToday: false,
+            tailEdge: .right,
+            scale: 1
+        )
+        // Worst case the card must not clip: the provider header, the guidance
+        // block at full wrap ("Reconnect required", a 2-line reason and a 3-line
+        // instruction at ~13pt each, plus their spacing), and the action button.
+        // The windows row is absent, since a disconnected provider has no quota.
+        let guidance: CGFloat = 84
+        let actionButton: CGFloat = 38
+        let floor: CGFloat = CapacityDockGlance.headerHeight + guidance + actionButton
+        #expect(height >= floor)
     }
 
     @MainActor

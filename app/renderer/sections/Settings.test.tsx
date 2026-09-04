@@ -3,7 +3,7 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { ActionResult, AliasRow, CombinedUsage, DeviceScanResult, Identity, MenubarPayload, PriceOverrideList, PriceRates, QuotaProvider, ShareStatus, StatusJson } from '../lib/types'
+import type { ActionResult, AliasRow, CombinedUsage, DeviceScanResult, Identity, MenubarPayload, PriceOverrideList, PriceRates, QuotaProvider, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
 import { Settings } from './Settings'
 
 const mocks = vi.hoisted(() => ({
@@ -27,18 +27,26 @@ const mocks = vi.hoisted(() => ({
   resetPlan: vi.fn<(provider: string) => Promise<ActionResult>>(),
   chooseDirectory: vi.fn<() => Promise<string | null>>(),
   exportData: vi.fn<(format: string, provider: string, path: string) => Promise<ActionResult>>(),
+  companionStatus: vi.fn(),
+  trayPrefs: vi.fn(),
+  setTrayAppPref: vi.fn(),
+  setTrayDockPref: vi.fn(),
+  setLaunchAtLogin: vi.fn(),
+  telemetryTrack: vi.fn<(name: string, props?: Record<string, unknown>) => Promise<boolean>>(),
+  telemetryStatus: vi.fn<() => Promise<TelemetryStatus | null>>(),
+  setTelemetryEnabled: vi.fn<(enabled: boolean) => Promise<TelemetryStatus | null>>(),
 }))
 vi.mock('../lib/ipc', async orig => {
   const actual = await orig<typeof import('../lib/ipc')>()
   return { ...actual, codeburn: mocks }
 })
 
-const identity: Identity = { name: 'Toruk MacBook Pro', fingerprint: 'AA:11:22:33:44:55:66:77' }
+const identity: Identity = { name: 'Studio MacBook Pro', fingerprint: 'AA:11:22:33:44:55:66:77' }
 const actionOk: ActionResult = { ok: true, stdout: 'updated', stderr: '', code: 0 }
 const devices: CombinedUsage = {
   perDevice: [
-    { id: 'local', name: 'Toruk MacBook Pro', local: true, cost: 120.1, calls: 100, sessions: 10, inputTokens: 1, outputTokens: 2, cacheCreateTokens: 3, cacheReadTokens: 4, totalTokens: 10 },
-    { id: 'mini', name: 'toruk-mini', local: false, cost: 41.2, calls: 680, sessions: 34, inputTokens: 11, outputTokens: 12, cacheCreateTokens: 13, cacheReadTokens: 14, totalTokens: 50 },
+    { id: 'local', name: 'Studio MacBook Pro', local: true, cost: 120.1, calls: 100, sessions: 10, inputTokens: 1, outputTokens: 2, cacheCreateTokens: 3, cacheReadTokens: 4, totalTokens: 10 },
+    { id: 'mini', name: 'studio-mini', local: false, cost: 41.2, calls: 680, sessions: 34, inputTokens: 11, outputTokens: 12, cacheCreateTokens: 13, cacheReadTokens: 14, totalTokens: 50 },
   ],
   combined: { cost: 161.3, calls: 780, sessions: 44, inputTokens: 12, outputTokens: 14, cacheCreateTokens: 16, cacheReadTokens: 18, totalTokens: 60, deviceCount: 2, reachableCount: 2 },
 }
@@ -48,6 +56,14 @@ const quotaProviders: QuotaProvider[] = [
   { provider: 'claude', connection: 'connected', primary: null, details: [], planLabel: 'Max 20x', footerLines: [] },
   { provider: 'codex', connection: 'disconnected', primary: null, details: [], planLabel: null, footerLines: [] },
 ]
+const trayPrefs = {
+  app: { metric: 'cost', menubarPeriod: 'today', accent: 'ember', trayBadge: false, usageRefreshSeconds: -1, quotaCadenceSeconds: 120, terminal: 'windowsTerminal' },
+  dock: { enabled: true, preferred: 'claude', scale: 0.6, theme: 'graphite', gaugeShape: 'circle', providers: ['claude'], manualSelection: true },
+  launchAtLogin: false,
+}
+const telemetryOff: TelemetryStatus = {
+  installId: '8f1c2b4d', country: 'DE', enabled: false, defaultEnabled: false, onboarded: true,
+}
 const stored = new Map<string, string>()
 vi.stubGlobal('localStorage', {
   getItem: (key: string) => stored.get(key) ?? null,
@@ -64,7 +80,7 @@ describe('Settings', () => {
     mocks.getIdentity.mockResolvedValue(identity)
     mocks.getDevices.mockResolvedValue(devices)
     mocks.getDevicesScan.mockResolvedValue(scan)
-    mocks.getShareStatus.mockResolvedValue({ sharing: true, name: 'Toruk MacBook Pro', port: 9732, always: false, peers: 1, pending: [] })
+    mocks.getShareStatus.mockResolvedValue({ sharing: true, name: 'Studio MacBook Pro', port: 9732, always: false, peers: 1, pending: [] })
     mocks.getQuota.mockResolvedValue(quotaProviders)
     mocks.getPlans.mockResolvedValue({ currency: 'EUR', today: { cost: 0, savings: 0, calls: 0 }, month: { cost: 0, savings: 0, calls: 0 }, plans: { claude: { id: 'claude-max', provider: 'claude', budget: 200, spent: 48, percentUsed: 24, status: 'under', projectedMonthEnd: 120, daysUntilReset: 19, periodStart: '2026-07-01', periodEnd: '2026-08-01' } } })
     mocks.getOverview.mockResolvedValue(overview)
@@ -79,8 +95,14 @@ describe('Settings', () => {
     mocks.removeDevice.mockResolvedValue(actionOk)
     mocks.setPlan.mockResolvedValue(actionOk)
     mocks.resetPlan.mockResolvedValue(actionOk)
-    mocks.chooseDirectory.mockResolvedValue('/Users/toruk/Exports')
+    mocks.chooseDirectory.mockResolvedValue('/Users/x/Exports')
     mocks.exportData.mockResolvedValue(actionOk)
+    mocks.telemetryTrack.mockResolvedValue(true)
+    mocks.telemetryStatus.mockResolvedValue(telemetryOff)
+    mocks.setTelemetryEnabled.mockImplementation(async enabled => ({ ...telemetryOff, enabled }))
+    // No bundled tray app unless a test says otherwise, which is every platform but Windows.
+    mocks.companionStatus.mockResolvedValue({ supported: false, menuBar: false, sidebar: false, store: false })
+    mocks.trayPrefs.mockResolvedValue(trayPrefs)
     localStorage.clear()
     document.documentElement.removeAttribute('data-theme')
   })
@@ -104,6 +126,74 @@ describe('Settings', () => {
     await user.click(screen.getByRole('option', { name: 'CNY' }))
     expect(mocks.setCurrency).toHaveBeenCalledWith('CNY')
     expect(await screen.findByText('Updated')).toBeInTheDocument()
+  })
+
+  it('reports settings, plan and export interactions as name-only events', async () => {
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+
+    await user.click(screen.getByRole('button', { name: 'Dark' }))
+    expect(mocks.telemetryTrack).toHaveBeenCalledWith('settings_change', { setting: 'theme', value: 'dark' })
+
+    await user.click(await screen.findByLabelText('Currency'))
+    await user.click(screen.getByRole('option', { name: 'CNY' }))
+    expect(mocks.telemetryTrack).toHaveBeenCalledWith('settings_change', { setting: 'currency', value: 'CNY' })
+
+    await user.click(screen.getByRole('button', { name: 'Plans' }))
+    await user.click(await screen.findByLabelText('Add a plan'))
+    await user.click(screen.getByRole('option', { name: 'Cursor Pro' }))
+    await user.click(screen.getByRole('button', { name: 'Add' }))
+    expect(mocks.telemetryTrack).toHaveBeenCalledWith('plan_set', { provider: 'cursor', plan: 'cursor-pro' })
+
+    await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
+    await user.click(screen.getByRole('button', { name: 'Choose folder…' }))
+    await screen.findByText('/Users/x/Exports')
+    await user.click(screen.getByRole('button', { name: 'JSON' }))
+    await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
+    expect(mocks.telemetryTrack).toHaveBeenCalledWith('export', { format: 'json', provider: 'all' })
+
+    // The chosen folder is a real path on this machine and never travels.
+    const sent = JSON.stringify(mocks.telemetryTrack.mock.calls)
+    expect(sent).not.toContain('/Users/x')
+  })
+
+  // The main process drops any event raised while telemetry is off, so an opt-in tracked
+  // before the write lands is one that can never be sent. It goes out after the toggle takes.
+  it('reports the telemetry opt-in only once the toggle has taken', async () => {
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+
+    await user.click(await screen.findByRole('switch', { name: 'Anonymous telemetry' }))
+
+    expect(mocks.setTelemetryEnabled).toHaveBeenCalledWith(true)
+    await waitFor(() => {
+      expect(mocks.telemetryTrack).toHaveBeenCalledWith('settings_change', { setting: 'telemetry', value: true })
+    })
+    const tracked = mocks.telemetryTrack.mock.invocationCallOrder.at(-1)!
+    expect(tracked).toBeGreaterThan(mocks.setTelemetryEnabled.mock.invocationCallOrder[0]!)
+  })
+
+  it('sends nothing when the write does not take, and nothing on the way out', async () => {
+    const user = userEvent.setup()
+    // A settings write that failed leaves telemetry off, so there is no opt-in to report.
+    mocks.setTelemetryEnabled.mockResolvedValue(telemetryOff)
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+    await user.click(await screen.findByRole('switch', { name: 'Anonymous telemetry' }))
+    await waitFor(() => expect(mocks.setTelemetryEnabled).toHaveBeenCalled())
+
+    // Turning it off mints a fresh install id and drops the queue, so an opt-out event would
+    // never arrive anywhere either.
+    mocks.telemetryStatus.mockResolvedValue({ ...telemetryOff, enabled: true })
+    mocks.setTelemetryEnabled.mockResolvedValue(telemetryOff)
+    render(<Settings period="month" />)
+    await user.click(screen.getAllByRole('button', { name: 'Privacy & data' }).at(-1)!)
+    await user.click((await screen.findAllByRole('switch', { name: 'Anonymous telemetry' })).at(-1)!)
+    await waitFor(() => expect(mocks.setTelemetryEnabled).toHaveBeenCalledWith(false))
+
+    const telemetryEvents = mocks.telemetryTrack.mock.calls.filter(([, props]) => props?.setting === 'telemetry')
+    expect(telemetryEvents).toEqual([])
   })
 
   it('persists theme choices and applies forced themes to the root', async () => {
@@ -317,24 +407,24 @@ describe('Settings', () => {
     await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
     await user.click(screen.getByRole('button', { name: 'Choose folder…' }))
     expect(mocks.chooseDirectory).toHaveBeenCalledOnce()
-    expect(await screen.findByText('/Users/toruk/Exports')).toBeInTheDocument()
+    expect(await screen.findByText('/Users/x/Exports')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'JSON' }))
     await user.click(screen.getByLabelText('Provider'))
     await user.click(screen.getByRole('option', { name: 'Claude' }))
     await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
-    expect(mocks.exportData).toHaveBeenCalledWith('json', 'claude', '/Users/toruk/Exports')
-    expect(await screen.findByText('Exported to /Users/toruk/Exports')).toBeInTheDocument()
+    expect(mocks.exportData).toHaveBeenCalledWith('json', 'claude', '/Users/x/Exports')
+    expect(await screen.findByText('Exported to /Users/x/Exports')).toBeInTheDocument()
   })
 
   it('renders real device status and removes paired devices without fake pairing controls', async () => {
     const user = userEvent.setup()
     render(<Settings period="month" />)
     await user.click(screen.getByRole('button', { name: 'Devices' }))
-    expect(await screen.findByText('Toruk MacBook Pro')).toBeInTheDocument()
-    expect(screen.getByText('Local device name: Toruk MacBook Pro')).toBeInTheDocument()
+    expect(await screen.findByText('Studio MacBook Pro')).toBeInTheDocument()
+    expect(screen.getByText('Local device name: Studio MacBook Pro')).toBeInTheDocument()
     expect(await screen.findByText('Mac Studio')).toBeInTheDocument()
     expect(screen.getByText('fingerprint 7F:2A:…:C4')).toBeInTheDocument()
-    expect(await screen.findByText('toruk-mini')).toBeInTheDocument()
+    expect(await screen.findByText('studio-mini')).toBeInTheDocument()
     expect(screen.getByText('34 sessions · $41.20 this month')).toBeInTheDocument()
     expect(screen.getByText('Visible')).toBeInTheDocument()
     expect(screen.getByText(/Pairing is interactive/)).toBeInTheDocument()
@@ -342,7 +432,7 @@ describe('Settings', () => {
     expect(screen.queryByText('Pull now')).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Remove' }))
     await user.click(screen.getByRole('button', { name: 'Confirm' }))
-    expect(mocks.removeDevice).toHaveBeenCalledWith('toruk-mini')
+    expect(mocks.removeDevice).toHaveBeenCalledWith('studio-mini')
     expect(screen.getByText('Combined view active · 2 devices')).toBeInTheDocument()
   })
 
@@ -366,5 +456,34 @@ describe('Settings', () => {
     await user.click(screen.getByRole('button', { name: 'Devices' }))
     await waitFor(() => expect(screen.getAllByText('Locate the codeburn CLI')).toHaveLength(2))
     expect(screen.getByText('permission denied; grant Full Disk Access')).toHaveStyle({ color: 'var(--warn)' })
+  })
+
+  // The tray app has settings of its own, and they only exist while it does. Each pane is
+  // shown only while its switch in the sidebar corner is on.
+  it("offers no tray panes where there is no bundled tray app", async () => {
+    render(<Settings period="month" />)
+    await waitFor(() => expect(mocks.companionStatus).toHaveBeenCalled())
+    expect(screen.queryByRole("button", { name: "Menu bar" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Capacity Dock" })).toBeNull()
+  })
+
+  it("offers both tray panes while both switches are on", async () => {
+    mocks.companionStatus.mockResolvedValue({ supported: true, menuBar: true, sidebar: true, store: false })
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+
+    await user.click(await screen.findByRole("button", { name: "Menu bar" }))
+    expect(await screen.findByRole("heading", { name: "Menu bar" })).toBeInTheDocument()
+
+    await user.click(screen.getByRole("button", { name: "Capacity Dock" }))
+    expect(await screen.findByRole("heading", { name: "Capacity Dock" })).toBeInTheDocument()
+  })
+
+  it("drops the Capacity Dock pane when the Sidebar switch is off", async () => {
+    mocks.companionStatus.mockResolvedValue({ supported: true, menuBar: true, sidebar: false, store: false })
+    render(<Settings period="month" />)
+
+    expect(await screen.findByRole("button", { name: "Menu bar" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Capacity Dock" })).toBeNull()
   })
 })

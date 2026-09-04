@@ -84,6 +84,13 @@ export type ProviderCost = {
   calls?: number
   /** True when the selected period contains cost, calls, sessions, savings, or tokens. */
   hasUsage?: boolean
+  /** Provider-scoped tokens for the period. Absent (not zero) when no day in the
+   *  period carried a per-provider token breakdown, so a consumer can tell
+   *  "no token data" from "no tokens". */
+  inputTokens?: number
+  outputTokens?: number
+  /** Provider-scoped session count for the period, absent under the same rule. */
+  sessions?: number
 }
 import type { OptimizeResult } from './optimize.js'
 import { getCurrency } from './currency.js'
@@ -91,6 +98,8 @@ import type { GranularHistory } from './granular-history.js'
 import { getShortModelName } from './models.js'
 import type { ReworkedFile } from './workflow-insights.js'
 import type { PrRow, BranchRow } from './sessions-report.js'
+import type { LiveSessionsBlock } from './live-sessions.js'
+import { buildTelemetrySnapshot, type TelemetrySnapshot, type TelemetrySnapshotInput } from './telemetry-snapshot.js'
 
 const TOP_ACTIVITIES_LIMIT = 20
 const TOP_MODELS_LIMIT = 20
@@ -109,6 +118,11 @@ export type DailyModelBreakdown = {
   calls: number
   inputTokens: number
   outputTokens: number
+  /// Raw provider/model ids that collapsed into this display name (e.g.
+  /// `minimax/MiniMax-M3` and `MiniMaxAI/MiniMax-M3` both showing as "MiniMax
+  /// M3"). Present only when more than one raw id folded in, so a cached vs
+  /// uncached route can still be told apart (#1239).
+  rawModels?: string[]
 }
 
 export type DailyHistoryEntry = {
@@ -212,6 +226,10 @@ export type MenubarPayload = {
   /// section AND its command wrote it. Surfaces render what they recognize
   /// and ignore the rest; absence always means "no plugin output today".
   plugins?: Record<string, unknown>
+  /// Add-only. Sessions whose transcript was appended inside the liveness
+  /// window, with the context each is holding. Omitted when the producer did
+  /// not compute it, so absence means "unknown", never "nothing is running".
+  liveSessions?: LiveSessionsBlock
   current: {
     label: string
     cost: number
@@ -265,7 +283,20 @@ export type MenubarPayload = {
     /// provider name (round-trips as `--provider`), `label` the display name,
     /// and `hasUsage` the period-activity signal used by provider pickers.
     /// The `providers` map keys stay lowercased display names for compatibility.
-    providerDetails: Array<{ id: string; label: string; cost: number; calls: number; hasUsage: boolean }>
+    /// `inputTokens`, `outputTokens` and `sessions` are add-only and optional:
+    /// they are omitted when the period carries no per-provider breakdown for
+    /// them, so a consumer must render the absence rather than substitute a
+    /// period-wide figure.
+    providerDetails: Array<{
+      id: string
+      label: string
+      cost: number
+      calls: number
+      hasUsage: boolean
+      inputTokens?: number
+      outputTokens?: number
+      sessions?: number
+    }>
     topProjects: Array<{
       name: string
       cost: number
@@ -382,6 +413,12 @@ export type MenubarPayload = {
   currency: { code: string; symbol: string; rate: number }
   combined?: CombinedUsage
   claudeConfigs?: ClaudeConfigSelector
+  /// Anonymised, fully bucketed daily aggregate for consent-gated product
+  /// telemetry: the `usage_snapshot` event that the desktop app and the Windows
+  /// tray both send verbatim, so the two surfaces cannot drift apart. Opaque to
+  /// every other consumer. `null` when it could not be computed. See
+  /// src/telemetry-snapshot.ts for the privacy contract it holds.
+  telemetrySnapshot: TelemetrySnapshot | null
 }
 
 function oneShotRateFor(editTurns: number, oneShotTurns: number): number | null {
@@ -473,6 +510,9 @@ function buildProviderDetails(providers: ProviderCost[]): MenubarPayload['curren
       cost: p.cost,
       calls: p.calls ?? 0,
       hasUsage: p.hasUsage ?? (p.cost > 0 || (p.calls ?? 0) > 0),
+      ...(p.inputTokens === undefined ? {} : { inputTokens: p.inputTokens }),
+      ...(p.outputTokens === undefined ? {} : { outputTokens: p.outputTokens }),
+      ...(p.sessions === undefined ? {} : { sessions: p.sessions }),
     }))
 }
 
@@ -548,6 +588,10 @@ export type BreakdownArrays = {
   /// menubar payload defaults to an empty savings block — keeping the
   /// schema stable for consumers that don't care about local savings.
   localModelSavings?: LocalModelSavings
+  /// Inputs the telemetry snapshot needs that the payload itself does not
+  /// carry: the per-(model, task category) turn cross and session wall-clock
+  /// durations. The raw values never enter the payload, only their buckets.
+  telemetry?: TelemetrySnapshotInput
 }
 
 export function buildMenubarPayload(
@@ -608,7 +652,11 @@ export function buildMenubarPayload(
       const c = getCurrency()
       return { code: c.code, symbol: c.symbol, rate: c.rate }
     })(),
+    telemetrySnapshot: null,
   }
+  // Derived from the payload that was just assembled, so the snapshot can never
+  // report something the payload does not already say.
+  payload.telemetrySnapshot = buildTelemetrySnapshot(payload, breakdowns?.telemetry)
   if (claudeConfigs && claudeConfigs.options.length > 1) {
     payload.claudeConfigs = claudeConfigs
   }

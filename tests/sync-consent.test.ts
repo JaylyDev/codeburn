@@ -15,6 +15,7 @@ import {
 import { readSyncConfig, writeSyncConfig, readReceipts, appendReceipt } from '../src/sync/config.js'
 import { CORE_SYNC_ATTRIBUTE_KEYS } from '../src/sync/otlp.js'
 import { buildLaunchAgentPlist } from '../src/sync/schedule-installer.js'
+import { setHome } from './setup/home.js'
 
 describe('Fingerprint', () => {
   it('is deterministic - same input produces same hash', () => {
@@ -301,7 +302,7 @@ describe('Config with auto block', () => {
 
   beforeEach(async () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'codeburn-test-'))
-    process.env.HOME = tmpDir
+    setHome(tmpDir)
   })
 
   afterEach(async () => {
@@ -391,7 +392,7 @@ describe('Receipts', () => {
 
   beforeEach(async () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'codeburn-test-'))
-    process.env.HOME = tmpDir
+    setHome(tmpDir)
   })
 
   afterEach(async () => {
@@ -435,7 +436,7 @@ describe('Receipts', () => {
 
   it('creates directory if missing when appending receipt', () => {
     // Don't pre-create configDir - test that appendReceipt creates it
-    process.env.HOME = tmpDir
+    setHome(tmpDir)
 
     const receipt = { at: '2024-01-01T00:00:00Z', result: 'pushed', spans: 5 }
     appendReceipt(receipt)
@@ -483,7 +484,7 @@ describe('Damaged acceptance record', () => {
 
   beforeEach(async () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'codeburn-test-'))
-    process.env.HOME = tmpDir
+    setHome(tmpDir)
   })
 
   afterEach(async () => {
@@ -584,7 +585,7 @@ describe('sync auto status --json', () => {
   let testDir: string
   beforeEach(async () => {
     testDir = await mkdtemp(join(tmpdir(), 'sync-auto-'))
-    process.env.HOME = testDir
+    setHome(testDir)
   })
 
   afterEach(async () => {

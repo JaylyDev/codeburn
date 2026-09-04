@@ -55,7 +55,8 @@
       <strong>Menubar</strong><br/>
       <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/menubar-app.jpg" alt="CodeBurn macOS menubar" /><br/>
       <code>codeburn menubar</code><br/>
-      <a href="https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.23"><img src="https://img.shields.io/badge/Windows-Tray_app_(.msi)-F97316?logo=windows&logoColor=white" alt="Download the CodeBurn Windows menubar" /></a>
+      <a href="https://apps.microsoft.com/detail/9P0R4ZL5XMB8"><img src="https://img.shields.io/badge/Windows-Microsoft_Store-F97316?logo=microsoft&logoColor=white" alt="Get CodeBurn from the Microsoft Store" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.23"><img src="https://img.shields.io/badge/Windows-Tray_app_.msi_(preview)-F97316?logo=windows&logoColor=white" alt="Download the CodeBurn Windows tray app developer preview (.msi)" /></a>
     </td>
   </tr>
   <tr>
@@ -75,7 +76,7 @@ You pay for Claude, Codex, Cursor, and a stack of other AI tools. The bill tells
 
 CodeBurn does. It reads the session files your tools already write to disk and breaks down every token and dollar by **task, model, tool, and project**, across **41 AI tools**.
 
-Everything runs locally. No wrapper, no proxy, no API keys, nothing leaves your machine. Pricing comes from [LiteLLM](https://github.com/BerriAI/litellm), refreshed daily.
+Everything runs locally. No wrapper, no proxy, no API keys, nothing leaves your machine. Pricing comes from [LiteLLM](https://github.com/BerriAI/litellm), refreshed daily. The optional desktop app can send an anonymous, bucketed usage report if you say yes to it; see [Telemetry](#telemetry).
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
@@ -88,7 +89,8 @@ Everything runs locally. No wrapper, no proxy, no API keys, nothing leaves your 
   <a href="#supported-tools">Supported tools</a> ·
   <a href="#commands">Commands</a> ·
   <a href="#features">Features</a> ·
-  <a href="#how-it-reads-your-data">How it reads data</a>
+  <a href="#how-it-reads-your-data">How it reads data</a> ·
+  <a href="#telemetry">Telemetry</a>
 </p>
 
 ## Quick start
@@ -348,6 +350,8 @@ Allowed values are `terminal` (macOS Terminal.app, the default) and `iterm2`. An
 
 ### Windows
 
+The recommended install is the [Microsoft Store](https://apps.microsoft.com/detail/9P0R4ZL5XMB8) (Store ID `9P0R4ZL5XMB8`), which ships the desktop app with the tray app inside it. Microsoft signs that package at submission, and the Store keeps it up to date, so the tray app leaves its own update checker switched off there.
+
 Windows gets the same ambient view from the system tray, from the same one command:
 
 ```powershell
@@ -358,7 +362,9 @@ It downloads the `.msi` for your CLI version, verifies its sha256, runs it throu
 
 Today's spend sits in the tray as a number beside the flame icon (turn it off in Settings, and the tooltip always carries it). Click for the same popover the macOS app shows: agent tabs, period switcher, Trend, Forecast, Pulse, Stats and Plan insights, activity and model breakdowns, optimize findings, and CSV/JSON export. Settings covers launch at login, the tray number, theme, and currency. It refreshes every 60 seconds while the popover is open and every 2 minutes while it is closed.
 
-The tray app reads everything through the CLI, so install that first (`npm install -g codeburn`) — it needs **codeburn 0.9.9 or newer**, and shows a setup screen with the install command until it finds one. Source and build instructions are in [`windows/`](windows/) ([windows/DEVELOPMENT.md](windows/DEVELOPMENT.md)). The `.msi` is unsigned for now, so SmartScreen prompts on first run.
+The tray app reads everything through the CLI, so install that first (`npm install -g codeburn`). It needs **codeburn 0.9.9 or newer**, and shows a setup screen with the install command until it finds one. Source and build instructions are in [`windows/`](windows/) ([windows/DEVELOPMENT.md](windows/DEVELOPMENT.md)).
+
+The `.msi` under the `windows-v*` releases and the desktop setup `.exe` are a developer preview. Both are unsigned, so SmartScreen prompts on first run: click "More info", then "Run anyway". The preview builds also do not update themselves. The tray app still tells you when a newer version exists and links to the release; taking it means re-running `codeburn menubar --force` or downloading the new build yourself.
 
 ### Linux (GNOME)
 
@@ -502,6 +508,8 @@ Sync sends token counts, costs, models, and projects, never prompts or code. Thi
 
 | Command | What it does |
 |---------|--------------|
+| `codeburn quota` | Live provider capacity: quota windows for each signed-in coding tool |
+| `codeburn quota --format json` | The same capacity readings as JSON |
 | `codeburn doctor` | Per-provider detection status: paths probed, sessions found, parse health (`--json`, `--provider`) |
 | `codeburn audit` | Per provider-model token source table: where every number comes from |
 | `codeburn context` | What fills a session's context window: interactive browser (Claude Code and Codex) |
@@ -665,6 +673,31 @@ codeburn doctor --json              # machine-readable, pipe to jq
 
 For each provider it shows the exact directories or databases probed (with any env override such as `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or `OPENCODE_DATA_DIR` and whether the path exists), how many session files were found, how many of a bounded sample parsed cleanly, the cached file count, and a one-line verdict: `OK (n sessions)`, `NOTHING FOUND` with the likely cause (directory missing, override points at an empty dir, or the tool is not installed), or `ERRORS (n parse failures)`. A provider that throws is caught and reported as its own error row, never crashing the rest of the report.
 
+### Provider quota
+
+`codeburn quota` reads how much of each provider's plan you have already spent, from the credentials the tools themselves keep on this machine. Claude, Codex, Gemini, GitHub Copilot and Kimi are read from their own signed-in sessions; Antigravity is read from its local language server.
+
+```bash
+codeburn quota               # table of every provider and its windows
+codeburn quota --format json # machine-readable, pipe to jq
+```
+
+Providers you are not signed in to are listed with `available: false` and no error. Reads run in parallel with a short per-provider timeout, and the command always exits 0 so a status bar or tray can poll it safely.
+
+```json
+{
+  "providers": [
+    {
+      "id": "claude",
+      "name": "Claude",
+      "available": true,
+      "plan": "Max 20x",
+      "windows": [{ "label": "Weekly", "usedPct": 42.5, "resetsAt": "2026-09-08T12:00:00.000Z" }]
+    }
+  ]
+}
+```
+
 ### JSON Output
 
 `report`, `today`, and `month` support `--format json` to output the full dashboard data as structured JSON to stdout:
@@ -743,6 +776,65 @@ These are starting points, not verdicts. A 60% cache hit on a single experimenta
 | **Vercel AI Gateway** | [Vercel AI Gateway reporting API](https://vercel.com/docs/ai-gateway/capabilities/custom-reporting) (cloud, not local logs) | Set `AI_GATEWAY_API_KEY` or `VERCEL_OIDC_TOKEN` (from `vercel env pull` / `vercel dev`); requires a Vercel plan with Custom Reporting. Without credentials, it's skipped silently in the combined dashboard. |
 
 CodeBurn deduplicates messages (by API message ID for Claude, by cumulative token cross-check for Codex, by conversation/timestamp for Cursor, by session ID for Gemini, by session+message ID for OpenCode, by responseId for Pi/OMP, by chat folder + message ID for Codebuff, by session+message ID for Kimi), filters by date range per entry, and classifies each turn.
+
+</details>
+
+## Telemetry
+
+<details>
+<summary><strong>What the desktop app sends, and how to turn it off</strong></summary>
+
+The **CLI sends nothing.** No wrapper, no proxy, no phoning home.
+
+The **desktop app and the Windows tray** can send an anonymous usage report, and only after you
+decide on the first-launch consent screen. The toggle defaults to **off** in the EU, EEA, UK and
+Switzerland, and anywhere the region is unknown; **on** elsewhere. Either way it is your call, and
+you can change it any time in **Settings > Privacy & data > Anonymous telemetry**. Turning it off
+stops all sending, clears anything queued, and mints a fresh install id so past and future reports
+cannot be linked.
+
+The only identifier is a random id generated on your machine. Events carry the calendar day, never
+a clock time. Alongside each batch go the app version, platform, architecture and country.
+
+**`usage_snapshot`** goes out at most once per calendar day. It is computed by the CLI so the app
+and the tray report the identical shape, and every magnitude in it is a bucket, never an exact
+figure. The daily report includes the names of the models, tools, skills and MCP servers you use,
+alongside those bucketed counts.
+
+| Field | What it carries |
+|-------|-----------------|
+| `schema`, `period` | Snapshot version, and the period label you were looking at (for example `30 Days`) |
+| `providerCount`, `costBucket` | How many providers had usage, and total spend as a range: `<1`, `1-10`, `10-50`, `50-200`, `200-1k`, `1k+` USD |
+| `models` | Up to 8 model names, each with its cost bucket, turn-count bucket, one-shot rate, and up to 6 task categories with a turn bucket and share of that model's turns |
+| `categories` | Up to 12 task category names (Coding, Debugging, Planning, …) with a turn bucket, one-shot rate, and up to 3 model names |
+| `providers` | Up to 8 provider names with a cost bucket each |
+| `mcpServers`, `skills`, `tools` | Up to 12 names each with a call-count bucket: `0`, `1-10`, `10-100`, `100-1k`, `1k+` |
+| `sessions` | Session count bucket, and median session length as a bucket: `<5`, `5-15`, `15-60`, `60-240`, `240+` minutes |
+| `efficiency` | Cache hit rate and retry tax as shares of the total, to two decimals |
+
+The other events are name-only:
+
+| Event | Fields |
+|-------|--------|
+| `app_open`, `app_close` | Session length in whole minutes |
+| `section_view` | Which section you opened (`overview`, `spend`, …) |
+| `cold_start` | Milliseconds to the first painted overview, and whether it timed out |
+| `cli_error` | Error kind and the command name, capped at 20 per kind per day |
+| `optimize_apply` | The finding id you took a fix for (`unused-mcp`, `claude-md-too-long`, …) and the fix type |
+| `plan_set` | Provider and plan preset id |
+| `export` | Format (`csv` or `json`) and provider |
+| `compare_view` | The two model names being compared |
+| `settings_change` | Setting name and its new boolean or enum value |
+
+**Never collected:** prompts, code, file contents, file or folder names, project names, branch names,
+working directories, session titles, PR links, API keys, exact dollar amounts, exact counts, clock
+times, or IP-based location beyond the country.
+The names of the models, tools, skills and MCP servers you use are collected, as the table above
+sets out, and a whitelist sanitizer drops anything that is not a short string, a finite number or a
+boolean before it leaves the machine.
+
+**To turn it off:** decline on the consent screen, or open **Settings > Privacy & data** and switch
+**Anonymous telemetry** off.
 
 </details>
 

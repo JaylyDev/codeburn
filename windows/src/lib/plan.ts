@@ -21,8 +21,11 @@ export type PlanProjection = {
   source: 'linear' | 'historical'
 }
 
-const FIVE_HOUR_SECONDS = 5 * 3600
-const SEVEN_DAY_SECONDS = 7 * 86_400
+const HOUR_SECONDS = 3600
+const DAY_SECONDS = 86_400
+const FIVE_HOUR_SECONDS = 5 * HOUR_SECONDS
+const SEVEN_DAY_SECONDS = 7 * DAY_SECONDS
+const THIRTY_DAY_SECONDS = 30 * DAY_SECONDS
 /// Below this fraction of the window the linear extrapolation is noise; fall back to
 /// last cycle's final reading instead.
 const FRESH_WINDOW_THRESHOLD = 0.05
@@ -32,36 +35,75 @@ function windowSeconds(key: string): number {
   return key === 'five_hour' ? FIVE_HOUR_SECONDS : SEVEN_DAY_SECONDS
 }
 
-export function projectWindow(window: PlanWindow, now = new Date()): PlanProjection | null {
-  if (!window.resets_at) return null
-  const resetsAt = new Date(window.resets_at)
-  if (Number.isNaN(resetsAt.getTime())) return null
-  const seconds = windowSeconds(window.key)
+/// How long a quota window from `codeburn quota` runs. The CLI reports a label and a reset
+/// time but not a length, and the projection needs one to know how far into the window we
+/// are. Anything unrecognised gets no projection rather than a made-up one.
+export function windowSecondsForLabel(label: string): number | null {
+  const text = label.toLowerCase()
+  if (text.includes('month')) return THIRTY_DAY_SECONDS
+  if (text.includes('week')) return SEVEN_DAY_SECONDS
+  if (text.includes('daily') || text.includes('day')) return DAY_SECONDS
+  const hours = text.match(/(\d+)\s*-?\s*hour/) ?? (text.includes('five-hour') ? ['', '5'] : null)
+  if (hours) return Number(hours[1]) * HOUR_SECONDS
+  return null
+}
+
+/// Linear extrapolation once the window is past the freshness threshold, else last cycle's
+/// final reading. Shared by the Claude credential path and the CLI quota rows.
+export function project(
+  percent: number,
+  resetsAt: Date,
+  seconds: number,
+  previousFinal: number | null,
+  now = new Date(),
+): PlanProjection | null {
   const windowStart = resetsAt.getTime() / 1000 - seconds
   const elapsed = now.getTime() / 1000 - windowStart
   const elapsedFraction = elapsed / seconds
 
-  if (elapsedFraction > FRESH_WINDOW_THRESHOLD && window.percent > 0) {
-    const projected = window.percent / elapsedFraction
+  if (elapsedFraction > FRESH_WINDOW_THRESHOLD && percent > 0) {
+    const projected = percent / elapsedFraction
     let hitsLimitAt: Date | null = null
-    if (projected > FULL_PERCENT && window.percent < FULL_PERCENT) {
-      const percentPerSecond = window.percent / elapsed
+    if (projected > FULL_PERCENT && percent < FULL_PERCENT) {
+      const percentPerSecond = percent / elapsed
       if (percentPerSecond > 0) {
-        hitsLimitAt = new Date(now.getTime() + ((FULL_PERCENT - window.percent) / percentPerSecond) * 1000)
+        hitsLimitAt = new Date(now.getTime() + ((FULL_PERCENT - percent) / percentPerSecond) * 1000)
       }
     }
     return { percent: projected, willOverflow: projected > FULL_PERCENT, hitsLimitAt, source: 'linear' }
   }
 
-  if (window.previous_final != null) {
+  if (previousFinal != null) {
     return {
-      percent: window.previous_final,
-      willOverflow: window.previous_final > FULL_PERCENT,
+      percent: previousFinal,
+      willOverflow: previousFinal > FULL_PERCENT,
       hitsLimitAt: null,
       source: 'historical',
     }
   }
   return null
+}
+
+export function projectWindow(window: PlanWindow, now = new Date()): PlanProjection | null {
+  if (!window.resets_at) return null
+  const resetsAt = new Date(window.resets_at)
+  if (Number.isNaN(resetsAt.getTime())) return null
+  return project(window.percent, resetsAt, windowSeconds(window.key), window.previous_final, now)
+}
+
+/// The same projection for a window the CLI reported, which carries no prior-cycle baseline.
+export function projectQuotaWindow(
+  label: string,
+  percent: number,
+  resetsAt: string | undefined,
+  now = new Date(),
+): PlanProjection | null {
+  if (!resetsAt) return null
+  const at = new Date(resetsAt)
+  if (Number.isNaN(at.getTime())) return null
+  const seconds = windowSecondsForLabel(label)
+  if (seconds === null) return null
+  return project(percent, at, seconds, null, now)
 }
 
 export function earliestReset(windows: PlanWindow[]): Date | null {

@@ -1,5 +1,4 @@
 import { mkdir, readFile, writeFile } from 'fs/promises'
-import { sep } from 'path'
 import type { ProjectSummary } from '../types.js'
 import { flagsPath, guardDir } from './store.js'
 
@@ -54,8 +53,24 @@ export function flagsAgeMs(flags: GuardFlags): number {
   return Number.isNaN(t) ? Number.POSITIVE_INFINITY : Date.now() - t
 }
 
+// A flagged project path comes from provider data and can be POSIX-shaped on a
+// Windows host, so a Windows host has to count either separator as a directory
+// boundary. Everywhere else a backslash is an ordinary filename character and
+// must never split a path.
+const WINDOWS_HOST = process.platform === 'win32'
+
+function endsWithSeparator(p: string): boolean {
+  return p.endsWith('/') || (WINDOWS_HOST && p.endsWith('\\'))
+}
+
 function norm(p: string): string {
-  return p.length > 1 && p.endsWith(sep) ? p.slice(0, -1) : p
+  return p.length > 1 && endsWithSeparator(p) ? p.slice(0, -1) : p
+}
+
+function isWithin(target: string, base: string): boolean {
+  if (target === base) return true
+  if (target.startsWith(`${base}/`)) return true
+  return WINDOWS_HOST && target.startsWith(`${base}\\`)
 }
 
 // Openers for the flagged project the cwd sits in (exact match or a subdir of
@@ -65,7 +80,7 @@ export function matchFlag(flags: GuardFlags, cwd: string): string[] {
   let best: ProjectFlag | null = null
   for (const flag of flags.projects) {
     const base = norm(flag.path)
-    if (target === base || target.startsWith(base + sep)) {
+    if (isWithin(target, base)) {
       if (!best || base.length > norm(best.path).length) best = flag
     }
   }

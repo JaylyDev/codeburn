@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- **The CLI now computes the anonymous usage aggregate the desktop app and the Windows tray send, so both report the identical shape.** `codeburn status --format menubar-json` gains a `telemetrySnapshot` block (schema 2) built by `src/telemetry-snapshot.ts` from the payload and its own turn-level reports. Its headline signal is the model x task cross: up to 8 models, each with a cost bucket, a turn bucket, a one-shot rate and up to 6 task categories with their share of that model's turns, alongside up to 12 task categories with their top models, providers, MCP servers, skills, tools, a session count and median-length bucket, and cache-hit and retry-tax shares. Every magnitude is a bucket label, never an exact dollar amount, count or duration, and every name is a model or configuration identifier: nothing in the block is derived from a working directory, project name, branch name, file path or message text. The desktop app sends the block verbatim as the once-daily `usage_snapshot` event when the CLI provides it and falls back to its own renderer-side builder for an older CLI, and it adds five name-only interaction events (`optimize_apply`, `plan_set`, `export`, `compare_view`, `settings_change`). Telemetry remains consent-gated behind the onboarding screen, off by default in the EU/EEA/UK/CH, and switchable at any time in Settings > Privacy & data; README documents exactly what each event carries. `STATUS_SNAPSHOT_VERSION` moves to 4 so persisted status snapshots re-derive with the new field.
+
 ## 0.9.23 - 2026-08-29
 
 ### Added

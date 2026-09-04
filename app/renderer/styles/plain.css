@@ -130,10 +130,44 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
 .foot { display: flex; align-items: center; gap: 10px; margin-top: 4px; padding: 11px 8px 2px; border-top: 1px solid var(--line); }
 .foot .about { color: var(--mut); text-decoration: none; font-size: 12px; font-weight: 520; cursor: pointer; }
 .foot .about:hover { color: var(--ink); }
+/* On every platform but Windows, where the corner above About carries the two companion
+   switches instead and a 186px sidebar has no room for both. */
 .foot .social { display: flex; gap: 2px; margin-left: auto; }
 .foot .social a { color: var(--mut2); display: flex; padding: 5px; border-radius: 6px; cursor: pointer; }
 .foot .social a:hover { color: var(--accent); background: var(--hover); }
 .foot .social svg { width: 15px; height: 15px; fill: currentColor; stroke: none; }
+/* Windows only: the tray app and the Capacity Dock rail, above About. Same 8px gutter and
+   12.5px type as a nav item, so the corner reads as one column rather than two. */
+.companion { padding: 8px 8px 2px; border-top: 1px solid var(--line); }
+.companion-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+.companion-label { color: var(--mut); font-size: 12px; font-weight: 480; }
+.companion-row .switch { margin-left: auto; }
+/* The one line the corner ever says out loud: an install Windows can only finish at the next
+   restart, which is why neither switch has started anything. */
+.companion-note { margin: 2px 0 4px; color: var(--mut); font-size: 11px; line-height: 1.35; }
+/* Sidebar while the menu bar app is off: the rail is one of its windows, so there is nothing
+   to switch. Dimmed rather than hidden, so the row does not appear and vanish under a pointer
+   on its way to About. */
+.companion-row.blocked .companion-label { opacity: .5; }
+
+/* The two tray-app panes in Settings: an accent picker, a size slider and a provider row. */
+.tray-accents { display: inline-flex; gap: 5px; align-items: center; }
+.tray-accent {
+  width: 16px; height: 16px; border-radius: 50%; padding: 0; cursor: pointer;
+  border: 1px solid color-mix(in srgb, var(--ink) 22%, transparent);
+}
+.tray-accent.on { outline: 2px solid var(--ink); outline-offset: 2px; }
+.tray-accent:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.set-range { width: 150px; accent-color: var(--accent); }
+.set-dock-prov { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.set-dock-prov img, .set-dock-prov svg { width: 16px; height: 16px; flex: 0 0 auto; }
+.set-dock-prov small { flex-basis: 100%; }
+/* The bare .switch is painted for the dark onboarding sheet; on the sidebar it keys off the
+   theme tokens, exactly as the Settings surface does. */
+.companion .switch { border-color: var(--line2); background: var(--hover); }
+.companion .switch .switch-knob { background: var(--mut); }
+.companion .switch.on { background: var(--accent); border-color: var(--accent); }
+.companion .switch.on .switch-knob { background: #fff; }
 
 /* About overlay: a compact, portal-free card using the reskin's surface tokens. */
 .about-modal-backdrop {
@@ -1093,6 +1127,11 @@ html.page-hidden *::after {
 .switch.on { background: #f2701c; border-color: #f2701c; }
 .switch.on .switch-knob { transform: translateX(16px); background: #fff; }
 .switch:focus-visible { outline: 1px solid #f2701c; outline-offset: 1px; }
+/* Compact variant for the 186px sidebar, where the full-size switch crowds the label out. */
+.switch.sm { width: 30px; height: 17px; }
+.switch.sm .switch-knob { width: 12px; height: 12px; }
+.switch.sm.on .switch-knob { transform: translateX(13px); }
+.switch:disabled { opacity: .55; cursor: default; }
 /* On themed (Settings) surfaces the same switch keys off theme tokens. */
 .set-p .switch { border-color: var(--line2); background: var(--hover); }
 .set-p .switch .switch-knob { background: var(--mut); }

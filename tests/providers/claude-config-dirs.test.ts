@@ -6,6 +6,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 
 import { claude, getDesktopSessionsDirs } from '../../src/providers/claude.js'
 import { clearSessionCache, filterProjectsByClaudeConfigSource, parseAllSessions } from '../../src/parser.js'
+import { setHome } from '../setup/home.js'
 
 let tmpRoot: string
 const savedEnv = {
@@ -14,7 +15,7 @@ const savedEnv = {
   CODEBURN_DESKTOP_SESSIONS_DIR: process.env['CODEBURN_DESKTOP_SESSIONS_DIR'],
   APPDATA: process.env['APPDATA'],
   LOCALAPPDATA: process.env['LOCALAPPDATA'],
-  HOME: process.env['HOME'],
+  HOME: process.env['HOME'], USERPROFILE: process.env['HOME'],
 }
 
 function withPlatform<T>(platform: typeof process.platform, run: () => T): T {
@@ -34,7 +35,7 @@ beforeEach(async () => {
   // Point HOME at a scratch dir so the default `~/.claude` fallback resolves
   // somewhere we control. Without this, a stray `~/.claude` on the test
   // machine could leak into discovery.
-  process.env['HOME'] = join(tmpRoot, 'home')
+  setHome(join(tmpRoot, 'home'))
   await mkdir(process.env['HOME'], { recursive: true })
   delete process.env['CLAUDE_CONFIG_DIR']
   delete process.env['CLAUDE_CONFIG_DIRS']

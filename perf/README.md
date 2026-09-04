@@ -9,13 +9,13 @@ It extends the [release-acceptance ledger](../docs/release-acceptance/README.md)
 | Metric | Command | What the number is | What it is not |
 |---|---|---|---|
 | Cold start (wait-path) | `run-metric.mjs --metric cold-start-cli` | One-shot `status --format menubar-json` argv Desktop/Menu Bar already spawn | Installed window show / flame in the menu bar |
-| Session parse | `--metric session-parse` | Cold parse of the synthetic fixture; MB/s and ms | Founder corpus (35 GB) |
+| Session parse | `--metric session-parse` | Cold parse of the synthetic fixture; MB/s and ms | A large real corpus |
 | Incremental re-parse | `--metric incremental-reparse` | Append two JSONL lines on the same inode, then re-run | Rewrite / inode change |
 | Period switch | `--metric period-switch` | Warm `serve --stdio` 7D/30D p50/p95 | Installed Desktop 250 ms p95 on the live corpus |
 | Dock/TUI interactions | `--metric dock-tui-proxy` | Overview-refresh and view-switch wait path | Capacity Dock hover (native, never spawns this argv) or TTY TUI keys |
 | Memory | `--metric memory` | RSS after cold load; optional `--idle-ms 3600000` | Packaged app RSS |
 
-Historical receipt, not this fixture: installed Desktop 0.9.21, live corpus, 2026-08-27, 7D useful summary **18286.98 ms** after 30 s idle. Spec target: **250 ms p95** ready summary, zero raw reads on unchanged generation. Evidence: `/Users/a/Documents/Codeburn-audits/snappy-performance-20260827T095615Z/baselines/installed-0.9.21/ui-period-baseline.json`.
+Historical receipt, not this fixture: installed Desktop 0.9.21, live corpus, 2026-08-27, 7D useful summary **18286.98 ms** after 30 s idle. Spec target: **250 ms p95** ready summary, zero raw reads on unchanged generation. That receipt came from an installed-app audit run that is not published, so treat the number as historical context rather than something you can re-derive from this repo.
 
 ## One-command reproduction
 

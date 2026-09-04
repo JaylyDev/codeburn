@@ -9,6 +9,7 @@ import { Compare } from './Compare'
 const mocks = vi.hoisted(() => ({
   getCompareModels: vi.fn<(period: string, provider: string) => Promise<ModelStats[]>>(),
   getCompare: vi.fn<(period: string, provider: string, modelA: string, modelB: string) => Promise<CompareJsonReport>>(),
+  telemetryTrack: vi.fn<(name: string, props?: Record<string, unknown>) => Promise<boolean>>(),
 }))
 vi.mock('../lib/ipc', async orig => {
   const actual = await orig<typeof import('../lib/ipc')>()
@@ -47,6 +48,22 @@ describe('Compare', () => {
   beforeEach(() => {
     mocks.getCompareModels.mockReset()
     mocks.getCompare.mockReset()
+    mocks.telemetryTrack.mockReset().mockResolvedValue(true)
+  })
+
+  it('reports each distinct pair put on screen as a name-only compare_view', async () => {
+    const user = userEvent.setup()
+    mocks.getCompareModels.mockResolvedValue([modelA, modelB])
+    mocks.getCompare.mockResolvedValue(report)
+    render(<Compare period="30days" provider="all" />)
+
+    await waitFor(() => expect(mocks.telemetryTrack).toHaveBeenCalledWith('compare_view', { modelA: 'Opus 4.8', modelB: 'Sonnet 5' }))
+    expect(mocks.telemetryTrack).toHaveBeenCalledTimes(1)
+
+    // Re-rendering the same pair does not fire again.
+    await user.click(await screen.findByLabelText('First model'))
+    await user.click(screen.getByRole('option', { name: 'Opus 4.8 · 4,812 calls' }))
+    expect(mocks.telemetryTrack).toHaveBeenCalledTimes(1)
   })
 
   it('defaults to the top two and renders formatted report panels and winners', async () => {

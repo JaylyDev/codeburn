@@ -15,7 +15,7 @@ final class CapacityDockController {
     private var localEventMonitor: Any?
     private var globalMouseMonitor: Any?
     private var hoverPollTimer: Timer?
-    private var lastPolledPointer: CGPoint?
+    private var pointerMonitoringSession = CapacityDockPointerMonitoringSession()
 
     private var expansionWork: DispatchWorkItem?
     private var collapseWork: DispatchWorkItem?
@@ -122,9 +122,8 @@ final class CapacityDockController {
         pointerInsideDetail = false
         hoveredRowProvider = nil
 
-        detailPanel?.orderOut(nil)
+        completeDetailDismissal()
         railPanel?.orderOut(nil)
-        detailPanel = nil
         railPanel = nil
         lastKnownRailTop = nil
     }
@@ -132,12 +131,21 @@ final class CapacityDockController {
     func refreshQuotaPresentation() {
         guard model.preferences.isEnabled else { return }
         if let provider = model.hoveredProvider {
-            model.detailHeight = CapacityDockMetrics.detailHeight(
-                quota: store.capacityDockQuotaSummary(for: provider),
-                scale: model.detailScale
-            )
+            model.detailHeight = glanceDetailHeight(for: provider)
             layoutDetail(for: provider, transaction: .immediate)
         }
+    }
+
+    /// Panel height for the glance popover, measured from the same store content
+    /// `CapacityDockDetailView` renders.
+    private func glanceDetailHeight(for provider: CapacityDockProvider) -> CGFloat {
+        return CapacityDockMetrics.detailHeight(
+            quota: store.capacityDockQuotaSummary(for: provider),
+            sessionCount: store.capacityDockLiveSessions(for: provider)?.count,
+            hasToday: store.capacityDockToday(for: provider) != nil,
+            tailEdge: model.detailTailEdge,
+            scale: model.detailScale
+        )
     }
 
     func reposition() {
@@ -160,10 +168,7 @@ final class CapacityDockController {
            !snapshot.selectedProviders.contains(hovered) {
             hideDetail(animated: false)
         } else if let hovered = model.hoveredProvider {
-            model.detailHeight = CapacityDockMetrics.detailHeight(
-                quota: store.capacityDockQuotaSummary(for: hovered),
-                scale: model.detailScale
-            )
+            model.detailHeight = glanceDetailHeight(for: hovered)
         }
 
         guard snapshot.isEnabled else {
@@ -240,6 +245,17 @@ final class CapacityDockController {
         railPanel = panel
     }
 
+    /// The bubble is cheap to rebuild and expensive to keep: a hidden, ordered-out
+    /// bubble panel left the app re-laying it out at display cadence for as long
+    /// as it lived (0.1 percent idle CPU before the first hover, 6 percent after).
+    /// Every completed dismissal, animated or immediate, converges here.
+    private func completeDetailDismissal() {
+        model.hoveredProvider = nil
+        detailIsDismissing = false
+        detailPanel?.orderOut(nil)
+        detailPanel = nil
+    }
+
     private func ensureDetailPanel() {
         guard detailPanel == nil else { return }
 
@@ -277,19 +293,20 @@ final class CapacityDockController {
 
     private func startEventMonitoring() {
         guard localEventMonitor == nil, globalMouseMonitor == nil else { return }
+        let monitoringGeneration = pointerMonitoringSession.start()
         // Global .mouseMoved monitors only deliver while the frontmost app
         // itself requests mouse-moved events (Chrome does, Finder and Terminal
         // don't), so the monitors alone leave hover dead over most apps. Poll
-        // the pointer as the activation-independent fallback; the diff guard
-        // makes idle ticks free.
+        // the pointer as the activation-independent fallback. All three paths
+        // feed one coalescer so a monitor event and its following poll do not
+        // publish the same point twice.
         let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                let point = NSEvent.mouseLocation
-                if point == self.lastPolledPointer { return }
-                self.lastPolledPointer = point
-                self.updateMouseEventPassthrough(at: point)
-                self.syncPointerHover(at: point)
+                self.enqueuePointerUpdate(
+                    at: NSEvent.mouseLocation,
+                    monitoringGeneration: monitoringGeneration
+                )
             }
         }
         timer.tolerance = 0.05
@@ -298,18 +315,25 @@ final class CapacityDockController {
         localEventMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown, .keyDown, .mouseMoved]
         ) { [weak self] event in
-            guard let self else { return event }
+            guard let self,
+                  self.pointerMonitoringSession.isCurrent(monitoringGeneration) else { return event }
             if event.type == .mouseMoved {
-                let point = NSEvent.mouseLocation
-                self.updateMouseEventPassthrough(at: point)
-                self.syncPointerHover(at: point)
+                self.enqueuePointerUpdate(
+                    at: NSEvent.mouseLocation,
+                    monitoringGeneration: monitoringGeneration
+                )
             } else if event.type == .keyDown, event.keyCode == 53 {
                 if self.model.interaction.handleEscape() {
                     self.hideDetail(animated: false)
                     self.layoutRail(animate: false)
                 }
             } else if event.type == .leftMouseDown || event.type == .rightMouseDown {
-                self.dismissIfOutside(point: NSEvent.mouseLocation)
+                let point = NSEvent.mouseLocation
+                self.flushPendingPointerUpdate(
+                    at: point,
+                    monitoringGeneration: monitoringGeneration
+                )
+                self.dismissIfOutside(point: point)
             }
             return event
         }
@@ -317,12 +341,20 @@ final class CapacityDockController {
             matching: [.leftMouseDown, .rightMouseDown, .mouseMoved]
         ) { [weak self] event in
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
+                guard let self,
+                      self.pointerMonitoringSession.isCurrent(monitoringGeneration) else { return }
                 let point = NSEvent.mouseLocation
-                self.updateMouseEventPassthrough(at: point)
                 if event.type == .mouseMoved {
-                    self.syncPointerHover(at: point)
+                    self.enqueuePointerUpdate(
+                        at: point,
+                        monitoringGeneration: monitoringGeneration
+                    )
                 } else {
+                    self.flushPendingPointerUpdate(
+                        at: point,
+                        monitoringGeneration: monitoringGeneration
+                    )
+                    self.updateMouseEventPassthrough(at: point)
                     self.dismissIfOutside(point: point)
                 }
             }
@@ -330,11 +362,11 @@ final class CapacityDockController {
     }
 
     private func stopEventMonitoring() {
+        pointerMonitoringSession.stop()
         railPanel?.ignoresMouseEvents = false
         detailPanel?.ignoresMouseEvents = false
         hoverPollTimer?.invalidate()
         hoverPollTimer = nil
-        lastPolledPointer = nil
         if let localEventMonitor {
             NSEvent.removeMonitor(localEventMonitor)
             self.localEventMonitor = nil
@@ -343,6 +375,41 @@ final class CapacityDockController {
             NSEvent.removeMonitor(globalMouseMonitor)
             self.globalMouseMonitor = nil
         }
+    }
+
+    private func enqueuePointerUpdate(
+        at point: CGPoint,
+        monitoringGeneration: CapacityDockPointerMonitoringSession.Generation
+    ) {
+        guard pointerMonitoringSession.enqueue(
+            point,
+            generation: monitoringGeneration
+        ) == .scheduleDrain else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.drainPointerUpdate(monitoringGeneration: monitoringGeneration)
+        }
+    }
+
+    private func drainPointerUpdate(
+        monitoringGeneration: CapacityDockPointerMonitoringSession.Generation
+    ) {
+        guard let point = pointerMonitoringSession.drain(
+            generation: monitoringGeneration
+        ) else { return }
+        updateMouseEventPassthrough(at: point)
+        syncPointerHover(at: point)
+    }
+
+    /// Makes a mouse-down authoritative without publishing hover changes before
+    /// AppKit delivers the local event to its target view.
+    private func flushPendingPointerUpdate(
+        at point: CGPoint,
+        monitoringGeneration: CapacityDockPointerMonitoringSession.Generation
+    ) {
+        _ = pointerMonitoringSession.flush(
+            with: point,
+            generation: monitoringGeneration
+        )
     }
 
     /// `NSHostingView.hitTest` can reject a transparent pixel, but AppKit still
@@ -550,12 +617,13 @@ final class CapacityDockController {
         let wasShowingDetail = detailPanel?.isVisible == true && model.hoveredProvider != nil
         detailIsDismissing = false
         model.hoveredProvider = provider
-        model.detailHeight = CapacityDockMetrics.detailHeight(
-            quota: store.capacityDockQuotaSummary(for: provider),
-            scale: model.detailScale
-        )
+        model.detailHeight = glanceDetailHeight(for: provider)
         ensureDetailPanel()
         layoutDetail(for: provider, transaction: wasShowingDetail ? .detailFollow : .detailPresent)
+        // A panel that lost its all-spaces membership returns to the desktop space alone,
+        // so hovering inside a full-screen app presented the popover where it could not be
+        // seen. The rail escapes this by never being ordered out.
+        detailPanel?.reassertSpaceMembership()
         detailPanel?.orderFrontRegardless()
     }
 
@@ -563,19 +631,14 @@ final class CapacityDockController {
         let provider = model.hoveredProvider
         model.interaction.setDetailHovered(false)
         guard let provider, detailPanel?.isVisible == true else {
-            model.hoveredProvider = nil
-            detailIsDismissing = false
-            detailPanel?.orderOut(nil)
+            completeDetailDismissal()
             return
         }
         if animated {
             dismissDetail(for: provider)
         } else {
             stopDetailMotion()
-            model.hoveredProvider = nil
-            detailIsDismissing = false
-            detailPanel?.orderOut(nil)
-            detailPanel?.alphaValue = 1
+            completeDetailDismissal()
         }
     }
 
@@ -959,6 +1022,9 @@ final class CapacityDockController {
             preferredEdge: model.attachmentEdge
         )
         model.detailTailEdge = side.opposite
+        // The tail's own allowance is part of the content insets, so the height
+        // is only exact once the side is known.
+        model.detailHeight = glanceDetailHeight(for: provider)
         let target = CapacityDockPlacement.detailFrame(
             size: CGSize(width: model.detailWidth, height: model.detailHeight),
             railFrame: railPanel.frame,
@@ -1132,10 +1198,7 @@ final class CapacityDockController {
                 guard let self, generation == self.detailMotionGeneration else { return }
                 self.detailMotion = nil
                 if fadeOut {
-                    self.detailPanel?.orderOut(nil)
-                    self.detailPanel?.alphaValue = 1
-                    self.model.hoveredProvider = nil
-                    self.detailIsDismissing = false
+                    self.completeDetailDismissal()
                 } else {
                     self.detailPanel?.setFrame(target, display: true)
                     self.detailPanel?.alphaValue = 1
@@ -1164,10 +1227,7 @@ final class CapacityDockController {
             )
         } else {
             stopDetailMotion()
-            model.hoveredProvider = nil
-            detailIsDismissing = false
-            detailPanel.orderOut(nil)
-            detailPanel.alphaValue = 1
+            completeDetailDismissal()
         }
     }
 
@@ -1378,11 +1438,21 @@ private final class CapacityDockPanel: NSPanel {
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
         isMovable = false
-        isFloatingPanel = true
         isExcludedFromWindowsMenu = true
         becomesKeyOnlyIfNeeded = true
         animationBehavior = .none
-        collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        collectionBehavior = Self.spaceBehavior
+    }
+
+    /// Membership of every space, including the one a full-screen app owns. The window
+    /// server drops it from a panel across a display sleep or a display reconfiguration,
+    /// and writing it again is what re-registers the window, so this is re-asserted
+    /// before each presentation rather than only at init.
+    static let spaceBehavior: NSWindow.CollectionBehavior =
+        [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+
+    func reassertSpaceMembership() {
+        collectionBehavior = Self.spaceBehavior
     }
 
     override var canBecomeKey: Bool { false }

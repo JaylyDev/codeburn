@@ -59,7 +59,9 @@ export function Onboarding({ defaultEnabled, onDone }: { defaultEnabled: boolean
             <h2 className="onboard-title">Help improve CodeBurn</h2>
             <p className="onboard-body">
               Share anonymous usage statistics: model and provider mix, task success rates, performance and errors.
-              Never your prompts, code, project names or anything that identifies you.
+              The daily report includes the names of the models, tools, skills and MCP servers you use, alongside
+              bucketed counts of how often each one came up.
+              Never your prompts, your code, or your project and file names.
             </p>
             <div className="onboard-consent">
               <span id="onboard-consent-label">Anonymous telemetry</span>

@@ -202,26 +202,28 @@ enum GrokBuildSubscriptionService {
             credential: credential,
             deps: deps
         )
-        let billing = try decodeBilling(billingData)
+        let billing = try decodeBilling(billingData, now: now)
         let settingsPlan = try await fetchPlan(credential: credential, deps: deps)
         let plan = normalizedPlan(settingsPlan) ?? normalizedPlan(billing.subscriptionTier)
-        let window = QuotaSummary.Window(
-            label: windowLabel(resetsAt: billing.resetsAt, now: now),
-            percent: billing.usedPercent,
-            resetsAt: billing.resetsAt
-        )
+        let window = billing.usedPercent.map { percent in
+            QuotaSummary.Window(
+                label: windowLabel(resetsAt: billing.resetsAt, now: now),
+                percent: percent,
+                resetsAt: billing.resetsAt
+            )
+        }
         return QuotaSummary(
             providerFilter: .grok,
             connection: .connected,
             primary: window,
-            details: [window],
+            details: window.map { [$0] } ?? [],
             planLabel: plan,
             footerLines: ["Source: Grok Build"]
         )
     }
 
     private struct BillingSnapshot {
-        let usedPercent: Double
+        let usedPercent: Double?
         let resetsAt: Date?
         let subscriptionTier: String?
     }
@@ -237,10 +239,16 @@ enum GrokBuildSubscriptionService {
         let billingPeriodEnd: String?
         let onDemandCap: Amount?
         let onDemandUsed: Amount?
+        let used: Amount?
+        let monthlyLimit: Amount?
         let subscriptionTier: String?
+        let isUnifiedBillingUser: Bool?
     }
 
-    private struct CurrentPeriod: Decodable { let end: String? }
+    private struct CurrentPeriod: Decodable {
+        let start: String?
+        let end: String?
+    }
     private struct Amount: Decodable { let val: Double? }
     private struct SettingsEnvelope: Decodable {
         let subscriptionTierDisplay: String?
@@ -250,7 +258,7 @@ enum GrokBuildSubscriptionService {
         }
     }
 
-    private static func decodeBilling(_ data: Data) throws -> BillingSnapshot {
+    private static func decodeBilling(_ data: Data, now: Date) throws -> BillingSnapshot {
         let envelope: BillingEnvelope
         do {
             envelope = try JSONDecoder().decode(BillingEnvelope.self, from: data)
@@ -266,17 +274,37 @@ enum GrokBuildSubscriptionService {
                   let cap = config.onDemandCap?.val,
                   used.isFinite, cap.isFinite, used >= 0, cap > 0 {
             rawPercent = used / cap * 100
+        } else if let used = config.used?.val,
+                  let cap = config.monthlyLimit?.val,
+                  used.isFinite, cap.isFinite, used >= 0, cap > 0 {
+            rawPercent = used / cap * 100
+        } else if isActiveBillingPeriod(config.currentPeriod, now: now) {
+            // Grok's web client and proto3 both treat an omitted
+            // creditUsagePercent as 0 during an active window. After a weekly
+            // reset the field is simply absent — that is 0% used, not unknown.
+            rawPercent = 0
         } else {
             rawPercent = nil
         }
-        guard let rawPercent else { throw FetchError.parseFailure }
 
         let reset = parseDate(config.currentPeriod?.end ?? config.billingPeriodEnd)
+        if rawPercent == nil, reset == nil, config.isUnifiedBillingUser != true {
+            throw FetchError.parseFailure
+        }
+
         return BillingSnapshot(
-            usedPercent: min(1, max(0, rawPercent / 100)),
+            usedPercent: rawPercent.map { min(1, max(0, $0 / 100)) },
             resetsAt: reset,
             subscriptionTier: config.subscriptionTier ?? envelope.subscriptionTier
         )
+    }
+
+    private static func isActiveBillingPeriod(_ period: CurrentPeriod?, now: Date) -> Bool {
+        guard let end = parseDate(period?.end), end > now else { return false }
+        if let start = parseDate(period?.start) {
+            return start <= now
+        }
+        return true
     }
 
     private static func fetchRequired(

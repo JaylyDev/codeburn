@@ -2,6 +2,25 @@ import AppKit
 import Observation
 import SwiftUI
 
+private extension String {
+    /// `asCompactTokens` prints an uppercase K; the glance popover uses the
+    /// lowercase form (182k) beside the uppercase M and B.
+    func lowercasedThousands() -> String { replacingOccurrences(of: "K", with: "k") }
+}
+
+private extension View {
+    /// Hairline between glance sections, drawn as an overlay so it never adds a
+    /// point the computed panel height did not reserve.
+    func dividerBelow() -> some View {
+        overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 0.5)
+                .padding(.horizontal, CapacityDockGlance.contentInset)
+        }
+    }
+}
+
 private extension Color {
     /// Warm off-white for Capacity Dock text: a very mild orange tint so bright
     /// labels on the dark card read softer than pure white and do not stress the eyes.
@@ -59,26 +78,163 @@ enum CapacityDockMetrics {
             + alongPad
     }
 
-    static func detailHeight(quota: QuotaSummary?, scale: CGFloat) -> CGFloat {
+    /// The glance popover's height is the sum of its blocks, not a fitted size:
+    /// the hosting view has intrinsic sizing off, so every block below carries
+    /// the same explicit frame height in `CapacityDockDetailView`. Keep the two
+    /// in step, and keep every term a whole number of points (see `points`).
+    static func detailHeight(
+        quota: QuotaSummary?,
+        sessionCount: Int?,
+        hasToday: Bool,
+        tailEdge: CapacityDockEdge,
+        scale: CGFloat
+    ) -> CGFloat {
         guard let quota else { return 186 * scale }
-        let rows = min(max(quota.details.count, quota.primary == nil ? 0 : 1), 5)
-        let visibleFooter = CapacityDockQuotaPresentation.visibleFooterLines(
-            quota.footerLines,
-            connection: quota.connection
-        )
-        let footer = visibleFooter.isEmpty ? 0 : min(visibleFooter.count, 2) * 16 + 4
-        let actionExtra: CGFloat = CapacityDockConnectionAction.resolve(quota: quota) == nil ? 0 : 38
+        // Each section carries its own padding, so the panel adds none.
+        var height = CapacityDockGlance.headerHeight
+        // The tail only eats vertical room when it points up or down.
+        if !tailEdge.isVertical { height += CapacityDockGlance.tailAllowance }
+        if let sessionCount { height += CapacityDockGlance.sessionsHeight(count: sessionCount) }
+        if hasToday { height += CapacityDockGlance.todayHeight }
+        if CapacityDockGlance.drawsWindows(quota) {
+            height += CapacityDockGlance.windows(quota).isEmpty
+                ? CapacityDockGlance.windowsEmptyHeight
+                : CapacityDockGlance.windowsHeight
+        }
+        height += CapacityDockConnectionAction.resolve(quota: quota) == nil ? 0 : 38
         let connectionExtra: CGFloat = switch quota.connection {
         case .terminalFailure: 90
         case .disconnected: 18
-        case .loading, .stale, .transientFailure: 16
+        // The staleness line is a section like any other, so it needs a section's
+        // height. It used to get 16, a bare 10pt line box with no padding, which is
+        // why it sat crammed against the header with the blocks below pushed into it.
+        case .loading, .stale, .transientFailure: CapacityDockGlance.noticeHeight
         case .connected: 0
         }
-        let base = min(
-            470,
-            max(132, 88 + CGFloat(rows) * 50 + CGFloat(footer) + actionExtra + connectionExtra)
-        )
-        return base * scale
+        height += connectionExtra
+        return (height * scale).rounded()
+    }
+}
+
+/// Fixed block heights shared by the glance popover's layout and its panel
+/// size, plus the ramps its numbers and rings use. Every section owns its own
+/// padding, so the panel itself only insets horizontally.
+enum CapacityDockGlance {
+    /// The panel's padding on all four sides. Horizontally it is applied by each
+    /// section rather than the panel, so group fills can still run edge to edge.
+    static let contentInset: CGFloat = 16
+    static let tailAllowance: CGFloat = 18
+
+    /// 16 top + 20 title + 8 bottom.
+    static let headerHeight: CGFloat = 44
+    static let sectionPadTop: CGFloat = 8
+    static let sectionPadBottom: CGFloat = 10
+    /// A 10.5pt caption's line box, shared by every section header.
+    static let captionLine: CGFloat = 13
+    /// Content driven: 8 padding + a 12pt line + 2 + a 10.5pt line + 8 padding.
+    /// Held as a constant because the panel frame is computed, not fitted.
+    static let pillHeight: CGFloat = 46
+    static let pillGap: CGFloat = 6
+    /// Three stacked lines, 13 + 13 + 12, with two 3pt gaps. Taller than the
+    /// 17pt burned figure beside it, so it sets the row.
+    static let todayContentHeight: CGFloat = 44
+    /// 8 top + 24 percent + 2 + 13 label + 2 + 12 reset + 16 bottom.
+    static let windowsHeight: CGFloat = 77
+    /// 8 top + one secondary line + 16 bottom.
+    static let windowsEmptyHeight: CGFloat = 37
+    /// The staleness or reconnect line under the header. It is a section like any
+    /// other, so the panel has to reserve its height: the frame is computed, not
+    /// fitted, and an unreserved line squeezes every block below it.
+    /// 6 top + a 10pt line box + 8 bottom.
+    static let noticeHeight: CGFloat = 27
+    /// Whether the band is drawn as its own padded section. Disconnected and
+    /// reconnect draw their own blocks with an action button instead.
+    static func drawsNotice(_ connection: QuotaSummary.Connection) -> Bool {
+        switch connection {
+        case .connected, .disconnected, .terminalFailure: return false
+        case .loading, .stale, .transientFailure: return true
+        }
+    }
+
+    /// The list scrolls past this many pills rather than truncating.
+    static let maxVisibleSessionRows = 4
+    static let maxWindowColumns = 4
+
+    /// Height of the scrolling pill list: every pill up to the visible cap, then
+    /// the list scrolls inside that.
+    static func sessionListHeight(count: Int) -> CGFloat {
+        let visible = min(count, maxVisibleSessionRows)
+        guard visible > 0 else { return 0 }
+        return CGFloat(visible) * pillHeight + CGFloat(visible - 1) * pillGap
+    }
+
+    static func sessionsHeight(count: Int) -> CGFloat {
+        var height = sectionPadTop + captionLine + sectionPadBottom
+        if count > 0 { height += pillGap + sessionListHeight(count: count) }
+        return height
+    }
+
+    static let todayHeight: CGFloat = sectionPadTop + captionLine + pillGap
+        + todayContentHeight + sectionPadBottom
+
+    /// Four bands, matching the rail's own sense of escalation: comfortable,
+    /// watch it, nearly out, over. Rings start green because a ring with no
+    /// colour reads as broken.
+    static func severityColor(_ fraction: Double) -> Color {
+        if fraction >= 0.9 { return .red }
+        if fraction >= 0.8 { return .orange }
+        if fraction >= 0.7 { return .yellow }
+        return .green
+    }
+
+    /// Share of the pill the tint covers. Anything outside 0...1 is a bad
+    /// context reading, not a reason to paint past the pill.
+    static func gaugeFillFraction(_ fraction: Double) -> Double {
+        min(max(fraction, 0), 1)
+    }
+
+    /// Where the tint starts fading, as a share of the filled band. The fade is
+    /// a fixed 12pt tail, so a short band fades over its whole length instead of
+    /// inverting.
+    static func pillFadeStart(filledWidth: CGFloat, scale: CGFloat) -> CGFloat {
+        let fade = 12 * scale
+        guard filledWidth > fade else { return 0 }
+        return (filledWidth - fade) / filledWidth
+    }
+
+    /// How far the reveal edge leans, as a share of the text's height.
+    static let gaugeSlantRatio: CGFloat = 0.35
+
+    /// Where the slanted reveal edge crosses the top and bottom of the text box.
+    /// The edge starts fully off the left and ends fully past the right, so 0
+    /// reveals nothing and 1 fills every glyph. Both values are clamped into the
+    /// box, which turns the parallelogram into a triangle at the two extremes
+    /// rather than letting it fold over itself.
+    static func gaugeRevealEdge(
+        fraction: Double,
+        width: CGFloat,
+        height: CGFloat
+    ) -> (top: CGFloat, bottom: CGFloat) {
+        let clamped = min(max(fraction, 0), 1)
+        let slant = height * gaugeSlantRatio
+        let bottom = (width + slant) * clamped
+        let clamp = { (value: CGFloat) in min(max(value, 0), width) }
+        return (clamp(bottom - slant), clamp(bottom))
+    }
+
+    /// A provider that is not connected has no quota and no spend to stand in for
+    /// one, so the windows row gives way to the reconnect guidance entirely.
+    static func drawsWindows(_ quota: QuotaSummary) -> Bool {
+        switch quota.connection {
+        case .disconnected, .terminalFailure: return false
+        case .connected, .loading, .stale, .transientFailure: return true
+        }
+    }
+
+    /// The windows the row draws, in the order the provider service reported them.
+    static func windows(_ quota: QuotaSummary) -> [QuotaSummary.Window] {
+        let ordered = quota.details.isEmpty ? [quota.primary].compactMap { $0 } : quota.details
+        return Array(ordered.prefix(maxWindowColumns))
     }
 }
 
@@ -171,7 +327,13 @@ final class CapacityDockViewModel {
         let eased = p * p * (3 - 2 * p)
         return CapacityDockMetrics.edgeShoulderDepth(scale: scale) * 0.6 * eased
     }
-    var railAlongPad: CGFloat { CapacityDockMetrics.railAlongPad(scale: scale) + flareCompensation }
+    // Rounded after the flare is added, not before: the panel's length is built from this
+    // padding, and a fractional length re-runs the window's layout at display cadence for
+    // as long as the dock is up. `points` rounds the base, the eased flare then reintroduced
+    // the fraction for the whole attach animation.
+    var railAlongPad: CGFloat {
+        (CapacityDockMetrics.railAlongPad(scale: scale) + flareCompensation).rounded()
+    }
     var railCrossPad: CGFloat { CapacityDockMetrics.railCrossPad(scale: scale) }
     var railTopPadding: CGFloat { railAlongPad }
     var railBottomPadding: CGFloat { railAlongPad }
@@ -485,6 +647,7 @@ struct CapacityDockDetailView: View {
     let model: CapacityDockViewModel
     let quota: (CapacityDockProvider) -> QuotaSummary?
     let onConnect: (CapacityDockProvider) -> Void
+    @Environment(AppStore.self) private var store
 
     var body: some View {
         let bubbleShape = CapacityDockBubbleShape(
@@ -514,83 +677,384 @@ struct CapacityDockDetailView: View {
     }
 
     private var detailInsets: EdgeInsets {
-        let horizontal = 22 * model.detailScale
-        let vertical = 16 * model.detailScale
-        let tailAllowance = 18 * model.detailScale
+        let tailAllowance = CapacityDockGlance.tailAllowance * model.detailScale
+        // Every section carries its own padding, so the panel adds only the tail's
+        // allowance on whichever side the tail points.
         return EdgeInsets(
-            top: vertical + (model.detailTailEdge == .top ? tailAllowance : 0),
-            leading: horizontal + (model.detailTailEdge == .left ? tailAllowance : 0),
-            bottom: vertical + (model.detailTailEdge == .bottom ? tailAllowance : 0),
-            trailing: horizontal + (model.detailTailEdge == .right ? tailAllowance : 0)
+            top: model.detailTailEdge == .top ? tailAllowance : 0,
+            leading: model.detailTailEdge == .left ? tailAllowance : 0,
+            bottom: model.detailTailEdge == .bottom ? tailAllowance : 0,
+            trailing: model.detailTailEdge == .right ? tailAllowance : 0
         )
     }
 
     @ViewBuilder
     private func detail(for provider: CapacityDockProvider, quota: QuotaSummary?) -> some View {
-        VStack(alignment: .leading, spacing: 11 * model.detailScale) {
-            HStack(spacing: 8 * model.detailScale) {
-                if let image = ProviderIconCache.image(named: provider.iconName) {
-                    Image(nsImage: image)
-                        .resizable()
-                        .scaledToFit()
-                        .foregroundStyle(Color.capacityDockText)
-                        .frame(width: 24 * model.detailScale, height: 24 * model.detailScale)
-                }
-                Text("\(provider.displayName) Usage")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(Color.capacityDockText)
-                Spacer(minLength: 8)
-                if let plan = quota?.planLabel, !plan.isEmpty {
-                    Text(plan)
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(Color.capacityDockText.opacity(0.62))
-                        .lineLimit(1)
-                }
-            }
-
-            if let quota {
-                connectionLabel(quota.connection, provider: provider)
-                if quota.details.isEmpty, let primary = quota.primary {
-                    CapacityDockQuotaRow(
-                        window: primary,
-                        scale: model.detailScale
-                    )
-                } else {
-                    ForEach(Array(quota.details.prefix(5).enumerated()), id: \.offset) { _, window in
-                        CapacityDockQuotaRow(
-                            window: window,
-                            scale: model.detailScale
-                        )
-                    }
-                }
-                let footerLines = CapacityDockQuotaPresentation.visibleFooterLines(
-                    quota.footerLines,
-                    connection: quota.connection
-                )
-                if !footerLines.isEmpty {
-                    Divider().overlay(Color.capacityDockText.opacity(0.12))
-                    ForEach(Array(footerLines.prefix(2).enumerated()), id: \.offset) { _, line in
-                        Text(line)
-                            .font(.system(size: 10))
-                            .foregroundStyle(Color.capacityDockText.opacity(0.58))
-                    }
-                }
-            } else {
+        if let quota {
+            glance(for: provider, quota: quota)
+        } else {
+            VStack(alignment: .leading, spacing: 11 * model.detailScale) {
+                header(provider, plan: nil)
                 Text(ProviderConnectionGuidance.dockInstruction(for: provider))
                     .font(.system(size: 12))
                     .foregroundStyle(Color.capacityDockText.opacity(0.62))
                     .fixedSize(horizontal: false, vertical: true)
+                connectButton(provider, quota: nil)
             }
+        }
+    }
 
-            if provider.catalogEntry.hasLiveCodeBurnQuotaAdapter,
-               let action = CapacityDockConnectionAction.resolve(quota: quota) {
-                let title = action.title(for: provider)
-                Button(title) { onConnect(provider) }
-                    .buttonStyle(.borderedProminent)
-                    .tint(provider.ringColor)
-                    .controlSize(.small)
-                    .accessibilityLabel("\(title) \(provider.displayName)")
+    /// Sections stack at fixed heights that mirror `CapacityDockMetrics.detailHeight`,
+    /// because the panel frame is computed rather than fitted. Separators are
+    /// overlays so a hairline never adds a point the height did not reserve.
+    @ViewBuilder
+    private func glance(for provider: CapacityDockProvider, quota: QuotaSummary) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            headerSection(provider, plan: quota.planLabel).dividerBelow()
+            noticeSection(quota.connection, provider: provider)
+            if !CapacityDockGlance.drawsNotice(quota.connection) {
+                connectionLabel(quota.connection, provider: provider)
             }
+            if let sessions = store.capacityDockLiveSessions(for: provider) {
+                sessionsSection(sessions).dividerBelow()
+            }
+            if let today = store.capacityDockToday(for: provider) {
+                todaySection(today).dividerBelow()
+            }
+            if CapacityDockGlance.drawsWindows(quota) { windowsSection(quota) }
+            Spacer(minLength: 0)
+            connectButton(provider, quota: quota)
+        }
+    }
+
+    @ViewBuilder
+    private func headerSection(_ provider: CapacityDockProvider, plan: String?) -> some View {
+        let s = model.detailScale
+        header(provider, plan: plan)
+            .padding(.top, CapacityDockGlance.contentInset * s)
+            .padding(.bottom, 8 * s)
+            .padding(.horizontal, CapacityDockGlance.contentInset * s)
+    }
+
+    /// The notice carries the same horizontal inset as every other section, its own
+    /// vertical padding, and a divider, so it reads as a band rather than as text
+    /// crammed against the header.
+    @ViewBuilder
+    private func noticeSection(
+        _ connection: QuotaSummary.Connection,
+        provider: CapacityDockProvider
+    ) -> some View {
+        let s = model.detailScale
+        if CapacityDockGlance.drawsNotice(connection) {
+            connectionLabel(connection, provider: provider)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 6 * s)
+                .padding(.bottom, 8 * s)
+                .padding(.horizontal, CapacityDockGlance.contentInset * s)
+                .dividerBelow()
+        }
+    }
+
+    @ViewBuilder
+    private func header(_ provider: CapacityDockProvider, plan: String?) -> some View {
+        let s = model.detailScale
+        HStack(spacing: 8 * s) {
+            if let image = ProviderIconCache.image(named: provider.iconName) {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    // Matches the 17pt title's cap height plus a little, so the
+                    // mark reads as its equal rather than as a bullet.
+                    .frame(width: 18 * s, height: 18 * s)
+            }
+            Text(provider.displayName)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(Color.capacityDockText)
+            Spacer(minLength: 6)
+            if let plan, !plan.isEmpty {
+                Text(plan)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Color.capacityDockText.opacity(0.6))
+                    .lineLimit(1)
+            }
+        }
+        .frame(height: 20 * s)
+    }
+
+    @ViewBuilder
+    private func sectionCaption(_ title: String, trailing: String?) -> some View {
+        let s = model.detailScale
+        HStack(spacing: 8 * s) {
+            Text(title)
+                .font(.system(size: 10.5, weight: .semibold))
+            if let trailing {
+                Spacer(minLength: 8)
+                Text(trailing)
+                    .font(.system(size: 10.5))
+                    .monospacedDigit()
+            }
+        }
+        .foregroundStyle(Color.capacityDockText.opacity(0.6))
+        .frame(height: CapacityDockGlance.captionLine * s)
+    }
+
+    @ViewBuilder
+    private func sessionsSection(_ sessions: [LiveSession]) -> some View {
+        let s = model.detailScale
+        VStack(alignment: .leading, spacing: 0) {
+            sectionCaption("Sessions", trailing: sessionsTrailing(sessions.count))
+            if !sessions.isEmpty {
+                ScrollView(.vertical) {
+                    VStack(spacing: CapacityDockGlance.pillGap * s) {
+                        ForEach(sessions) { session in
+                            sessionPill(session)
+                        }
+                    }
+                }
+                .scrollIndicators(.automatic)
+                .frame(height: CapacityDockGlance.sessionListHeight(count: sessions.count) * s)
+                .padding(.top, CapacityDockGlance.pillGap * s)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, CapacityDockGlance.sectionPadTop * s)
+        .padding(.bottom, CapacityDockGlance.sectionPadBottom * s)
+        .padding(.horizontal, CapacityDockGlance.contentInset * s)
+    }
+
+    private func sessionsTrailing(_ count: Int) -> String {
+        switch count {
+        case 0: return "none running"
+        case 1: return "1 running"
+        default: return "\(count) running"
+        }
+    }
+
+    @ViewBuilder
+    private func sessionPill(_ session: LiveSession) -> some View {
+        let s = model.detailScale
+        let fraction = session.contextFraction
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 2 * s) {
+                Text(session.title)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.capacityDockText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(height: 15 * s)
+                Text(sessionSubtitle(session))
+                    .font(.system(size: 10.5))
+                    .monospacedDigit()
+                    .foregroundStyle(Color.capacityDockText.opacity(0.6))
+                    .lineLimit(1)
+                    .frame(height: 13 * s)
+                    // The model name identifies the row, so the project above it
+                    // gives up width first.
+                    .layoutPriority(1)
+            }
+            Spacer(minLength: 12)
+            if let fraction {
+                VStack(alignment: .trailing, spacing: 2 * s) {
+                    PercentGaugeText(
+                        label: "\(Int((fraction * 100).rounded()))%",
+                        fraction: fraction,
+                        font: .system(size: 12)
+                    )
+                    .frame(height: 15 * s)
+                    if let remaining = session.contextRemaining {
+                        Text("\(Double(remaining).asCompactTokens().lowercasedThousands()) left")
+                            .font(.system(size: 10))
+                            .monospacedDigit()
+                            .foregroundStyle(Color.capacityDockText.opacity(0.6))
+                            .frame(height: 13 * s)
+                    }
+                }
+                .layoutPriority(1)
+            }
+        }
+        .padding(.vertical, 8 * s)
+        .padding(.horizontal, 12 * s)
+        .frame(height: CapacityDockGlance.pillHeight * s)
+        .background(
+            ZStack(alignment: .leading) {
+                Color.white.opacity(0.06)
+                if let fraction {
+                    GeometryReader { geometry in
+                        pillFill(fraction: fraction, width: geometry.size.width, scale: s)
+                    }
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 8 * s, style: .continuous))
+        )
+        // A session waiting on the user recedes; one that is generating does not.
+        .opacity(session.isIdle ? 0.55 : 1)
+    }
+
+    /// The pill itself is the context gauge: a tinted band over the first N% of
+    /// its width, faded out at the leading edge so the boundary reads as a
+    /// gradient rather than a rule.
+    @ViewBuilder
+    private func pillFill(fraction: Double, width: CGFloat, scale: CGFloat) -> some View {
+        let filled = width * CapacityDockGlance.gaugeFillFraction(fraction)
+        let colour = CapacityDockGlance.severityColor(fraction)
+        LinearGradient(
+            stops: [
+                .init(color: colour.opacity(0.14), location: 0),
+                .init(
+                    color: colour.opacity(0.14),
+                    location: CapacityDockGlance.pillFadeStart(filledWidth: filled, scale: scale)
+                ),
+                .init(color: colour.opacity(0), location: 1),
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+        .frame(width: filled)
+    }
+
+    private func sessionSubtitle(_ session: LiveSession) -> String {
+        [session.model, session.elapsedLabel().isEmpty ? nil : session.elapsedLabel()]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+    }
+
+    @ViewBuilder
+    /// Provider scoped: the row belongs to the hovered provider, not the machine.
+    /// Its height is the same whether or not the payload carried that provider's
+    /// tokens — the column drops out of a fixed frame, so the panel's reserved
+    /// `todayHeight` keeps matching what is drawn.
+    private func todaySection(_ today: ProviderDetail) -> some View {
+        let s = model.detailScale
+        VStack(alignment: .leading, spacing: 0) {
+            sectionCaption("Today", trailing: nil)
+            HStack(alignment: .center, spacing: 8 * s) {
+                HStack(alignment: .firstTextBaseline, spacing: 5 * s) {
+                    Text(today.cost.asUSD())
+                        .font(.system(size: 17, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(Color.capacityDockText)
+                    Text("burned")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(Color.capacityDockText.opacity(0.6))
+                }
+                Spacer(minLength: 8)
+                VStack(alignment: .trailing, spacing: 3 * s) {
+                    // Absent on a CLI that predates per-provider tokens. Showing
+                    // the machine-wide pair here would be a wrong number, so the
+                    // arrows drop out instead.
+                    if let input = today.inputTokens { tokenLine("arrow.down", Double(input)) }
+                    if let output = today.outputTokens { tokenLine("arrow.up", Double(output)) }
+                    Text("\(today.calls.asThousandsSeparated()) calls")
+                        .font(.system(size: 10))
+                        .monospacedDigit()
+                        .foregroundStyle(Color.capacityDockText.opacity(0.6))
+                        .frame(height: 12 * s)
+                }
+            }
+            .frame(height: CapacityDockGlance.todayContentHeight * s)
+            .padding(.top, CapacityDockGlance.pillGap * s)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, CapacityDockGlance.sectionPadTop * s)
+        .padding(.bottom, CapacityDockGlance.sectionPadBottom * s)
+        .padding(.horizontal, CapacityDockGlance.contentInset * s)
+    }
+
+    @ViewBuilder
+    private func tokenLine(_ symbol: String, _ value: Double) -> some View {
+        let s = model.detailScale
+        HStack(spacing: 4 * s) {
+            Image(systemName: symbol)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(Color.capacityDockText.opacity(0.6))
+            Text(value.asCompactTokens().lowercasedThousands())
+                .font(.system(size: 10.5))
+                .monospacedDigit()
+                .foregroundStyle(Color.capacityDockText)
+        }
+        .frame(height: 13 * s)
+    }
+
+    /// One column per quota window, in the order the provider reported them.
+    @ViewBuilder
+    private func windowsSection(_ quota: QuotaSummary) -> some View {
+        let s = model.detailScale
+        let windows = CapacityDockGlance.windows(quota)
+        Group {
+            if windows.isEmpty {
+                budgetLine()
+                    .frame(height: CapacityDockGlance.captionLine * s)
+            } else {
+                // A single window has no siblings to line up with, so it reads as
+                // a left-aligned figure rather than a lone centred digit.
+                let alignment: HorizontalAlignment = windows.count == 1 ? .leading : .center
+                HStack(spacing: 0) {
+                    ForEach(Array(windows.enumerated()), id: \.offset) { _, window in
+                        windowColumn(window, alignment: alignment)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, CapacityDockGlance.sectionPadTop * s)
+        .padding(.bottom, CapacityDockGlance.contentInset * s)
+        .padding(.horizontal, CapacityDockGlance.contentInset * s)
+    }
+
+    @ViewBuilder
+    private func windowColumn(
+        _ window: QuotaSummary.Window,
+        alignment: HorizontalAlignment
+    ) -> some View {
+        let s = model.detailScale
+        VStack(alignment: alignment, spacing: 0) {
+            PercentGaugeText(
+                label: window.percentLabel,
+                fraction: window.percent,
+                font: .system(size: 20, weight: .semibold)
+            )
+            .frame(height: 24 * s)
+            Text(CapacityDockQuotaPresentation.displayLabel(window.label))
+                .font(.system(size: 11))
+                .foregroundStyle(Color.capacityDockText.opacity(0.6))
+                .lineLimit(1)
+                .frame(height: CapacityDockGlance.captionLine * s)
+                .padding(.top, 2 * s)
+            Text(window.resetsInLabel)
+                .font(.system(size: 10))
+                .monospacedDigit()
+                .foregroundStyle(Color.capacityDockText.opacity(0.3))
+                .lineLimit(1)
+                .frame(height: 12 * s)
+                .padding(.top, 2 * s)
+        }
+        .frame(
+            maxWidth: .infinity,
+            alignment: alignment == .leading ? .leading : .center
+        )
+    }
+
+    /// No quota window exists for this provider, so money is the capacity.
+    @ViewBuilder
+    private func budgetLine() -> some View {
+        let spend = store.capacityDockToday?.cost ?? 0
+        let budget = store.activeDailyBudget
+        Text(budget > 0 ? "today \(spend.asUSD()) of \(budget.asUSD())" : "no budget set")
+            .font(.system(size: 11))
+            .monospacedDigit()
+            .foregroundStyle(Color.capacityDockText.opacity(0.6))
+    }
+
+    @ViewBuilder
+    private func connectButton(_ provider: CapacityDockProvider, quota: QuotaSummary?) -> some View {
+        if provider.catalogEntry.hasLiveCodeBurnQuotaAdapter,
+           let action = CapacityDockConnectionAction.resolve(quota: quota) {
+            let title = action.title(for: provider)
+            Button(title) { onConnect(provider) }
+                .buttonStyle(.borderedProminent)
+                .tint(provider.ringColor)
+                .controlSize(.small)
+                .accessibilityLabel("\(title) \(provider.displayName)")
         }
     }
 
@@ -639,50 +1103,56 @@ struct CapacityDockDetailView: View {
     }
 }
 
-private struct CapacityDockQuotaRow: View {
-    let window: QuotaSummary.Window
-    let scale: CGFloat
+/// A percentage drawn as its own gauge: the glyphs sit dim, and the value's own
+/// severity colour fills them left to right up to the value, wiped off on a
+/// slant. One band colour, so the fill says how bad it is and the wipe says how
+/// far along it is.
+private struct PercentGaugeText: View {
+    let label: String
+    let fraction: Double
+    let font: Font
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6 * scale) {
-            HStack(alignment: .firstTextBaseline, spacing: 8 * scale) {
-                Text(CapacityDockQuotaPresentation.displayLabel(window.label))
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Color.capacityDockText.opacity(0.82))
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 8)
-                Text(window.percentLabel)
-                    .font(.system(size: 12, weight: .medium))
-                    .monospacedDigit()
-                    .foregroundStyle(Color.capacityDockText)
+        Text(label)
+            .font(font)
+            .monospacedDigit()
+            .foregroundStyle(Color.white.opacity(0.3))
+            .overlay {
+                CapacityDockGlance.severityColor(fraction)
+                    .clipShape(PercentGaugeReveal(fraction: fraction))
+                    .mask {
+                        Text(label)
+                            .font(font)
+                            .monospacedDigit()
+                    }
             }
-            GeometryReader { geometry in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.capacityDockText.opacity(0.14))
-                    Capsule()
-                        .fill(progressColor)
-                        .frame(width: max(2, geometry.size.width * min(max(window.percent, 0), 1)))
-                }
-            }
-            .frame(height: 6 * scale)
-            if !window.resetsInLabel.isEmpty {
-                Text("Resets in \(window.resetsInLabel)")
-                    .font(.system(size: 10))
-                    .monospacedDigit()
-                    .foregroundStyle(Color.capacityDockText.opacity(0.5))
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
-        }
+            .accessibilityLabel(label)
+    }
+}
+
+/// The slanted wipe. An overlay clip only, so it never changes layout size.
+private struct PercentGaugeReveal: Shape {
+    var fraction: Double
+
+    var animatableData: Double {
+        get { fraction }
+        set { fraction = newValue }
     }
 
-    private var progressColor: Color {
-        switch QuotaSummary.severity(for: window.percent) {
-        case .normal: return .green
-        case .warning: return .yellow
-        case .critical: return .orange
-        case .danger: return .red
-        }
+    func path(in rect: CGRect) -> Path {
+        let edge = CapacityDockGlance.gaugeRevealEdge(
+            fraction: fraction,
+            width: rect.width,
+            height: rect.height
+        )
+        guard edge.bottom > 0 else { return Path() }
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.minX + edge.top, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.minX + edge.bottom, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        path.closeSubpath()
+        return path
     }
 }
 

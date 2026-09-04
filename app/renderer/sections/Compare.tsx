@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { CliErrorPanel } from '../components/CliErrorPanel'
 import { Dropdown } from '../components/Dropdown'
@@ -10,6 +10,7 @@ import { usePolled } from '../hooks/usePolled'
 import { formatCompact, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import { reportMemoKey } from '../lib/reportMemoKey'
+import { trackEvent } from '../lib/track'
 import type { CompareJsonReport, ComparisonRow, DateRange, ModelStats, Period, WorkingStyleRow } from '../lib/types'
 
 function fmtMetric(v: number | null, fn: 'cost' | 'number' | 'percent' | 'decimal'): string {
@@ -57,6 +58,17 @@ export function Compare({
     setModelA(current => current && available.has(current) ? current : models.data?.[0]?.model ?? null)
     setModelB(current => current && available.has(current) ? current : models.data?.[1]?.model ?? null)
   }, [models.data])
+
+  // One event per distinct pair actually put on screen, not per keystroke in
+  // the pickers. Model names only.
+  const comparedPair = useRef<string | null>(null)
+  useEffect(() => {
+    if (!modelA || !modelB || modelA === modelB) return
+    const pair = `${modelA} ${modelB}`
+    if (comparedPair.current === pair) return
+    comparedPair.current = pair
+    trackEvent('compare_view', { modelA, modelB })
+  }, [modelA, modelB])
 
   const resetToDefaults = useCallback(() => {
     if (!models.data) return

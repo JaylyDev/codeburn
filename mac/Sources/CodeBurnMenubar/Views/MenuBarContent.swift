@@ -20,6 +20,14 @@ struct MenuBarContent: View {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 0) {
                         HeroSection()
+                        if store.selectedPayloadMayBeIncomplete {
+                            Text("This total may be incomplete.")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Color.secondary.opacity(0.75))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 14)
+                                .padding(.bottom, 6)
+                        }
                         Divider().opacity(0.5)
                         PeriodSegmentedControl()
                         ScopeSegmentedControl()
@@ -119,7 +127,7 @@ struct MenuBarContent: View {
         // visible. Without this, the strip disappears for one frame on a period
         // switch when the new key's payload is still empty.
         if store.hasAnyProvidersInCache { return true }
-        let payload = store.todayPayload ?? store.payload
+        let payload = store.todayPayload ?? (store.hasCachedData ? store.payload : .empty)
         return !payload.current.providers.isEmpty
     }
 

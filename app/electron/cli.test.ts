@@ -3,9 +3,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { spawn } from 'node:child_process'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, isAbsolute, relative, win32, posix } from 'node:path'
+import { delimiter, dirname, join, isAbsolute, relative, win32, posix } from 'node:path'
 
-import { spawnCli, spawnCliAction, spawnEnvFor, spawnSpecFor, startServe, killAll, shutdownAll, CliError, nodeManagerDirs, notFoundStage, reapOrphanServe, resolveCodeburnPath, resolveTarget } from './cli'
+import { spawnCli, spawnCliAction, spawnEnvFor, spawnSpecFor, startServe, killAll, shutdownAll, CliError, cmdShimArgs, escapeForCmd, nodeManagerDirs, notFoundStage, reapOrphanServe, resolveCodeburnPath, resolveTarget } from './cli'
 
 let dir: string
 const originalBin = process.env.CODEBURN_BIN
@@ -14,6 +14,15 @@ const originalPathFile = process.env.CODEBURN_CLI_PATH_FILE
 const originalViteUrl = process.env.VITE_DEV_SERVER_URL
 const originalBundled = process.env.CODEBURN_BUNDLED_CLI
 const originalDevRepoRoot = process.env.CODEBURN_DEV_REPO_ROOT
+
+/**
+ * Windows has no catchable SIGTERM: child.kill() is TerminateProcess, which ends the child
+ * outright, so a grace window, a cleanup handler and a child that ignores the first signal
+ * are all things the platform cannot do rather than things this code gets wrong. The same
+ * goes for a resident that closes its own stdin. These stay exactly as they are and simply
+ * do not run there.
+ */
+const posixOnly = it.skipIf(process.platform === 'win32')
 
 /** Writes an executable node script and points CODEBURN_BIN at it. */
 function fakeBin(name: string, body: string): string {
@@ -316,7 +325,7 @@ describe('spawnSpecFor (bundled CLI runs via Electron-as-node)', () => {
     expect(spec.env.ELECTRON_RUN_AS_NODE).toBe('1')
     // PATH is still augmented (the bundle's own dir leads), harmless for a CLI
     // that itself shells out during pairing/sync.
-    expect((spec.env.PATH ?? '').split(':')[0]).toBe('/res/cli/dist')
+    expect((spec.env.PATH ?? '').split(delimiter)[0]).toBe('/res/cli/dist')
   })
 
   it('spawns an external CLI directly, with no run-as-node flag', () => {
@@ -324,7 +333,84 @@ describe('spawnSpecFor (bundled CLI runs via Electron-as-node)', () => {
     expect(spec.bin).toBe('/some/bin/codeburn')
     expect(spec.args).toEqual(['status'])
     expect(spec.env.ELECTRON_RUN_AS_NODE).toBeUndefined()
-    expect((spec.env.PATH ?? '').split(':')[0]).toBe('/some/bin')
+    expect((spec.env.PATH ?? '').split(delimiter)[0]).toBe('/some/bin')
+  })
+
+  // Windows cannot start a script. Both shapes a `codeburn` install takes there get a runner
+  // that can; a POSIX `codeburn` is a shebang script with an exec bit and still runs directly.
+  const windowsOnly = it.skipIf(process.platform !== 'win32')
+
+  windowsOnly('runs a .js CLI through Node rather than failing with EFTYPE', () => {
+    const spec = spawnSpecFor({ kind: 'external', bin: 'C:\\repo\\dist\\cli.js' }, ['status'])
+    expect(spec.bin).toBe(process.execPath)
+    expect(spec.args).toEqual(['C:\\repo\\dist\\cli.js', 'status'])
+    expect(spec.env.ELECTRON_RUN_AS_NODE).toBe('1')
+  })
+
+  windowsOnly('runs a .cmd shim through cmd.exe, as one verbatim command line', () => {
+    const spec = spawnSpecFor({ kind: 'external', bin: 'C:\\npm\\codeburn.cmd' }, ['status', '--period', 'today'])
+    expect(spec.bin.toLowerCase()).toMatch(/\\system32\\cmd\.exe$/)
+    expect(spec.args.slice(0, 3)).toEqual(['/d', '/s', '/c'])
+    expect(spec.verbatim).toBe(true)
+    expect(spec.env.ELECTRON_RUN_AS_NODE).toBeUndefined()
+  })
+
+  windowsOnly('leaves an .exe alone', () => {
+    const spec = spawnSpecFor({ kind: 'external', bin: 'C:\\tools\\codeburn.exe' }, ['status'])
+    expect(spec.bin).toBe('C:\\tools\\codeburn.exe')
+    expect(spec.args).toEqual(['status'])
+    expect(spec.verbatim).toBeUndefined()
+  })
+})
+
+// Two parsers read this string: cmd itself, then the runtime that splits a command line back
+// into argv. Nothing a renderer can put in an argument may reach either as syntax.
+describe('cmd.exe command line', () => {
+  it('quotes every argument and neutralises the shell metacharacters', () => {
+    // The quotes are for the runtime that splits the line back into argv; the `^` are for
+    // cmd, which reads the line first and would otherwise act on what is inside them.
+    expect(escapeForCmd('status', false)).toBe('^"status^"')
+    expect(escapeForCmd('a&b', false)).toBe('^"a^&b^"')
+    expect(escapeForCmd('a|b', false)).toBe('^"a^|b^"')
+    expect(escapeForCmd('a>b<c', false)).toBe('^"a^>b^<c^"')
+    // A `.cmd` re-expands its own arguments, so those get a second round of escaping.
+    expect(escapeForCmd('a&b', true)).toBe('^^^"a^^^&b^^^"')
+  })
+
+  it('keeps an embedded quote from ending the argument', () => {
+    expect(escapeForCmd('say "hi"', false)).toBe('^"say^ \\^"hi\\^"^"')
+    // A trailing backslash run would otherwise escape the closing quote and swallow the
+    // argument after it.
+    expect(escapeForCmd('C:\\dir\\', false)).toBe('^"C:\\dir\\\\^"')
+  })
+
+  it('builds one /d /s /c line with the shim first', () => {
+    const args = cmdShimArgs('C:\\npm\\codeburn.cmd', ['export', '-o', 'C:\\out dir'])
+    expect(args.slice(0, 3)).toEqual(['/d', '/s', '/c'])
+    expect(args[3]).toBe('"^"C:\\npm\\codeburn.cmd^" ^^^"export^^^" ^^^"-o^^^" ^^^"C:\\out^^^ dir^^^""')
+  })
+
+  it.skipIf(process.platform !== 'win32')('runs a real .cmd shim end to end with its arguments intact', async () => {
+    // The shape a global npm install leaves on PATH: a batch file that re-expands %* into a
+    // node invocation, which is the second parse the double escaping above exists for.
+    const target = join(dir, 'echo-args.js')
+    writeFileSync(target, 'process.stdout.write(JSON.stringify({ args: process.argv.slice(2) }))\n')
+    const shim = join(dir, 'codeburn.cmd')
+    writeFileSync(shim, `@echo off\r\n"${process.execPath}" "${target}" %*\r\n`)
+    process.env.CODEBURN_BIN = shim
+
+    await expect(spawnCli(['status', '--model', 'a & b'])).resolves.toEqual({
+      args: ['status', '--model', 'a & b'],
+    })
+  })
+
+  it('never lets an argument close the line and start a command', () => {
+    const line = cmdShimArgs('C:\\npm\\codeburn.cmd', ['status" & calc.exe & "'])[3]!
+    // Every quote the argument carried is escaped and so is every &, so neither parser can
+    // read the tail as a second command.
+    expect(line).not.toMatch(/(^|[^^])& calc/)
+    expect(line).not.toMatch(/(^|[^^\\])" /)
+    expect(line).toContain('^^^&')
   })
 
   it('spawnCli runs the bundled entry end-to-end as Node', async () => {
@@ -439,7 +525,7 @@ describe('no-output watchdog (timeoutMs bounds SILENCE, not total runtime)', () 
 })
 
 describe('graceful kill (SIGTERM, then SIGKILL after the grace)', () => {
-  it('sends SIGTERM first and SIGKILLs a child that ignores it', async () => {
+  posixOnly('sends SIGTERM first and SIGKILLs a child that ignores it', async () => {
     const signalFile = join(dir, 'signals')
     const pidFile = join(dir, 'stubborn-pid')
     fakeBin(
@@ -463,7 +549,7 @@ describe('graceful kill (SIGTERM, then SIGKILL after the grace)', () => {
     }, 12_000)
   }, 20_000)
 
-  it('keeps a child inside the SIGTERM grace reapable, so quit cannot orphan it', async () => {
+  posixOnly('keeps a child inside the SIGTERM grace reapable, so quit cannot orphan it', async () => {
     // The grace timer dies with the app. A child that ignores SIGTERM must still
     // be in the reap set when quit sweeps, or it survives the app that spawned it.
     //
@@ -491,7 +577,7 @@ describe('graceful kill (SIGTERM, then SIGKILL after the grace)', () => {
     }, 3_000)
   })
 
-  it('lets a SIGTERM-handling child exit on its own without waiting for SIGKILL', async () => {
+  posixOnly('lets a SIGTERM-handling child exit on its own without waiting for SIGKILL', async () => {
     const cleanupFile = join(dir, 'cleanup')
     fakeBin(
       'handles-sigterm.js',
@@ -507,7 +593,10 @@ describe('graceful kill (SIGTERM, then SIGKILL after the grace)', () => {
   })
 })
 
-describe('orphan serve reaping', () => {
+// These start real children and then wait for the OS to report them gone, which is the same
+// reason the resident-serve block gets room: the assertions are about which process survives,
+// never about how quickly a busy machine gets round to ending it.
+describe('orphan serve reaping', { timeout: 30_000 }, () => {
   /** A long-lived stand-in for an orphaned `codeburn serve --stdio` child. */
   function orphanServe(): { pid: number; pidFile: string } {
     const bin = join(dir, 'codeburn')
@@ -581,15 +670,15 @@ describe('spawn PATH augmentation (GUI-launched apps have a minimal PATH)', () =
   it("prepends the resolved binary's own directory so its env-shebang finds node", async () => {
     const bin = fakeBin('path-echo.js', 'process.stdout.write(JSON.stringify({ path: process.env.PATH }))')
     const result = await spawnCli(['status']) as { path: string }
-    expect(result.path.split(':')[0]).toBe(dirname(bin))
+    expect(result.path.split(delimiter)[0]).toBe(dirname(bin))
   })
 
   it('spawnEnvFor dedupes and keeps the original PATH entries', () => {
     const env = spawnEnvFor('/some/tool/bin/codeburn')
-    const parts = (env.PATH ?? '').split(':')
+    const parts = (env.PATH ?? '').split(delimiter)
     expect(parts[0]).toBe('/some/tool/bin')
     expect(new Set(parts).size).toBe(parts.length)
-    for (const original of (process.env.PATH ?? '').split(':').filter(Boolean)) {
+    for (const original of (process.env.PATH ?? '').split(delimiter).filter(Boolean)) {
       expect(parts).toContain(original)
     }
   })
@@ -685,7 +774,10 @@ describe('spawnCli coalescing (read-only)', () => {
   })
 })
 
-describe('resident serve single-flight', () => {
+// Every test here starts several real node children, and the suite runs fifty files at once.
+// The assertions are about which child answers, never about how quickly, so the wall clock
+// gets room rather than the machine having to be fast enough for the default.
+describe('resident serve single-flight', { timeout: 30_000 }, () => {
   it('startServe is idempotent and creates only one resident child', async () => {
     const files = fakeResidentBin()
     startServe()
@@ -730,7 +822,7 @@ describe('resident serve single-flight', () => {
     expect(readMaybe(oneShotsFile)).toBe('o')
   })
 
-  it('falls back instead of crashing when a live resident closes its stdin', async () => {
+  posixOnly('falls back instead of crashing when a live resident closes its stdin', async () => {
     const stdinClosedFile = join(dir, 'resident-stdin-closed')
     fakeBin(
       'closes-stdin-resident.js',
@@ -1014,7 +1106,7 @@ describe('resident serve single-flight', () => {
     expect(readMaybe(files.actionsFile)).toBe('a')
   })
 
-  it('SIGTERMs the outgoing resident on a mutation restart instead of hard-killing it', async () => {
+  posixOnly('SIGTERMs the outgoing resident on a mutation restart instead of hard-killing it', async () => {
     // A settings mutation replaces a child that may hold the cache refresh lock.
     // Same hazard as a timeout, so it gets the same grace: only a catchable
     // signal lets the outgoing child unlink its own lock instead of leaving it

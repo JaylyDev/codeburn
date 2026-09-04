@@ -13,6 +13,7 @@ import { tmpdir } from 'os'
 
 import type { ParsedApiCall, TokenUsage, ProjectSummary } from '../src/types.js'
 import type { CallWithSession } from '../src/sync/otlp.js'
+import { setHome } from './setup/home.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -88,14 +89,14 @@ const originalHome = process.env.HOME
 
 beforeEach(async () => {
   tmpDir = await mkdtemp(join(tmpdir(), 'codeburn-push-'))
-  process.env.HOME = tmpDir
+  setHome(tmpDir)
   // env-isolation.ts redirects XDG_CACHE_HOME to a per-worker sandbox shared
   // across tests — the ledger honors XDG, so point it at the per-test dir.
   process.env.XDG_CACHE_HOME = join(tmpDir, '.cache')
 })
 
 afterEach(async () => {
-  process.env.HOME = originalHome
+  setHome(originalHome)
   await rm(tmpDir, { recursive: true, force: true })
 })
 

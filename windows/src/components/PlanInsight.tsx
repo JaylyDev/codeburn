@@ -4,8 +4,10 @@ import type { MenubarPayload } from '../lib/payload'
 import type { CurrencyState } from '../lib/currency'
 import { formatCompactCurrency, formatTokens, plural } from '../lib/currency'
 import { relativeFuture } from '../lib/dates'
-import type { PlanUsage, PlanWindow } from '../lib/plan'
-import { projectWindow, earliestReset } from '../lib/plan'
+import type { PlanProjection, PlanUsage } from '../lib/plan'
+import { projectQuotaWindow, projectWindow, earliestReset } from '../lib/plan'
+import { displayLabel, refreshQuota, summaryFor, type QuotaState, type QuotaSummary } from '../lib/quota'
+import { ALL_PROVIDER, type Provider } from './AgentTabStrip'
 import { BulbIcon, ChevronRight, KeySlashIcon, PersonDashedIcon, WarningIcon, ArrowUpRight } from './Icons'
 
 /// Sonnet-weighted approximation the mac app uses to turn a dollar saving into tokens.
@@ -23,11 +25,47 @@ type LoadState =
 type Props = {
   payload: MenubarPayload | null
   currency: CurrencyState
+  provider: Provider
+  quota: QuotaState
   onOpenTerminal: (args: string[]) => void
   onConnectClaude: () => void
 }
 
-export function PlanInsight({ payload, currency, onOpenTerminal, onConnectClaude }: Props) {
+/// What the Plan tab has to say about the selected provider. All has no plan of its own, as
+/// on the mac, so the pill is hidden there. Claude always qualifies even before the quota
+/// store has answered: its tier and prior-cycle baseline come from the credential file, not
+/// from the CLI's quota answer.
+export function planTarget(quota: QuotaState, provider: Provider): QuotaSummary | 'claude' | null {
+  if (provider === ALL_PROVIDER) return null
+  const summary = summaryFor(quota, provider)
+  if (summary) return summary
+  return provider === 'claude' ? 'claude' : null
+}
+
+export function PlanInsight({ payload, currency, provider, quota, onOpenTerminal, onConnectClaude }: Props) {
+  const target = planTarget(quota, provider)
+  if (target === null) return null
+  if (target === 'claude' || target.id === 'claude') {
+    return (
+      <ClaudePlan
+        payload={payload}
+        currency={currency}
+        onOpenTerminal={onOpenTerminal}
+        onConnectClaude={onConnectClaude}
+      />
+    )
+  }
+  return <ProviderPlan summary={target} />
+}
+
+/// The Claude tab keeps its own path: `plan_usage` reads the credential file directly, which
+/// is the only source for the subscription tier and last cycle's final reading.
+function ClaudePlan({ payload, currency, onOpenTerminal, onConnectClaude }: {
+  payload: MenubarPayload | null
+  currency: CurrencyState
+  onOpenTerminal: (args: string[]) => void
+  onConnectClaude: () => void
+}) {
   const [state, setState] = useState<LoadState>({ kind: 'idle' })
   const [now, setNow] = useState(() => new Date())
 
@@ -94,7 +132,9 @@ export function PlanInsight({ payload, currency, onOpenTerminal, onConnectClaude
             {reset && <span className="plan-reset">Resets {relativeFuture(reset, now)}</span>}
           </div>
           <div className="plan-rows">
-            {usage.windows.map(w => <UtilizationRow key={w.key} window={w} now={now} />)}
+            {usage.windows.map(w => (
+              <UtilizationRow key={w.key} label={w.label} percent={w.percent} projection={projectWindow(w, now)} now={now} />
+            ))}
           </div>
           {payload && payload.optimize.findingCount > 0 && payload.optimize.savingsUSD > 0 && (
             <button type="button" className="savings-badge" onClick={() => onOpenTerminal(['optimize'])}>
@@ -113,9 +153,89 @@ export function PlanInsight({ payload, currency, onOpenTerminal, onConnectClaude
   }
 }
 
-function UtilizationRow({ window, now }: { window: PlanWindow; now: Date }) {
-  const projection = projectWindow(window, now)
-  const clamped = Math.min(Math.max(window.percent, 0), 100)
+/// Every other provider reads the shared quota store, which is the same data the mac's
+/// per-provider plan tabs render. There is no prior-cycle baseline behind it, so a window
+/// too fresh to extrapolate simply gets no caption.
+function ProviderPlan({ summary }: { summary: QuotaSummary }) {
+  const [now, setNow] = useState(() => new Date())
+
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), PLAN_REFRESH_MS)
+    return () => clearInterval(id)
+  }, [])
+
+  const retry = () => { setNow(new Date()); void refreshQuota() }
+
+  if (summary.connection === 'disconnected') {
+    return (
+      <div className="plan-state">
+        <KeySlashIcon size={20} className="plan-state-icon" />
+        <div className="plan-state-title">No {summary.name} credentials found</div>
+        <div className="plan-state-note">Sign in with the {summary.name} CLI first. Then click Try Again.</div>
+        <div className="plan-actions">
+          <button type="button" className="btn btn-prominent" onClick={retry}>Try Again</button>
+        </div>
+      </div>
+    )
+  }
+  if (summary.connection === 'terminalFailure') {
+    return (
+      <div className="plan-state">
+        <WarningIcon size={18} filled={false} className="plan-state-icon plan-state-icon-accent" />
+        <div className="plan-state-title">Reconnect {summary.name}</div>
+        <div className="plan-state-error">{summary.reason ?? `Your ${summary.name} session has expired. Sign in again in your terminal, then click Reconnect.`}</div>
+        <div className="plan-actions">
+          <button type="button" className="btn btn-prominent" onClick={retry}>Reconnect</button>
+        </div>
+      </div>
+    )
+  }
+  if (summary.windows.length === 0) {
+    return (
+      <div className="plan-state">
+        <PersonDashedIcon size={22} className="plan-state-icon" />
+        <div className="plan-state-title-muted">Reading {summary.name} credentials...</div>
+      </div>
+    )
+  }
+
+  const reset = summary.windows
+    .map(w => (w.resetsAt ? new Date(w.resetsAt) : null))
+    .filter((d): d is Date => d !== null && !Number.isNaN(d.getTime()))
+    .reduce<Date | null>((a, b) => (a && a < b ? a : b), null)
+
+  return (
+    <div className="plan-insight">
+      <div className="plan-header">
+        <span className="plan-tier">{summary.planLabel ?? summary.name}</span>
+        {reset && <span className="plan-reset">Resets {relativeFuture(reset, now)}</span>}
+      </div>
+      <div className="plan-rows">
+        {summary.windows.map((window, index) => (
+          <UtilizationRow
+            key={`${window.label}-${index}`}
+            label={`${displayLabel(window.label)} window`}
+            percent={window.usedPct}
+            projection={projectQuotaWindow(window.label, window.usedPct, window.resetsAt, now)}
+            now={now}
+          />
+        ))}
+      </div>
+      {summary.connection === 'transientFailure' && (
+        <div className="plan-note">{summary.name} temporarily unreachable. Retrying.</div>
+      )}
+      {summary.connection === 'stale' && <div className="plan-note">Showing the last reading.</div>}
+    </div>
+  )
+}
+
+function UtilizationRow({ label, percent, projection, now }: {
+  label: string
+  percent: number
+  projection: PlanProjection | null
+  now: Date
+}) {
+  const clamped = Math.min(Math.max(percent, 0), 100)
   const marker = projection ? Math.min(Math.max(projection.percent, 0), 100) : null
 
   let caption: string | null = null
@@ -129,7 +249,7 @@ function UtilizationRow({ window, now }: { window: PlanWindow; now: Date }) {
   return (
     <div className="util-row">
       <div className="util-row-head">
-        <span className="util-label">{window.label}</span>
+        <span className="util-label">{label}</span>
         <span className="util-percent">{Math.round(clamped)}%</span>
       </div>
       <div className="util-bar">

@@ -47,6 +47,14 @@ struct CLIDecodeFailure: Error, CustomStringConvertible {
 /// Runs the CLI via argv (no shell interpretation). See `CodeburnCLI` for why we never route
 /// commands through `/bin/zsh -c` anymore.
 struct DataClient {
+#if DEBUG
+    /// Test seam. The in-flight slot and the all-provider acceptance ordering
+    /// are only observable when two REAL fetches overlap, which needs a fetch
+    /// whose completion the test controls rather than a spawned CLI.
+    @MainActor
+    static var fetchHookForTesting: (@Sendable (ProviderFilter, Bool) async throws -> MenubarPayload)?
+#endif
+
     static func fetch(period: Period,
                       day: String? = nil,
                       days: Set<String> = [],
@@ -54,7 +62,13 @@ struct DataClient {
                       includeOptimize: Bool,
                       scope: MenubarScope = .local,
                       claudeConfigSourceId: String? = nil,
+                      bypassResident: Bool = false,
                       qualityOfService: QualityOfService = .userInitiated) async throws -> MenubarPayload {
+#if DEBUG
+        if let hook = await MainActor.run(body: { fetchHookForTesting }) {
+            return try await hook(provider, bypassResident)
+        }
+#endif
         let subcommand = statusSubcommand(
             period: period,
             day: day,
@@ -64,7 +78,11 @@ struct DataClient {
             scope: scope,
             claudeConfigSourceId: claudeConfigSourceId
         )
-        let result = try await runCLI(subcommand: subcommand, qualityOfService: qualityOfService)
+        let result = try await runCLI(
+            subcommand: subcommand,
+            bypassResident: bypassResident,
+            qualityOfService: qualityOfService
+        )
         guard result.exitCode == 0 else {
             throw DataClientError.nonZeroExit(code: result.exitCode, stderr: result.stderr)
         }
@@ -133,10 +151,12 @@ struct DataClient {
 
     private static func runCLI(
         subcommand: [String],
+        bypassResident: Bool = false,
         qualityOfService: QualityOfService = .userInitiated
     ) async throws -> ProcessResult {
         try await runCLI(
             subcommand: subcommand,
+            bypassResident: bypassResident,
             serveRequest: { args in
                 try await ServeConnection.shared.request(args: args)
             },
@@ -164,6 +184,7 @@ struct DataClient {
     /// the shared resident and globally limited one-shot closures above.
     static func runCLI(
         subcommand: [String],
+        bypassResident: Bool = false,
         serveRequest: ([String]) async throws -> Data,
         spawnFallback: () async throws -> ProcessResult
     ) async throws -> ProcessResult {
@@ -172,7 +193,7 @@ struct DataClient {
         // Transport/protocol failures fall back to the spawn path below, so
         // the resident remains an optimization. Resource-policy failures stay
         // terminal and cannot bypass the resident output ceiling.
-        if ServeConnection.isEligible(subcommand) {
+        if !bypassResident, ServeConnection.isEligible(subcommand) {
             do {
                 let stdout = try await serveRequest(subcommand)
                 return ProcessResult(stdout: stdout, stderr: "", exitCode: 0)

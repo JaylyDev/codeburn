@@ -1893,22 +1893,10 @@ function inferJetBrainsProject(raw: string): string | undefined {
   while ((m = re.exec(raw))) {
     let p = m[1].trim()
     try { p = decodeURIComponent(p) } catch { /* leave as-is */ }
-    p = p.replace(/\\+/g, '/').replace(/\/+$/, '')
-    const dir = dirname(p)
-    if (dir) seen.add(dir)
-  }
-  if (seen.size === 0) {
-    const fallbackRe = /file:\/\/(?:localhost)?(?:\/)?([^\x00"'\r\n]+?)(?=(?:["'\x00\r\n]|\s+file:\/\/|$))/g
-    while ((m = fallbackRe.exec(raw))) {
-      let p = m[1].trim()
-      try { p = decodeURIComponent(p) } catch { /* leave as-is */ }
-      if (process.platform === 'win32' && p.startsWith('/') && /^\/[A-Za-z]:/.test(p)) {
-        p = p.slice(1)
-      }
-      p = p.replace(/\\+/g, '/').replace(/\/+$/, '')
-      const dir = dirname(p)
-      if (dir) seen.add(dir)
-    }
+    const dir = p.slice(0, p.lastIndexOf('/'))
+    // A Windows URL is file:///C:/repo/One.ts, so the captured path carries a
+    // leading slash that is part of the URL, not of the drive path.
+    if (dir.startsWith('/')) seen.add(dir.replace(/^\/(?=[a-zA-Z]:\/)/, ''))
   }
   if (seen.size === 0) return undefined
 

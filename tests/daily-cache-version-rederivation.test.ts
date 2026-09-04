@@ -4,8 +4,10 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 
 import {
+  DAILY_CACHE_VERSION,
   currentTzKey,
   ensureCacheHydrated,
+  loadDailyCache,
   toDateString,
   type DailyEntry,
 } from '../src/daily-cache.js'
@@ -105,5 +107,52 @@ describe('daily-cache re-derivation on a DAILY_CACHE_VERSION bump', () => {
     expect(refreshedDay?.providers.grok?.cost).toBe(2)
     expect(refreshedDay?.cost).toBe(2)
     expect(JSON.parse(await readFile(oldPath, 'utf8'))).toEqual(oldCache)
+  })
+})
+
+// v30 is claimed by two open branches at once: this one and #1132. A v30 file
+// on disk therefore carries UNKNOWN accounting, so adopting it as the
+// finalized base would serve #1132's numbers under this branch's contract.
+describe('daily-cache adoption of a v30 file written under a different accounting', () => {
+  it('carries its days forward but never adopts it as the finalized base', async () => {
+    const date = toDateString(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000))
+    const yesterday = toDateString(new Date(Date.now() - 24 * 60 * 60 * 1000))
+    const foreign = day(date, 42)
+    foreign.providers = {
+      hermes: {
+        calls: 1,
+        cost: 42,
+        savingsUSD: 0,
+        sessions: 1,
+        inputTokens: 100,
+        outputTokens: 20,
+        cacheReadTokens: 30,
+        cacheWriteTokens: 0,
+      },
+    }
+    await writeFile(
+      join(cacheRoot, 'daily-cache.v30.json'),
+      JSON.stringify({
+        version: 30,
+        savingsConfigHash: 'cfg',
+        tzKey: currentTzKey(),
+        lastComputedDate: yesterday,
+        days: [foreign],
+        complete: true,
+        watermarkTrusted: true,
+      }),
+    )
+
+    const loaded = await loadDailyCache()
+
+    expect(DAILY_CACHE_VERSION).toBe(31)
+    expect(loaded.version).toBe(31)
+    // A v30 candidate must not satisfy the same-version adoption at
+    // adoptOlderDailyCaches, so its trust markers cannot survive.
+    expect(loaded.complete).toBe(false)
+    expect(loaded.watermarkTrusted).toBe(false)
+    const carried = loaded.days.find(entry => entry.date === date)
+    expect(carried?.carried).toBe(true)
+    expect(loaded.pendingRederive).toContain('hermes')
   })
 })

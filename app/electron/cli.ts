@@ -25,7 +25,12 @@ export type SpawnPriority = 'interactive' | 'background'
  * acting as Node via `ELECTRON_RUN_AS_NODE`.
  */
 export type CliTarget = { kind: 'external'; bin: string } | { kind: 'bundled'; entry: string }
-type SpawnSpec = { bin: string; args: string[]; env: NodeJS.ProcessEnv }
+/**
+ * `verbatim` marks a spec that goes through `cmd.exe`: its args are one already
+ * escaped command line that Windows must hand over untouched, and the real CLI
+ * runs a generation below, so ending it means ending the tree.
+ */
+type SpawnSpec = { bin: string; args: string[]; env: NodeJS.ProcessEnv; verbatim?: true }
 
 /**
  * Which resolution/spawn stage produced a `not-found`, as a non-sensitive enum
@@ -108,11 +113,73 @@ function ownsProcessGroup(): boolean {
   return platform() !== 'win32'
 }
 
-/** Signal the CLI and every subprocess it created. POSIX children are spawned
- * as process-group leaders; Windows keeps the direct-child behavior here and
- * relies on its existing orphan-reap path after a crash. */
+/** Everything but the stdio shape, which stays at the call site so its literal tuple keeps
+ *  telling the type system which streams the child will have. */
+function spawnOptionsFor(spec: SpawnSpec) {
+  return {
+    shell: false as const,
+    env: spec.env,
+    detached: ownsProcessGroup(),
+    ...(spec.verbatim ? { windowsVerbatimArguments: true } : {}),
+  }
+}
+
+/** `taskkill.exe` out of System32, never by bare name: Windows searches the current
+ *  directory first, so anything dropped beside the app could answer for it. Same rule as
+ *  `comspecPath` below. */
+export function taskkillPath(env: NodeJS.ProcessEnv = process.env): string {
+  const root = env.SystemRoot
+  const base = root && /^[a-zA-Z]:[\\/]/.test(root) ? root.replace(/[\\/]+$/, '') : 'C:\\Windows'
+  return `${base}\\System32\\taskkill.exe`
+}
+
+/** The one taskkill argv, exported so a test can pin it: end this pid and everything
+ *  below it, without asking. */
+export function taskkillArgs(pid: number): string[] {
+  return ['/pid', String(pid), '/T', '/F']
+}
+
+/**
+ * End a Windows child and every process below it.
+ *
+ * `child.kill()` reaches one process. That is never the whole CLI: a `.cmd` shim runs node
+ * as its own child, and the CLI itself spawns provider subprocesses. `taskkill /T` walks
+ * the tree from this pid and is the only way to reach them.
+ *
+ * The handle is ended only once taskkill has finished, or could not run at all. Ending it
+ * first is what made the tree kill a no-op: the descendants are reparented the moment the
+ * top of the tree dies, and `taskkill /pid` on a pid that has already gone reports it as
+ * not found and reaps nothing.
+ *
+ * `/F` on every signal, including SIGTERM: Windows has no catchable termination signal, so
+ * `child.kill('SIGTERM')` is already an unconditional TerminateProcess. The graceful half
+ * of {@link killGracefully} exists for POSIX.
+ */
+function killWindowsTree(child: ChildProcess, signal: NodeJS.Signals): boolean {
+  const pid = child.pid
+  if (!pid) return false
+  const endHandle = () => { try { child.kill(signal) } catch { /* already gone */ } }
+  let killer: ChildProcess
+  try {
+    killer = spawn(taskkillPath(), taskkillArgs(pid), { stdio: 'ignore', windowsHide: true })
+  } catch {
+    endHandle()
+    return true
+  }
+  // A non-zero exit means taskkill found nothing to end, which is the state we were after
+  // anyway; the direct kill then costs nothing. So a taskkill that cannot run at all leaves
+  // exactly the behaviour there was before.
+  killer.on('error', endHandle)
+  killer.on('exit', code => { if (code !== 0) endHandle() })
+  return true
+}
+
+/** Signal the CLI and every subprocess it created. POSIX children are spawned as
+ *  process-group leaders; Windows has no process group to signal, so the tree is walked
+ *  by pid instead. */
 function signalOwnedTree(child: ChildProcess, signal: NodeJS.Signals): boolean {
-  if (ownsProcessGroup() && child.pid) {
+  if (!ownsProcessGroup()) return killWindowsTree(child, signal)
+  if (child.pid) {
     try { process.kill(-child.pid, signal); return true } catch { /* already gone or no group */ }
   }
   try { return child.kill(signal) } catch { return false }
@@ -264,12 +331,78 @@ export function spawnEnvFor(bin: string): NodeJS.ProcessEnv {
  * as the first argument. PATH is still augmented so anything the CLI itself
  * shells out to (pairing, sync) resolves the same way an external CLI would.
  */
+/** A script run by this process's own runtime: Electron's binary acting as Node. */
+function nodeSpec(entry: string, args: string[]): SpawnSpec {
+  return {
+    bin: process.execPath,
+    args: [entry, ...args],
+    env: { ...spawnEnvFor(entry), ELECTRON_RUN_AS_NODE: '1' },
+  }
+}
+
+/** What a `codeburn` install looks like on Windows: an npm `.cmd` shim on PATH, or the
+ *  repo's own `dist/cli.js` in dev. Neither is something `CreateProcess` can start. */
+const NODE_SCRIPT = /\.[cm]?js$/i
+const CMD_SCRIPT = /\.(?:cmd|bat)$/i
+
+/** `cmd.exe` out of System32, never by bare name: Windows searches the current directory
+ *  first, so anything dropped beside the app could answer for it. */
+function comspecPath(env: NodeJS.ProcessEnv = process.env): string {
+  const root = env.SystemRoot
+  const base = root && /^[a-zA-Z]:[\\/]/.test(root) ? root.replace(/[\\/]+$/, '') : 'C:\\Windows'
+  return `${base}\\System32\\cmd.exe`
+}
+
+/**
+ * Quote one argument for a `cmd.exe /c` command line.
+ *
+ * Two parsers see this string, and each needs its own pass. The quotes and the
+ * backslash doubling are for the runtime that splits a command line back into argv;
+ * the `^` escapes are for cmd itself, which re-reads the line first and would
+ * otherwise act on a `&` or a `|` inside the quotes rather than pass it along. A
+ * `.cmd` shim re-expands its own arguments, so those meta characters are escaped
+ * twice: once for cmd reading this line, once for the shim reading what it gets.
+ *
+ * This is the rule `cross-spawn` applies, restated rather than depended on: the app's
+ * main process ships no npm dependencies (app/DISTRIBUTION.md).
+ */
+const CMD_META = /([()\][%!^"`<>&|;, *?])/g
+export function escapeForCmd(arg: string, doubleEscape: boolean): string {
+  let escaped = String(arg)
+    // Any run of backslashes immediately before a quote is doubled, and the quote escaped.
+    .replace(/(\\*)"/g, '$1$1\\"')
+    // A trailing backslash run would otherwise escape the closing quote.
+    .replace(/(\\*)$/, '$1$1')
+  escaped = `"${escaped}"`.replace(CMD_META, '^$1')
+  return doubleEscape ? escaped.replace(CMD_META, '^$1') : escaped
+}
+
+/** The `cmd.exe /d /s /c "<line>"` argv for a `.cmd` or `.bat` CLI. Exported for tests:
+ *  everything security-relevant about the shell route is in this one string. */
+export function cmdShimArgs(bin: string, args: string[]): string[] {
+  const line = [escapeForCmd(bin, false), ...args.map(arg => escapeForCmd(arg, true))].join(' ')
+  // /d skips AutoRun commands from the registry, /s fixes how the quotes around the whole
+  // line are read, /c runs it and exits.
+  return ['/d', '/s', '/c', `"${line}"`]
+}
+
 export function spawnSpecFor(target: CliTarget, args: string[]): SpawnSpec {
-  if (target.kind === 'bundled') {
-    return {
-      bin: process.execPath,
-      args: [target.entry, ...args],
-      env: { ...spawnEnvFor(target.entry), ELECTRON_RUN_AS_NODE: '1' },
+  if (target.kind === 'bundled') return nodeSpec(target.entry, args)
+
+  // Windows has no shebang. `CreateProcess` starts executables, so a `.js` CLI (the repo
+  // build in dev) and a `.cmd` shim (what a global npm install puts on PATH) both fail
+  // outright with EFTYPE, which is why nothing the desktop app spawned ever ran here. Each
+  // is given a runner that can start it. A POSIX `codeburn` is a script with a shebang and
+  // an exec bit and still runs directly, exactly as before.
+  if (platform() === 'win32') {
+    if (NODE_SCRIPT.test(target.bin)) return nodeSpec(target.bin, args)
+    if (CMD_SCRIPT.test(target.bin)) {
+      return {
+        bin: comspecPath(),
+        args: cmdShimArgs(target.bin, args),
+        env: spawnEnvFor(target.bin),
+        verbatim: true,
+      }
     }
   }
   return { bin: target.bin, args, env: spawnEnvFor(target.bin) }
@@ -365,10 +498,22 @@ export function resolveTarget(): CliTarget | null {
   const persisted = readPersistedPath()
   if (persisted) return { kind: 'external', bin: persisted }
 
-  for (const bin of searchDirs().map(dir => join(dir, 'codeburn'))) {
+  for (const bin of searchDirs().flatMap(pathCandidates)) {
     if (isExecutableFile(bin)) return { kind: 'external', bin }
   }
   return null
+}
+
+/**
+ * What a `codeburn` in one PATH directory can be called. A global npm install writes both
+ * `codeburn` (a shell script, useless here) and `codeburn.cmd` (the Windows shim) into the
+ * same directory, so the extensions have to come first or the lookup finds the one Windows
+ * cannot start. Elsewhere there is only ever the bare name.
+ */
+function pathCandidates(dir: string): string[] {
+  return platform() === 'win32'
+    ? [join(dir, 'codeburn.cmd'), join(dir, 'codeburn.exe'), join(dir, 'codeburn.bat'), join(dir, 'codeburn')]
+    : [join(dir, 'codeburn')]
 }
 
 /** The resolved CLI's path for display/status, or null. See {@link resolveTarget}. */
@@ -420,7 +565,7 @@ function withoutProgressLines(stderr: string): string {
 
 function runCli(spec: SpawnSpec, cmdLabel: string, timeoutMs: number, onStderr?: (chunk: string) => void): Promise<unknown> {
   return new Promise<unknown>((resolve, reject) => {
-    const child = spawn(spec.bin, spec.args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'], env: spec.env, detached: ownsProcessGroup() })
+    const child = spawn(spec.bin, spec.args, { stdio: ['ignore', 'pipe', 'pipe'], ...spawnOptionsFor(spec) })
     activeChildren.add(child)
     let stdout = ''
     let stderr = ''
@@ -574,7 +719,7 @@ class ServeClient {
 
   start(): void {
     if (this.child || this.disabled() || this.destroyed) return
-    const child = spawn(this.spec.bin, [...this.spec.args], { shell: false, stdio: ['pipe', 'pipe', 'ignore'], env: this.spec.env, detached: ownsProcessGroup() })
+    const child = spawn(this.spec.bin, [...this.spec.args], { stdio: ['pipe', 'pipe', 'ignore'], ...spawnOptionsFor(this.spec) })
     this.child = child
     if (this.pidFile && child.pid) {
       const record = JSON.stringify({ pid: child.pid, cmd: [this.spec.bin, ...this.spec.args].join(' '), processGroup: ownsProcessGroup() })
@@ -948,12 +1093,16 @@ export function spawnCli(
 /** Spawn a config-mutating CLI command and return its text output verbatim.
  *  Mutations count as interactive, so they take a run slot ahead of any queued
  *  background warm — a Settings save is never stuck behind speculative prefetch. */
-export function spawnCliAction(args: string[], opts: { timeoutMs?: number } = {}): Promise<ActionResult> {
+export function spawnCliAction(args: string[], opts: { timeoutMs?: number; extraEnv?: NodeJS.ProcessEnv } = {}): Promise<ActionResult> {
   if (shuttingDown) return Promise.resolve({ ok: false, stdout: '', stderr: 'codeburn is shutting down', code: null })
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const target = resolveTarget()
   if (!target) return Promise.resolve({ ok: false, stdout: '', stderr: 'codeburn CLI not found', code: null })
   const spec = spawnSpecFor(target, args)
+  // Actions never ride the resident `serve` child, so an extra variable simply joins the
+  // one-shot spawn's env. The bundled-menubar install is the only caller: it names the .msi
+  // the desktop app staged rather than putting a path on a command line.
+  if (opts.extraEnv) spec.env = { ...spec.env, ...opts.extraEnv }
   return (async () => {
     try {
       await acquireSlot('interactive')
@@ -975,7 +1124,7 @@ export function spawnCliAction(args: string[], opts: { timeoutMs?: number } = {}
 // no long silent stretch for a watchdog to misread.
 function runAction(spec: SpawnSpec, args: string[], timeoutMs: number): Promise<ActionResult> {
   return new Promise<ActionResult>(resolve => {
-    const child = spawn(spec.bin, spec.args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'], env: spec.env, detached: ownsProcessGroup() })
+    const child = spawn(spec.bin, spec.args, { stdio: ['ignore', 'pipe', 'pipe'], ...spawnOptionsFor(spec) })
     activeChildren.add(child)
     let stdout = ''
     let stderr = ''
