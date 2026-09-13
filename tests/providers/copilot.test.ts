@@ -2597,6 +2597,13 @@ describe('copilot provider - JetBrains parsing', () => {
   // Build an assistant response blob in the real nested-escaped shape:
   // {"__first__":{"type":"Subgraph","value":"{\"<uuid>\":{\"type\":\"Value\",
   //   \"value\":\"{\\\"type\\\":\\\"Markdown\\\",\\\"data\\\":\\\"{\\\\\\\"text\\\\\\\":...}\"}"}}
+  // JetBrains records VirtualFile URLs: forward slashes throughout, and a
+  // leading slash ahead of a Windows drive letter (file:///C:/repo/One.ts).
+  function jbFileUrl(filePath: string): string {
+    const slashed = filePath.replace(/\\/g, '/')
+    return `file://${slashed.startsWith('/') ? '' : '/'}${slashed}`
+  }
+
   function jbAssistantBlob(text: string, opts: { model?: string; errored?: boolean; files?: string[] } = {}) {
     const innerMd = { type: 'Markdown', data: JSON.stringify({ text, annotations: [] }) }
     const valueMap: Record<string, unknown> = {
@@ -2607,7 +2614,7 @@ describe('copilot provider - JetBrains parsing', () => {
     if (opts.files) {
       valueMap['__refs__'] = {
         type: 'Value',
-        value: JSON.stringify({ type: 'References', data: opts.files.map((f) => `file://${f}`).join(' ') }),
+        value: JSON.stringify({ type: 'References', data: opts.files.map(jbFileUrl).join(' ') }),
       }
     }
     const outer: Record<string, unknown> = {
@@ -3484,17 +3491,35 @@ describe('copilot provider - legacy JSON format', () => {
             promptTokens: 0,
             completionTokens: 0,
           },
+          // Row 4: metadata.outputTokens is 0, must fall back to root completionTokens (250)
+          {
+            requestId: 'req-split-2',
+            modelId: 'copilot/claude-sonnet-4.6',
+            completionTokens: 250,
+            result: {
+              metadata: {
+                promptTokens: 500,
+                outputTokens: 0,
+                resolvedModel: 'claude-sonnet-4-6',
+              },
+            },
+          },
         ],
       },
     ])
 
     const calls = await collectCalls({ path: filePath, project: 'myproject', provider: 'copilot', sourceType: 'chatsession' })
 
-    expect(calls).toHaveLength(1)
+    expect(calls).toHaveLength(2)
     expect(calls[0]!.inputTokens).toBe(32543)
     expect(calls[0]!.outputTokens).toBe(490)
     expect(calls[0]!.costIsEstimated).toBe(false)
     expect(calls[0]!.costUSD).toBeGreaterThan(0)
+
+    expect(calls[1]!.inputTokens).toBe(500)
+    expect(calls[1]!.outputTokens).toBe(250)
+    expect(calls[1]!.costIsEstimated).toBe(false)
+    expect(calls[1]!.costUSD).toBeGreaterThan(0)
   })
 
   it('preserves dotted model IDs without replacing dots with dashes', async () => {

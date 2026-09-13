@@ -256,6 +256,7 @@ interface LegacyChatRequest {
   result?: IResultMetadata
   promptTokens?: number
   completionTokens?: number
+  outputTokens?: number
 }
 
 interface LegacyChatSession {
@@ -629,40 +630,42 @@ function parseLegacyChatSession(
 
     // Exact token extraction: check metadata, result, root req, and usage independently
     const exactPromptTokens =
-      (meta && typeof meta['promptTokens'] === 'number' ? meta['promptTokens'] : undefined) ??
-      (resultObj && typeof resultObj['promptTokens'] === 'number' ? resultObj['promptTokens'] : undefined) ??
-      (typeof req.promptTokens === 'number' ? req.promptTokens : undefined) ??
-      (usage && typeof usage['promptTokens'] === 'number' ? usage['promptTokens'] : undefined) ??
-      (usage && typeof usage['prompt_tokens'] === 'number' ? usage['prompt_tokens'] : undefined)
+      numberOrZero(meta?.['promptTokens']) ||
+      numberOrZero(resultObj?.['promptTokens']) ||
+      numberOrZero(req.promptTokens) ||
+      numberOrZero(usage?.['promptTokens']) ||
+      numberOrZero(usage?.['prompt_tokens']) ||
+      undefined
 
     const exactOutputTokens =
-      (meta && typeof meta['outputTokens'] === 'number' ? meta['outputTokens'] : undefined) ??
-      (resultObj && typeof resultObj['outputTokens'] === 'number' ? resultObj['outputTokens'] : undefined) ??
-      (typeof req.completionTokens === 'number' ? req.completionTokens : undefined) ??
-      (typeof req.outputTokens === 'number' ? req.outputTokens : undefined) ??
-      (usage && typeof usage['completionTokens'] === 'number' ? usage['completionTokens'] : undefined) ??
-      (usage && typeof usage['completion_tokens'] === 'number' ? usage['completion_tokens'] : undefined)
+      numberOrZero(meta?.['outputTokens']) ||
+      numberOrZero(resultObj?.['outputTokens']) ||
+      numberOrZero(req.completionTokens) ||
+      numberOrZero(req.outputTokens) ||
+      numberOrZero(usage?.['completionTokens']) ||
+      numberOrZero(usage?.['completion_tokens']) ||
+      undefined
 
     const exactCacheRead =
-      (meta && typeof meta['cacheReadTokens'] === 'number' ? meta['cacheReadTokens'] : undefined) ??
-      (meta && typeof meta['cachedTokens'] === 'number' ? meta['cachedTokens'] : undefined) ??
-      (resultObj && typeof resultObj['cacheReadTokens'] === 'number' ? resultObj['cacheReadTokens'] : undefined) ??
-      (resultObj && typeof resultObj['cachedTokens'] === 'number' ? resultObj['cachedTokens'] : undefined) ??
-      (usage && typeof usage['cacheReadTokens'] === 'number' ? usage['cacheReadTokens'] : undefined) ??
-      (usage && typeof usage['cache_read_tokens'] === 'number' ? usage['cache_read_tokens'] : undefined) ??
-      (usage && typeof usage['cachedTokens'] === 'number' ? usage['cachedTokens'] : undefined) ??
-      (usage && typeof usage['cached_tokens'] === 'number' ? usage['cached_tokens'] : undefined) ??
+      numberOrZero(meta?.['cacheReadTokens']) ||
+      numberOrZero(meta?.['cachedTokens']) ||
+      numberOrZero(resultObj?.['cacheReadTokens']) ||
+      numberOrZero(resultObj?.['cachedTokens']) ||
+      numberOrZero(usage?.['cacheReadTokens']) ||
+      numberOrZero(usage?.['cache_read_tokens']) ||
+      numberOrZero(usage?.['cachedTokens']) ||
+      numberOrZero(usage?.['cached_tokens']) ||
       0
 
     const exactCacheCreation =
-      (meta && typeof meta['cacheCreationTokens'] === 'number' ? meta['cacheCreationTokens'] : undefined) ??
-      (meta && typeof meta['cacheWriteTokens'] === 'number' ? meta['cacheWriteTokens'] : undefined) ??
-      (resultObj && typeof resultObj['cacheCreationTokens'] === 'number' ? resultObj['cacheCreationTokens'] : undefined) ??
-      (resultObj && typeof resultObj['cacheWriteTokens'] === 'number' ? resultObj['cacheWriteTokens'] : undefined) ??
-      (usage && typeof usage['cacheCreationTokens'] === 'number' ? usage['cacheCreationTokens'] : undefined) ??
-      (usage && typeof usage['cache_creation_tokens'] === 'number' ? usage['cache_creation_tokens'] : undefined) ??
-      (usage && typeof usage['cacheWriteTokens'] === 'number' ? usage['cacheWriteTokens'] : undefined) ??
-      (usage && typeof usage['cache_write_tokens'] === 'number' ? usage['cache_write_tokens'] : undefined) ??
+      numberOrZero(meta?.['cacheCreationTokens']) ||
+      numberOrZero(meta?.['cacheWriteTokens']) ||
+      numberOrZero(resultObj?.['cacheCreationTokens']) ||
+      numberOrZero(resultObj?.['cacheWriteTokens']) ||
+      numberOrZero(usage?.['cacheCreationTokens']) ||
+      numberOrZero(usage?.['cache_creation_tokens']) ||
+      numberOrZero(usage?.['cacheWriteTokens']) ||
+      numberOrZero(usage?.['cache_write_tokens']) ||
       0
 
     const hasExactTokens = exactPromptTokens !== undefined || exactOutputTokens !== undefined
@@ -959,57 +962,6 @@ type SessionStartData = {
   selectedModel?: string
 }
 
-const CHARS_PER_TOKEN = 4
-
-// --- VS Code transcript format (workspaceStorage transcripts) ---
-
-type TranscriptToolRequest = {
-  toolCallId?: string
-  name?: string
-  arguments?: string
-  type?: string
-}
-
-type TranscriptEvent =
-  | { type: 'session.start'; timestamp?: string; data: { sessionId: string; producer?: string } }
-  | { type: 'user.message'; timestamp?: string; data: { content: string; attachments?: unknown[] } }
-  | { type: 'assistant.message'; timestamp?: string; data: { messageId: string; content?: string; reasoningText?: string; toolRequests?: TranscriptToolRequest[]; outputTokens?: number } }
-  | { type: string; timestamp?: string; data: Record<string, unknown> }
-
-function inferModelFromToolCallIds(events: TranscriptEvent[]): string {
-  const modelCounts = new Map<string, number>()
-
-  for (const e of events) {
-    // Some newer events (like tool.execution_complete) explicitly include the model ID.
-    const data = e.data as { model?: string }
-    if (typeof data?.model === 'string' && data.model) {
-      modelCounts.set(data.model, (modelCounts.get(data.model) ?? 0) + 100)
-    }
-
-    // NEW: Also check for llm_request attrs
-    const attrs = (e as any).attrs
-    if (attrs && typeof attrs.model === 'string' && attrs.model) {
-      modelCounts.set(attrs.model, (modelCounts.get(attrs.model) ?? 0) + 100)
-    }
-
-    if (e.type !== 'assistant.message') continue
-    const msg = e as { data: { toolRequests?: TranscriptToolRequest[] } }
-    for (const t of msg.data.toolRequests ?? []) {
-      const toolCallId = t.toolCallId ?? ''
-      for (const hint of transcriptToolCallModelHints) {
-        if (!toolCallId.startsWith(hint.prefix)) continue
-        modelCounts.set(hint.model, (modelCounts.get(hint.model) ?? 0) + 1)
-        break
-      }
-    }
-  }
-
-  if (modelCounts.size > 0) {
-    return [...modelCounts.entries()].sort((a, b) => b[1] - a[1])[0]![0]
-  }
-
-  return 'copilot-auto'
-}
 
 // --- Parser ---
 
