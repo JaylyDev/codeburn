@@ -88,28 +88,58 @@ const transcriptToolCallModelHints: Array<{ prefix: string; model: string }> = [
   { prefix: 'call_', model: COPILOT_OPENAI_AUTO },
 ]
 
+// ---------------------------------------------------------------------------
 // Legacy chat-session JSON format helpers
-function normaliseLegacyModelId(raw: string): string {
-  const stripped = raw.replace(/^[^/]+\//, '')
-  return stripped.replace(/(\d+)\.(\d+)/g, '$1-$2')
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalise the model ID emitted by the legacy chatSessions JSON format.
+ * Examples:
+ *   "copilot/claude-sonnet-4.5" → "claude-sonnet-4-5"
+ *   "copilot/gpt-4o"           → "gpt-4o"
+ *
+ * The alias table in models.ts (BUILTIN_ALIASES) maps dot-separated Claude
+ * versions ("claude-sonnet-4.5") to dash-separated ones ("claude-sonnet-4-5")
+ * so calculateCost() will already resolve them correctly, but we also
+ * normalise here so the stored `model` field matches what modelDisplayName()
+ * expects (dash-separated).
+ */
+function stripCopilotPrefix(raw: string): string {
+  return raw.replace(/^copilot\//, '').trim()
 }
 
 const CHARS_PER_TOKEN_LEGACY = 4
 
+/**
+ * A leaf text node inside a VSCode render tree.
+ * These appear at arbitrary depths; `type === 2` marks a concrete text segment.
+ */
 interface LegacyRenderNode {
   type?: number
   text?: string
   children?: LegacyRenderNode[]
 }
 
+// Most of the types below are extracted from https://github.com/microsoft/vscode-copilot-chat/
+
 export interface ChatCompletionContentPartText {
-  text: string
-  type: ChatCompletionContentPartKind.Text
+  /**
+   * The text content.
+   */
+  text: string;
+
+  /**
+   * The type of the content part.
+   */
+  type: ChatCompletionContentPartKind.Text;
 }
 
 export interface ChatCompletionContentPartCacheBreakpoint {
-  type: ChatCompletionContentPartKind.CacheBreakpoint
-  cacheType?: string
+  type: ChatCompletionContentPartKind.CacheBreakpoint;
+  /**
+   * Optional implementation-specific type of the breakpoint.
+   */
+  cacheType?: string;
 }
 
 export enum ChatCompletionContentPartKind {
@@ -120,45 +150,55 @@ export enum ChatCompletionContentPartKind {
   Document,
 }
 
-export type ChatCompletionContentPart = ChatCompletionContentPartText | ChatCompletionContentPartCacheBreakpoint
+export type ChatCompletionContentPart = ChatCompletionContentPartText | ChatCompletionContentPartCacheBreakpoint;
 
-export const openAIContextManagementCompactionType = 'compaction'
+export const openAIContextManagementCompactionType = 'compaction';
 
 export interface OpenAIContextManagementResponse {
-  encrypted_content: string
-  type: typeof openAIContextManagementCompactionType
-  id: string
+  encrypted_content: string;
+  type: typeof openAIContextManagementCompactionType;
+  id: string;
 }
 
 export interface ThinkingData {
-  id: string
-  text: string | string[]
-  metadata?: { [key: string]: any }
-  tokens?: number
-  encrypted?: string
+  id: string;
+  text: string | string[];
+  metadata?: { [key: string]: any };
+  tokens?: number;
+  encrypted?: string;
 }
 
 export interface IToolCall {
-  name: string
-  arguments: string
-  id: string
+  name: string;
+  arguments: string;
+  id: string;
 }
 
 export interface IToolCallRound {
-  id: string
-  summary?: string
-  response: string
-  toolInputRetry: number
-  toolCalls: IToolCall[]
-  thinking?: ThinkingData
-  statefulMarker?: string
-  compaction?: OpenAIContextManagementResponse
-  timestamp?: number
-  hookContext?: string
-  phase?: string
-  phaseModelId?: string
+  id: string;
+  summary?: string;
+  response: string;
+  toolInputRetry: number;
+  toolCalls: IToolCall[];
+  thinking?: ThinkingData;
+  statefulMarker?: string;
+  /** Compaction data from the Responses API, round-tripped in outgoing requests */
+  compaction?: OpenAIContextManagementResponse;
+  /** Epoch millis (`Date.now()`) when this round started. */
+  timestamp?: number;
+  /**
+   * Additional context from a hook that was executed after this round completed.
+   * For example, when a stop hook blocks the agent from stopping, this contains
+   * the message to show the model about what requirements must be addressed.
+   */
+  hookContext?: string;
+  /** The phase of the agent loop during which this tool call round occurred. */
+  phase?: string;
+  /** The model ID that produced the phase value. */
+  phaseModelId?: string;
 }
 
+// (native VScode types are hidden behind a `vscode` import, these are relevant bits)
 interface LanguageModelToolResult {
   content?: Array<{
     value?: string | { node?: LegacyRenderNode }
@@ -170,24 +210,34 @@ interface IResultMetadata {
     renderedUserMessage?: ChatCompletionContentPart[]
     renderedGlobalContext?: ChatCompletionContentPart[]
     toolCallRounds?: readonly IToolCallRound[]
+    /**
+     * Keyed by the tool call ID from toolCallRounds[].toolCalls[].id.
+     * Each entry holds the rendered result the model receives as tool-use
+     * input for its next reasoning step (file contents, command output, etc.).
+     * content[x].value is either a plain string ($mid:21 form) or an object
+     * with a .node render tree ($mid:23 form).
+     */
     toolCallResults?: Record<string, LanguageModelToolResult>
   }
   details?: string
 }
 
 export interface IParsedChatRequestPart {
-  readonly kind: string
-  readonly range: unknown
-  readonly editorRange: unknown
-  readonly text: string
-  readonly promptText: string
+  readonly kind: string; // for serialization
+  readonly range: unknown;
+  readonly editorRange: unknown;
+  readonly text: string;
+  /** How this part is represented in the prompt going to the agent */
+  readonly promptText: string;
 }
+
 
 export interface IParsedChatRequest {
-  readonly parts: ReadonlyArray<IParsedChatRequestPart>
-  readonly text: string
+  readonly parts: ReadonlyArray<IParsedChatRequestPart>;
+  readonly text: string;
 }
 
+// https://github.com/microsoft/vscode/blob/main/src/vs/workbench/contrib/chat/common/model/chatModel.ts#L1648
 export interface SerializedChatResponsePart {
   kind?: string
   value?: string
@@ -206,6 +256,7 @@ interface LegacyChatRequest {
   result?: IResultMetadata
   promptTokens?: number
   completionTokens?: number
+  outputTokens?: number
 }
 
 interface LegacyChatSession {
@@ -334,29 +385,34 @@ interface LegacyResultMetadata {
 }
 
 function inferModelFromLegacySession(session: LegacyChatSession): string {
-  // 1. Try to find the first request that has a non-empty modelId
+  // 1. Try to find the first request that has a non-empty, non-auto modelId
   for (const req of session.requests ?? []) {
     if (req.modelId) {
-      const normalized = normaliseLegacyModelId(req.modelId)
-      if (normalized !== 'auto' && normalized !== 'unknown') {
-        return normalized
+      const stripped = stripCopilotPrefix(req.modelId)
+      if (stripped && stripped !== 'auto' && stripped !== 'copilot-auto' && stripped !== 'unknown') {
+        return stripped
       }
     }
   }
 
-  // 1.5. Look in inputState.selectedModel.identifier and metadata
+  // 1.5. Look in inputState.selectedModel
   const selectedModel = session.inputState?.selectedModel
   if (selectedModel) {
     const version = selectedModel.metadata?.version || selectedModel.metadata?.family || selectedModel.identifier
-    if (version && version !== 'copilot/auto' && version !== 'auto') {
-      return normaliseLegacyModelId(version)
+    if (version) {
+      const stripped = stripCopilotPrefix(version)
+      if (stripped && stripped !== 'copilot/auto' && stripped !== 'auto' && stripped !== 'copilot-auto') {
+        return stripped
+      }
     }
   }
 
-  // 2. Try to find if there are any tool calls or IDs that hint at the model, like in transcript parser
+  // 2. Try to find if there are any tool calls or IDs that hint at the model
   for (const req of session.requests ?? []) {
-    const rounds = req.result?.metadata?.toolCallRounds
-    for (const round of rounds ?? []) {
+    const rawRounds = (req.result?.metadata as Record<string, unknown> | undefined)?.['toolCallRounds'] ??
+      (isRecord(req.result) ? (req.result as Record<string, unknown>)['toolCallRounds'] : null)
+    const rounds: IToolCallRound[] = Array.isArray(rawRounds) ? rawRounds : []
+    for (const round of rounds) {
       for (const tc of round.toolCalls ?? []) {
         const id = tc.id ?? ''
         for (const hint of transcriptToolCallModelHints) {
@@ -380,8 +436,7 @@ function inferModelFromLegacySession(session: LegacyChatSession): string {
     }
   }
 
-  // 3. Fallback to copilot-auto
-  return 'copilot-auto'
+  return 'unknown'
 }
 
 function extractToolCallResultContentFromParts(response: LegacyChatRequest['response']): string {
@@ -503,50 +558,58 @@ function extractLegacyOutputs(req: LegacyChatRequest): LegacyOutputs {
 }
 
 function extractModelFromRequest(req: LegacyChatRequest, session: LegacyChatSession): string {
-  const result = req.result as Record<string, unknown> | undefined
-  const metadata = result?.['metadata'] as Record<string, unknown> | undefined
+  const result = isRecord(req.result) ? (req.result as Record<string, unknown>) : undefined
+  const metadata = isRecord(result?.['metadata']) ? (result?.['metadata'] as Record<string, unknown>) : undefined
 
   // 1. Check resolved model from result metadata
   const resolvedMeta = readString(metadata?.['resolvedModel']) || readString(metadata?.['model'])
-  if (resolvedMeta && resolvedMeta !== 'auto' && resolvedMeta !== 'copilot-auto') {
-    return normaliseLegacyModelId(resolvedMeta)
+  if (resolvedMeta) {
+    const stripped = stripCopilotPrefix(resolvedMeta)
+    if (stripped && stripped !== 'auto' && stripped !== 'copilot-auto') {
+      return stripped
+    }
   }
 
   // 2. Check resolved model directly on result
   const resultResolved = readString(result?.['resolvedModel']) || readString(result?.['model'])
-  if (resultResolved && resultResolved !== 'auto' && resultResolved !== 'copilot-auto') {
-    return normaliseLegacyModelId(resultResolved)
+  if (resultResolved) {
+    const stripped = stripCopilotPrefix(resultResolved)
+    if (stripped && stripped !== 'auto' && stripped !== 'copilot-auto') {
+      return stripped
+    }
   }
 
   // 3. Check response parts for autoModeResolution or model info
   for (const part of req.response ?? []) {
     if (part && typeof part === 'object') {
       const p = part as Record<string, unknown>
-      if (p.kind === 'autoModeResolution') {
+      if (p['kind'] === 'autoModeResolution') {
         const resolved = readString(p['resolvedModel']) || readString(p['model']) || readString(p['modelId'])
-        if (resolved && resolved !== 'auto') return normaliseLegacyModelId(resolved)
+        if (resolved) {
+          const stripped = stripCopilotPrefix(resolved)
+          if (stripped && stripped !== 'auto' && stripped !== 'copilot-auto') {
+            return stripped
+          }
+        }
       }
     }
   }
 
-  // 4. Check details if string contains model identifier
-  if (typeof result?.['details'] === 'string') {
-    const detailsModel = findJetBrainsModelToken(result['details'])
-    if (detailsModel) return detailsModel
+  // 4. Check request modelId
+  if (req.modelId) {
+    const stripped = stripCopilotPrefix(req.modelId)
+    if (stripped && stripped !== 'auto' && stripped !== 'copilot-auto') {
+      return stripped
+    }
   }
 
-  // 5. Check request modelId
-  if (req.modelId && req.modelId !== 'auto' && req.modelId !== 'copilot/auto') {
-    return normaliseLegacyModelId(req.modelId)
-  }
-
-  // 6. Inferred session model or fallback
+  // 5. Inferred session model or fallback
   const inferred = inferModelFromLegacySession(session)
-  if (inferred && inferred !== 'auto' && inferred !== 'copilot-auto') {
+  if (inferred && inferred !== 'auto' && inferred !== 'copilot-auto' && inferred !== 'unknown') {
     return inferred
   }
 
-  return 'claude-sonnet-4-5'
+  return 'unknown'
 }
 
 function parseLegacyChatSession(
@@ -554,147 +617,188 @@ function parseLegacyChatSession(
   sessionId: string,
   project: string,
   seenKeys: Set<string>,
+  isJsonl: boolean,
 ): ParsedProviderCall[] {
   if (!session || !Array.isArray(session.requests)) return []
 
   const results: ParsedProviderCall[] = []
 
   for (const [reqIndex, req] of session.requests.entries()) {
+    const resultObj = isRecord(req.result) ? (req.result as Record<string, unknown>) : null
+    const meta = isRecord(resultObj?.['metadata']) ? (resultObj?.['metadata'] as Record<string, unknown>) : null
+    const usage = isRecord(resultObj?.['usage']) ? (resultObj?.['usage'] as Record<string, unknown>) : null
+
+    // Exact token extraction: check metadata, result, root req, and usage independently
+    const exactPromptTokens =
+      numberOrZero(meta?.['promptTokens']) ||
+      numberOrZero(resultObj?.['promptTokens']) ||
+      numberOrZero(req.promptTokens) ||
+      numberOrZero(usage?.['promptTokens']) ||
+      numberOrZero(usage?.['prompt_tokens']) ||
+      undefined
+
+    const exactOutputTokens =
+      numberOrZero(meta?.['outputTokens']) ||
+      numberOrZero(resultObj?.['outputTokens']) ||
+      numberOrZero(req.completionTokens) ||
+      numberOrZero(req.outputTokens) ||
+      numberOrZero(usage?.['completionTokens']) ||
+      numberOrZero(usage?.['completion_tokens']) ||
+      undefined
+
+    const exactCacheRead =
+      numberOrZero(meta?.['cacheReadTokens']) ||
+      numberOrZero(meta?.['cachedTokens']) ||
+      numberOrZero(resultObj?.['cacheReadTokens']) ||
+      numberOrZero(resultObj?.['cachedTokens']) ||
+      numberOrZero(usage?.['cacheReadTokens']) ||
+      numberOrZero(usage?.['cache_read_tokens']) ||
+      numberOrZero(usage?.['cachedTokens']) ||
+      numberOrZero(usage?.['cached_tokens']) ||
+      0
+
+    const exactCacheCreation =
+      numberOrZero(meta?.['cacheCreationTokens']) ||
+      numberOrZero(meta?.['cacheWriteTokens']) ||
+      numberOrZero(resultObj?.['cacheCreationTokens']) ||
+      numberOrZero(resultObj?.['cacheWriteTokens']) ||
+      numberOrZero(usage?.['cacheCreationTokens']) ||
+      numberOrZero(usage?.['cache_creation_tokens']) ||
+      numberOrZero(usage?.['cacheWriteTokens']) ||
+      numberOrZero(usage?.['cache_write_tokens']) ||
+      0
+
+    const hasExactTokens = exactPromptTokens !== undefined || exactOutputTokens !== undefined
+
+    // Regressed .jsonl path fix: modern .jsonl sessions never char-estimate.
+    // Rows with no token fields (or 0 tokens) are skipped.
+    if (isJsonl) {
+      if (!hasExactTokens || ((exactPromptTokens ?? 0) === 0 && (exactOutputTokens ?? 0) === 0)) {
+        continue
+      }
+    }
+
     const model = extractModelFromRequest(req, session)
-    const meta = req.result?.metadata
 
-    const rounds = meta?.toolCallRounds ?? []
+    // Extract tool calls / tools
+    const rawRounds = (meta?.['toolCallRounds'] ?? resultObj?.['toolCallRounds'])
+    const rounds: IToolCallRound[] = Array.isArray(rawRounds) ? (rawRounds as IToolCallRound[]) : []
+    const toolNamesSet = new Set<string>()
 
-    const globalParts = (meta?.renderedGlobalContext ?? []).filter((p) => p.type === ChatCompletionContentPartKind.Text && typeof p.text === 'string') as ChatCompletionContentPartText[];
-    const userParts = (meta?.renderedUserMessage ?? []).filter((p) => p.type === ChatCompletionContentPartKind.Text && typeof p.text === 'string') as ChatCompletionContentPartText[];
-    const globalCacheMarkers = (meta?.renderedGlobalContext ?? []).filter((p) => p.type === ChatCompletionContentPartKind.CacheBreakpoint) as ChatCompletionContentPartCacheBreakpoint[];
-    const userCacheMarkers = (meta?.renderedUserMessage ?? []).filter((p) => p.type === ChatCompletionContentPartKind.CacheBreakpoint) as ChatCompletionContentPartCacheBreakpoint[];
+    const addTool = (raw: unknown): void => {
+      if (typeof raw === 'string' && raw.trim()) {
+        toolNamesSet.add(normalizeTool(raw.trim()))
+      }
+    }
 
-    // ── INPUT ──────────────────────────────────────────────────────────────────
-    // Primary source: renderedGlobalContext + renderedUserMessage are the exact
-    // strings VSCode assembled for the LLM prompt. This is more accurate than
-    // scanning req.message/variableData, which are the raw user inputs before
-    // the system prompt, file context, and instructions are added.
-    //
-    // When metadata is absent (older format), fall back to message text.
-    const hasRenderedMetadata = globalParts.length > 0 || userParts.length > 0
-
-    let inputTokens: number = 0
-    let cacheCreationInputTokens = 0
-    let cacheReadInputTokens = 0
+    for (const round of rounds) {
+      if (!isRecord(round)) continue
+      addTool(round.summary)
+      addTool(round.phase)
+      if (Array.isArray(round.toolCalls)) {
+        for (const tc of round.toolCalls) {
+          if (isRecord(tc)) {
+            addTool(tc.name)
+            addTool(tc.id)
+          }
+        }
+      }
+    }
+    if (Array.isArray(req.response)) {
+      for (const item of req.response) {
+        if (item && typeof item === 'object') {
+          if ((item as LegacyResponsePart).kind === 'toolInvocationSerialized') {
+            addTool((item as LegacyResponsePart).toolId)
+          }
+        }
+      }
+    }
+    const tools = [...toolNamesSet]
 
     const msgText = typeof req.message === 'string' ? req.message : (req.message?.text ?? '')
-
-    if (hasRenderedMetadata) {
-      const globalText = globalParts.map((p) => p.text as string).join('\n')
-      const userText = userParts.map((p) => p.text as string).join('\n')
-
-      if (globalCacheMarkers.length > 0 || userCacheMarkers.length > 0) {
-        // Cache semantics in VSCode Copilot Chat (ephemeral / 5-min cache):
-        //
-        // renderedGlobalContext (system prompt + workspace context) is STABLE across
-        // all turns within a session — VSCode caches it once and reads it on every
-        // subsequent turn.  Treat as cacheRead.
-        //
-        // renderedUserMessage attachments (file excerpts, editor context, tool output)
-        // are NEW each turn — VSCode writes them to the ephemeral cache per message.
-        // Treat as cacheCreation.
-        //
-        // Only count a section as cached if it actually has cache markers.
-        if (globalCacheMarkers.length > 0) {
-          cacheReadInputTokens = Math.ceil(globalText.length / CHARS_PER_TOKEN_LEGACY)
-        } else {
-          // Global context present but not marked cached — regular input.
-          inputTokens = Math.ceil(globalText.length / CHARS_PER_TOKEN_LEGACY)
-        }
-
-        const attachmentText = userText.replace(msgText, '')
-        if (userCacheMarkers.length > 0 && attachmentText.length > 0) {
-          cacheCreationInputTokens = Math.ceil(attachmentText.length / CHARS_PER_TOKEN_LEGACY)
-        } else if (userCacheMarkers.length === 0) {
-          // User message not cached — all of it is regular input.
-          inputTokens = (inputTokens ?? 0) + Math.ceil(userText.length / CHARS_PER_TOKEN_LEGACY)
-          inputTokens -= Math.ceil(msgText.length / CHARS_PER_TOKEN_LEGACY) // will re-add below
-        }
-        // Bare user message is always regular (non-cached) input.
-        inputTokens = (inputTokens ?? 0) + Math.ceil(msgText.length / CHARS_PER_TOKEN_LEGACY)
-      } else {
-        inputTokens = Math.ceil((globalText + '\n' + userText).length / CHARS_PER_TOKEN_LEGACY)
-      }
-    } else {
-      // Fallback: no rendered metadata — use the raw message text
-      inputTokens = Math.ceil(msgText.length / CHARS_PER_TOKEN_LEGACY)
-    }
-
-    // Tool results (file contents, terminal output, command results) are fed back
-    // to the model as input for subsequent reasoning rounds.
-    // We use a targeted extractor instead of the generic key traversal to avoid
-    // double-counting text that appears in req.response.toolSpecificData.
-    let toolResultText = extractToolCallResultContent(meta?.toolCallResults)
-    if (!toolResultText) {
-      toolResultText = extractToolCallResultContentFromParts(req.response)
-    }
-    const toolResultTokens = Math.ceil(toolResultText.length / CHARS_PER_TOKEN_LEGACY)
-
-    let totalInputTokens = inputTokens + toolResultTokens
-
-    // ── OUTPUT & REASONING ─────────────────────────────────────────────────────
     const { outputText, reasoningText } = extractLegacyOutputs(req)
-    let outputTokens = Math.ceil(outputText.length / CHARS_PER_TOKEN_LEGACY)
-    let reasoningTokens = Math.ceil(reasoningText.length / CHARS_PER_TOKEN_LEGACY)
-    let isEstimated = true
 
-    // Check for exact token counts
-    if (typeof req.promptTokens === 'number' && typeof req.completionTokens === 'number') {
-      totalInputTokens = req.promptTokens
-      outputTokens = req.completionTokens
-      isEstimated = false
+    let totalInputTokens: number
+    let outputTokens: number
+    let cacheReadInputTokens = exactCacheRead
+    let cacheCreationInputTokens = exactCacheCreation
+    let reasoningTokens = 0
+    let isEstimated = false
+
+    // Extract reasoning tokens
+    if (reasoningText.length > 0) {
+      reasoningTokens = Math.ceil(reasoningText.length / CHARS_PER_TOKEN_LEGACY)
     }
-
-    const resultObj = req.result as LegacyResultMetadata
-    if (resultObj) {
-      let foundExact = false
-      if (typeof resultObj.promptTokens === 'number' && typeof resultObj.outputTokens === 'number') {
-        totalInputTokens = resultObj.promptTokens
-        outputTokens = resultObj.outputTokens
-        cacheReadInputTokens = resultObj.cacheReadTokens ?? resultObj.cachedTokens ?? cacheReadInputTokens
-        cacheCreationInputTokens = resultObj.cacheCreationTokens ?? resultObj.cacheWriteTokens ?? cacheCreationInputTokens
-        foundExact = true
-      } else if (resultObj.metadata && typeof resultObj.metadata.promptTokens === 'number' && typeof resultObj.metadata.outputTokens === 'number') {
-        totalInputTokens = resultObj.metadata.promptTokens
-        outputTokens = resultObj.metadata.outputTokens
-        cacheReadInputTokens = resultObj.metadata.cacheReadTokens ?? resultObj.metadata.cachedTokens ?? cacheReadInputTokens
-        cacheCreationInputTokens = resultObj.metadata.cacheCreationTokens ?? resultObj.metadata.cacheWriteTokens ?? cacheCreationInputTokens
-        foundExact = true
-      } else if (resultObj.usage) {
-        totalInputTokens = resultObj.usage.promptTokens ?? resultObj.usage.prompt_tokens ?? totalInputTokens
-        outputTokens = resultObj.usage.completionTokens ?? resultObj.usage.completion_tokens ?? outputTokens
-        cacheReadInputTokens = resultObj.usage.cacheReadTokens ?? resultObj.usage.cache_read_tokens ?? resultObj.usage.cachedTokens ?? resultObj.usage.cached_tokens ?? cacheReadInputTokens
-        cacheCreationInputTokens = resultObj.usage.cacheCreationTokens ?? resultObj.usage.cache_creation_tokens ?? resultObj.usage.cacheWriteTokens ?? resultObj.usage.cache_write_tokens ?? cacheCreationInputTokens
-        foundExact = true
+    for (const round of rounds) {
+      if (round.thinking?.tokens && typeof round.thinking.tokens === 'number') {
+        reasoningTokens = Math.max(reasoningTokens, round.thinking.tokens)
       }
-      if (foundExact) isEstimated = false
     }
 
-    if (outputTokens === 0 && totalInputTokens === 0 && cacheCreationInputTokens === 0 && reasoningTokens === 0) continue
-
-    let tools: string[] = []
-    if (rounds.length > 0) {
-      tools = rounds
-        .flatMap((r) => r.toolCalls ?? [])
-        .map((t) => t.name ?? '')
-        .filter(Boolean)
-        .map((n) => toolNameMap[n] ?? n)
+    if (hasExactTokens) {
+      totalInputTokens = exactPromptTokens ?? 0
+      outputTokens = exactOutputTokens ?? 0
+      isEstimated = false
     } else {
-      tools = (req.response ?? [])
-        .filter((item) => item && typeof item === 'object' && item.kind === 'toolInvocationSerialized')
-        .map((item) => (item as LegacyResponsePart).toolId)
-        .map((n) => normalizeTool(n ?? ''))
+      isEstimated = true
+
+      const globalParts = ((meta?.['renderedGlobalContext'] as unknown[]) ?? []).filter(
+        (p): p is ChatCompletionContentPartText => isRecord(p) && p.type === ChatCompletionContentPartKind.Text && typeof p.text === 'string'
+      )
+      const userParts = ((meta?.['renderedUserMessage'] as unknown[]) ?? []).filter(
+        (p): p is ChatCompletionContentPartText => isRecord(p) && p.type === ChatCompletionContentPartKind.Text && typeof p.text === 'string'
+      )
+      const globalCacheMarkers = ((meta?.['renderedGlobalContext'] as unknown[]) ?? []).filter(
+        (p): p is ChatCompletionContentPartCacheBreakpoint => isRecord(p) && p.type === ChatCompletionContentPartKind.CacheBreakpoint
+      )
+      const userCacheMarkers = ((meta?.['renderedUserMessage'] as unknown[]) ?? []).filter(
+        (p): p is ChatCompletionContentPartCacheBreakpoint => isRecord(p) && p.type === ChatCompletionContentPartKind.CacheBreakpoint
+      )
+
+      let inputTokens = 0
+      const hasRenderedMetadata = globalParts.length > 0 || userParts.length > 0
+
+      if (hasRenderedMetadata) {
+        const globalText = globalParts.map((p) => p.text).join('\n')
+        const userText = userParts.map((p) => p.text).join('\n')
+
+        if (globalCacheMarkers.length > 0 || userCacheMarkers.length > 0) {
+          if (globalCacheMarkers.length > 0) {
+            cacheReadInputTokens = Math.ceil(globalText.length / CHARS_PER_TOKEN_LEGACY)
+          } else {
+            inputTokens = Math.ceil(globalText.length / CHARS_PER_TOKEN_LEGACY)
+          }
+
+          const attachmentText = userText.replace(msgText, '')
+          if (userCacheMarkers.length > 0 && attachmentText.length > 0) {
+            cacheCreationInputTokens = Math.ceil(attachmentText.length / CHARS_PER_TOKEN_LEGACY)
+          } else if (userCacheMarkers.length === 0) {
+            inputTokens += Math.ceil(userText.length / CHARS_PER_TOKEN_LEGACY)
+            inputTokens -= Math.ceil(msgText.length / CHARS_PER_TOKEN_LEGACY)
+          }
+          inputTokens += Math.ceil(msgText.length / CHARS_PER_TOKEN_LEGACY)
+        } else {
+          inputTokens = Math.ceil((globalText + '\n' + userText).length / CHARS_PER_TOKEN_LEGACY)
+        }
+      } else {
+        inputTokens = Math.ceil(msgText.length / CHARS_PER_TOKEN_LEGACY)
+      }
+
+      let toolResultText = extractToolCallResultContent(meta?.['toolCallResults'] as NonNullable<NonNullable<LegacyChatRequest['result']>['metadata']>['toolCallResults'])
+      if (!toolResultText) {
+        toolResultText = extractToolCallResultContentFromParts(req.response)
+      }
+      const toolResultTokens = Math.ceil(toolResultText.length / CHARS_PER_TOKEN_LEGACY)
+
+      totalInputTokens = inputTokens + toolResultTokens
+      outputTokens = Math.ceil(outputText.length / CHARS_PER_TOKEN_LEGACY)
+
+      if (outputTokens === 0 && totalInputTokens === 0 && cacheCreationInputTokens === 0 && reasoningTokens === 0) {
+        continue
+      }
     }
 
-    // Index-based fallback matches upstream's inline loop, so a cached
-    // pre-fork parse and a re-parse produce identical dedup keys.
-    const reqId = req.requestId || `request-${reqIndex}`
+    const reqId = readString(req.requestId) || `request-${reqIndex}`
     const dedupKey = `copilot-chatsession:${sessionId}:${reqId}`
     if (seenKeys.has(dedupKey)) continue
     seenKeys.add(dedupKey)
@@ -708,9 +812,6 @@ function parseLegacyChatSession(
       0,
     )
 
-    // The timestamp field on each request is a Unix ms epoch integer.
-    // Fall back to the session's creationDate like upstream so undated legacy
-    // requests stay visible to date-range filters instead of vanishing.
     const ts = timestampToISO(req.timestamp) || timestampToISO(session.creationDate)
 
     results.push({
@@ -742,6 +843,43 @@ function parseLegacyChatSession(
 // ---------------------------------------------------------------------------
 // Model display names (unchanged from original)
 // ---------------------------------------------------------------------------
+const modelDisplayNames: Record<string, string> = {
+  'gpt-4.1-nano': 'GPT-4.1 Nano',
+  'gpt-4.1-mini': 'GPT-4.1 Mini',
+  'gpt-4.1': 'GPT-4.1',
+  'gpt-4-1': 'GPT-4.1',
+  'gpt-4o-mini': 'GPT-4o Mini',
+  'gpt-5.4': 'GPT-5.4',
+  'gpt-5-4': 'GPT-5.4',
+  'gpt-5.3-codex': 'GPT-5.3 Codex',
+  'gpt-5-3-codex': 'GPT-5.3 Codex',
+  'gpt-5.2-codex': 'GPT-5.2 Codex',
+  'gpt-5-2-codex': 'GPT-5.2 Codex',
+  'gpt-5.1-codex-max': 'GPT-5.1 Codex Max',
+  'gpt-5-1-codex-max': 'GPT-5.1 Codex Max',
+  'gpt-5.4-mini': 'GPT-5.4 Mini',
+  'gpt-5-4-mini': 'GPT-5.4 Mini',
+  'gpt-5-mini': 'GPT-5 Mini',
+  'gpt-5': 'GPT-5',
+  'claude-sonnet-4-6': 'Sonnet 4.6',
+  'claude-sonnet-4-5': 'Sonnet 4.5',
+  'claude-sonnet-4': 'Sonnet 4',
+  'claude-opus-4-7': 'Opus 4.7',
+  'claude-opus-4-6': 'Opus 4.6',
+  'claude-3-7-sonnet': 'Sonnet 3.7',
+  'claude-3-5-sonnet': 'Sonnet 3.5',
+  'claude-haiku-4-5': 'Haiku 4.5',
+  'gemini-3-1-pro-preview': 'Gemini 3.1 Pro',
+  'gemini-3-pro-preview': 'Gemini 3 Pro',
+  'gemini-2-5-pro': 'Gemini 2.5 Pro',
+  'o4-mini': 'o4-mini',
+  'o3': 'o3',
+  'copilot-auto': 'Copilot (auto)',
+  'auto': 'Copilot (auto)',
+  'copilot-openai-auto': 'Copilot (OpenAI auto)',
+  'copilot-anthropic-auto': 'Copilot (Anthropic auto)',
+}
+
 // ---------------------------------------------------------------------------
 // Tool name normalisation (unchanged from original, plus OTel tool names)
 // ---------------------------------------------------------------------------
@@ -803,6 +941,10 @@ function normalizeTool(rawTool: string): string {
   return rawTool
 }
 
+const modelDisplayEntries = Object.entries(modelDisplayNames).sort(
+  (a, b) => b[0].length - a[0].length
+)
+
 // Tool names that represent shell/bash execution. When the AI calls one of
 // these, we extract the `arguments.command` string into bashCommands[].
 const BASH_TOOL_NAMES = new Set(['bash', 'run_in_terminal', 'runInTerminal', 'runCommand'])
@@ -820,57 +962,6 @@ type SessionStartData = {
   selectedModel?: string
 }
 
-const CHARS_PER_TOKEN = 4
-
-// --- VS Code transcript format (workspaceStorage transcripts) ---
-
-type TranscriptToolRequest = {
-  toolCallId?: string
-  name?: string
-  arguments?: string
-  type?: string
-}
-
-type TranscriptEvent =
-  | { type: 'session.start'; timestamp?: string; data: { sessionId: string; producer?: string } }
-  | { type: 'user.message'; timestamp?: string; data: { content: string; attachments?: unknown[] } }
-  | { type: 'assistant.message'; timestamp?: string; data: { messageId: string; content?: string; reasoningText?: string; toolRequests?: TranscriptToolRequest[]; outputTokens?: number } }
-  | { type: string; timestamp?: string; data: Record<string, unknown> }
-
-function inferModelFromToolCallIds(events: TranscriptEvent[]): string {
-  const modelCounts = new Map<string, number>()
-
-  for (const e of events) {
-    // Some newer events (like tool.execution_complete) explicitly include the model ID.
-    const data = e.data as { model?: string }
-    if (typeof data?.model === 'string' && data.model) {
-      modelCounts.set(data.model, (modelCounts.get(data.model) ?? 0) + 100)
-    }
-
-    // NEW: Also check for llm_request attrs
-    const attrs = (e as any).attrs
-    if (attrs && typeof attrs.model === 'string' && attrs.model) {
-      modelCounts.set(attrs.model, (modelCounts.get(attrs.model) ?? 0) + 100)
-    }
-
-    if (e.type !== 'assistant.message') continue
-    const msg = e as { data: { toolRequests?: TranscriptToolRequest[] } }
-    for (const t of msg.data.toolRequests ?? []) {
-      const toolCallId = t.toolCallId ?? ''
-      for (const hint of transcriptToolCallModelHints) {
-        if (!toolCallId.startsWith(hint.prefix)) continue
-        modelCounts.set(hint.model, (modelCounts.get(hint.model) ?? 0) + 1)
-        break
-      }
-    }
-  }
-
-  if (modelCounts.size > 0) {
-    return [...modelCounts.entries()].sort((a, b) => b[1] - a[1])[0]![0]
-  }
-
-  return 'copilot-auto'
-}
 
 // --- Parser ---
 
@@ -1368,13 +1459,6 @@ function inferTranscriptModel(lines: string[]): string {
     try {
       const event = JSON.parse(line) as CopilotEvent
 
-      if (event.type === 'llm_request' || event.type === 'llm.request') {
-        const attrs = (event as any).attrs as { model?: string } | undefined
-        if (typeof attrs?.model === 'string' && attrs.model) {
-          return normaliseLegacyModelId(attrs.model)
-        }
-      }
-
       if (event.type !== 'assistant.message') continue
       const data = event.data as AssistantMessageData & { toolRequests?: Array<{ toolCallId?: string }> }
       const reqs = coerceToolRequests(data.toolRequests)
@@ -1768,9 +1852,8 @@ function createChatSessionParser(
       const content = await readSessionFile(source.path)
       if (!content) return
 
-      let session: LegacyChatSession | null = null
       const isJson = source.path.endsWith('.json') || isChatSessionJsonFormat(source.path, content)
-      const sessionId = basename(source.path, isJson ? '.json' : '.jsonl')
+      let session: LegacyChatSession | null = null
 
       if (isJson) {
         try {
@@ -1786,8 +1869,9 @@ function createChatSessionParser(
 
       if (!session) return
 
-      const resolvedSessionId = readString(session.sessionId) || sessionId
-      const calls = parseLegacyChatSession(session, resolvedSessionId, source.project, seenKeys)
+      const fallbackSessionId = basename(source.path, isJson ? '.json' : '.jsonl')
+      const sessionId = readString(session.sessionId) || fallbackSessionId
+      const calls = parseLegacyChatSession(session, sessionId, source.project, seenKeys, !isJson)
       for (const call of calls) {
         yield call
       }
@@ -3565,6 +3649,9 @@ export function createCopilotProvider(
     },
 
     modelDisplayName(model: string): string {
+      for (const [key, display] of modelDisplayEntries) {
+        if (model === key || model.includes(key)) return display
+      }
       return getShortModelName(model)
     },
 
@@ -3678,15 +3765,11 @@ export function createCopilotProvider(
       source: SessionSource,
       seenKeys: Set<string>
     ): SessionParser {
-      // Route to the correct parser based on source type.
-      // The dedup key set (seenKeys) is shared across both parsers,
-      // so if OTel already yielded a span, the JSONL parser will skip
-      // the matching assistant.message (and vice versa).
-      if (isOtelSource(source)) {
-        return createOtelParser(source, seenKeys)
-      }
       if (isSessionStoreSource(source)) {
         return createSessionStoreParser(source, seenKeys)
+      }
+      if (isOtelSource(source)) {
+        return createOtelParser(source, seenKeys)
       }
       if (isChatSessionSource(source)) {
         return createChatSessionParser(source, seenKeys)
