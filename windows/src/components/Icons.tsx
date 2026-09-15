@@ -34,6 +34,65 @@ export function ChevronRight(p: IconProps) {
   return <Svg {...p}><path d="M6 3.5 10.5 8 6 12.5" /></Svg>
 }
 
+export function RetryIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <path d="M2.5 6.5A5 5 0 0 1 12 5.4M13.5 9.5A5 5 0 0 1 4 10.6" />
+      <path d="M12.5 2.5v3h-3M3.5 13.5v-3h3" />
+    </Svg>
+  )
+}
+
+export function RouteIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <path d="M2.5 5h8.5M2.5 11h8.5" />
+      <path d="M9 2.5 11.5 5 9 7.5M5 8.5 2.5 11 5 13.5" />
+    </Svg>
+  )
+}
+
+export function PersonCircleIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <circle cx="8" cy="8" r="6" />
+      <circle cx="8" cy="6.5" r="2" />
+      <path d="M4 13a4.2 4.2 0 0 1 8 0" />
+    </Svg>
+  )
+}
+
+export function MonitorIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <rect x="2" y="3" width="12" height="8" rx="1.5" />
+      <path d="M6 13.5h4" />
+    </Svg>
+  )
+}
+
+export function LeafIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <path d="M13.5 2.5c0 6.1-3.1 9.5-7.3 9.5A3.7 3.7 0 0 1 2.5 8.3c0-4 3.6-5.8 11-5.8z" fill="currentColor" stroke="none" />
+      <path d="M11 5 3.5 13" />
+    </Svg>
+  )
+}
+
+export function ChevronLeft(p: IconProps) {
+  return <Svg {...p}><path d="M10 3.5 5.5 8 10 12.5" /></Svg>
+}
+
+export function CalendarIcon(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <rect x="2.5" y="3.5" width="11" height="10" rx="1.5" />
+      <path d="M2.5 6.5h11M5.5 2v3M10.5 2v3" />
+    </Svg>
+  )
+}
+
 export function ChevronDown(p: IconProps) {
   return <Svg {...p}><path d="M3.5 6 8 10.5 12.5 6" /></Svg>
 }
@@ -122,6 +181,20 @@ export function WarningIcon({ filled = true, ...p }: IconProps & { filled?: bool
   )
 }
 
+/// The rest of the severity ladder the quota warning row climbs, standing in for the mac's
+/// info.circle, exclamationmark.circle and octagon (WarningIcon covers the triangle).
+export function InfoCircleIcon(p: IconProps) {
+  return <Svg {...p}><circle cx="8" cy="8" r="6" /><path d="M8 7.3v3.4M8 5.2v.2" /></Svg>
+}
+
+export function ExclamationCircleIcon(p: IconProps) {
+  return <Svg {...p}><circle cx="8" cy="8" r="6" /><path d="M8 5.1v3.5M8 10.7v.2" /></Svg>
+}
+
+export function OctagonIcon(p: IconProps) {
+  return <Svg {...p}><path d="M5.9 2h4.2L13 4.9v4.2L10.1 12H5.9L3 9.1V4.9z" /></Svg>
+}
+
 export function ArrowUpRight(p: IconProps) {
   return <Svg {...p}><path d="M4.5 11.5 11.5 4.5M6 4.5h5.5V10" /></Svg>
 }
@@ -172,24 +245,26 @@ export function EllipsisIcon(p: IconProps) {
   )
 }
 
-export function CheckIcon(p: IconProps) {
-  return <Svg {...p}><path d="M3.5 8.5 6.5 11.5 12.5 5" /></Svg>
-}
-
-export function SunMoonIcon(p: IconProps) {
+/// pencil.line, for the Pulse cost-per-edit caption.
+export function PencilLineIcon(p: IconProps) {
   return (
     <Svg {...p}>
-      <circle cx="8" cy="8" r="4" />
-      <path d="M8 4V1.5M8 14.5V12M4 8H1.5M14.5 8H12M5.2 5.2 3.4 3.4M12.6 12.6l-1.8-1.8M5.2 10.8l-1.8 1.8M12.6 3.4l-1.8 1.8" />
+      <path d="M10.5 2.8 13.2 5.5 6.4 12.3 3.2 13l.7-3.2z" />
+      <path d="M2.5 14.5h11" />
     </Svg>
   )
 }
 
-export function PowerIcon(p: IconProps) {
+export function CheckIcon(p: IconProps) {
+  return <Svg {...p}><path d="M3.5 8.5 6.5 11.5 12.5 5" /></Svg>
+}
+
+/// doc.on.doc, for the copyable command in the CLI update banner.
+export function CopyIcon(p: IconProps) {
   return (
     <Svg {...p}>
-      <path d="M8 2v6" />
-      <path d="M4.6 4.6a5 5 0 1 0 6.8 0" />
+      <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
+      <path d="M10.5 3.5a1.5 1.5 0 0 0-1.5-1.5H4a1.5 1.5 0 0 0-1.5 1.5V9a1.5 1.5 0 0 0 1.5 1.5" />
     </Svg>
   )
 }

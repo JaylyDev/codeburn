@@ -19,6 +19,7 @@ import { createRequire } from 'node:module'
 
 import { isSqliteAvailable } from '../src/sqlite.js'
 import { clearSessionCache, parseAllSessions } from '../src/parser.js'
+import { setHome } from './setup/home.js'
 
 const requireForTest = createRequire(import.meta.url)
 
@@ -98,7 +99,7 @@ describe.skipIf(!isSqliteAvailable())(
       tmpCache = await mkdtemp(join(tmpdir(), 'cb-otel-agg-cache-'))
       dbPath   = join(tmpHome, 'agent-traces.db')
 
-      process.env['HOME']              = tmpHome
+      setHome(tmpHome)
       process.env['CODEBURN_CACHE_DIR'] = tmpCache
 
       vi.stubEnv('CODEBURN_COPILOT_OTEL_DB', dbPath)

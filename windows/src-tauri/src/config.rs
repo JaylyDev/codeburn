@@ -34,46 +34,62 @@ impl CurrencyConfig {
     }
 
     pub fn set_currency(&mut self, code: &str, symbol: &str) -> Result<()> {
-        fs::create_dir_all(codeburn_config_dir())
-            .with_context(|| "failed to create ~/.config/codeburn")?;
-
-        #[cfg(unix)]
-        let _lock = unix_lock::acquire()?;
-        #[cfg(windows)]
-        let _lock = windows_lock::acquire()?;
-
-        let mut disk: serde_json::Value = match fs::read(config_path()) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({})),
-            Err(_) => serde_json::json!({}),
-        };
-
-        if code == "USD" {
-            if let Some(obj) = disk.as_object_mut() {
+        let disk = update(|obj| {
+            if code == "USD" {
                 obj.remove("currency");
+            } else {
+                obj.insert(
+                    "currency".into(),
+                    serde_json::json!({ "code": code, "symbol": symbol }),
+                );
             }
-        } else if let Some(obj) = disk.as_object_mut() {
-            obj.insert(
-                "currency".into(),
-                serde_json::json!({ "code": code, "symbol": symbol }),
-            );
-        }
-
-        let serialized = serde_json::to_vec_pretty(&disk)?;
-        let tmp = config_path().with_extension("tmp");
-        {
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp)?;
-            file.write_all(&serialized)?;
-            file.flush()?;
-        }
-        fs::rename(&tmp, config_path())?;
-
-        *self = serde_json::from_value(disk).unwrap_or_default();
+        })?;
+        *self = serde_json::from_value(serde_json::Value::Object(disk)).unwrap_or_default();
         Ok(())
     }
+}
+
+/// The whole config file, or an empty object when it is missing or unreadable. Read without
+/// the lock on purpose: every writer renames a complete temporary file into place, so a
+/// reader can never see a half-written file.
+pub fn read() -> serde_json::Map<String, serde_json::Value> {
+    fs::read(config_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// Read, mutate, rename: the one write path for every key this app shares with the CLI
+/// (currency, `claudeConfigDirs`, the daily budget). The lock keeps two instances of this
+/// app from dropping each other's edits; the rename keeps the file from ever being torn.
+pub fn update(
+    mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    fs::create_dir_all(codeburn_config_dir())
+        .with_context(|| "failed to create ~/.config/codeburn")?;
+
+    #[cfg(unix)]
+    let _lock = unix_lock::acquire()?;
+    #[cfg(windows)]
+    let _lock = windows_lock::acquire()?;
+
+    let mut disk = read();
+    mutate(&mut disk);
+
+    let serialized = serde_json::to_vec_pretty(&disk)?;
+    let tmp = config_path().with_extension("tmp");
+    {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(&serialized)?;
+        file.flush()?;
+    }
+    fs::rename(&tmp, config_path())?;
+    Ok(disk)
 }
 
 #[cfg(unix)]

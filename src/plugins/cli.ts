@@ -13,6 +13,7 @@
 import type { Command } from 'commander'
 import { stat, mkdir, readFile, writeFile, rm, readdir, copyFile, mkdtemp } from 'fs/promises'
 import { join } from 'path'
+import { existsSync } from 'fs'
 import { homedir } from 'os'
 import { spawn } from 'child_process'
 import { createHash } from 'crypto'
@@ -274,12 +275,25 @@ async function copyPluginTree(sourceDir: string, destDir: string): Promise<void>
   await walk(sourceDir, destDir)
 }
 
+/// Resolve the tar binary to spawn.
+///
+/// A bare `tar` on Windows can resolve to the GNU tar shipped with Git for
+/// Windows, which reads any argument containing a colon as `host:path` and so
+/// fails on every absolute path ("Cannot connect to C:"). Windows ships bsdtar
+/// at %SystemRoot%\System32\tar.exe, which understands drive letters, so prefer
+/// that and fall back to a PATH lookup when it is absent.
+export function tarBin(): string {
+  if (process.platform !== 'win32') return 'tar'
+  const systemTar = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
+  return existsSync(systemTar) ? systemTar : 'tar'
+}
+
 /// Validate tarball entries to prevent directory traversal attacks.
 /// Lists all entries and rejects if any: starts with /, contains .., starts with ~, or contains \.
 export async function validateTarEntries(tarFile: string): Promise<void> {
   return new Promise((resolve, reject) => {
     let output = ''
-    const child = spawn('tar', ['-tzf', tarFile])
+    const child = spawn(tarBin(), ['-tzf', tarFile])
     child.on('error', reject)
     if (child.stdout) {
       child.stdout.on('data', chunk => {
@@ -319,7 +333,7 @@ export async function validateTarEntries(tarFile: string): Promise<void> {
       // fifo) can escape the extraction dir before verifyPlugin's post-extract
       // symlink check runs, on platforms whose tar follows links mid-archive.
       // Reject by type flag, which every tar puts at column 0 of a verbose list.
-      const verbose = spawn('tar', ['-tvzf', tarFile])
+      const verbose = spawn(tarBin(), ['-tvzf', tarFile])
       let vout = ''
       verbose.on('error', reject)
       if (verbose.stdout) verbose.stdout.on('data', c => { vout += c.toString('utf8') })
@@ -439,7 +453,7 @@ async function addRemote(name: string, pluginsDir: string): Promise<void> {
 
     // Extract tar
     await new Promise<void>((resolve, reject) => {
-      const child = spawn('tar', ['-xzf', tarFile, '-C', tempDir])
+      const child = spawn(tarBin(), ['-xzf', tarFile, '-C', tempDir])
       child.on('error', reject)
       child.on('exit', (code) => {
         if (code === 0) resolve()

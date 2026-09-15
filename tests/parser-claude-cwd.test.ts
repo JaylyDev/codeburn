@@ -409,7 +409,9 @@ async function writeCoworkSession(opts: {
   await writeFile(join(workspaceDir, `${sessionId}.json`), JSON.stringify(sessionMeta))
 
   // .claude/projects/<slug>/session.jsonl — the actual token-bearing session
-  const projectSlug = outputsDir.replace(/[/\\]/g, '-').replace(/^-/, '')
+  // The drive colon is encoded too: Claude Code writes 'C--Users-...' because a
+  // colon cannot appear in a Windows directory name.
+  const projectSlug = outputsDir.replace(/[/\\:]/g, '-').replace(/^-/, '')
   const projectDir = join(workspaceDir, sessionId, '.claude', 'projects', projectSlug)
   await mkdir(projectDir, { recursive: true })
   const filePath = join(projectDir, `${claudeSessionId}.jsonl`)
@@ -590,7 +592,7 @@ describe('Claude Cowork local-agent-mode session grouping', () => {
     const workspaceDir = join(desktopSessionsDir, 'app-abc', 'ws-005')
     const sessionId = 'local_gggg'
     const outputsDir = join(workspaceDir, sessionId, 'outputs')
-    const projectSlug = outputsDir.replace(/[/\\]/g, '-').replace(/^-/, '')
+    const projectSlug = outputsDir.replace(/[/\\:]/g, '-').replace(/^-/, '')
     const projectDir = join(workspaceDir, sessionId, '.claude', 'projects', projectSlug)
     await mkdir(projectDir, { recursive: true })
 

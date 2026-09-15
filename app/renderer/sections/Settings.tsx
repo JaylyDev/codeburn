@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { Hint } from '../components/Hint'
 import { CliErrorText, cliErrorDisplay } from '../components/CliErrorPanel'
@@ -11,8 +11,9 @@ import { clearPolledMemo, usePolled } from '../hooks/usePolled'
 import { updateDownloadUrl, useUpdateStatus } from '../hooks/useUpdateStatus'
 import { version as appVersion } from '../../package.json'
 import { readDailyBudget } from '../lib/budget'
-import { formatConverted, formatUsd } from '../lib/format'
+import { formatConverted, formatUsd, shortenProjectPath } from '../lib/format'
 import { codeburn } from '../lib/ipc'
+import { projectMatches, projectPattern } from '../lib/projectMatch'
 import { shortcutLabel } from '../lib/platform'
 import { motionClass } from '../lib/motion'
 import { clearOverviewHeadlines } from '../lib/overviewSnapshot'
@@ -20,12 +21,14 @@ import { PROVIDER_NAMES, QUOTA_PROVIDERS, readDisabledProviders, writeDisabledPr
 import { REFRESH_OPTIONS, useRefreshCadence } from '../lib/refreshCadence'
 import { reportMemoKey } from '../lib/reportMemoKey'
 import { showToast } from '../lib/toast'
+import { trackEvent } from '../lib/track'
 import { ToastHost } from '../components/ToastHost'
 import { rateLimitedNote } from './Plans'
 import { SharingPane } from './SettingsSharing'
-import type { ActionResult, AliasRow, ClaudeConfigSelector, CliError, CombinedUsage, DeviceScanResult, Identity, JsonPlanSummary, MenubarPayload, Period, PlanId, PlanProvider, PriceOverrideList, PriceOverrideRow, PriceRates, ProviderName, QuotaProvider, Scope, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
+import { CapacityDockPane, MenuBarPane } from './SettingsTray'
+import type { ActionResult, AliasRow, ClaudeConfigSelector, CompanionStatus, CliError, CombinedUsage, DeviceScanResult, Identity, JsonPlanSummary, MenubarPayload, Period, PlanId, PlanProvider, PriceOverrideList, PriceOverrideRow, PriceRates, ProjectFilter, ProjectRow, ProjectsReport, ProviderName, QuotaProvider, Scope, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
 
-export type SettingsPane = 'general' | 'providers' | 'aliases' | 'pricing' | 'plans' | 'devices' | 'export' | 'privacy' | 'sharing'
+export type SettingsPane = 'general' | 'providers' | 'projects' | 'aliases' | 'pricing' | 'plans' | 'devices' | 'export' | 'privacy' | 'sharing' | 'menubar' | 'dock'
 type Pane = SettingsPane
 type Theme = 'system' | 'light' | 'dark'
 
@@ -60,6 +63,7 @@ function writeSetting(key: string, value: string): void {
 const RAIL_ITEMS: Array<{ id: Pane; label: string; icon: React.ReactNode }> = [
   { id: 'general', label: 'General', icon: <><line x1="4" y1="8" x2="20" y2="8" /><circle cx="9" cy="8" r="2.2" /><line x1="4" y1="16" x2="20" y2="16" /><circle cx="15" cy="16" r="2.2" /></> },
   { id: 'providers', label: 'Providers', icon: <><rect x="3" y="3" width="7" height="7" rx="1.5" /><rect x="14" y="3" width="7" height="7" rx="1.5" /><rect x="3" y="14" width="7" height="7" rx="1.5" /><rect x="14" y="14" width="7" height="7" rx="1.5" /></> },
+  { id: 'projects', label: 'Projects', icon: <><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4L11 8.5h8.5A1.5 1.5 0 0 1 21 10v7.5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z" /><path d="M9 14l2 2 4-4" /></> },
   { id: 'aliases', label: 'Model aliases', icon: <><path d="M20 12l-8 8-9-9V3h8z" /><circle cx="7.5" cy="7.5" r="1.4" /></> },
   { id: 'pricing', label: 'Pricing', icon: <><circle cx="12" cy="12" r="9" /><path d="M14.5 9a2.5 2.5 0 0 0-2.5-1.6c-1.5 0-2.5.8-2.5 2s1 1.6 2.5 2 2.5.9 2.5 2-1 2-2.5 2A2.5 2.5 0 0 1 9.5 15" /><line x1="12" y1="6" x2="12" y2="18" /></> },
   { id: 'plans', label: 'Plans', icon: <><rect x="2" y="5" width="20" height="14" rx="2" /><line x1="2" y1="10" x2="22" y2="10" /></> },
@@ -68,6 +72,27 @@ const RAIL_ITEMS: Array<{ id: Pane; label: string; icon: React.ReactNode }> = [
   { id: 'sharing', label: 'Automatic Sync', icon: <><path d="M12 3v12" /><path d="M7 11l5 5 5-5" /><path d="M4 21h16" /></> },
   { id: 'privacy', label: 'Privacy & data', icon: <path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z" /> },
 ]
+
+/// Appended to the rail only while the matching switch in the sidebar corner is on.
+const TRAY_RAIL_ITEMS: Record<'menubar' | 'dock', { id: Pane; label: string; icon: React.ReactNode }> = {
+  menubar: { id: 'menubar', label: 'Menu bar', icon: <><rect x="2" y="4" width="20" height="5" rx="1.5" /><circle cx="18" cy="6.5" r="1" /><path d="M5 14h6M5 18h10" /></> },
+  dock: { id: 'dock', label: 'Capacity Dock', icon: <><rect x="16" y="4" width="5" height="16" rx="2.5" /><circle cx="18.5" cy="9" r="1.4" /><circle cx="18.5" cy="15" r="1.4" /><path d="M3 12h8" /></> },
+}
+
+/// The sidebar's two switches decide which tray panes exist, so this reads the same status
+/// the corner does. Null until the main process answers, and on any platform without a
+/// bundled tray app it stays unsupported and neither pane appears.
+function useCompanionStatus(): CompanionStatus | null {
+  const [status, setStatus] = useState<CompanionStatus | null>(null)
+  useEffect(() => {
+    let live = true
+    void codeburn?.companionStatus?.()
+      .then(next => { if (live) setStatus(next) })
+      .catch(() => {})
+    return () => { live = false }
+  }, [])
+  return status
+}
 
 function periodLabel(period: Period): string {
   if (period === 'today') return 'today'
@@ -103,8 +128,22 @@ function ConfirmButton({ label, prompt, onConfirm }: { label: string; prompt: st
   )
 }
 
-export function Settings({ period, refreshToken = 0, onNavigate, initialPane, claudeConfigs, claudeConfigSource = null, onConfigMutated, scope = 'local', onScopeChange }: { period: Period; refreshToken?: number; onNavigate?: (section: Section) => void; initialPane?: SettingsPane; claudeConfigs?: ClaudeConfigSelector; claudeConfigSource?: string | null; onConfigMutated?: () => void; scope?: Scope; onScopeChange?: (scope: string) => void }) {
+export function Settings({ period, refreshToken = 0, onNavigate, initialPane, claudeConfigs, claudeConfigSource = null, onConfigMutated, scope = 'local', onScopeChange, projectFiltered = false }: { period: Period; refreshToken?: number; onNavigate?: (section: Section) => void; initialPane?: SettingsPane; claudeConfigs?: ClaudeConfigSelector; claudeConfigSource?: string | null; onConfigMutated?: () => void; scope?: Scope; onScopeChange?: (scope: string) => void; projectFiltered?: boolean }) {
   const [pane, setPane] = useState<Pane>(initialPane ?? 'general')
+  // The tray app's own two panes, Windows only, each shown only while its switch in the
+  // sidebar corner is on: there is nothing to configure about a tray app that is not running,
+  // and the rail is one of its windows.
+  const companion = useCompanionStatus()
+  const railItems = [
+    ...RAIL_ITEMS,
+    ...(companion?.supported && companion.menuBar ? [TRAY_RAIL_ITEMS.menubar] : []),
+    ...(companion?.supported && companion.sidebar ? [TRAY_RAIL_ITEMS.dock] : []),
+  ]
+  // A pane whose switch has just been turned off cannot stay on screen.
+  const paneExists = railItems.some(item => item.id === pane)
+  useEffect(() => {
+    if (!paneExists) setPane('general')
+  }, [paneExists])
 
   return (
     <>
@@ -112,15 +151,16 @@ export function Settings({ period, refreshToken = 0, onNavigate, initialPane, cl
       <ToastHost />
       <div className={motionClass('body set-body', 'section-fade')}>
         <nav className="set-rail" aria-label="Settings sections">
-          {RAIL_ITEMS.map(item => (
+          {railItems.map(item => (
             <button key={item.id} className={pane === item.id ? 'set-rail-item on' : 'set-rail-item'} aria-current={pane === item.id ? 'page' : undefined} onClick={() => setPane(item.id)}>
               <svg viewBox="0 0 24 24" aria-hidden="true">{item.icon}</svg>{item.label}
             </button>
           ))}
         </nav>
         <main className="set-pane">
-          {pane === 'general' && <GeneralPane period={period} refreshToken={refreshToken} claudeConfigs={claudeConfigs} claudeConfigSource={claudeConfigSource} onConfigMutated={onConfigMutated} scope={scope} onScopeChange={onScopeChange} />}
+          {pane === 'general' && <GeneralPane period={period} refreshToken={refreshToken} claudeConfigs={claudeConfigs} claudeConfigSource={claudeConfigSource} onConfigMutated={onConfigMutated} scope={scope} onScopeChange={onScopeChange} projectFiltered={projectFiltered} />}
           {pane === 'providers' && <ProvidersPane period={period} refreshToken={refreshToken} />}
+          {pane === 'projects' && <ProjectsPane refreshToken={refreshToken} onConfigMutated={onConfigMutated} />}
           {pane === 'aliases' && <AliasesPane refreshToken={refreshToken} onConfigMutated={onConfigMutated} />}
           {pane === 'pricing' && <PricingPane refreshToken={refreshToken} onConfigMutated={onConfigMutated} />}
           {pane === 'plans' && <PlansPane period={period} refreshToken={refreshToken} onNavigate={onNavigate} onConfigMutated={onConfigMutated} />}
@@ -128,6 +168,8 @@ export function Settings({ period, refreshToken = 0, onNavigate, initialPane, cl
           {pane === 'export' && <ExportPane period={period} refreshToken={refreshToken} />}
           {pane === 'sharing' && <SharingPane />}
           {pane === 'privacy' && <PrivacyPane />}
+          {pane === 'menubar' && <MenuBarPane />}
+          {pane === 'dock' && <CapacityDockPane refreshToken={refreshToken} />}
         </main>
       </div>
       <Hint items={[{ k: shortcutLabel('1-8'), label: 'Navigate' }, { k: shortcutLabel('R'), label: 'Refresh' }]} right="pairing uses mutual TLS · approve-style, no PIN" />
@@ -135,7 +177,7 @@ export function Settings({ period, refreshToken = 0, onNavigate, initialPane, cl
   )
 }
 
-function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, onConfigMutated, scope = 'local', onScopeChange }: { period: Period; refreshToken: number; claudeConfigs?: ClaudeConfigSelector; claudeConfigSource: string | null; onConfigMutated?: () => void; scope?: Scope; onScopeChange?: (scope: string) => void }) {
+function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, onConfigMutated, scope = 'local', onScopeChange, projectFiltered = false }: { period: Period; refreshToken: number; claudeConfigs?: ClaudeConfigSelector; claudeConfigSource: string | null; onConfigMutated?: () => void; scope?: Scope; onScopeChange?: (scope: string) => void; projectFiltered?: boolean }) {
   const [currencyNonce, setCurrencyNonce] = useState(0)
   const plans = usePolled<StatusJson>(() => codeburn.getPlans(period), [period, refreshToken, currencyNonce], {
     memoKey: reportMemoKey('plans', period),
@@ -176,6 +218,7 @@ function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, 
   const chooseTheme = (next: Theme) => {
     setTheme(next)
     writeSetting('codeburn.theme', next)
+    trackEvent('settings_change', { setting: 'theme', value: next })
   }
   const finishCurrency = (result: ActionResult) => {
     showToast(result.ok ? 'Updated' : result.stderr || 'Unable to update currency', result.ok ? 'ok' : 'error')
@@ -207,11 +250,11 @@ function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, 
         <div className="about-sec">
           <div className="about-sec-h">Display</div>
           <div className="about-row"><label className="tx" htmlFor="settings-currency">Currency</label><span className="r">
-            {plans.data ? <Dropdown id="settings-currency" ariaLabel="Currency" value={plans.data.currency} options={currencies.map(code => ({ value: code, label: code }))} onChange={value => void codeburn.setCurrency(value).then(finishCurrency)} width={92} /> : plans.error ? <SettingsErrorText error={plans.error} /> : <span className="set-cap">Loading…</span>}
-            <button className="set-text-button" onClick={() => void codeburn.resetCurrency().then(finishCurrency)}>Reset to USD</button>
+            {plans.data ? <Dropdown id="settings-currency" ariaLabel="Currency" value={plans.data.currency} options={currencies.map(code => ({ value: code, label: code }))} onChange={value => { trackEvent('settings_change', { setting: 'currency', value }); void codeburn.setCurrency(value).then(finishCurrency) }} width={92} /> : plans.error ? <SettingsErrorText error={plans.error} /> : <span className="set-cap">Loading…</span>}
+            <button className="set-text-button" onClick={() => { trackEvent('settings_change', { setting: 'currency', value: 'USD' }); void codeburn.resetCurrency().then(finishCurrency) }}>Reset to USD</button>
           </span></div>
-          <div className="about-row"><label className="tx" htmlFor="settings-period">Default period<small>Applied on next launch.</small></label><span className="r"><Dropdown id="settings-period" ariaLabel="Default period" value={defaultPeriod} options={[{ value: 'today', label: 'Today' }, { value: 'week', label: '7d' }, { value: '30days', label: '30d' }, { value: 'month', label: 'Month' }, { value: 'all', label: 'All' }]} onChange={value => { setDefaultPeriod(value); writeSetting('codeburn.defaultPeriod', value) }} width={92} /></span></div>
-          <div className="about-row"><label className="tx" htmlFor="settings-scope">Scope<small>Combined aggregates usage across every paired device, like the menubar. Local shows this device only.</small></label><span className="r"><Dropdown id="settings-scope" ariaLabel="Scope" value={scope} options={[{ value: 'local', label: 'Local' }, { value: 'combined', label: 'Combined' }]} onChange={value => onScopeChange?.(value)} width={110} /></span></div>
+          <div className="about-row"><label className="tx" htmlFor="settings-period">Default period<small>Applied on next launch.</small></label><span className="r"><Dropdown id="settings-period" ariaLabel="Default period" value={defaultPeriod} options={[{ value: 'today', label: 'Today' }, { value: 'week', label: '7d' }, { value: '30days', label: '30d' }, { value: 'month', label: 'Month' }, { value: 'all', label: 'All' }]} onChange={value => { setDefaultPeriod(value); writeSetting('codeburn.defaultPeriod', value); trackEvent('settings_change', { setting: 'defaultPeriod', value }) }} width={92} /></span></div>
+          <div className="about-row"><label className="tx" htmlFor="settings-scope">Scope<small>{projectFiltered ? 'Local only while the Projects pane hides something: paired devices report their usage unfiltered, so a combined total would carry the hidden projects.' : 'Combined aggregates usage across every paired device, like the menubar. Local shows this device only.'}</small></label><span className="r"><Dropdown id="settings-scope" ariaLabel="Scope" value={scope} options={projectFiltered ? [{ value: 'local', label: 'Local' }] : [{ value: 'local', label: 'Local' }, { value: 'combined', label: 'Combined' }]} onChange={value => onScopeChange?.(value)} width={110} /></span></div>
           <div className="about-row"><label className="tx" htmlFor="settings-refresh">Refresh every<small>Runs automatically at this interval. Press {shortcutLabel('R')} to refresh sooner.</small></label><span className="r"><Dropdown id="settings-refresh" ariaLabel="Refresh every" value={cadence.value} options={REFRESH_OPTIONS.map(option => ({ value: option.value, label: option.label }))} onChange={cadence.setValue} width={124} /></span></div>
           <div className="about-row"><label className="tx" htmlFor="settings-budget">Daily budget<small>Warns at 80%, alerts at 100%.</small></label><span className="r"><Dropdown id="settings-budget" ariaLabel="Daily budget" value={budgetKind} options={[{ value: 'off', label: 'Off' }, { value: 'usd', label: 'USD amount' }, { value: 'tokens', label: 'Tokens' }]} onChange={value => { const kind = value as 'off' | 'usd' | 'tokens'; setBudgetKind(kind); persistBudget(kind, budgetInput) }} width={120} />{budgetKind !== 'off' && <input className="set-input" type="text" inputMode="decimal" aria-label="Daily budget amount" placeholder={budgetKind === 'usd' ? 'USD' : 'tokens'} value={budgetInput} onChange={event => { setBudgetInput(event.target.value); persistBudget(budgetKind, event.target.value) }} style={{ width: 90 }} />}</span></div>
           {budgetError && <p className="set-action-msg error">{budgetError}</p>}
@@ -232,11 +275,120 @@ function ProvidersPane({ period, refreshToken }: { period: Period; refreshToken:
   // the internal id. Fall back to the providers map keys (lowercased display
   // names) for older CLIs that omit providerDetails.
   const providers = details
-    ? details.filter(entry => entry.hasUsage ?? entry.cost > 0).map(entry => ({ id: entry.id, label: entry.label, cost: entry.cost }))
+    ? details.filter(entry => entry.hasUsage ?? true).map(entry => ({ id: entry.id, label: entry.label, cost: entry.cost }))
     : Object.entries(overview.data?.current.providers ?? {}).map(([id, cost]) => ({ id, label: id.charAt(0).toUpperCase() + id.slice(1), cost }))
   return <section className="set-p on">
     <div><h3 className="set-h">Providers</h3><p className="set-sub">codeburn auto-detects coding tools from local session files. No setup needed.</p></div>
     {overview.error ? <SettingsErrorText error={overview.error} /> : !overview.data ? <p className="set-cap">Loading detected providers…</p> : providers.length === 0 ? <p className="set-cap">No providers detected.</p> : providers.map(entry => <div className="card" key={entry.id}><div className="set-prov-head"><ProviderLogo provider={entry.id} /><span className="set-prov-name">{entry.label}</span><span className="set-status"><span className="set-dot ok" />Detected · {formatUsd(entry.cost)}</span></div></div>)}
+  </section>
+}
+
+const NO_PROJECT_FILTER: ProjectFilter = { project: [], exclude: [] }
+
+function projectVisible(project: ProjectRow, filter: ProjectFilter): boolean {
+  if (filter.exclude.some(pattern => projectMatches(project, pattern))) return false
+  return filter.project.length === 0 || filter.project.some(pattern => projectMatches(project, pattern))
+}
+
+function ProjectsPane({ refreshToken, onConfigMutated }: { refreshToken: number; onConfigMutated?: () => void }) {
+  const [actionNonce, setActionNonce] = useState(0)
+  const [pattern, setPattern] = useState('')
+  const [search, setSearch] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  // Lifetime, and not the period on screen: the filter applies to every screen
+  // and every horizon, so a list bounded to the visible period would call a live
+  // exclude an orphan and leave "Nothing is hidden." under hidden projects.
+  //
+  // Not keyed on refreshToken, and never on an interval: `report` is the
+  // heaviest fetch in the app, a toggle cannot change an unfiltered list, and
+  // the only thing that can is a project appearing, which the next open picks
+  // up. The memo key goes through reportMemoKey like every other pane's.
+  const report = usePolled<ProjectsReport>(() => codeburn.getUnfilteredProjects(), [], {
+    memoKey: reportMemoKey('projects', 'lifetime'),
+    intervalMs: null,
+  })
+  const saved = usePolled<ProjectFilter>(() => codeburn.getProjectFilter(), [refreshToken, actionNonce])
+  const filter = saved.data ?? NO_PROJECT_FILTER
+  // Costliest first: a lifetime list runs to thousands of rows here, and the
+  // ones worth hiding are the ones with spend on them.
+  const projects = useMemo(
+    () => [...(report.data?.projects ?? [])].sort((a, b) => (b.cost ?? 0) - (a.cost ?? 0)),
+    [report.data],
+  )
+  const needle = search.trim().toLowerCase()
+  const shown = needle
+    ? projects.filter(project => project.name.toLowerCase().includes(needle) || project.path.toLowerCase().includes(needle))
+    : projects
+
+  // One write at a time, or a second click drops the first.
+  const apply = (next: ProjectFilter, clearInput = false): void => {
+    if (busy) return
+    setBusy(true)
+    void codeburn.setProjectFilter(next).then(() => {
+      setError('')
+      if (clearInput) setPattern('')
+      setActionNonce(value => value + 1)
+      clearPolledMemo()
+      onConfigMutated?.()
+    }).catch(() => setError('Could not save the project filter'))
+      .finally(() => setBusy(false))
+  }
+
+  const toggle = (project: ProjectRow, visible: boolean): void => {
+    if (visible) {
+      // Widen the include list too, or it would keep hiding what was just shown.
+      const exclude = filter.exclude.filter(entry => !projectMatches(project, entry))
+      const include = filter.project.length > 0 && !filter.project.some(entry => projectMatches(project, entry))
+        ? [...filter.project, projectPattern(project)]
+        : filter.project
+      apply({ project: include, exclude })
+      return
+    }
+    // Exclude wins over include in the CLI, so hiding is always one append.
+    apply({ ...filter, exclude: [...filter.exclude, projectPattern(project)] })
+  }
+
+  const orphans = report.data ? filter.exclude.filter(entry => !projects.some(project => projectMatches(project, entry))) : []
+  const hiddenCount = projects.filter(project => !projectVisible(project, filter)).length
+
+  return <section className="set-p on">
+    <div><h3 className="set-h">Projects</h3><p className="set-sub">Choose which projects the app shows. Everything else keeps being tracked, and is only hidden from these screens.</p></div>
+    {filter.project.length > 0 && <div className="card"><div className="about-row">
+      <span className="tx">Showing only projects matching <span className="set-mono">{filter.project.join(', ')}</span></span>
+      <button className="btnp r" disabled={busy} onClick={() => apply({ ...filter, project: [] })}>Show all</button>
+    </div></div>}
+    <div className="card"><div className="about-sec set-last-sec">
+      {projects.length > 0 && <div className="set-filter-form set-search-form">
+        <input aria-label="Search projects" className="set-input set-mono" placeholder="search projects…" value={search} onChange={event => setSearch(event.target.value)} />
+        {needle && <span className="set-cap">{shown.length.toLocaleString()} of {projects.length.toLocaleString()}</span>}
+      </div>}
+      {report.error ? <SettingsErrorText error={report.error} />
+        : saved.error ? <SettingsErrorText error={saved.error} />
+        : !report.data || !saved.data ? <p className="set-cap">Loading projects…</p>
+        : projects.length === 0 ? <p className="set-cap">No projects detected yet.</p>
+        : shown.length === 0 ? <p className="set-cap">No project matches that search.</p>
+        : shown.map(project => {
+          const visible = projectVisible(project, filter)
+          const pattern_ = projectPattern(project)
+          return <div className="about-row" key={pattern_}>
+            <span className="tx set-mono">{shortenProjectPath(project.path || project.name, 2)}<small>{pattern_}</small></span>
+            <span className="r set-status"><span className="set-cap">{formatConverted(project.cost)} · {project.sessions} sessions</span></span>
+            <button type="button" role="switch" aria-checked={visible} aria-label={`Show ${pattern_}`} className={visible ? 'switch on' : 'switch'} disabled={busy} onClick={() => toggle(project, !visible)}><span className="switch-knob" /></button>
+          </div>
+        })}
+      {orphans.map(entry => <div className="about-row" key={`orphan-${entry}`}>
+        <span className="tx set-mono">{entry}</span>
+        <span className="r set-status">matches nothing detected</span>
+        <button className="btnp" disabled={busy} onClick={() => apply({ ...filter, exclude: filter.exclude.filter(value => value !== entry) })}>Remove</button>
+      </div>)}
+      <div className="set-filter-form">
+        <input aria-label="Hide projects matching" className="set-input set-mono" placeholder="hide projects matching…" value={pattern} onChange={event => setPattern(event.target.value)} />
+        <button className="btnp btnp-primary" disabled={busy || !pattern.trim() || filter.exclude.includes(pattern.trim())} onClick={() => apply({ ...filter, exclude: [...filter.exclude, pattern.trim()] }, true)}>Hide</button>
+      </div>
+      {error && <p className="set-action-msg error">{error}</p>}
+    </div></div>
+    <p className="set-cap">{hiddenCount === 0 ? 'Nothing is hidden. ' : `${hiddenCount} project${hiddenCount === 1 ? '' : 's'} hidden. `}A full path hides just that project and anything inside it. A plain word hides everything it appears in, so “my-company” also covers its worktrees.</p>
   </section>
 }
 
@@ -391,6 +543,7 @@ function PlansPane({ period, refreshToken, onNavigate, onConfigMutated }: { peri
   }
   const add = () => {
     const preset = MANUAL_PLAN_PRESETS.find(item => item.id === presetId)!
+    trackEvent('plan_set', { provider: preset.provider, plan: preset.id })
     void codeburn.setPlan(preset.id, preset.provider).then(finish)
   }
 
@@ -441,6 +594,9 @@ function ExportPane({ period, refreshToken }: { period: Period; refreshToken: nu
     if (!destination) return
     setExporting(true)
     try {
+      // Format and provider only. The destination is a real path on this
+      // machine and never leaves it.
+      trackEvent('export', { format, provider })
       const result = await codeburn.exportData(format, provider, destination)
       showToast(result.ok ? `Exported to ${destination}` : (result.stderr || 'Export failed'), result.ok ? 'ok' : 'error')
     } finally {
@@ -496,9 +652,18 @@ function TelemetryClaim() {
   if (!status) return null
   const toggle = () => {
     if (typeof codeburn.setTelemetryEnabled !== 'function') return
-    codeburn.setTelemetryEnabled(!status.enabled).then(value => setStatus(value)).catch(() => {})
+    // Only the opt-IN is reportable: turning telemetry off mints a fresh install
+    // id and drops the queue, so an opt-out event would never be sent anyway.
+    // And it is tracked after the switch has taken, never before: telemetry that is
+    // still off drops the event on the floor, so an opt-in recorded ahead of the
+    // write was one that could never be sent.
+    const optingIn = !status.enabled
+    codeburn.setTelemetryEnabled(optingIn).then(value => {
+      setStatus(value)
+      if (optingIn && value?.enabled) trackEvent('settings_change', { setting: 'telemetry', value: true })
+    }).catch(() => {})
   }
-  return <div className="set-claim"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19v-5M9 19V9M14 19v-8M19 19V5" /></svg><div style={{ flex: 1 }}><div className="set-claim-t">Anonymous telemetry</div><div className="set-claim-d">Optional usage statistics: model mix, task success, performance and errors. Never prompts, code or anything identifying.</div></div>
+  return <div className="set-claim"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19v-5M9 19V9M14 19v-8M19 19V5" /></svg><div style={{ flex: 1 }}><div className="set-claim-t">Anonymous telemetry</div><div className="set-claim-d">Optional usage statistics: model mix, task success, performance and errors. The daily report includes the names of the models, tools, skills and MCP servers you use, alongside bucketed counts of how often each one came up. Never your prompts, your code, or your project and file names.</div></div>
     <button type="button" role="switch" aria-checked={status.enabled} aria-label="Anonymous telemetry" className={status.enabled ? 'switch on' : 'switch'} onClick={toggle}><span className="switch-knob" /></button>
   </div>
 }

@@ -133,7 +133,10 @@ describe('resolveMenubarReleaseAssets', () => {
     const lookupPath = buildPersistentCodeburnLookupPath('/Users/me/.nvm/versions/node/v22.13.0/bin:/usr/bin')
 
     expect(lookupPath.split(':')).toContain('/Users/me/.nvm/versions/node/v22.13.0/bin')
-    expect(lookupPath.split(':')).toContain('/opt/homebrew/bin')
+    // The fallback prefixes appended here are POSIX-only; Windows has no
+    // system-wide bin dir to add, so there the caller PATH comes back untouched.
+    if (process.platform === 'win32') expect(lookupPath).toBe('/Users/me/.nvm/versions/node/v22.13.0/bin:/usr/bin')
+    else expect(lookupPath.split(':')).toContain('/opt/homebrew/bin')
   })
 
   it('selects a persistent codeburn binary when npx is first in which output', () => {

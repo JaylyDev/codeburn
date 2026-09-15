@@ -9,7 +9,6 @@ export type MenuItem = {
   label: string
   checked?: boolean
   disabled?: boolean
-  danger?: boolean
   separatorBefore?: boolean
 }
 
@@ -22,7 +21,7 @@ type Props = {
   className?: string
   /// Optional read-only footer line under the items (version, last update).
   footnote?: string
-  /// Lay the items out in a grid (used for the 17-currency picker) instead of one column.
+  /// Lay the items out in a grid (used for the currency picker) instead of one column.
   columns?: number
 }
 
@@ -73,7 +72,7 @@ export function DropMenu({ label, title, items, onSelect, align = 'left', classN
               <button
                 type="button"
                 role="menuitem"
-                className={`dropmenu-item ${item.danger ? 'dropmenu-danger' : ''}`}
+                className="dropmenu-item"
                 disabled={item.disabled}
                 onClick={() => {
                   setOpen(false)

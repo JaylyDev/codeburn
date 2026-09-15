@@ -7,7 +7,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
-import { validateTarEntries } from '../src/plugins/cli.js'
+import { tarBin, validateTarEntries } from '../src/plugins/cli.js'
 
 const run = promisify(execFile)
 
@@ -20,7 +20,7 @@ describe('tarball entry-type validation', () => {
       await writeFile(join(build, 'ok.txt'), 'fine')
       await symlink('/etc/hosts', join(build, 'evil-link'))
       const tarFile = join(dir, 'evil.tgz')
-      await run('tar', ['-czf', tarFile, '-C', build, 'ok.txt', 'evil-link'])
+      await run(tarBin(), ['-czf', tarFile, '-C', build, 'ok.txt', 'evil-link'])
       await expect(validateTarEntries(tarFile)).rejects.toThrow(/non-regular entry/)
     } finally {
       await rm(dir, { recursive: true, force: true })
@@ -35,7 +35,7 @@ describe('tarball entry-type validation', () => {
       await writeFile(join(build, 'a.txt'), 'a')
       await writeFile(join(build, 'sub', 'b.txt'), 'b')
       const tarFile = join(dir, 'good.tgz')
-      await run('tar', ['-czf', tarFile, '-C', build, '.'])
+      await run(tarBin(), ['-czf', tarFile, '-C', build, '.'])
       await expect(validateTarEntries(tarFile)).resolves.toBeUndefined()
     } finally {
       await rm(dir, { recursive: true, force: true })

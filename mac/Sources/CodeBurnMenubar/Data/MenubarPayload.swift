@@ -14,6 +14,10 @@ struct MenubarPayload: Codable, Sendable {
     let history: HistoryBlock
     let combined: CombinedUsage?
     let claudeConfigs: ClaudeConfigSelector?
+    /// Sessions whose transcript was appended inside the CLI's liveness window.
+    /// Absent on payloads from a CLI that predates the block, so absence means
+    /// "unknown", not "nothing running": the popover hides the section either way.
+    let liveSessions: LiveSessionsBlock?
 
     init(generated: String,
          current: CurrentBlock,
@@ -21,7 +25,9 @@ struct MenubarPayload: Codable, Sendable {
          history: HistoryBlock,
          combined: CombinedUsage?,
          claudeConfigs: ClaudeConfigSelector? = nil,
-         stale: Bool? = nil) {
+         stale: Bool? = nil,
+         liveSessions: LiveSessionsBlock? = nil) {
+        self.liveSessions = liveSessions
         self.generated = generated
         self.stale = stale
         self.current = current
@@ -32,7 +38,7 @@ struct MenubarPayload: Codable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case generated, stale, current, optimize, history, combined, claudeConfigs
+        case generated, stale, current, optimize, history, combined, claudeConfigs, liveSessions
     }
 
     init(from decoder: Decoder) throws {
@@ -44,6 +50,72 @@ struct MenubarPayload: Codable, Sendable {
         history = try c.decode(HistoryBlock.self, forKey: .history)
         combined = try c.decodeIfPresent(CombinedUsage.self, forKey: .combined)
         claudeConfigs = try c.decodeIfPresent(ClaudeConfigSelector.self, forKey: .claudeConfigs)
+        liveSessions = try c.decodeIfPresent(LiveSessionsBlock.self, forKey: .liveSessions)
+    }
+}
+
+struct LiveSessionsBlock: Codable, Sendable {
+    let windowSeconds: Int
+    let sessions: [LiveSession]
+}
+
+struct LiveSession: Codable, Sendable, Identifiable {
+    let id: String
+    /// Provider catalog id, matching the dock ring the session runs under.
+    let provider: String
+    let project: String
+    let branch: String?
+    let model: String?
+    let contextTokens: Int?
+    let contextWindow: Int?
+    let startedAt: String
+    let lastActivityAt: String
+    /// Seconds since this session last wrote, as of the payload's build. Absent
+    /// on payloads from a CLI that predates it, which reads as "not idle".
+    var idleSeconds: Int? = nil
+
+    /// A live session that is waiting on the user rather than generating. The
+    /// panel dims these so the two states are told apart at a glance.
+    var isIdle: Bool { (idleSeconds ?? 0) > Self.idleThresholdSeconds }
+
+    static let idleThresholdSeconds = 120
+
+    /// Row title: the folder in flight, plus the branch when the transcript
+    /// named one.
+    var title: String {
+        guard let branch, !branch.isEmpty else { return project }
+        return "\(project) · \(branch)"
+    }
+
+    /// Fraction of the context window in use, nil when the CLI could not read
+    /// a usage record so the row renders without a ring.
+    var contextFraction: Double? {
+        guard let contextTokens, let contextWindow, contextWindow > 0 else { return nil }
+        return min(max(Double(contextTokens) / Double(contextWindow), 0), 1)
+    }
+
+    var contextRemaining: Int? {
+        guard let contextTokens, let contextWindow else { return nil }
+        return max(0, contextWindow - contextTokens)
+    }
+
+    /// How long this session has been open, in the same shape the quota rows use
+    /// for resets. Empty when the timestamp is unparseable.
+    func elapsedLabel(now: Date = Date()) -> String {
+        guard let started = Self.parseISO8601(startedAt) else { return "" }
+        let minutes = Int(max(0, now.timeIntervalSince(started)) / 60)
+        let hours = minutes / 60
+        if hours > 0 { return "\(hours)h \(minutes % 60)m" }
+        return "\(minutes)m"
+    }
+
+    /// The CLI stamps milliseconds; the plain formatter rejects those, so try the
+    /// fractional variant first.
+    static func parseISO8601(_ value: String) -> Date? {
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFraction.date(from: value) { return date }
+        return ISO8601DateFormatter().date(from: value)
     }
 }
 
@@ -209,6 +281,9 @@ struct CurrentBlock: Codable, Sendable {
     let cost: Double
     let calls: Int
     let sessions: Int
+    /// How `sessions` was derived. Nil on older payloads. `identity` is exact;
+    /// `partial` is a lower bound.
+    var sessionCountBasis: String? = nil
     let oneShotRate: Double?
     let inputTokens: Int
     let outputTokens: Int
@@ -256,7 +331,7 @@ struct PullRequestRow: Codable, Sendable {
 
 extension CurrentBlock {
     enum CodingKeys: String, CodingKey {
-        case label, cost, calls, sessions, oneShotRate, inputTokens, outputTokens,
+        case label, cost, calls, sessions, sessionCountBasis, oneShotRate, inputTokens, outputTokens,
              cacheHitPercent, codexCredits, topActivities, topModels, localModelSavings, providers, providerDetails, topProjects,
              modelEfficiency, topSessions, retryTax, routingWaste,
              tools, skills, subagents, mcpServers,
@@ -268,6 +343,7 @@ extension CurrentBlock {
         cost = try c.decode(Double.self, forKey: .cost)
         calls = try c.decode(Int.self, forKey: .calls)
         sessions = try c.decode(Int.self, forKey: .sessions)
+        sessionCountBasis = try c.decodeIfPresent(String.self, forKey: .sessionCountBasis)
         oneShotRate = try c.decodeIfPresent(Double.self, forKey: .oneShotRate)
         inputTokens = try c.decode(Int.self, forKey: .inputTokens)
         outputTokens = try c.decode(Int.self, forKey: .outputTokens)
@@ -299,17 +375,46 @@ struct ProviderDetail: Codable, Sendable {
     let cost: Double
     let calls: Int
     let hasUsage: Bool
+    /// Provider-scoped tokens and sessions for the period. Nil on every CLI up
+    /// to 0.9.23, which never emitted them: absent means "no breakdown", which
+    /// the glance renders as a missing column rather than as zero or as the
+    /// machine-wide figure.
+    let inputTokens: Int?
+    let outputTokens: Int?
+    let sessions: Int?
+    var sessionCountBasis: String? = nil
+    /// Input tokens re-served from the provider's prompt cache for the period,
+    /// accounted separately from `inputTokens` and priced at the cache-read
+    /// rate inside `cost`. Nil on CLIs that predate per-provider cache
+    /// accounting: absent means unknown, never a fabricated zero.
+    let cacheReadTokens: Int?
 
-    init(id: String, label: String, cost: Double, calls: Int, hasUsage: Bool) {
+    init(
+        id: String,
+        label: String,
+        cost: Double,
+        calls: Int,
+        hasUsage: Bool,
+        inputTokens: Int? = nil,
+        outputTokens: Int? = nil,
+        sessions: Int? = nil,
+        sessionCountBasis: String? = nil,
+        cacheReadTokens: Int? = nil
+    ) {
         self.id = id
         self.label = label
         self.cost = cost
         self.calls = calls
         self.hasUsage = hasUsage
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.sessions = sessions
+        self.sessionCountBasis = sessionCountBasis
+        self.cacheReadTokens = cacheReadTokens
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, label, cost, calls, hasUsage
+        case id, label, cost, calls, hasUsage, inputTokens, outputTokens, sessions, sessionCountBasis, cacheReadTokens
     }
 
     init(from decoder: Decoder) throws {
@@ -317,18 +422,19 @@ struct ProviderDetail: Codable, Sendable {
         id = try c.decode(String.self, forKey: .id)
         label = try c.decode(String.self, forKey: .label)
         cost = try c.decode(Double.self, forKey: .cost)
-        // Older CLIs emitted providerDetails without calls/hasUsage. When calls
-        // exists, derive activity from calls/cost; with neither signal, keep the
-        // detected provider visible rather than hiding valid $0 subscriptions.
-        let decodedCalls = try c.decodeIfPresent(Int.self, forKey: .calls)
-        calls = decodedCalls ?? 0
-        if let decodedUsage = try c.decodeIfPresent(Bool.self, forKey: .hasUsage) {
-            hasUsage = decodedUsage
-        } else if decodedCalls != nil {
-            hasUsage = cost > 0 || calls > 0
-        } else {
-            hasUsage = true
-        }
+        calls = try c.decodeIfPresent(Int.self, forKey: .calls) ?? 0
+        // EVERY released CLI omits hasUsage, so the absent case is the common
+        // one, not a legacy edge. Deriving activity from cost there hid every
+        // subscription-backed provider whose period spend is $0 (Hermes, Kimi,
+        // Copilot on an included plan). A provider the payload bothered to list
+        // is one the user has, so absent means visible; the strict signal
+        // applies only when the field is actually present.
+        hasUsage = try c.decodeIfPresent(Bool.self, forKey: .hasUsage) ?? true
+        inputTokens = try c.decodeIfPresent(Int.self, forKey: .inputTokens)
+        outputTokens = try c.decodeIfPresent(Int.self, forKey: .outputTokens)
+        sessions = try c.decodeIfPresent(Int.self, forKey: .sessions)
+        sessionCountBasis = try c.decodeIfPresent(String.self, forKey: .sessionCountBasis)
+        cacheReadTokens = try c.decodeIfPresent(Int.self, forKey: .cacheReadTokens)
     }
 }
 
@@ -342,7 +448,9 @@ enum ProviderVisibility {
                 .filter(\.hasUsage)
                 .flatMap { [$0.id.lowercased(), $0.label.lowercased()] })
         }
-        return Set(legacyProviders.keys.map { $0.lowercased() })
+        return Set(legacyProviders.compactMap { key, cost in
+            cost > 0 ? key.lowercased() : nil
+        })
     }
 }
 
@@ -458,7 +566,8 @@ struct ProjectEntry: Codable, Sendable {
     let cost: Double
     let savingsUSD: Double
     let sessions: Int
-    let avgCostPerSession: Double
+    let avgCostPerSession: Double?
+    let sessionCountBasis: String?
     let sessionDetails: [SessionDetailEntry]
 
     init(from decoder: Decoder) throws {
@@ -467,12 +576,13 @@ struct ProjectEntry: Codable, Sendable {
         cost = try c.decode(Double.self, forKey: .cost)
         savingsUSD = try c.decodeIfPresent(Double.self, forKey: .savingsUSD) ?? 0
         sessions = try c.decode(Int.self, forKey: .sessions)
-        avgCostPerSession = try c.decode(Double.self, forKey: .avgCostPerSession)
+        avgCostPerSession = try c.decodeIfPresent(Double.self, forKey: .avgCostPerSession)
+        sessionCountBasis = try c.decodeIfPresent(String.self, forKey: .sessionCountBasis)
         sessionDetails = try c.decodeIfPresent([SessionDetailEntry].self, forKey: .sessionDetails) ?? []
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, cost, savingsUSD, sessions, avgCostPerSession, sessionDetails
+        case name, cost, savingsUSD, sessions, avgCostPerSession, sessionCountBasis, sessionDetails
     }
 }
 

@@ -4,6 +4,7 @@ import { showToast } from '../lib/toast'
 import { PluginDetailsModal } from './PluginDetails'
 import { InstallFlowModal } from './InstallFlow'
 import styles from './Plugins.module.css'
+import { isWindowsPlatform } from '../lib/platform'
 
 interface PluginInfo {
   name: string
@@ -18,7 +19,36 @@ interface PluginInfo {
   }
 }
 
+/**
+ * The plugin runtime has not shipped for Windows, so the CLI there never answers and the page
+ * sat on "Loading plugins..." for good. This branch loads nothing at all: no CLI call, no
+ * spinner, no timer, and none of the loader's hooks even mount, because the dispatcher below
+ * returns before reaching them.
+ */
+function PluginsComingSoon() {
+  return (
+    <div className={styles.container}>
+      <h1>Plugins</h1>
+      <div className={styles.soon}>
+        <svg className={styles.soonMark} viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="1" />
+          <path d="M12 2v6m0 8v6M4.22 4.22l4.24 4.24m5.08 5.08l4.24 4.24M2 12h6m8 0h6M4.22 19.78l4.24-4.24m5.08-5.08l4.24-4.24" />
+        </svg>
+        <div className={styles.soonTitle}>Plugins are coming to Windows</div>
+        <p className={styles.soonBody}>
+          They arrive in a later Windows release; on macOS and Linux they are available today.
+        </p>
+      </div>
+    </div>
+  )
+}
+
 export function PluginsSection() {
+  // Decided before the loader renders rather than inside it, so its effects never run.
+  return isWindowsPlatform() ? <PluginsComingSoon /> : <PluginsList />
+}
+
+function PluginsList() {
   const [plugins, setPlugins] = useState<PluginInfo[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -80,10 +110,15 @@ export function PluginsSection() {
       <h1>Plugins</h1>
       {error && <div className={styles.error}>{error}</div>}
       {plugins.length === 0 ? (
-        <div className={styles.empty}>
-          <p>No plugins installed</p>
-          <button className="btnp" onClick={() => void loadPlugins()}>Refresh</button>
-          <button className="btnp btnp-primary" onClick={() => setShowInstallFlow(true)} style={{ marginLeft: '0.5rem' }}>Install plugin</button>
+        <div className={`card ${styles.empty}`}>
+          <h2 className={styles.emptyTitle}>Coming soon</h2>
+          <p className={styles.emptyBody}>
+            Plugins will let CodeBurn do more than count. The first one ships with CodeBurn Teams: it sends your session outcomes, retries and kind of work to your team dashboard, and nothing else.
+          </p>
+          <p className={styles.emptyBody}>Until then, everything on the other screens stays local to this machine.</p>
+          <p className={styles.emptyFooter}>
+            Have a plugin file already? <button type="button" className="set-text-button" onClick={() => setShowInstallFlow(true)}>Install it</button>
+          </p>
         </div>
       ) : (
         <div className={styles.list}>
@@ -137,9 +172,11 @@ export function PluginsSection() {
           ))}
         </div>
       )}
-      <button className="btnp btnp-primary" onClick={() => setShowInstallFlow(true)} style={{ marginTop: '1.5rem' }}>
-        Install plugin
-      </button>
+      {plugins.length > 0 && (
+        <button className="btnp btnp-primary" onClick={() => setShowInstallFlow(true)} style={{ marginTop: '1.5rem' }}>
+          Install plugin
+        </button>
+      )}
 
       {detailsPlugin && (
         <PluginDetailsModal

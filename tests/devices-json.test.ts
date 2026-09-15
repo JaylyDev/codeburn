@@ -2,10 +2,13 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { pathToFileURL } from 'node:url'
 
 import { describe, expect, it, vi } from 'vitest'
 
-const DISCOVERY_MOCK_REGISTER = join(process.cwd(), 'tests', 'fixtures', 'mock-discovery-register.mjs')
+// node --import takes a module specifier, and an absolute Windows path parses as
+// a URL with scheme 'c:', so the loader rejects it. A file:// URL works on both.
+const DISCOVERY_MOCK_REGISTER = pathToFileURL(join(process.cwd(), 'tests', 'fixtures', 'mock-discovery-register.mjs')).href
 
 const bonjourMock = vi.hoisted(() => ({
   destroy: vi.fn((cb: () => void) => cb()),
@@ -51,7 +54,7 @@ function runCli(args: string[], home: string, opts: { mockDiscovery?: boolean } 
       ...process.env,
       CLAUDE_CONFIG_DIR: join(home, '.claude'),
       CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'),
-      HOME: home,
+      HOME: home, USERPROFILE: home,
       TZ: 'UTC',
     },
     encoding: 'utf-8',

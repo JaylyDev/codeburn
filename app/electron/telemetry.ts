@@ -14,7 +14,12 @@ import { dirname, join } from 'node:path'
 //   Either way the user decides on the consent screen.
 // - The only identifier is a random UUID minted locally. No fingerprinting.
 // - Events carry day-granularity timestamps only, and props pass a whitelist
-//   sanitizer (short strings / finite numbers / booleans, capped arrays).
+//   sanitizer: every leaf is a short string, a finite number or a boolean, and
+//   the nesting, key count and array length are all capped. Anything else
+//   (functions, dates, deep trees) is dropped rather than encoded.
+// - The richest event is `usage_snapshot`, the CLI-computed daily aggregate in
+//   `payload.telemetrySnapshot`. It is bucketed and name-only by construction:
+//   see src/telemetry-snapshot.ts for the contract it holds.
 // - Dev / unpackaged builds never send (CODEBURN_TELEMETRY_DEV=1 overrides
 //   for end-to-end testing).
 
@@ -40,6 +45,13 @@ export const EVENT_NAMES = new Set([
   'cold_start',
   'usage_snapshot',
   'cli_error',
+  // Name-only interaction events. Props carry a fix id, a provider, a format,
+  // a model name or a setting name and its boolean/enum value, never free text.
+  'optimize_apply',
+  'plan_set',
+  'export',
+  'compare_view',
+  'settings_change',
 ])
 
 const MAX_QUEUE = 200
@@ -47,6 +59,13 @@ const MAX_CLI_ERRORS_PER_KIND_PER_DAY = 20
 const MAX_STRING = 64
 const MAX_ARRAY = 12
 const MAX_KEYS = 16
+// Containers may nest this deep below the props object. The daily usage
+// snapshot is the deepest shape we send: props -> models[] -> model -> tasks[]
+// -> task. Anything deeper is dropped whole.
+const MAX_DEPTH = 5
+// Belt and braces on top of the per-level caps: one event can never encode more
+// than this many leaf values, whatever shape it arrives in.
+const MAX_LEAVES = 1000
 
 export type TelemetryStatus = {
   installId: string
@@ -99,45 +118,52 @@ function loadCliErrorBudget(day: unknown, counts: unknown): Pick<PersistedState,
   return { cliErrorDay: day, cliErrorCounts: cleanCounts }
 }
 
-function sanitizeValue(value: unknown): unknown | undefined {
-  if (typeof value === 'string') return value.slice(0, MAX_STRING)
-  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
-  if (typeof value === 'boolean') return value
-  return undefined
+type LeafBudget = { left: number }
+
+function sanitizeValue(value: unknown, depth: number, budget: LeafBudget): unknown | undefined {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    if (budget.left <= 0) return undefined
+    if (typeof value === 'number' && !Number.isFinite(value)) return undefined
+    budget.left--
+    return typeof value === 'string' ? value.slice(0, MAX_STRING) : value
+  }
+  if (depth >= MAX_DEPTH) return undefined
+  if (Array.isArray(value)) {
+    const items: unknown[] = []
+    for (const entry of value.slice(0, MAX_ARRAY)) {
+      const sv = sanitizeValue(entry, depth + 1, budget)
+      if (sv !== undefined) items.push(sv)
+    }
+    return items.length > 0 ? items : undefined
+  }
+  // Plain objects only. A Date, Map, function or class instance carries state
+  // we have no whitelist for, so it is dropped rather than walked.
+  if (value === null || typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) return undefined
+  const flat = sanitizeObject(value as Record<string, unknown>, depth + 1, budget)
+  return Object.keys(flat).length > 0 ? flat : undefined
 }
 
-/** Whitelist sanitizer: primitives, plus one level of arrays-of-flat-objects. */
-export function sanitizeProps(props: unknown): Record<string, unknown> {
-  if (!props || typeof props !== 'object' || Array.isArray(props)) return {}
+function sanitizeObject(obj: Record<string, unknown>, depth: number, budget: LeafBudget): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   let keys = 0
-  for (const [key, value] of Object.entries(props as Record<string, unknown>)) {
+  for (const [key, value] of Object.entries(obj)) {
     if (keys >= MAX_KEYS) break
-    const k = key.slice(0, MAX_STRING)
-    if (Array.isArray(value)) {
-      const items: Record<string, unknown>[] = []
-      for (const entry of value.slice(0, MAX_ARRAY)) {
-        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue
-        const flat: Record<string, unknown> = {}
-        let inner = 0
-        for (const [ik, iv] of Object.entries(entry as Record<string, unknown>)) {
-          if (inner >= MAX_KEYS) break
-          const sv = sanitizeValue(iv)
-          if (sv === undefined) continue
-          flat[ik.slice(0, MAX_STRING)] = sv
-          inner++
-        }
-        if (Object.keys(flat).length > 0) items.push(flat)
-      }
-      if (items.length > 0) { out[k] = items; keys++ }
-      continue
-    }
-    const sv = sanitizeValue(value)
+    const sv = sanitizeValue(value, depth, budget)
     if (sv === undefined) continue
-    out[k] = sv
+    out[key.slice(0, MAX_STRING)] = sv
     keys++
   }
   return out
+}
+
+/** Whitelist sanitizer. Keeps short strings, finite numbers and booleans, plus
+ *  plain objects and arrays of them nested up to MAX_DEPTH, each level capped by
+ *  MAX_KEYS / MAX_ARRAY and the whole event by MAX_LEAVES. Everything else is
+ *  dropped. Deep enough for the daily usage snapshot's model x task cross and
+ *  nothing more. */
+export function sanitizeProps(props: unknown): Record<string, unknown> {
+  if (!props || typeof props !== 'object' || Array.isArray(props)) return {}
+  return sanitizeObject(props as Record<string, unknown>, 1, { left: MAX_LEAVES })
 }
 
 export class Telemetry {

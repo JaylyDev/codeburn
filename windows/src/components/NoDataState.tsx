@@ -1,16 +1,8 @@
-/// First-run copy for a machine where the CLI ran fine but found no sessions. Paths are
-/// shown the way the reader's own OS spells them.
+/// First-run copy for a machine where the CLI ran fine but found no sessions. The watched
+/// locations are the CLI's own roots, from lib/watched, which the tab strip's known-tool
+/// fallback reads too, so the two surfaces cannot describe the same tool differently.
 
-import { homePath } from '../lib/platform'
-
-const SOURCES: Array<{ path: string | null; tool: string }> = [
-  { path: homePath('.claude', 'projects'), tool: 'Claude Code' },
-  { path: homePath('.codex', 'sessions'), tool: 'Codex CLI' },
-  { path: null, tool: 'Cursor local database' },
-  { path: null, tool: 'GitHub Copilot session events' },
-  { path: homePath('.local', 'share', 'opencode'), tool: 'OpenCode' },
-  { path: homePath('.pi'), tool: 'Pi' },
-]
+import { WATCHED_TOOLS } from '../lib/watched'
 
 export function NoDataState({ onRefresh }: { onRefresh: () => void }) {
   return (
@@ -22,9 +14,9 @@ export function NoDataState({ onRefresh }: { onRefresh: () => void }) {
       </p>
       <p className="no-data-sub">Watched locations</p>
       <ul>
-        {SOURCES.map(s => (
-          <li key={s.tool}>
-            {s.path ? <><code>{s.path}</code> <span className="no-data-tool">{s.tool}</span></> : s.tool}
+        {WATCHED_TOOLS.map(t => (
+          <li key={t.id}>
+            <code>{t.path}</code> <span className="no-data-tool">{t.tool}</span>
           </li>
         ))}
       </ul>

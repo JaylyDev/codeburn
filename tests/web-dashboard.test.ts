@@ -7,6 +7,7 @@ import type { Server } from 'http'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { injectDashboardBootstrap, runWebDashboard } from '../src/web-dashboard.js'
+import { setHome } from './setup/home.js'
 
 describe('web dashboard bootstrap injection', () => {
   it('keeps replacement syntax in a payload value literal', () => {
@@ -57,7 +58,7 @@ describe('web dashboard server: invalid query returns 400 without exiting', () =
   beforeAll(async () => {
     homeDir = await mkdtemp(join(tmpdir(), 'codeburn-web-home-'))
     cacheDir = await mkdtemp(join(tmpdir(), 'codeburn-web-cache-'))
-    process.env['HOME'] = homeDir
+    setHome(homeDir)
     process.env['CODEBURN_CACHE_DIR'] = cacheDir
     server = await runWebDashboard({
       period: 'today', provider: 'all', project: [], exclude: [], port: 0, open: false,
@@ -67,8 +68,8 @@ describe('web dashboard server: invalid query returns 400 without exiting', () =
 
   afterAll(async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()))
-    if (prevHome === undefined) delete process.env['HOME']
-    else process.env['HOME'] = prevHome
+    if (prevHome === undefined) setHome(undefined)
+    else setHome(prevHome)
     if (prevCache === undefined) delete process.env['CODEBURN_CACHE_DIR']
     else process.env['CODEBURN_CACHE_DIR'] = prevCache
     await rm(homeDir, { recursive: true, force: true })

@@ -20,6 +20,7 @@ import {
   flushAntigravityCache,
 } from '../src/providers/antigravity.js'
 import type { ParsedProviderCall } from '../src/providers/types.js'
+import { setHome } from './setup/home.js'
 
 const originalCacheDir = process.env['CODEBURN_CACHE_DIR']
 const originalHome = process.env['HOME']
@@ -84,8 +85,8 @@ beforeEach(async () => {
 afterEach(async () => {
   if (originalCacheDir === undefined) delete process.env['CODEBURN_CACHE_DIR']
   else process.env['CODEBURN_CACHE_DIR'] = originalCacheDir
-  if (originalHome === undefined) delete process.env['HOME']
-  else process.env['HOME'] = originalHome
+  if (originalHome === undefined) setHome(undefined)
+  else setHome(originalHome)
   if (originalCodexHome === undefined) delete process.env['CODEX_HOME']
   else process.env['CODEX_HOME'] = originalCodexHome
   await rm(root, { recursive: true, force: true })
@@ -186,7 +187,7 @@ describe('call-time CODEBURN_CACHE_DIR isolation', () => {
       }),
     ].join('\n') + '\n')
 
-    process.env['HOME'] = home
+    setHome(home)
     process.env['CODEX_HOME'] = codexHome
     process.env['CODEBURN_CACHE_DIR'] = cacheA
     const { clearSessionCache, parseAllSessions } = await import('../src/parser.js')

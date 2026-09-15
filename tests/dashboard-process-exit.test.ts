@@ -96,7 +96,7 @@ async function startHydratingDashboard(): Promise<RunningDashboard> {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
       ...process.env,
-      HOME: home,
+      HOME: home, USERPROFILE: home,
       CLAUDE_CONFIG_DIR: join(home, '.claude'),
       CODEBURN_CACHE_DIR: cacheDir,
       CODEBURN_DESKTOP_SESSIONS_DIR: join(home, 'desktop-sessions'),

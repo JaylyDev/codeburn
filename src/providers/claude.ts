@@ -117,7 +117,15 @@ export function getDesktopSessionsDirs(): string[] {
   const appDataInput = process.env['APPDATA']
   const localAppDataInput = process.env['LOCALAPPDATA']
   const platform = process.platform
-  const cacheKey = JSON.stringify([platform, override ?? null, appDataInput ?? null, localAppDataInput ?? null])
+  // homedir() feeds every non-override branch below, so a key without it hands
+  // back the previous home's paths once the home directory moves.
+  const cacheKey = JSON.stringify([
+    platform,
+    override ?? null,
+    appDataInput ?? null,
+    localAppDataInput ?? null,
+    homedir(),
+  ])
   const cached = desktopSessionsDirsCache.get(cacheKey)
   if (cached) return [...cached]
 

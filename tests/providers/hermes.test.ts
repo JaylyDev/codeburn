@@ -861,6 +861,37 @@ skipUnlessSqlite('hermes provider', () => {
     expect(calls[0]?.projectPath).toBeUndefined()
   })
 
+  it('takes a drive-letter cwd as a workspace only on a Windows host', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'drive-cwd',
+        source: 'desktop',
+        cwd: 'C:\\repos\\codeburn',
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('drive-cwd', 'user', 'hi', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=drive-cwd`)
+    // A state.db is only ever read from this host's own Hermes home, so a
+    // drive-letter path is a real workspace on Windows and an odd relative
+    // filename anywhere else.
+    if (process.platform === 'win32') {
+      expect(calls[0]?.projectPath).toBe('C:\\repos\\codeburn')
+      expect(calls[0]?.workingDirectory).toBe('C:\\repos\\codeburn')
+    } else {
+      expect(calls[0]?.project).toBe('hermes')
+      expect(calls[0]?.projectPath).toBeUndefined()
+    }
+  })
+
   it('never promotes prompt text into project or cwd provenance', async () => {
     const dbPath = createHermesDb(tmpDir)
     withTestDb(dbPath, (db) => {

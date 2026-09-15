@@ -10,6 +10,7 @@ import { buildDurablePeriod, buildMenubarPayloadForRange, buildPeriodData, getDa
 import { parseAllSessions, filterProjectsByName, clearSessionCache } from '../src/parser.js'
 import { renderOverview } from '../src/overview.js'
 import type { DateRange } from '../src/types.js'
+import { setHome } from './setup/home.js'
 
 // The durable headline (overview / report Overview panel / menubar current) is
 // built from the carry-forward daily cache unioned with today's live parse, so
@@ -111,6 +112,18 @@ function carriedDayTwoProviders(date: string): DailyEntry {
   return day
 }
 
+/** The same carried day, with the two projects as path siblings sharing a prefix. */
+function carriedDaySiblingProjects(date: string): DailyEntry {
+  const day = carriedDayWithProjects(date)
+  const projects = {
+    app: { cost: KEEP.cost, calls: KEEP.calls, savingsUSD: 0, sessions: KEEP.sessions, path: '/Users/gone/app' },
+    'app-kit': { cost: DROP.cost, calls: DROP.calls, savingsUSD: 0, sessions: DROP.sessions, path: '/Users/gone/app-kit' },
+  }
+  day.projects = projects
+  day.providers['claude']!.projects = projects
+  return day
+}
+
 async function seedCache(...days: DailyEntry[]): Promise<void> {
   const cache: DailyCache = {
     version: DAILY_CACHE_VERSION,
@@ -164,7 +177,7 @@ beforeEach(async () => {
   savedEnv = Object.fromEntries(ENV_KEYS.map(k => [k, process.env[k]]))
   await mkdir(join(ROOT, 'home', '.claude'), { recursive: true })
   await mkdir(join(ROOT, 'cache'), { recursive: true })
-  process.env['HOME'] = join(ROOT, 'home')
+  setHome(join(ROOT, 'home'))
   process.env['CODEBURN_CACHE_DIR'] = join(ROOT, 'cache')
   process.env['CLAUDE_CONFIG_DIR'] = join(ROOT, 'home', '.claude')
   delete process.env['CLAUDE_CONFIG_DIRS']
@@ -232,6 +245,35 @@ describe('durable headline honours --project / --exclude on carried days', () =>
     const durable = await buildDurablePeriod({ range, label: 'p' }, { provider: 'all', exclude: ['/Users/gone/drop-me'] })
 
     expect(durable.data.cost).toBeCloseTo(live.cost + KEEP.cost, 6)
+  })
+
+  // A cached day and a live day must answer the same pattern the same way. The
+  // two below are the shapes where a substring copy of the rule diverges from
+  // the anchored one, inside a single headline total.
+  it('anchors an absolute pattern on a carried day, so the sibling survives', async () => {
+    await seedCache(carriedDaySiblingProjects(daysAgoStr(10)))
+    await seedLiveTodaySession()
+    const range = coveringRange()
+
+    const live = await liveOnly(range, [], ['/Users/gone/app'])
+    clearSessionCache()
+    const durable = await buildDurablePeriod({ range, label: 'p' }, { provider: 'all', exclude: ['/Users/gone/app'] })
+
+    expect(durable.data.cost).toBeCloseTo(live.cost + DROP.cost, 6)
+    expect(durable.data.calls).toBe(live.calls + DROP.calls)
+  })
+
+  it('keeps POSIX case identity on a carried day, so a wrong-case path selects nothing', async () => {
+    await seedCache(carriedDaySiblingProjects(daysAgoStr(10)))
+    await seedLiveTodaySession()
+    const range = coveringRange()
+
+    const live = await liveOnly(range, [], ['/users/gone/app'])
+    clearSessionCache()
+    const durable = await buildDurablePeriod({ range, label: 'p' }, { provider: 'all', exclude: ['/users/gone/app'] })
+
+    expect(durable.data.cost).toBeCloseTo(live.cost + DAY_COST, 6)
+    expect(durable.data.calls).toBe(live.calls + DAY_CALLS)
   })
 
   it('keeps a project whose name is a prototype member (constructor) in the sliced total', async () => {

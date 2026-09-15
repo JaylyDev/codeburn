@@ -1,5 +1,8 @@
 import { execFile } from 'node:child_process'
-import { constants, type Stats } from 'node:fs'
+import {
+  chmodSync, closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync,
+  openSync, readFileSync, renameSync, unlinkSync, writeFileSync, type Stats,
+} from 'node:fs'
 import { chmod, lstat, mkdir, open, rename, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -120,6 +123,74 @@ export async function readSecureFile(filePath: string, maxBytes = 64 * 1024): Pr
     return await handle.readFile({ encoding: 'utf8' })
   } finally {
     await handle.close()
+  }
+}
+
+/** Synchronous twin of {@link readSecureFile}, for the rotation path that must
+ * not yield to the event loop between reading and writing a credential. */
+export function readSecureFileSync(filePath: string, maxBytes = 64 * 1024): string | null {
+  let before: Stats
+  try {
+    before = lstatSync(filePath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+  if (before.isSymbolicLink()) throw new Error(`Refusing symbolic link: ${filePath}`)
+  assertSafeMode(before, filePath)
+  if (before.size > maxBytes) throw new Error(`Credential file exceeds ${maxBytes} bytes: ${filePath}`)
+
+  const fd = openSync(filePath, constants.O_RDONLY | NOFOLLOW)
+  try {
+    const after = fstatSync(fd)
+    assertSafeMode(after, filePath)
+    if (after.dev !== before.dev || after.ino !== before.ino) throw new Error(`Credential file changed while opening: ${filePath}`)
+    if (after.size > maxBytes) throw new Error(`Credential file exceeds ${maxBytes} bytes: ${filePath}`)
+    return readFileSync(fd, { encoding: 'utf8' })
+  } finally {
+    closeSync(fd)
+  }
+}
+
+// Rewrite a credential with exactly the owner-only permissions it already had,
+// so a refreshed token neither widens the file the user chose nor drops a
+// tighter mode like 0o400. Group or world bits (or Windows, where mode bits are
+// not the access control) mean there is nothing safe to copy: use owner rw.
+function privateModeFor(filePath: string): number {
+  if (process.platform === 'win32') return 0o600
+  try {
+    const stats = lstatSync(filePath)
+    if (!stats.isFile()) return 0o600
+    const mode = stats.mode & 0o777
+    return mode !== 0 && (mode & 0o077) === 0 ? mode : 0o600
+  } catch {
+    return 0o600
+  }
+}
+
+/**
+ * Writes a credential file atomically and synchronously. Synchronous on
+ * purpose: a caller holding a freshly rotated token has to get it onto disk
+ * without an await for an abort, a timeout or a quit to land in.
+ */
+export function atomicWriteSecureFileSync(filePath: string, contents: string): void {
+  const mode = privateModeFor(filePath)
+  const dir = path.dirname(filePath)
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const tempPath = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`)
+  try {
+    const fd = openSync(tempPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, mode)
+    try {
+      writeFileSync(fd, contents, 'utf8')
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    if (process.platform !== 'win32') chmodSync(tempPath, mode)
+    renameSync(tempPath, filePath)
+  } catch (error) {
+    try { unlinkSync(tempPath) } catch { /* nothing to clean up */ }
+    throw error
   }
 }
 

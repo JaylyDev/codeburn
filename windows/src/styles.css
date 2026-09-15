@@ -8,9 +8,10 @@
   --ember-deep: #8B3E13;
   --ember-glow: #F0A070;
 
-  /* Light: warm popover material over the desktop. */
-  --surface: rgba(250, 247, 243, 0.94);
-  --surface-solid: #FAF7F3;
+  /* The popover card. Opaque, because the window behind it is fully transparent: the
+     card is the only thing that paints, so its border-radius is the only shape there is
+     and nothing square can bleed at the corners. */
+  --surface: #FAF7F3;
   --surface-window: #FFFFFF;
   --label: rgba(0, 0, 0, 0.85);
   --label-2: rgba(0, 0, 0, 0.50);
@@ -37,28 +38,51 @@
   --menu-shadow: 0 8px 28px rgba(0, 0, 0, 0.18), 0 1px 3px rgba(0, 0, 0, 0.10);
   --icon-contrast: #FFFFFF;
   --danger: #C83F2C;
+  /* Routing waste, from the mac OptimizeInsight purple. */
+  --routing-ink: #8944AB;
+  /* The CLI update banner, from the mac's Color.blue: informational rather than branded,
+     so it never reads as the terracotta star banner two rows below it. */
+  --update-ink: #007AFF;
+
+  /* Quota severity, from QuotaSummary.Severity: under 50 green, then yellow, orange, red.
+     Three sets, because one colour cannot do three jobs here. The bare token is the bar
+     fill (the system colours the mac and the Capacity Dock use). `-ink` carries text and
+     icons on the popover surface: the mac only ever draws them on a dark material, and
+     plain yellow is unreadable on this warm light one, so the light theme darkens them.
+     `-tip` is the same text inside the hover card, which is a deliberately inverted
+     surface, so it takes the opposite theme's value. */
+  --sev-normal: #34C759;
+  --sev-warning: #FFCC00;
+  --sev-critical: #FF9500;
+  --sev-danger: #FF3B30;
+  --sev-normal-ink: #2C9E45;
+  --sev-warning-ink: #A9750B;
+  --sev-critical-ink: #C2610A;
+  --sev-danger-ink: #C83F2C;
+  --sev-critical-tip: #FF9F0A;
+  --sev-danger-tip: #FF453A;
 
   --font-sans: 'Segoe UI Variable Text', 'Segoe UI', -apple-system, system-ui, sans-serif;
   --font-display: 'Segoe UI Variable Display', 'Segoe UI', -apple-system, system-ui, sans-serif;
   --font-mono: 'Cascadia Mono', 'Cascadia Code', Consolas, 'SF Mono', Menlo, monospace;
 
   --gutter: 14px;
-  --popover-radius: 10px;
+  --popover-radius: 12px;
+  --popover-gutter: 12px;
+  --popover-shadow: 0 4px 16px rgba(0, 0, 0, 0.22), 0 1px 3px rgba(0, 0, 0, 0.12);
   --radius-bar: 2px;
   --radius-util: 3px;
   --radius-segment: 5px;
   --radius-pill: 6px;
   --radius-track: 7px;
   --radius-card: 8px;
-  --scroll-height: 520px;
 
   --ease-ui: cubic-bezier(0.2, 0.7, 0.2, 1);
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --surface: rgba(28, 24, 22, 0.92);
-    --surface-solid: #1C1816;
+    --surface: #1C1816;
     --surface-window: #2A2320;
     --label: rgba(255, 255, 255, 0.86);
     --label-2: rgba(255, 255, 255, 0.55);
@@ -83,14 +107,25 @@
     --control-hover: rgba(255, 255, 255, 0.10);
     --menu-bg: rgba(40, 35, 32, 0.98);
     --menu-shadow: 0 8px 28px rgba(0, 0, 0, 0.5), 0 1px 3px rgba(0, 0, 0, 0.3);
+    --sev-normal: #30D158;
+    --sev-warning: #FFD60A;
+    --sev-critical: #FF9F0A;
+    --sev-danger: #FF453A;
+    --sev-normal-ink: #30D158;
+    --sev-warning-ink: #FFD60A;
+    --sev-critical-ink: #FF9F0A;
+    --sev-danger-ink: #FF453A;
+    --sev-critical-tip: #C2610A;
+    --sev-danger-tip: #C83F2C;
+    --routing-ink: #BF5AF2;
+    --update-ink: #0A84FF;
     --icon-contrast: #1C1816;
     color-scheme: dark;
   }
 }
 
 :root[data-theme="dark"] {
-  --surface: rgba(28, 24, 22, 0.92);
-  --surface-solid: #1C1816;
+  --surface: #1C1816;
   --surface-window: #2A2320;
   --label: rgba(255, 255, 255, 0.86);
   --label-2: rgba(255, 255, 255, 0.55);
@@ -115,6 +150,18 @@
   --control-hover: rgba(255, 255, 255, 0.10);
   --menu-bg: rgba(40, 35, 32, 0.98);
   --menu-shadow: 0 8px 28px rgba(0, 0, 0, 0.5), 0 1px 3px rgba(0, 0, 0, 0.3);
+  --sev-normal: #30D158;
+  --sev-warning: #FFD60A;
+  --sev-critical: #FF9F0A;
+  --sev-danger: #FF453A;
+  --sev-normal-ink: #30D158;
+  --sev-warning-ink: #FFD60A;
+  --sev-critical-ink: #FF9F0A;
+  --sev-danger-ink: #FF453A;
+  --sev-critical-tip: #C2610A;
+  --sev-danger-tip: #C83F2C;
+  --routing-ink: #BF5AF2;
+  --update-ink: #0A84FF;
   --icon-contrast: #1C1816;
   color-scheme: dark;
 }
@@ -142,11 +189,15 @@ button {
   color: inherit;
   cursor: default;
 }
-button:focus-visible, a:focus-visible, summary:focus-visible {
+button:focus-visible, a:focus-visible, summary:focus-visible, input:focus-visible {
   outline: 2px solid var(--brand-accent);
   outline-offset: 1px;
   border-radius: 4px;
 }
+/* A selected swatch already wears an outline, so a focused one needs its own ring outside
+   that: same colour, further out, or keyboard focus is invisible on exactly the control the
+   reader is about to change. */
+.stg-swatch:focus-visible, .accent-swatch:focus-visible { outline-offset: 3px; }
 a { color: inherit; }
 code { font-family: var(--font-mono); }
 
@@ -156,14 +207,19 @@ code { font-family: var(--font-mono); }
 
 /* ---- shell ---------------------------------------------------------------------- */
 
+/* The window is 12 px larger than the card on every side and paints nothing itself, so
+   this drop shadow follows the card radius instead of the square window frame. That is
+   why the window has no DWM shadow and no DWM rounding: both trace a rectangle. */
 .popover {
+  position: relative;
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  margin: var(--popover-gutter);
+  height: calc(100% - 2 * var(--popover-gutter));
   overflow: hidden;
   border-radius: var(--popover-radius);
   background: var(--surface);
-  box-shadow: inset 0 0 0 0.5px var(--separator);
+  box-shadow: var(--popover-shadow), inset 0 0 0 0.5px var(--separator);
 }
 
 .header {
@@ -173,10 +229,104 @@ code { font-family: var(--font-mono); }
   padding: 10px var(--gutter) 8px;
   border-bottom: 1px solid var(--separator);
 }
+.header-top { display: flex; align-items: flex-start; gap: 8px; }
+.header-brand { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .brand { font-size: 13px; font-weight: 600; letter-spacing: -0.15px; line-height: 16px; }
-.brand-primary { color: var(--label); }
-.brand-accent { color: var(--brand-accent); }
+/* The website's .flame-text: a 300% wide flame gradient clipped to the letters and swept by
+   flameShift, 3s ease infinite. The sweep pauses while the popover is hidden, as on the mac,
+   where an always-running animation cost 5 to 7 percent idle CPU. */
+.brand-flame {
+  background: linear-gradient(90deg, #ff6a00, #ffda44, #e8553a, #ff8c00, #ffda44, #ff6a00);
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: flameShift 3s ease infinite;
+}
+.brand-flame.is-still { animation-play-state: paused; }
+@keyframes flameShift {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .brand-flame { animation: none; background-position: 0% 50%; }
+}
 .subhead { font-size: 10.5px; color: var(--label-2); }
+
+/* Accent picker: a dot showing the current preset, which reveals the nine swatches. */
+.header-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.accent-picker { display: flex; align-items: center; margin-left: auto; }
+
+/* The update badge: the mac's borderedProminent mini pill in the brand tint, sitting where
+   the header has room for it and gone entirely when there is nothing to update. */
+.update-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 18px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--brand-accent);
+  color: #FFFFFF;
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.update-badge:hover:not(:disabled) { background: #B84A1A; }
+.update-badge:active:not(:disabled) { background: var(--ember-deep); }
+.update-badge:disabled { opacity: 0.75; }
+.update-badge-spin { display: inline-flex; animation: spin 0.9s linear infinite; }
+.accent-swatches {
+  display: flex;
+  gap: 5px;
+  padding: 4px 6px;
+  border-radius: var(--radius-card);
+  background: var(--fill-08);
+  animation: accent-swatches-in 200ms var(--ease-ui);
+}
+@keyframes accent-swatches-in {
+  from { opacity: 0; transform: translateX(6px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+.accent-swatch {
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+}
+.accent-swatch.is-selected { box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.9); }
+.accent-current {
+  width: 14px;
+  height: 14px;
+  margin-left: 4px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.3);
+  cursor: pointer;
+}
+/* Quota warning row: sits under the wordmark, above the strip, tinted by the worst
+   connected provider's severity. */
+.quota-warning {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  font-size: 10.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--label-2);
+  background: var(--fill-08);
+}
+.quota-warning.is-warning { color: var(--sev-warning-ink); background: rgba(217, 143, 41, 0.12); }
+.quota-warning.is-critical { color: var(--sev-critical-ink); background: rgba(255, 149, 0, 0.12); }
+.quota-warning.is-danger { color: var(--sev-danger-ink); background: rgba(255, 59, 48, 0.12); }
 
 .main-content {
   position: relative;
@@ -194,22 +344,61 @@ code { font-family: var(--font-mono); }
   z-index: 40;
   border-bottom: 1px solid var(--separator);
 }
-.agent-tabs {
+.agent-tabs-row {
   display: flex;
-  gap: 5px;
+  align-items: center;
+}
+.agent-tabs {
+  flex: 1 1 auto;
+  min-width: 0;
   padding: 8px 12px;
   overflow-x: auto;
   scrollbar-width: none;
   mask-image: linear-gradient(90deg, #000 calc(100% - 18px), transparent);
   -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 18px), transparent);
 }
+.agent-tabs-content {
+  display: flex;
+  gap: 5px;
+  width: max-content;
+}
 .agent-tabs::-webkit-scrollbar { display: none; }
+/* Overflow arrows, as on the mac: they select the neighbouring tab rather than scrolling
+   blindly, so the strip and the active filter never disagree about what is in view. */
+.tab-chevron {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--label);
+}
+.tab-chevron:hover:not(:disabled) { background: var(--fill-08); }
+.tab-chevron:disabled { color: var(--label-3); }
+.agent-tabs-row > .tab-chevron:first-child { margin-left: 6px; }
+.agent-tabs-row > .tab-chevron:last-child { margin-right: 6px; }
+.agent-tabs-row > .tab-chevron:first-child + .agent-tabs { padding-left: 6px; }
 .tab-muted, .tab-muted:hover { background: transparent; color: var(--label-3); box-shadow: inset 0 0 0 1px var(--fill-08); }
-.tab-preview {
+/* The hover column under the strip: the share preview first, then the quota card, so the
+   card appearing after its 250ms delay never shifts the preview. */
+.tab-hover {
   position: absolute;
   left: 12px;
   right: 12px;
   top: calc(100% + 4px);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  pointer-events: none;
+}
+.quota-anchor { width: 260px; }
+.tab-preview {
+  align-self: stretch;
   padding: 8px 10px;
   border-radius: var(--radius-card);
   background: var(--tooltip-bg);
@@ -219,11 +408,11 @@ code { font-family: var(--font-mono); }
   animation: fadeIn 120ms ease-out;
 }
 .tab-preview-title { font-size: 11px; font-weight: 600; }
-.tab-preview-body { margin-top: 2px; font-size: 10px; color: var(--tooltip-fg-2); font-variant-numeric: tabular-nums; }
+.tab-preview-body { margin-top: 2px; font-size: 10px; color: var(--tooltip-fg-2); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .tab {
   display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
+  flex-direction: column;
+  gap: 3px;
   flex: 0 0 auto;
   border: 0;
   padding: 4px 10px;
@@ -238,6 +427,121 @@ code { font-family: var(--font-mono); }
 }
 .tab:hover { background: var(--fill-12); }
 .tab-active, .tab-active:hover { background: var(--brand-accent); color: #fff; }
+.tab-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+}
+/* AgentTabQuotaBar: 3px of live quota under the chip, in the four severity tiers. */
+.tab-quota {
+  display: block;
+  height: 3px;
+  border-radius: 1.5px;
+  background: var(--fill-18);
+  overflow: hidden;
+}
+.tab-quota-active { background: rgba(255, 255, 255, 0.2); }
+.tab-quota-fill {
+  display: block;
+  height: 100%;
+  border-radius: 1.5px;
+  background: var(--sev-normal);
+  transition: width 250ms var(--ease-ui);
+}
+.tab-quota-fill-active { background: #fff; }
+.tab-quota-fill.is-warning { background: var(--sev-warning); }
+.tab-quota-fill.is-critical { background: var(--sev-critical); }
+.tab-quota-fill.is-danger { background: var(--sev-danger); }
+
+/* ---- quota hover card ------------------------------------------------------------ */
+
+.quota-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px;
+  border-radius: var(--radius-card);
+  background: var(--tooltip-bg);
+  color: var(--tooltip-fg);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35), inset 0 0 0 0.5px var(--tooltip-border);
+  animation: fadeIn 120ms ease-out;
+}
+.quota-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.quota-head-title { font-size: 11px; font-weight: 600; }
+.quota-head-spacer { flex: 1 1 auto; }
+.quota-flag { font-size: 9.5px; color: var(--tooltip-fg-2); }
+.quota-flag-warn { color: var(--sev-critical-tip); }
+.quota-plan-pill {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(128, 128, 128, 0.22);
+  color: var(--tooltip-fg-2);
+  font-size: 9.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.quota-note { font-size: 11px; color: var(--tooltip-fg-2); }
+.quota-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-variant-numeric: tabular-nums;
+}
+.quota-row-label {
+  width: 92px;
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.quota-row-track {
+  flex: 1 1 auto;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(128, 128, 128, 0.3);
+  overflow: hidden;
+}
+.quota-row-fill { display: block; height: 100%; border-radius: 2px; background: var(--sev-normal); }
+.quota-row-fill.is-warning { background: var(--sev-warning); }
+.quota-row-fill.is-critical { background: var(--sev-critical); }
+.quota-row-fill.is-danger { background: var(--sev-danger); }
+.quota-row-pct {
+  width: 36px;
+  flex: 0 0 auto;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+}
+.quota-row-resets {
+  width: 50px;
+  flex: 0 0 auto;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--tooltip-fg-2);
+}
+.quota-footer {
+  margin-top: 2px;
+  padding-top: 6px;
+  border-top: 1px solid var(--tooltip-border);
+}
+.quota-footer-line { font-size: 10.5px; color: var(--tooltip-fg-2); }
+.quota-reconnect-title { font-size: 11.5px; font-weight: 600; color: var(--sev-danger-tip); }
+.quota-reconnect-reason {
+  font-size: 11px;
+  color: var(--tooltip-fg-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.quota-reconnect-note { font-size: 10.5px; color: var(--tooltip-fg-2); }
 .tab-cost {
   font-family: var(--font-mono);
   font-size: 10.5px;
@@ -281,6 +585,19 @@ code { font-family: var(--font-mono); }
   gap: 2px;
   font-variant-numeric: tabular-nums;
 }
+/* Two one-line notes under the hero figure: the budget alert and the local-model
+   saving. Both sit outside the amount so neither reads as part of it. */
+.hero-note {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  font-size: 11px;
+  font-weight: 500;
+}
+.hero-note-warn { color: var(--sev-critical-ink); }
+.hero-note-saved { color: var(--sev-normal-ink); }
+.hero-note-muted { color: var(--label-2); }
 .hero-calls { font-size: 11px; color: var(--label-2); }
 .hero-sessions { font-size: 10.5px; color: var(--label-3); }
 
@@ -348,6 +665,202 @@ code { font-family: var(--font-mono); }
   color: var(--label);
   box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.10);
 }
+/* The six segments are wrapped in their own radio group; it lays out as a row of equal
+   segments so the strip looks exactly as it did before the group existed. */
+.period-radios { display: flex; gap: 1px; flex: 1; min-width: 0; }
+
+/* The calendar button is a fixed 28 px, as on the mac: the six period segments share what
+   is left, and its width must not move as the labels change. */
+.period-calendar-anchor { position: relative; flex: 0 0 28px; display: flex; }
+.period-calendar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  flex: 0 0 28px;
+  cursor: pointer;
+}
+.period-calendar.is-day-mode { color: var(--brand-accent); }
+
+/* Day picker. Anchored under the calendar button and right-aligned so a month never runs
+   off the popover. */
+.calendar-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  width: 234px;
+  padding: 10px 6px;
+  border-radius: var(--radius-card);
+  border: 1px solid var(--control-border);
+  background: var(--menu-bg);
+  box-shadow: var(--menu-shadow);
+}
+.calendar-head { display: flex; align-items: center; padding: 0 4px 6px; }
+.calendar-title { flex: 1; text-align: center; font-size: 12px; font-weight: 600; color: var(--label); }
+.calendar-nav {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-util);
+  background: transparent;
+  color: var(--label-2);
+  cursor: pointer;
+}
+.calendar-nav:hover:not(:disabled) { background: var(--control-hover); color: var(--label); }
+.calendar-nav:disabled { color: var(--label-3); cursor: default; }
+.calendar-weekdays, .calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 30px);
+  justify-content: center;
+}
+.calendar-weekdays span {
+  height: 16px;
+  text-align: center;
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--label-3);
+}
+.calendar-grid { gap: 2px 0; }
+.calendar-day {
+  justify-self: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--label);
+  cursor: pointer;
+}
+.calendar-day:hover:not(:disabled):not(.is-selected) { background: var(--control-hover); }
+.calendar-day.is-outside { color: var(--label-3); }
+.calendar-day.is-today { font-weight: 700; color: var(--brand-accent); border-color: var(--brand-accent); }
+.calendar-day.is-selected, .calendar-day.is-selected.is-today {
+  background: var(--brand-accent);
+  border-color: transparent;
+  color: #fff;
+}
+.calendar-day:disabled { color: var(--label-3); opacity: 0.5; cursor: default; }
+.calendar-foot { display: flex; align-items: center; gap: 8px; padding: 8px 4px 0; }
+.calendar-clear {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--label-2);
+  cursor: pointer;
+}
+.calendar-clear:hover { color: var(--label); }
+.calendar-summary { flex: 1; text-align: center; font-size: 10px; color: var(--label-3); }
+.calendar-done {
+  border: 0;
+  padding: 5px 14px;
+  border-radius: var(--radius-segment);
+  background: var(--brand-accent);
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  cursor: pointer;
+}
+.calendar-done.is-idle { background: var(--fill-18); color: var(--label-2); }
+
+
+/* Scope: Local / Combined, with the Claude config picker beside it when there is more than
+   one config to choose from. Shares the segment styling with the period strip. */
+.scope-wrap { display: flex; align-items: center; gap: 8px; padding: 0 12px 10px; }
+.scope-tabs {
+  display: flex;
+  flex: 1;
+  gap: 1px;
+  padding: 2px;
+  border-radius: var(--radius-track);
+  background: var(--fill-08);
+}
+.config-picker { position: relative; flex: 0 0 auto; }
+.config-button {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 118px;
+  height: 26px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--radius-track);
+  background: var(--fill-08);
+  color: var(--label);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.config-label {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.config-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  min-width: 160px;
+  padding: 4px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--control-border);
+  background: var(--menu-bg);
+  box-shadow: var(--menu-shadow);
+}
+.config-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: var(--radius-util);
+  background: transparent;
+  color: var(--label);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+.config-item:hover { background: var(--brand-accent); color: #fff; }
+.config-check { display: inline-flex; width: 10px; flex: 0 0 10px; }
+.config-sep { height: 1px; margin: 4px 0; background: var(--separator); }
+
+/* Combined-scope device list under the hero. */
+.device-breakdown { display: flex; flex-direction: column; gap: 3px; margin-top: 6px; }
+.device-row { display: flex; align-items: center; gap: 6px; }
+.device-dot {
+  flex: 0 0 5px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--label-2);
+}
+.device-dot.is-error { background: var(--sev-critical-ink); }
+.device-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--label);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.device-cost { font-size: 10.5px; color: var(--label-2); font-variant-numeric: tabular-nums; }
+.device-tokens { font-size: 10px; color: var(--label-3); font-variant-numeric: tabular-nums; }
 
 /* ---- insight area -------------------------------------------------------------- */
 
@@ -360,10 +873,26 @@ code { font-family: var(--font-mono); }
   position: relative;
   z-index: 10;
 }
-.insight-pills { display: flex; gap: 4px; }
+/* Seven pills do not fit a 384 px popover, and Plan is the seventh whenever a provider with
+   quota is selected: Optimize was being clipped by the card edge. The mac puts the row in a
+   horizontal ScrollView with no indicator, so this scrolls the same way, and a pill keeps its
+   own width rather than being squeezed into an ellipsis. */
+.insight-pills {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  /* The focus ring sits 1 px outside the pill; without the padding the scroll box clips it. */
+  padding: 2px;
+  margin: -2px;
+}
+.insight-pills::-webkit-scrollbar { display: none; }
 .insight-pill {
   border: 0;
-  padding: 4px 10px;
+  flex: 0 0 auto;
+  /* A pixel off the mac's 10, which is what lets the six ordinary pills sit inside a 384 px
+     card without the last one being cut. The seventh, Plan, still scrolls. */
+  padding: 4px 9px;
   border-radius: var(--radius-pill);
   background: var(--fill-10);
   color: var(--label-2);
@@ -415,11 +944,15 @@ code { font-family: var(--font-mono); }
   gap: 4px;
   height: 100%;
 }
+/* The columns share the width, as the mac bars do: 19 of them land on the same 13 px
+   they always had, and 90 simply get thinner. */
 .trend-bar-col {
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
-  width: 13px;
+  flex: 1 1 0;
+  min-width: 0;
+  max-width: 13px;
   height: 100%;
 }
 .trend-bar {
@@ -483,6 +1016,152 @@ code { font-family: var(--font-mono); }
 .bar-tooltip-tokens { font-family: var(--font-mono); font-size: 9.5px; color: var(--tooltip-fg-2); }
 .bar-tooltip-split { font-family: var(--font-mono); font-size: 9px; color: var(--tooltip-fg-3); }
 
+
+/* Calendar heatmap. Cell 8, gap 3, weekday gutter 26, from ContributionHeatmapInsight. */
+.calendar-insight { display: flex; flex-direction: column; gap: 10px; }
+.heat-active { font-size: 10.5px; font-weight: 500; color: var(--brand-accent); font-variant-numeric: tabular-nums; }
+.heat-body { display: flex; align-items: flex-start; gap: 6px; }
+.heat-weekdays {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 26px;
+  flex: 0 0 26px;
+}
+.heat-weekdays span {
+  height: 8px;
+  line-height: 8px;
+  text-align: right;
+  font-size: 8.5px;
+  font-weight: 500;
+  color: var(--label-3);
+}
+.heat-weeks { display: flex; gap: 3px; flex: 1; justify-content: flex-end; }
+.heat-week { display: flex; flex-direction: column; gap: 3px; }
+.heat-cell {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--fill-15);
+  box-shadow: inset 0 0 0 0 transparent;
+  transition: transform 100ms ease-out;
+}
+.heat-l1 { background: color-mix(in srgb, var(--brand-accent) 30%, transparent); }
+.heat-l2 { background: color-mix(in srgb, var(--brand-accent) 48%, transparent); }
+.heat-l3 { background: color-mix(in srgb, var(--brand-accent) 66%, transparent); }
+.heat-l4 { background: color-mix(in srgb, var(--brand-accent) 88%, transparent); }
+.heat-cell.is-future { background: var(--fill-06); }
+.heat-cell.is-today { box-shadow: inset 0 0 0 1px var(--brand-accent); }
+.heat-cell.is-hovered {
+  background: var(--brand-accent);
+  box-shadow: inset 0 0 0 1px var(--brand-accent);
+  transform: scale(1.35);
+}
+.heat-detail {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 42px;
+  padding: 7px 9px;
+  border-radius: var(--radius-pill);
+  background: var(--fill-06);
+}
+.heat-detail-main { flex: 1; min-width: 0; }
+.heat-detail-metric { min-width: 42px; text-align: right; }
+.heat-detail-label { font-size: 9px; font-weight: 500; color: var(--label-3); }
+.heat-detail-main .heat-detail-label { font-size: 10px; }
+.heat-detail-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--label);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.heat-detail-num {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--label);
+}
+
+
+/* Optimize. Retry tax and routing waste keep their own hues, as on the mac, so the two
+   kinds of avoidable spend never read as one pot. */
+.optimize-insight { display: flex; flex-direction: column; gap: 12px; }
+.optimize-empty { font-size: 11px; line-height: 1.45; color: var(--label-2); }
+.optimize-headline { padding-bottom: 2px; }
+.optimize-total {
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--sev-critical-ink);
+}
+.optimize-share { text-align: right; }
+.optimize-share-pct { font-size: 11px; font-weight: 600; color: var(--sev-critical-ink); }
+.optimize-share-note { font-size: 9.5px; color: var(--label-3); }
+.waste-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--separator-soft);
+}
+.waste-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.waste-spacer { flex: 1; }
+.waste-title { font-size: 10px; font-weight: 500; color: var(--label-3); }
+.waste-total {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.waste-share { font-size: 9.5px; color: var(--label-3); }
+.waste-note { font-size: 9.5px; color: var(--label-3); }
+.is-retry .waste-icon, .is-retry .waste-total { color: var(--sev-critical-ink); }
+.is-routing .waste-icon, .is-routing .waste-total { color: var(--routing-ink); }
+.waste-rows { display: flex; flex-direction: column; gap: 3px; }
+.waste-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 6px;
+  border-radius: var(--radius-util);
+}
+.is-retry .waste-row { background: rgba(255, 149, 0, 0.07); }
+.is-routing .waste-row { background: rgba(175, 82, 222, 0.07); }
+.waste-row-name {
+  font-size: 9.5px;
+  font-weight: 500;
+  color: var(--label-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.waste-row-note { font-size: 9px; color: var(--label-3); }
+.waste-row-value {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.is-retry .waste-row-value { color: var(--sev-critical-ink); }
+.is-routing .waste-row-value { color: var(--routing-ink); }
+
 .mini-stats { display: flex; gap: 14px; }
 .mini-stat { flex: 1; min-width: 0; }
 .mini-stat-label { font-size: 9.5px; font-weight: 500; color: var(--label-3); }
@@ -537,6 +1216,30 @@ code { font-family: var(--font-mono); }
   color: var(--label-2);
 }
 .pulse-value-accent { color: var(--brand-accent); }
+.pulse { display: flex; flex-direction: column; gap: 8px; }
+.pulse-cpe {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: var(--label-3);
+}
+.pulse-cpe-label { font-size: 10px; font-weight: 500; }
+.pulse-cpe-figure {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--label);
+}
+.pulse-cpe-best { color: var(--brand-accent); }
+.pulse-cpe-model {
+  font-size: 10px;
+  color: var(--label-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pulse-cpe-dash { font-size: 9px; color: var(--label-3); }
 
 /* Stats */
 .stats-grid { display: flex; gap: 14px; }
@@ -568,10 +1271,111 @@ code { font-family: var(--font-mono); }
   color: var(--brand-accent);
 }
 
+
+/* Stats: top projects and the costliest session, from the mac StatsInsight. */
+.stats-spacer { flex: 1; }
+.stats-projects {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 10px;
+  border-top: 1px solid var(--separator-soft);
+}
+.project-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.project-name {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--label);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.project-sessions { font-size: 9.5px; color: var(--label-3); }
+.project-cost {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--label-2);
+  font-variant-numeric: tabular-nums;
+}
+.project-bar {
+  flex: 0 0 auto;
+  height: 6px;
+  border-radius: var(--radius-bar);
+  background: var(--brand-accent);
+  opacity: 0.5;
+}
+.session-list { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 0 14px; }
+.session-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 3px 6px;
+  border-radius: var(--radius-segment);
+  background: var(--fill-06);
+}
+.session-line { display: flex; align-items: center; gap: 6px; }
+.session-cost {
+  min-width: 52px;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--label);
+  font-variant-numeric: tabular-nums;
+}
+.session-calls { font-size: 9px; color: var(--label-3); }
+.session-tokens {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 9px;
+  color: var(--label-3);
+  font-variant-numeric: tabular-nums;
+}
+.session-models { display: flex; gap: 4px; margin-left: 52px; }
+.session-model {
+  padding: 1.5px 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--brand-accent) 10%, transparent);
+  font-size: 8.5px;
+  font-weight: 500;
+  color: var(--label-2);
+}
+.stats-costliest { display: flex; align-items: center; gap: 4px; }
+.stats-costliest-icon { color: var(--brand-accent); flex-shrink: 0; }
+.stats-costliest-label { font-size: 10px; font-weight: 500; color: var(--label-3); }
+.stats-costliest-value {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--label-2);
+  font-variant-numeric: tabular-nums;
+}
+.stats-costliest-project {
+  font-size: 10px;
+  color: var(--label-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Plan */
-.plan-header { display: flex; align-items: baseline; justify-content: space-between; }
+.plan-header { display: flex; align-items: baseline; gap: 6px; }
 .plan-tier { font-size: 13px; font-weight: 600; color: var(--brand-accent); }
-.plan-reset { font-size: 10.5px; color: var(--label-2); }
+.plan-reset { margin-left: auto; font-size: 10.5px; color: var(--label-2); }
+.plan-note { font-size: 10px; color: var(--label-3); }
 .plan-rows { display: flex; flex-direction: column; gap: 8px; }
 .util-row { display: flex; flex-direction: column; gap: 3px; }
 .util-row-head { display: flex; align-items: baseline; justify-content: space-between; }
@@ -658,6 +1462,45 @@ code { font-family: var(--font-mono); }
 }
 .plan-actions { display: flex; gap: 8px; margin-top: 2px; }
 
+/* Pull requests: the same 14 px gutter and separator as a collapsible section, but there
+   is nothing to collapse, so it is a plain block. */
+.pr-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 11px var(--gutter);
+  border-bottom: 1px solid var(--separator-soft);
+}
+.pr-row { display: flex; align-items: baseline; gap: 8px; }
+.pr-label {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--label);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pr-cost {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--label);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Tooling: three lists under one collapsible header. */
+.tooling-groups { display: flex; flex-direction: column; gap: 12px; }
+.tooling-group { display: flex; flex-direction: column; gap: 3px; }
+.tooling-title {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--label-3);
+  margin-bottom: 2px;
+}
+
 /* ---- collapsible sections (Activity / Models) ---------------------------------- */
 
 .collapsible {
@@ -738,6 +1581,15 @@ code { font-family: var(--font-mono); }
   color: var(--label);
 }
 .row-count { font-size: 11px; text-align: right; color: var(--label-2); }
+/* Counterfactual, not spend: green and never in the bar. */
+.row-saved {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: -0.2px;
+  text-align: right;
+  color: var(--label-2);
+}
+.row-saved-on { color: var(--sev-normal-ink); }
 .row-oneshot { font-size: 10.5px; text-align: right; color: var(--label-2); }
 
 .tokens-line {
@@ -859,6 +1711,7 @@ code { font-family: var(--font-mono); }
   background: var(--fill-06);
   color: var(--label);
   user-select: text;
+  overflow-wrap: anywhere;
 }
 .no-data-tool { color: var(--label-3); }
 
@@ -889,43 +1742,6 @@ code { font-family: var(--font-mono); }
 .setup-error { margin-top: 6px; text-align: left; font-family: var(--font-mono); font-size: 10px; word-break: break-word; user-select: text; }
 .setup-error-muted { margin-top: 4px; text-align: left; font-size: 10px; color: var(--label-3); word-break: break-all; }
 
-/* ---- settings ------------------------------------------------------------------- */
-
-.settings { display: flex; flex-direction: column; padding: 8px 0 14px; }
-.settings-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 2px var(--gutter) 10px;
-}
-.settings-title { font-size: 13px; font-weight: 600; color: var(--label); }
-.settings-group {
-  display: flex;
-  flex-direction: column;
-  padding: 8px var(--gutter) 6px;
-  border-top: 1px solid var(--separator-soft);
-}
-.settings-group-label {
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.4px;
-  text-transform: uppercase;
-  color: var(--label-3);
-  margin-bottom: 4px;
-}
-.settings-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 7px 0;
-}
-.settings-row-text { flex: 1; min-width: 0; }
-.settings-row-label { font-size: 12px; font-weight: 500; color: var(--label); }
-.settings-row-hint { margin-top: 1px; font-size: 10.5px; line-height: 1.35; color: var(--label-2); word-break: break-word; }
-.settings-row-control { flex-shrink: 0; display: flex; align-items: center; }
-.settings-error { font-size: 10.5px; color: var(--danger); padding-bottom: 6px; }
-
 .toggle {
   position: relative;
   width: 34px;
@@ -951,24 +1767,6 @@ code { font-family: var(--font-mono); }
 }
 .toggle-on .toggle-knob { transform: translateX(14px); }
 
-.segmented {
-  display: flex;
-  gap: 1px;
-  padding: 2px;
-  border-radius: var(--radius-track);
-  background: var(--fill-08);
-}
-.segment {
-  border: 0;
-  background: transparent;
-  padding: 3px 9px;
-  border-radius: var(--radius-segment);
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--label-2);
-}
-.segment-active { background: var(--surface-window); color: var(--label); box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.10); }
-
 /* ---- loading overlay ---------------------------------------------------------- */
 
 .loading-overlay {
@@ -985,6 +1783,41 @@ code { font-family: var(--font-mono); }
 }
 .loading-content { display: flex; flex-direction: column; align-items: center; gap: 14px; }
 .loading-text { font-size: 11.5px; font-weight: 500; color: var(--label-2); }
+
+/* Fetch error: the same sheet as the loading overlay, because it replaces it. */
+.fetch-error-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 20px;
+  background: var(--overlay-material);
+  backdrop-filter: blur(18px) saturate(160%);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  animation: fadeIn 200ms ease-in-out;
+}
+.fetch-error-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  max-width: 280px;
+  text-align: center;
+}
+.fetch-error-icon { color: var(--brand-accent); }
+.fetch-error-title { font-size: 12.5px; font-weight: 600; color: var(--label); }
+.fetch-error-message {
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--label-2);
+  user-select: text;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 
 .burn-flame { position: relative; }
 .burn-flame svg { position: absolute; inset: 0; }
@@ -1129,6 +1962,37 @@ code { font-family: var(--font-mono); }
 }
 .star-banner-close:hover { background: var(--fill-08); }
 
+/* ---- CLI update banner ---------------------------------------------------------- */
+
+.cli-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: color-mix(in srgb, var(--update-ink) 8%, transparent);
+  box-shadow: inset 0 0.5px 0 var(--fill-18);
+}
+.cli-banner-icon { color: var(--update-ink); display: inline-flex; flex-shrink: 0; }
+.cli-banner-text { font-size: 10.5px; font-weight: 500; color: var(--label); white-space: nowrap; }
+.cli-banner-action,
+.cli-banner-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--update-ink);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.cli-banner-action:disabled { opacity: 0.6; }
+.cli-banner-copy code { font-family: var(--font-mono); font-size: 10px; font-weight: 500; }
+.cli-banner-copy:hover code { text-decoration: underline; }
+.cli-banner-spacer { flex: 1; }
+
 /* ---- error toast --------------------------------------------------------------- */
 
 .error-toast {
@@ -1159,3 +2023,255 @@ code { font-family: var(--font-mono); }
   color: var(--tooltip-fg-2);
 }
 .error-toast-close:hover { background: rgba(127, 127, 127, 0.2); }
+
+/* ---- settings window ------------------------------------------------------------- */
+
+/* A decorated, resizable window rather than a panel inside the popover, so it paints its
+   own background edge to edge: the sidebar takes the warm surface and the detail pane the
+   lighter window surface, which is the arrangement macOS System Settings uses and the one
+   the mac app's SettingsView mirrors. */
+.stg {
+  display: flex;
+  height: 100%;
+  background: var(--surface-window);
+  color: var(--label);
+  font-size: 12px;
+}
+
+.stg-sidebar {
+  flex: 0 0 240px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 10px;
+  background: var(--surface);
+  border-right: 1px solid var(--separator);
+}
+
+.stg-search { padding: 12px 12px 8px; }
+.stg-search-field,
+.stg-field,
+.stg-select {
+  font: inherit;
+  color: var(--label);
+  background: var(--control-bg);
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius-pill);
+  padding: 4px 7px;
+}
+.stg-search-field { width: 100%; }
+.stg-search-field::-webkit-search-cancel-button { cursor: default; }
+.stg-select { min-width: 132px; }
+.stg-field { min-width: 120px; }
+.stg-select:focus-visible,
+.stg-field:focus-visible,
+.stg-search-field:focus-visible { outline: 2px solid var(--brand-accent); outline-offset: 1px; }
+
+.stg-list { list-style: none; margin: 0; padding: 0 8px; }
+.stg-list-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 14px 14px 5px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--label-3);
+}
+.stg-list-count { font-family: var(--font-mono); letter-spacing: 0; text-transform: none; }
+.stg-list-empty { padding: 4px 14px; font-size: 11px; color: var(--label-3); }
+
+.stg-row-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 30px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  text-align: left;
+}
+.stg-row-btn:hover { background: var(--control-hover); }
+.stg-row-btn-active,
+.stg-row-btn-active:hover { background: var(--brand-accent); color: #FFFFFF; }
+.stg-row-btn-dim { color: var(--label-2); }
+.stg-row-btn-active.stg-row-btn-dim { color: rgba(255, 255, 255, 0.86); }
+.stg-row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.stg-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  border-radius: 5px;
+  font-size: 9px;
+  font-weight: 700;
+  color: #FFFFFF;
+}
+.stg-chip-general { background: linear-gradient(var(--brand-accent-dark), var(--brand-accent)); }
+.stg-chip-about { background: linear-gradient(#9A9AA0, #75757A); }
+.stg-glyph { display: inline-flex; align-items: center; justify-content: center; width: 20px; flex-shrink: 0; }
+.stg-dot { width: 6px; height: 6px; border-radius: 3px; background: var(--sev-normal); flex-shrink: 0; }
+
+.stg-detail { flex: 1; min-width: 0; overflow-y: auto; }
+.stg-pane { padding: 20px 24px 32px; max-width: 640px; }
+
+.stg-group { margin-bottom: 22px; }
+.stg-group-title { margin: 0 0 7px 2px; font-size: 12px; font-weight: 600; color: var(--label); }
+.stg-card {
+  background: var(--surface);
+  border: 1px solid var(--separator);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+}
+.stg-footer { margin: 7px 2px 0; font-size: 10.5px; line-height: 1.4; color: var(--label-2); }
+
+.stg-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--separator-soft);
+}
+.stg-row:last-child, .stg-card > :last-child { border-bottom: 0; }
+.stg-row-stacked { flex-direction: column; align-items: stretch; gap: 8px; }
+.stg-row-text { min-width: 0; }
+.stg-row-label { font-size: 12px; font-weight: 500; color: var(--label); }
+.stg-row-hint { margin-top: 1px; font-size: 10.5px; line-height: 1.35; color: var(--label-2); }
+.stg-row-control { flex-shrink: 0; display: flex; align-items: center; gap: 8px; }
+.stg-row-stacked .stg-row-control { justify-content: flex-start; }
+.stg-note {
+  padding: 8px 12px;
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--label-2);
+  border-bottom: 1px solid var(--separator-soft);
+}
+.stg-error { color: var(--danger); }
+
+/* 18 px on a 26 px pitch: the popover's own swatches are 12 px and easy to miss. */
+.stg-swatches { display: flex; gap: 8px; }
+.stg-swatch {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--separator);
+  border-radius: 9px;
+}
+.stg-swatch-on { outline: 2px solid var(--label); outline-offset: 1px; }
+
+.stg-slider {
+  width: 168px;
+  height: 16px;
+  appearance: none;
+  background: transparent;
+}
+.stg-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(
+    to right,
+    var(--brand-accent) 0 var(--slider-filled),
+    var(--fill-15) var(--slider-filled) 100%
+  );
+}
+.stg-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border-radius: 50%;
+  background: var(--brand-accent);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+
+.stg-link-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--separator-soft);
+  background: transparent;
+  text-align: left;
+}
+.stg-link-row:hover { background: var(--control-hover); }
+.stg-link-arrow { color: var(--label-3); display: inline-flex; }
+.stg-link-row:hover .stg-link-arrow { color: var(--brand-accent); }
+
+.stg-hero { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 0 22px; }
+.stg-hero-mark { line-height: 0; margin-bottom: 8px; }
+.stg-hero-name { font-family: var(--font-display); font-size: 17px; font-weight: 600; }
+.stg-hero-version { font-size: 11.5px; color: var(--label-2); }
+.stg-hero-tagline { font-size: 11px; color: var(--label-3); }
+
+.stg-conn { display: flex; align-items: flex-start; gap: 10px; min-width: 0; }
+.stg-conn-icon { display: inline-flex; flex-shrink: 0; padding-top: 1px; color: var(--label-3); }
+.stg-conn-connected, .stg-conn-stale { color: var(--sev-normal-ink); }
+.stg-conn-terminalFailure { color: var(--danger); }
+.stg-conn-transientFailure { color: var(--sev-critical-ink); }
+.stg-row-btn-active .stg-dot { background: #FFFFFF; }
+.stg-path {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  word-break: break-all;
+  user-select: text;
+}
+.stg-readout { font-family: var(--font-mono); font-size: 11px; color: var(--label-2); min-width: 38px; text-align: right; }
+.stg-provider { display: inline-flex; align-items: center; gap: 7px; }
+.stg-attention { font-size: 10px; color: var(--danger); }
+/* The Tokens metric swaps calls and sessions for an up and down pair, so those two rows
+   carry a glyph as well as a figure. */
+.hero-calls, .hero-sessions { display: inline-flex; align-items: center; gap: 2px; }
+/* The native popup is painted by the OS in its own colours, so an option that only inherits
+   the select's colour is white on white in the dark theme. Both are stated here. */
+.stg-select option { background: var(--surface-window); color: var(--label); }
+
+/* ---- Anonymous telemetry consent ------------------------------------------------- */
+
+/* Shown once, in the popover and in the settings window, so it is sized from tokens
+   rather than from either surface's own spacing. */
+.consent {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 10px 12px;
+  background: var(--fill-06);
+  box-shadow: inset 0 0.5px 0 var(--fill-18);
+}
+.consent-title {
+  margin: 0;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--label);
+}
+.consent-body {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--label-2);
+}
+.consent-link {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--brand-accent);
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 500;
+  text-decoration: underline;
+}
+.consent-actions {
+  display: flex;
+  gap: 8px;
+  align-self: flex-end;
+}

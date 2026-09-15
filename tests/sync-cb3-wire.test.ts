@@ -20,6 +20,7 @@ import {
 } from '../src/sync/otlp.js'
 import type { ParsedApiCall, ProjectSummary, TokenUsage } from '../src/types.js'
 import type { PlanMap } from '../src/config.js'
+import { setHome } from './setup/home.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -190,12 +191,12 @@ const originalHome = process.env.HOME
 
 beforeEach(async () => {
   tmpDir = await mkdtemp(join(tmpdir(), 'codeburn-cb3-'))
-  process.env.HOME = tmpDir
+  setHome(tmpDir)
   process.env.XDG_CACHE_HOME = join(tmpDir, '.cache')
 })
 
 afterEach(async () => {
-  process.env.HOME = originalHome
+  setHome(originalHome)
   await rm(tmpDir, { recursive: true, force: true })
 })
 

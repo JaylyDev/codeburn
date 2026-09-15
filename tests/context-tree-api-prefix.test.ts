@@ -7,6 +7,7 @@ import type { Server } from 'http'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { runWebDashboard } from '../src/web-dashboard.js'
+import { setHome } from './setup/home.js'
 
 // Issue #767 item 2: `codeburn context <session>` accepts an 8-char session id
 // prefix (findClaudeSession does a startsWith match), but /api/context/tree
@@ -27,7 +28,7 @@ describe('web dashboard /api/context/tree: session id prefix', () => {
   beforeEach(async () => {
     homeDir = await mkdtemp(join(tmpdir(), 'codeburn-context-home-'))
     cacheDir = await mkdtemp(join(tmpdir(), 'codeburn-context-cache-'))
-    process.env['HOME'] = homeDir
+    setHome(homeDir)
     process.env['CODEBURN_CACHE_DIR'] = cacheDir
     delete process.env['CLAUDE_CONFIG_DIR']
 

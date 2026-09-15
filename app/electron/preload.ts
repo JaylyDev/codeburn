@@ -26,10 +26,17 @@ const bridge = {
   getActReport: () => invoke('codeburn:getActReport'),
   getModels: (period: string, provider: string, byTask: boolean, range?: DateRange, background?: boolean) => invoke('codeburn:getModels', period, provider, byTask, range, background),
   getSessions: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getSessions', period, provider, range, background),
+  getSessionsContributions: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getSessionsContributions', period, provider, range, background),
   getCompareModels: (period: string, provider: string, background?: boolean) => invoke('codeburn:getCompareModels', period, provider, background),
   getCompare: (period: string, provider: string, modelA: string, modelB: string) => invoke('codeburn:getCompare', period, provider, modelA, modelB),
+  getPeriodCompare: (rangeA: DateRange, rangeB: DateRange, provider: string, background?: boolean) => invoke('codeburn:getPeriodCompare', rangeA, rangeB, provider, background),
+  getPeriodCompareSessions: (rangeA: DateRange, rangeB: DateRange, provider: string, dimension: string, key: string) => invoke('codeburn:getPeriodCompareSessions', rangeA, rangeB, provider, dimension, key),
+  getCompareCohortModels: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getCompareCohortModels', period, provider, range, background),
+  getCompareCohort: (period: string, provider: string, modelA: string, modelB: string, range?: DateRange, projects?: string[], category?: string, background?: boolean) =>
+    invoke('codeburn:getCompareCohort', period, provider, modelA, modelB, range, projects, category, background),
   getYield: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getYield', period, provider, range, background),
   getSpendFlow: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getSpendFlow', period, provider, range, background),
+  getBranchSpend: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getBranchSpend', period, provider, range, background),
   getOptimizeReport: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getOptimizeReport', period, provider, range, background),
   getDevices: (period: string) => invoke('codeburn:getDevices', period),
   getDevicesScan: () => invoke('codeburn:getDevicesScan'),
@@ -39,6 +46,9 @@ const bridge = {
   getProxyPaths: () => invoke('codeburn:getProxyPaths'),
   getAudit: (period: string, provider: string, range?: DateRange) => invoke('codeburn:getAudit', period, provider, range),
   getPriceOverrides: () => invoke('codeburn:getPriceOverrides'),
+  getProjectFilter: () => invoke('codeburn:getProjectFilter'),
+  setProjectFilter: (filter: { project: string[]; exclude: string[] }) => invoke('codeburn:setProjectFilter', filter),
+  getUnfilteredProjects: () => invoke('codeburn:getUnfilteredProjects'),
   setPriceOverride: (model: string, rates: PriceRates) => invoke('codeburn:setPriceOverride', model, rates),
   removePriceOverride: (model: string) => invoke('codeburn:removePriceOverride', model),
   setCurrency: (code: string) => invoke('codeburn:setCurrency', code),
@@ -69,6 +79,16 @@ const bridge = {
     ipcRenderer.on('codeburn:update', listener)
     return () => { ipcRenderer.removeListener('codeburn:update', listener) }
   },
+  // The bundled tray app and its Capacity Dock (Windows). Every setter answers with the
+  // whole status, so the sidebar renders what took rather than what it asked for.
+  companionStatus: () => invoke('codeburn:companionStatus'),
+  setMenuBarEnabled: (enabled: boolean) => invoke('codeburn:setMenuBarEnabled', enabled),
+  setSidebarEnabled: (enabled: boolean) => invoke('codeburn:setSidebarEnabled', enabled),
+  // The tray app's own settings, in the two files it reads them from.
+  trayPrefs: () => invoke('codeburn:trayPrefs'),
+  setTrayAppPref: (patch: Record<string, unknown>) => invoke('codeburn:setTrayAppPref', patch),
+  setTrayDockPref: (patch: Record<string, unknown>) => invoke('codeburn:setTrayDockPref', patch),
+  setLaunchAtLogin: (enabled: boolean) => invoke('codeburn:setLaunchAtLogin', enabled),
   // Plugin management
   pluginList: () => invoke('codeburn:pluginList'),
   pluginInfo: (name: string) => invoke('codeburn:pluginInfo', name),

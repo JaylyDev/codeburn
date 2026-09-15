@@ -52,6 +52,145 @@ bundled CLI's dependency tree gets stripped out of an `extraResources` copy
 in verbatim, which is the electron-builder-recommended mechanism for adding
 unpacked files that must not be ASAR-archived.
 
+## The bundled tray app and Capacity Dock (Windows only)
+
+The Windows desktop app also carries the Tauri tray app from `windows/`, so
+installing the desktop app gives the user the tray icon and the Capacity Dock
+without their having to know that `codeburn menubar` exists. Two switches in the
+sidebar's bottom-left corner turn each surface off ("Menu bar" is the tray
+process, "Sidebar" is the dock rail); both default on, and neither appears on
+macOS or Linux, or in a build with nothing staged.
+
+`scripts/stage-menubar.mjs` puts the tray app into `app/build/menubar`, which
+`build.win.extraResources` ships as `resources/menubar`. It copies rather than
+downloads, exactly like `stage-cli.mjs`: with no `--from` it takes the local
+`windows/src-tauri/target/release` output, and CI downloads the `windows-v*`
+release assets in its own step and passes `--from <dir>`.
+
+The two routes need different things staged, which is why there are two scripts:
+
+- `npm run stage-menubar` (run by `package:win`) stages
+  `CodeBurn.Menubar_<version>_x64_en-US.msi` and its `.sha256`. The digest is
+  copied from the release when it is there and computed when it is not, so a
+  local `cargo tauri build` stages the same shape a release does.
+- `npm run stage-menubar:store` (run by `package:store`) stages
+  `codeburn-menubar.exe` itself, plus any sidecar DLL beside it.
+
+**The staged tray app is not the released one, even at the same version.**
+`build-windows-installer.yml` runs `npm run tauri build` itself and stages the
+MSI that run produced. `release-menubar-windows.yml` runs its own
+`npm run tauri build` on a `windows-v*` tag and uploads that MSI as the release
+asset. Two builds, two binaries: a Tauri MSI is not byte-reproducible (build
+timestamps, the package GUID and the PDB signature differ per run), so the
+`CodeBurn.Menubar_<version>_x64_en-US.msi` inside a desktop installer and the
+`windows-v<version>` release asset of the same name are different files with
+different `.sha256` digests, even off the same commit.
+
+Nothing in the install path depends on them matching: the CLI's installer
+verifies the digest of the file it was handed, and the upgrade rules go by the
+`DisplayVersion` in the uninstall registry rather than by a hash. What it does
+mean is that a version number is not a statement about which binary is on a
+machine, and the release asset is not a way to reproduce or verify what a
+desktop installer carries. So cut both from one commit when releasing, and say
+"built by the desktop installer" or "the windows-v asset" rather than treating
+the version as an identifier for either.
+
+### The NSIS route: install through the CLI, never downgrade
+
+`app/electron/menubar.ts` runs at every launch (which is also what covers a
+desktop-app update, since the staged MSI travels with the app) and hands the
+staged file to the CLI's own Windows installer by spawning
+`codeburn menubar --staged-msi <absolute path>`. The path is an argument of the
+command rather than an environment variable, so nothing a variable in the
+inherited environment happens to name can reach msiexec; the
+`CODEBURN_MENUBAR_MSI` variable this replaced is now rejected by the CLI. The
+install itself is not reimplemented on the Electron side:
+`src/menubar-installer.ts` owns the uninstall-registry read, the checksum
+verification, the `msiexec /i ... /passive /norestart` call and the rules that
+go with a bundled copy. It prints one `CODEBURN_MENUBAR_RESULT <json>` line that
+the desktop app reads.
+
+The spawn itself is not made at every launch. `msiexec /passive` puts an admin
+prompt in front of the user, so `companion.v1.json` records the version of the
+tray app that is on disk and the version of any staged MSI whose install the
+user declined at that prompt (exit 1602). A launch skips the probe when the
+recorded tray app is the staged version and is still there, and skips it when
+this exact staged version was already refused. A newer staged version is always
+offered, and so is turning the "Menu bar" switch on by hand, which clears the
+refusal.
+
+Only a refusal is remembered. A spawn that timed out, a CLI that was not there
+and a run that died before printing its result are all transient, so nothing is
+written down and the install is attempted again at the next launch; recording
+them would turn one bad launch into a tray app that is never installed.
+
+When msiexec exits 3010 the install is real but unfinished: Windows could not
+replace a file that was in use and has deferred it to the next restart, so the
+binary on disk is still the previous tray app while the uninstall registry
+already reports the new version. The desktop app starts nothing in that state
+and the sidebar corner says "Restart Windows to finish installing the menu bar
+app." instead. `BundledInstallResult` carries no field for this, so the desktop
+side reads the installer's own notice line; the optional `rebootRequired` in
+`MenubarInstallResult` is believed first, for when the CLI starts sending it.
+
+Two of those rules matter here:
+
+- **Deduplication.** The MSI carries a fixed WiX upgrade code
+  (`windows/src-tauri/tauri.conf.json`, `bundle.windows.wix.upgradeCode`), which
+  is the value Tauri already derived from the product name, so installing the
+  bundled copy over a manual `codeburn menubar` install is an in-place upgrade
+  rather than a second entry in Programs and Features.
+- **Never downgrade.** If the installed `DisplayVersion` is newer than the
+  bundled one, nothing is installed and the existing app is left alone.
+
+**The marker.** The installer writes
+`%LOCALAPPDATA%\codeburn-menubar\installed-by.json`, crediting `desktop` only
+when it installed onto a machine that had no tray app, and `manual` when it
+upgraded one that was already there. An existing marker's verdict is never
+rewritten. `build/installer.nsh` (wired as `nsis.include`) reads it in the
+uninstaller and removes the tray app only when the marker says `desktop`, so a
+tray app the user installed by hand survives an uninstall of the desktop app.
+
+Launch at login on this route is a single `HKCU\...\CurrentVersion\Run` value
+named `CodeBurn`, the same value the tray app's own settings toggle writes
+(`windows/src-tauri/src/autostart.rs`), so the two can never leave two entries.
+
+### The Store route: no msiexec
+
+A packaged app cannot run `msiexec` and would be fighting the package manager if
+it could, so the AppX build ships `codeburn-menubar.exe` inside the package and
+launches it from `app\resources\menubar\`. Launch at login is a
+`windows.startupTask` extension (`build/appx-extensions.xml`, wired as
+`appx.customExtensionsPath`), which also lets the user turn it off in
+**Settings > Apps > Startup**; no Run value is written. The tray app detects the
+package with `GetCurrentPackageFullName` and skips its own update checker
+entirely, since Store updates cover it.
+
+That is why the Store is the recommended Windows install: it is the only
+Windows route with a signed artifact (Microsoft signs the package at
+submission) and a real update path. The GitHub downloads stay a developer
+preview, unsigned and without self-update, until an Authenticode certificate
+exists.
+
+The startup task is Windows' to set, not this app's: reaching one would take the
+WinRT `Windows.ApplicationModel.StartupTask` API, which Electron has no binding
+for and which this app ships no native code to reach, and a Run value written
+beside it would start the tray app twice. So `trayPrefs()` reports
+`launchAtLoginManaged: true` on this route and the Menu bar pane renders that row
+as text plus a button that opens `ms-settings:startupapps`, rather than a switch
+that would silently move nothing. That URL is the one exception in the main
+process's external-open guard, which is otherwise http(s) only.
+
+### Talking to a running tray app
+
+The tray app has no window of its own, so its argv is the control channel: the
+Tauri single-instance plugin hands a running instance whatever a second launch
+was started with (`windows/src-tauri/src/lib.rs`). `--quit` exits and
+`--reload-settings` re-reads the preference files. Turning "Sidebar" off writes
+`enabled: false` into `~/.config/codeburn/windows-dock.json` and then sends
+`--reload-settings`, so a running rail disappears at once rather than at the next
+launch.
+
 ## Versioning
 
 `app/package.json`'s `version` tracks the CLI's version (root
@@ -176,6 +315,11 @@ Config (`build.win` + `build.nsis`):
 - `win.target: nsis`, `arch: x64`.
 - `win.icon: build/icon.png` — electron-builder converts the 1024x1024 PNG to
   a multi-resolution `.ico` at build time (same source PNG as the mac icon).
+- `win.extraResources: build/menubar -> menubar`: the staged tray app (see
+  "The bundled tray app and Capacity Dock" above). No `node_modules` is
+  involved, so unlike the CLI this one can use `extraResources`.
+- `nsis.include: build/installer.nsh`: the uninstall macro that removes the
+  tray app only when the marker says the desktop app installed it.
 - `nsis.oneClick: false` — an assisted installer with a wizard, so users get
   an **install-directory choice** instead of a silent one-click install.
 - `nsis.perMachine: false` — installs per-user (into the user's `AppData`),
@@ -187,6 +331,47 @@ no-op — the `.exe` ships without a signature. On first run, Windows SmartScree
 shows **"Windows protected your PC"**. Users click **"More info" → "Run
 anyway"** to launch it. This is expected for an unsigned build; the only fix is
 a purchased code-signing (Authenticode/EV) certificate.
+
+**ARM64 builds.** `npm --prefix app run package:win:arm64` builds the installer for ARM64
+Windows. It sets `ELECTRON_BUILDER_7Z_FILTER=BCJ`, and that is not optional: 7-Zip
+compresses ARM64 executables with its ARM64 branch filter by default, the 7-Zip decoder
+inside the NSIS installer predates that filter, and the installer then silently drops
+every .exe and .dll while the data files land, leaving an install with no program in it.
+The x64 build is unaffected because its default filter is one the decoder knows. The
+per-architecture archives inside a universal installer get the same treatment, so an
+installer built with both `--x64` and `--arm64` needs the variable too.
+
+**The ARM64 installer carries the x64 tray app.** `package:win:arm64` runs the same
+`npm run stage-menubar` as `package:win`, and there is no ARM64 tray app for it to stage:
+
+- `tauri build` builds for the host, so an ARM64 Windows machine produces
+  `CodeBurn Menubar_<version>_arm64_en-US.msi`, and `stage-menubar.mjs` matches only
+  `CodeBurn[ .]Menubar_<version>_x64_en-US.msi`. Staging on an ARM64 host therefore fails
+  outright with `no CodeBurn.Menubar_<version>_x64_en-US.msi` rather than staging the arm64
+  bundle. What `package:win:arm64` actually ships is the x64 MSI, from an x64 host build or
+  from the `windows-v*` release assets passed with `--from`.
+- Teaching the staging script the arm64 name would not help on its own. The CLI is what runs
+  the install, and `src/menubar-installer.ts` accepts only the x64 name: its release-asset
+  pattern, `parseWindowsMsiVersion` and the staged-install path all require
+  `_x64_en-US.msi`, and a file named anything else is rejected before msiexec sees it. An
+  ARM64 tray app would need a matching change there and in the tray's own updater, which is a
+  larger piece of work than the packaging script.
+- What it means in practice: on ARM64 Windows the desktop app installs the x64 tray app, and
+  Windows runs it under x64 emulation. It works, and it is slower and heavier than a native
+  build would be. Nothing misreports its architecture, because the tray app's version and the
+  uninstall-registry entry are both the x64 MSI's own.
+
+`build-windows-installer.yml` builds `package:win` on `windows-latest` only, so no released
+artifact is affected: `package:win:arm64` is a local build today.
+
+**Distribution policy.** The Microsoft Store build (Store ID `9P0R4ZL5XMB8`) is
+the recommended Windows install. This NSIS setup `.exe` and the tray `.msi`
+under the `windows-v*` releases are a developer preview: unsigned, SmartScreen
+warns on first run, and neither route updates itself. The tray app still
+reports that a newer version exists and points at the GitHub release; taking it
+means re-running `codeburn menubar --force` or downloading the build by hand.
+One-click updating comes back once an Authenticode certificate signs the
+artifacts.
 
 ### Microsoft Store (`package:store`)
 
@@ -208,6 +393,10 @@ submission. Direct sideloading requires a separate trusted or development
 certificate. The AppX declares `runFullTrust` (electron-builder's required
 default for Electron apps), so CodeBurn retains access to the user's local
 provider session files rather than running in a UWP application sandbox.
+
+The tray app ships inside this package too (`app\resources\menubar\`), with a
+`windows.startupTask` extension for launch at login. `msiexec` is never run on
+this route. See "The Store route" above.
 
 ### Linux (`package:linux`)
 

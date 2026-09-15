@@ -56,6 +56,9 @@ export type DailyModelBreakdown = {
   calls: number
   inputTokens: number
   outputTokens: number
+  // Raw provider/model ids that collapsed into this display name. Present
+  // only when more than one folded in; absent for an older CLI (#1239).
+  rawModels?: string[]
 }
 
 export type DailyHistoryEntry = {
@@ -149,6 +152,7 @@ export type MenubarPayload = {
     cost: number
     calls: number
     sessions: number
+    sessionCountBasis?: 'identity' | 'partial'
     oneShotRate: number | null
     inputTokens: number
     outputTokens: number
@@ -162,6 +166,9 @@ export type MenubarPayload = {
       savingsUSD: number
       turns: number
       oneShotRate: number | null
+      // Raw TaskCategory key (additive, optional): `name` is the display label,
+      // this round-trips as the drill-through filter value.
+      rawCategory?: string
     }>
     topModels: Array<{
       name: string
@@ -176,13 +183,15 @@ export type MenubarPayload = {
     // Optional: older CLIs omit it. `id` is the internal provider name (round-trips
     // as --provider), `label` the display name. `hasUsage` distinguishes active $0
     // providers from detected-but-idle providers when present.
-    providerDetails?: Array<{ id: string; label: string; cost: number; calls?: number; hasUsage?: boolean }>
+    providerDetails?: Array<{ id: string; label: string; cost: number; calls?: number; hasUsage?: boolean; sessions?: number; sessionCountBasis?: 'identity' | 'partial' }>
     topProjects: Array<{
+      id?: string
       name: string
       cost: number
       savingsUSD: number
       sessions: number
-      avgCostPerSession: number
+      avgCostPerSession?: number
+      sessionCountBasis?: 'identity' | 'partial'
       sessionDetails: Array<{
         cost: number
         savingsUSD: number
@@ -191,6 +200,9 @@ export type MenubarPayload = {
         outputTokens: number
         date: string
         models: Array<{ name: string; cost: number; savingsUSD: number }>
+        // Drill-through identity (additive, optional): see topSessions.
+        sessionId?: string
+        provider?: string
       }>
     }>
     modelEfficiency: Array<{
@@ -204,6 +216,13 @@ export type MenubarPayload = {
       savingsUSD: number
       calls: number
       date: string
+      // Drill-through identity (additive, optional): provider + session id
+      // open the exact session even when another provider reuses id or title.
+      sessionId?: string
+      provider?: string
+      // Raw session project (the sessions-list row key); `project` stays the
+      // friendly display name.
+      projectKey?: string
     }>
     // Workflow-intelligence rollups (src/menubar-json.ts buildWorkflow /
     // buildTopReworkedFiles). Optional: older CLIs omit them, so the Overview
@@ -299,6 +318,12 @@ export type MenubarPayload = {
   currency?: { code: string; symbol: string; rate: number }
   combined?: CombinedUsage
   claudeConfigs?: ClaudeConfigSelector
+  // The CLI's anonymised, fully bucketed daily aggregate (src/telemetry-snapshot.ts).
+  // Sent verbatim as the `usage_snapshot` telemetry event, so the desktop app and
+  // the Windows tray report identical shapes. Opaque here: the renderer never reads
+  // inside it. Absent on CLIs that predate the field, which is when the renderer's
+  // own fallback builder takes over.
+  telemetrySnapshot?: Record<string, unknown> | null
 }
 
 // ————— src/types.ts + src/models-report.ts —————
@@ -323,6 +348,9 @@ export type ModelReportRow = {
   providerDisplayName: string
   model: string
   modelDisplayName: string
+  // Raw provider/model ids folded into this row (e.g. two routes of the same
+  // model). Length 1 when nothing merged.
+  rawModels: string[]
   category: TaskCategory | null
   inputTokens: number
   outputTokens: number
@@ -423,6 +451,74 @@ export type SpendFlow = {
   links: SpendFlowLink[]
 }
 
+// ————— src/branch-spend.ts — Spend "By branch" lens (shared contract) —————
+
+export type BranchTokenSplit = {
+  inputTokens: number
+  outputTokens: number
+  reasoningTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+}
+
+/** One session's contribution inside a single (project, branch) row; cost is
+ *  the branch-sliced portion. `workingDirectory` is the provider-recorded
+ *  historical cwd (the worktree path itself when the session ran in one). */
+export type BranchSpendSessionRow = {
+  sessionId: string
+  title?: string
+  provider: string
+  workingDirectory?: string
+  isSidechain?: boolean
+  cost: number
+  calls: number
+  tokens: BranchTokenSplit
+  models: string[]
+  firstActive: string | null
+  lastActive: string | null
+}
+
+export type BranchWorktreeRow = { path: string; sessions: number; cost: number }
+
+export type BranchSpendRow = {
+  projectId: string
+  projectLabel: string
+  /** `null` = Unknown: spend before the session's first observed branch. */
+  branch: string | null
+  cost: number
+  calls: number
+  sessions: number
+  tokens: BranchTokenSplit
+  firstActive: string | null
+  lastActive: string | null
+  worktrees: BranchWorktreeRow[]
+  sessionRows: BranchSpendSessionRow[]
+}
+
+export type BranchSpendCoverage = {
+  branchKnownCost: number
+  branchUnknownCost: number
+  noBranchDataCost: number
+  noBranchDataSessions: number
+  noBranchDataProviders: string[]
+  /** Identity-based; never the sum of row session counts (rows overlap). */
+  distinctSessions: number
+}
+
+export type BranchSpendProjectReport = {
+  id: string
+  label: string
+  totalCost: number
+  branches: BranchSpendRow[]
+  coverage: BranchSpendCoverage
+}
+
+export type BranchSpendReport = {
+  period: { label: string; start: string; end: string }
+  projects: BranchSpendProjectReport[]
+  totals: BranchSpendCoverage
+}
+
 // ————— src/optimize.ts —————
 
 export type WasteAction =
@@ -504,7 +600,7 @@ export type DeviceScanResult = { found: ScannedDevice[] }
 // ————— src/act/report.ts buildActReportJson —————
 
 export type ActReportJson = {
-  totals: {
+  totals?: {
     realizedCostUSD: number
     measuredActions: number
   }
@@ -532,6 +628,49 @@ export type SessionRow = {
   endedAt: string
   durationMs: number
 }
+
+// ————— src/session-contributions.ts (drill-through, `sessions --contributions`) —————
+
+/** One attributed slice of a session's in-range spend. Segments PARTITION the
+ *  session (every call lands in exactly one), so summing a single dimension
+ *  over all segments reconciles that dimension's aggregate exactly. `prs` is
+ *  the turn's ACTIVE PR set carried forward like the by-PR attribution: []
+ *  means unattributed, and a multi-PR set is listed whole (attributing to one
+ *  PR of the set is a 1/len share of the segment, never the full amount). */
+export type ContributionSegment = {
+  day: string
+  category: string | null
+  branch: string | null
+  /** Short model name -> attributed cost (same key family as modelBreakdown).
+   *  Sums to `cost`; the unattributable remainder rides under ''. */
+  models: Record<string, number>
+  /** Per-model request/token counts; absent in old cached reports. */
+  modelUsage?: Record<string, { calls: number; inputTokens: number; outputTokens: number }>
+  prs: string[]
+  /** True when the PR set is the legacy whole-session even split (transcript
+   *  expired before per-turn capture); absent otherwise. */
+  approx?: true
+  cost: number
+  calls: number
+  savingsUSD: number
+  inputTokens: number
+  outputTokens: number
+}
+
+/** Additive fields on SessionRow, present only in the contributions report. */
+export type SessionDrillFields = {
+  contributions?: { segments: ContributionSegment[] }
+  /** Canonical project identity (the same id topProjects[].id carries), so a
+   *  project chip matches rows exactly even when raw paths are prefix-similar. */
+  projectId?: string
+  /** Provider-recorded parent of a subagent transcript (integration point for
+   *  work-unit grouping). Absent for ordinary sessions. */
+  parentSessionId?: string
+  agentId?: string
+  isSidechain?: boolean
+}
+
+export type SessionDrillRow = SessionRow & SessionDrillFields
 
 // ————— src/compare-stats.ts —————
 export type ModelStats = {
@@ -582,6 +721,198 @@ export type CompareJsonReport = {
   metrics: ComparisonRow[]
   categories: CategoryComparison[]
   workingStyle: WorkingStyleRow[]
+}
+
+// ————— src/compare-cohorts.ts (compare --format cohort-json) —————
+// Mirrors the core contracts 1:1. The renderer never imports the Node engine,
+// so these hand copies ARE the IPC types; tests on both sides pin the same
+// percentile convention ([1,2,4,8] → median 3, P90 6.8).
+
+/** One observation = one edit turn whose behavioral calls carry exactly one
+ *  model. `costUSD` is that model's own recorded cost in the turn (never
+ *  another model's, never the session total). */
+export type CohortObservation = {
+  sessionId: string
+  provider: string
+  project: string
+  timestamp: string
+  category: string
+  model: string
+  costUSD: number
+  /** False when costUSD is 0 on a model the pricing rules do not declare free
+   *  — a pricing gap, never displayed as a real $0 observation. */
+  costKnown: boolean
+  retries: number
+  oneShot: boolean
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  /** input + cache-read tokens: an explicit PROXY for context size, never a
+   *  measured context window. */
+  contextProxyTokens: number
+  /** False when the turn's calls report no tokens at all; volume bands must
+   *  exclude and count these, never read them as small. */
+  tokensReported: boolean
+}
+
+export type CohortVolumeStats = {
+  outputMedian: number | null
+  outputP90: number | null
+  inputMedian: number | null
+  inputP90: number | null
+  contextProxyMedian: number | null
+  contextProxyP90: number | null
+  missingMeasureCount: number
+}
+
+export type CohortStats = {
+  model: string
+  label: string
+  /** Declared population the rates below divide by (selection filters, plus a
+   *  volume band when one is active). */
+  observationCount: number
+  distinctSessionCount: number
+  retryCount: number
+  retryRate: number | null
+  oneShotCount: number
+  oneShotRate: number | null
+  costKnownCount: number
+  unknownCostCount: number
+  costMedian: number | null
+  costP90: number | null
+  costMean: number | null
+  costHistogram: { edges: number[]; counts: number[] }
+  volume: CohortVolumeStats
+}
+
+export type CohortModelReport = {
+  model: string
+  label: string
+  stats: CohortStats
+  /** The declared population itself: every statistic is reproducible from it. */
+  observations: CohortObservation[]
+  exclusions: {
+    multiModelTurnCount: number
+    combinedMultiModelCostUSD: number
+    noBehavioralModelTurns: number
+  }
+}
+
+export type CohortComparisonReport = {
+  kind: 'cohort-comparison'
+  period: { label: string; provider: string }
+  selection: { projects: string[]; category: string | null; from: string | null; to: string | null }
+  conventions: {
+    percentile: string
+    contextProxy: string
+    attribution: string
+  }
+  modelA: CohortModelReport
+  modelB: CohortModelReport
+}
+
+export type CohortFacets = {
+  kind: 'cohort-facets'
+  models: ModelStats[]
+  projects: Array<{ id: string; project: string; projectPath: string; sessions: number; costUSD: number }>
+  categories: Array<{ id: string; label: string }>
+}
+// ---- Compare periods (period-diff; B minus A, A is the reference) ----
+// Mirrors the JSON emitted by `codeburn compare-periods --format json`
+// (src/period-diff.ts). Raw (unrounded) numbers; the UI formats.
+
+export type PeriodRangeInfo = { from: string; to: string; days: number }
+
+export type PeriodContribution = {
+  key: string
+  costA: number
+  costB: number
+  diff: number
+  /** diff / |costA| x 100; null when costA is 0 (the row is `new`). */
+  pct: number | null
+  status: 'new' | 'gone' | 'up' | 'down' | 'flat'
+  callsA: number
+  callsB: number
+}
+
+export type PeriodTotalsRow = {
+  cost: number
+  calls: number
+  sessions: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  savingsUSD: number
+  estimatedCostUSD: number
+}
+
+export type PeriodTotalsDiff = {
+  A: PeriodTotalsRow
+  B: PeriodTotalsRow
+  diff: PeriodTotalsRow
+  pct: Record<keyof PeriodTotalsRow, number | null>
+}
+
+export type NormalizedMetric = { a: number | null; b: number | null; diff: number | null; pct: number | null }
+
+export type AggregateDayRow = { date: string; historyCost: number; detailCost: number; aggregateOnly: number }
+
+export type PeriodDayCost = { date: string; cost: number }
+
+export type PeriodHistoryBasis = {
+  historyCost: { A: number; B: number }
+  detailCost: { A: number; B: number }
+  days: { A: AggregateDayRow[]; B: AggregateDayRow[] }
+  aggregateOnly: { A: number; B: number }
+  basis: string
+}
+
+export type PeriodDiffReport = {
+  schema: 1
+  provider: string
+  rangeA: PeriodRangeInfo
+  rangeB: PeriodRangeInfo
+  overlapDays: number
+  durationDeltaDays: number
+  totals: PeriodTotalsDiff
+  projects: PeriodContribution[]
+  models: PeriodContribution[]
+  normalized: {
+    perDay: NormalizedMetric
+    per100Calls: NormalizedMetric
+    denominators: { perDay: string; per100Calls: string }
+  }
+  /** Cost per local day for each side, zero-filled over every day in the range. */
+  daily: { A: PeriodDayCost[]; B: PeriodDayCost[] }
+  coverage: {
+    unpricedModelsA: Array<{ model: string; calls: number }>
+    unpricedModelsB: Array<{ model: string; calls: number }>
+    pricingCoverageA: number | null
+    pricingCoverageB: number | null
+  }
+  history?: PeriodHistoryBasis
+}
+
+export type PeriodSessionDiff = {
+  dimension: 'project' | 'model'
+  key: string
+  provider: string
+  rangeA: PeriodRangeInfo
+  rangeB: PeriodRangeInfo
+  sessions: Array<{
+    identity: string
+    provider: string
+    sessionId: string
+    project: string
+    title?: string
+    costA: number
+    costB: number
+    diff: number
+    callsA: number
+    callsB: number
+  }>
 }
 
 // ————— src/models.ts + src/audit-report.ts (audit --format json) —————
@@ -676,6 +1007,54 @@ export type UpdateStatus = {
   tag: string | null
 }
 
+/** The tray app and the Capacity Dock the Windows desktop app bundles (app/electron/menubar.ts).
+ *  `supported` is false everywhere else, and on a Windows build with nothing staged. */
+export type CompanionStatus = {
+  supported: boolean
+  menuBar: boolean
+  sidebar: boolean
+  /** The Store route, where launch at login is the package's own startup task. */
+  store: boolean
+  /** True when this run installed a tray app that Windows can only finish putting in place at
+   *  the next restart. Nothing is started until then, so the corner says so rather than
+   *  showing two switches on with nothing running. */
+  restartRequired?: boolean
+}
+
+/** The tray app's own settings, from the two files it reads them from
+ *  (windows-settings.json, windows-dock.json) plus the HKCU Run value. */
+export type TrayPrefs = {
+  app: {
+    metric: string
+    menubarPeriod: string
+    accent: string
+    trayBadge: boolean
+    usageRefreshSeconds: number
+    quotaCadenceSeconds: number
+    terminal: string
+  }
+  dock: {
+    enabled: boolean
+    preferred: string | null
+    scale: number
+    theme: string
+    gaugeShape: string
+    providers: string[]
+    manualSelection: boolean
+  }
+  launchAtLogin: boolean
+  /** True where launch at login belongs to Windows rather than to this app: the Store
+   *  package declares it as its own startup task, so the pane points at Settings > Apps >
+   *  Startup instead of showing a switch (app/electron/menubar.ts). */
+  launchAtLoginManaged: boolean
+}
+
+export type ProjectFilter = { project: string[]; exclude: string[] }
+
+export type ProjectRow = { name: string; path: string; cost: number; sessions: number }
+
+export type ProjectsReport = { projects: ProjectRow[] }
+
 export interface CodeburnBridge {
   /** Subscribe to cold-start scan progress; returns an unsubscribe fn. */
   onProgress(cb: (event: ScanProgressEvent) => void): () => void
@@ -698,10 +1077,23 @@ export interface CodeburnBridge {
   readonly arch?: string
   getModels(period: Period, provider: string, byTask: boolean, range?: DateRange, background?: boolean): Promise<ModelReportRow[]>
   getSessions(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<SessionRow[]>
+  /** Session rows with per-turn contribution segments (`sessions --contributions`).
+   *  Same population and filtering semantics as getSessions; additive fields only. */
+  getSessionsContributions(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<SessionDrillRow[]>
   getCompareModels(period: Period, provider: string, background?: boolean): Promise<ModelStats[]>
   getCompare(period: Period, provider: string, modelA: string, modelB: string): Promise<CompareJsonReport>
+  /** Cohort mode facets: models, canonical projects, activity categories. */
+  getCompareCohortModels(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<CohortFacets>
+  /** Cohort mode report; projects contains exact ids from CohortFacets. */
+  getCompareCohort(period: Period, provider: string, modelA: string, modelB: string, range?: DateRange, projects?: string[], category?: string, background?: boolean): Promise<CohortComparisonReport>
+  /** Compare periods (B minus A). Both ranges are required local YYYY-MM-DD keys. */
+  getPeriodCompare(rangeA: DateRange, rangeB: DateRange, provider: string, background?: boolean): Promise<PeriodDiffReport>
+  /** Sessions behind one project/model contribution, joined across A and B. */
+  getPeriodCompareSessions(rangeA: DateRange, rangeB: DateRange, provider: string, dimension: 'project' | 'model', key: string): Promise<PeriodSessionDiff>
   getYield(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<YieldJsonReport>
   getSpendFlow(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<SpendFlow>
+  /** Spend per canonical project × branch (`spend --format branch-json`). */
+  getBranchSpend(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<BranchSpendReport>
   getOptimizeReport(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<OptimizeJsonReport>
   getDevices(period: Period): Promise<CombinedUsage>
   getDevicesScan(): Promise<DeviceScanResult>
@@ -711,6 +1103,10 @@ export interface CodeburnBridge {
   getProxyPaths(): Promise<string[]>
   getAudit(period: Period, provider: string, range?: DateRange): Promise<AuditRow[]>
   getPriceOverrides(): Promise<PriceOverrideList>
+  getProjectFilter(): Promise<ProjectFilter>
+  setProjectFilter(filter: ProjectFilter): Promise<ProjectFilter>
+  /** Every project that exists, filter NOT applied: the Projects pane's checklist. */
+  getUnfilteredProjects(): Promise<ProjectsReport>
   setPriceOverride(model: string, rates: PriceRates): Promise<ActionResult>
   removePriceOverride(model: string): Promise<ActionResult>
   setCurrency(code: string): Promise<ActionResult>
@@ -728,6 +1124,16 @@ export interface CodeburnBridge {
   completeOnboarding(enabled: boolean): Promise<TelemetryStatus | null>
   telemetryTrack(name: string, props?: Record<string, unknown>): Promise<boolean>
   openExternal(url: string): Promise<void>
+  /** The bundled tray app and Capacity Dock (Windows). Optional so a preload that
+   *  predates them degrades to "not supported" rather than throwing. */
+  companionStatus?(): Promise<CompanionStatus>
+  setMenuBarEnabled?(enabled: boolean): Promise<CompanionStatus>
+  setSidebarEnabled?(enabled: boolean): Promise<CompanionStatus>
+  /** The tray app's own settings. Null when there is no tray app to have any. */
+  trayPrefs?(): Promise<TrayPrefs | null>
+  setTrayAppPref?(patch: Record<string, unknown>): Promise<TrayPrefs | null>
+  setTrayDockPref?(patch: Record<string, unknown>): Promise<TrayPrefs | null>
+  setLaunchAtLogin?(enabled: boolean): Promise<TrayPrefs | null>
   // Plugin management
   pluginList(): Promise<unknown>
   pluginInfo(name: string): Promise<unknown>

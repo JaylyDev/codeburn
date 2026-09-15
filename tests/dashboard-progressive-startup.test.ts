@@ -22,6 +22,7 @@ import { clearSessionCache, filesParsedFromSourceCount, isCompleteSessionSnapsho
 import { clearLoadCacheMemo, fingerprintFileCount, isColdCacheOnDisk } from '../src/session-cache.js'
 import { buildDurablePeriod } from '../src/usage-aggregator.js'
 import type { ProjectSummary } from '../src/types.js'
+import { setHome } from './setup/home.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -32,7 +33,7 @@ beforeEach(async () => {
   clearSessionCache()
   clearLoadCacheMemo()
   tmpDir = await mkdtemp(join(tmpdir(), 'dashboard-progressive-'))
-  process.env['HOME'] = tmpDir
+  setHome(tmpDir)
   process.env['CLAUDE_CONFIG_DIR'] = tmpDir
   process.env['CODEBURN_CACHE_DIR'] = join(tmpDir, 'cache')
   process.env['CODEBURN_DESKTOP_SESSIONS_DIR'] = join(tmpDir, 'desktop-sessions')
@@ -44,8 +45,8 @@ afterEach(async () => {
   delete process.env['CLAUDE_CONFIG_DIR']
   delete process.env['CODEBURN_CACHE_DIR']
   delete process.env['CODEBURN_DESKTOP_SESSIONS_DIR']
-  if (originalHome == null) delete process.env['HOME']
-  else process.env['HOME'] = originalHome
+  if (originalHome == null) setHome(undefined)
+  else setHome(originalHome)
   await rm(tmpDir, { recursive: true, force: true })
 })
 
@@ -101,6 +102,8 @@ async function renderAutoPeriodDashboard(initialProjects: ProjectSummary[], init
   stdout.rows = 50
   const frames: string[] = []
   stdout.on('data', chunk => frames.push(stripAnsi(String(chunk))))
+  let indexed!: () => void
+  const settled = new Promise<void>(resolve => { indexed = resolve })
   const app = render(React.createElement(InteractiveDashboard, {
     initialProjects,
     initialPeriod: 'today',
@@ -111,19 +114,15 @@ async function renderAutoPeriodDashboard(initialProjects: ProjectSummary[], init
     initialHistoryIndexing: true,
     initialCacheWasCold: true,
     autoFallbackFromEmptyToday: true,
+    onHistoryIndexed: indexed,
   }), { stdin, stdout, debug: true, interactive: true, patchConsole: false })
   onTestFinished(() => app.unmount())
-  return { app, frames }
-}
-
-async function waitForFrame(app: ReturnType<typeof render>, frames: string[], predicate: (frame: string) => boolean): Promise<string> {
-  for (let attempt = 0; attempt < 200; attempt++) {
+  const settledFrame = async (): Promise<string> => {
+    await settled
     await app.waitUntilRenderFlush()
-    const frame = frames.filter(value => value.trim()).at(-1) ?? ''
-    if (predicate(frame)) return frame
-    await new Promise(resolve => setTimeout(resolve, 20))
+    return frames.filter(value => value.trim()).at(-1) ?? ''
   }
-  return frames.filter(value => value.trim()).at(-1) ?? ''
+  return { app, frames, settledFrame }
 }
 
 describe('interactive dashboard progressive startup', () => {
@@ -134,17 +133,13 @@ describe('interactive dashboard progressive startup', () => {
     )
     expect(paint.result.filteredProjects).toEqual([])
 
-    const { app, frames } = await renderAutoPeriodDashboard(
+    const { app, frames, settledFrame } = await renderAutoPeriodDashboard(
       paint.result.filteredProjects,
       paint.result.initialDurable,
     )
     await app.waitUntilRenderFlush()
     expect(frames.filter(value => value.trim()).at(-1)).toContain('[ Today ]')
-    const frame = await waitForFrame(
-      app,
-      frames,
-      value => value.includes('[ 7 Days ]') && !value.includes('indexing'),
-    )
+    const frame = await settledFrame()
 
     expect(frame).toContain('[ 7 Days ]')
     expect(frame).toContain('proj')
@@ -158,17 +153,13 @@ describe('interactive dashboard progressive startup', () => {
     )
     expect(paint.result.filteredProjects).toHaveLength(1)
 
-    const { app, frames } = await renderAutoPeriodDashboard(
+    const { app, frames, settledFrame } = await renderAutoPeriodDashboard(
       paint.result.filteredProjects,
       paint.result.initialDurable,
     )
     await app.waitUntilRenderFlush()
     expect(frames.filter(value => value.trim()).at(-1)).toContain('[ Today ]')
-    const frame = await waitForFrame(
-      app,
-      frames,
-      value => value.includes('[ Today ]') && !value.includes('indexing'),
-    )
+    const frame = await settledFrame()
 
     expect(frame).toContain('[ Today ]')
     expect(frame).not.toContain('[ 7 Days ]')
@@ -280,6 +271,7 @@ describe('interactive dashboard progressive startup', () => {
         savingsUSD: expected.data.savingsUSD,
         calls: expected.data.calls,
         sessions: expected.data.sessions,
+        sessionCountBasis: expected.data.sessionCountBasis,
         inputTokens: expected.data.inputTokens,
         outputTokens: expected.data.outputTokens,
         cacheReadTokens: expected.data.cacheReadTokens,

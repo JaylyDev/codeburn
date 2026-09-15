@@ -315,6 +315,20 @@ describe('aggregateModels', () => {
     expect(rows[0]!.calls).toBe(3)
   })
 
+  it('collapses two raw MiniMax routes into one row and keeps both visible as rawModels (#1239)', async () => {
+    const rows = await aggregateModels([makeProject([
+      makeTurn('feature', [makeCall({ provider: 'opencode', model: 'minimax/MiniMax-M3', input: 100, output: 50, costUSD: 0.05 })]),
+      makeTurn('feature', [makeCall({ provider: 'opencode', model: 'MiniMaxAI/MiniMax-M3', input: 200, output: 100, costUSD: 6.94 })]),
+    ])])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.modelDisplayName).toBe('MiniMax M3')
+    expect(rows[0]!.rawModels).toEqual(['minimax/MiniMax-M3', 'MiniMaxAI/MiniMax-M3'])
+    expect(rows[0]!.costUSD).toBeCloseTo(6.99, 6)
+
+    const parsed = JSON.parse(renderJson(rows))
+    expect(parsed[0].rawModels).toEqual(['minimax/MiniMax-M3', 'MiniMaxAI/MiniMax-M3'])
+  })
+
   it('does not merge the same display name across providers', async () => {
     const rows = await aggregateModels([makeProject([
       makeTurn('feature', [makeCall({ provider: 'cline-cli', model: 'glm-5p2', costUSD: 1 })]),
@@ -923,7 +937,7 @@ describe('models CLI breakdown flags', () => {
       const res = spawnSync(
         process.execPath,
         ['--import', 'tsx', 'src/cli.ts', 'models', '--unpriced', '--from', '2026-05-09', '--to', '2026-05-09', '--provider', 'claude', '--format', 'json'],
-        { cwd: process.cwd(), env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'), TZ: 'UTC' }, encoding: 'utf-8', timeout: 30_000 },
+        { cwd: process.cwd(), env: { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'), TZ: 'UTC' }, encoding: 'utf-8', timeout: 30_000 },
       )
 
       expect(res.status, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0)
@@ -971,7 +985,7 @@ describe('models CLI breakdown flags', () => {
       const res = spawnSync(
         process.execPath,
         ['--import', 'tsx', 'src/cli.ts', 'models', '--unpriced', '--top', '2', '--from', '2026-05-09', '--to', '2026-05-09', '--provider', 'claude', '--format', 'json'],
-        { cwd: process.cwd(), env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'), TZ: 'UTC' }, encoding: 'utf-8', timeout: 30_000 },
+        { cwd: process.cwd(), env: { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: join(home, '.claude'), CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'), TZ: 'UTC' }, encoding: 'utf-8', timeout: 30_000 },
       )
 
       expect(res.status, `stdout: ${res.stdout}\nstderr: ${res.stderr}`).toBe(0)

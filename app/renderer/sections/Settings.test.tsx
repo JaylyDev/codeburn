@@ -3,7 +3,7 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { ActionResult, AliasRow, CombinedUsage, DeviceScanResult, Identity, MenubarPayload, PriceOverrideList, PriceRates, QuotaProvider, ShareStatus, StatusJson } from '../lib/types'
+import type { ActionResult, AliasRow, CombinedUsage, DeviceScanResult, Identity, MenubarPayload, PriceOverrideList, PriceRates, ProjectFilter, ProjectsReport, QuotaProvider, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
 import { Settings } from './Settings'
 
 const mocks = vi.hoisted(() => ({
@@ -16,6 +16,9 @@ const mocks = vi.hoisted(() => ({
   getOverview: vi.fn<(period: string, provider: string) => Promise<MenubarPayload>>(),
   getAliases: vi.fn<() => Promise<AliasRow[]>>(),
   getPriceOverrides: vi.fn<() => Promise<PriceOverrideList>>(),
+  getProjectFilter: vi.fn<() => Promise<ProjectFilter>>(),
+  setProjectFilter: vi.fn<(filter: ProjectFilter) => Promise<ProjectFilter>>(),
+  getUnfilteredProjects: vi.fn<() => Promise<ProjectsReport>>(),
   setPriceOverride: vi.fn<(model: string, rates: PriceRates) => Promise<ActionResult>>(),
   removePriceOverride: vi.fn<(model: string) => Promise<ActionResult>>(),
   setCurrency: vi.fn<(code: string) => Promise<ActionResult>>(),
@@ -27,18 +30,26 @@ const mocks = vi.hoisted(() => ({
   resetPlan: vi.fn<(provider: string) => Promise<ActionResult>>(),
   chooseDirectory: vi.fn<() => Promise<string | null>>(),
   exportData: vi.fn<(format: string, provider: string, path: string) => Promise<ActionResult>>(),
+  companionStatus: vi.fn(),
+  trayPrefs: vi.fn(),
+  setTrayAppPref: vi.fn(),
+  setTrayDockPref: vi.fn(),
+  setLaunchAtLogin: vi.fn(),
+  telemetryTrack: vi.fn<(name: string, props?: Record<string, unknown>) => Promise<boolean>>(),
+  telemetryStatus: vi.fn<() => Promise<TelemetryStatus | null>>(),
+  setTelemetryEnabled: vi.fn<(enabled: boolean) => Promise<TelemetryStatus | null>>(),
 }))
 vi.mock('../lib/ipc', async orig => {
   const actual = await orig<typeof import('../lib/ipc')>()
   return { ...actual, codeburn: mocks }
 })
 
-const identity: Identity = { name: 'Toruk MacBook Pro', fingerprint: 'AA:11:22:33:44:55:66:77' }
+const identity: Identity = { name: 'Studio MacBook Pro', fingerprint: 'AA:11:22:33:44:55:66:77' }
 const actionOk: ActionResult = { ok: true, stdout: 'updated', stderr: '', code: 0 }
 const devices: CombinedUsage = {
   perDevice: [
-    { id: 'local', name: 'Toruk MacBook Pro', local: true, cost: 120.1, calls: 100, sessions: 10, inputTokens: 1, outputTokens: 2, cacheCreateTokens: 3, cacheReadTokens: 4, totalTokens: 10 },
-    { id: 'mini', name: 'toruk-mini', local: false, cost: 41.2, calls: 680, sessions: 34, inputTokens: 11, outputTokens: 12, cacheCreateTokens: 13, cacheReadTokens: 14, totalTokens: 50 },
+    { id: 'local', name: 'Studio MacBook Pro', local: true, cost: 120.1, calls: 100, sessions: 10, inputTokens: 1, outputTokens: 2, cacheCreateTokens: 3, cacheReadTokens: 4, totalTokens: 10 },
+    { id: 'mini', name: 'studio-mini', local: false, cost: 41.2, calls: 680, sessions: 34, inputTokens: 11, outputTokens: 12, cacheCreateTokens: 13, cacheReadTokens: 14, totalTokens: 50 },
   ],
   combined: { cost: 161.3, calls: 780, sessions: 44, inputTokens: 12, outputTokens: 14, cacheCreateTokens: 16, cacheReadTokens: 18, totalTokens: 60, deviceCount: 2, reachableCount: 2 },
 }
@@ -48,6 +59,21 @@ const quotaProviders: QuotaProvider[] = [
   { provider: 'claude', connection: 'connected', primary: null, details: [], planLabel: 'Max 20x', footerLines: [] },
   { provider: 'codex', connection: 'disconnected', primary: null, details: [], planLabel: null, footerLines: [] },
 ]
+const trayPrefs = {
+  app: { metric: 'cost', menubarPeriod: 'today', accent: 'ember', trayBadge: false, usageRefreshSeconds: -1, quotaCadenceSeconds: 120, terminal: 'windowsTerminal' },
+  dock: { enabled: true, preferred: 'claude', scale: 0.6, theme: 'graphite', gaugeShape: 'circle', providers: ['claude'], manualSelection: true },
+  launchAtLogin: false,
+}
+const telemetryOff: TelemetryStatus = {
+  installId: '8f1c2b4d', country: 'DE', enabled: false, defaultEnabled: false, onboarded: true,
+}
+const noProjectFilter: ProjectFilter = { project: [], exclude: [] }
+const projectsReport: ProjectsReport = {
+  projects: [
+    { name: 'my-company', path: '/Users/x/Web/work/my-company', cost: 28.09, sessions: 16 },
+    { name: 'shop-ops', path: '/Users/x/ecommerce/shop-ops', cost: 4.2, sessions: 3 },
+  ],
+}
 const stored = new Map<string, string>()
 vi.stubGlobal('localStorage', {
   getItem: (key: string) => stored.get(key) ?? null,
@@ -64,13 +90,16 @@ describe('Settings', () => {
     mocks.getIdentity.mockResolvedValue(identity)
     mocks.getDevices.mockResolvedValue(devices)
     mocks.getDevicesScan.mockResolvedValue(scan)
-    mocks.getShareStatus.mockResolvedValue({ sharing: true, name: 'Toruk MacBook Pro', port: 9732, always: false, peers: 1, pending: [] })
+    mocks.getShareStatus.mockResolvedValue({ sharing: true, name: 'Studio MacBook Pro', port: 9732, always: false, peers: 1, pending: [] })
     mocks.getQuota.mockResolvedValue(quotaProviders)
     mocks.getPlans.mockResolvedValue({ currency: 'EUR', today: { cost: 0, savings: 0, calls: 0 }, month: { cost: 0, savings: 0, calls: 0 }, plans: { claude: { id: 'claude-max', provider: 'claude', budget: 200, spent: 48, percentUsed: 24, status: 'under', projectedMonthEnd: 120, daysUntilReset: 19, periodStart: '2026-07-01', periodEnd: '2026-08-01' } } })
     mocks.getOverview.mockResolvedValue(overview)
     mocks.getAliases.mockResolvedValue([{ from: 'proxy-opus', to: 'claude-opus-4-6' }])
     mocks.getPriceOverrides.mockResolvedValue({ overrides: [{ model: 'local/llama', inputPerM: 0.2, outputPerM: 0.6, cacheReadPerM: 0.05 }], configPath: '/home/user/.config/codeburn/config.json' })
     mocks.setPriceOverride.mockResolvedValue(actionOk)
+    mocks.getProjectFilter.mockResolvedValue(noProjectFilter)
+    mocks.setProjectFilter.mockImplementation(async filter => filter)
+    mocks.getUnfilteredProjects.mockResolvedValue(projectsReport)
     mocks.removePriceOverride.mockResolvedValue(actionOk)
     mocks.setCurrency.mockResolvedValue(actionOk)
     mocks.resetCurrency.mockResolvedValue(actionOk)
@@ -79,10 +108,122 @@ describe('Settings', () => {
     mocks.removeDevice.mockResolvedValue(actionOk)
     mocks.setPlan.mockResolvedValue(actionOk)
     mocks.resetPlan.mockResolvedValue(actionOk)
-    mocks.chooseDirectory.mockResolvedValue('/Users/toruk/Exports')
+    mocks.chooseDirectory.mockResolvedValue('/Users/x/Exports')
     mocks.exportData.mockResolvedValue(actionOk)
+    mocks.telemetryTrack.mockResolvedValue(true)
+    mocks.telemetryStatus.mockResolvedValue(telemetryOff)
+    mocks.setTelemetryEnabled.mockImplementation(async enabled => ({ ...telemetryOff, enabled }))
+    // No bundled tray app unless a test says otherwise, which is every platform but Windows.
+    mocks.companionStatus.mockResolvedValue({ supported: false, menuBar: false, sidebar: false, store: false })
+    mocks.trayPrefs.mockResolvedValue(trayPrefs)
     localStorage.clear()
     document.documentElement.removeAttribute('data-theme')
+  })
+
+  it('hides a project by saving it as an exclude pattern', async () => {
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Projects' }))
+    const toggle = await screen.findByRole('switch', { name: 'Show /Users/x/Web/work/my-company' })
+    expect(toggle).toHaveAttribute('aria-checked', 'true')
+    await user.click(toggle)
+    expect(mocks.setProjectFilter).toHaveBeenCalledWith({ project: [], exclude: ['/Users/x/Web/work/my-company'] })
+  })
+
+  it('shows a project as hidden when an include list leaves it out, and clears that list on Show all', async () => {
+    mocks.getProjectFilter.mockResolvedValue({ project: ['my-company'], exclude: [] })
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Projects' }))
+    expect(await screen.findByRole('switch', { name: 'Show /Users/x/ecommerce/shop-ops' })).toHaveAttribute('aria-checked', 'false')
+    await user.click(screen.getByRole('button', { name: 'Show all' }))
+    expect(mocks.setProjectFilter).toHaveBeenCalledWith({ project: [], exclude: [] })
+  })
+
+  it('lists the projects unfiltered so a hidden one can be switched back on', async () => {
+    mocks.getProjectFilter.mockResolvedValue({ project: [], exclude: ['my-company'] })
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Projects' }))
+    const toggle = await screen.findByRole('switch', { name: 'Show /Users/x/Web/work/my-company' })
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
+    await user.click(toggle)
+    expect(mocks.setProjectFilter).toHaveBeenCalledWith({ project: [], exclude: [] })
+  })
+
+  it('hides a project whose name starts with a dash, by its path', async () => {
+    mocks.getUnfilteredProjects.mockResolvedValue({ projects: [{ name: '-Users-x-Web-Github-notes-app', path: '/Users/x/Web/Github/notes-app', cost: 219.35, sessions: 19 }] })
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Projects' }))
+    // The row reads as the directory, not as the encoded transcript folder name,
+    // and keeps its parent so two projects of the same name stay distinguishable.
+    expect(await screen.findByText('Github/notes-app')).toBeInTheDocument()
+    await user.click(screen.getByRole('switch', { name: 'Show /Users/x/Web/Github/notes-app' }))
+    expect(mocks.setProjectFilter).toHaveBeenCalledWith({ project: [], exclude: ['/Users/x/Web/Github/notes-app'] })
+  })
+
+  it('keeps an exclude pattern that matches nothing removable', async () => {
+    mocks.getProjectFilter.mockResolvedValue({ project: [], exclude: ['gone-repo'] })
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Projects' }))
+    expect(await screen.findByText('matches nothing detected')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Remove' }))
+    expect(mocks.setProjectFilter).toHaveBeenCalledWith({ project: [], exclude: [] })
+  })
+
+  // A filter has no period, so neither can the list it is checked against. The
+  // period on screen used to key this fetch, which made a pattern excluding a
+  // dormant project read as an orphan next to a Remove button.
+  it('asks for one project list for the whole history, not one per period on screen', async () => {
+    const user = userEvent.setup()
+    render(<Settings period="today" />)
+    await user.click(screen.getByRole('button', { name: 'Projects' }))
+    await screen.findByRole('switch', { name: 'Show /Users/x/Web/work/my-company' })
+    expect(mocks.getUnfilteredProjects).toHaveBeenCalledWith()
+  })
+
+  it('keeps the project list across a period change instead of refetching it', async () => {
+    const user = userEvent.setup()
+    const { rerender } = render(<Settings period="today" />)
+    await user.click(screen.getByRole('button', { name: 'Projects' }))
+    await screen.findByRole('switch', { name: 'Show /Users/x/Web/work/my-company' })
+    expect(mocks.getUnfilteredProjects).toHaveBeenCalledTimes(1)
+    rerender(<Settings period="month" />)
+    expect(await screen.findByRole('switch', { name: 'Show /Users/x/Web/work/my-company' })).toBeInTheDocument()
+    expect(mocks.getUnfilteredProjects).toHaveBeenCalledTimes(1)
+  })
+
+  // A lifetime list runs to thousands of rows on a real machine, so the pane
+  // leads with the costliest and narrows on a substring of the name or path.
+  it('sorts projects by lifetime cost and narrows them by a substring search', async () => {
+    mocks.getUnfilteredProjects.mockResolvedValue({
+      projects: [
+        { name: 'shop-ops', path: '/Users/x/ecommerce/shop-ops', cost: 4.2, sessions: 3 },
+        { name: 'my-company', path: '/Users/x/Web/work/my-company', cost: 28.09, sessions: 16 },
+        { name: 'notes-app', path: '/Users/x/Web/Github/notes-app', cost: 1.5, sessions: 1 },
+      ],
+    })
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Projects' }))
+    await screen.findByRole('switch', { name: 'Show /Users/x/Web/work/my-company' })
+    expect(screen.getAllByRole('switch').map(node => node.getAttribute('aria-label'))).toEqual([
+      'Show /Users/x/Web/work/my-company',
+      'Show /Users/x/ecommerce/shop-ops',
+      'Show /Users/x/Web/Github/notes-app',
+    ])
+
+    await user.type(screen.getByRole('textbox', { name: 'Search projects' }), 'ECOM')
+    expect(screen.getAllByRole('switch').map(node => node.getAttribute('aria-label'))).toEqual([
+      'Show /Users/x/ecommerce/shop-ops',
+    ])
+    expect(screen.getByText('1 of 3')).toBeInTheDocument()
+
+    await user.clear(screen.getByRole('textbox', { name: 'Search projects' }))
+    expect(screen.getAllByRole('switch')).toHaveLength(3)
+    expect(screen.queryByText('1 of 3')).not.toBeInTheDocument()
   })
 
   it('switches panes from the rail and renders the completed Plans pane', async () => {
@@ -104,6 +245,74 @@ describe('Settings', () => {
     await user.click(screen.getByRole('option', { name: 'CNY' }))
     expect(mocks.setCurrency).toHaveBeenCalledWith('CNY')
     expect(await screen.findByText('Updated')).toBeInTheDocument()
+  })
+
+  it('reports settings, plan and export interactions as name-only events', async () => {
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+
+    await user.click(screen.getByRole('button', { name: 'Dark' }))
+    expect(mocks.telemetryTrack).toHaveBeenCalledWith('settings_change', { setting: 'theme', value: 'dark' })
+
+    await user.click(await screen.findByLabelText('Currency'))
+    await user.click(screen.getByRole('option', { name: 'CNY' }))
+    expect(mocks.telemetryTrack).toHaveBeenCalledWith('settings_change', { setting: 'currency', value: 'CNY' })
+
+    await user.click(screen.getByRole('button', { name: 'Plans' }))
+    await user.click(await screen.findByLabelText('Add a plan'))
+    await user.click(screen.getByRole('option', { name: 'Cursor Pro' }))
+    await user.click(screen.getByRole('button', { name: 'Add' }))
+    expect(mocks.telemetryTrack).toHaveBeenCalledWith('plan_set', { provider: 'cursor', plan: 'cursor-pro' })
+
+    await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
+    await user.click(screen.getByRole('button', { name: 'Choose folder…' }))
+    await screen.findByText('/Users/x/Exports')
+    await user.click(screen.getByRole('button', { name: 'JSON' }))
+    await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
+    expect(mocks.telemetryTrack).toHaveBeenCalledWith('export', { format: 'json', provider: 'all' })
+
+    // The chosen folder is a real path on this machine and never travels.
+    const sent = JSON.stringify(mocks.telemetryTrack.mock.calls)
+    expect(sent).not.toContain('/Users/x')
+  })
+
+  // The main process drops any event raised while telemetry is off, so an opt-in tracked
+  // before the write lands is one that can never be sent. It goes out after the toggle takes.
+  it('reports the telemetry opt-in only once the toggle has taken', async () => {
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+
+    await user.click(await screen.findByRole('switch', { name: 'Anonymous telemetry' }))
+
+    expect(mocks.setTelemetryEnabled).toHaveBeenCalledWith(true)
+    await waitFor(() => {
+      expect(mocks.telemetryTrack).toHaveBeenCalledWith('settings_change', { setting: 'telemetry', value: true })
+    })
+    const tracked = mocks.telemetryTrack.mock.invocationCallOrder.at(-1)!
+    expect(tracked).toBeGreaterThan(mocks.setTelemetryEnabled.mock.invocationCallOrder[0]!)
+  })
+
+  it('sends nothing when the write does not take, and nothing on the way out', async () => {
+    const user = userEvent.setup()
+    // A settings write that failed leaves telemetry off, so there is no opt-in to report.
+    mocks.setTelemetryEnabled.mockResolvedValue(telemetryOff)
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+    await user.click(await screen.findByRole('switch', { name: 'Anonymous telemetry' }))
+    await waitFor(() => expect(mocks.setTelemetryEnabled).toHaveBeenCalled())
+
+    // Turning it off mints a fresh install id and drops the queue, so an opt-out event would
+    // never arrive anywhere either.
+    mocks.telemetryStatus.mockResolvedValue({ ...telemetryOff, enabled: true })
+    mocks.setTelemetryEnabled.mockResolvedValue(telemetryOff)
+    render(<Settings period="month" />)
+    await user.click(screen.getAllByRole('button', { name: 'Privacy & data' }).at(-1)!)
+    await user.click((await screen.findAllByRole('switch', { name: 'Anonymous telemetry' })).at(-1)!)
+    await waitFor(() => expect(mocks.setTelemetryEnabled).toHaveBeenCalledWith(false))
+
+    const telemetryEvents = mocks.telemetryTrack.mock.calls.filter(([, props]) => props?.setting === 'telemetry')
+    expect(telemetryEvents).toEqual([])
   })
 
   it('persists theme choices and applies forced themes to the root', async () => {
@@ -173,6 +382,16 @@ describe('Settings', () => {
     await user.click(scope)
     await user.click(screen.getByRole('option', { name: 'Combined' }))
     expect(onScopeChange).toHaveBeenCalledWith('combined')
+  })
+
+  it('offers Local only while a project filter hides something, and says why', async () => {
+    const user = userEvent.setup()
+    render(<Settings period="month" scope="local" onScopeChange={vi.fn()} projectFiltered />)
+    const scope = screen.getByLabelText('Scope')
+    expect(screen.getByText(/Local only while the Projects pane hides something/)).toBeInTheDocument()
+    await user.click(scope)
+    expect(screen.queryByRole('option', { name: 'Combined' })).not.toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'Local' })).toBeInTheDocument()
   })
 
   it('lists providers from the real overview payload', async () => {
@@ -317,24 +536,24 @@ describe('Settings', () => {
     await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
     await user.click(screen.getByRole('button', { name: 'Choose folder…' }))
     expect(mocks.chooseDirectory).toHaveBeenCalledOnce()
-    expect(await screen.findByText('/Users/toruk/Exports')).toBeInTheDocument()
+    expect(await screen.findByText('/Users/x/Exports')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'JSON' }))
     await user.click(screen.getByLabelText('Provider'))
     await user.click(screen.getByRole('option', { name: 'Claude' }))
     await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
-    expect(mocks.exportData).toHaveBeenCalledWith('json', 'claude', '/Users/toruk/Exports')
-    expect(await screen.findByText('Exported to /Users/toruk/Exports')).toBeInTheDocument()
+    expect(mocks.exportData).toHaveBeenCalledWith('json', 'claude', '/Users/x/Exports')
+    expect(await screen.findByText('Exported to /Users/x/Exports')).toBeInTheDocument()
   })
 
   it('renders real device status and removes paired devices without fake pairing controls', async () => {
     const user = userEvent.setup()
     render(<Settings period="month" />)
     await user.click(screen.getByRole('button', { name: 'Devices' }))
-    expect(await screen.findByText('Toruk MacBook Pro')).toBeInTheDocument()
-    expect(screen.getByText('Local device name: Toruk MacBook Pro')).toBeInTheDocument()
+    expect(await screen.findByText('Studio MacBook Pro')).toBeInTheDocument()
+    expect(screen.getByText('Local device name: Studio MacBook Pro')).toBeInTheDocument()
     expect(await screen.findByText('Mac Studio')).toBeInTheDocument()
     expect(screen.getByText('fingerprint 7F:2A:…:C4')).toBeInTheDocument()
-    expect(await screen.findByText('toruk-mini')).toBeInTheDocument()
+    expect(await screen.findByText('studio-mini')).toBeInTheDocument()
     expect(screen.getByText('34 sessions · $41.20 this month')).toBeInTheDocument()
     expect(screen.getByText('Visible')).toBeInTheDocument()
     expect(screen.getByText(/Pairing is interactive/)).toBeInTheDocument()
@@ -342,7 +561,7 @@ describe('Settings', () => {
     expect(screen.queryByText('Pull now')).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Remove' }))
     await user.click(screen.getByRole('button', { name: 'Confirm' }))
-    expect(mocks.removeDevice).toHaveBeenCalledWith('toruk-mini')
+    expect(mocks.removeDevice).toHaveBeenCalledWith('studio-mini')
     expect(screen.getByText('Combined view active · 2 devices')).toBeInTheDocument()
   })
 
@@ -366,5 +585,34 @@ describe('Settings', () => {
     await user.click(screen.getByRole('button', { name: 'Devices' }))
     await waitFor(() => expect(screen.getAllByText('Locate the codeburn CLI')).toHaveLength(2))
     expect(screen.getByText('permission denied; grant Full Disk Access')).toHaveStyle({ color: 'var(--warn)' })
+  })
+
+  // The tray app has settings of its own, and they only exist while it does. Each pane is
+  // shown only while its switch in the sidebar corner is on.
+  it("offers no tray panes where there is no bundled tray app", async () => {
+    render(<Settings period="month" />)
+    await waitFor(() => expect(mocks.companionStatus).toHaveBeenCalled())
+    expect(screen.queryByRole("button", { name: "Menu bar" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Capacity Dock" })).toBeNull()
+  })
+
+  it("offers both tray panes while both switches are on", async () => {
+    mocks.companionStatus.mockResolvedValue({ supported: true, menuBar: true, sidebar: true, store: false })
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+
+    await user.click(await screen.findByRole("button", { name: "Menu bar" }))
+    expect(await screen.findByRole("heading", { name: "Menu bar" })).toBeInTheDocument()
+
+    await user.click(screen.getByRole("button", { name: "Capacity Dock" }))
+    expect(await screen.findByRole("heading", { name: "Capacity Dock" })).toBeInTheDocument()
+  })
+
+  it("drops the Capacity Dock pane when the Sidebar switch is off", async () => {
+    mocks.companionStatus.mockResolvedValue({ supported: true, menuBar: true, sidebar: false, store: false })
+    render(<Settings period="month" />)
+
+    expect(await screen.findByRole("button", { name: "Menu bar" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Capacity Dock" })).toBeNull()
   })
 })

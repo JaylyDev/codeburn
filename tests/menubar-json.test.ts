@@ -19,8 +19,7 @@ function emptyPeriod(label: string): PeriodData {
 }
 
 describe('buildMenubarPayload', () => {
-  it('emits the full schema with current-period metrics and iso timestamp', () => {
-    const period: PeriodData = {
+  it('emits the full schema with current-period metrics and iso timestamp', () => {    const period: PeriodData = {
       label: '7 Days',
       cost: 1248.01,
       calls: 11231,
@@ -44,6 +43,33 @@ describe('buildMenubarPayload', () => {
     expect(payload.current.sessions).toBe(97)
     expect(payload.current.inputTokens).toBe(19100)
     expect(payload.current.outputTokens).toBe(675600)
+  })
+
+  it('carries drill-through session identity (sessionId, provider) into topSessions and project sessionDetails', () => {
+    const period: PeriodData = {
+      ...emptyPeriod('7 Days'),
+      projects: [{
+        id: '/abs/project-a',
+        name: 'project-a',
+        cost: 5,
+        savingsUSD: 0,
+        sessions: 1,
+        sessionDetails: [{
+          cost: 5, savingsUSD: 0, calls: 3, inputTokens: 100, outputTokens: 20,
+          date: '2026-09-10',
+          models: [{ name: 'Sonnet 4.5', cost: 5, savingsUSD: 0 }],
+          sessionId: 'session-a1',
+          provider: 'claude',
+        }],
+      }],
+      topSessions: [{
+        project: 'project-a', cost: 5, savingsUSD: 0, calls: 3, date: '2026-09-10',
+        sessionId: 'session-a1', provider: 'claude',
+      }],
+    }
+    const payload = buildMenubarPayload(period, [], null)
+    expect(payload.current.topSessions[0]).toMatchObject({ sessionId: 'session-a1', provider: 'claude', project: 'project-a' })
+    expect(payload.current.topProjects[0]!.sessionDetails[0]).toMatchObject({ sessionId: 'session-a1', provider: 'claude' })
   })
 
   it('passes the pull-requests payload (models, categories, cap remainder) through verbatim', () => {
@@ -269,6 +295,70 @@ describe('buildMenubarPayload', () => {
     expect(payload.current.providers).toEqual({ 'grok build': 12.5, 'cursor agent': 3.4 })
   })
 
+  it('carries per-provider tokens and sessions into providerDetails', () => {
+    const providers: ProviderCost[] = [
+      { name: 'claude', displayName: 'Claude', cost: 190.1, calls: 900, hasUsage: true, inputTokens: 6_000_000, outputTokens: 250_000, sessions: 12 },
+      { name: 'codex', displayName: 'Codex', cost: 88.84, calls: 642, hasUsage: true, inputTokens: 3_000_000, outputTokens: 150_000, sessions: 4 },
+    ]
+    const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'claude', label: 'Claude', cost: 190.1, calls: 900, hasUsage: true, inputTokens: 6_000_000, outputTokens: 250_000, sessions: 12 },
+      { id: 'codex', label: 'Codex', cost: 88.84, calls: 642, hasUsage: true, inputTokens: 3_000_000, outputTokens: 150_000, sessions: 4 },
+    ])
+  })
+
+  it('carries per-provider cache read into providerDetails', () => {
+    const providers: ProviderCost[] = [
+      { name: 'claude', displayName: 'Claude', cost: 190.1, calls: 900, hasUsage: true, inputTokens: 6_000_000, outputTokens: 250_000, sessions: 12, cacheReadTokens: 4_200_000 },
+      { name: 'codex', displayName: 'Codex', cost: 88.84, calls: 642, hasUsage: true, inputTokens: 3_000_000, outputTokens: 150_000, sessions: 4, cacheReadTokens: 0 },
+    ]
+    const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'claude', label: 'Claude', cost: 190.1, calls: 900, hasUsage: true, inputTokens: 6_000_000, outputTokens: 250_000, sessions: 12, cacheReadTokens: 4_200_000 },
+      { id: 'codex', label: 'Codex', cost: 88.84, calls: 642, hasUsage: true, inputTokens: 3_000_000, outputTokens: 150_000, sessions: 4, cacheReadTokens: 0 },
+    ])
+  })
+
+  it('omits the cache-read key entirely when no day reported it', () => {
+    // Add-only contract: absent means unknown, not zero, so a legacy row must
+    // stay absent rather than being emitted as 0.
+    const payload = buildMenubarPayload(
+      emptyPeriod('Today'),
+      [{ name: 'claude', displayName: 'Claude', cost: 190.1, calls: 900, hasUsage: true, inputTokens: 6_000_000, outputTokens: 250_000, sessions: 12 }],
+      null,
+    )
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'claude', label: 'Claude', cost: 190.1, calls: 900, hasUsage: true, inputTokens: 6_000_000, outputTokens: 250_000, sessions: 12 },
+    ])
+    expect(Object.keys(payload.current.providerDetails[0]!)).not.toContain('cacheReadTokens')
+  })
+
+  it('drops a partial cache-read sum when an active day lacked counts', () => {
+    // A fold that summed some days but missed a legacy active day must not be
+    // labelled complete: the emitter omits the key rather than publish a
+    // partial number.
+    const payload = buildMenubarPayload(
+      emptyPeriod('Today'),
+      [{ name: 'claude', displayName: 'Claude', cost: 190.1, calls: 900, hasUsage: true, cacheReadTokens: 4_200_000, cacheReadIncomplete: true }],
+      null,
+    )
+    expect(Object.keys(payload.current.providerDetails[0]!)).not.toContain('cacheReadTokens')
+  })
+
+  it('omits the token and session keys entirely when the period has no breakdown', () => {
+    // Add-only contract: a consumer must be able to tell "no breakdown" from
+    // zero, so absent stays absent rather than being emitted as 0.
+    const payload = buildMenubarPayload(
+      emptyPeriod('Today'),
+      [{ name: 'claude', displayName: 'Claude', cost: 190.1, calls: 900, hasUsage: true }],
+      null,
+    )
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'claude', label: 'Claude', cost: 190.1, calls: 900, hasUsage: true },
+    ])
+    expect(Object.keys(payload.current.providerDetails[0]!)).not.toContain('inputTokens')
+  })
+
   it('preserves zero-cost provider usage counts for menubar provider visibility', () => {
     const providers = [
       { name: 'hermes', displayName: 'Hermes Agent', cost: 0, calls: 7 },
@@ -295,7 +385,7 @@ describe('buildMenubarPayload', () => {
     ])
   })
 
-  it('keeps zero-cost detected providers in the legacy dict for compatibility', () => {
+  it('keeps the legacy provider dict additive while providerDetails remains the activity authority', () => {
     const providers: ProviderCost[] = [
       { name: 'claude', displayName: 'Claude', cost: 76.45 },
       { name: 'codex', displayName: 'Codex', cost: 0 },
@@ -303,6 +393,11 @@ describe('buildMenubarPayload', () => {
     ]
     const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
     expect(payload.current.providers).toEqual({ claude: 76.45, codex: 0, cursor: 2.18 })
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'claude', label: 'Claude', cost: 76.45, calls: 0, hasUsage: true },
+      { id: 'codex', label: 'Codex', cost: 0, calls: 0, hasUsage: false },
+      { id: 'cursor', label: 'Cursor', cost: 2.18, calls: 0, hasUsage: true },
+    ])
   })
 
   it('includes up to 365 daily history entries sorted ascending by date', () => {

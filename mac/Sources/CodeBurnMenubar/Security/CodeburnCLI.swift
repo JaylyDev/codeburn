@@ -20,7 +20,7 @@ enum CodeburnCLI {
     ) -> [String] {
         let home = homeDirectory
         var paths: [String] = []
-        for dir in ["\(home)/.volta/bin", "\(home)/.npm-global/bin", "\(home)/.asdf/shims"] {
+        for dir in ["\(home)/.volta/bin", "\(home)/.npm-global/bin", "\(home)/.local/bin", "\(home)/.asdf/shims"] {
             paths.append(dir)
         }
         // `mise use -g npm:codeburn` installs the CLI under its npm backend, but
@@ -43,6 +43,32 @@ enum CodeburnCLI {
                 }
             }
         }
+        paths.append(contentsOf: nixPaths(homeDirectory: home))
+        return paths
+    }
+
+    /// Nix keeps Node outside every location above. nix-darwin exposes the per-user profile at
+    /// `/etc/profiles/per-user/$USER/bin` and the system profile at `/run/current-system/sw/bin`;
+    /// standalone `nix profile` uses `~/.nix-profile/bin`, which on the XDG state layout resolves
+    /// through `~/.local/state/nix/profiles/profile/bin`.
+    ///
+    /// These matter because a macOS system update clears `launchctl config user path`, the only
+    /// mechanism that put those directories on a GUI-launched app's PATH. After the update the
+    /// app inherits the bare `/usr/bin:/bin:/usr/sbin:/sbin`, so the CLI's `#!/usr/bin/env node`
+    /// shim can no longer resolve `node` and every spawn dies with exit 127. Naming the
+    /// directories here keeps the app working without any machine-level launchd configuration.
+    private static func nixPaths(homeDirectory: String) -> [String] {
+        var paths: [String] = []
+        let user = (homeDirectory as NSString).lastPathComponent
+        if !user.isEmpty {
+            paths.append("/etc/profiles/per-user/\(user)/bin")
+        }
+        paths.append(contentsOf: [
+            "\(homeDirectory)/.nix-profile/bin",
+            "\(homeDirectory)/.local/state/nix/profiles/profile/bin",
+            "/run/current-system/sw/bin",
+            "/nix/var/nix/profiles/default/bin",
+        ])
         return paths
     }
     private static let persistedPathFilename = "codeburn-cli-path.v1"
@@ -105,16 +131,20 @@ enum CodeburnCLI {
     ) -> Process {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        // Resolved once so the PATH we build and the argv we run can never disagree
+        // about which install of the CLI this launch is talking about.
+        let argv = baseArgv()
         var environment = ProcessInfo.processInfo.environment
         environment["PATH"] = augmentedPath(
             environment["PATH"] ?? "",
             homeDirectory: FileManager.default.homeDirectoryForCurrentUser.path,
-            environment: environment
+            environment: environment,
+            resolvedCLI: argv.first
         )
         process.environment = environment
         // `env --` treats everything following as argv, not VAR=val pairs -- guards against an
         // argument accidentally resembling an env assignment.
-        process.arguments = ["--"] + baseArgv() + subcommand
+        process.arguments = ["--"] + argv + subcommand
         // The menubar runs as an accessory app with no foreground window, and macOS
         // background-throttles accessory apps and their children. Without this lift the
         // codeburn subprocess parses 5-10x slower than the same command run from a
@@ -128,12 +158,27 @@ enum CodeburnCLI {
         return safeArgPattern.firstMatch(in: s, range: range) != nil
     }
 
+    /// `resolvedCLI` defaults to the CLI this app would actually launch; tests pass
+    /// a fixture path so PATH ordering can be asserted without a real install.
     static func augmentedPath(
         _ existing: String,
         homeDirectory: String,
-        environment: [String: String]
+        environment: [String: String],
+        resolvedCLI: String? = nil
     ) -> String {
         var parts = existing.split(separator: ":", omittingEmptySubsequences: true).map(String.init)
+        // The CLI's shebang resolves `node` through PATH, so whichever node comes
+        // first wins — and a version manager's default can easily be older than
+        // the 22.13 the CLI requires, which surfaces as "Could not load Today"
+        // rather than anything pointing at Node. The interpreter that sits beside
+        // the CLI we are about to run is known to satisfy it, so it goes first.
+        if let cli = resolvedCLI ?? baseArgv().first, cli.hasPrefix("/") {
+            let binDir = (cli as NSString).deletingLastPathComponent
+            if FileManager.default.isExecutableFile(atPath: "\(binDir)/node") {
+                parts.removeAll { $0 == binDir }
+                parts.insert(binDir, at: 0)
+            }
+        }
         let userPaths = userNodePaths(homeDirectory: homeDirectory, environment: environment)
         for extra in additionalPathEntries + userPaths where !parts.contains(extra) {
             parts.append(extra)

@@ -10,7 +10,11 @@ import { isSqliteAvailable } from '../src/sqlite.js'
 // created, at import time. Point it at the fixture during module hoisting so the
 // pipeline can never read the developer's real ~/.hermes.
 const testRoot = vi.hoisted(() => {
-  const root = `${process.env['TMPDIR'] || '/tmp'}/hermes-pr-pipeline-${process.pid}-${Date.now()}`
+  // A hoisted block runs before the module's imports, so os.tmpdir() is out of
+  // reach here. A bare /tmp would resolve against the current drive on Windows,
+  // which is not an absolute path to the code that reads git_repo_root back.
+  const base = process.env['TMPDIR'] || process.env['TMP'] || process.env['TEMP'] || '/tmp'
+  const root = `${base.replace(/[\\/]+$/, '')}/hermes-pr-pipeline-${process.pid}-${Date.now()}`
   process.env['HERMES_HOME'] = `${root}/hermes`
   return root
 })

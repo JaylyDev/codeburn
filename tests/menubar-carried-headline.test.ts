@@ -8,6 +8,7 @@ import { DAILY_CACHE_VERSION, currentTzKey, type DailyCache, type DailyEntry } f
 import { getDateRange } from '../src/cli-date.js'
 import { loadPricing } from '../src/models.js'
 import { buildMenubarPayloadForRange, getDailyCacheConfigHash } from '../src/usage-aggregator.js'
+import { setHome } from './setup/home.js'
 
 // The adversarial-review blocker on the carry-forward PR: the daily cache held
 // carried history, history.daily showed it, but the HEADLINE current.cost /
@@ -60,7 +61,7 @@ beforeEach(async () => {
   savedEnv = Object.fromEntries(ENV_KEYS.map(k => [k, process.env[k]]))
   await mkdir(join(ROOT, 'home'), { recursive: true })
   await mkdir(join(ROOT, 'cache'), { recursive: true })
-  process.env['HOME'] = join(ROOT, 'home')
+  setHome(join(ROOT, 'home'))
   process.env['CODEBURN_CACHE_DIR'] = join(ROOT, 'cache')
   delete process.env['CLAUDE_CONFIG_DIR']
   delete process.env['CLAUDE_CONFIG_DIRS']

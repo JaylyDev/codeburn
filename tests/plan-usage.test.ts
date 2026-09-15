@@ -7,6 +7,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { savePlan, type Plan } from '../src/config.js'
 import { activePlansFromMap, computePeriodFromResetDay, copilotCreditSpend, copilotCreditsNote, getPlanScopedProjects, getPlanUsage, getPlanUsageFromProjects, getPlanUsages } from '../src/plan-usage.js'
 import type { ProjectSummary } from '../src/types.js'
+import { setHome } from './setup/home.js'
 
 const { parseAllSessionsMock } = vi.hoisted(() => ({
   parseAllSessionsMock: vi.fn(),
@@ -254,7 +255,7 @@ describe('getPlanUsage', () => {
 
   it('keeps the provider-specific parser filter for one active plan', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'codeburn-plan-usage-test-'))
-    process.env['HOME'] = dir
+    setHome(dir)
 
     try {
       await savePlan({
@@ -291,7 +292,7 @@ describe('getPlanUsage', () => {
 
   it('computes multiple active plan usages from one all-provider parse', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'codeburn-plan-usage-test-'))
-    process.env['HOME'] = dir
+    setHome(dir)
 
     try {
       await savePlan({

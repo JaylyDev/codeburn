@@ -20,6 +20,7 @@ const rows: ModelReportRow[] = [
     providerDisplayName: 'Anthropic',
     model: 'claude-opus-4.8',
     modelDisplayName: 'Claude Opus 4.8',
+    rawModels: ['claude-opus-4.8'],
     category: null,
     topCategory: 'coding',
     topCategoryShare: 0.71,
@@ -39,6 +40,7 @@ const rows: ModelReportRow[] = [
     providerDisplayName: 'Codex',
     model: 'gpt-5.5-codex',
     modelDisplayName: 'GPT-5.5 Codex',
+    rawModels: ['gpt-5.5-codex'],
     category: null,
     topCategory: 'debugging',
     topCategoryShare: 0.42,
@@ -58,6 +60,7 @@ const rows: ModelReportRow[] = [
     providerDisplayName: 'Local',
     model: 'llama-local',
     modelDisplayName: 'Llama Local',
+    rawModels: ['llama-local'],
     category: null,
     inputTokens: 750_000,
     outputTokens: 400_000,
@@ -75,6 +78,7 @@ const rows: ModelReportRow[] = [
     providerDisplayName: 'Custom',
     model: 'my-proxy-model',
     modelDisplayName: 'my-proxy-model',
+    rawModels: ['my-proxy-model'],
     category: null,
     inputTokens: 4_800_000,
     outputTokens: 400_000,
@@ -164,8 +168,8 @@ describe('Models', () => {
     expect(screen.getByText('$35.10')).toHaveClass('pos')
 
     const dots = [...container.querySelectorAll('.mdot')]
-    expect(dots[0]).toHaveAttribute('style', expect.stringContaining('var(--s-opus)'))
-    expect(dots[1]).toHaveAttribute('style', expect.stringContaining('var(--s-gpt)'))
+    expect(dots[0]).toHaveAttribute('style', expect.stringContaining('var(--s-flagship)'))
+    expect(dots[1]).toHaveAttribute('style', expect.stringContaining('var(--s-balanced)'))
   })
 
   it('names the provider on each model row so duplicate model names stay distinguishable', async () => {

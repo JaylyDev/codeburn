@@ -1,8 +1,10 @@
 import Foundation
+import CoreGraphics
 import SwiftUI
 import AppKit
 import Observation
 import ServiceManagement
+import UserNotifications
 
 private let refreshIntervalSeconds: UInt64 = 30
 private let forceRefreshWatchdogSeconds: TimeInterval = 90
@@ -63,10 +65,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     private var contextMenu: NSMenu?
     fileprivate let store = AppStore()
     let updateChecker = UpdateChecker()
-    /// True while the displays are asleep. Refresh ticks skip spawning
-    /// entirely then: nobody can see the menubar, and every fetch is a full
-    /// Node process (#647).
-    private var displayAsleep = false
     /// Bounds status staleness under App Nap: the 30s timer can be coalesced
     /// once the app naps (no permanent activity assertion anymore, #647), so
     /// this system-scheduled activity guarantees a tick attempt every few
@@ -132,6 +130,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        SingleInstanceGuard.retireOlderInstances()
         ProcessInfo.processInfo.automaticTerminationSupportEnabled = false
         ProcessInfo.processInfo.disableSuddenTermination()
         // Deliberately NO app-lifetime beginActivity here. A permanent
@@ -165,7 +164,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         registerLoginItemIfNeeded()
         observeSubscriptionDisconnect()
         observeCapacityDockProviderSettingsRequests()
+        setupUpdateNotifications()
         Task { await updateChecker.checkIfNeeded() }
+    }
+
+    /// Delegate only: authorization is requested lazily by UpdateChecker the
+    /// first time a notification would actually be posted.
+    private func setupUpdateNotifications() {
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        UNUserNotificationCenter.current().delegate = self
     }
 
     private func observeCapacityDockProviderSettingsRequests() {
@@ -208,7 +215,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.displayAsleep = false
                 self?.recoverRefreshPipelineAfterInterruption(resetLoading: true, reason: "wake")
                 self?.startStatusItemPlacementRecovery()
             }
@@ -220,22 +226,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.displayAsleep = false
                 self?.recoverRefreshPipelineAfterInterruption(resetLoading: true, reason: "screen wake")
                 self?.startStatusItemPlacementRecovery()
             }
         }
 
-        // Display sleep without system sleep (clamshell displays off, screen
-        // saver energy settings) previously kept the full spawn cadence
-        // running for hours. Skip refreshes until the screens wake.
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.screensDidSleepNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.displayAsleep = true
                 self?.stopStatusItemPlacementRecovery()
             }
         }
@@ -568,6 +569,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     fileprivate var lastCapacityDockProviderRefreshAt: Date?
     private var claudeQuotaFailureCount = 0
     private var nextClaudeQuotaRefreshAt: Date?
+    private var lastQuotaRolloverCheckAt = Date()
+
+    /// Reset instants crossed since the previous tick, grouped by the force
+    /// flags `refreshLiveQuotaProgressIfDue` takes. Without this a window that
+    /// resets at 14:00 keeps showing its pre-reset percentage until the next
+    /// cadence tick.
+    private func quotaGroupsRolledOver(
+        now: Date = Date()
+    ) -> (claude: Bool, codex: Bool, dock: Bool, any: Bool) {
+        let since = lastQuotaRolloverCheckAt
+        lastQuotaRolloverCheckAt = now
+        func rolledOver(_ dates: [Date?]) -> Bool {
+            QuotaRefreshDecision.windowRolledOver(
+                resetDates: dates.compactMap { $0 },
+                lastCheckedAt: since,
+                now: now
+            )
+        }
+        let claude = rolledOver(store.subscription.map {
+            [$0.fiveHourResetsAt, $0.sevenDayResetsAt, $0.sevenDayOpusResetsAt, $0.sevenDaySonnetResetsAt]
+        } ?? [])
+        let codex = rolledOver(store.codexUsage.map { [$0.primary?.resetsAt, $0.secondary?.resetsAt] } ?? [])
+        let dock = rolledOver(store.capacityDockProviderSummaries.values.flatMap {
+            [$0.primary?.resetsAt] + $0.details.map(\.resetsAt)
+        })
+        return (claude, codex, dock, claude || codex || dock)
+    }
 
     @discardableResult
     private func refreshLiveQuotaProgressIfDue(
@@ -588,12 +616,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             (now.timeIntervalSince(lastSubscriptionRefreshAt ?? .distantPast) >= threshold)
         )
         let shouldRefreshClaude = force || forceClaude || claudeDue
-        let shouldRefreshCodex = force || forceCodex || (
-            autoRefreshAllowed && now.timeIntervalSince(lastCodexRefreshAt ?? .distantPast) >= threshold
+        let shouldRefreshCodex = QuotaRefreshDecision.isDue(
+            force: force || forceCodex,
+            autoRefreshAllowed: autoRefreshAllowed,
+            lastAttemptAt: lastCodexRefreshAt,
+            now: now,
+            threshold: threshold
         )
-        let shouldRefreshCapacityDockProviders = force || forceCapacityDockProviders || (
-            autoRefreshAllowed
-                && now.timeIntervalSince(lastCapacityDockProviderRefreshAt ?? .distantPast) >= threshold
+        let shouldRefreshCapacityDockProviders = QuotaRefreshDecision.isDue(
+            force: force || forceCapacityDockProviders,
+            autoRefreshAllowed: autoRefreshAllowed,
+            lastAttemptAt: lastCapacityDockProviderRefreshAt,
+            now: now,
+            threshold: threshold
         )
         guard shouldRefreshClaude || shouldRefreshCodex || shouldRefreshCapacityDockProviders else {
             return false
@@ -604,36 +639,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             // the provider fails. Failures get their own shorter backoff below.
             lastSubscriptionRefreshAt = now
         }
+        if shouldRefreshCodex {
+            // Attempt anchor, like the generic adapters below: a disconnected
+            // or failing Codex must not force this branch on every tick.
+            lastCodexRefreshAt = now
+        }
+
+        if shouldRefreshCapacityDockProviders {
+            // Ahead of the Claude/Codex awaits: the dock must not wait on a
+            // slow provider to redraw its rings.
+            lastCapacityDockProviderRefreshAt = now
+            await store.refreshSelectedCapacityDockProviders()
+        }
 
         switch (shouldRefreshClaude, shouldRefreshCodex) {
         case (true, true):
             async let claude = refreshClaudeQuotaSingleFlight()
             async let codex = refreshCodexQuotaSingleFlight()
             let claudeSucceeded = await claude
-            let codexSucceeded = await codex
+            _ = await codex
             finishClaudeQuotaRefresh(
                 succeeded: claudeSucceeded,
                 attemptedAt: now,
                 cadence: threshold
             )
-            if codexSucceeded { lastCodexRefreshAt = Date() }
         case (true, false):
             let succeeded = await refreshClaudeQuotaSingleFlight()
             finishClaudeQuotaRefresh(succeeded: succeeded, attemptedAt: now, cadence: threshold)
         case (false, true):
-            if await refreshCodexQuotaSingleFlight() {
-                lastCodexRefreshAt = Date()
-            }
+            _ = await refreshCodexQuotaSingleFlight()
         case (false, false):
             break
         }
-        if shouldRefreshCapacityDockProviders {
-            // Generic adapters have their own attempt anchor. They must not be
-            // polled on every payload tick merely because Codex is disconnected
-            // or a Codex refresh failed.
-            lastCapacityDockProviderRefreshAt = now
-            await store.refreshSelectedCapacityDockProviders()
-        }
+        await store.quotaCrossingMonitor.record(windows: store.quotaWindows)
         return true
     }
 
@@ -757,9 +795,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         // key's stuck loading / in-flight / generation bookkeeping and force a
         // fresh fetch — even if the cache looks "not stale yet". This is the
         // guaranteed one-round-trip recovery path.
-        // An open popover also proves the screens are on: recover from a
-        // missed screensDidWake so a latched flag can't suppress refreshes.
-        displayAsleep = false
         if refreshTimer == nil {
             startRefreshLoop(forceQuotaOnStart: false)
         }
@@ -804,7 +839,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
 
     private func runRefreshLoopTick(reason: String, forcePayload: Bool = false, forceQuota: Bool = false) {
         refreshLoopHeartbeatAt = Date()
-        if displayAsleep && !forcePayload { return }
+        // Display sleep without system sleep (clamshell displays off, screen
+        // saver energy settings) otherwise keeps the full spawn cadence running
+        // for hours (#647). Asked live rather than latched from
+        // screensDidSleep, so a missed wake notification cannot strand it.
+        if !forcePayload && CGDisplayIsAsleep(CGMainDisplayID()) != 0 { return }
         let hadForceRefreshInFlight = forceRefreshTask != nil
         let clearedStaleForceRefresh = clearStaleForceRefreshIfNeeded()
         let clearedStaleStatusRefresh = clearStaleStatusPayloadRefreshIfNeeded()
@@ -835,6 +874,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
                     bypassRateLimit: true,
                     forceQuota: forceQuota,
                     qualityOfService: qualityOfService
+                )
+            }
+        }
+
+        let rolledOver = quotaGroupsRolledOver()
+        if rolledOver.any || QuotaRefreshDecision.needsQuotaOnlyTick(
+            payloadRefreshDue: shouldForceRefresh,
+            payloadSkippedUnchanged: skippedUnchangedUsageRefresh
+        ) {
+            Task { [weak self] in
+                _ = await self?.refreshLiveQuotaProgressIfDue(
+                    force: forceQuota,
+                    forceClaude: rolledOver.claude,
+                    forceCodex: rolledOver.codex,
+                    forceCapacityDockProviders: rolledOver.dock
                 )
             }
         }
@@ -970,6 +1024,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             // currency switch instead of waiting for the next 30s payload tick.
             _ = self.store.currency
             _ = self.store.displayMetric
+            // Second-row settings: the title has to re-render the moment the
+            // toggle or its metric changes, not on the next payload tick.
+            _ = self.store.menubarSecondRowEnabled
+            _ = self.store.menubarSecondRowMetric
             _ = self.store.dailyBudget
             _ = self.store.dailyTokenBudget
             // Read the derived flag so the flame re-tints when today's usage
@@ -1228,8 +1286,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     /// menubar text point size. With no tint it stays a template image so the system
     /// auto-adapts to the menu bar; a tint returns a recolored non-template copy for
     /// the budget/quota warning states.
-    private static func menubarFlameImage(tint: NSColor?) -> NSImage? {
-        let config = NSImage.SymbolConfiguration(pointSize: menubarTitleFontSize, weight: .medium)
+    private static func menubarFlameImage(
+        tint: NSColor?,
+        pointSize: CGFloat = menubarTitleFontSize
+    ) -> NSImage? {
+        let config = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .medium)
         guard let symbol = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "CodeBurn")?
             .withSymbolConfiguration(config) else { return nil }
         guard let tint else {
@@ -1246,6 +1307,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         return recolored
     }
 
+    /// Typography for one rendering of the status-item title. `singleRow` holds
+    /// the historical constants, so the off state of the second-row setting
+    /// produces exactly the string this app has always rendered.
+    private struct MenubarTitleStyle {
+        let fontSize: CGFloat
+        let attachmentPointSize: CGFloat
+        let baselineOffset: CGFloat
+        let attachmentVerticalOffset: CGFloat
+        /// Two rows only. The single row has the whole menu bar to itself, so its
+        /// flame keeps the image size the system hands back, exactly as before.
+        let clampsAttachmentToLineHeight: Bool
+
+        static let singleRow = MenubarTitleStyle(
+            fontSize: menubarTitleFontSize,
+            attachmentPointSize: menubarTitleFontSize,
+            baselineOffset: -1.0,
+            attachmentVerticalOffset: -3,
+            clampsAttachmentToLineHeight: false
+        )
+        static let twoRow = MenubarTitleStyle(
+            fontSize: MenubarRowTypography.twoRowFontSize,
+            attachmentPointSize: MenubarRowTypography.twoRowAttachmentPointSize,
+            baselineOffset: MenubarRowTypography.twoRowBaselineOffset,
+            attachmentVerticalOffset: MenubarRowTypography.twoRowAttachmentVerticalOffset,
+            clampsAttachmentToLineHeight: true
+        )
+
+        func attachmentBounds(imageSize: CGSize) -> CGRect {
+            guard clampsAttachmentToLineHeight else {
+                return CGRect(
+                    x: 0,
+                    y: attachmentVerticalOffset,
+                    width: imageSize.width,
+                    height: imageSize.height
+                )
+            }
+            return MenubarRowTypography.twoRowAttachmentBounds(imageSize: imageSize)
+        }
+    }
+
+    /// The button cell's single-line state as AppKit handed it to us, captured
+    /// before the two-row path ever touches it so turning the second row back
+    /// off restores the original rendering rather than a guessed default.
+    private var defaultTitleUsesSingleLineMode: Bool?
+    private var defaultTitleWraps: Bool?
+
     private func refreshStatusButton() {
         guard let button = statusItem.button else { return }
         // Skip while the popover is anchored to this button. Rewriting the
@@ -1260,7 +1367,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         button.image = nil
         button.imagePosition = .noImage
 
-        let font = NSFont.monospacedDigitSystemFont(ofSize: menubarTitleFontSize, weight: .regular)
+        // nil whenever the setting is off or the chosen metric has no data, in
+        // which case the title falls back to the single-row composition.
+        // `menubarRowSnapshot` walks every provider's quota summary and reads
+        // the today block, so it is only built once the setting is on: with the
+        // row off a refresh costs no more than the bool it already reads.
+        let rowSettings = store.menubarRowSettings
+        let secondRow = rowSettings.isSecondRowEnabled
+            ? MenubarRowFormatter.secondRow(settings: rowSettings, snapshot: store.menubarRowSnapshot)
+            : nil
+        applyTitleLineMode(to: button, multiline: secondRow != nil)
+        let title = composeStatusTitle(
+            style: secondRow == nil ? .singleRow : .twoRow,
+            secondRow: secondRow
+        )
+        button.attributedTitle = title
+        // The two-line title is one string with a literal newline in it, which
+        // VoiceOver reads as a single run-on phrase. Spell it out instead. The
+        // single-row state sets nil, so turning the row off restores exactly the
+        // label AppKit derives from the title on its own.
+        button.setAccessibilityLabel(
+            secondRow == nil ? nil : MenubarRowFormatter.accessibilityLabel(title: title.string)
+        )
+
+        let menubarPeriod = store.menubarPeriod
+        if let shortfall = store.menubarBadgeDeviceShortfall {
+            button.toolTip = L(
+                "CodeBurn %1$@ · %2$lld of %3$lld devices reporting",
+                menubarPeriod.menubarMetricLabel,
+                shortfall.reachable,
+                shortfall.total
+            )
+        } else {
+            button.toolTip = "CodeBurn \(menubarPeriod.menubarMetricLabel)"
+        }
+
+        persistBadgeStatusFile()
+    }
+
+    /// A multi-line attributed title only renders once the cell stops forcing a
+    /// single line. Both states are applied explicitly so toggling the setting
+    /// at runtime never leaves the cell in the other mode.
+    private func applyTitleLineMode(to button: NSStatusBarButton, multiline: Bool) {
+        guard let cell = button.cell else { return }
+        if defaultTitleUsesSingleLineMode == nil {
+            defaultTitleUsesSingleLineMode = cell.usesSingleLineMode
+            defaultTitleWraps = cell.wraps
+        }
+        if multiline {
+            cell.usesSingleLineMode = false
+            cell.wraps = true
+        } else {
+            cell.usesSingleLineMode = defaultTitleUsesSingleLineMode ?? false
+            cell.wraps = defaultTitleWraps ?? false
+        }
+    }
+
+    /// Composes the status-item title. With `secondRow` nil this is the original
+    /// single-row string, byte for byte; with a second row it renders the same
+    /// first line at the two-row point size and appends the extra line under a
+    /// paragraph style that clamps both lines into the menu bar's height.
+    private func composeStatusTitle(
+        style: MenubarTitleStyle,
+        secondRow: String?
+    ) -> NSAttributedString {
+        let font = NSFont.monospacedDigitSystemFont(ofSize: style.fontSize, weight: .regular)
         // Tint the flame based on the worst-affected connected provider's quota.
         // Normal (<70%) keeps the template (auto white-on-dark / black-on-light);
         // warning/critical/danger override with a fixed palette color so the
@@ -1270,12 +1441,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         if tint == nil, store.isOverDailyBudget {
             tint = NSColor.systemYellow
         }
-        let flame = Self.menubarFlameImage(tint: tint)
+        let flame = Self.menubarFlameImage(tint: tint, pointSize: style.attachmentPointSize)
 
         let attachment = NSTextAttachment()
         attachment.image = flame
         if let size = flame?.size {
-            attachment.bounds = CGRect(x: 0, y: -3, width: size.width, height: size.height)
+            attachment.bounds = style.attachmentBounds(imageSize: size)
         }
 
         let menubarPeriod = store.menubarPeriod
@@ -1307,7 +1478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
                 valueText = compact ? "\(total)\(suffix)" : " \(total)\(suffix)"
             } else if store.displayMetric == .credits, let p = menubarPayload?.current {
                 let credits = formatTokensMenubar((p.codexCredits ?? 0).rounded())
-                valueText = compact ? "\(credits)cr\(suffix)" : " \(credits) credits\(suffix)"
+                valueText = compact ? "\(credits)cr\(suffix)" : " " + L("%@ credits", credits) + suffix
             } else {
                 let fallback = compact ? "$-" : "$—"
                 valueText = compact
@@ -1315,7 +1486,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
                     : " " + (cost?.asCompactCurrency() ?? fallback) + suffix
             }
 
-            var textAttrs: [NSAttributedString.Key: Any] = [.font: font, .baselineOffset: -1.0]
+            var textAttrs: [NSAttributedString.Key: Any] = [.font: font, .baselineOffset: style.baselineOffset]
             if !hasPayload {
                 textAttrs[.foregroundColor] = NSColor.secondaryLabelColor
             }
@@ -1328,21 +1499,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
                 let marker = " · \(shortfall.reachable)/\(shortfall.total)"
                 let markerAttrs: [NSAttributedString.Key: Any] = [
                     .font: font,
-                    .baselineOffset: -1.0,
+                    .baselineOffset: style.baselineOffset,
                     .foregroundColor: NSColor.secondaryLabelColor,
                 ]
                 composed.append(NSAttributedString(string: marker, attributes: markerAttrs))
             }
         }
 
-        button.attributedTitle = composed
-        if let shortfall = store.menubarBadgeDeviceShortfall {
-            button.toolTip = "CodeBurn \(menubarPeriod.menubarMetricLabel) · \(shortfall.reachable) of \(shortfall.total) devices reporting"
-        } else {
-            button.toolTip = "CodeBurn \(menubarPeriod.menubarMetricLabel)"
-        }
+        guard let secondRow else { return composed }
 
-        persistBadgeStatusFile()
+        var secondRowAttrs: [NSAttributedString.Key: Any] = [.font: font]
+        if style.baselineOffset != 0 {
+            secondRowAttrs[.baselineOffset] = style.baselineOffset
+        }
+        composed.append(NSAttributedString(string: "\n" + secondRow, attributes: secondRowAttrs))
+
+        // Centre both lines against each other and clamp their height: the
+        // status item is only as tall as the menu bar, and an unclamped 9pt
+        // line box (with its natural leading) pushes the pair past 22pt, which
+        // AppKit resolves by clipping the second line away.
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        paragraph.lineBreakMode = .byClipping
+        paragraph.lineSpacing = 0
+        paragraph.paragraphSpacing = 0
+        paragraph.minimumLineHeight = MenubarRowTypography.twoRowLineHeight
+        paragraph.maximumLineHeight = MenubarRowTypography.twoRowLineHeight
+        composed.addAttribute(
+            .paragraphStyle,
+            value: paragraph,
+            range: NSRange(location: 0, length: composed.length)
+        )
+        return composed
     }
 
     private var lastWrittenBadgeGenerated: String?
@@ -1398,12 +1586,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         popover.animates = true
         popover.delegate = self
 
+        popover.contentViewController = makePopoverContent()
+    }
+
+    /// Built fresh for every show and dropped on close: a popover content view
+    /// that outlives its window kept re-laying itself out at display cadence
+    /// after being shown once during the first load (6 percent idle CPU until
+    /// relaunch). Rebuilding a 360pt view on open is far cheaper than that.
+    private func makePopoverContent() -> NSViewController {
         let content = MenuBarContent()
             .environment(store)
             .environment(updateChecker)
             .frame(width: popoverWidth)
 
-        popover.contentViewController = NSHostingController(rootView: content)
+        let hosting = NSHostingController(rootView: content)
+        // Let the popover size itself from preferredContentSize only. With the
+        // default options the hosting view also pushes min/max content sizes at
+        // its window on every pass, and once the popover has been shown while
+        // loading (content 520pt tall, then the real height), the closed
+        // popover keeps re-laying itself out at display cadence: 6 percent idle
+        // CPU until relaunch.
+        hosting.sizingOptions = [.preferredContentSize]
+        return hosting
     }
 
     @objc private func handleButtonClick(_ sender: AnyObject?) {
@@ -1427,6 +1631,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             // closes. The popover's window takes keyboard focus on its own
             // via makeKeyAndOrderFront, which is enough for keystrokes to
             // reach the SwiftUI content.
+            if popover.contentViewController == nil {
+                popover.contentViewController = makePopoverContent()
+            }
             store.menuPopoverVisible = true
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             if let window = popover.contentViewController?.view.window {
@@ -1468,29 +1675,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         usageItem.isEnabled = false
         menu.addItem(usageItem)
 
-        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: "")
+        let settingsItem = NSMenuItem(title: L("Settings…"), action: #selector(openSettings), keyEquivalent: "")
         settingsItem.target = self
         settingsItem.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Settings")
         menu.addItem(settingsItem)
 
-        let dockSettingsItem = NSMenuItem(title: "Capacity Dock Settings…", action: #selector(openCapacityDockSettings), keyEquivalent: "")
+        let dockSettingsItem = NSMenuItem(title: L("Capacity Dock Settings…"), action: #selector(openCapacityDockSettings), keyEquivalent: "")
         dockSettingsItem.target = self
         dockSettingsItem.image = NSImage(systemSymbolName: "rectangle.trailinghalf.inset.filled.arrow.trailing", accessibilityDescription: "Capacity Dock")
         menu.addItem(dockSettingsItem)
 
-        let refreshNow = NSMenuItem(title: "Refresh Now", action: #selector(refreshNowAction), keyEquivalent: "")
+        let refreshNow = NSMenuItem(title: L("Refresh Now"), action: #selector(refreshNowAction), keyEquivalent: "")
         refreshNow.target = self
         menu.addItem(refreshNow)
 
-        let updateItem = NSMenuItem(title: "Check for Updates", action: #selector(checkForUpdates), keyEquivalent: "")
+        let updateItem = NSMenuItem(title: L("Check for Updates"), action: #selector(checkForUpdates), keyEquivalent: "")
         updateItem.target = self
         menu.addItem(updateItem)
 
-        let aboutItem = NSMenuItem(title: "About CodeBurn", action: #selector(openAbout), keyEquivalent: "")
+        let aboutItem = NSMenuItem(title: L("About CodeBurn"), action: #selector(openAbout), keyEquivalent: "")
         aboutItem.target = self
         menu.addItem(aboutItem)
 
-        let quitItem = NSMenuItem(title: "Quit CodeBurn", action: #selector(quitApp), keyEquivalent: "")
+        let quitItem = NSMenuItem(title: L("Quit CodeBurn"), action: #selector(quitApp), keyEquivalent: "")
         quitItem.target = self
         menu.addItem(quitItem)
 
@@ -1531,9 +1738,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
 
     /// One-line "today" summary for the context menu's usage row.
     private func contextMenuUsageSummary() -> String {
-        guard let current = store.todayPayload?.current else { return "Today · no usage yet" }
-        let calls = current.calls == 1 ? "1 call" : "\(current.calls) calls"
-        return "Today · \(current.cost.asCurrency()) · \(calls)"
+        guard let current = store.todayPayload?.current else { return L("Today · no usage yet") }
+        let calls = current.calls == 1 ? L("1 call") : L("%lld calls", current.calls)
+        return L("Today · %1$@ · %2$@", current.cost.asCurrency(), calls)
     }
 
     private var settingsWindowController: NSWindowController?
@@ -1569,7 +1776,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             backing: .buffered,
             defer: false
         )
-        window.title = "CodeBurn Settings"
+        window.title = L("CodeBurn Settings")
         window.contentViewController = hosting
         window.center()
         window.isReleasedWhenClosed = false
@@ -1608,24 +1815,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             let alert = NSAlert()
             alert.icon = codeburnAlertIcon()
             if let error = updateChecker.updateError {
-                alert.messageText = "Update Check Failed"
+                alert.messageText = L("Update Check Failed")
                 alert.informativeText = error
                 alert.alertStyle = .warning
             } else if updateChecker.updateAvailable, let latest = updateChecker.latestVersion {
-                alert.messageText = "Update Available"
-                let header = "\(AppVersion.display(latest)) is available (you have \(AppVersion.display(updateChecker.currentVersion)))."
+                alert.messageText = L("Update Available")
+                let header = L(
+                    "%1$@ is available (you have %2$@).",
+                    AppVersion.display(latest),
+                    AppVersion.display(updateChecker.currentVersion)
+                )
                 if updateChecker.cliTooOldForUpdate {
-                    alert.informativeText = "\(header) Your codeburn CLI is too old to install it. First run:\n\n\(updateChecker.cliUpdateCommand)\n\nthen:\n\ncodeburn menubar --force"
+                    alert.informativeText = L(
+                        "%1$@ Your codeburn CLI is too old to install it. First run:\n\n%2$@\n\nthen:\n\ncodeburn menubar --force",
+                        header,
+                        updateChecker.cliUpdateCommand
+                    )
                 } else {
-                    alert.informativeText = "\(header) Run:\n\ncodeburn menubar --force"
+                    alert.informativeText = L("%@ Run:\n\ncodeburn menubar --force", header)
                 }
                 alert.alertStyle = .informational
             } else {
-                alert.messageText = "Up to Date"
-                alert.informativeText = "You're on the latest version (\(AppVersion.display(updateChecker.currentVersion)))."
+                alert.messageText = L("Up to Date")
+                alert.informativeText = L(
+                    "You're on the latest version (%@).",
+                    AppVersion.display(updateChecker.currentVersion)
+                )
                 alert.alertStyle = .informational
             }
-            alert.addButton(withTitle: "OK")
+            alert.addButton(withTitle: L("OK"))
             alert.runModal()
         }
     }
@@ -1642,8 +1860,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
 
     func popoverDidClose(_ notification: Notification) {
         store.menuPopoverVisible = false
+        popover.contentViewController = nil
         // Catch up on any menubar title updates that were skipped while the
         // popover was anchored.
         refreshStatusButton()
+    }
+}
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner]
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        // Only the release notice installs anything. Every other poster shares
+        // this delegate, so a tap on one of those must not start an update.
+        guard response.notification.request.identifier
+            .hasPrefix(UpdateChecker.notificationIdentifierPrefix) else { return }
+        await MainActor.run { self.updateChecker.performFullUpdate() }
     }
 }

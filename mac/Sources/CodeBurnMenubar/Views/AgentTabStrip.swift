@@ -16,6 +16,7 @@ struct AgentTabStrip: View {
     @State private var stripViewportWidth: CGFloat = 0
     @State private var stripContentWidth: CGFloat = 0
     @State private var scrollWheelMonitor: Any?
+    @State private var viewportAnchor: ProviderFilter?
 
     var body: some View {
         GeometryReader { viewportGeo in
@@ -23,7 +24,7 @@ struct AgentTabStrip: View {
                 HStack(spacing: 4) {
                     if isOverflowing {
                         Button {
-                            selectAdjacentProvider(direction: -1, proxy: proxy)
+                            pageProviderStrip(direction: .backward, proxy: proxy)
                         } label: {
                             Image(systemName: "chevron.left")
                                 .font(.system(size: 10, weight: .semibold))
@@ -32,7 +33,7 @@ struct AgentTabStrip: View {
                         .buttonStyle(.plain)
                         .foregroundStyle(canMoveBackward ? Color.primary : Color.secondary.opacity(0.35))
                         .disabled(!canMoveBackward)
-                        .help("Show previous providers")
+                        .help(L("Show previous providers"))
                     }
 
                     ScrollView(.horizontal, showsIndicators: false) {
@@ -44,6 +45,7 @@ struct AgentTabStrip: View {
                                     isActive: store.selectedProvider == filter,
                                     quota: store.quotaSummary(for: filter)
                                 ) {
+                                    viewportAnchor = filter
                                     store.switchTo(provider: filter)
                                     withAnimation(.easeInOut(duration: 0.18)) {
                                         proxy.scrollTo(filter.id, anchor: .center)
@@ -73,7 +75,7 @@ struct AgentTabStrip: View {
 
                     if isOverflowing {
                         Button {
-                            selectAdjacentProvider(direction: 1, proxy: proxy)
+                            pageProviderStrip(direction: .forward, proxy: proxy)
                         } label: {
                             Image(systemName: "chevron.right")
                                 .font(.system(size: 10, weight: .semibold))
@@ -82,23 +84,25 @@ struct AgentTabStrip: View {
                         .buttonStyle(.plain)
                         .foregroundStyle(canMoveForward ? Color.primary : Color.secondary.opacity(0.35))
                         .disabled(!canMoveForward)
-                        .help("Show next providers")
+                        .help(L("Show next providers"))
                     }
                 }
                 .onAppear {
                     stripViewportWidth = viewportGeo.size.width
                     installScrollWheelMonitorIfNeeded()
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        proxy.scrollTo(store.selectedProvider.id, anchor: .center)
-                    }
+                    viewportAnchor = pagingState.viewportAnchor
+                    scrollToViewportAnchor(proxy: proxy)
                 }
                 .onChange(of: viewportGeo.size.width) { _, newWidth in
                     stripViewportWidth = newWidth
                 }
                 .onChange(of: store.selectedProvider) { _, newProvider in
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        proxy.scrollTo(newProvider.id, anchor: .center)
-                    }
+                    viewportAnchor = visibleFilters.contains(newProvider) ? newProvider : pagingState.viewportAnchor
+                    scrollToViewportAnchor(proxy: proxy)
+                }
+                .onChange(of: visibleFilters) { _, _ in
+                    viewportAnchor = pagingState.viewportAnchor
+                    scrollToViewportAnchor(proxy: proxy)
                 }
                 .onDisappear {
                     removeScrollWheelMonitorIfNeeded()
@@ -109,14 +113,18 @@ struct AgentTabStrip: View {
     }
 
     private var periodAll: MenubarPayload {
-        store.periodAllPayload ?? store.payload
+        // `store.payload` is the SCOPED selection. Falling back to it while the
+        // selection has no cached data of its own used to surface the previous
+        // provider's totals here; the same hasCachedData gate the popover body
+        // uses keeps that out of the tab strip.
+        store.periodAllPayload ?? (store.hasCachedData ? store.payload : .empty)
     }
 
     private var visibleFilters: [ProviderFilter] {
         // Tabs reflect the selected range. The payload's activity signal keeps
         // token-only and subscription/flat-rate providers visible while hiding
         // providers merely discovered on disk. Older payloads lack the activity
-        // signal, so they preserve detected-provider visibility for compatibility.
+        // signal, so their zero-cost discovery rows fail closed.
         let activeKeys = ProviderVisibility.activeKeys(
             providerDetails: periodAll.current.providerDetails,
             legacyProviders: periodAll.current.providers
@@ -149,21 +157,29 @@ struct AgentTabStrip: View {
         }
     }
 
-    private var currentFilterIndex: Int {
-        visibleFilters.firstIndex(of: store.selectedProvider) ?? 0
+    private var pagingState: ProviderStripPagingState {
+        ProviderStripPagingState(
+            filters: visibleFilters,
+            selectedProvider: store.selectedProvider,
+            viewportAnchor: viewportAnchor
+        )
     }
 
-    private var canMoveBackward: Bool { currentFilterIndex > 0 }
-    private var canMoveForward: Bool { currentFilterIndex < visibleFilters.count - 1 }
+    private var canMoveBackward: Bool { pagingState.canMoveBackward }
+    private var canMoveForward: Bool { pagingState.canMoveForward }
     private var isOverflowing: Bool { stripContentWidth > (stripViewportWidth - 30) }
 
-    private func selectAdjacentProvider(direction: Int, proxy: ScrollViewProxy) {
-        guard !visibleFilters.isEmpty else { return }
-        let targetIndex = min(max(currentFilterIndex + direction, 0), visibleFilters.count - 1)
-        let target = visibleFilters[targetIndex]
-        store.switchTo(provider: target)
+    private func pageProviderStrip(direction: ProviderStripPagingDirection, proxy: ScrollViewProxy) {
+        var state = pagingState
+        guard let target = state.move(direction: direction) else { return }
+        viewportAnchor = target
+        scrollToViewportAnchor(proxy: proxy)
+    }
+
+    private func scrollToViewportAnchor(proxy: ScrollViewProxy) {
+        guard let viewportAnchor else { return }
         withAnimation(.easeInOut(duration: 0.18)) {
-            proxy.scrollTo(target.id, anchor: .center)
+            proxy.scrollTo(viewportAnchor.id, anchor: .center)
         }
     }
 
@@ -329,6 +345,7 @@ private struct AgentTabQuotaBar: View {
 }
 
 private struct QuotaDetailPopover: View {
+    @Environment(AppStore.self) private var store
     let quota: QuotaSummary
 
     var body: some View {
@@ -341,7 +358,7 @@ private struct QuotaDetailPopover: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             case .loading where quota.details.isEmpty:
-                Text("Loading…")
+                Text(L("Loading…"))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             default:
@@ -354,23 +371,23 @@ private struct QuotaDetailPopover: View {
 
     private var disconnectedMessage: String {
         switch quota.providerFilter {
-        case .codex:  return "Sign in with `codex` (ChatGPT mode) to track quota."
-        case .claude: return "Sign in to Claude Code to track quota."
-        default:      return "Sign in to track quota."
+        case .codex:  return L("Sign in with `codex` (ChatGPT mode) to track quota.")
+        case .claude: return L("Sign in to Claude Code to track quota.")
+        default:      return L("Sign in to track quota.")
         }
     }
 
     private var rowsCard: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Text("\(quota.providerFilter.rawValue) usage")
+                Text(L("%@ usage", quota.providerFilter.displayLabel))
                     .font(.system(size: 11, weight: .semibold))
                 if case .stale = quota.connection {
-                    Text("stale")
+                    Text(L("stale"))
                         .font(.system(size: 9.5))
                         .foregroundStyle(.secondary)
                 } else if case .transientFailure = quota.connection {
-                    Text("retrying")
+                    Text(L("retrying"))
                         .font(.system(size: 9.5))
                         .foregroundStyle(.orange)
                 }
@@ -393,8 +410,19 @@ private struct QuotaDetailPopover: View {
                         .fixedSize(horizontal: true, vertical: false)
                 }
             }
-            ForEach(Array(quota.details.enumerated()), id: \.offset) { _, w in
+            ForEach(Array(quota.details.enumerated()), id: \.offset) { index, w in
                 QuotaDetailRow(window: w)
+            }
+            // What this Mac has seen of the provider's own reset timing, next to
+            // the pace captions. Derived from the snapshots already on disk.
+            let earlyResetLines = store.earlyResetHistoryCaptions(for: quota.providerFilter)
+            if !earlyResetLines.isEmpty {
+                ForEach(Array(earlyResetLines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .help(L("Derived from this Mac's own record of past quota windows for this provider. Local only — nothing is fetched to produce it."))
+                }
             }
             if !quota.footerLines.isEmpty {
                 Divider()
@@ -410,66 +438,54 @@ private struct QuotaDetailPopover: View {
 
     private func terminalFailureCard(reason: String?) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(reconnectTitle)
+            Text(reconnectPresentation.title)
                 .font(.system(size: 11.5, weight: .semibold))
                 .foregroundStyle(.red)
-            Text(reason ?? defaultReconnectReason)
+            Text(reason ?? reconnectPresentation.defaultReason)
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
-            Text(reconnectInstruction)
+            Text(reconnectPresentation.instruction)
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
         }
     }
 
-    private var reconnectTitle: String {
-        switch quota.providerFilter {
-        case .codex:  return "Reconnect Codex"
-        default:      return "Reconnect Claude"
-        }
-    }
-
-    private var defaultReconnectReason: String {
-        switch quota.providerFilter {
-        case .codex:  return "Refresh token rejected by OpenAI."
-        default:      return "Refresh token rejected by Anthropic."
-        }
-    }
-
-    private var reconnectInstruction: String {
-        switch quota.providerFilter {
-        case .codex:  return "Run `codex login` in your terminal, then click Reconnect."
-        default:      return "Open Claude Code in your terminal and type `/login`, then click Reconnect."
-        }
+    private var reconnectPresentation: ProviderReconnectPresentation {
+        ProviderReconnectPresentation(provider: quota.providerFilter)
     }
 }
 
 private struct QuotaDetailRow: View {
     let window: QuotaSummary.Window
 
+    private static let labelWidth: CGFloat = 92
+    private static let rowSpacing: CGFloat = 8
+
     var body: some View {
-        HStack(spacing: 8) {
-            Text(window.label)
-                .font(.system(size: 10.5))
-                .frame(width: 92, alignment: .leading)
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.secondary.opacity(0.18))
-                    Capsule()
-                        .fill(barColor)
-                        .frame(width: max(2, geo.size.width * CGFloat(min(max(window.percent, 0), 1))))
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: Self.rowSpacing) {
+                Text(window.label)
+                    .font(.system(size: 10.5))
+                    .frame(width: Self.labelWidth, alignment: .leading)
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.secondary.opacity(0.18))
+                        Capsule()
+                            .fill(barColor)
+                            .frame(width: max(2, geo.size.width * CGFloat(min(max(window.percent, 0), 1))))
+                    }
                 }
-            }
-            .frame(height: 4)
-            Text(window.percentLabel)
-                .font(.codeMono(size: 10.5, weight: .medium))
-                .frame(width: 36, alignment: .trailing)
-            if !window.resetsInLabel.isEmpty {
-                Text(window.resetsInLabel)
-                    .font(.codeMono(size: 10))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 50, alignment: .trailing)
+                .frame(height: 4)
+                Text(window.percentLabel)
+                    .font(.codeMono(size: 10.5, weight: .medium))
+                    .frame(width: 36, alignment: .trailing)
+                if !window.resetsInLabel.isEmpty {
+                    Text(window.resetsInLabel)
+                        .font(.codeMono(size: 10))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 50, alignment: .trailing)
+                }
             }
         }
     }

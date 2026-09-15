@@ -1,7 +1,7 @@
 {
   "name": "codeburn-desktop",
   "private": true,
-  "version": "0.9.23",
+  "version": "0.9.24",
   "description": "CodeBurn Desktop \u2014 Electron app fed by the codeburn CLI",
   "main": "dist/electron/main.js",
   "scripts": {
@@ -12,11 +12,14 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "stage-cli": "npm --prefix .. run build:cli && node scripts/stage-cli.mjs",
+    "stage-menubar": "node scripts/stage-menubar.mjs --target nsis",
+    "stage-menubar:store": "node scripts/stage-menubar.mjs --target appx",
     "package": "npm run stage-cli && npm run build && electron-builder --mac",
     "package:arm64": "npm run stage-cli && npm run build && electron-builder --mac --arm64",
     "package:x64": "npm run stage-cli && npm run build && electron-builder --mac --x64",
-    "package:win": "npm run stage-cli && npm run build && electron-builder --win",
-    "package:store": "npm run stage-cli && npm run build && electron-builder --win appx --x64",
+    "package:win": "npm run stage-cli && npm run stage-menubar && npm run build && electron-builder --win",
+    "package:win:arm64": "npm run stage-cli && npm run stage-menubar && npm run build && cross-env ELECTRON_BUILDER_7Z_FILTER=BCJ electron-builder --win nsis --arm64",
+    "package:store": "npm run stage-cli && npm run stage-menubar:store && npm run build && electron-builder --win appx --x64",
     "package:linux": "npm run stage-cli && npm run build && electron-builder --linux",
     "package:snap": "npm run stage-cli && npm run build && electron-builder --linux snap --x64"
   },
@@ -24,27 +27,27 @@
     "@gsap/react": "^2.1.2",
     "gsap": "^3.15.0",
     "lz-string": "^1.5.0",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.9.1",
-    "@testing-library/react": "^16.3.2",
-    "@testing-library/user-event": "^14.6.1",
-    "@types/node": "^26.1.1",
-    "@types/react": "^19.2.17",
-    "@types/react-dom": "^19.2.3",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.7",
+    "@types/node": "^26.5.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^4.7.0",
     "@vitest/ui": "^3.2.7",
-    "concurrently": "^10.0.3",
+    "concurrently": "^10.0.5",
     "cross-env": "^10.1.0",
-    "electron": "^43.1.0",
+    "electron": "^43.7.0",
     "electron-builder": "^26.15.3",
     "jsdom": "^29.1.1",
     "typescript": "^7.0.2",
     "vite": "^6.4.3",
     "vitest": "^3.2.7",
-    "wait-on": "^9.0.10"
+    "wait-on": "^9.1.0"
   },
   "build": {
     "appId": "org.agentseal.codeburn-desktop",
@@ -96,14 +99,25 @@
           ]
         }
       ],
-      "icon": "build/icon.png"
+      "icon": "build/icon.png",
+      "extraResources": [
+        {
+          "from": "build/menubar",
+          "to": "menubar",
+          "filter": [
+            "**/*"
+          ]
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,
       "perMachine": false,
-      "artifactName": "CodeBurn-Setup-${version}.${ext}"
+      "artifactName": "CodeBurn-Setup-${version}.${ext}",
+      "include": "build/installer.nsh"
     },
     "appx": {
+      "customExtensionsPath": "build/appx-extensions.xml",
       "applicationId": "CodeBurn",
       "identityName": "Codeburn.CodeBurn",
       "publisher": "CN=3EFA3336-87E1-46F2-9DFA-2EB5A7693F89",

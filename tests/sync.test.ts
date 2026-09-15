@@ -13,6 +13,7 @@ import {
   renderCallbackPage,
   CALLBACK_PORTS,
 } from '../src/sync/auth.js'
+import { setHome } from './setup/home.js'
 
 // ── Discovery Doc Parser ──────────────────────────────────────────────
 
@@ -212,11 +213,11 @@ describe('syncConfig', () => {
 
   beforeEach(async () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'codeburn-sync-config-'))
-    process.env.HOME = tmpDir
+    setHome(tmpDir)
   })
 
   afterEach(async () => {
-    process.env.HOME = originalHome
+    setHome(originalHome)
     await rm(tmpDir, { recursive: true, force: true })
   })
 

@@ -18,6 +18,7 @@ import {
 } from '../src/sync/otlp.js'
 
 import type { ParsedApiCall, TokenUsage } from '../src/types.js'
+import { setHome } from './setup/home.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -278,12 +279,12 @@ describe('ledger', () => {
 
   beforeEach(async () => {
     tmpDir = await mkdtemp(join(tmpdir(), 'codeburn-ledger-'))
-    process.env.HOME = tmpDir
+    setHome(tmpDir)
     process.env.CODEBURN_CACHE_DIR = join(tmpDir, '.cache', 'codeburn')
   })
 
   afterEach(async () => {
-    process.env.HOME = originalHome
+    setHome(originalHome)
     if (originalCacheDir === undefined) delete process.env.CODEBURN_CACHE_DIR
     else process.env.CODEBURN_CACHE_DIR = originalCacheDir
     if (originalXdgCacheDir === undefined) delete process.env.XDG_CACHE_HOME

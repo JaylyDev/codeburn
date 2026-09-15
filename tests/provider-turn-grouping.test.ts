@@ -4,6 +4,7 @@ import { tmpdir } from 'os'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DateRange } from '../src/types.js'
+import { setHome } from './setup/home.js'
 
 let home: string
 let cacheDir: string
@@ -14,7 +15,7 @@ beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), 'codeburn-turn-group-home-'))
   cacheDir = await mkdtemp(join(tmpdir(), 'codeburn-turn-group-cache-'))
   vibeHome = await mkdtemp(join(tmpdir(), 'codeburn-turn-group-vibe-'))
-  process.env['HOME'] = home
+  setHome(home)
   process.env['CODEBURN_CACHE_DIR'] = cacheDir
   process.env['VIBE_HOME'] = vibeHome
 })

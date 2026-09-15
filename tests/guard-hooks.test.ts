@@ -330,6 +330,26 @@ describe('session opener (SessionStart)', () => {
     expect(matchFlag(flags, '/repo/alpha/src')).toEqual(matchFlag(flags, '/repo/alpha')) // subdir matches
     expect(matchFlag(flags, '/repo/beta')).toEqual([])
   })
+
+  const separatorFlags: GuardFlags = {
+    generatedAt: new Date().toISOString(),
+    projects: [{ path: '/repo/alpha', openers: ['opener'] }],
+  }
+
+  it('counts a forward slash as a directory boundary on every platform', () => {
+    expect(matchFlag(separatorFlags, '/repo/alpha')).toEqual(['opener'])
+    expect(matchFlag(separatorFlags, '/repo/alpha/src')).toEqual(['opener'])
+    expect(matchFlag(separatorFlags, '/repo/alpha/')).toEqual(['opener'])
+    expect(matchFlag(separatorFlags, '/repo/alphabet')).toEqual([])
+  })
+
+  it('counts a backslash as a directory boundary only on Windows', () => {
+    // Off Windows a backslash is an ordinary filename character, so
+    // "/repo/alpha\src" is one sibling directory of /repo, not a subdirectory.
+    const expected = process.platform === 'win32' ? ['opener'] : []
+    expect(matchFlag(separatorFlags, '/repo/alpha\\src')).toEqual(expected)
+    expect(matchFlag(separatorFlags, '/repo/alpha\\')).toEqual(expected)
+  })
 })
 
 describe('fail-open: malformed stdin', () => {

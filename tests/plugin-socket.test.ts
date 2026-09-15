@@ -25,6 +25,7 @@ import { gzipSync } from 'zlib'
 import { buildOtlpPayload, type OtlpAttribute } from '../src/sync/otlp.js'
 import { pluginPayloadSections, loadPlugins } from '../src/plugins/loader.js'
 import { filterPluginAttributes } from '../src/sync/otlp.js'
+import { tarBin } from '../src/plugins/cli.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -637,7 +638,7 @@ describe('plugin signing and verification: recursive trees and tampering detecti
     // Create tarball
     const tarFile = join(tmpDir, 'plugin.tar.gz')
     await new Promise<void>((resolve, reject) => {
-      const child = spawn('tar', ['-czf', tarFile, '-C', tmpDir, 'fixture-plugin'])
+      const child = spawn(tarBin(), ['-czf', tarFile, '-C', tmpDir, 'fixture-plugin'])
       child.on('error', reject)
       child.on('exit', (code) => {
         if (code === 0) resolve()

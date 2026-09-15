@@ -24,12 +24,12 @@ There is no separate build step required to run the dev CLI. `npm run dev` runs 
 
 | Command | What it does |
 |---|---|
-| `npm test` | Runs the vitest suite under `tests/` (189 of the 192 files, 2,494 tests). |
-| `npm run test:locks` | Runs the three parallelism-sensitive `cache-refresh-lock` suites serially. |
+| `npm test` | Runs the vitest suite under `tests/`, excluding the four serial lock suites. |
+| `npm run test:locks` | Runs the four parallelism-sensitive `cache-refresh-lock` suites serially. |
 | `npm run test:watch` | Same scope as `npm test`, in watch mode. |
 | `npm run dev -- status` | Runs the CLI in dev mode against your real data. |
-| `npm run build` | Bundles the litellm pricing snapshot, then runs `tsup` to produce `dist/cli.js`. |
-| `npm run bundle-litellm` | Refreshes `src/data/litellm-snapshot.json` from the upstream litellm repo. |
+| `npm run build` | Builds the CLI and dashboard from the checked-in pricing catalogs without mutating tracked source files. |
+| `npm run bundle-litellm` | Explicitly refreshes the checked-in pricing catalogs from their upstream sources. Review and commit the resulting data changes separately. |
 
 To test a specific suite, run vitest directly with a path:
 
@@ -83,7 +83,7 @@ See `docs/architecture.md` for a fuller map.
 
 ### The full suite is the gate
 
-Before opening or updating a PR, run `npx vitest run` on your branch and on `main`, and compare. Your branch must introduce zero new failures. Listing only your own new tests as verification is not verification; the regressions we catch are almost always in tests the author never ran. For `mac/` changes the same applies to `swift test`.
+Before opening or updating a PR, run `npm test` on your branch and on `main`, and compare (`cd app && npm test` if your change touches the Electron app). Your branch must introduce zero new failures. Listing only your own new tests as verification is not verification; the regressions we catch are almost always in tests the author never ran. For `mac/` changes the same applies to `swift test` run from `mac/`.
 
 ## Commit Message Format
 
@@ -129,6 +129,10 @@ PRs that add a provider based solely on online documentation or AI-generated cod
 3. The `firstlook` workflow will auto-assess the PR. The `semgrep` CI workflow runs the hot-path bracket-assign guard. The `block-claude-coauthor` workflow scans commits.
 4. A maintainer reviews. For non-trivial changes, expect requests for tests.
 5. Squash-merge is the default. Keep the PR title short and accurate; the description carries the context.
+6. Fill in the description. A PR whose "Summary" is still the template is closed automatically; write what the change does and why, then reopen.
+7. If this is your first contribution and the change is over about 300 lines, open an issue first and reference it in the PR. Large work gets discussed before it is written; small fixes do not need this.
+8. Keep at most five pull requests open at a time. A sixth is closed automatically with a note and can be reopened once one of the others lands or closes. If you have more ideas than open slots, file an issue for each so the work is visible and can be discussed before it is written.
+9. UI change? Attach before and after screenshots of the affected screen to the PR. No screenshots, no review.
 
 ## Reporting Bugs
 

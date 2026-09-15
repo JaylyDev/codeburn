@@ -6,7 +6,7 @@ import { SERIES_LABELS, type SeriesKey, seriesClassForKey, seriesClassForModel, 
 import { formatChartDate } from '../lib/period'
 import type { DailyHistoryEntry } from '../lib/types'
 
-const SERIES_ORDER: readonly SeriesKey[] = ['opus', 'fable', 'haiku', 'gpt', 'sonnet', 'other']
+const SERIES_ORDER: readonly SeriesKey[] = ['flagship', 'premium', 'balanced', 'fast', 'other']
 
 function modelSpend(day: DailyHistoryEntry): number {
   return day.topModels.reduce((sum, model) => sum + Math.max(0, model.cost), 0)
@@ -59,12 +59,13 @@ export function StackedBars({ daily, fallbackLabel = 'All models', animateKey = 
                   (a, b) => SERIES_ORDER.indexOf(seriesKeyForModel(a.name)) - SERIES_ORDER.indexOf(seriesKeyForModel(b.name)),
                 ).map(model => {
                   const pct = Math.max(1, (Math.max(0, model.cost) / maxTotal) * 100)
+                  const routes = model.rawModels && model.rawModels.length > 1 ? ` (${model.rawModels.join(', ')})` : ''
                   return (
                     <span
                       key={`${day.date}-${model.name}`}
                       className={`s ${seriesClassForModel(model.name)}`}
                       style={{ height: `${pct}%` }}
-                      title={`${model.name} · ${formatUsd(model.cost)}`}
+                      title={`${model.name}${routes} · ${formatUsd(model.cost)}`}
                     />
                   )
                 })

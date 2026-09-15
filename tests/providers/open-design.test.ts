@@ -26,7 +26,7 @@ async function collect(source: SessionSource, seenKeys = new Set<string>()): Pro
 async function fixtureSource(runId: string): Promise<SessionSource> {
   const provider = createOpenDesignProvider()
   const sources = await provider.discoverSessions()
-  const source = sources.find(s => s.path.includes(`${runId}/events.jsonl`))
+  const source = sources.find(s => s.path.includes(join(runId, 'events.jsonl')))
   expect(source).toBeDefined()
   return source!
 }

@@ -410,6 +410,10 @@ async function findLastBoundary(filePath: string): Promise<{
 // 200K unless the session itself proves bigger.
 const MILLION_WINDOW_RE = /opus-4-8|\[1m\]/
 
+export function reportedContextWindow(model: string, maxSeenTokens: number): number {
+  return MILLION_WINDOW_RE.test(model) || maxSeenTokens > 220_000 ? 1_000_000 : 200_000
+}
+
 export async function buildContextTree(session: SessionRef): Promise<ContextTreeResult> {
   const boundary = await findLastBoundary(session.filePath)
   const builder = new TreeBuilder()
@@ -445,8 +449,7 @@ export async function buildContextTree(session: SessionRef): Promise<ContextTree
       (builder.lastUsage.cache_creation_input_tokens ?? 0) +
       (builder.lastUsage.output_tokens ?? 0)
     builder.maxSeenTokens = Math.max(builder.maxSeenTokens, context)
-    const million = MILLION_WINDOW_RE.test(builder.model) || builder.maxSeenTokens > 220_000
-    reported = { context, window: million ? 1_000_000 : 200_000 }
+    reported = { context, window: reportedContextWindow(builder.model, builder.maxSeenTokens) }
   }
 
   return {

@@ -1,7 +1,11 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell, type MenuItemConstructorOptions } from 'electron'
+import { randomBytes } from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
 import { CliError, DESKTOP_COLD_TIMEOUT_MS, PROGRESS_LINE_PREFIX, reapOrphanServe, resolveCodeburnPath, shutdownAll, spawnCli, spawnCliAction, startServe, type ActionResult, type SpawnPriority } from './cli'
+import { MenubarCompanion, STARTUP_APPS_SETTINGS_URL, type CompanionStatus } from './menubar'
 import { getQuota, sanitizeError } from './quota'
 import { Telemetry } from './telemetry'
 import { createUpdateChecker, type UpdateChecker, type UpdateStatus } from './updates'
@@ -10,6 +14,11 @@ import { createUpdateChecker, type UpdateChecker, type UpdateStatus } from './up
 let telemetryInstance: Telemetry | null = null
 // The once-per-launch + 24h update-availability checker. Null under tests.
 let updateChecker: UpdateChecker | null = null
+// The bundled tray app and its Capacity Dock (Windows only). Null under tests.
+let companion: MenubarCompanion | null = null
+
+/** What the sidebar switches read on a platform that has no tray app to bundle. */
+export const NO_COMPANION: CompanionStatus = { supported: false, menuBar: false, sidebar: false, store: false }
 
 /** The slice of Telemetry the bridge handlers use — injectable for tests. */
 export type TelemetryBridge = Pick<Telemetry, 'status' | 'setEnabled' | 'completeOnboarding' | 'track'>
@@ -122,6 +131,133 @@ function providerArgs(provider: string | undefined): string[] {
   return provider && provider !== 'all' ? ['--provider', provider] : []
 }
 
+/** Include/exclude patterns scoping every CLI fetch the app makes. */
+export type ProjectFilter = { project: string[]; exclude: string[] }
+
+const EMPTY_PROJECT_FILTER: ProjectFilter = { project: [], exclude: [] }
+
+// A file rather than a build-time constant so it toggles without rebuilding,
+// and it lives here, not in renderer storage, because this is where the argv is
+// assembled. Re-read whenever the file changes, so a hand edit lands.
+let appFilterCache: { path: string; stamp: string; filter: ProjectFilter } | null = null
+
+/**
+ * CODEBURN_APP_FILTER overrides the location; an empty string disables the
+ * filter outright, which is what the test suite sets so a filter file in the
+ * developer's own home cannot reach the assertions.
+ */
+function appFilterPath(): string | null {
+  const override = process.env.CODEBURN_APP_FILTER
+  if (override !== undefined) return override.trim() === '' ? null : override
+  return path.join(os.homedir(), '.config', 'codeburn', 'app-filter.json')
+}
+
+/// Drops blanks and duplicates. A leading "-" is KEPT: Claude encodes a project
+/// directory as "-Users-me-Web-thing", which is most real projects.
+function normalizePatterns(value: unknown): string[] {
+  // A hand-edit writes one pattern as a bare string; dropping it would unhide.
+  const entries = typeof value === 'string' ? [value] : value
+  if (!Array.isArray(entries)) return []
+  const patterns = new Set<string>()
+  for (const entry of entries) {
+    if (typeof entry !== 'string') continue
+    const pattern = expandTilde(entry.trim())
+    if (pattern === '') continue
+    patterns.add(pattern)
+  }
+  return [...patterns]
+}
+
+/// A pattern typed into the pane has no shell behind it, so "~/work/app" is
+/// expanded here, on the way in and on the way out of the file. The renderer
+/// has no home directory of its own, and a tilde it cannot resolve would make
+/// its switches disagree with the argv this process writes.
+function expandTilde(pattern: string): string {
+  const raw = pattern.replace(/\\/g, '/')
+  if (raw !== '~' && !raw.startsWith('~/')) return pattern
+  return os.homedir().replace(/\\/g, '/') + raw.slice(1)
+}
+
+function normalizeProjectFilter(value: unknown): ProjectFilter {
+  const raw = (value ?? {}) as { project?: unknown; exclude?: unknown }
+  return { project: normalizePatterns(raw.project), exclude: normalizePatterns(raw.exclude) }
+}
+
+/// A read that failed is NOT an empty filter. Answering with one would run the
+/// next fetch unfiltered and paint the projects the file exists to hide, which
+/// is the single outcome this pane must never produce. Callers surface this as
+/// a panel error instead, so the screen stays empty until the file is readable.
+function unreadableFilter(error: unknown): CliError {
+  const code = (error as NodeJS.ErrnoException).code
+  return new CliError('nonzero', `Could not read the project filter${code ? ` (${code})` : ''}. Showing nothing rather than the projects it hides.`)
+}
+
+export function readProjectFilter(): ProjectFilter {
+  const filterPath = appFilterPath()
+  if (filterPath === null) return EMPTY_PROJECT_FILTER
+  // mtime alone misses a same-tick rewrite and a cp -p / git checkout restore.
+  let stamp: string
+  try {
+    const stat = fs.statSync(filterPath)
+    stamp = `${stat.mtimeMs}:${stat.size}:${stat.ino}`
+  } catch (error) {
+    // A missing file is the one honest way to have no filter. Every other errno
+    // (EACCES on the directory, EIO) is a read that failed, and statSync rejects
+    // them all the same way.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw unreadableFilter(error)
+    appFilterCache = null
+    return EMPTY_PROJECT_FILTER
+  }
+  if (appFilterCache?.path === filterPath && appFilterCache.stamp === stamp) return appFilterCache.filter
+  try {
+    const filter = normalizeProjectFilter(JSON.parse(fs.readFileSync(filterPath, 'utf8')))
+    appFilterCache = { path: filterPath, stamp, filter }
+    return filter
+  } catch (error) {
+    // Unreadable or half-written: keep the last filter, never unhide. The cache
+    // is per-process, so the first read of a launch has no last filter to keep
+    // and the failure has to travel instead of being flattened to "show all".
+    if (appFilterCache?.path === filterPath) return appFilterCache.filter
+    throw unreadableFilter(error)
+  }
+}
+
+/** Persists the filter and returns what actually landed, normalization included. */
+export function writeProjectFilter(value: unknown): ProjectFilter {
+  const filter = normalizeProjectFilter(value)
+  const filterPath = appFilterPath()
+  // CODEBURN_APP_FILTER='' disables the filter outright: there is no file to
+  // write, and the empty filter is what every later read will report.
+  if (filterPath === null) return EMPTY_PROJECT_FILTER
+  fs.mkdirSync(path.dirname(filterPath), { recursive: true })
+  // Staged and renamed, like saveConfig in src/config.ts and for the same
+  // reason: a writeFileSync straight over the live path can be interrupted, and
+  // this is the one file that decides what stays hidden. A truncated filter is
+  // an unreadable filter, which now costs a visible error on the next read
+  // instead of a silent unhide, but neither is a state a click should produce.
+  // The temp name is randomized so two windows saving at once cannot collide.
+  const tmpPath = `${filterPath}.${randomBytes(8).toString('hex')}.tmp`
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(filter, null, 2) + '\n')
+    fs.renameSync(tmpPath, filterPath)
+  } catch (error) {
+    fs.rmSync(tmpPath, { force: true })
+    throw error
+  }
+  appFilterCache = null
+  return filter
+}
+
+// `--opt=value`, never `--opt value`: a pattern routinely starts with "-", and
+// as a separate argv entry that parses as another flag.
+function projectArgs(): string[] {
+  const { project, exclude } = readProjectFilter()
+  const args: string[] = []
+  for (const name of project) args.push(`--project=${name}`)
+  for (const name of exclude) args.push(`--exclude=${name}`)
+  return args
+}
+
 type DateRange = { from: string; to: string }
 
 function rangeArgs(range: DateRange | undefined): string[] {
@@ -150,6 +286,25 @@ function vRange(range: DateRange | undefined): DateRange | undefined {
   }
   return range
 }
+/**
+ * Drill-down contribution key (canonical project path or model id). Unlike
+ * vToken, a leading '-' is legal here: Claude sanitizes project paths by
+ * replacing separators with '-' (e.g. `/work/pricing` → `-work-pricing`), and
+ * the key is only ever emitted in the VALUE position of `--key`/`--dimension`
+ * pairs, where Commander binds the next token as the value — a dash-leading
+ * value cannot inject a flag through the argv array (no shell involved).
+ * Empty and NUL are still rejected.
+ */
+function vContributionKey(value: string): string {
+  if (!value || value.includes('\0')) throw new CliError('bad-args', 'invalid contribution key')
+  return value
+}
+/** vRange for channels where the range is REQUIRED (compare periods). */
+function vRequiredRange(range: DateRange | undefined, name: string): DateRange {
+  const v = vRange(range)
+  if (!v) throw new CliError('bad-args', `missing ${name} date range`)
+  return v
+}
 function vCurrency(code: string): string {
   if (!/^[A-Z]{3}$/.test(code)) throw new CliError('bad-args', 'invalid currency code')
   return code
@@ -158,6 +313,29 @@ function vCurrency(code: string): string {
 function vToken(value: string): string {
   if (value.startsWith('-')) throw new CliError('bad-args', 'argument must not start with "-"')
   return value
+}
+// Exact identities from the cohort facet report, not loose CLI patterns.
+// Keep the value attached to its flag so label-only ids starting with "-"
+// remain data; NUL is invalid in process argv.
+function vProjectIds(projects: string[] | undefined): string[] {
+  if (!projects || projects.length === 0) return []
+  for (const pattern of projects) {
+    if (typeof pattern !== 'string' || pattern.length === 0 || pattern.includes('\0')) {
+      throw new CliError('bad-args', 'invalid project identity')
+    }
+  }
+  return projects.map(id => `--project-id=${id}`)
+}
+// Activity categories for the cohort selection: the ids behind the CLI's
+// --category (src/types.ts CATEGORY_LABELS keys). Duplicated here because the
+// main process deliberately does not import core src/ modules.
+const COHORT_CATEGORIES = new Set([
+  'coding', 'debugging', 'feature', 'refactoring', 'testing', 'exploration',
+  'planning', 'delegation', 'git', 'build/deploy', 'conversation', 'brainstorming', 'general',
+])
+function vCategory(category: string): string {
+  if (!COHORT_CATEGORIES.has(category)) throw new CliError('bad-args', 'invalid category')
+  return category
 }
 // Claude config source ids are `<kind>:<hex>` (src/providers/claude.ts) — the
 // colon is part of the real value, so the token class allows it while anchoring
@@ -231,6 +409,11 @@ type Deps = {
   telemetry?: TelemetryBridge | null
   /** Cached update-availability status; absent under tests unless injected. */
   getUpdateStatus?: () => Promise<UpdateStatus>
+  /** The bundled tray app and Capacity Dock; absent off Windows and under tests. */
+  companion?: Pick<
+    MenubarCompanion,
+    'status' | 'setMenuBarEnabled' | 'setSidebarEnabled' | 'trayPrefs' | 'setTrayAppPref' | 'setTrayDockPref' | 'setLaunchAtLogin'
+  > | null
 }
 
 type Handler = (...args: any[]) => Promise<Envelope>
@@ -240,7 +423,16 @@ type Handler = (...args: any[]) => Promise<Envelope>
  * shell) and returns a result envelope. Pure + injectable so the wiring is
  * unit-testable without launching Electron.
  */
-export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, resolveCodeburnPath, getQuota, emitProgress: broadcastProgress, telemetry: telemetryInstance, getUpdateStatus: () => updateChecker ? updateChecker.getStatus() : Promise.resolve(NO_UPDATE_STATUS) }): Record<string, Handler> {
+/**
+ * The line `codeburn export` prints only after a file or folder is written
+ * (src/main.ts, the `Exported (<label>) to: <path>` log). An empty export
+ * prints `No usage data found.` and still exits 0, so the exit code alone
+ * cannot tell the two apart.
+ */
+const EXPORT_SAVED_MARKER = 'Exported ('
+const EXPORT_NOTHING_WRITTEN = 'Nothing to export: no usage in the export window, or the project filter hides all of it.'
+
+export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, resolveCodeburnPath, getQuota, emitProgress: broadcastProgress, telemetry: telemetryInstance, getUpdateStatus: () => updateChecker ? updateChecker.getStatus() : Promise.resolve(NO_UPDATE_STATUS), companion: companion }): Record<string, Handler> {
   const emitProgress = deps.emitProgress ?? (() => {})
   const telemetry = deps.telemetry ?? null
   // Flips true after the first overview fetch succeeds. Until then, every
@@ -311,11 +503,17 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
   // combined alongside --provider/--project/--exclude (paired devices report
   // unfiltered usage), so the provider filter is dropped in that mode. The
   // caller (renderer) forces provider='all' when combined, so nothing is lost.
+  // A project filter cannot be dropped the same way: the hidden projects would
+  // come back inside the combined total. The renderer already picks local while
+  // a filter is set; this keeps a stale caller off the rejected argv.
   const buildOverviewArgs = (period: string, provider: string, range?: DateRange, configSource?: string | null, scope?: string): string[] => {
     const vScopeValue = vScope(scope)
+    const filterArgs = projectArgs()
+    const combined = vScopeValue === 'combined' && filterArgs.length === 0
     return [
       'status', '--format', 'menubar-json', '--period', vPeriod(period), '--no-timeline',
-      ...(vScopeValue === 'combined' ? ['--scope', 'combined'] : providerArgs(vProvider(provider))),
+      ...(combined ? ['--scope', 'combined'] : providerArgs(vProvider(provider))),
+      ...filterArgs,
       ...rangeArgs(vRange(range)), ...configSourceArgs(vConfigSource(configSource)),
     ]
   }
@@ -364,30 +562,107 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     // Timeline variant for the Spend punchcard only: identical payload WITH
     // history.timeline (every other fetch keeps --no-timeline lean).
     'codeburn:getTimeline': run((period: string, provider: string, range?: DateRange) => [
-      'status', '--format', 'menubar-json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
+      'status', '--format', 'menubar-json', '--period', vPeriod(period),
+      ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+      ...rangeArgs(vRange(range)),
     ]),
+    // Unfiltered like combined scope: a plan is billed on every project.
     'codeburn:getPlans': run((period: string) => ['status', '--format', 'json', '--period', vPeriod(period)], 1),
     'codeburn:getActReport': run(() => ['act', 'report', '--json']),
     'codeburn:getModels': run((period: string, provider: string, byTask: boolean, range?: DateRange) => [
-      'models', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...(byTask ? ['--by-task'] : []), ...rangeArgs(vRange(range)),
+      'models', '--format', 'json', '--period', vPeriod(period),
+      ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+      ...(byTask ? ['--by-task'] : []),
+      ...rangeArgs(vRange(range)),
     ], 4),
     'codeburn:getSessions': run((period: string, provider: string, range?: DateRange) => [
-      'sessions', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
+      'sessions', '--format', 'json', '--period', vPeriod(period),
+      ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+      ...rangeArgs(vRange(range)),
+    ], 3),
+    // Drill-through report: plain session rows plus per-turn contribution
+    // segments (day/category/branch/model/PR). Same filtering semantics as
+    // getSessions — one filtering mechanism, additive payload fields only.
+    'codeburn:getSessionsContributions': run((period: string, provider: string, range?: DateRange) => [
+      'sessions', '--format', 'json', '--contributions', '--period', vPeriod(period),
+      ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+      ...rangeArgs(vRange(range)),
     ], 3),
     'codeburn:getCompareModels': run((period: string, provider: string) => [
-      'compare', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)),
+      'compare', '--format', 'json', '--period', vPeriod(period),
+      ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
     ], 2),
     'codeburn:getCompare': run((period: string, provider: string, modelA: string, modelB: string) => [
-      'compare', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), '--model-a', vToken(modelA), '--model-b', vToken(modelB),
+      'compare', '--format', 'json', '--period', vPeriod(period),
+      ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+      '--model-a', vToken(modelA), '--model-b', vToken(modelB),
     ]),
+    // Compare periods (B minus A). Both ranges are REQUIRED local YYYY-MM-DD
+    // key pairs; the renderer computes the 7v7 default so argv stays explicit.
+    'codeburn:getPeriodCompare': run((rangeA: DateRange, rangeB: DateRange, provider: string, background?: boolean) => [
+      'compare-periods', '--format', 'json',
+      '--from-a', vRequiredRange(rangeA, 'A').from, '--to-a', vRequiredRange(rangeA, 'A').to,
+      '--from-b', vRequiredRange(rangeB, 'B').from, '--to-b', vRequiredRange(rangeB, 'B').to,
+      ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+    ], 3),
+    'codeburn:getPeriodCompareSessions': run((rangeA: DateRange, rangeB: DateRange, provider: string, dimension: string, key: string) => {
+      if (dimension !== 'project' && dimension !== 'model') throw new CliError('bad-args', 'invalid drill-down dimension')
+      return [
+        'compare-periods', '--format', 'sessions',
+        '--from-a', vRequiredRange(rangeA, 'A').from, '--to-a', vRequiredRange(rangeA, 'A').to,
+        '--from-b', vRequiredRange(rangeB, 'B').from, '--to-b', vRequiredRange(rangeB, 'B').to,
+        ...providerArgs(vProvider(provider)),
+        ...projectArgs(),
+        '--dimension', dimension, '--key', vContributionKey(key),
+      ]
+    }),
+    // Cohort mode: the facet query (models/projects/categories) and the report
+    // for two models over an explicit selection. Same `compare` command, new
+    // cohort-json format; project identities are exact, category is one id.
+    'codeburn:getCompareCohortModels': run((period: string, provider: string, range?: DateRange) => [
+      'compare', '--format', 'cohort-json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)),
+      ...projectArgs(), ...rangeArgs(vRange(range)),
+    ], 3),
+    // The saved project filter still scopes the population; --project-id then
+    // narrows it further to one identity the facet report offered.
+    'codeburn:getCompareCohort': run((period: string, provider: string, modelA: string, modelB: string, range?: DateRange, projects?: string[], category?: string) => [
+      'compare', '--format', 'cohort-json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+      '--model-a', vToken(modelA), '--model-b', vToken(modelB), ...rangeArgs(vRange(range)),
+      ...(vProjectIds(projects)), ...(category ? ['--category', vCategory(category)] : []),
+    ], 7),
     'codeburn:getYield': run((period: string, provider: string, range?: DateRange) => [
-      'yield', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
+      'yield', '--format', 'json', '--period', vPeriod(period),
+      ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+      ...rangeArgs(vRange(range)),
     ], 3),
     'codeburn:getSpendFlow': run((period: string, provider: string, range?: DateRange) => [
-      'spend', '--format', 'flow-json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
+      'spend', '--format', 'flow-json', '--period', vPeriod(period),
+      ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+      ...rangeArgs(vRange(range)),
+    ], 3),
+    // Spend "By branch" lens: spend per canonical project × branch (plus
+    // coverage for sources without branch metadata).
+    'codeburn:getBranchSpend': run((period: string, provider: string, range?: DateRange) => [
+      'spend', '--format', 'branch-json', '--period', vPeriod(period),
+      ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+      ...rangeArgs(vRange(range)),
     ], 3),
     'codeburn:getOptimizeReport': run((period: string, provider: string, range?: DateRange) => [
-      'optimize', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
+      'optimize', '--format', 'json', '--period', vPeriod(period),
+      ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+      ...rangeArgs(vRange(range)),
     ], 3),
     'codeburn:getDevices': run((period: string) => ['devices', '--format', 'json', '--period', vPeriod(period)]),
     'codeburn:getDevicesScan': run(() => ['devices', 'scan', '--format', 'json']),
@@ -396,9 +671,30 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     'codeburn:getAliases': run(() => ['model-alias', '--list', '--format', 'json']),
     'codeburn:getProxyPaths': run(() => ['proxy-path', '--list', '--format', 'json']),
     'codeburn:getAudit': run((period: string, provider: string, range?: DateRange) => [
-      'audit', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
+      'audit', '--format', 'json', '--period', vPeriod(period),
+      ...providerArgs(vProvider(provider)),
+      ...projectArgs(),
+      ...rangeArgs(vRange(range)),
     ]),
     'codeburn:getPriceOverrides': run(() => ['price-override', '--list', '--format', 'json']),
+    'codeburn:getProjectFilter': async () => {
+      try { return { ok: true, value: readProjectFilter() } }
+      catch (error) { return { ok: false, error: toEnvelopeError(error) } }
+    },
+    'codeburn:setProjectFilter': async (filter?: unknown) => {
+      try { return { ok: true, value: writeProjectFilter(filter) } }
+      catch (error) { return { ok: false, error: { kind: 'nonzero', message: sanitizeError(error) } } }
+    },
+    // Deliberately NOT scoped by projectArgs(): the Projects pane builds its
+    // checklist from this, so it has to see the projects the filter is hiding.
+    //
+    // Lifetime, and NOT the period on screen. A filter scopes every screen and
+    // every horizon at once, so a list bounded to the visible period hides the
+    // projects a pattern is actually excluding: the pane would print "matches
+    // nothing detected" beside a live exclude, offer to remove it, and count it
+    // out of "N projects hidden". `all` is capped at six months, so `lifetime`
+    // is the only horizon that can answer for the whole filter.
+    'codeburn:getUnfilteredProjects': run(() => ['report', '--format', 'json', '--period', 'lifetime']),
     'codeburn:setCurrency': runAction((code: string) => ['currency', vCurrency(code)]),
     'codeburn:resetCurrency': runAction(() => ['currency', '--reset']),
     'codeburn:addAlias': runAction((from: string, to: string) => ['model-alias', vToken(from), vToken(to)]),
@@ -408,9 +704,25 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     'codeburn:removeDevice': runAction((name: string) => ['devices', 'rm', vToken(name)]),
     'codeburn:setPlan': runAction((id: string, provider: string) => ['plan', 'set', vToken(id), '--provider', vProvider(provider)]),
     'codeburn:resetPlan': runAction((provider: string) => ['plan', 'reset', '--provider', vProvider(provider)]),
-    'codeburn:exportData': runAction((format: string, provider: string, outPath: string) => [
-      'export', '-f', vToken(format), '-o', vOutPath(outPath), '--provider', vProvider(provider),
-    ]),
+    // Not plain runAction: `export` prints prose and exits 0 when every period
+    // came back empty, and a filter that hides every project now makes that
+    // reachable from a click. The exit code would toast "Exported to <folder>"
+    // over a folder the CLI never created, so success reads the saved-path line
+    // the CLI prints only after a write.
+    'codeburn:exportData': async (format: string, provider: string, outPath: string) => {
+      try {
+        const result = await deps.spawnCliAction([
+          'export', '-f', vToken(format), '-o', vOutPath(outPath), '--provider', vProvider(provider),
+          ...projectArgs(),
+        ])
+        if (result.ok && !result.stdout.includes(EXPORT_SAVED_MARKER)) {
+          return { ok: true, value: { ...result, ok: false, stderr: EXPORT_NOTHING_WRITTEN } }
+        }
+        return { ok: true, value: { ...result, stderr: sanitizeError(result.stderr) } }
+      } catch (err) {
+        return { ok: false, error: toEnvelopeError(err) }
+      }
+    },
     'codeburn:cliStatus': async () => {
       const p = deps.resolveCodeburnPath()
       return { ok: true, value: { found: p !== null, path: p } }
@@ -427,6 +739,25 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     // One-shot read of the cached update-availability status. The check itself
     // runs in the background (launch + 24h); this returns whatever is known.
     'codeburn:getUpdateStatus': async () => ({ ok: true, value: deps.getUpdateStatus ? await deps.getUpdateStatus() : NO_UPDATE_STATUS }),
+    // The bundled tray app and its Capacity Dock (Windows). Every setter answers with the
+    // whole status, so the sidebar renders the state that actually took rather than the one
+    // it asked for: an install that was cancelled leaves the switch where it was.
+    'codeburn:companionStatus': async () => ({ ok: true, value: deps.companion ? deps.companion.status() : NO_COMPANION }),
+    'codeburn:setMenuBarEnabled': async (enabled?: boolean) =>
+      ({ ok: true, value: deps.companion ? await deps.companion.setMenuBarEnabled(Boolean(enabled)) : NO_COMPANION }),
+    'codeburn:setSidebarEnabled': async (enabled?: boolean) =>
+      ({ ok: true, value: deps.companion ? await deps.companion.setSidebarEnabled(Boolean(enabled)) : NO_COMPANION }),
+    // The tray app's own settings, which live in the files it reads them from. Every setter
+    // answers with the whole set, so the panes render what landed rather than what was sent.
+    'codeburn:trayPrefs': async () => ({ ok: true, value: deps.companion ? await deps.companion.trayPrefs() : null }),
+    // A patch is whatever came over the channel, so it is typed as that and checked where it
+    // is read (tray-settings.ts, isPatchObject) rather than asserted into a shape here.
+    'codeburn:setTrayAppPref': async (patch?: unknown) =>
+      ({ ok: true, value: deps.companion ? await deps.companion.setTrayAppPref(patch) : null }),
+    'codeburn:setTrayDockPref': async (patch?: unknown) =>
+      ({ ok: true, value: deps.companion ? await deps.companion.setTrayDockPref(patch) : null }),
+    'codeburn:setLaunchAtLogin': async (enabled?: boolean) =>
+      ({ ok: true, value: deps.companion ? await deps.companion.setLaunchAtLogin(Boolean(enabled)) : null }),
     // Plugin management reads (all return parsed JSON)
     'codeburn:pluginList': run(() => ['plugin', 'list', '--json']),
     'codeburn:pluginInfo': run((name: string) => ['plugin', 'info', vToken(name), '--json']),
@@ -467,12 +798,24 @@ function registerHandlers(): void {
     return { ok: true, value: res.canceled ? null : (res.filePaths[0] ?? null) }
   })
   ipcMain.handle('open-external', (_event, url: string) => {
-    try {
-      const { protocol } = new URL(url)
-      if (protocol === 'https:' || protocol === 'http:') return shell.openExternal(url)
-    } catch { /* malformed URL — refuse to open */ }
-    return
+    const allowed = externalUrlToOpen(url)
+    return allowed === null ? undefined : shell.openExternal(allowed)
   })
+}
+
+/**
+ * What the renderer may hand the shell, or null for anything else. The web is http(s) only.
+ * The one exception is the Windows Settings page for startup apps, allowed by exact value:
+ * on the Store route launch at login is the package's own startup task, so the tray pane
+ * points at that page instead of offering a switch it cannot move (app/electron/menubar.ts).
+ */
+export function externalUrlToOpen(url: string, platform: string = process.platform): string | null {
+  if (platform === 'win32' && url === STARTUP_APPS_SETTINGS_URL) return url
+  try {
+    const { protocol } = new URL(url)
+    if (protocol === 'https:' || protocol === 'http:') return url
+  } catch { /* malformed URL, refuse to open */ }
+  return null
 }
 
 export function createApplicationMenuTemplate(isDev = Boolean(process.env.VITE_DEV_SERVER_URL)): MenuItemConstructorOptions[] {
@@ -651,6 +994,18 @@ function bootstrap(): void {
     } catch (err) {
       console.error('telemetry init failed (continuing without):', err)
     }
+    // The tray app and the Capacity Dock the desktop app carries on Windows. Constructed
+    // before the handlers so the sidebar's switches have something to read, and installed in
+    // the background so a `/passive` msiexec run never holds the first window back.
+    companion = new MenubarCompanion({
+      resourcesPath: app.isPackaged ? process.resourcesPath : null,
+      stateDir: app.getPath('userData'),
+      // Electron sets this in an installed AppX package, which is the Store route.
+      store: (process as NodeJS.Process & { windowsStore?: boolean }).windowsStore === true,
+      platform: process.platform,
+      env: process.env,
+    })
+    void companion.bootstrap().catch(err => console.error('menubar bootstrap failed:', err))
     registerHandlers()
     installApplicationMenu()
     createWindow()

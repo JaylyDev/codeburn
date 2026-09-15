@@ -34,7 +34,9 @@ export type ModelCosts = {
 /// and nothing else, and its supplementary store-row/shutdown calls carry
 /// reasoningTokens with outputTokens 0 while the per-turn assistant.message call
 /// bills the full output, so adding reasoning on top bills it twice.
-const REASONING_INCLUDED_IN_OUTPUT = new Set(['claude', 'codex', 'copilot'])
+/// DSH TokenUsage includes reasoning in output too; see the pinned contract:
+/// https://github.com/deepseek-ai/deepseek-harness/blob/c291e7961a515f6d7af9304e7fd1d257929aef26/docs/subsystems/llm-streaming.md#tokenusage
+const REASONING_INCLUDED_IN_OUTPUT = new Set(['claude', 'codex', 'copilot', 'dsh'])
 
 /// Output tokens to bill and display for one call. Single source of truth so
 /// the pricing sites and the display sums can never disagree about whether a
@@ -1060,14 +1062,17 @@ export function resolveCanonicalModelId(model: string): string {
 // rather than hand-listed so a vendor LiteLLM already knows (`x-ai/`, `qwen/`,
 // `nousresearch/`, …) is never dropped by a stale list.
 const EXTRA_NAMESPACES = [
-  // Routing wrappers (see ROUTER_PREFIXES); no catalog lists them.
-  'cp', 'cline-pass', 'cline-free', 'cmd', 'antigravity', 'orcarouter',
+  // Routing wrappers (see ROUTER_PREFIXES); no catalog lists them. `cliproxy/`
+  // is codex-cliproxy-gateway's default route prefix over CLIProxyAPI.
+  'cp', 'cline-pass', 'cline-free', 'cmd', 'antigravity', 'orcarouter', 'cliproxy',
   // LiteLLM route prefixes that never appear as a key prefix.
   'litellm_proxy', 'openai_like',
   // Vendor spellings the catalog indexes under another name: `zhipu` is `z-ai`,
   // `mimo` is `xiaomi` (BUILTIN_ALIASES maps the bare MiMo ids to `xiaomi/`),
   // and `kimi/` is a client-side prefix (Codex records `kimi/k3[1m]`).
-  'zhipu', 'mimo', 'kimi',
+  // `zcode/` is CLIProxyAPI's provider spelling for the Z.ai coding plans; the
+  // bare `glm-*` leaf already prices via its own catalog row, which carries an explicit zero cache-write cost.
+  'zhipu', 'mimo', 'kimi', 'zcode',
 ]
 
 // Local runners. Their catalog rows are $0 stubs, so an unlisted local tag must
@@ -1114,6 +1119,12 @@ const ROUTER_PREFIXES = [
   /^cmd\//i,
   /^antigravity\//i,
   /^orcarouter\//i,
+  // codex-cliproxy-gateway keeps Codex's own OAuth routing native and forwards
+  // only `cliproxy/*` ids to CLIProxyAPI, so a routed session records
+  // `cliproxy/<id>` — and `<id>` can itself be a provider path
+  // (`cliproxy/zcode/glm-5.3-flash`). Peeling the wrapper lets the one
+  // known-namespace strip in getCanonicalName reach the priced leaf.
+  /^cliproxy\//i,
   // `xiaomi/` is NOT peeled: it is the vendor namespace LiteLLM prices under,
   // and BUILTIN_ALIASES maps the bare MiMo ids INTO it. Peeling would pull the
   // opposite way. It stays a known namespace via the catalog-derived set.
@@ -1425,9 +1436,6 @@ const autoModelNames: Record<string, string> = {
 }
 
 const SHORT_NAMES: Record<string, string> = {
-  // claude-fable-5 and claude-mythos-5 are outside the opus/sonnet/haiku families deriveClaudeShortName covers.
-  'claude-fable-5': 'Fable 5',
-  'claude-mythos-5': 'Mythos 5',
   // Modern claude-<family>-<major>-<minor> ids are derived in deriveClaudeShortName.
   // Only the legacy 3.x ids (family-last) need explicit mapping.
   'claude-3-7-sonnet': 'Sonnet 3.7',
@@ -1540,9 +1548,15 @@ const SORTED_SHORT_NAMES: [string, string][] = Object.entries(SHORT_NAMES)
 // Anthropic's id scheme is `claude-<family>-<major>[-<minor>]`, so every new
 // version is derivable — no hand-maintained entry per release. (Legacy 3.x ids
 // put the family last, e.g. `claude-3-5-sonnet`, and stay in SHORT_NAMES.)
-const CLAUDE_FAMILY: Record<string, string> = { opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku' }
+const CLAUDE_FAMILY: Record<string, string> = {
+  opus: 'Opus',
+  sonnet: 'Sonnet',
+  haiku: 'Haiku',
+  fable: 'Fable',
+  mythos: 'Mythos',
+}
 function deriveClaudeShortName(canonical: string): string | undefined {
-  const m = canonical.match(/^claude-(opus|sonnet|haiku)-(\d+)(?:-(\d+))?/)
+  const m = canonical.match(/^claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d+))?/)
   if (!m) return undefined
   const [, family, major, minor] = m
   return `${CLAUDE_FAMILY[family]} ${major}${minor ? `.${minor}` : ''}`

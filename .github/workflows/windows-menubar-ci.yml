@@ -63,6 +63,15 @@ jobs:
         working-directory: windows
         run: npm ci
 
+      # The Rust suite's cross-process lock test spawns a real Node process beside the
+      # Rust one, so both hammer the same settings file (dock.rs,
+      # `concurrent_node_and_rust_patches_to_the_dock_file_both_survive`). The worker is
+      # TypeScript run through tsx, which lives in the repo root's devDependencies and is
+      # not installed by `npm ci` inside windows/. Without it the worker exits 1 and the
+      # test fails, which is what it did rather than skipping.
+      - name: Install the repo-root tools the Rust tests spawn
+        run: npm ci --no-audit --no-fund
+
       - name: Typecheck frontend
         working-directory: windows
         run: npx tsc --noEmit

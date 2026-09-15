@@ -26,6 +26,7 @@ windows/
 │   │   ├── cli.rs    argv-validated spawn of the codeburn CLI
 │   │   ├── config.rs ~/.config/codeburn/config.json read/write under a lock
 │   │   ├── plan.rs   Claude OAuth quota (port of mac/.../ClaudeSubscriptionService.swift)
+│   │   ├── telemetry.rs consent, event queue and batch POST (twin of app/electron/telemetry.ts)
 │   │   └── fx.rs     Frankfurter fetch + 24h disk cache + [0.0001, 1e6] clamp
 │   ├── capabilities/ Tauri v2 permission manifests
 │   └── icons/        tray + bundle icons
@@ -162,8 +163,15 @@ npm run tauri build
 - **FX fetches**: Frankfurter response is parsed as JSON and the rate is clamped to
   `[0.0001, 1_000_000]` before it touches displayed numbers. Stale cache preferred over poisoned
   fresh data.
-- **CSP**: `connect-src` restricted to `self`, `ipc:`, and `https://api.frankfurter.app`. No
-  inline scripts.
+- **Update check**: the GitHub releases request is HTTPS-only (redirects included), carries a
+  30 s timeout and a response cap, and runs in Rust, so the webview never reaches
+  api.github.com and the CSP does not have to let it. Nothing is downloaded or executed
+  here: `codeburn menubar --force` does the install, which is what verifies the sha256.
+  Subprocess stderr is capped at 64 KB and scrubbed of API keys, JWTs and bearer tokens
+  before any of it is shown.
+- **CSP**: `connect-src` restricted to `self` and `ipc:`. No inline scripts. The Frankfurter
+  rate is fetched in Rust (`fx.rs`), as the GitHub check is, so the webview needs no host of
+  its own and is not given one.
 
 ## CI and release tags
 
@@ -180,6 +188,66 @@ npm run tauri build
   `%SystemRoot%\System32\msiexec.exe /i <msi> /passive /norestart` and launches the exe named by
   the product's Uninstall registry key. Renaming the bundle or the MSI asset breaks that lookup —
   `WINDOWS_RELEASE` and `WINDOWS_PRODUCT_NAME` in the installer have to move with it.
+
+## Updates
+
+`src-tauri/src/update.rs` is the port of `mac/.../Data/UpdateChecker.swift`.
+
+- Every two days it reads the releases API and looks for the newest `windows-v*` release
+  carrying both a `CodeBurn.Menubar_<version>_x64_en-US.msi` and its `.sha256`, and for the
+  newest CLI release, whose tags are a bare `v*`. The answer is cached in
+  `%LOCALAPPDATA%\codeburn-menubar\update.json`, so a relaunch inside the interval costs no
+  request and a failed check keeps whatever the cache held.
+- The surfaces are the header update badge, the CLI update banner under the footer, and
+  Check for Updates in the tray menu and in About. The tray item opens About on the
+  `about#check` anchor, which is where the up to date / update available / check failed
+  result is shown, and where the button that installs it lives.
+- There is no install button. Outside a Store package the app only reports that a newer
+  version exists, opens the `windows-v*` release page, and shows `codeburn menubar --force`
+  as the manual command, because the MSI is unsigned and its checksum comes from the same
+  release (the module doc in `update.rs` has the reasoning). Inside a Store package the
+  checker stands down, since Store updates cover it. `MIN_CLI_VERSION_FOR_UPDATE` is
+  **0.9.21**, the first CLI whose `menubar` can install a Windows app at all; an older one
+  is told to update the CLI first.
+- Renaming the MSI asset breaks the version lookup here as well as in the installer:
+  `MSI_PREFIX` / `MSI_SUFFIX` have to move with `WINDOWS_RELEASE`.
+
+## Telemetry
+
+`src-tauri/src/telemetry.rs` is the Windows twin of `app/electron/telemetry.ts`. Both post the
+same envelope to the same endpoint, so the desktop app and the tray app land in one table and
+are told apart by `app.name` (`codeburn-desktop` against `codeburn-menubar`). Read that file's
+module doc before changing anything here: its invariants are the contract.
+
+- **Consent.** The desktop app's state file wins whenever it exists:
+  `%APPDATA%\codeburn-desktop\telemetry.v1.json` supplies `installId`, `enabled` and
+  `onboardedAt`, and this app never writes it. One decision then covers both apps and their
+  events join on one id. Standalone, the decision lives in this app's own
+  `~/.config/codeburn/windows-settings.json` as `telemetryEnabled`, `telemetryOnboardedAt` and
+  `telemetryInstallId`, defaulting off for EU / EEA / UK / CH and for an unknown region and on
+  elsewhere, from the Windows user locale. A standalone install is asked once, by the notice in
+  the popover and in Settings > General > Privacy; nothing is queued or sent before it answers.
+  Switching the toggle off mints a fresh install id and empties the queue, as the desktop does.
+- **Events.** `app_open` and `app_close` (`sessionMinutes`), `popover_open`, `settings_open`
+  (`pane`), `update_click` (`action`), `glance_open`, `dock_enabled` / `dock_disabled` (`edge`,
+  `scaleBucket`), `dock_provider_switch` (`provider`), `dock_drag_end` (`edge`) and
+  `usage_snapshot`, which forwards the `telemetrySnapshot` object out of the CLI's menubar
+  payload at most once a calendar day, and only when the desktop app is not the consent source
+  (that app sends the same aggregate from the same payload). An unknown name is dropped, and
+  every prop goes through the same whitelist sanitizer the desktop uses: every leaf is a
+  short string, a finite number or a boolean, and the nesting (5), key count (16), array
+  length (12) and leaf count (1000) are all capped.
+- **Transport.** The queue is persisted to
+  `%LOCALAPPDATA%\codeburn-menubar\telemetry-queue.json` after every change, so a crash or a
+  quit loses nothing, and is capped at 200 events with the oldest giving way. A batch goes out
+  every five minutes and once more on quit with a short timeout; a 4xx drops the batch, a 5xx
+  or a dead network keeps it for the next beat. Debug builds never send unless
+  `CODEBURN_TELEMETRY_DEV=1`.
+- **The pages** report through `src/lib/telemetry.ts`, which invokes `telemetry_track`. It has
+  no gate of its own on purpose: Rust owns every decision, so a page never has to know the
+  current one. `dock_enabled` / `dock_disabled` are the exception and come from
+  `set_dock_enabled` in `lib.rs`, the one funnel the tray item, the settings toggle and the
+  dock's own Hide item all pass through.
 
 ## Pending work
 

@@ -75,4 +75,34 @@ describe('StackedBars', () => {
     expect(legend.querySelectorAll('span')).toHaveLength(1)
     expect(legend).toHaveTextContent('Claude')
   })
+
+  it('renders one segment for a model merged from two raw routes and names both routes in the tooltip (#1239)', () => {
+    const daily = [{
+      ...entry(26),
+      topModels: [{
+        name: 'MiniMax M3',
+        cost: 6.99,
+        savingsUSD: 0,
+        calls: 415,
+        inputTokens: 700,
+        outputTokens: 150,
+        rawModels: ['minimax/MiniMax-M3', 'MiniMaxAI/MiniMax-M3'],
+      }],
+    }]
+    const { container } = render(<StackedBars daily={daily} />)
+
+    const segments = container.querySelectorAll('.sbars .c .s')
+    expect(segments).toHaveLength(1)
+    expect(segments[0]).toHaveAttribute('title', 'MiniMax M3 (minimax/MiniMax-M3, MiniMaxAI/MiniMax-M3) · $6.99')
+  })
+
+  it('omits the route list from the tooltip when only one raw model fed the row', () => {
+    const daily = [{
+      ...entry(26),
+      topModels: [{ name: 'GPT-5', cost: 2, savingsUSD: 0, calls: 3, inputTokens: 10, outputTokens: 5 }],
+    }]
+    const { container } = render(<StackedBars daily={daily} />)
+
+    expect(container.querySelector('.sbars .c .s')).toHaveAttribute('title', 'GPT-5 · $2.00')
+  })
 })

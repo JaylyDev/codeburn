@@ -1,5 +1,5 @@
 import { open, rename, unlink, mkdir } from 'fs/promises'
-import { existsSync, readFileSync } from 'fs'
+import { existsSync, readFileSync, unlinkSync } from 'fs'
 import { randomBytes } from 'crypto'
 import { join } from 'path'
 
@@ -22,10 +22,13 @@ import type { CachedCall, ProviderSection } from './session-cache.js'
 //   dropped: sealed days are not re-read. This slice does not bump
 //   DAILY_CACHE_VERSION (one cold re-parse for every user) to recover history.
 
-export const HERMES_SESSION_LEDGER_FILENAME = 'hermes-session-ledger.v1.json'
-export const HERMES_SESSION_LEDGER_VERSION = 1 as const
+// v3 discards the local-only v2 migration candidate. Seeding v2 from the warm
+// session cache could preserve lifetime totals while assigning historical
+// observations to the migration day, inflating that day's scoped Hermes spend.
+export const HERMES_SESSION_LEDGER_FILENAME = 'hermes-session-ledger.v3.json'
+export const HERMES_SESSION_LEDGER_VERSION = 3 as const
 
-export type HermesCostBasis = 'actual' | 'estimated' | 'calculated'
+export type HermesCostBasis = 'actual' | 'estimated' | 'calculated' | 'included'
 
 export type HermesTokenTotals = {
   inputTokens: number
@@ -299,7 +302,7 @@ function isNum(v: unknown): v is number {
 }
 
 function isCostBasis(v: unknown): v is HermesCostBasis {
-  return v === 'actual' || v === 'estimated' || v === 'calculated'
+  return v === 'actual' || v === 'estimated' || v === 'calculated' || v === 'included'
 }
 
 function validateTokens(o: Record<string, unknown>): o is Record<string, unknown> & HermesTokenTotals {
@@ -346,7 +349,17 @@ function validateLedger(raw: unknown): raw is HermesSessionLedger {
 
 function readLedgerFromDisk(): HermesSessionLedger {
   const path = hermesSessionLedgerPath()
-  if (!existsSync(path)) return emptyHermesSessionLedger()
+  if (!existsSync(path)) {
+    // The v1 file is superseded and can never be read again: the parse-version
+    // bump forces a cold re-parse that rebuilds every cursor from source.
+    // Left behind it is dead bytes that only invite a future reader to trust
+    // observations recorded under an accounting this branch replaced.
+    const v1 = join(getCodeburnCacheDir(), 'hermes-session-ledger.v1.json')
+    if (existsSync(v1)) {
+      try { unlinkSync(v1) } catch { /* another process got there first */ }
+    }
+    return emptyHermesSessionLedger()
+  }
   try {
     const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'))
     if (!validateLedger(parsed)) return emptyHermesSessionLedger()

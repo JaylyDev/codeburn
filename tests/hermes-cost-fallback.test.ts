@@ -28,6 +28,7 @@ function seedDb(): void {
       input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
       cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0,
       reasoning_tokens INTEGER DEFAULT 0, estimated_cost_usd REAL, actual_cost_usd REAL,
+      cost_status TEXT, cost_source TEXT,
       api_call_count INTEGER DEFAULT 0, tool_call_count INTEGER DEFAULT 0,
       started_at REAL, title TEXT
     )
@@ -41,18 +42,24 @@ function seedDb(): void {
   const startedAt = Date.now() / 1000 - 3600
   const insert = db.prepare(
     `INSERT INTO sessions (id, source, model, input_tokens, output_tokens,
-      estimated_cost_usd, actual_cost_usd, api_call_count, started_at)
-     VALUES (?, 'cli', ?, ?, ?, ?, ?, 1, ?)`,
+      estimated_cost_usd, actual_cost_usd, cost_status, cost_source, api_call_count, started_at)
+     VALUES (?, 'cli', ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
   )
-  // Hermes writes estimated 0.0 when cost_status is 'unknown' or 'included'
-  // (subscription). CodeBurn must not trust that $0: the tokens are real, so
-  // cost falls through to the token-based calculation.
-  insert.run('zero-estimate', 'claude-opus-4-6', 100000, 10000, 0.0, null, startedAt)
+  // Subscription-included usage is recorded $0 spend even though it carries
+  // real tokens. API-equivalent pricing must not overwrite that provenance.
+  insert.run('included-zero', 'gpt-5.6-sol', 100000, 10000, 0.0, null, 'included', 'none', startedAt)
+  // Unknown cost with no usable estimate falls back to token pricing.
+  insert.run('unknown-zero', 'claude-opus-4-6', 100000, 10000, 0.0, null, 'unknown', 'none', startedAt)
+  // An unknown row may retain a partial estimate from earlier priced calls.
+  // It is not a complete session total and must still be recalculated.
+  insert.run('unknown-partial', 'claude-opus-4-6', 100000, 10000, 0.25, null, 'unknown', 'official_docs_snapshot', startedAt)
   // A positive recorded estimate stays authoritative.
-  insert.run('positive-estimate', 'claude-opus-4-6', 100000, 10000, 0.5, null, startedAt)
+  insert.run('positive-estimate', 'claude-opus-4-6', 100000, 10000, 0.5, null, 'estimated', 'official_docs_snapshot', startedAt)
+  // An explicitly estimated free value remains zero.
+  insert.run('estimated-zero', 'free-model', 100000, 10000, 0.0, null, 'estimated', 'provider_models_api', startedAt)
   // An explicit $0 *actual* invoice amount is recorded fact and stays $0.
-  insert.run('zero-actual', 'claude-opus-4-6', 100000, 10000, null, 0.0, startedAt)
-  for (const id of ['zero-estimate', 'positive-estimate', 'zero-actual']) {
+  insert.run('zero-actual', 'claude-opus-4-6', 100000, 10000, null, 0.0, 'actual', 'invoice', startedAt)
+  for (const id of ['included-zero', 'unknown-zero', 'unknown-partial', 'positive-estimate', 'estimated-zero', 'zero-actual']) {
     db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
       .run(id, 'user', `session ${id}`, startedAt)
     db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
@@ -77,17 +84,27 @@ afterEach(async () => {
 const skipUnlessSqlite = isSqliteAvailable() ? describe : describe.skip
 
 skipUnlessSqlite('hermes recorded-cost fallback', () => {
-  it('ignores a $0 estimated cost and calculates from tokens', async () => {
+  it('preserves included and recorded zeroes while estimating unknown cost', async () => {
     seedDb()
     const projects = await parseAllSessions(undefined, 'hermes')
     const sessions = projects.flatMap(project => project.sessions)
     const byId = new Map(sessions.map(s => [s.sessionId, s]))
 
-    const zeroEstimate = byId.get('zero-estimate')!
-    expect(zeroEstimate.totalCostUSD).toBeGreaterThan(0)
+    const included = byId.get('included-zero')!
+    expect(included.totalCostUSD).toBe(0)
+
+    const unknown = byId.get('unknown-zero')!
+    expect(unknown.totalCostUSD).toBeGreaterThan(0)
+
+    const unknownPartial = byId.get('unknown-partial')!
+    expect(unknownPartial.totalCostUSD).toBeGreaterThan(0)
+    expect(unknownPartial.totalCostUSD).not.toBe(0.25)
 
     const positive = byId.get('positive-estimate')!
     expect(positive.totalCostUSD).toBe(0.5)
+
+    const estimatedZero = byId.get('estimated-zero')!
+    expect(estimatedZero.totalCostUSD).toBe(0)
 
     const zeroActual = byId.get('zero-actual')!
     expect(zeroActual.totalCostUSD).toBe(0)

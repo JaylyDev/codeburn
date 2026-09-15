@@ -1,0 +1,683 @@
+/* Capacity Dock, the Windows twin of mac/Sources/CodeBurnMenubar/Views/CapacityDockView.swift.
+   Metrics come from src/dockGeometry.ts (mac base values times the size scale) and the window
+   that holds them is sized in src-tauri/src/dock.rs; all three stay in step. Anything a rule
+   needs rather than an element arrives as a --dock-* variable on .dock, so the whole rail
+   follows the size setting. The dock is always the mac's dark graphite palette, whichever
+   theme the popover is in and whichever surface is behind it. */
+
+:root {
+  /* Warm off-white: a mild orange tint so bright labels on the dark card read softer. */
+  --dock-text: #FAF2E6;
+  --dock-green: #30D158;
+  --dock-yellow: #FFD60A;
+  --dock-orange: #FF9F0A;
+  --dock-red: #FF453A;
+  --dock-rail-expand: cubic-bezier(0.22, 1, 0.36, 1);
+  --dock-detail-present: cubic-bezier(0.16, 1, 0.3, 1);
+  --dock-detail-follow: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --dock-detail-dismiss: cubic-bezier(0.4, 0, 1, 1);
+  /* MOTION.dockAttach and MOTION.dockDetach in dockGeometry.ts, which the drag glide and
+     the flare already ease with; the rail entering and leaving uses the same two. */
+  --dock-attach: cubic-bezier(0.16, 1, 0.3, 1);
+  --dock-attach-ms: 280ms;
+  --dock-detach: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dock-detach-ms: 240ms;
+}
+
+.dock {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: var(--font-sans);
+  color: var(--dock-text);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.dock-surface {
+  position: absolute;
+  inset: 0;
+  display: block;
+  pointer-events: none;
+}
+
+/* Rail */
+
+.dock-rail {
+  position: absolute;
+  box-sizing: border-box;
+  will-change: left, top, width, height;
+  touch-action: none;
+}
+
+.dock-rail.is-dragging {
+  cursor: grabbing;
+}
+
+/* Activation: the rail emerges from its edge rather than appearing. It is tucked a whole
+   cross width outside the window while `is-tucked` is on, so nothing of it shows, and the
+   transform is released on the frame after the first layout. A floating rail has no edge to
+   hide behind, so it fades and scales instead. The window never moves for either: this is a
+   transform on the rail alone, which is what keeps every window metric a whole pixel. */
+.dock-rail {
+  transition:
+    transform var(--dock-attach-ms) var(--dock-attach),
+    opacity var(--dock-attach-ms) var(--dock-attach);
+}
+
+.dock-rail.is-leaving {
+  transition:
+    transform var(--dock-detach-ms) var(--dock-detach),
+    opacity var(--dock-detach-ms) var(--dock-detach);
+}
+
+/* Dragging moves the rail every frame from Rust; an entrance curve on top of that would
+   fight it. */
+.dock-rail.is-dragging {
+  transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dock-rail,
+  .dock-rail.is-leaving {
+    transition: none;
+  }
+}
+
+.dock-rows {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: var(--dock-row-gap);
+}
+
+.dock-row {
+  appearance: none;
+  border: 0;
+  margin: 0;
+  padding: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: default;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--dock-ring-gap);
+}
+
+.dock-row:focus-visible {
+  outline: none;
+}
+
+.dock-gauge {
+  position: relative;
+  width: var(--dock-gauge-size);
+  height: var(--dock-gauge-size);
+  display: grid;
+  place-items: center;
+}
+
+.dock-ring {
+  position: absolute;
+  top: calc(-1 * var(--dock-ring-margin));
+  left: calc(-1 * var(--dock-ring-margin));
+  overflow: visible;
+}
+
+.dock-ring-arc {
+  transition: stroke-dasharray 240ms var(--ease-ui), stroke 240ms var(--ease-ui);
+}
+
+.dock-glyph {
+  position: relative;
+  display: grid;
+  place-items: center;
+  color: #fff;
+}
+
+.dock-glyph.is-loading {
+  opacity: 0.6;
+}
+
+.dock-row-alert {
+  position: absolute;
+  top: var(--dock-alert-inset);
+  right: var(--dock-alert-inset);
+  width: var(--dock-alert-size);
+  height: var(--dock-alert-size);
+  border-radius: 50%;
+  background: var(--dock-red);
+  box-shadow: 0 0 0 1.5px #000;
+}
+
+.dock-pct {
+  font-size: var(--dock-pct-size);
+  font-weight: 500;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  color: var(--dock-text);
+}
+
+.dock-pct.is-empty { color: rgba(250, 242, 230, 0.72); }
+.dock-pct.is-warning { color: var(--dock-yellow); }
+.dock-pct.is-critical { color: var(--dock-orange); }
+.dock-pct.is-danger { color: var(--dock-red); }
+
+/* Detail bubble */
+
+.dock-detail {
+  position: absolute;
+  box-sizing: border-box;
+  transition:
+    transform 200ms var(--dock-detail-present),
+    opacity 200ms var(--dock-detail-present),
+    top 220ms var(--dock-detail-follow),
+    left 220ms var(--dock-detail-follow);
+}
+
+/* Measured before it is placed: laid out at full size, but neither seen nor hit. */
+.dock-detail.is-measuring {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* Starts a step toward the rail so the bubble emerges from the dock. */
+.dock-detail.is-entering {
+  opacity: 0;
+  transition: none;
+}
+.dock-detail.is-entering.is-tail-right { transform: translateX(10px); }
+.dock-detail.is-entering.is-tail-left { transform: translateX(-10px); }
+.dock-detail.is-entering.is-tail-top { transform: translateY(-10px); }
+.dock-detail.is-entering.is-tail-bottom { transform: translateY(10px); }
+
+.dock-detail.is-dismissing.is-tail-right { transform: translateX(6px); }
+.dock-detail.is-dismissing.is-tail-left { transform: translateX(-6px); }
+.dock-detail.is-dismissing.is-tail-top { transform: translateY(-6px); }
+.dock-detail.is-dismissing.is-tail-bottom { transform: translateY(6px); }
+
+.dock-detail.is-dismissing {
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform 140ms var(--dock-detail-dismiss),
+    opacity 140ms var(--dock-detail-dismiss);
+}
+
+/* The glance popover, ported from CapacityDockDetailView. Every block carries its own
+   padding and an explicit content height, so the height the page measures is the sum of
+   whole pixels and the window Rust sizes around it stays whole too. Section boxes come from
+   --glance-* on .dock (dockGeometry's glanceMetrics); type sizes are fixed, as they are on
+   the mac, where the size setting scales the boxes and not the text. */
+
+.dock-glance {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Hairline between blocks, drawn as an overlay so a rule never adds a pixel the measured
+   height did not reserve. */
+.dock-glance > .has-rule {
+  position: relative;
+}
+
+.dock-glance > .has-rule::after {
+  content: '';
+  position: absolute;
+  left: var(--glance-inset);
+  right: var(--glance-inset);
+  bottom: 0;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* The bubble opens and closes on the same inset it uses sideways, so whichever block ends it
+   carries the closing one. */
+.dock-glance > :last-child {
+  padding-bottom: var(--glance-inset);
+}
+
+.dock-glance-head {
+  display: flex;
+  align-items: center;
+  gap: var(--glance-head-gap);
+  padding: var(--glance-inset) var(--glance-inset) var(--glance-head-pad-bottom);
+}
+
+.dock-glance-glyph {
+  display: grid;
+  place-items: center;
+  height: var(--glance-head-title);
+  color: var(--dock-text);
+  flex: 0 0 auto;
+}
+
+.dock-glance-name {
+  font-size: 17px;
+  font-weight: 600;
+  line-height: var(--glance-head-title);
+  white-space: nowrap;
+}
+
+.dock-glance-plan {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: var(--glance-head-title);
+  color: rgba(250, 242, 230, 0.6);
+  white-space: nowrap;
+}
+
+.dock-glance-block,
+.dock-glance-windows,
+.dock-footer {
+  padding: var(--glance-pad-top) var(--glance-inset) var(--glance-pad-bottom);
+}
+
+.dock-glance-caption {
+  display: flex;
+  align-items: center;
+  height: var(--glance-caption);
+  line-height: var(--glance-caption);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: rgba(250, 242, 230, 0.6);
+}
+
+.dock-glance-caption-end {
+  margin-left: auto;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Connection states. The mac draws these flush to the bubble edge; here they take the same
+   side inset as every other block, which is the one thing about them that is not a port. */
+
+.dock-conn,
+.dock-conn-reason,
+.dock-conn-hint,
+.dock-conn-instruction {
+  margin: 0;
+}
+
+/* Only the block that sits directly in the card takes the side inset, or a line inside a
+   block would take it twice. */
+.dock-glance > .dock-conn,
+.dock-glance > .dock-conn-block {
+  padding-left: var(--glance-inset);
+  padding-right: var(--glance-inset);
+}
+
+.dock-conn.is-loading,
+.dock-conn.is-stale,
+.dock-conn.is-retrying {
+  height: var(--glance-conn-loading);
+  line-height: var(--glance-conn-loading);
+  font-size: 10px;
+}
+
+.dock-conn.is-loading { color: rgba(250, 242, 230, 0.52); }
+.dock-conn.is-stale { color: rgba(255, 214, 10, 0.82); }
+.dock-conn.is-retrying { color: rgba(255, 159, 10, 0.86); }
+
+.dock-conn-block {
+  display: flex;
+  flex-direction: column;
+  gap: var(--glance-block-gap);
+  overflow: hidden;
+}
+
+.dock-conn-block.is-failed {
+  height: var(--glance-conn-terminal);
+}
+
+.dock-conn.is-disconnected,
+.dock-conn.is-failed {
+  height: var(--glance-conn-title);
+  line-height: var(--glance-conn-title);
+  font-size: 11px;
+}
+
+.dock-conn.is-disconnected { color: rgba(250, 242, 230, 0.6); }
+
+.dock-conn.is-failed {
+  font-weight: 600;
+  color: var(--dock-red);
+}
+
+.dock-conn-reason,
+.dock-conn-hint,
+.dock-conn-instruction {
+  font-size: 10px;
+  line-height: var(--glance-conn-line);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.dock-conn-reason {
+  -webkit-line-clamp: 2;
+  color: rgba(250, 242, 230, 0.58);
+}
+
+.dock-conn-hint {
+  -webkit-line-clamp: 3;
+  color: rgba(250, 242, 230, 0.72);
+}
+
+.dock-conn-instruction {
+  -webkit-line-clamp: 2;
+  color: rgba(250, 242, 230, 0.62);
+}
+
+/* Sessions: what is using the quota right now. The pill is its own context gauge, tinted
+   over the first N% of its width and faded out at the leading edge so the boundary reads as
+   a gradient rather than a rule. */
+
+.dock-pills {
+  margin-top: var(--glance-pill-gap);
+  display: flex;
+  flex-direction: column;
+  gap: var(--glance-pill-gap);
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* A list that scrolls has to say so, which is what the mac's automatic scroll indicator
+     does. Every other scrollbar in this app is hidden, so this one is stated. */
+  scrollbar-width: thin;
+  scrollbar-color: rgba(250, 242, 230, 0.26) transparent;
+}
+
+.dock-pills::-webkit-scrollbar {
+  width: 6px;
+}
+
+.dock-pills::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.dock-pills::-webkit-scrollbar-thumb {
+  background: rgba(250, 242, 230, 0.26);
+  border-radius: 3px;
+}
+
+.dock-pill {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  height: var(--glance-pill-h);
+  padding: 0 var(--glance-pill-pad-x);
+  border-radius: var(--glance-pill-radius);
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+  --dock-pill-tint: rgba(48, 209, 88, 0.14);
+}
+
+.dock-pill.is-warning { --dock-pill-tint: rgba(255, 214, 10, 0.14); }
+.dock-pill.is-critical { --dock-pill-tint: rgba(255, 159, 10, 0.14); }
+.dock-pill.is-danger { --dock-pill-tint: rgba(255, 69, 58, 0.14); }
+
+/* A session waiting on the user recedes; one that is generating does not. */
+.dock-pill.is-idle { opacity: 0.55; }
+
+.dock-pill-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: linear-gradient(
+    to right,
+    var(--dock-pill-tint) 0,
+    var(--dock-pill-tint) calc(100% - var(--glance-pill-fade)),
+    transparent 100%
+  );
+}
+
+.dock-pill-text {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.dock-pill-title {
+  height: var(--glance-pill-title);
+  line-height: var(--glance-pill-title);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dock-pill-sub {
+  margin-top: var(--glance-line-gap);
+  height: var(--glance-pill-sub);
+  line-height: var(--glance-pill-sub);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(250, 242, 230, 0.6);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dock-pill-right {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  flex: 0 0 auto;
+  margin-left: 12px;
+}
+
+.dock-pill-pct {
+  height: var(--glance-pill-title);
+  line-height: var(--glance-pill-title);
+  font-size: 12px;
+  text-align: right;
+}
+
+.dock-pill-left {
+  margin-top: var(--glance-line-gap);
+  height: var(--glance-pill-sub);
+  line-height: var(--glance-pill-sub);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(250, 242, 230, 0.6);
+  white-space: nowrap;
+}
+
+/* Today */
+
+.dock-today {
+  display: flex;
+  align-items: center;
+  height: var(--glance-today-content);
+  margin-top: var(--glance-pill-gap);
+}
+
+.dock-today-figure {
+  display: flex;
+  align-items: baseline;
+  gap: var(--glance-today-cost-gap);
+  min-width: 0;
+}
+
+.dock-today-cost {
+  font-size: 17px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.dock-today-burned {
+  font-size: 11.5px;
+  color: rgba(250, 242, 230, 0.6);
+}
+
+.dock-today-stack {
+  margin-left: auto;
+  padding-left: 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  flex: 0 0 auto;
+}
+
+.dock-today-token {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: var(--glance-today-line);
+  line-height: var(--glance-today-line);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.dock-today-token + .dock-today-token,
+.dock-today-calls {
+  margin-top: var(--glance-today-line-gap);
+}
+
+.dock-today-arrow {
+  font-size: 9px;
+  font-weight: 600;
+  color: rgba(250, 242, 230, 0.6);
+}
+
+.dock-today-calls {
+  height: var(--glance-today-calls);
+  line-height: var(--glance-today-calls);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(250, 242, 230, 0.6);
+  white-space: nowrap;
+}
+
+/* Quota windows: one column per window, in the order the provider reported them. */
+
+.dock-window-row {
+  display: flex;
+}
+
+.dock-window-col {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.dock-window-pct {
+  height: var(--glance-window-pct);
+  line-height: var(--glance-window-pct);
+  font-size: 20px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.dock-window-label {
+  display: block;
+  margin-top: var(--glance-window-gap);
+  height: var(--glance-caption);
+  line-height: var(--glance-caption);
+  font-size: 11px;
+  color: rgba(250, 242, 230, 0.6);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dock-window-reset {
+  display: block;
+  margin-top: var(--glance-window-gap);
+  height: var(--glance-window-reset);
+  line-height: var(--glance-window-reset);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(250, 242, 230, 0.3);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* No quota window exists for this provider, so money is the capacity. */
+.dock-budget-line {
+  margin: 0;
+  height: var(--glance-caption);
+  line-height: var(--glance-caption);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(250, 242, 230, 0.6);
+}
+
+/* A percentage drawn as its own gauge: dim glyphs with the value's severity colour filling
+   them left to right, wiped off on a slant (PercentGaugeText and PercentGaugeReveal). */
+
+.dock-gauge-text {
+  display: block;
+}
+
+/* Shrink-wrapped around the glyphs, so a run centred in a wider column is still wiped from
+   its own leading edge rather than from the column's. */
+.dock-gauge-run {
+  position: relative;
+  display: inline-block;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+.dock-gauge-base {
+  color: rgba(255, 255, 255, 0.3);
+}
+
+.dock-gauge-fill {
+  position: absolute;
+  inset: 0;
+  color: var(--dock-green);
+}
+
+.dock-gauge-fill.is-warning { color: var(--dock-yellow); }
+.dock-gauge-fill.is-critical { color: var(--dock-orange); }
+.dock-gauge-fill.is-danger { color: var(--dock-red); }
+
+/* Footer. The mac's glance has none: its own adapters report freshness through the
+   connection state, while the CLI's `quota` output drops those facts, so the two the dock
+   can still tell honestly stay here at the foot of the card. */
+
+.dock-footer-line {
+  margin: 0;
+  height: var(--glance-caption);
+  line-height: var(--glance-caption);
+  font-size: 10px;
+  color: rgba(250, 242, 230, 0.58);
+}
+
+.dock-footer-line + .dock-footer-line {
+  margin-top: var(--glance-block-gap);
+}
+
+/* The mac's prominent small button, tinted with the provider's brand colour. */
+
+.dock-connect-row {
+  padding: 0 var(--glance-inset);
+}
+
+.dock-connect {
+  appearance: none;
+  border: 0;
+  border-radius: 6px;
+  height: var(--glance-connect-h);
+  padding: 0 11px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  cursor: default;
+}
+
+.dock-connect:hover {
+  filter: brightness(1.12);
+}

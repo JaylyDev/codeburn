@@ -114,9 +114,16 @@ function makeProject(name: string, sessions: ReturnType<typeof makeSession>[]) {
   }
 }
 
+// A real TTY always drains, so Ink's render pipeline never waits on a write.
+// A PassThrough with no reader stalls once the default 16 KB buffer fills, and
+// a few 120x50 frames reach that: the app then never gets to run its exit, and
+// the test times out instead of failing. The tests that read stdout keep it
+// flowing themselves; the ones that only wait for the exit need the headroom.
+const TUI_STDOUT_BUFFER_BYTES = 4 * 1024 * 1024
+
 function makeTui() {
   const stdin = new PassThrough() as PassThrough & NodeJS.ReadStream
-  const stdout = new PassThrough() as PassThrough & NodeJS.WriteStream
+  const stdout = new PassThrough({ highWaterMark: TUI_STDOUT_BUFFER_BYTES }) as PassThrough & NodeJS.WriteStream
   stdin.isTTY = true
   stdin.setRawMode = () => stdin
   stdin.ref = () => stdin

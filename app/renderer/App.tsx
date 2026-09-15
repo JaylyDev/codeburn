@@ -9,27 +9,46 @@ import { Panel } from './components/Panel'
 import { Sidebar, type Section } from './components/Sidebar'
 import { Splash } from './components/Splash'
 import { ToastHost } from './components/ToastHost'
-import { SwitchingBanner } from './components/SwitchingBanner'
 import { UpdateBanner } from './components/UpdateBanner'
 import { rangeLabel, TopBar } from './components/TopBar'
 import { Window } from './components/Window'
-import { clearPolledMemo, hasPolledMemo, polledMemoTimestamp, primePolledMemo, usePolled } from './hooks/usePolled'
+import { clearPolledMemo, hasPolledMemo, polledMemoTimestamp, primePolledMemo, usePolled, usePolledInFlight } from './hooks/usePolled'
 import { readDailyBudget } from './lib/budget'
 import { formatCompact, formatUsd, setActiveCurrency } from './lib/format'
+import {
+  EMPTY_FILTERS,
+  filtersActive,
+  modelFilters,
+  projectFilters,
+  unionFilters,
+  type InvestigationFilters,
+} from './lib/investigation'
+import {
+  backState,
+  EMPTY_NAV_HISTORY,
+  forwardState,
+  persistNavState,
+  pushState,
+  readPersistedNavState,
+  type NavHistory,
+  type NavState,
+} from './lib/navHistory'
 import { motionClass } from './lib/motion'
 import { clearOverviewHeadlines, readOverviewHeadline, writeOverviewHeadline } from './lib/overviewSnapshot'
 import { codeburn } from './lib/ipc'
-import { isModifierChord, shortcutLabel } from './lib/platform'
+import { trackEvent } from './lib/track'
+import { isMacPlatform, isModifierChord, shortcutLabel } from './lib/platform'
 import { localDateKey, PERIOD_LABELS } from './lib/period'
 import { readDisabledProviders } from './lib/providers'
 import { reportMemoKey } from './lib/reportMemoKey'
 import { persistRefreshValue, readRefreshValue, refreshValueToMs, RefreshCadenceContext, type RefreshCadence } from './lib/refreshCadence'
-import { OverviewContent } from './sections/Overview'
+import { OverviewContent, type InvestigateRequest } from './sections/Overview'
 import { OptimizeContent } from './sections/Optimize'
 import { Models } from './sections/Models'
-import { Sessions } from './sections/Sessions'
+import { INITIAL_VISIBLE, Sessions, type SessionSort } from './sections/Sessions'
 import { PullRequestsContent } from './sections/PullRequests'
 import { Compare } from './sections/Compare'
+import { PeriodCompare } from './sections/PeriodCompare'
 import { Plans } from './sections/Plans'
 import { Settings, type SettingsPane } from './sections/Settings'
 import { SpendContent } from './sections/Spend'
@@ -50,6 +69,7 @@ function costBucket(usd: number): string {
 // Bucket occurrence counts (MCP-server / skill invocations) the same way costBucket
 // coarsens dollars: telemetry carries usage magnitude, never an exact tally.
 function countBucket(n: number): string {
+  if (!(n > 0)) return '0'
   if (n < 10) return '1-10'
   if (n < 100) return '10-100'
   if (n < 1000) return '100-1k'
@@ -71,7 +91,11 @@ export function topCategoryByModel(rows: ModelReportRow[]): Map<string, string> 
   return map
 }
 
-/** The once-per-day anonymous aggregate (main process dedups by calendar day). */
+/** The once-per-day anonymous aggregate, built in the renderer.
+ * Fallback only: current CLIs compute the richer `payload.telemetrySnapshot`
+ * (src/telemetry-snapshot.ts) so the desktop app and the Windows tray send the
+ * identical shape. This builder covers a CLI that predates that field.
+ * The main process dedups the event by calendar day either way. */
 export function usageSnapshotProps(payload: MenubarPayload, modelCategories?: Map<string, string>): Record<string, unknown> {
   return {
     period: payload.current.label,
@@ -119,6 +143,7 @@ const SECTION_TITLES: Record<Section, string> = {
   optimize: 'Optimize',
   models: 'Models',
   compare: 'Compare',
+  periods: 'Compare periods',
   plans: 'Plans',
   settings: 'Settings',
   plugins: 'Plugins',
@@ -215,6 +240,15 @@ function persistScope(scope: Scope): void {
   try { globalThis.localStorage?.setItem('codeburn.scope', scope) } catch { /* storage can be unavailable */ }
 }
 
+/// Boot mirror of the main-process filter, which arrives after the first poll.
+function initialProjectFiltered(): boolean {
+  try { return globalThis.localStorage?.getItem('codeburn.projectFiltered') === '1' } catch { return false }
+}
+
+function persistProjectFiltered(active: boolean): void {
+  try { globalThis.localStorage?.setItem('codeburn.projectFiltered', active ? '1' : '0') } catch { /* storage can be unavailable */ }
+}
+
 function providerName(provider: string): string {
   if (provider === 'all') return 'All providers'
   return provider
@@ -256,20 +290,109 @@ export function App() {
   )
 }
 
+const NAV_SECTIONS = new Set<string>(['overview', 'sessions', 'pullRequests', 'spend', 'optimize', 'models', 'compare', 'plans', 'settings', 'plugins'])
+
+/** Boot position: the best-effort restart snapshot when it is still valid
+ *  (section and period re-validated; a stale drawer revalidates itself once
+ *  the destination data lands), else the plain defaults. */
+function initialNavState(): NavState {
+  const restored = readPersistedNavState()
+  if (restored
+    && NAV_SECTIONS.has(restored.section)
+    && isPeriod(restored.period)) {
+    return { ...restored, range: restored.range ?? null, filters: restored.filters ?? EMPTY_FILTERS }
+  }
+  return {
+    section: 'overview',
+    period: initialPeriod(),
+    provider: 'all',
+    range: null,
+    filters: EMPTY_FILTERS,
+    sessionId: null,
+    sort: 'cost',
+    visibleCount: INITIAL_VISIBLE,
+  }
+}
+
 function AppMain() {
-  const [section, setSection] = useState<Section>('overview')
+  const [nav, setNav] = useState<NavState>(initialNavState)
+  const [history, setHistory] = useState<NavHistory>(EMPTY_NAV_HISTORY)
+  // Mirrors for synchronous reads inside callbacks (commit/back/forward must
+  // reason about the CURRENT state, not the one from the last render).
+  const navRef = useRef(nav)
+  navRef.current = nav
+  const historyRef = useRef(history)
+  historyRef.current = history
+
+  const { section, period, provider, filters, sessionId: openSessionId } = nav
+  const customRange = nav.range
   const [settingsPane, setSettingsPane] = useState<SettingsPane>('general')
-  const [period, setPeriod] = useState<Period>(initialPeriod)
-  const [provider, setProvider] = useState<string>('all')
-  const [detectedProviders, setDetectedProviders] = useState<Array<{ id: string; label: string }>>([])
-  const [customRange, setCustomRange] = useState<DateRange | null>(null)
+  const [providerCatalog, setProviderCatalog] = useState<{
+    key: string | null
+    entries: Array<{ id: string; label: string }>
+  }>({ key: null, entries: [] })
+  const detectedProviders = providerCatalog.entries
   const [claudeConfigSource, setClaudeConfigSource] = useState<string | null>(initialConfigSource)
-  const [scope, setScopeState] = useState<Scope>(initialScope)
+  const [requestedScope, setScopeState] = useState<Scope>(initialScope)
   const [refreshToken, setRefreshToken] = useState(0)
+  const [projectFiltered, setProjectFiltered] = useState(initialProjectFiltered)
+  // Combined reports unfiltered paired-device usage, so a project filter would
+  // come back inside the aggregate. The filter wins, from the first poll.
+  const scope: Scope = projectFiltered ? 'local' : requestedScope
   const [now, setNow] = useState(() => Date.now())
   const [, setCurrencyTick] = useState(0)
   const [snapshotRevision, setSnapshotRevision] = useState(0)
   const configGenerationRef = useRef(0)
+
+  /** Commit a new app position: one history entry per committed change, with
+   *  identical consecutive states coalesced (poll refreshes never push). */
+  const commitNav = useCallback((patch: Partial<NavState>) => {
+    const current = navRef.current
+    const next = { ...current, ...patch }
+    if (next === current) return
+    navRef.current = next
+    setNav(next)
+    setHistory(currentHistory => pushState(currentHistory, current, next))
+  }, [])
+
+  const goBack = useCallback(() => {
+    const result = backState(historyRef.current, navRef.current)
+    if (!result) return
+    historyRef.current = result.history
+    setHistory(result.history)
+    navRef.current = result.state
+    setNav(result.state)
+  }, [])
+
+  const goForward = useCallback(() => {
+    const result = forwardState(historyRef.current, navRef.current)
+    if (!result) return
+    historyRef.current = result.history
+    setHistory(result.history)
+    navRef.current = result.state
+    setNav(result.state)
+  }, [])
+
+  // Best-effort restart restore of the app position (section, selection,
+  // drawer): the snapshot revalidates lazily — the Sessions drawer closes
+  // itself when its session is no longer in the reloaded population.
+  useEffect(() => { persistNavState(nav) }, [nav])
+
+  /** A drill-through entry from any report: navigate to Sessions with the
+   *  selection applied (and the drawer pre-opened for a session entry). While
+   *  an investigation is already active, a second aggregate click UNIONS into
+   *  it (the OR rule within a dimension; the drawer closes for revalidation). */
+  const investigate = useCallback((request: InvestigateRequest) => {
+    const current = navRef.current
+    // An active investigation survives going Back to the graph (that is the
+    // point of returning with context), so a further aggregate click unions
+    // into it instead of discarding it. With no active selection the click
+    // starts a fresh one.
+    const filters = filtersActive(current.filters)
+      ? unionFilters(current.filters, request.filters)
+      : request.filters
+    commitNav({ section: 'sessions', filters, sessionId: request.sessionId ?? null, visibleCount: INITIAL_VISIBLE })
+  }, [commitNav])
 
   // Preserve the 2/3-arg call shapes when no config is scoped so the CLI argv
   // stays flag-free; only add --claude-config-source once a config is picked.
@@ -278,6 +401,10 @@ function AppMain() {
   // the config scope before this poll runs. Passing scope='local' produces the
   // same flag-free argv as before, so local users are unaffected.
   const activeOverviewKey = overviewMemoKey(provider, period, customRange, claudeConfigSource, scope, new Date(now))
+  // Provider membership is period/range-specific. Keep the catalog tied to the
+  // exact unscoped local overview that produced it so a scoped view cannot leak
+  // providers from a different time horizon while its own payload is loading.
+  const allProviderOverviewKey = overviewMemoKey('all', period, customRange, null, 'local', new Date(now))
   const overview = usePolled<MenubarPayload>(
     () => scope === 'combined'
       ? codeburn.getOverview(period, 'all', customRange ?? undefined, undefined, undefined, 'combined')
@@ -330,7 +457,7 @@ function AppMain() {
     const sessions = overview.data?.current.sessions
     if (!autoPeriod.current || sessions === undefined) return
     autoPeriod.current = false
-    if (period === 'today' && sessions === 0) setPeriod('week')
+    if (period === 'today' && sessions === 0) commitNav({ period: 'week', visibleCount: INITIAL_VISIBLE })
   }, [overview.data, period])
 
   const overviewCold = isColdHydrating(overview.error)
@@ -354,16 +481,13 @@ function AppMain() {
     if (typeof codeburn.completeOnboarding === 'function') void codeburn.completeOnboarding(enabled).catch(() => {})
   }, [])
 
-  const trackEvent = useCallback((name: string, props?: Record<string, unknown>) => {
-    if (typeof codeburn.telemetryTrack === 'function') void codeburn.telemetryTrack(name, props).catch(() => {})
-  }, [])
-
   // Once-per-day anonymous usage aggregate, only from the canonical view
   // (all providers, standard period, no config scope) so buckets are stable.
-  // Gated to the first qualifying render per calendar day so the extra by-model
-  // report fetch runs at most once/day, not on every poll (main also dedups the
-  // event). The fetch enriches each model with its dominant task category; if it
-  // fails we still emit the snapshot, just without the model x category cross.
+  // Gated to the first qualifying render per calendar day (main also dedups the
+  // event). Current CLIs hand us the finished, already-bucketed snapshot and we
+  // forward it verbatim; only an older CLI falls back to the renderer builder,
+  // which needs an extra by-model report fetch to get the model x category cross
+  // and still emits without it if that fetch fails.
   const snapshotDayRef = useRef<string | null>(null)
   useEffect(() => {
     if (!overview.data || provider !== 'all' || customRange || claudeConfigSource || scope !== 'local') return
@@ -371,6 +495,11 @@ function AppMain() {
     if (snapshotDayRef.current === today) return
     snapshotDayRef.current = today
     const payload = overview.data
+    const fromCli = payload.telemetrySnapshot
+    if (fromCli && typeof fromCli === 'object') {
+      trackEvent('usage_snapshot', fromCli)
+      return
+    }
     void (async () => {
       let modelCategories: Map<string, string> | undefined
       try {
@@ -378,7 +507,7 @@ function AppMain() {
       } catch { /* degrade: emit the snapshot without per-model topCategory */ }
       trackEvent('usage_snapshot', usageSnapshotProps(payload, modelCategories))
     })()
-  }, [overview.data, provider, customRange, claudeConfigSource, scope, period, trackEvent])
+  }, [overview.data, provider, customRange, claudeConfigSource, scope, period])
 
   useEffect(() => {
     let saved: string | null = null
@@ -388,30 +517,41 @@ function AppMain() {
   }, [])
 
   useEffect(() => {
-    if (!overview.data) return
+    // Only the all-provider payload is authoritative for the picker. A scoped
+    // payload contains just the selected provider; merging it forever also
+    // leaked idle providers across period changes.
+    if (!overview.data || overview.switching || provider !== 'all' || claudeConfigSource || scope !== 'local') return
     const details = overview.data.current.providerDetails
     // Prefer providerDetails (internal id + display label); fall back to the
-    // providers map keys (lowercased display names) for older CLIs. The CLI
-    // only emits detected providers, so keep every entry (including ones with
-    // no spend this period) and sort by cost so zero-cost ones sit at the
-    // bottom of the picker.
+    // providers map keys (lowercased display names) for older CLIs. `hasUsage`
+    // keeps idle discovery rows out of the picker, but only when the CLI
+    // actually emits it: every released CLI omits it, and falling back to cost
+    // there hid subscription-backed providers whose period spend is $0.
     const found = details
       ? [...details]
+          .filter(entry => entry.hasUsage ?? true)
           .sort((a, b) => b.cost - a.cost)
           .map(entry => ({ id: entry.id, label: entry.label }))
       : Object.entries(overview.data.current.providers)
           // Fallback map keys are lowercased display names; ones with spaces
           // ("grok build") cannot round-trip as --provider, so exclude them
           // rather than offer a filter that is guaranteed to error.
-          .filter(([key]) => /^[a-z0-9-]+$/.test(key))
+          .filter(([key, cost]) => cost > 0 && /^[a-z0-9-]+$/.test(key))
           .sort(([, a], [, b]) => b - a)
           .map(([key]) => ({ id: key, label: providerName(key) }))
-    setDetectedProviders(current => {
-      const next = [...current]
-      for (const item of found) if (!next.some(entry => entry.id === item.id)) next.push(item)
-      return next.length === current.length ? current : next
-    })
-  }, [overview.data])
+    setProviderCatalog({ key: allProviderOverviewKey, entries: found })
+  }, [allProviderOverviewKey, claudeConfigSource, overview.data, overview.switching, provider, scope])
+
+  const selectedProviderEntry = useMemo(() => provider === 'all'
+    ? null
+    : detectedProviders.find(entry => entry.id === provider) ?? { id: provider, label: providerName(provider) },
+  [detectedProviders, provider])
+  const visibleProviderEntries = useMemo(() => providerCatalog.key === allProviderOverviewKey
+    ? detectedProviders
+    : selectedProviderEntry
+      ? [selectedProviderEntry]
+      : [],
+  [allProviderOverviewKey, detectedProviders, providerCatalog.key, selectedProviderEntry])
 
   useEffect(() => {
     const currency = overview.data?.currency
@@ -532,7 +672,7 @@ function AppMain() {
       // Keep the current-main provider-switch contract while the shared Core
       // provider snapshot work is still held: warm the visible period for each
       // detected provider only after the higher-value period/report queue.
-      for (const targetProvider of detectedProviders.map(entry => entry.id)) {
+      for (const targetProvider of visibleProviderEntries.map(entry => entry.id)) {
         if (cancelled || targetProvider === provider) continue
         const key = overviewMemoKey(targetProvider, period, null, null)
         if (warmedKeys.current.has(key) || hasPolledMemo(key)) continue
@@ -558,7 +698,7 @@ function AppMain() {
     // `overview.data == null` (a boolean) gates on first-resolution without
     // re-running every poll; the data content itself is intentionally not a dep.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, period, provider, detectedProviders, customRange, claudeConfigSource, scope, snapshotRevision, overview.data == null])
+  }, [ready, period, provider, visibleProviderEntries, customRange, claudeConfigSource, scope, snapshotRevision, overview.data == null])
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), 1000)
@@ -587,12 +727,51 @@ function AppMain() {
 
   const navigate = useCallback((next: Section, pane: SettingsPane = 'general') => {
     setSettingsPane(pane)
-    setSection(next)
+    commitNav({ section: next })
     trackEvent('section_view', { section: next })
-  }, [trackEvent])
+  }, [commitNav])
+
+  /** Compare periods' contribution drill-down: the same Sessions destination
+   *  every other drill-through lands on, scoped to the clicked side's range
+   *  and filtered to the contribution's own key. Not a union: the range moves,
+   *  so any previous selection no longer describes this population. */
+  const inspectContribution = useCallback((range: DateRange, dimension: 'project' | 'model', key: string) => {
+    commitNav({
+      section: 'sessions',
+      range,
+      filters: dimension === 'project' ? projectFilters(key) : modelFilters([key]),
+      sessionId: null,
+      visibleCount: INITIAL_VISIBLE,
+    })
+  }, [commitNav])
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      // Back/Forward in app history: the platform navigation chords (Cmd+[ /
+      // Cmd+] on macOS, Alt+Left/Right elsewhere). Checked BEFORE
+      // isModifierChord, which deliberately rejects Alt for layout reasons.
+      const mac = isMacPlatform()
+      const plainModifiers = !event.ctrlKey && !event.metaKey && !event.shiftKey
+      if (mac && event.metaKey && !event.ctrlKey && !event.altKey && event.key === '[') {
+        event.preventDefault()
+        goBack()
+        return
+      }
+      if (mac && event.metaKey && !event.ctrlKey && !event.altKey && event.key === ']') {
+        event.preventDefault()
+        goForward()
+        return
+      }
+      if (!mac && plainModifiers && event.altKey && event.key === 'ArrowLeft') {
+        event.preventDefault()
+        goBack()
+        return
+      }
+      if (!mac && plainModifiers && event.altKey && event.key === 'ArrowRight') {
+        event.preventDefault()
+        goForward()
+        return
+      }
       if (!isModifierChord(event)) return
       const key = event.key.toLowerCase()
       if (key === '1') navigate('overview')
@@ -602,6 +781,7 @@ function AppMain() {
       else if (key === '5') navigate('optimize')
       else if (key === '6') navigate('models')
       else if (key === '7') navigate('compare')
+      else if (key === '9') navigate('periods')
       else if (key === '8') navigate('plans')
       else if (key === ',') navigate('settings')
       else if (key === 'r') refreshVisible()
@@ -611,13 +791,12 @@ function AppMain() {
 
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
-  }, [refreshVisible, navigate])
+  }, [refreshVisible, navigate, goBack, goForward])
 
   const onPeriodChange = (value: string) => {
     if (isPeriod(value)) {
       autoPeriod.current = false
-      setCustomRange(null)
-      setPeriod(value)
+      commitNav({ period: value, range: null, visibleCount: INITIAL_VISIBLE })
     }
   }
 
@@ -627,7 +806,7 @@ function AppMain() {
   // implies a device-specific view, so drop combined scope back to local.
   const onConfigSelect = (id: string) => {
     const next = id || null
-    if (next && provider !== 'all' && provider !== 'claude') setProvider('all')
+    if (next && provider !== 'all' && provider !== 'claude') commitNav({ provider: 'all' })
     if (next && scope === 'combined') { setScopeState('local'); persistScope('local') }
     setClaudeConfigSource(next)
     persistConfigSource(next)
@@ -643,8 +822,38 @@ function AppMain() {
       setClaudeConfigSource(null)
       persistConfigSource(null)
     }
-    setProvider(value)
+    commitNav({ provider: value })
   }
+
+  // Re-read on config invalidation (another window can save the pane too), on a
+  // manual refresh, and on every overview poll. The main process honours a hand
+  // edit of app-filter.json the moment the file changes, so a renderer that only
+  // re-read on its own saves kept offering Combined while buildOverviewArgs had
+  // already dropped `--scope combined` — a local, filtered total under a
+  // "Combined · …" headline, which is the one reading the pane must never give.
+  useEffect(() => {
+    let cancelled = false
+    void Promise.resolve().then(() => codeburn.getProjectFilter())
+      .then(filter => {
+        if (cancelled) return
+        const active = filter.project.length > 0 || filter.exclude.length > 0
+        // reportMemoKey has no filter component, so a snapshot memoised under
+        // the other scope would repaint until the next fetch lands.
+        if (active !== initialProjectFiltered()) clearPolledMemo()
+        setProjectFiltered(active)
+        persistProjectFiltered(active)
+      })
+      .catch(() => { /* an older preload has no getProjectFilter to honour */ })
+    return () => { cancelled = true }
+  }, [snapshotRevision, refreshToken, overview.data])
+
+  // Collapse the stored preference too, so clearing the filter later starts
+  // from local instead of silently restoring a combined view.
+  useEffect(() => {
+    if (!projectFiltered || requestedScope !== 'combined') return
+    setScopeState('local')
+    persistScope('local')
+  }, [projectFiltered, requestedScope])
 
   // Combined scope reports unfiltered, all-provider usage across paired devices,
   // so switching to it resets the provider filter and Claude-config scope (which
@@ -652,7 +861,7 @@ function AppMain() {
   const onScopeChange = (value: string) => {
     const next: Scope = value === 'combined' ? 'combined' : 'local'
     if (next === 'combined') {
-      if (provider !== 'all') setProvider('all')
+      if (provider !== 'all') commitNav({ provider: 'all' })
       if (claudeConfigSource) { setClaudeConfigSource(null); persistConfigSource(null) }
     }
     setScopeState(next)
@@ -662,9 +871,9 @@ function AppMain() {
   const claudeConfigs = overview.data?.claudeConfigs
   const providerOptions = [
     { value: 'all', label: 'All providers' },
-    ...detectedProviders.map(entry => ({ value: entry.id, label: entry.label })),
+    ...visibleProviderEntries.map(entry => ({ value: entry.id, label: entry.label })),
   ]
-  const providerLabel = detectedProviders.find(entry => entry.id === provider)?.label ?? providerName(provider)
+  const providerLabel = selectedProviderEntry?.label ?? providerName(provider)
   const activeConfigLabel = claudeConfigSource
     ? claudeConfigs?.options.find(option => option.id === claudeConfigSource)?.label ?? null
     : null
@@ -673,6 +882,7 @@ function AppMain() {
   const scopeCaption = scope === 'combined'
     ? `${customRange ? rangeLabel(customRange) : PERIOD_LABELS[period]} · Combined`
     : `${customRange ? rangeLabel(customRange) : PERIOD_LABELS[period]} · ${providerLabel}${activeConfigLabel ? ` · ${activeConfigLabel}` : ''}`
+  const refreshing = usePolledInFlight() || overview.switching || (!!headlineSnapshot && overview.loading)
   const selectedReportKeys = selectedReportMemoKeys(section, period, provider, customRange, activeOverviewKey)
   const selectedReportTimestamps = selectedReportKeys.map(polledMemoTimestamp)
   const selectedLastSuccessAt = selectedReportKeys.length > 0 && selectedReportTimestamps.every((value): value is number => value != null)
@@ -685,9 +895,8 @@ function AppMain() {
       <ToastHost />
       <Splash hasData={overview.data != null || headlineSnapshot != null} hasError={overview.error != null && !overviewCold} />
       {onboardingStatus && <Onboarding defaultEnabled={onboardingStatus.defaultEnabled} onDone={finishOnboarding} />}
-      <div className="ct" aria-busy={overview.switching || (!!headlineSnapshot && overview.loading)}>
-        <div className={overview.switching || (!!headlineSnapshot && overview.loading) ? 'switch-line on' : 'switch-line'} aria-hidden="true" />
-        {(overview.switching || (!!headlineSnapshot && overview.loading)) && <SwitchingBanner />}
+      <div className="ct" aria-busy={refreshing}>
+        <div className={refreshing ? 'switch-line on' : 'switch-line'} aria-hidden="true" />
         <UpdateBanner />
         <IndexingBanner payload={overview.data ?? null} />
         <DailyBudgetBanner payload={overview.data ?? null} provider={provider} />
@@ -695,18 +904,22 @@ function AppMain() {
         {section === 'plans' ? (
           <Plans period={period} refreshToken={refreshToken} onNavigate={navigate} ready={ready} />
         ) : section === 'settings' ? (
-          <Settings period={period} refreshToken={refreshToken} onNavigate={navigate} initialPane={settingsPane} claudeConfigs={claudeConfigs} claudeConfigSource={claudeConfigSource} onConfigMutated={onConfigMutated} scope={scope} onScopeChange={onScopeChange} />
+          <Settings period={period} refreshToken={refreshToken} onNavigate={navigate} initialPane={settingsPane} claudeConfigs={claudeConfigs} claudeConfigSource={claudeConfigSource} onConfigMutated={onConfigMutated} scope={scope} onScopeChange={onScopeChange} projectFiltered={projectFiltered} />
         ) : section === 'plugins' ? (
           <PluginsSection />
         ) : (
           <>
             <TopBar
               title={SECTION_TITLES[section]}
+              canBack={history.past.length > 0}
+              canForward={history.future.length > 0}
+              onBack={goBack}
+              onForward={goForward}
               scope={scopeCaption}
               period={period}
               onPeriodChange={onPeriodChange}
               customRange={customRange}
-              onRangeSelect={setCustomRange}
+              onRangeSelect={range => commitNav({ range, visibleCount: INITIAL_VISIBLE })}
               provider={provider}
               providerLabel={providerLabel}
               providerOptions={providerOptions}
@@ -717,19 +930,25 @@ function AppMain() {
             />
             <div className={motionClass('body', 'section-fade')}>
               {section === 'overview' ? (
-                <OverviewContent period={period} provider={provider} range={customRange} overview={overview} onNavigate={navigate} ready={ready} scope={scope} headlineSnapshot={headlineSnapshot} />
+                <OverviewContent period={period} provider={provider} range={customRange} overview={overview} onNavigate={navigate} onInvestigate={investigate} ready={ready} scope={scope} headlineSnapshot={headlineSnapshot} />
               ) : section === 'sessions' ? (
-                <Sessions period={period} provider={provider} range={customRange} refreshToken={refreshToken} detectedProviders={detectedProviders} onProviderChange={onProviderSelect} ready={ready} />
+                // A new sort or a changed selection reorders the whole list, so
+                // the pagination depth resets IN THE SAME commit — one history
+                // entry, and the depth a Back/Forward restores stays whatever it
+                // was when that position was committed.
+                <Sessions period={period} provider={provider} range={customRange} refreshToken={refreshToken} detectedProviders={visibleProviderEntries} onProviderChange={onProviderSelect} ready={ready} filters={filters} onFiltersChange={next => commitNav({ filters: next, visibleCount: INITIAL_VISIBLE })} openSessionId={openSessionId} onSessionOpen={key => commitNav({ sessionId: key })} onSessionClose={() => commitNav({ sessionId: null })} sort={nav.sort as SessionSort} onSortChange={value => commitNav({ sort: value, visibleCount: INITIAL_VISIBLE })} visibleCount={nav.visibleCount} onVisibleCountChange={value => commitNav({ visibleCount: value })} />
               ) : section === 'pullRequests' ? (
-                <PullRequestsContent overview={overview} period={period} provider={provider} range={customRange} />
+                <PullRequestsContent overview={overview} period={period} provider={provider} range={customRange} onInvestigate={investigate} />
               ) : section === 'spend' ? (
-                <SpendContent period={period} provider={provider} range={customRange} overview={overview} refreshToken={refreshToken} ready={ready} />
+                <SpendContent period={period} provider={provider} range={customRange} overview={overview} refreshToken={refreshToken} ready={ready} onInvestigate={investigate} />
               ) : section === 'optimize' ? (
                 <OptimizeContent period={period} provider={provider} range={customRange} overview={overview} refreshToken={refreshToken} ready={ready} />
               ) : section === 'models' ? (
-                <Models period={period} provider={provider} range={customRange} refreshToken={refreshToken} onNavigate={navigate} ready={ready} />
+                <Models period={period} provider={provider} range={customRange} refreshToken={refreshToken} onNavigate={navigate} onInvestigate={investigate} ready={ready} />
               ) : section === 'compare' ? (
-                <Compare period={period} provider={provider} range={customRange} refreshToken={refreshToken} ready={ready} />
+                <Compare period={period} provider={provider} range={customRange} refreshToken={refreshToken} ready={ready} onInvestigate={investigate} />
+              ) : section === 'periods' ? (
+                <PeriodCompare provider={provider} refreshToken={refreshToken} ready={ready} onInspectContribution={inspectContribution} />
               ) : (
                 <SectionPlaceholder title={SECTION_TITLES[section]} />
               )}
@@ -740,15 +959,41 @@ function AppMain() {
         {section !== 'settings' && (
           <Hint
             items={[
-              { k: shortcutLabel('1-8'), label: 'Navigate' },
+              { k: shortcutLabel('1-8,9'), label: 'Navigate' },
               { k: shortcutLabel(','), label: 'Settings' },
               { k: shortcutLabel('R'), label: 'Refresh' },
             ]}
-            right={refreshedLabel(selectedLastSuccessAt, false, now)}
+            right={<RefreshMark refreshing={refreshing} label={refreshedLabel(selectedLastSuccessAt, false, now)} />}
           />
         )}
       </div>
     </Window>
+  )
+}
+
+/** Footer refresh state. The icon is always in the DOM at a fixed 12px so the
+ *  "refreshed Ns ago" text never moves between idle and in-flight. */
+function RefreshMark({ refreshing, label }: { refreshing: boolean; label: string }) {
+  return (
+    <>
+      <svg
+        className={refreshing ? 'refresh-mark spinning' : 'refresh-mark'}
+        width="12"
+        height="12"
+        viewBox="0 0 12 12"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        <path d="M10.1 6a4.1 4.1 0 1 1-1.25-2.95" />
+        <path d="M10.6 1.3v2.9H7.7" />
+      </svg>
+      <span className="sr-only" role="status" aria-live="polite">{refreshing ? 'Refreshing' : ''}</span>
+      <span>{label}</span>
+    </>
   )
 }
 
