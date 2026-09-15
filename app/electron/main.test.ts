@@ -1,7 +1,8 @@
 // @vitest-environment node
-import { mkdtempSync, rmSync } from 'node:fs'
+import fs, { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { describe, it, expect, vi } from 'vitest'
 
 // Stub electron so importing main.ts does not require an Electron runtime.
@@ -14,7 +15,7 @@ vi.mock('electron', () => ({
   shell: { openExternal: vi.fn() },
 }))
 
-import { createApplicationMenuTemplate, createBeforeQuitHandler, createBridgeHandlers, externalUrlToOpen } from './main'
+import { createApplicationMenuTemplate, createBeforeQuitHandler, createBridgeHandlers, externalUrlToOpen, readProjectFilter, writeProjectFilter } from './main'
 import { CliError } from './cli'
 import { Telemetry } from './telemetry'
 
@@ -41,10 +42,16 @@ const CHANNELS = [
   'codeburn:getActReport',
   'codeburn:getModels',
   'codeburn:getSessions',
+  'codeburn:getSessionsContributions',
   'codeburn:getCompareModels',
   'codeburn:getCompare',
+  'codeburn:getPeriodCompare',
+  'codeburn:getPeriodCompareSessions',
+  'codeburn:getCompareCohortModels',
+  'codeburn:getCompareCohort',
   'codeburn:getYield',
   'codeburn:getSpendFlow',
+  'codeburn:getBranchSpend',
   'codeburn:getOptimizeReport',
   'codeburn:getDevices',
   'codeburn:getDevicesScan',
@@ -54,6 +61,9 @@ const CHANNELS = [
   'codeburn:getProxyPaths',
   'codeburn:getAudit',
   'codeburn:getPriceOverrides',
+  'codeburn:getProjectFilter',
+  'codeburn:setProjectFilter',
+  'codeburn:getUnfilteredProjects',
   'codeburn:setCurrency',
   'codeburn:resetCurrency',
   'codeburn:addAlias',
@@ -96,8 +106,19 @@ const ARGV_CASES: Array<{ channel: string; args: unknown[]; argv: string[] }> = 
   { channel: 'codeburn:getModels', args: ['week', 'all', false], argv: ['models', '--format', 'json', '--period', 'week'] },
   { channel: 'codeburn:getSessions', args: ['week', 'all'], argv: ['sessions', '--format', 'json', '--period', 'week'] },
   { channel: 'codeburn:getSessions', args: ['30days', 'claude', { from: '2026-07-01', to: '2026-07-11' }], argv: ['sessions', '--format', 'json', '--period', '30days', '--provider', 'claude', '--from', '2026-07-01', '--to', '2026-07-11'] },
+  { channel: 'codeburn:getSessionsContributions', args: ['week', 'all'], argv: ['sessions', '--format', 'json', '--contributions', '--period', 'week'] },
+  { channel: 'codeburn:getSessionsContributions', args: ['30days', 'claude', { from: '2026-07-01', to: '2026-07-11' }], argv: ['sessions', '--format', 'json', '--contributions', '--period', '30days', '--provider', 'claude', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getCompareModels', args: ['month', 'codex'], argv: ['compare', '--format', 'json', '--period', 'month', '--provider', 'codex'] },
   { channel: 'codeburn:getCompare', args: ['month', 'all', 'model-a', 'model-b'], argv: ['compare', '--format', 'json', '--period', 'month', '--model-a', 'model-a', '--model-b', 'model-b'] },
+  { channel: 'codeburn:getPeriodCompare', args: [{ from: '2026-07-01', to: '2026-07-07' }, { from: '2026-07-08', to: '2026-07-14' }, 'claude'], argv: ['compare-periods', '--format', 'json', '--from-a', '2026-07-01', '--to-a', '2026-07-07', '--from-b', '2026-07-08', '--to-b', '2026-07-14', '--provider', 'claude'] },
+  { channel: 'codeburn:getPeriodCompare', args: [{ from: '2026-07-01', to: '2026-07-07' }, { from: '2026-07-08', to: '2026-07-14' }, 'all'], argv: ['compare-periods', '--format', 'json', '--from-a', '2026-07-01', '--to-a', '2026-07-07', '--from-b', '2026-07-08', '--to-b', '2026-07-14'] },
+  { channel: 'codeburn:getPeriodCompareSessions', args: [{ from: '2026-07-01', to: '2026-07-07' }, { from: '2026-07-08', to: '2026-07-14' }, 'all', 'project', '/work/app'], argv: ['compare-periods', '--format', 'sessions', '--from-a', '2026-07-01', '--to-a', '2026-07-07', '--from-b', '2026-07-08', '--to-b', '2026-07-14', '--dimension', 'project', '--key', '/work/app'] },
+  // Claude sanitizes project paths to dash-leading slugs; the key rides in the
+  // VALUE position of --key, so a dash-leading key must survive validation.
+  { channel: 'codeburn:getPeriodCompareSessions', args: [{ from: '2026-07-01', to: '2026-07-07' }, { from: '2026-07-08', to: '2026-07-14' }, 'all', 'project', '-work-pricing'], argv: ['compare-periods', '--format', 'sessions', '--from-a', '2026-07-01', '--to-a', '2026-07-07', '--from-b', '2026-07-08', '--to-b', '2026-07-14', '--dimension', 'project', '--key', '-work-pricing'] },
+  { channel: 'codeburn:getCompareCohortModels', args: ['month', 'claude', { from: '2026-07-01', to: '2026-07-11' }], argv: ['compare', '--format', 'cohort-json', '--period', 'month', '--provider', 'claude', '--from', '2026-07-01', '--to', '2026-07-11'] },
+  { channel: 'codeburn:getCompareCohort', args: ['month', 'all', 'model-a', 'model-b'], argv: ['compare', '--format', 'cohort-json', '--period', 'month', '--model-a', 'model-a', '--model-b', 'model-b'] },
+  { channel: 'codeburn:getCompareCohort', args: ['month', 'all', 'model-a', 'model-b', undefined, ['/Users/gone/alpha', '-Users-gone-alpha'], 'coding'], argv: ['compare', '--format', 'cohort-json', '--period', 'month', '--model-a', 'model-a', '--model-b', 'model-b', '--project-id=/Users/gone/alpha', '--project-id=-Users-gone-alpha', '--category', 'coding'] },
   { channel: 'codeburn:getYield', args: ['today', 'all'], argv: ['yield', '--format', 'json', '--period', 'today'] },
   { channel: 'codeburn:getYield', args: ['today', 'claude'], argv: ['yield', '--format', 'json', '--period', 'today', '--provider', 'claude'] },
   { channel: 'codeburn:getSpendFlow', args: ['month', 'openai'], argv: ['spend', '--format', 'flow-json', '--period', 'month', '--provider', 'openai'] },
@@ -114,6 +135,8 @@ const ARGV_CASES: Array<{ channel: string; args: unknown[]; argv: string[] }> = 
   { channel: 'codeburn:getModels', args: ['week', 'claude', true, { from: '2026-07-01', to: '2026-07-11' }], argv: ['models', '--format', 'json', '--period', 'week', '--provider', 'claude', '--by-task', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getYield', args: ['today', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['yield', '--format', 'json', '--period', 'today', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getSpendFlow', args: ['month', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['spend', '--format', 'flow-json', '--period', 'month', '--from', '2026-07-01', '--to', '2026-07-11'] },
+  { channel: 'codeburn:getBranchSpend', args: ['month', 'openai'], argv: ['spend', '--format', 'branch-json', '--period', 'month', '--provider', 'openai'] },
+  { channel: 'codeburn:getBranchSpend', args: ['30days', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['spend', '--format', 'branch-json', '--period', '30days', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getOptimizeReport', args: ['month', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['optimize', '--format', 'json', '--period', 'month', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getDevices', args: ['week'], argv: ['devices', '--format', 'json', '--period', 'week'] },
   { channel: 'codeburn:getDevicesScan', args: [], argv: ['devices', 'scan', '--format', 'json'] },
@@ -124,6 +147,7 @@ const ARGV_CASES: Array<{ channel: string; args: unknown[]; argv: string[] }> = 
   { channel: 'codeburn:getAudit', args: ['month', 'claude'], argv: ['audit', '--format', 'json', '--period', 'month', '--provider', 'claude'] },
   { channel: 'codeburn:getAudit', args: ['30days', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['audit', '--format', 'json', '--period', '30days', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getPriceOverrides', args: [], argv: ['price-override', '--list', '--format', 'json'] },
+  { channel: 'codeburn:getUnfilteredProjects', args: [], argv: ['report', '--format', 'json', '--period', 'lifetime'] },
   { channel: 'codeburn:setPriceOverride', args: ['unpriced/test-model', { input: 0.27, output: 1.1 }], argv: ['price-override', 'unpriced/test-model', '--input', '0.27', '--output', '1.1'] },
   { channel: 'codeburn:setPriceOverride', args: ['unpriced/test-model', { input: 0.27, output: 1.1, cacheRead: 0.03, cacheCreation: 0.42 }], argv: ['price-override', 'unpriced/test-model', '--input', '0.27', '--output', '1.1', '--cache-read', '0.03', '--cache-creation', '0.42'] },
   { channel: 'codeburn:removePriceOverride', args: ['unpriced/test-model'], argv: ['price-override', '--remove', 'unpriced/test-model'] },
@@ -242,6 +266,10 @@ describe('createBridgeHandlers (IPC input validation)', () => {
     { name: 'device name that looks like a flag', channel: 'codeburn:removeDevice', args: ['-rf'] },
     { name: 'relative export path', channel: 'codeburn:exportData', args: ['json', 'all', 'relative/out'] },
     { name: 'compare model that looks like a flag', channel: 'codeburn:getCompare', args: ['month', 'all', '-a', 'model-b'] },
+    { name: 'cohort model that looks like a flag', channel: 'codeburn:getCompareCohort', args: ['month', 'all', '-a', 'model-b'] },
+    { name: 'cohort project identity containing NUL', channel: 'codeburn:getCompareCohort', args: ['month', 'all', 'model-a', 'model-b', undefined, ['bad\0id']] },
+    { name: 'empty cohort project identity', channel: 'codeburn:getCompareCohort', args: ['month', 'all', 'model-a', 'model-b', undefined, ['']] },
+    { name: 'unknown cohort category', channel: 'codeburn:getCompareCohort', args: ['month', 'all', 'model-a', 'model-b', undefined, undefined, 'not-a-category'] },
     { name: 'price override model that looks like a flag', channel: 'codeburn:setPriceOverride', args: ['-x', { input: 1, output: 2 }] },
     { name: 'non-positive price override rate', channel: 'codeburn:setPriceOverride', args: ['my-model', { input: 0, output: 2 }] },
     { name: 'non-finite price override rate', channel: 'codeburn:setPriceOverride', args: ['my-model', { input: 1, output: Number.POSITIVE_INFINITY }] },
@@ -512,6 +540,7 @@ describe('createBridgeHandlers (cold-start warmup)', () => {
       ['codeburn:getCompareModels', ['today', 'all', true]],
       ['codeburn:getYield', ['today', 'all', undefined, true]],
       ['codeburn:getSpendFlow', ['today', 'all', undefined, true]],
+      ['codeburn:getBranchSpend', ['today', 'all', undefined, true]],
       ['codeburn:getOptimizeReport', ['today', 'all', undefined, true]],
     ]
 
@@ -781,5 +810,319 @@ describe('externalUrlToOpen', () => {
     expect(externalUrlToOpen('ms-settings:startupapps', 'darwin')).toBeNull()
     expect(externalUrlToOpen('ms-settings:privacy-webcam', 'win32')).toBeNull()
     expect(externalUrlToOpen('ms-settings:startupapps&more', 'win32')).toBeNull()
+  })
+})
+
+describe('project filter', () => {
+  const deps = (extra = {}) => ({ spawnCli: vi.fn(), spawnCliAction: vi.fn(), resolveCodeburnPath: () => null, getQuota: vi.fn(async () => []), ...extra })
+
+  // The suite runs with CODEBURN_APP_FILTER='' (vitest.config.ts): a real
+  // filter file must not reach any other assertion.
+  async function withFilterFile<T>(body: (filterPath: string) => T | Promise<T>): Promise<T> {
+    const dir = mkdtempSync(join(tmpdir(), 'codeburn-filter-'))
+    const previous = process.env.CODEBURN_APP_FILTER
+    process.env.CODEBURN_APP_FILTER = join(dir, 'app-filter.json')
+    try {
+      // Awaited, or the finally would undo it at the body's first await.
+      return await body(process.env.CODEBURN_APP_FILTER)
+    } finally {
+      if (previous === undefined) delete process.env.CODEBURN_APP_FILTER
+      else process.env.CODEBURN_APP_FILTER = previous
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  it('reads an empty filter when no file exists', async () => {
+    await withFilterFile(() => {
+      expect(readProjectFilter()).toEqual({ project: [], exclude: [] })
+    })
+  })
+
+  it('round-trips a saved filter and scopes every fetch by it', async () => {
+    await withFilterFile(async () => {
+      expect(writeProjectFilter({ project: ['my-company'], exclude: ['scratch'] }))
+        .toEqual({ project: ['my-company'], exclude: ['scratch'] })
+      expect(readProjectFilter()).toEqual({ project: ['my-company'], exclude: ['scratch'] })
+
+      const { spawnCli, spawnCliAction, calls } = fakeSpawn()
+      const handlers = createBridgeHandlers(deps({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
+      await handlers['codeburn:getSessions']!('week', 'all')
+      expect(calls[0]).toEqual(['sessions', '--format', 'json', '--period', 'week', '--project=my-company', '--exclude=scratch'])
+      await handlers['codeburn:getSessionsContributions']!('week', 'all')
+      expect(calls[1]).toEqual(['sessions', '--format', 'json', '--contributions', '--period', 'week', '--project=my-company', '--exclude=scratch'])
+      await handlers['codeburn:getBranchSpend']!('week', 'all')
+      expect(calls[2]).toEqual(['spend', '--format', 'branch-json', '--period', 'week', '--project=my-company', '--exclude=scratch'])
+      const rangeA = { from: '2026-07-01', to: '2026-07-07' }
+      const rangeB = { from: '2026-07-08', to: '2026-07-14' }
+      await handlers['codeburn:getPeriodCompare']!(rangeA, rangeB, 'all')
+      expect(calls[3]).toEqual(['compare-periods', '--format', 'json', '--from-a', '2026-07-01', '--to-a', '2026-07-07', '--from-b', '2026-07-08', '--to-b', '2026-07-14', '--project=my-company', '--exclude=scratch'])
+      // The drill-down too: a filtered-out project must not surface behind a
+      // contribution row either.
+      await handlers['codeburn:getPeriodCompareSessions']!(rangeA, rangeB, 'all', 'model', 'sonnet')
+      expect(calls[4]).toEqual(['compare-periods', '--format', 'sessions', '--from-a', '2026-07-01', '--to-a', '2026-07-07', '--from-b', '2026-07-08', '--to-b', '2026-07-14', '--project=my-company', '--exclude=scratch', '--dimension', 'model', '--key', 'sonnet'])
+      await handlers['codeburn:getCompareCohortModels']!('week', 'all')
+      expect(calls[5]).toEqual(['compare', '--format', 'cohort-json', '--period', 'week', '--project=my-company', '--exclude=scratch'])
+      // --project-id narrows WITHIN the saved filter; it never replaces it.
+      await handlers['codeburn:getCompareCohort']!('week', 'all', 'model-a', 'model-b', undefined, ['/Users/gone/alpha'])
+      expect(calls[6]).toEqual([
+        'compare', '--format', 'cohort-json', '--period', 'week', '--project=my-company', '--exclude=scratch',
+        '--model-a', 'model-a', '--model-b', 'model-b', '--project-id=/Users/gone/alpha',
+      ])
+    })
+  })
+
+  it('leaves the Projects pane fetch unfiltered so hidden projects stay listable', async () => {
+    await withFilterFile(async () => {
+      writeProjectFilter({ project: [], exclude: ['my-company'] })
+      const { spawnCli, spawnCliAction, calls } = fakeSpawn()
+      const handlers = createBridgeHandlers(deps({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
+      await handlers['codeburn:getUnfilteredProjects']!()
+      expect(calls[0]).toEqual(['report', '--format', 'json', '--period', 'lifetime'])
+    })
+  })
+
+  // A filter has no period: a pattern excluding a project that was last touched
+  // months ago is live on every screen. Asking for anything narrower than
+  // lifetime returns a list that pattern is missing from, and the pane reads
+  // that absence as "this exclude matches nothing".
+  it('asks for the whole history, never the period on screen', async () => {
+    await withFilterFile(async () => {
+      const { spawnCli, spawnCliAction, calls } = fakeSpawn()
+      const handlers = createBridgeHandlers(deps({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
+      await handlers['codeburn:getUnfilteredProjects']!('today')
+      expect(calls[0]).toEqual(['report', '--format', 'json', '--period', 'lifetime'])
+    })
+  })
+
+  it('serves the local filtered overview when combined is asked for with a filter set', async () => {
+    await withFilterFile(async () => {
+      writeProjectFilter({ project: [], exclude: ['my-company'] })
+      const { spawnCli, spawnCliAction, calls } = fakeSpawn()
+      const handlers = createBridgeHandlers(deps({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
+      await handlers['codeburn:getOverview']!('30days', 'all', undefined, undefined, undefined, 'combined')
+      // No --scope combined: the CLI rejects it next to --exclude.
+      expect(calls[0]).toEqual(['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--exclude=my-company'])
+    })
+  })
+
+  it('still emits combined scope once the filter is empty again', async () => {
+    await withFilterFile(async () => {
+      writeProjectFilter({ project: [], exclude: [] })
+      const { spawnCli, spawnCliAction, calls } = fakeSpawn()
+      const handlers = createBridgeHandlers(deps({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
+      await handlers['codeburn:getOverview']!('30days', 'all', undefined, undefined, undefined, 'combined')
+      expect(calls[0]).toEqual(['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--scope', 'combined'])
+    })
+  })
+
+  it('drops blanks and duplicates on write, but keeps encoded names starting with "-"', async () => {
+    await withFilterFile(() => {
+      expect(writeProjectFilter({ project: ['  my-company  ', 'my-company', '', '-Users-me-Web-my-company', 7], exclude: 7 }))
+        .toEqual({ project: ['my-company', '-Users-me-Web-my-company'], exclude: [] })
+    })
+  })
+
+  it('expands a leading ~ so the pane and the CLI resolve the same path', async () => {
+    await withFilterFile(filterPath => {
+      const home = homedir().replace(/\\/g, '/')
+      expect(writeProjectFilter({ project: ['~/work/app'], exclude: ['~'] }))
+        .toEqual({ project: [`${home}/work/app`], exclude: [home] })
+      // Also on the way out: the file can be hand-edited with a tilde the
+      // renderer has no way to resolve.
+      writeFileSync(filterPath, JSON.stringify({ exclude: ['~/work/other'] }))
+      expect(readProjectFilter()).toEqual({ project: [], exclude: [`${home}/work/other`] })
+    })
+  })
+
+  it('reads a hand-written bare string as one pattern instead of dropping it', async () => {
+    await withFilterFile(filterPath => {
+      writeFileSync(filterPath, JSON.stringify({ exclude: 'my-company' }))
+      expect(readProjectFilter()).toEqual({ project: [], exclude: ['my-company'] })
+    })
+  })
+
+  it('carries the filter into an export, which writes project names to a file', async () => {
+    await withFilterFile(async () => {
+      writeProjectFilter({ project: [], exclude: ['my-company'] })
+      const { spawnCli, spawnCliAction, calls } = fakeSpawn()
+      const handlers = createBridgeHandlers(deps({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
+      await handlers['codeburn:exportData']!('csv', 'all', '/tmp/out')
+      expect(calls[0]).toContain('--exclude=my-company')
+    })
+  })
+
+  it('passes a pattern starting with "-" as --opt=value so it cannot parse as a flag', async () => {
+    await withFilterFile(async () => {
+      writeProjectFilter({ project: [], exclude: ['-Users-me-Web-Github-notes-app'] })
+      const { spawnCli, spawnCliAction, calls } = fakeSpawn()
+      const handlers = createBridgeHandlers(deps({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
+      await handlers['codeburn:getSessions']!('week', 'all')
+      expect(calls[0]).toEqual(['sessions', '--format', 'json', '--period', 'week', '--exclude=-Users-me-Web-Github-notes-app'])
+    })
+  })
+
+  it('keeps the last known filter when the file is malformed rather than unhiding', async () => {
+    await withFilterFile(filterPath => {
+      writeProjectFilter({ project: [], exclude: ['my-company'] })
+      expect(readProjectFilter()).toEqual({ project: [], exclude: ['my-company'] })
+      writeFileSync(filterPath, '{ not json')
+      expect(readProjectFilter()).toEqual({ project: [], exclude: ['my-company'] })
+    })
+  })
+
+  it('shows everything again once the file is gone', async () => {
+    await withFilterFile(filterPath => {
+      writeProjectFilter({ project: [], exclude: ['my-company'] })
+      expect(readProjectFilter()).toEqual({ project: [], exclude: ['my-company'] })
+      rmSync(filterPath)
+      expect(readProjectFilter()).toEqual({ project: [], exclude: [] })
+    })
+  })
+
+  it('picks up an edit made outside the app', async () => {
+    await withFilterFile(filterPath => {
+      writeProjectFilter({ project: ['my-company'], exclude: [] })
+      expect(readProjectFilter()).toEqual({ project: ['my-company'], exclude: [] })
+      // No utimes bump: same millisecond, so only size and inode catch it.
+      writeFileSync(filterPath, JSON.stringify({ project: ['side-project'], exclude: [] }))
+      expect(readProjectFilter()).toEqual({ project: ['side-project'], exclude: [] })
+    })
+  })
+
+  // The cache is per-process and empty on the FIRST read of a launch, which is
+  // exactly when an unreadable file must not be flattened into "no filter".
+  // A directory where the file belongs makes statSync succeed and readFileSync
+  // fail, the same shape as a half-written file with nothing cached yet.
+  it('refuses to report an empty filter when the file cannot be read', async () => {
+    await withFilterFile(filterPath => {
+      mkdirSync(filterPath)
+      expect(() => readProjectFilter()).toThrow(/Could not read the project filter/)
+    })
+  })
+
+  // statSync rejects EACCES and EIO exactly the way it rejects ENOENT, so only
+  // the errno separates "there is no filter" from "the filter did not load".
+  it('refuses to report an empty filter when the path cannot be stat-ed', async () => {
+    await withFilterFile(filterPath => {
+      writeFileSync(filterPath, JSON.stringify({ exclude: ['my-company'] }))
+      const previous = process.env.CODEBURN_APP_FILTER
+      // The parent is a file, so this stats ENOTDIR rather than ENOENT.
+      process.env.CODEBURN_APP_FILTER = join(filterPath, 'app-filter.json')
+      try {
+        expect(() => readProjectFilter()).toThrow(/Could not read the project filter/)
+      } finally {
+        process.env.CODEBURN_APP_FILTER = previous
+      }
+    })
+  })
+
+  it('fails a fetch closed rather than spawning it unfiltered', async () => {
+    await withFilterFile(async filterPath => {
+      mkdirSync(filterPath)
+      const { spawnCli, spawnCliAction, calls } = fakeSpawn()
+      const handlers = createBridgeHandlers(deps({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
+      const res = await handlers['codeburn:getSessions']!('week', 'all')
+      expect(calls).toEqual([])
+      expect(res).toMatchObject({ ok: false, error: { kind: 'nonzero' } })
+    })
+  })
+
+  // The renderer drops to local scope from what this channel reports. An empty
+  // filter here would re-offer Combined, whose total is unfilterable by design.
+  it('reports the read failure to the pane instead of an empty filter', async () => {
+    await withFilterFile(async filterPath => {
+      mkdirSync(filterPath)
+      const handlers = createBridgeHandlers(deps({ spawnCli: vi.fn(), spawnCliAction: vi.fn(), resolveCodeburnPath: () => '/bin/codeburn' }))
+      expect(await handlers['codeburn:getProjectFilter']!()).toMatchObject({ ok: false, error: { kind: 'nonzero' } })
+    })
+  })
+
+  it('never falls back to a combined overview when the filter cannot be read', async () => {
+    await withFilterFile(async filterPath => {
+      mkdirSync(filterPath)
+      const { spawnCli, spawnCliAction, calls } = fakeSpawn()
+      const handlers = createBridgeHandlers(deps({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
+      const res = await handlers['codeburn:getOverview']!('30days', 'all', undefined, undefined, undefined, 'combined')
+      expect(calls).toEqual([])
+      expect(res).toMatchObject({ ok: false })
+    })
+  })
+
+  /** Records every path writeFileSync is aimed at, and still performs the write. */
+  function recordWrites(): { targets: string[]; restore: () => void } {
+    const targets: string[] = []
+    const real = fs.writeFileSync
+    const spy = vi.spyOn(fs, 'writeFileSync').mockImplementation(((target, data, options) => {
+      targets.push(String(target))
+      return real(target, data, options)
+    }) as typeof fs.writeFileSync)
+    return { targets, restore: () => spy.mockRestore() }
+  }
+
+  // A write straight over the live path can be interrupted, and a truncated
+  // filter is an unreadable one. Same staging rule as saveConfig in src/config.ts.
+  it('stages the write and renames it into place, never writing the live path', async () => {
+    await withFilterFile(filterPath => {
+      const { targets, restore } = recordWrites()
+      try {
+        writeProjectFilter({ project: [], exclude: ['my-company'] })
+      } finally {
+        restore()
+      }
+      expect(targets).toHaveLength(1)
+      expect(targets[0]).not.toBe(filterPath)
+      expect(readdirSync(dirname(filterPath))).toEqual(['app-filter.json'])
+      expect(readProjectFilter()).toEqual({ project: [], exclude: ['my-company'] })
+    })
+  })
+
+  // A staged file that outlived a failed rename is the half-written JSON the
+  // staging exists to prevent, sitting one directory entry away from the real one.
+  it('cleans up the staged file when the rename cannot land', async () => {
+    await withFilterFile(filterPath => {
+      mkdirSync(filterPath)
+      writeFileSync(join(filterPath, 'occupied'), '')
+      const { targets, restore } = recordWrites()
+      try {
+        expect(() => writeProjectFilter({ project: [], exclude: ['my-company'] })).toThrow()
+      } finally {
+        restore()
+      }
+      expect(targets).toHaveLength(1)
+      expect(existsSync(targets[0]!)).toBe(false)
+    })
+  })
+
+  // `codeburn export` prints prose and exits 0 when every period is empty, which
+  // an exclude list covering every project now makes reachable from a click.
+  it('reports an export that wrote nothing as a failure', async () => {
+    await withFilterFile(async () => {
+      writeProjectFilter({ project: [], exclude: ['my-company'] })
+      const spawnCliAction = vi.fn(async () => ({ ok: true, stdout: '\n  No usage data found.\n', stderr: '', code: 0 }))
+      const handlers = createBridgeHandlers(deps({ spawnCli: vi.fn(), spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
+      const res = await handlers['codeburn:exportData']!('csv', 'all', '/tmp/out')
+      expect(res).toMatchObject({ ok: true, value: { ok: false, stderr: expect.stringMatching(/Nothing to export/) } })
+    })
+  })
+
+  it('keeps an export that named a saved path successful', async () => {
+    await withFilterFile(async () => {
+      const spawnCliAction = vi.fn(async () => ({ ok: true, stdout: '\n  Exported (Today + 7 Days + 30 Days) to: /tmp/out\n', stderr: '', code: 0 }))
+      const handlers = createBridgeHandlers(deps({ spawnCli: vi.fn(), spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
+      const res = await handlers['codeburn:exportData']!('csv', 'all', '/tmp/out')
+      expect(res).toMatchObject({ ok: true, value: { ok: true } })
+    })
+  })
+
+  it('persists nothing while the filter is disabled by env', () => {
+    const previous = process.env.CODEBURN_APP_FILTER
+    process.env.CODEBURN_APP_FILTER = ''
+    try {
+      expect(writeProjectFilter({ project: ['my-company'], exclude: [] })).toEqual({ project: [], exclude: [] })
+      expect(readProjectFilter()).toEqual({ project: [], exclude: [] })
+    } finally {
+      if (previous === undefined) delete process.env.CODEBURN_APP_FILTER
+      else process.env.CODEBURN_APP_FILTER = previous
+    }
   })
 })

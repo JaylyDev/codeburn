@@ -32,12 +32,12 @@
     <td align="center" width="50%">
       <strong>Desktop</strong><br/>
       <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/desktop.jpg" alt="CodeBurn Desktop" /><br/>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.23/CodeBurn-0.9.23-arm64.dmg"><img src="https://img.shields.io/badge/macOS-Apple_Silicon-F97316?logo=apple&logoColor=white" alt="Download for macOS (Apple Silicon)" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.23/CodeBurn-0.9.23.dmg"><img src="https://img.shields.io/badge/macOS-Intel-F97316?logo=apple&logoColor=white" alt="Download for macOS (Intel)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.24/CodeBurn-0.9.24-arm64.dmg"><img src="https://img.shields.io/badge/macOS-Apple_Silicon-F97316?logo=apple&logoColor=white" alt="Download for macOS (Apple Silicon)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.24/CodeBurn-0.9.24.dmg"><img src="https://img.shields.io/badge/macOS-Intel-F97316?logo=apple&logoColor=white" alt="Download for macOS (Intel)" /></a>
       <a href="https://apps.microsoft.com/detail/9P0R4ZL5XMB8"><img src="https://img.shields.io/badge/Windows-Microsoft_Store-F97316?logo=microsoft&logoColor=white" alt="Get CodeBurn from the Microsoft Store" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.23/codeburn-desktop_0.9.23_amd64.deb"><img src="https://img.shields.io/badge/Linux-.deb-F97316?logo=debian&logoColor=white" alt="Download for Linux (.deb)" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.23/codeburn-desktop-0.9.23.x86_64.rpm"><img src="https://img.shields.io/badge/Linux-.rpm-F97316?logo=redhat&logoColor=white" alt="Download for Linux (.rpm)" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.23/CodeBurn-0.9.23.AppImage"><img src="https://img.shields.io/badge/Linux-AppImage-F97316?logo=linux&logoColor=white" alt="Download for Linux (AppImage)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.24/codeburn-desktop_0.9.24_amd64.deb"><img src="https://img.shields.io/badge/Linux-.deb-F97316?logo=debian&logoColor=white" alt="Download for Linux (.deb)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.24/codeburn-desktop-0.9.24.x86_64.rpm"><img src="https://img.shields.io/badge/Linux-.rpm-F97316?logo=redhat&logoColor=white" alt="Download for Linux (.rpm)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.24/CodeBurn-0.9.24.AppImage"><img src="https://img.shields.io/badge/Linux-AppImage-F97316?logo=linux&logoColor=white" alt="Download for Linux (AppImage)" /></a>
     </td>
     <td align="center" width="50%">
       <strong>Web</strong><br/>
@@ -56,13 +56,13 @@
       <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/menubar-app.jpg" alt="CodeBurn macOS menubar" /><br/>
       <code>codeburn menubar</code><br/>
       <a href="https://apps.microsoft.com/detail/9P0R4ZL5XMB8"><img src="https://img.shields.io/badge/Windows-Microsoft_Store-F97316?logo=microsoft&logoColor=white" alt="Get CodeBurn from the Microsoft Store" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.23"><img src="https://img.shields.io/badge/Windows-Tray_app_.msi_(preview)-F97316?logo=windows&logoColor=white" alt="Download the CodeBurn Windows tray app developer preview (.msi)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.24"><img src="https://img.shields.io/badge/Windows-Tray_app_.msi_(preview)-F97316?logo=windows&logoColor=white" alt="Download the CodeBurn Windows tray app developer preview (.msi)" /></a>
     </td>
   </tr>
   <tr>
     <td align="center" colspan="2">
-      <strong>Capacity Dock</strong> <em>&middot; native macOS menubar</em><br/>
-      <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/capacity-dock.jpg" alt="CodeBurn Capacity Dock showing live provider usage rings on the screen edge" width="66%" /><br/>
+      <strong>Capacity Dock</strong> <em>&middot; macOS menubar and Windows tray</em><br/>
+      <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/capacity-dock.jpg?v=0.9.24-2" alt="CodeBurn Capacity Dock showing live provider usage rings on the screen edge" width="66%" /><br/>
       <code>codeburn menubar</code>
     </td>
   </tr>
@@ -79,6 +79,7 @@ CodeBurn does. It reads the session files your tools already write to disk and b
 Everything runs locally. No wrapper, no proxy, no API keys, nothing leaves your machine. Pricing comes from [LiteLLM](https://github.com/BerriAI/litellm), refreshed daily. The optional desktop app can send an anonymous, bucketed usage report if you say yes to it; see [Telemetry](#telemetry).
 
 <p align="center">
+  <a href="https://codeburn.app">Website</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#find-and-fix-waste">Find waste</a> ·
   <a href="#apply-fixes-undo-anytime">Apply fixes</a> ·
@@ -332,6 +333,15 @@ defaults write org.agentseal.codeburn-menubar CodeBurnMenubarCompact -bool true
 
 Relaunch the app to apply. To revert: `defaults delete org.agentseal.codeburn-menubar CodeBurnMenubarCompact`.
 
+**Second row** adds an optional smaller line under the menubar figure. Turn it on in Settings → General → Display and pick what it shows: quota remaining with its reset countdown (for whichever connected provider is nearest its limit), today's cost, today's tokens, or running sessions. It is off by default, and the line hides itself while the chosen metric has no data, so the item falls back to its single-row figure. From Terminal:
+
+```bash
+defaults write org.agentseal.codeburn-menubar CodeBurnMenubarSecondRowEnabled -bool true
+defaults write org.agentseal.codeburn-menubar CodeBurnMenubarSecondRowMetric -string todayCost
+```
+
+Allowed metric values are `quotaRemaining`, `todayCost`, `todayTokens`, and `activeSessions`. Relaunch the app to apply external defaults changes.
+
 **Refresh cadence** is set in Settings under Usage Refresh. Auto (the default) refreshes every 30 seconds on AC power and backs off on battery, in Low Power Mode, and while the display sleeps; fixed 1, 5, or 15 minute cadences and a Manual mode (refresh only when you open the popover or click Refresh Now) are also available. From Terminal:
 
 ```bash
@@ -358,9 +368,11 @@ Windows gets the same ambient view from the system tray, from the same one comma
 codeburn menubar
 ```
 
-It downloads the `.msi` for your CLI version, verifies its sha256, runs it through `msiexec /passive`, and launches the tray app. Re-run with `--force` to reinstall; an already-installed matching version is just launched. You can also download the `.msi` yourself from the [latest Windows Menubar release](https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.23).
+It downloads the `.msi` for your CLI version, verifies its sha256, runs it through `msiexec /passive`, and launches the tray app. Re-run with `--force` to reinstall; an already-installed matching version is just launched. You can also download the `.msi` yourself from the [latest Windows Menubar release](https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.24).
 
 Today's spend sits in the tray as a number beside the flame icon (turn it off in Settings, and the tooltip always carries it). Click for the same popover the macOS app shows: agent tabs, period switcher, Trend, Forecast, Pulse, Stats and Plan insights, activity and model breakdowns, optimize findings, and CSV/JSON export. Settings covers launch at login, the tray number, theme, and currency. It refreshes every 60 seconds while the popover is open and every 2 minutes while it is closed.
+
+Turn on **Show Capacity Dock** in the tray menu for the same edge-docked quota rail the macOS menubar has: one ring per connected provider, hover for every quota window with its reset time, drag it to any screen edge. It is off by default and needs codeburn 0.9.24 or newer for `codeburn quota`.
 
 The tray app reads everything through the CLI, so install that first (`npm install -g codeburn`). It needs **codeburn 0.9.9 or newer**, and shows a setup screen with the install command until it finds one. Source and build instructions are in [`windows/`](windows/) ([windows/DEVELOPMENT.md](windows/DEVELOPMENT.md)).
 
@@ -377,16 +389,6 @@ gnome-extensions enable codeburn@codeburn.dev
 ```
 
 See [gnome/README.md](gnome/README.md) for settings and development notes. The Tauri tray app in `windows/` also builds and runs on Linux, but it is experimental and unreleased there — the GNOME extension is the supported Linux surface.
-
-### Omarchy
-
-Install the [CodeBurn Omarchy plugin](https://omarchyplugins.com/plugin.html?id=codeburn) to add CodeBurn to Omarchy:
-
-Community-maintained by [@erzz](https://github.com/erzz) — issues and feature requests go to [erzz/omarchy-codeburn](https://github.com/erzz/omarchy-codeburn).
-
-```bash
-omarchy plugin add https://github.com/erzz/omarchy-codeburn.git --enable
-```
 
 ## CodeBurn in your agent (MCP)
 
@@ -557,7 +559,7 @@ Left/right arrow keys switch between Today, 7 Days, 30 Days, Month, 6 Months, an
 
 ### Pricing
 
-Prices every API call using input, output, cache read, cache write, and web search token counts, with a fast mode multiplier for Claude. Prices are fetched from [LiteLLM](https://github.com/BerriAI/litellm) and cached locally for 24 hours at `~/.cache/codeburn/`. Hardcoded fallbacks for all Claude and GPT-5 models prevent fuzzy-matching mispricing. Routing-gateway model ids are priced as the model they wrap: [OrcaRouter](https://www.orcarouter.ai) fusion route ids peel to their current upstream (`openai/gpt-oss-120b`), `orcarouter/auto` stays unpriced until a live probe pins the rotating target, and a nested upstream spelling (`orcarouter/deepseek/deepseek-v4-pro`) prices at that exact row, so a gateway-routed session reports real spend instead of $0.
+Prices every API call using input, output, cache read, cache write, and web search token counts, with a fast mode multiplier for Claude. Prices are fetched from [LiteLLM](https://github.com/BerriAI/litellm) and cached locally for 24 hours at `~/.cache/codeburn/`. Hardcoded fallbacks for all Claude and GPT-5 models prevent fuzzy-matching mispricing. Routing-gateway model ids are priced as the model they wrap: [OrcaRouter](https://www.orcarouter.ai) fusion route ids peel to their current upstream (`openai/gpt-oss-120b`), `orcarouter/auto` stays unpriced until a live probe pins the rotating target, and a nested upstream spelling (`orcarouter/deepseek/deepseek-v4-pro`) prices at that exact row, so a gateway-routed session reports real spend instead of $0. Codex sessions routed through [codex-cliproxy-gateway](https://github.com/aceHubert/codex-cliproxy-gateway) record `cliproxy/<model>` ids — including CLIProxyAPI provider paths like `cliproxy/zcode/glm-5.3-flash` — and the wrapper and the known provider segment peel the same way.
 
 ### Task Categories
 
@@ -651,7 +653,7 @@ codeburn month --project api --project web       # include multiple projects
 codeburn export --project inventory              # export only "inventory" project data
 ```
 
-Filter by provider, project name (case-insensitive substring), or exact date range. The `--project` and `--exclude` flags work on all commands and can be combined with `--provider`.
+Filter by provider, project, or exact date range. The `--project` and `--exclude` flags work on every reporting command and can be combined with `--provider`. A plain word matches a project's name or path as a case-insensitive substring, so `--project my-company` also covers `my-company-kit` and its worktrees. An absolute path selects that one project and anything inside it, so `--exclude /Users/me/work/my-company` leaves the sibling `/Users/me/work/my-company-kit` alone. A leading `~` is expanded against your home directory, so a quoted `'~/work/my-company'` selects the same project as the path the shell would have expanded. An absolute POSIX path is case-sensitive, the same rule that decides project identity everywhere else (`/Users/me/Vault` and `/Users/me/vault` are two projects); a Windows drive or UNC path folds case. An absolute path that matches no project in the period you asked for is reported on stderr, since it would otherwise leave a total that looks right.
 
 ```bash
 codeburn report --from 2026-04-01 --to 2026-04-10   # explicit window
@@ -884,14 +886,13 @@ Sponsoring as a team or company? Your logo lands right here, in front of every d
 
 ## Star History
 
-<p align="center">
-<!-- star-history:start -->
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/star-history/star-history-dark.svg">
-  <img alt="Star history" src="assets/star-history/star-history-light.svg">
-</picture>
-<!-- star-history:end -->
-</p>
+<a href="https://www.star-history.com/?repos=getagentseal%2Fcodeburn&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=getagentseal/codeburn&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=getagentseal/codeburn&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=getagentseal/codeburn&type=date&legend=top-left" />
+ </picture>
+</a>
 
 ## License
 
@@ -907,4 +908,4 @@ Built by [AgentSeal](https://agentseal.org).
 
 ## Acknowledgements
 
-The macOS Capacity Dock's provider-usage tracking was informed by [CodexBar](https://github.com/steipete/CodexBar) by Peter Steinberger ([@steipete](https://github.com/steipete)) — an MIT-licensed menubar app for AI provider usage. Thanks.
+The Capacity Dock's provider-usage tracking was informed by [CodexBar](https://github.com/steipete/CodexBar) by Peter Steinberger ([@steipete](https://github.com/steipete)) — an MIT-licensed menubar app for AI provider usage. Thanks.

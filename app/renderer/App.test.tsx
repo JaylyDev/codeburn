@@ -7,7 +7,8 @@ import { sanitizeProps } from '../electron/telemetry'
 import { __resetPolledMemo, hasPolledMemo, primePolledMemo } from './hooks/usePolled'
 import { setActiveCurrency } from './lib/format'
 import { readOverviewHeadline, writeOverviewHeadline } from './lib/overviewSnapshot'
-import type { DateRange, MenubarPayload, ModelReportRow, OptimizeJsonReport, SpendFlow } from './lib/types'
+import type { BranchSpendReport, DateRange, MenubarPayload, ModelReportRow, OptimizeJsonReport, SessionRow, SpendFlow } from './lib/types'
+import { INITIAL_VISIBLE } from './sections/Sessions'
 
 const stored = new Map<string, string>()
 vi.stubGlobal('localStorage', {
@@ -22,6 +23,7 @@ vi.stubGlobal('localStorage', {
 const mocks = vi.hoisted(() => ({
   getOverview: vi.fn<(period: string, provider: string, range?: DateRange, configSource?: string | null, background?: boolean, scope?: string) => Promise<MenubarPayload>>(),
   getSpendFlow: vi.fn<(period: string, provider: string, range?: DateRange, background?: boolean) => Promise<SpendFlow>>(),
+  getBranchSpend: vi.fn<(period: string, provider: string, range?: DateRange, background?: boolean) => Promise<BranchSpendReport>>(),
   getTimeline: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<MenubarPayload>>(),
   getOptimizeReport: vi.fn<(period: string, provider: string, range?: DateRange, background?: boolean) => Promise<OptimizeJsonReport>>(),
   getModels: vi.fn(),
@@ -37,6 +39,7 @@ const mocks = vi.hoisted(() => ({
   getIdentity: vi.fn(),
   cliStatus: vi.fn(),
   getPriceOverrides: vi.fn(),
+  getProjectFilter: vi.fn<() => Promise<{ project: string[]; exclude: string[] }>>(),
   getAliases: vi.fn(),
   setCurrency: vi.fn(),
   resetCurrency: vi.fn(),
@@ -137,6 +140,11 @@ function installDefaultMocks() {
   mocks.getOverview.mockResolvedValue(overviewPayload())
   mocks.getTimeline.mockResolvedValue(overviewPayload())
   mocks.getSpendFlow.mockResolvedValue({ period: { label: 'Last 30 days', start: '', end: '' }, models: [], projects: [], links: [] })
+  mocks.getBranchSpend.mockResolvedValue({
+    period: { label: '', start: '', end: '' },
+    projects: [],
+    totals: { branchKnownCost: 0, branchUnknownCost: 0, noBranchDataCost: 0, noBranchDataSessions: 0, noBranchDataProviders: [], distinctSessions: 0 },
+  })
   mocks.getOptimizeReport.mockResolvedValue({
     period: { label: 'Last 30 days', start: null, end: null },
     summary: {
@@ -152,6 +160,7 @@ function installDefaultMocks() {
     findings: [],
   })
   mocks.getModels.mockResolvedValue([])
+  mocks.getProjectFilter.mockResolvedValue({ project: [], exclude: [] })
   mocks.getSessions.mockResolvedValue([])
   mocks.getCompareModels.mockResolvedValue([])
   mocks.getQuota.mockResolvedValue([
@@ -231,9 +240,8 @@ describe('App shortcuts', () => {
 
     expect(await screen.findByLabelText('Cached usage summary')).toBeInTheDocument()
     expect(screen.getAllByText('$12.34').length).toBeGreaterThan(0)
-    expect(screen.getByText(/sessions updating/)).toBeInTheDocument()
+    expect(screen.getByText('12 calls · sessions updating')).toBeInTheDocument()
     expect(screen.getByText('Updating detailed drill-downs…')).toBeInTheDocument()
-    expect(screen.getByText('Refreshing selected view…')).toBeInTheDocument()
     expect(mocks.getActReport).not.toHaveBeenCalled()
   })
 
@@ -394,7 +402,7 @@ describe('App shortcuts', () => {
     render(<App />)
 
     expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
-    expect(screen.getByText(`${mod}1-8`)).toBeInTheDocument()
+    expect(screen.getByText(`${mod}1-8,9`)).toBeInTheDocument()
     expect(screen.getAllByText(`${mod},`).length).toBeGreaterThan(0)
     expect(screen.getByText(`${mod}R`)).toBeInTheDocument()
     expect(screen.queryByText('Command')).not.toBeInTheDocument()
@@ -478,6 +486,59 @@ describe('App shortcuts', () => {
     localStorage.setItem('codeburn.scope', 'combined')
     render(<App />)
     await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'all', undefined, undefined, undefined, 'combined'))
+  })
+
+  it('never boots a filtered session into combined scope, and collapses the stored setting', async () => {
+    localStorage.setItem('codeburn.scope', 'combined')
+    localStorage.setItem('codeburn.projectFiltered', '1')
+    mocks.getProjectFilter.mockResolvedValue({ project: [], exclude: ['my-company'] })
+    render(<App />)
+    // Local from the first poll: a combined total would carry the hidden project.
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'all'))
+    expect(mocks.getOverview).not.toHaveBeenCalledWith('30days', 'all', undefined, undefined, undefined, 'combined')
+    await waitFor(() => expect(localStorage.getItem('codeburn.scope')).toBe('local'))
+  })
+
+  // app-filter.json is read by the main process on every fetch, so a hand edit
+  // lands there at once. A renderer that only re-read on its own saves kept
+  // Combined on screen over argv that had already dropped `--scope combined`.
+  it('collapses combined scope when the filter appears outside the app', async () => {
+    localStorage.setItem('codeburn.scope', 'combined')
+    localStorage.setItem('codeburn.projectFiltered', '0')
+    mocks.getProjectFilter.mockResolvedValueOnce({ project: [], exclude: [] })
+    mocks.getProjectFilter.mockResolvedValue({ project: [], exclude: ['my-company'] })
+    mocks.getOverview.mockResolvedValue(overviewPayload())
+    render(<App />)
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'all', undefined, undefined, undefined, 'combined'))
+    await waitFor(() => expect(localStorage.getItem('codeburn.scope')).toBe('local'))
+    await waitFor(() => expect(localStorage.getItem('codeburn.projectFiltered')).toBe('1'))
+  })
+
+  // reportMemoKey carries no filter component, so an entry memoised under the
+  // other scope repaints until the next fetch lands. Clear on the change only:
+  // clearing on every poll would throw away the instant-switch memo wholesale.
+  it('clears the instant-switch memo once when the filter changes outside the app', async () => {
+    localStorage.setItem('codeburn.projectFiltered', '0')
+    mocks.getProjectFilter.mockResolvedValue({ project: [], exclude: ['my-company'] })
+    mocks.getOverview.mockResolvedValue(overviewPayload())
+    primePolledMemo('sentinel-filter-key', { stale: true })
+
+    render(<App />)
+
+    await waitFor(() => expect(localStorage.getItem('codeburn.projectFiltered')).toBe('1'))
+    await waitFor(() => expect(hasPolledMemo('sentinel-filter-key')).toBe(false))
+
+    // The filter now matches what is persisted: further polls must leave it alone.
+    primePolledMemo('sentinel-filter-key', { stale: true })
+    const calls = mocks.getOverview.mock.calls.length
+    fireEvent.keyDown(document, { key: 'r', metaKey: true })
+    await waitFor(() => expect(mocks.getOverview.mock.calls.length).toBeGreaterThan(calls))
+    expect(hasPolledMemo('sentinel-filter-key')).toBe(true)
+  })
+
+  it('records the filter for the next boot when the pane is empty', async () => {
+    render(<App />)
+    await waitFor(() => expect(localStorage.getItem('codeburn.projectFiltered')).toBe('0'))
   })
 
   it('builds the provider picker from providerDetails so display-name providers round-trip their internal id', async () => {
@@ -1287,5 +1348,101 @@ describe('usage_snapshot telemetry props', () => {
       { name: 'coding', oneShotRate: 0.61 },
       { name: 'debugging', oneShotRate: -1 },
     ])
+  })
+})
+
+describe('sessions pagination', () => {
+  beforeEach(() => {
+    installDefaultMocks()
+    localStorage.clear()
+    localStorage.setItem('codeburn.defaultPeriod', '30days')
+    setPlatform('darwin')
+  })
+
+  afterEach(() => {
+    clearPlatform()
+    vi.useRealTimers()
+  })
+
+  function sessionRows(count: number): SessionRow[] {
+    return Array.from({ length: count }, (_, index) => ({
+      sessionId: `session-${index}`,
+      project: `project-${index}`,
+      provider: 'claude',
+      models: ['Opus 4.8'],
+      cost: count - index,
+      savingsUSD: 0,
+      calls: 1,
+      turns: 1,
+      inputTokens: 1_000,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      startedAt: '2026-09-10T10:00:00.000Z',
+      endedAt: '2026-09-10T10:01:00.000Z',
+      durationMs: 60_000,
+    }))
+  }
+
+  // 30s timeout: the list renders 120+ rows three times inside a full App
+  // render, and the suite runs its files in parallel.
+  it('returns a revealed sessions list to the first page when the sort changes', { timeout: 30_000 }, async () => {
+    mocks.getSessions.mockResolvedValue(sessionRows(INITIAL_VISIBLE + 5))
+    render(<App />)
+    expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
+
+    fireEvent.keyDown(document, { key: '2', metaKey: true })
+    expect(await screen.findByText(`Showing ${INITIAL_VISIBLE} of ${INITIAL_VISIBLE + 5}`)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show 5 more · 5 remaining' }))
+    expect(await screen.findByText(`Showing ${INITIAL_VISIBLE + 5} of ${INITIAL_VISIBLE + 5}`)).toBeInTheDocument()
+
+    // A new sort is a new ordering of the whole list: it starts at the first
+    // page again instead of holding the depth reached under the old one.
+    const toolbar = document.querySelector('.sessions-toolbar') as HTMLElement
+    fireEvent.click(within(toolbar).getByRole('tab', { name: 'Recent' }))
+    expect(await screen.findByText(`Showing ${INITIAL_VISIBLE} of ${INITIAL_VISIBLE + 5}`)).toBeInTheDocument()
+  })
+})
+
+describe('refresh indicators', () => {
+  beforeEach(() => {
+    installDefaultMocks()
+    localStorage.clear()
+    localStorage.setItem('codeburn.defaultPeriod', '30days')
+    setPlatform('darwin')
+    __resetPolledMemo()
+  })
+
+  afterEach(() => {
+    clearPlatform()
+  })
+
+  it('lights the top hairline only while a fetch is in flight, and always reserves its 2px', async () => {
+    let settle: (payload: MenubarPayload) => void = () => {}
+    mocks.getOverview.mockReturnValue(new Promise<MenubarPayload>(resolve => { settle = resolve }))
+
+    const { container } = render(<App />)
+
+    await waitFor(() => expect(container.querySelector('.switch-line.on')).not.toBeNull())
+
+    await act(async () => { settle(overviewPayload()); await Promise.resolve() })
+
+    await waitFor(() => expect(container.querySelector('.switch-line.on')).toBeNull())
+    expect(container.querySelector('.switch-line')).not.toBeNull()
+  })
+
+  it('spins the footer refresh mark only while a fetch is in flight', async () => {
+    let settle: (payload: MenubarPayload) => void = () => {}
+    mocks.getOverview.mockReturnValue(new Promise<MenubarPayload>(resolve => { settle = resolve }))
+
+    const { container } = render(<App />)
+
+    await waitFor(() => expect(container.querySelector('.refresh-mark.spinning')).not.toBeNull())
+
+    await act(async () => { settle(overviewPayload()); await Promise.resolve() })
+
+    await waitFor(() => expect(container.querySelector('.refresh-mark.spinning')).toBeNull())
+    expect(container.querySelector('.refresh-mark')).not.toBeNull()
   })
 })

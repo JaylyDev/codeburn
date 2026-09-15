@@ -278,10 +278,13 @@ enum GrokBuildSubscriptionService {
                   let cap = config.monthlyLimit?.val,
                   used.isFinite, cap.isFinite, used >= 0, cap > 0 {
             rawPercent = used / cap * 100
-        } else if isActiveBillingPeriod(config.currentPeriod, now: now) {
+        } else if config.isUnifiedBillingUser == true,
+                  isActiveBillingPeriod(config.currentPeriod, now: now) {
             // Grok's web client and proto3 both treat an omitted
             // creditUsagePercent as 0 during an active window. After a weekly
             // reset the field is simply absent — that is 0% used, not unknown.
+            // Only unified-billing accounts carry that contract; for anyone
+            // else an omitted field stays unknown rather than a fabricated 0%.
             rawPercent = 0
         } else {
             rawPercent = nil

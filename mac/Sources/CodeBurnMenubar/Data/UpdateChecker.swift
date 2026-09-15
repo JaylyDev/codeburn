@@ -6,6 +6,7 @@ private let checkIntervalSeconds: TimeInterval = 2 * 24 * 60 * 60
 private let lastCheckKey = "UpdateChecker.lastCheckDate"
 private let cachedVersionKey = "UpdateChecker.latestVersion"
 private let cachedCliVersionKey = "UpdateChecker.latestCliVersion"
+private let lastNotifiedVersionsKey = "UpdateChecker.lastNotifiedVersions"
 private let updateTimeoutSeconds: UInt64 = 120
 private let maxUpdateStderrBytes = 64 * 1024
 // The installer that scans `mac-v*` releases for the menubar zip (instead of
@@ -21,24 +22,24 @@ enum UpdateFailureStage: Equatable {
 
     var badgeLabel: String {
         switch self {
-        case .check: "Update Check Failed"
-        case .cliUpdate: "CLI Update Failed"
-        case .menubarUpdate: "Menubar Update Failed"
+        case .check: L("Update Check Failed")
+        case .cliUpdate: L("CLI Update Failed")
+        case .menubarUpdate: L("Menubar Update Failed")
         }
     }
 
     var summary: String {
         switch self {
-        case .check: "CodeBurn could not check GitHub for updates."
-        case .cliUpdate: "CodeBurn could not update the CLI."
-        case .menubarUpdate: "CodeBurn could not update the menubar app."
+        case .check: L("CodeBurn could not check GitHub for updates.")
+        case .cliUpdate: L("CodeBurn could not update the CLI.")
+        case .menubarUpdate: L("CodeBurn could not update the menubar app.")
         }
     }
 
     var retryHelp: String {
         switch self {
-        case .check: "Click to retry the update check."
-        case .cliUpdate, .menubarUpdate: "Click to retry the update."
+        case .check: L("Click to retry the update check.")
+        case .cliUpdate, .menubarUpdate: L("Click to retry the update.")
         }
     }
 }
@@ -62,6 +63,15 @@ private final class LockedDataBuffer: @unchecked Sendable {
 @MainActor
 @Observable
 final class UpdateChecker {
+    @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private let makeNotifier: () -> any UpdateNotifier
+    @ObservationIgnored private var notifier: (any UpdateNotifier)?
+
+    init(defaults: UserDefaults = .standard, makeNotifier: @escaping () -> any UpdateNotifier = { SystemUpdateNotifier() }) {
+        self.defaults = defaults
+        self.makeNotifier = makeNotifier
+    }
+
     var latestVersion: String?
     var latestCliVersion: String?
     var installedCliVersion: String?
@@ -70,13 +80,13 @@ final class UpdateChecker {
     var updateFailureStage: UpdateFailureStage?
 
     var updateBadgeLabel: String {
-        if isUpdating { return "Updating..." }
-        return updateFailureStage?.badgeLabel ?? "Update"
+        if isUpdating { return L("Updating...") }
+        return updateFailureStage?.badgeLabel ?? L("Update")
     }
 
     var updateHelpText: String {
         guard let error = updateError, let stage = updateFailureStage else {
-            return "Update the CLI and menubar to the latest release"
+            return L("Update the CLI and menubar to the latest release")
         }
         return "\(stage.summary)\n\n\(error)\n\n\(stage.retryHelp)"
     }
@@ -118,14 +128,19 @@ final class UpdateChecker {
 
     func checkIfNeeded() async {
         installedCliVersion = Self.queryInstalledCliVersion()
-        let lastCheck = UserDefaults.standard.double(forKey: lastCheckKey)
+        let lastCheck = defaults.double(forKey: lastCheckKey)
         let now = Date().timeIntervalSince1970
         if now - lastCheck < checkIntervalSeconds {
-            latestVersion = UserDefaults.standard.string(forKey: cachedVersionKey)
-            latestCliVersion = UserDefaults.standard.string(forKey: cachedCliVersionKey)
+            latestVersion = defaults.string(forKey: cachedVersionKey)
+            latestCliVersion = defaults.string(forKey: cachedCliVersionKey)
             return
         }
         await check()
+        // Only the background poll notifies; a manual check already shows its result.
+        await notifyIfUpdateAvailable(
+            appVersion: updateAvailable ? latestVersion : nil,
+            cliVersion: cliUpdateAvailable ? latestCliVersion : nil
+        )
     }
 
     func check() async {
@@ -157,13 +172,44 @@ final class UpdateChecker {
 
             latestVersion = version
             latestCliVersion = cliVersion
-            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastCheckKey)
-            UserDefaults.standard.set(version, forKey: cachedVersionKey)
-            if let cliVersion { UserDefaults.standard.set(cliVersion, forKey: cachedCliVersionKey) }
+            defaults.set(Date().timeIntervalSince1970, forKey: lastCheckKey)
+            defaults.set(version, forKey: cachedVersionKey)
+            if let cliVersion { defaults.set(cliVersion, forKey: cachedCliVersionKey) }
         } catch {
             updateFailureStage = .check
             updateError = error.localizedDescription
             NSLog("CodeBurn: update check failed: \(error)")
+        }
+    }
+
+    /// Marks the notifications a tap should install an update from. Other
+    /// posters share the notification delegate.
+    nonisolated static let notificationIdentifierPrefix = "UpdateChecker."
+
+    /// Posts at most one notification per new version pair; the 2-day repoll
+    /// finds the same pair stamped and stays quiet.
+    func notifyIfUpdateAvailable(appVersion: String?, cliVersion: String?) async {
+        guard UpdateNotificationPreference.isEnabled(defaults: defaults) else { return }
+        guard let copy = Self.updateNotificationCopy(appVersion: appVersion, cliVersion: cliVersion) else { return }
+        let stamp = "\(appVersion ?? "-")|\(cliVersion ?? "-")"
+        guard defaults.string(forKey: lastNotifiedVersionsKey) != stamp else { return }
+        let notifier = notifier ?? makeNotifier()
+        self.notifier = notifier
+        guard await notifier.requestAuthorizationIfNeeded() else { return }
+        notifier.post(title: copy.title, body: copy.body, identifier: "\(Self.notificationIdentifierPrefix)\(stamp)")
+        defaults.set(stamp, forKey: lastNotifiedVersionsKey)
+    }
+
+    nonisolated static func updateNotificationCopy(appVersion: String?, cliVersion: String?) -> (title: String, body: String)? {
+        switch (appVersion, cliVersion) {
+        case let (app?, cli?):
+            return (L("CodeBurn %@ available", AppVersion.display(app)), L("App and CLI %@ updates are ready. Click to install.", AppVersion.display(cli)))
+        case let (app?, nil):
+            return (L("CodeBurn %@ available", AppVersion.display(app)), L("Click to install the update."))
+        case let (nil, cli?):
+            return (L("CodeBurn CLI %@ available", AppVersion.display(cli)), L("Click to install the update."))
+        case (nil, nil):
+            return nil
         }
     }
 
@@ -244,7 +290,11 @@ final class UpdateChecker {
             guard let argv = Self.cliUpdateInvocation(cliPath: cliPath), let bin = argv.first else {
                 isUpdating = false
                 updateFailureStage = .cliUpdate
-                updateError = "Could not find the package manager for \(cliPath.isEmpty ? "the CLI" : cliPath). Run \u{201C}\(cliUpdateCommand)\u{201D} manually, then try again."
+                updateError = L(
+                "Could not find the package manager for %1$@. Run “%2$@” manually, then try again.",
+                cliPath.isEmpty ? L("the CLI") : cliPath,
+                cliUpdateCommand
+            )
                 return
             }
             let process = Process()
@@ -256,7 +306,7 @@ final class UpdateChecker {
                     if status != 0 {
                         self.isUpdating = false
                         self.updateFailureStage = .cliUpdate
-                        self.updateError = stderr.isEmpty ? "CLI update failed (exit \(status))" : stderr
+                        self.updateError = stderr.isEmpty ? L("CLI update failed (exit %lld)", status) : stderr
                         NSLog("CodeBurn: CLI update failed (exit \(status)): \(stderr)")
                         return
                     }
@@ -311,7 +361,11 @@ final class UpdateChecker {
         installedCliVersion = Self.queryInstalledCliVersion()
         if cliTooOldForUpdate {
             updateFailureStage = .menubarUpdate
-            updateError = "Your codeburn CLI (\(AppVersion.display(installedCliVersion ?? ""))) is too old to update the menubar. Run “\(cliUpdateCommand)” first, then try again."
+            updateError = L(
+                "Your codeburn CLI (%1$@) is too old to update the menubar. Run “%2$@” first, then try again.",
+                AppVersion.display(installedCliVersion ?? ""),
+                cliUpdateCommand
+            )
             return
         }
         isUpdating = true
@@ -347,7 +401,7 @@ final class UpdateChecker {
                 self.isUpdating = false
                 if proc.terminationStatus != 0 {
                     self.updateFailureStage = .menubarUpdate
-                    self.updateError = stderr.isEmpty ? "Update failed (exit \(proc.terminationStatus))" : stderr
+                    self.updateError = stderr.isEmpty ? L("Update failed (exit %lld)", proc.terminationStatus) : stderr
                     NSLog("CodeBurn: update failed (exit \(proc.terminationStatus)): \(stderr)")
                 } else {
                     self.latestVersion = nil
@@ -387,8 +441,8 @@ enum UpdateCheckError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case let .http(status): "GitHub returned HTTP \(status)."
-        case .missingMenubarAsset: "No mac-v release with a menubar zip and checksum was found."
+        case let .http(status): L("GitHub returned HTTP %lld.", status)
+        case .missingMenubarAsset: L("No mac-v release with a menubar zip and checksum was found.")
         }
     }
 }

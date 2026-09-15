@@ -1,5 +1,6 @@
 import { Fragment, useState } from 'react'
 
+import { BranchBreakdown } from '../components/BranchBreakdown'
 import { CliErrorPanel, CliErrorText } from '../components/CliErrorPanel'
 import { EmptyNote } from '../components/EmptyState'
 import { ListRow } from '../components/ListRow'
@@ -9,15 +10,22 @@ import { Sankey } from '../components/Sankey'
 import { SectionSkeleton } from '../components/Skeleton'
 import { StackedBars } from '../components/StackedBars'
 import { StaleBanner } from '../components/StaleBanner'
-import { SwitchingBanner } from '../components/SwitchingBanner'
 import { type Polled, usePolled } from '../hooks/usePolled'
 import { formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import { contiguousDailyWindow, dataStartKey, localDateKey } from '../lib/period'
 import { reportMemoKey } from '../lib/reportMemoKey'
+import { projectFilters } from '../lib/investigation'
+import { formatSessionCount, SESSION_COUNT_HELP } from '../lib/session-count-label'
 import type { CliError, DateRange, MenubarPayload, Period, SpendFlow } from '../lib/types'
 
+import type { InvestigateRequest } from './Overview'
+
 type Project = MenubarPayload['current']['topProjects'][number]
+
+function projectRowKey(project: Project, index: number): string {
+  return project.id || `legacy:${index}:${project.name}`
+}
 
 /** Date-only CLI strings ("2026-07-11") formatted at local noon so the calendar day never rolls across time zones. */
 function formatProjectDay(date: string): string {
@@ -65,6 +73,7 @@ export function SpendContent({
   overview,
   refreshToken = 0,
   ready = true,
+  onInvestigate,
 }: {
   period: Period
   provider: string
@@ -72,6 +81,7 @@ export function SpendContent({
   overview: Polled<MenubarPayload>
   refreshToken?: number
   ready?: boolean
+  onInvestigate?: (request: InvestigateRequest) => void
 }) {
   // Gate on app-level readiness so boot hydrates the cache once (default true
   // keeps standalone renders/tests polling normally).
@@ -87,7 +97,7 @@ export function SpendContent({
   }
 
   const animateKey = `${period}|${provider}|${range?.from ?? ''}|${range?.to ?? ''}`
-  return <SpendPage data={overview.data} flow={flow} period={period} provider={provider} range={range} staleError={overview.error} animateKey={animateKey} />
+  return <SpendPage data={overview.data} flow={flow} period={period} provider={provider} range={range} staleError={overview.error} animateKey={animateKey} onInvestigate={onInvestigate} />
 }
 
 function SpendPage({
@@ -98,6 +108,7 @@ function SpendPage({
   range,
   staleError,
   animateKey,
+  onInvestigate,
 }: {
   data: MenubarPayload
   flow: ReturnType<typeof usePolled<SpendFlow>>
@@ -106,6 +117,7 @@ function SpendPage({
   range: DateRange | null
   staleError: CliError | null
   animateKey: string
+  onInvestigate?: (request: InvestigateRequest) => void
 }) {
   // `history.daily` is SPARSE (active days only), so zero-fill a contiguous
   // calendar window client-side; date keys are localDateKey / the CLI dateKey,
@@ -170,14 +182,15 @@ function SpendPage({
 
   return (
     <>
-      {flow.switching && <SwitchingBanner />}
       {staleError && <StaleBanner error={staleError} />}
       <div className="spend-top-row">
         <Panel title="Daily spend by model" className="spend-chart-panel">
           {chartHasSpend ? <StackedBars daily={chartDaily} fallbackLabel={providerLabel(provider)} animateKey={animateKey} dataStart={dataStart} /> : <EmptyNote>No model spend in this range yet.</EmptyNote>}
         </Panel>
-        <ProjectBreakdown projects={projects} />
+        <ProjectBreakdown projects={projects} onInvestigate={onInvestigate} />
       </div>
+
+      <BranchBreakdown period={period} provider={provider} range={range} />
 
       <Panel title="Cost flow · model → project" right="model → project flow for this range" className="scroll-x">
         {flow.data && flow.data.links.length ? (
@@ -202,26 +215,38 @@ function SpendPage({
   )
 }
 
-function ProjectBreakdown({ projects }: { projects: Project[] }) {
+function ProjectBreakdown({ projects, onInvestigate }: { projects: Project[]; onInvestigate?: (request: InvestigateRequest) => void }) {
   const [expanded, setExpanded] = useState<string | null>(null)
 
   return (
     <Panel title="By project" right={projects.length ? `top ${projects.length}` : undefined} className="spend-scroll">
       {projects.length ? (
         projects.map((project, i) => {
-          const open = expanded === project.name
+          const rowKey = projectRowKey(project, i)
+          const open = expanded === rowKey
           return (
-            <Fragment key={project.name}>
+            <Fragment key={rowKey}>
               <ListRow
                 no={String(i + 1).padStart(2, '0')}
                 title={project.name}
-                sub={`${project.sessions.toLocaleString('en-US')} ${project.sessions === 1 ? 'session' : 'sessions'}`}
+                sub={<span title={project.sessionCountBasis === 'identity' ? undefined : SESSION_COUNT_HELP}>{formatSessionCount(project.sessions, project.sessionCountBasis)}</span>}
                 value={formatUsd(project.cost)}
                 expanded={open}
-                onClick={() => setExpanded(current => current === project.name ? null : project.name)}
+                onClick={() => setExpanded(current => current === rowKey ? null : rowKey)}
               />
               {open && (
                 <div className="spend-proj-detail" role="region" aria-label={`${project.name} sessions`}>
+                  {/* Drill-through entry: canonical project id (the same one the
+                      session rows carry), so the destination matches exactly. */}
+                  {onInvestigate && (
+                    <button
+                      className="ov-link spend-proj-drill"
+                      type="button"
+                      onClick={() => onInvestigate({ filters: projectFilters(project.id || project.name) })}
+                    >
+                      View sessions for this project →
+                    </button>
+                  )}
                   {project.sessionDetails.length ? (
                     project.sessionDetails.map((session, j) => (
                       <div className="spend-proj-session" key={`${session.date}-${j}`}>
