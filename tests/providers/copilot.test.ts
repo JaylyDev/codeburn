@@ -3286,6 +3286,31 @@ describe('copilot provider - legacy JSON format', () => {
     expect(calls[0]!.outputTokens).toBeGreaterThan(0)
   })
 
+  it('strips the older github.copilot-chat/ namespace so the model prices', async () => {
+    const session = {
+      sessionId: 'sess-json-ghcc',
+      creationDate: 1718000000000,
+      requests: [
+        {
+          requestId: 'req-1',
+          message: 'hi',
+          modelId: 'github.copilot-chat/claude-sonnet-4',
+          response: [{ kind: 'markdownContent', content: { value: 'hello there' } }]
+        }
+      ]
+    }
+
+    const filePath = join(tmpDir, 'session-ghcc.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const source = { path: filePath, project: 'test-project', provider: 'copilot' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.model).toBe('claude-sonnet-4')
+  })
+
   it('infers model when modelId is missing on the request', async () => {
     const session = {
       requests: [

@@ -105,7 +105,7 @@ const transcriptToolCallModelHints: Array<{ prefix: string; model: string }> = [
  * expects (dash-separated).
  */
 function stripCopilotPrefix(raw: string): string {
-  return raw.replace(/^copilot\//, '').trim()
+  return raw.replace(/^(?:copilot|github\.copilot-chat)\//, '').trim()
 }
 
 const CHARS_PER_TOKEN_LEGACY = 4
