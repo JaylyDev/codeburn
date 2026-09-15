@@ -48,7 +48,9 @@ final class CopilotQuotaTests: XCTestCase {
         settings: String? = nil,
         environment: [String: String] = [:],
         ghToken: String? = nil,
+        ghHostsYAML: String? = nil,
         savedToken: String? = nil,
+        savedHost: String? = nil,
         recorder: RequestRecorder,
         readFile: (@Sendable (URL) -> Data?)? = nil,
         now: (@Sendable () -> Date)? = nil,
@@ -66,18 +68,20 @@ final class CopilotQuotaTests: XCTestCase {
                 case "apps.json": return apps?.data(using: .utf8)
                 case "config.json": return config?.data(using: .utf8)
                 case "settings.json": return settings?.data(using: .utf8)
+                case "hosts.yml": return ghHostsYAML?.data(using: .utf8)
                 default: return nil
                 }
             },
             hostsURL: URL(fileURLWithPath: "/tmp/codeburn-tests/.config/github-copilot/hosts.json"),
             appsURL: URL(fileURLWithPath: "/tmp/codeburn-tests/.config/github-copilot/apps.json"),
             copilotDirURL: URL(fileURLWithPath: "/tmp/codeburn-tests/.copilot"),
+            ghHostsURL: URL(fileURLWithPath: "/tmp/codeburn-tests/.config/gh/hosts.yml"),
             environment: { environment[$0] },
             ghAuthToken: {
                 onGhProbe?()
                 return ghToken
             },
-            savedToken: { savedToken },
+            savedCredential: { savedToken.map { CopilotCredential(token: $0, host: savedHost) } },
             now: now ?? { Self.now }
         )
     }
@@ -194,6 +198,7 @@ final class CopilotQuotaTests: XCTestCase {
         }
         let usage = try await CopilotSubscriptionService.refresh(deps: deps)
         XCTAssertEqual(usage.plan, "Individual")
+        XCTAssertEqual(usage.apiHost, "api.github.com")
         XCTAssertEqual(recorder.requests.count, 1)
         let request = recorder.requests[0]
         XCTAssertEqual(request.url?.absoluteString, "https://api.github.com/copilot_internal/user")
@@ -434,6 +439,181 @@ final class CopilotQuotaTests: XCTestCase {
         XCTAssertEqual(authorization(recorder), "token github_pat_pasted")
     }
 
+    // MARK: - Host-carrying rungs (#1306)
+
+    /// An enterprise PAT exported as GH_TOKEN went to api.github.com and came
+    /// back 401. GH_HOST sits next to it in the same environment and names the
+    /// host the token belongs to.
+    func testEnvironmentTokenFollowsGHHost() async throws {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: nil,
+            environment: ["GH_TOKEN": "gho_env-tenant", "GH_HOST": "acme.ghe.com"],
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        let usage = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(
+            recorder.requests.first?.url?.absoluteString,
+            "https://api.acme.ghe.com/copilot_internal/user")
+        XCTAssertEqual(authorization(recorder), "token gho_env-tenant")
+        XCTAssertEqual(usage.apiHost, "api.acme.ghe.com")
+    }
+
+    func testEnvironmentTokenWithoutGHHostStaysOnDotcom() async throws {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: nil,
+            environment: ["GITHUB_TOKEN": "gho_env-dotcom"],
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        _ = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(
+            recorder.requests.first?.url?.absoluteString,
+            "https://api.github.com/copilot_internal/user")
+    }
+
+    /// `gh auth login --hostname <tenant>.ghe.com` writes that host into gh's
+    /// own hosts.yml; the token `gh auth token` hands back belongs to it.
+    func testGhTokenFollowsTheHostInGhHostsYML() async throws {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: nil,
+            ghToken: "gho_gh-tenant",
+            ghHostsYAML: """
+            acme.ghe.com:
+                users:
+                    octocat:
+                        oauth_token: gho_gh-tenant
+                git_protocol: https
+            """,
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        let usage = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(
+            recorder.requests.first?.url?.absoluteString,
+            "https://api.acme.ghe.com/copilot_internal/user")
+        XCTAssertEqual(authorization(recorder), "token gho_gh-tenant")
+        XCTAssertEqual(usage.apiHost, "api.acme.ghe.com")
+    }
+
+    /// gh resolves `gh auth token` against GH_HOST first, so we must too, and
+    /// a hosts.yml listing dotcom as well keeps the pick on dotcom.
+    func testGhHostEnvironmentOverridesTheConfigFileAndDotcomWinsAmongSeveral() async throws {
+        let overridden = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: nil,
+            environment: ["GH_HOST": "acme.ghe.com"],
+            ghToken: "gho_gh-tenant",
+            ghHostsYAML: "github.com:\n    user: octocat\n",
+            recorder: overridden
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        _ = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(
+            overridden.requests.first?.url?.absoluteString,
+            "https://api.acme.ghe.com/copilot_internal/user")
+
+        CopilotSubscriptionService.resetProbeCache()
+        let several = RequestRecorder()
+        let bothHosts = Self.makeDeps(
+            hosts: nil,
+            ghToken: "gho_gh-dotcom",
+            ghHostsYAML: "acme.ghe.com:\n    user: octocat\ngithub.com:\n    user: octocat\n",
+            recorder: several
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        _ = try await CopilotSubscriptionService.refresh(deps: bothHosts)
+        XCTAssertEqual(
+            several.requests.first?.url?.absoluteString,
+            "https://api.github.com/copilot_internal/user")
+    }
+
+    func testGhTokenWithNoHostsFileStaysOnDotcom() async throws {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(hosts: nil, ghToken: "gho_gh-cli", recorder: recorder) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        _ = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(
+            recorder.requests.first?.url?.absoluteString,
+            "https://api.github.com/copilot_internal/user")
+    }
+
+    func testPastedTokenFollowsTheHostSavedBesideIt() async throws {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: nil,
+            savedToken: "github_pat_tenant",
+            savedHost: "acme.ghe.com",
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        let usage = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(
+            recorder.requests.first?.url?.absoluteString,
+            "https://api.acme.ghe.com/copilot_internal/user")
+        XCTAssertEqual(authorization(recorder), "token github_pat_tenant")
+        XCTAssertEqual(usage.apiHost, "api.acme.ghe.com")
+    }
+
+    /// GH_HOST, gh's hosts.yml and the pasted host are three new untrusted
+    /// inputs. A crafted value passes the `.ghe.com` suffix check but would
+    /// build a URL pointing at a host of its own choosing, so each one has to
+    /// fail closed with no request at all.
+    func testHostileHostFromAnyNewSourceFailsClosedWithoutARequest() async {
+        let crafted = "evil.com?.ghe.com"
+        let sources: [(String, CopilotSubscriptionService.Deps, RequestRecorder)] = {
+            var cases: [(String, CopilotSubscriptionService.Deps, RequestRecorder)] = []
+            let envRecorder = RequestRecorder()
+            cases.append(("GH_HOST", Self.makeDeps(
+                hosts: nil,
+                environment: ["GH_TOKEN": "gho_env", "GH_HOST": crafted],
+                recorder: envRecorder
+            ) { request in Self.okJson(request, Self.usageBody) }, envRecorder))
+            let ghRecorder = RequestRecorder()
+            cases.append(("hosts.yml", Self.makeDeps(
+                hosts: nil,
+                ghToken: "gho_gh",
+                ghHostsYAML: "\(crafted):\n    user: octocat\n",
+                recorder: ghRecorder
+            ) { request in Self.okJson(request, Self.usageBody) }, ghRecorder))
+            let pastedRecorder = RequestRecorder()
+            cases.append(("pasted host", Self.makeDeps(
+                hosts: nil,
+                savedToken: "github_pat_pasted",
+                savedHost: crafted,
+                recorder: pastedRecorder
+            ) { request in Self.okJson(request, Self.usageBody) }, pastedRecorder))
+            return cases
+        }()
+
+        for (source, deps, recorder) in sources {
+            CopilotSubscriptionService.resetProbeCache()
+            do {
+                _ = try await CopilotSubscriptionService.refresh(deps: deps)
+                XCTFail("\(source): expected unsupportedHost")
+            } catch let error as CopilotSubscriptionService.FetchError {
+                guard case let .unsupportedHost(host) = error else {
+                    return XCTFail("\(source): expected unsupportedHost, got \(error)")
+                }
+                XCTAssertEqual(host, crafted)
+                XCTAssertTrue(error.isTerminal)
+            } catch {
+                XCTFail("\(source): unexpected error: \(error)")
+            }
+            XCTAssertTrue(recorder.requests.isEmpty, "\(source): built a request")
+        }
+    }
+
     func testEveryRungAbsentStillReportsNoCredentialsWithoutFetching() async {
         let recorder = RequestRecorder()
         let deps = Self.makeDeps(
@@ -534,5 +714,164 @@ final class CopilotQuotaTests: XCTestCase {
         } catch {
             XCTFail("unexpected error: \(error)")
         }
+    }
+
+    // MARK: - Enterprise Cloud hosts (issue #1286)
+
+    /// A data-residency enterprise signs in on `<tenant>.ghe.com`, whose API
+    /// host is the only one that honours the token.
+    func testTenantHostIsQueriedOnItsOwnAPIHost() async throws {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: #"{"acme.ghe.com":{"user":"octocat","oauth_token":"gho_tenant"}}"#,
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        let usage = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(usage.apiHost, "api.acme.ghe.com")
+        XCTAssertEqual(recorder.requests.count, 1)
+        XCTAssertEqual(
+            recorder.requests[0].url?.absoluteString,
+            "https://api.acme.ghe.com/copilot_internal/user")
+        XCTAssertEqual(
+            recorder.requests[0].value(forHTTPHeaderField: "Authorization"), "token gho_tenant")
+    }
+
+    /// With both hosts signed in, dotcom wins and the enterprise token is
+    /// never the one sent.
+    func testDotcomWinsOverATenantAndTheTenantTokenIsNotSent() async throws {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: #"{"acme.ghe.com":{"oauth_token":"gho_tenant"},"github.com":{"oauth_token":"gho_dotcom"}}"#,
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        let usage = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(usage.apiHost, "api.github.com")
+        XCTAssertEqual(
+            recorder.requests[0].url?.absoluteString,
+            "https://api.github.com/copilot_internal/user")
+        XCTAssertEqual(authorization(recorder), "token gho_dotcom")
+    }
+
+    /// The token and the host must come from the same entry: a dotcom key with
+    /// no token must not lend its host to the tenant's credential.
+    func testTenantEntryWinsWhenTheDotcomEntryHasNoToken() async throws {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: #"{"github.com":{"user":"octocat"},"acme.ghe.com":{"oauth_token":"gho_tenant"}}"#,
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        _ = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(
+            recorder.requests[0].url?.absoluteString,
+            "https://api.acme.ghe.com/copilot_internal/user")
+        XCTAssertEqual(authorization(recorder), "token gho_tenant")
+    }
+
+    /// apps.json keys are `<host>:<app id>` on the newer plugins, so the host
+    /// is carried there too.
+    func testAppsJsonHostPrefixedKeyIsQueriedOnTheTenantAPIHost() async throws {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: "{}",
+            apps: #"{"acme.ghe.com:Iv1.b507a08c87ecfe98":{"oauth_token":"gho_apps-tenant"}}"#,
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        _ = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(
+            recorder.requests[0].url?.absoluteString,
+            "https://api.acme.ghe.com/copilot_internal/user")
+        XCTAssertEqual(authorization(recorder), "token gho_apps-tenant")
+    }
+
+    /// An app-name key carries no host, so dotcom stays the assumption.
+    func testAppsJsonAppNameKeyStillQueriesDotcom() async throws {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: "{}",
+            apps: #"{"Visual Studio Code":{"oauth_token":"ghu_apps-token"}}"#,
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        _ = try await CopilotSubscriptionService.refresh(deps: deps)
+        XCTAssertEqual(
+            recorder.requests[0].url?.absoluteString,
+            "https://api.github.com/copilot_internal/user")
+    }
+
+    /// A host this build cannot address (a self-hosted GHES install) fails
+    /// naming the host instead of sending the credential to dotcom.
+    func testUnsupportedHostFailsWithoutFetching() async {
+        let recorder = RequestRecorder()
+        let deps = Self.makeDeps(
+            hosts: #"{"github.acme-corp.net":{"oauth_token":"gho_ghes"}}"#,
+            recorder: recorder
+        ) { request in
+            Self.okJson(request, Self.usageBody)
+        }
+        do {
+            _ = try await CopilotSubscriptionService.refresh(deps: deps)
+            XCTFail("expected unsupportedHost")
+        } catch let error as CopilotSubscriptionService.FetchError {
+            guard case let .unsupportedHost(host) = error else {
+                return XCTFail("expected unsupportedHost, got \(error)")
+            }
+            XCTAssertEqual(host, "github.acme-corp.net")
+            XCTAssertTrue(error.isTerminal)
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Copilot quota is not available for the GitHub host github.acme-corp.net. "
+                    + "CodeBurn can read github.com and GitHub Enterprise Cloud (*.ghe.com) hosts.")
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        XCTAssertTrue(recorder.requests.isEmpty)
+    }
+
+    /// An unreachable tenant is the case the issue reported as a bare
+    /// "Temporarily unavailable", so the message has to name the host tried.
+    func testUnreachableTenantHostNamesTheHostInTheError() async {
+        let recorder = RequestRecorder()
+        let deps = CopilotSubscriptionService.Deps(
+            fetch: { request in
+                recorder.record(request)
+                throw URLError(.cannotFindHost)
+            },
+            readFile: { url in
+                url.lastPathComponent == "hosts.json"
+                    ? #"{"acme.ghe.com":{"oauth_token":"gho_tenant"}}"#.data(using: .utf8)
+                    : nil
+            },
+            hostsURL: URL(fileURLWithPath: "/tmp/codeburn-tests/.config/github-copilot/hosts.json"),
+            appsURL: URL(fileURLWithPath: "/tmp/codeburn-tests/.config/github-copilot/apps.json"),
+            copilotDirURL: URL(fileURLWithPath: "/tmp/codeburn-tests/.copilot"),
+            ghHostsURL: URL(fileURLWithPath: "/tmp/codeburn-tests/.config/gh/hosts.yml"),
+            environment: { _ in nil },
+            ghAuthToken: { nil },
+            savedCredential: { nil },
+            now: { Self.now }
+        )
+        do {
+            _ = try await CopilotSubscriptionService.refresh(deps: deps)
+            XCTFail("expected network error")
+        } catch let error as CopilotSubscriptionService.FetchError {
+            guard case let .network(_, host) = error else {
+                return XCTFail("expected network, got \(error)")
+            }
+            XCTAssertEqual(host, "api.acme.ghe.com")
+            XCTAssertTrue(error.localizedDescription.contains("api.acme.ghe.com"))
+            XCTAssertFalse(error.isTerminal)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        XCTAssertEqual(recorder.requests.count, 1)
     }
 }

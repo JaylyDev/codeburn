@@ -5,6 +5,7 @@ import React, { Fragment, useState, useCallback, useEffect, useLayoutEffect, use
 import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, type DOMElement, type Instance, type RenderOptions } from 'ink'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost, formatTokens, markEstimated, carriedCostNote } from './format.js'
+import { formatSessionCount } from './session-count-label.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
 import { parseAllSessions, filterProjectsByDateRange, filterProjectsByName, setInteractiveScanUI, withSinglePassParse, withColdFirstPaintFloor, filesParsedFromSourceCount, isCompleteSessionSnapshotAvailable } from './parser.js'
 import { findUnpricedModels, isExpectedFreeModel, loadPricing } from './models.js'
@@ -24,6 +25,7 @@ import { getPlanUsages, type PlanUsage } from './plan-usage.js'
 import { planDisplayName } from './plans.js'
 import { formatDayRangeLabel, getDateRange, parseDayFlag, PERIODS, PERIOD_LABELS, shiftDay, type Period } from './cli-date.js'
 import { BSU, patchStdoutForWindows } from './ink-win.js'
+import { startUserTimingGuard } from './user-timing-guard.js'
 
 type View = 'dashboard' | 'optimize' | 'compare'
 
@@ -360,6 +362,7 @@ export type DurableOverview = {
   savingsUSD: number
   calls: number
   sessions: number
+  sessionCountBasis?: 'identity' | 'partial'
   inputTokens: number
   outputTokens: number
   cacheReadTokens: number
@@ -393,6 +396,7 @@ async function computeDurableOverview(
     savingsUSD: data.savingsUSD,
     calls: data.calls,
     sessions: data.sessions,
+    sessionCountBasis: data.sessionCountBasis,
     inputTokens: data.inputTokens,
     outputTokens: data.outputTokens,
     cacheReadTokens: data.cacheReadTokens,
@@ -616,8 +620,8 @@ function Overview({ projects, label, width, planUsages, durable }: { projects: P
         <Text dimColor> cost   </Text>
         <Text bold>{totalCalls.toLocaleString()}</Text>
         <Text dimColor> calls   </Text>
-        <Text bold>{String(totalSessions)}</Text>
-        <Text dimColor> sessions   </Text>
+        <Text bold>{durable ? formatSessionCount(totalSessions, durable.sessionCountBasis) : `${totalSessions.toLocaleString()} sessions`}</Text>
+        <Text dimColor>   </Text>
         <Text bold>{cacheHit.toFixed(1)}%</Text>
         <Text dimColor> cache hit</Text>
       </Text>
@@ -1556,7 +1560,7 @@ function ScrollableViewport({ children, width, lineScroll = true }: { children: 
   )
 }
 
-export function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, initialPeriod, initialProvider, initialPlanUsages, initialDurable, refreshSeconds, projectFilter, excludeFilter, customRange, customRangeLabel, initialDay, windowColumns, initialIndexPendingFiles, initialHistoryIndexing = false, initialCacheWasCold = false, initialHistoryIndex, autoFallbackFromEmptyToday = false, terminateProcess }: {
+export function InteractiveDashboard({ initialProjects, initialDailyHistoryProjects, initialPeriod, initialProvider, initialPlanUsages, initialDurable, refreshSeconds, projectFilter, excludeFilter, customRange, customRangeLabel, initialDay, windowColumns, initialIndexPendingFiles, initialHistoryIndexing = false, initialCacheWasCold = false, initialHistoryIndex, autoFallbackFromEmptyToday = false, terminateProcess, onHistoryIndexed }: {
   initialProjects: ProjectSummary[]
   initialDailyHistoryProjects?: ProjectSummary[]
   initialPeriod: Period
@@ -1577,6 +1581,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   initialCacheWasCold?: boolean
   initialHistoryIndex?: DashboardHistoryIndex
   autoFallbackFromEmptyToday?: boolean
+  onHistoryIndexed?: () => void
   /// CLI-only hard stop after Ink has been asked to restore the terminal.
   /// Component tests and embedders omit it and receive ordinary Ink exit.
   terminateProcess?: (exitCode: number) => void
@@ -1614,6 +1619,8 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   const [indexPhase, setIndexPhase] = useState<DashboardIndexPhase>(initialCacheWasCold ? 'week' : 'cached')
   const historyIndexRef = useRef<DashboardHistoryIndex | null>(initialHistoryIndex ?? null)
   const autoFallbackAppliedRef = useRef(false)
+  const onHistoryIndexedRef = useRef(onHistoryIndexed)
+  onHistoryIndexedRef.current = onHistoryIndexed
   const quitArmedRef = useRef(false)
   // #1143: first q during the cold-start fill arms a confirmation so the user
   // sees feedback instead of a silent ~16.5s drain. The second q (or any
@@ -1863,7 +1870,9 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
       if (!cancelled) console.error(error)
     }).finally(() => {
       clearInterval(progressId)
-      if (!cancelled) setIndexing(false)
+      if (cancelled) return
+      setIndexing(false)
+      onHistoryIndexedRef.current?.()
     })
     return () => {
       cancelled = true
@@ -2108,7 +2117,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
         {isCustomRange && <CustomRangeBanner label={headerLabel} width={dashWidth} />}
         {indexing && <IndexingBanner width={dashWidth} done={indexedFiles} total={indexPendingFiles} cold={indexCold} phase={indexPhase} visiblePeriod={period} />}
         {view === 'compare'
-          ? <CompareView projects={projects} onBack={() => setView('dashboard')} />
+          ? <CompareView projects={projects} onBack={() => setView('dashboard')} scopeToProjects={(projectFilter?.length ?? 0) > 0 || (excludeFilter?.length ?? 0) > 0} />
           : view === 'optimize' && optimizeResult
             ? <OptimizeView findings={optimizeResult.findings} costRate={optimizeResult.costRate} projects={projects} label={headerLabel} width={dashWidth} healthScore={optimizeResult.healthScore} healthGrade={optimizeResult.healthGrade} cursor={findingsCursor} appliedFixes={appliedFixes} />
             : <DashboardContent projects={projects} period={period} columns={columns} maxContentWidth={maxContentWidth} activeProvider={activeProvider} budgets={projectBudgets} planUsages={planUsages} label={headerLabel} dayMode={isDayMode} dailyHistoryProjects={dailyHistoryProjects} dailyHistoryPageSize={dailyHistoryPageSize} scrollableDailyHistory={scrollableDailyHistory} dailyHistoryCursor={Math.min(dailyHistoryCursor, dailyHistoryMaxCursor)} durable={durable} />}
@@ -2463,6 +2472,7 @@ export async function renderDashboard(period: Period = 'week', provider: string 
       }
     }
     process.stdin.on('data', hardQuitGuard)
+    const stopUserTimingGuard = startUserTimingGuard()
     const app = renderDebouncedInteractive(process.stdout, ({ columns }) => (
       <InteractiveDashboard initialProjects={filteredProjects} initialDailyHistoryProjects={scrollableDailyHistory ? scannedProjects : undefined} initialPeriod={opened} initialProvider={provider} initialPlanUsages={planUsages} initialDurable={initialDurable} refreshSeconds={refreshSeconds} projectFilter={projectFilter} excludeFilter={excludeFilter} customRange={customRange} customRangeLabel={customRangeLabel} initialDay={initialDay} windowColumns={columns} initialIndexPendingFiles={paint.deferredFiles} initialHistoryIndexing={progressive} initialCacheWasCold={cacheWasCold} autoFallbackFromEmptyToday={auto} terminateProcess={exitCode => { setImmediate(() => exitAfterCacheCleanup(exitCode)) }} />
     ))
@@ -2471,6 +2481,7 @@ export async function renderDashboard(period: Period = 'week', provider: string 
     } finally {
       process.stdin.off('data', hardQuitGuard)
       app.dispose()
+      stopUserTimingGuard()
     }
   } else {
     const { unmount } = render(<StaticDashboard projects={filteredProjects} period={opened} activeProvider={provider} planUsages={planUsages} label={label} dayMode={initialDay != null} durable={initialDurable} />, { patchConsole: false })
