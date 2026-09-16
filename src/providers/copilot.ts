@@ -861,13 +861,22 @@ const modelDisplayNames: Record<string, string> = {
   'gpt-5-4-mini': 'GPT-5.4 Mini',
   'gpt-5-mini': 'GPT-5 Mini',
   'gpt-5': 'GPT-5',
+  // Dot-form spellings emitted by Copilot's native model IDs (e.g. copilot/claude-sonnet-4.5)
+  // and their equivalent dash-form counterparts that other sources may store.
+  'claude-sonnet-4.6': 'Sonnet 4.6',
   'claude-sonnet-4-6': 'Sonnet 4.6',
+  'claude-sonnet-4.5': 'Sonnet 4.5',
   'claude-sonnet-4-5': 'Sonnet 4.5',
   'claude-sonnet-4': 'Sonnet 4',
+  'claude-opus-4.7': 'Opus 4.7',
   'claude-opus-4-7': 'Opus 4.7',
+  'claude-opus-4.6': 'Opus 4.6',
   'claude-opus-4-6': 'Opus 4.6',
+  'claude-opus-4.5': 'Opus 4.5',
+  'claude-opus-4-5': 'Opus 4.5',
   'claude-3-7-sonnet': 'Sonnet 3.7',
   'claude-3-5-sonnet': 'Sonnet 3.5',
+  'claude-haiku-4.5': 'Haiku 4.5',
   'claude-haiku-4-5': 'Haiku 4.5',
   'gemini-3-1-pro-preview': 'Gemini 3.1 Pro',
   'gemini-3-pro-preview': 'Gemini 3 Pro',
@@ -3650,7 +3659,7 @@ export function createCopilotProvider(
 
     modelDisplayName(model: string): string {
       for (const [key, display] of modelDisplayEntries) {
-        if (model === key || model.includes(key)) return display
+        if (model === key || model.startsWith(key + '-') || model.startsWith(key + '.')) return display
       }
       return getShortModelName(model)
     },
