@@ -2296,6 +2296,8 @@ describe.skipIf(!isSqliteAvailable())('copilot provider - session-store parsing'
     // suppression keeps holding from previously cached rows — and its parse
     // raises the busy shape parseProviderSources skips-and-retries. The
     // session-state file parses normally either way.
+    // Windows has no POSIX mode denial: chmod only toggles the read-only
+    // attribute, so the store stays readable and there is nothing to observe.
     if (process.platform === 'win32') return
     if (typeof process.getuid === 'function' && process.getuid() === 0) return // root ignores modes
     const deniedDir = join(tmpDir, 'denied')
@@ -2338,6 +2340,8 @@ describe.skipIf(!isSqliteAvailable())('copilot provider - session-store parsing'
     // fall through to the generic parse-failure path — that would cache a
     // failed marker at the current fingerprint and zero the covered
     // sessions until the file next changes.
+    // Windows has no POSIX mode denial: chmod only toggles the read-only
+    // attribute, so the store stays readable and there is nothing to observe.
     if (process.platform === 'win32') return
     if (typeof process.getuid === 'function' && process.getuid() === 0) return // root ignores modes
     createSessionStoreDb(dbPath)
