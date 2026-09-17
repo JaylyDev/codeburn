@@ -5,7 +5,7 @@ import { createHash } from 'crypto'
 import { performance } from 'node:perf_hooks'
 import { basename, dirname, join, resolve, sep } from 'path'
 import { FS_SCAN_CONCURRENCY, mapWithConcurrency, readSessionLines } from './fs-utils.js'
-import { billableOutputTokens, calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
+import { billableOutputTokens, calculateCost, calculateLocalModelSavings, getShortModelName, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, resolveCanonicalModelId } from './models.js'
 import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
 import { normalizeContentBlocks, flatSlice, flatString } from './content-utils.js'
 import { discoverAllSessions, discoverAllSessionsWithFailures, getProvider } from './providers/index.js'
@@ -3319,6 +3319,8 @@ function classifiedTurnSlicedToDays(turn: ClassifiedTurn, days: Set<string>): Cl
   return { ...turn, assistantCalls: inRangeCalls, timestamp: inRangeCalls[0]!.timestamp || turn.timestamp }
 }
 
+const copilotAggModel = (m: string): string => resolveCanonicalModelId(m)
+
 export async function parseProviderSources(
   providerName: string,
   sources: SessionSource[],
@@ -3849,7 +3851,7 @@ export async function parseProviderSources(
           const ts = new Date(c.timestamp).getTime()
           const isStore = c.deduplicationKey.startsWith('copilot-store:')
           const isRollup = c.deduplicationKey.startsWith(shutdownPrefix)
-          const aggKey = `${turn.sessionId}\n${c.model}`
+          const aggKey = `${turn.sessionId}\n${copilotAggModel(c.model)}`
           if (!Number.isNaN(ts)) {
             lastValidTsInFile = c.timestamp
             const prev = sessionEarliestValidTs.get(turn.sessionId)
@@ -3950,7 +3952,7 @@ export async function parseProviderSources(
     for (const c of turn.calls) {
       if (c.deduplicationKey.startsWith(shutdownPrefix)) {
         const tsValid = !Number.isNaN(new Date(c.timestamp).getTime())
-        if (tsValid && copilotRecon.storeKeys.has(`${turn.sessionId}\n${c.model}`)) {
+        if (tsValid && copilotRecon.storeKeys.has(`${turn.sessionId}\n${copilotAggModel(c.model)}`)) {
           // Store rows exist for this (session, model): the rollup is
           // replaced by the rows plus the per-leg residuals synthesized at
           // session assembly.

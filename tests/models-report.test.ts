@@ -230,6 +230,15 @@ describe('aggregateModels', () => {
     expect(rows[0]!.model).toBe('gpt-5.6-sol')
   })
 
+  it('resolves copilot gpt-5.6-luna to GPT-5.6 Luna instead of swallowing under GPT-5', async () => {
+    const rows = await aggregateModels([makeProject([
+      makeTurn('feature', [makeCall({ provider: 'copilot', model: 'gpt-5.6-luna', costUSD: 1 })]),
+    ])])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.modelDisplayName).toBe('GPT-5.6 Luna')
+    expect(rows[0]!.model).toBe('gpt-5.6-luna')
+  })
+
   it('resolves Fireworks path-form ids through the global table', async () => {
     const rows = await aggregateModels([makeProject([
       makeTurn('feature', [makeCall({ provider: 'cline', model: 'accounts/fireworks/models/kimi-k2p6', costUSD: 1 })]),

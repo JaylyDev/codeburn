@@ -1274,6 +1274,7 @@ function insertStoreRow(
   createdAt: string,
   reasoning = 0,
   cwd = '/home/user/testproj',
+  model = 'claude-sonnet-4-5',
 ): void {
   const { DatabaseSync } = requireForTest('node:sqlite') as { DatabaseSync: new (path: string) => TestDb }
   const db = new DatabaseSync(dbPath)
@@ -1281,8 +1282,8 @@ function insertStoreRow(
   db.prepare(
     `INSERT INTO assistant_usage_events
        (session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, created_at)
-     VALUES (?, 'claude-sonnet-4-5', ?, 0, ?, ?, ?, ?)`
-  ).run(sessionId, inputTokens, cacheRead, cacheWrite, reasoning, createdAt)
+     VALUES (?, ?, ?, 0, ?, ?, ?, ?)`
+  ).run(sessionId, model, inputTokens, cacheRead, cacheWrite, reasoning, createdAt)
   db.close()
 }
 
@@ -1596,12 +1597,20 @@ async function setupCopilotStoreEnv(): Promise<{
 
   // The rollup always uses the maintainer's repro numbers: cache-inclusive
   // input 20,000 → uncached 600, cacheRead 17,000, cacheWrite 2,400.
-  const writeSession = async (sessionId: string, opts: { output: number; rollup?: boolean }): Promise<string> => {
+  const writeSession = async (sessionId: string, opts: {
+    output: number
+    rollup?: boolean
+    model?: string
+    rollupModel?: string
+    rollupUsage?: { inputTokens: number; outputTokens?: number; cacheReadTokens: number; cacheWriteTokens: number; reasoningTokens?: number }
+  }): Promise<string> => {
+    const model = opts.model ?? 'claude-sonnet-4-5'
+    const rollupModel = opts.rollupModel ?? model
     const dir = join(sessionStateDir, sessionId)
     await mkdir(dir, { recursive: true })
     await writeFile(join(dir, 'workspace.yaml'), `id: ${sessionId}\ncwd: /home/user/testproj\n`)
     const lines = [
-      JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: 'claude-sonnet-4-5' } }),
+      JSON.stringify({ type: 'session.model_change', timestamp: at(0), data: { newModel: model } }),
       JSON.stringify({ type: 'assistant.message', timestamp: at(10), data: { messageId: 'msg-1', outputTokens: opts.output, toolRequests: [] } }),
     ]
     if (opts.rollup) {
@@ -1611,9 +1620,15 @@ async function setupCopilotStoreEnv(): Promise<{
         data: {
           shutdownType: 'routine',
           modelMetrics: {
-            'claude-sonnet-4-5': {
+            [rollupModel]: {
               requests: { count: 1, cost: 1 },
-              usage: { inputTokens: 20000, outputTokens: opts.output, cacheReadTokens: 17000, cacheWriteTokens: 2400, reasoningTokens: 0 },
+              usage: {
+                inputTokens: opts.rollupUsage?.inputTokens ?? 20000,
+                outputTokens: opts.rollupUsage?.outputTokens ?? opts.output,
+                cacheReadTokens: opts.rollupUsage?.cacheReadTokens ?? 17000,
+                cacheWriteTokens: opts.rollupUsage?.cacheWriteTokens ?? 2400,
+                reasoningTokens: opts.rollupUsage?.reasoningTokens ?? 0,
+              },
             },
           },
         },
@@ -1748,6 +1763,49 @@ describe.skipIf(!isSqliteAvailable())('(o) absence epoch: served totals are inde
     // rollup stays reconciled away, and no epoch can double-count a day.
     const second = sumUsage(await parseAllSessions(undefined, 'copilot'))
     expect(second).toEqual({ input: 600, cacheRead: 17000, cacheWrite: 2400, output: 25 })
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// (u) Spelling variants in model id reconcile correctly
+// ═══════════════════════════════════════════════════════════════════════════
+// When Copilot spells the same model differently across stores (dot vs dash,
+// e.g. claude-sonnet-4.5 vs claude-sonnet-4-5), resolveCanonicalModelId
+// collapses both to one key so the shutdown rollup is suppressed and not
+// double-counted on top of store rows.
+describe.skipIf(!isSqliteAvailable())('(u) spelling variants in model id reconcile correctly', () => {
+  it('suppresses rollup when shutdown key is dot-form and store row is dash-form', async () => {
+    const { dbPath, at, writeSession, sumUsage } = await setupCopilotStoreEnv()
+    createStoreDb(dbPath)
+    // Store row: claude-sonnet-4-5
+    insertStoreRow(dbPath, 'sess-variant', 10100, 8000, 2000, at(15), 0, '/home/user/testproj', 'claude-sonnet-4-5')
+    // Shutdown rollup: claude-sonnet-4.5
+    await writeSession('sess-variant', {
+      output: 345,
+      rollup: true,
+      model: 'claude-sonnet-4-5',
+      rollupModel: 'claude-sonnet-4.5',
+      rollupUsage: { inputTokens: 10100, cacheReadTokens: 8000, cacheWriteTokens: 2000 },
+    })
+
+    const totals = sumUsage(await parseAllSessions(undefined, 'copilot'))
+    expect(totals).toEqual({ input: 100, cacheRead: 8000, cacheWrite: 2000, output: 345 })
+  })
+
+  it('negative control: identical spellings suppress rollup unchanged', async () => {
+    const { dbPath, at, writeSession, sumUsage } = await setupCopilotStoreEnv()
+    createStoreDb(dbPath)
+    insertStoreRow(dbPath, 'sess-same', 10100, 8000, 2000, at(15), 0, '/home/user/testproj', 'claude-sonnet-4-5')
+    await writeSession('sess-same', {
+      output: 345,
+      rollup: true,
+      model: 'claude-sonnet-4-5',
+      rollupModel: 'claude-sonnet-4-5',
+      rollupUsage: { inputTokens: 10100, cacheReadTokens: 8000, cacheWriteTokens: 2000 },
+    })
+
+    const totals = sumUsage(await parseAllSessions(undefined, 'copilot'))
+    expect(totals).toEqual({ input: 100, cacheRead: 8000, cacheWrite: 2000, output: 345 })
   })
 })
 

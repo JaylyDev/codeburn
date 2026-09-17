@@ -166,7 +166,7 @@ describe('getModelCosts', () => {
     const known = ['anthropic', 'x-ai', 'xai', 'qwen', 'moonshotai', 'nousresearch', 'kimi',
       'litellm_proxy', 'openai_like', 'zhipu', 'mimo', 'xiaomi',
       'cp', 'cline-pass', 'cline-free', 'cmd', 'antigravity', 'orcarouter',
-      'cliproxy', 'zcode']
+      'cliproxy', 'zcode', 'copilot', 'github.copilot-chat']
     for (const ns of known) {
       expect(getModelCosts(`${ns}/zzz-namespace-probe`), ns).not.toBeNull()
     }
@@ -176,6 +176,18 @@ describe('getModelCosts', () => {
     for (const ns of unknown) {
       expect(getModelCosts(`${ns}/zzz-namespace-probe`), ns).toBeNull()
     }
+  })
+
+  it('prices copilot/<model> and github.copilot-chat/<model> identically to the bare model', () => {
+    const bare = getModelCosts('gpt-5.6-luna')
+    const copilotPrefixed = getModelCosts('copilot/gpt-5.6-luna')
+    const githubChatPrefixed = getModelCosts('github.copilot-chat/gpt-5.6-luna')
+
+    expect(bare).not.toBeNull()
+    expect(copilotPrefixed).not.toBeNull()
+    expect(githubChatPrefixed).not.toBeNull()
+    expect(copilotPrefixed).toEqual(bare)
+    expect(githubChatPrefixed).toEqual(bare)
   })
 
   it('peels every routing wrapper but not an unknown vendor inside one', () => {

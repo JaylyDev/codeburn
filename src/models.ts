@@ -1064,7 +1064,7 @@ export function resolveCanonicalModelId(model: string): string {
 const EXTRA_NAMESPACES = [
   // Routing wrappers (see ROUTER_PREFIXES); no catalog lists them. `cliproxy/`
   // is codex-cliproxy-gateway's default route prefix over CLIProxyAPI.
-  'cp', 'cline-pass', 'cline-free', 'cmd', 'antigravity', 'orcarouter', 'cliproxy',
+  'cp', 'cline-pass', 'cline-free', 'cmd', 'antigravity', 'orcarouter', 'cliproxy', 'copilot', 'github.copilot-chat',
   // LiteLLM route prefixes that never appear as a key prefix.
   'litellm_proxy', 'openai_like',
   // Vendor spellings the catalog indexes under another name: `zhipu` is `z-ai`,

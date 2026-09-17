@@ -3659,7 +3659,7 @@ export function createCopilotProvider(
 
     modelDisplayName(model: string): string {
       for (const [key, display] of modelDisplayEntries) {
-        if (model === key || model.startsWith(key + '-') || model.startsWith(key + '.')) return display
+        if (model === key || model.startsWith(key + '-')) return display
       }
       return getShortModelName(model)
     },
