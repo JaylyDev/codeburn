@@ -714,3 +714,9 @@
 "%1$@ · %2$@ at 80%%" = "%1$@ · %2$@が80%%到達";
 "%1$@ · %2$@ limit reached" = "%1$@ · %2$@が上限到達";
 "Quota crossings (%1$lld%% and %2$lld%%)" = "クォータ通知しきい値（%1$lld%%と%2$lld%%）";
+
+/* MARK: Privacy */
+"Privacy" = "プライバシー";
+"Anonymous usage statistics" = "匿名の利用統計";
+"Controlled in the CodeBurn desktop app." = "CodeBurn デスクトップアプリで管理されています。";
+"Optional usage statistics: the names of the models, tools and providers you use, with bucketed counts of how often each one came up, plus when the app is opened. A random install id, the app version and your country code travel with them. Never your prompts, your code, your project and file names, or exact amounts." = "任意の利用統計です:使用したモデル、ツール、プロバイダーの名前と、それぞれの出現回数を区分けした集計、およびアプリを開いた回数。これらにはランダムなインストールID、アプリのバージョン、国コードが付随します。プロンプト、コード、プロジェクト名やファイル名、正確な金額は一切含まれません。";

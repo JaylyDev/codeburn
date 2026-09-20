@@ -86,6 +86,10 @@ CODEBURN_ALLOW_DEV_BIN=1 CODEBURN_BIN="node $(pwd)/../dist/cli.js" swift run
 
 The app registers itself as a menubar accessory (`LSUIElement = true` at runtime). No Dock icon.
 
+A `swift run` or Xcode build is matched against the installed app by executable name, and
+being the newest start it retires the installed copy as it comes up. Pass `--keep-both` to
+run yours alongside it (`swift run CodeBurnMenubar --keep-both`).
+
 ## Data source
 
 On launch and every 60 seconds thereafter, the app spawns `codeburn status --format menubar-json --no-optimize` directly (argv, no shell) via `CodeburnCLI.makeProcess` and decodes the JSON into `MenubarPayload`. The manual refresh button in the footer invokes the same command without `--no-optimize`, which includes optimize findings but takes longer.

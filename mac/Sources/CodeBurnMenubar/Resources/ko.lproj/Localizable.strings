@@ -714,3 +714,9 @@
 "%1$@ · %2$@ at 80%%" = "%1$@ · %2$@ 80%% 도달";
 "%1$@ · %2$@ limit reached" = "%1$@ · %2$@ 한도 도달";
 "Quota crossings (%1$lld%% and %2$lld%%)" = "할당량 임계값 알림 (%1$lld%% 및 %2$lld%%)";
+
+/* MARK: Privacy */
+"Privacy" = "개인정보";
+"Anonymous usage statistics" = "익명 사용 통계";
+"Controlled in the CodeBurn desktop app." = "CodeBurn 데스크톱 앱에서 관리됩니다.";
+"Optional usage statistics: the names of the models, tools and providers you use, with bucketed counts of how often each one came up, plus when the app is opened. A random install id, the app version and your country code travel with them. Never your prompts, your code, your project and file names, or exact amounts." = "선택적 사용 통계입니다: 사용한 모델, 도구, 제공업체의 이름과 각 항목이 나타난 횟수를 구간별로 집계한 값, 그리고 앱을 연 횟수. 여기에는 무작위 설치 ID, 앱 버전, 국가 코드가 함께 전송됩니다. 프롬프트, 코드, 프로젝트 및 파일 이름, 정확한 금액은 절대 포함되지 않습니다.";

@@ -13,7 +13,6 @@ export type ClaudeDeps = {
   fetch: typeof fetch
   credentialPath: string
   readFile: typeof readSecureFile
-  now: () => number
   keychain?: () => Promise<KeychainOutcome>
 }
 
@@ -21,7 +20,6 @@ const defaults: ClaudeDeps = {
   fetch: globalThis.fetch,
   credentialPath: path.join(os.homedir(), '.claude', '.credentials.json'),
   readFile: readSecureFile,
-  now: Date.now,
 }
 
 function empty(connection: QuotaProvider['connection']): QuotaProvider {
@@ -134,13 +132,7 @@ export async function fetchClaudeQuota(options: Partial<ClaudeDeps> & { signal?:
     }
     if (!credential) return { quota: empty('disconnected') }
 
-    let response: Response
-    if (credential.expiresAt !== undefined && credential.expiresAt - deps.now() <= 5 * 60_000) {
-      const reread = await credentialFromFile(deps)
-      if (!reread || reread.accessToken === credential.accessToken) return { quota: empty('transientFailure') }
-      credential = reread
-    }
-    response = await request(credential.accessToken, deps, options.signal)
+    let response = await request(credential.accessToken, deps, options.signal)
     if (response.status === 401) {
       const reread = await credentialFromFile(deps)
       if (!reread || reread.accessToken === credential.accessToken) return { quota: empty('transientFailure') }

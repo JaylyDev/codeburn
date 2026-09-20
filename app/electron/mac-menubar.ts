@@ -28,6 +28,14 @@ export const NO_ANSWER = 'The menu bar app did not respond. Update it and try ag
 /** The steps of an install worth naming while a person waits ~30s for it. */
 export type InstallPhase = 'Downloading' | 'Verifying' | 'Installing' | 'Starting'
 
+/** Wire marker for the CLI's leftover-bundle lines (src/menubar-installer.ts: LEFTOVER_LINE_PREFIX). */
+const LEFTOVER_LINE_PREFIX = 'CODEBURN_LEFTOVER '
+
+/** The path of an older bundle the CLI could not remove, or null for any other line. */
+export function leftoverBundle(line: string): string | null {
+  return line.startsWith(LEFTOVER_LINE_PREFIX) ? line.slice(LEFTOVER_LINE_PREFIX.length).trim() || null : null
+}
+
 /**
  * The CLI narrates its own install on stdout (src/menubar-installer.ts). Reading those lines
  * beats inventing a second progress protocol, and a line this does not know simply keeps the
@@ -96,7 +104,7 @@ export type MacMenubarDeps = {
   /** `process.mas` is true only inside a Mac App Store build. */
   mas: boolean
   home?: string
-  runCli?: (args: string[], opts?: { timeoutMs?: number; onStdout?: (chunk: string) => void }) => Promise<ActionResult>
+  runCli?: (args: string[], opts?: { timeoutMs?: number; extraEnv?: NodeJS.ProcessEnv; onStdout?: (chunk: string) => void }) => Promise<ActionResult>
   /** Named steps of a running install, pushed to the card so a 30-second wait says something. */
   onPhase?: (phase: InstallPhase) => void
   /** The desktop app's own executable, which is also the Node that runs the CLI it carries. */
@@ -229,35 +237,41 @@ export class MacMenubar {
    * the app's own SingleInstanceGuard retires anything that outlived that, so this cannot end
    * with two.
    */
-  async install(): Promise<{ ok: boolean; error: string | null; status: MacMenubarStatus }> {
-    if (!this.supported()) return { ok: false, error: 'The menu bar app is macOS only.', status: NOT_SUPPORTED }
+  async install(): Promise<{ ok: boolean; error: string | null; status: MacMenubarStatus; leftovers: string[] }> {
+    if (!this.supported()) return { ok: false, error: 'The menu bar app is macOS only.', status: NOT_SUPPORTED, leftovers: [] }
     if (this.deps.mas) {
-      return { ok: false, error: 'Get the menu bar app from the website.', status: await this.status() }
+      return { ok: false, error: 'Get the menu bar app from the website.', status: await this.status(), leftovers: [] }
     }
     const runCli = this.deps.runCli
-    if (!runCli) return { ok: false, error: 'The codeburn CLI is not available.', status: await this.status() }
+    if (!runCli) return { ok: false, error: 'The codeburn CLI is not available.', status: await this.status(), leftovers: [] }
     // Before the install, not after: the CLI records a persistent codeburn path for the
     // menubar and refuses to go on without one, and a desktop-only user has none on PATH.
     await this.writeCliLauncher()
     const already = Boolean(await this.locate())
     this.deps.onPhase?.('Downloading')
     let pending = ''
+    const leftovers: string[] = []
     const result = await runCli(already ? ['menubar', '--force'] : ['menubar'], {
       timeoutMs: INSTALL_TIMEOUT_MS,
+      // What turns the CLI's leftover-bundle advice into machine-readable lines.
+      extraEnv: { CODEBURN_PROGRESS: '1' },
       onStdout: chunk => {
         // Chunks split mid-line, so only whole lines are read and the tail is kept.
         pending += chunk
         const lines = pending.split('\n')
         pending = lines.pop() ?? ''
         for (const line of lines) {
-          const phase = installPhase(line.trim())
+          const text = line.trim()
+          const leftover = leftoverBundle(text)
+          if (leftover) leftovers.push(leftover)
+          const phase = installPhase(text)
           if (phase) this.deps.onPhase?.(phase)
         }
       },
     })
     const status = await this.status()
-    if (result.ok && status.installed) return { ok: true, error: null, status }
-    return { ok: false, error: installErrorMessage(result), status }
+    if (result.ok && status.installed) return { ok: true, error: null, status, leftovers }
+    return { ok: false, error: installErrorMessage(result), status, leftovers }
   }
 
   /** `open` on a running LSUIElement app activates the one that is up rather than starting a
@@ -278,8 +292,17 @@ export class MacMenubar {
    * its own defaults domain. A concrete Apple tag (en/ja/ko/fr, or zh-Hans/zh-Hant)
    * overrides; null (System) clears the override so the OS language decides. The
    * menu bar ships en + zh-Hans and falls back to English for the rest, so this is
-   * correct with no Swift change. AppKit reads AppleLanguages once, at launch, so a
-   * running copy is quit first — `open` then relaunches it into the new locale.
+   * correct with no Swift change. AppKit reads AppleLanguages once, at launch, so the
+   * menu bar has to come back up for the switch to show.
+   *
+   * It restarts *itself*, asked through the remote-command key. Quitting it and
+   * reopening it from here made the desktop app the new process's responsible
+   * process, and macOS then re-asked for "access data from other apps" on every
+   * single language change. An older menubar falls back to the quit-and-open below
+   * only because {@link OLDEST_ASKABLE} is the first version that watches the
+   * remote-command key at all. That is not a gate any later command inherits: a
+   * menubar that watches the key but does not know the command consumes it and
+   * drops it, so a command added here later needs a version floor of its own.
    */
   async setLanguage(appleLang: string | null): Promise<MacMenubarStatus> {
     if (appleLang) await this.run('/usr/bin/defaults', ['write', MENUBAR_BUNDLE_ID, 'AppleLanguages', '-array', appleLang])
@@ -288,6 +311,16 @@ export class MacMenubar {
     if (!path) return this.open()
     const executable = join(path, 'Contents', 'MacOS', 'CodeBurnMenubar')
     if ((await this.status()).running) {
+      const before = await this.runningPids(executable)
+      await this.run('/usr/bin/defaults', ['write', MENUBAR_BUNDLE_ID, REMOTE_COMMAND_KEY, '-string', 'relaunch'])
+      if (await this.waitForConsumed(EXIT_TIMEOUT_MS)) {
+        // It took the command but never came back up: open it ourselves rather than leave
+        // the menu bar gone for the sake of the permission prompt.
+        if (!(await this.waitForReplacement(executable, before, RELAUNCH_TIMEOUT_MS))) return this.open()
+        return this.status()
+      }
+      // Nobody consumed it, so it would relaunch the next launch instead.
+      await this.run('/usr/bin/defaults', ['delete', MENUBAR_BUNDLE_ID, REMOTE_COMMAND_KEY])
       await this.run('/usr/bin/osascript', ['-e', 'quit app "CodeBurnMenubar"'])
       await this.waitForExit(executable, EXIT_TIMEOUT_MS)
     }
@@ -412,6 +445,26 @@ export class MacMenubar {
     const deadline = this.now() + timeoutMs
     for (;;) {
       if (!(await this.run('/usr/bin/pgrep', ['-f', executable]))) return true
+      if (this.now() >= deadline) return false
+      await new Promise(resolve => setTimeout(resolve, EXIT_POLL_MS))
+    }
+  }
+
+  /** The pids running from this bundle, as pgrep reports them. */
+  private async runningPids(executable: string): Promise<Set<string>> {
+    const found = await this.run('/usr/bin/pgrep', ['-f', executable])
+    return new Set((found ?? '').split('\n').map(line => line.trim()).filter(Boolean))
+  }
+
+  /** True once a menubar process appears that is not one of `before`. A self-relaunch is
+   *  only done when the *replacement* is up: the old process still matches pgrep while it
+   *  tears itself down, so "something is running" would pass instantly and every relaunch
+   *  that silently failed would look like it worked. */
+  private async waitForReplacement(executable: string, before: Set<string>, timeoutMs: number): Promise<boolean> {
+    const deadline = this.now() + timeoutMs
+    for (;;) {
+      const pids = await this.runningPids(executable)
+      if ([...pids].some(pid => !before.has(pid))) return true
       if (this.now() >= deadline) return false
       await new Promise(resolve => setTimeout(resolve, EXIT_POLL_MS))
     }

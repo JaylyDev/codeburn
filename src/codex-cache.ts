@@ -171,7 +171,13 @@ async function loadCacheFromDisk(cacheDir: string): Promise<ResultCache> {
 function getEntry(cache: ResultCache, filePath: string, fp: FileFingerprint): FileEntry | null {
   if (!Object.hasOwn(cache.files, filePath)) return null
   const entry = cache.files[filePath]
-  if (entry && entry.mtimeMs === fp.mtimeMs && entry.sizeBytes === fp.sizeBytes) {
+  if (
+    entry
+    && entry.dev === fp.dev
+    && entry.ino === fp.ino
+    && entry.mtimeMs === fp.mtimeMs
+    && entry.sizeBytes === fp.sizeBytes
+  ) {
     return entry
   }
   return null

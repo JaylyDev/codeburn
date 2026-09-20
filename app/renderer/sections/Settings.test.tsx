@@ -3,7 +3,7 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { ActionResult, AliasRow, CombinedUsage, DeviceScanResult, Identity, MenubarPayload, PriceOverrideList, PriceRates, ProjectFilter, ProjectsReport, QuotaProvider, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
+import type { ActionResult, AliasRow, CombinedUsage, DeviceScanResult, ExportResult, Identity, MenubarPayload, PriceOverrideList, PriceRates, ProjectFilter, ProjectsReport, QuotaProvider, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
 import { Settings } from './Settings'
 
 const mocks = vi.hoisted(() => ({
@@ -29,7 +29,7 @@ const mocks = vi.hoisted(() => ({
   setPlan: vi.fn<(id: string, provider: string) => Promise<ActionResult>>(),
   resetPlan: vi.fn<(provider: string) => Promise<ActionResult>>(),
   chooseDirectory: vi.fn<() => Promise<string | null>>(),
-  exportData: vi.fn<(format: string, provider: string, path: string) => Promise<ActionResult>>(),
+  exportData: vi.fn<(format: string, provider: string, path: string) => Promise<ExportResult>>(),
   companionStatus: vi.fn(),
   trayPrefs: vi.fn(),
   setTrayAppPref: vi.fn(),
@@ -37,6 +37,7 @@ const mocks = vi.hoisted(() => ({
   setLaunchAtLogin: vi.fn(),
   telemetryTrack: vi.fn<(name: string, props?: Record<string, unknown>) => Promise<boolean>>(),
   telemetryStatus: vi.fn<() => Promise<TelemetryStatus | null>>(),
+  openExternal: vi.fn<(url: string) => Promise<void>>(),
   setTelemetryEnabled: vi.fn<(enabled: boolean) => Promise<TelemetryStatus | null>>(),
 }))
 vi.mock('../lib/ipc', async orig => {
@@ -109,8 +110,9 @@ describe('Settings', () => {
     mocks.setPlan.mockResolvedValue(actionOk)
     mocks.resetPlan.mockResolvedValue(actionOk)
     mocks.chooseDirectory.mockResolvedValue('/Users/x/Exports')
-    mocks.exportData.mockResolvedValue(actionOk)
+    mocks.exportData.mockResolvedValue({ ...actionOk, savedPath: '/Users/x/Exports/codeburn-export-2026-09-19' })
     mocks.telemetryTrack.mockResolvedValue(true)
+    mocks.openExternal.mockResolvedValue(undefined)
     mocks.telemetryStatus.mockResolvedValue(telemetryOff)
     mocks.setTelemetryEnabled.mockImplementation(async enabled => ({ ...telemetryOff, enabled }))
     // No bundled tray app unless a test says otherwise, which is every platform but Windows.
@@ -283,7 +285,7 @@ describe('Settings', () => {
     render(<Settings period="month" />)
     await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
 
-    await user.click(await screen.findByRole('switch', { name: 'Anonymous telemetry' }))
+    await user.click(await screen.findByRole('switch', { name: 'Anonymous usage statistics' }))
 
     expect(mocks.setTelemetryEnabled).toHaveBeenCalledWith(true)
     await waitFor(() => {
@@ -299,7 +301,7 @@ describe('Settings', () => {
     mocks.setTelemetryEnabled.mockResolvedValue(telemetryOff)
     render(<Settings period="month" />)
     await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
-    await user.click(await screen.findByRole('switch', { name: 'Anonymous telemetry' }))
+    await user.click(await screen.findByRole('switch', { name: 'Anonymous usage statistics' }))
     await waitFor(() => expect(mocks.setTelemetryEnabled).toHaveBeenCalled())
 
     // Turning it off mints a fresh install id and drops the queue, so an opt-out event would
@@ -308,7 +310,7 @@ describe('Settings', () => {
     mocks.setTelemetryEnabled.mockResolvedValue(telemetryOff)
     render(<Settings period="month" />)
     await user.click(screen.getAllByRole('button', { name: 'Privacy & data' }).at(-1)!)
-    await user.click((await screen.findAllByRole('switch', { name: 'Anonymous telemetry' })).at(-1)!)
+    await user.click((await screen.findAllByRole('switch', { name: 'Anonymous usage statistics' })).at(-1)!)
     await waitFor(() => expect(mocks.setTelemetryEnabled).toHaveBeenCalledWith(false))
 
     const telemetryEvents = mocks.telemetryTrack.mock.calls.filter(([, props]) => props?.setting === 'telemetry')
@@ -361,12 +363,65 @@ describe('Settings', () => {
     render(<Settings period="month" />)
     await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
     expect(screen.getByText('Local report snapshots')).toBeInTheDocument()
-    expect(screen.getByText(/Calculated usage and cost reports/)).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Clear snapshots' }))
+    expect(screen.getByText(/Calculated usage reports are kept on this machine/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Clear snapshots Local report snapshots' }))
     expect([...stored.keys()].some(key => key.startsWith('codeburn.reportSnapshot.v1.'))).toBe(false)
     expect(stored.has('codeburn.overview-headlines.v2')).toBe(false)
     expect(stored.get('codeburn.theme')).toBe('dark')
     expect(await screen.findByText('Cached report snapshots cleared')).toBeInTheDocument()
+  })
+
+  it('lays Privacy out as one card of label + hint + control rows', async () => {
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+
+    // The two static claims are a sentence under the heading now, not rows of their own.
+    expect(screen.getByText(/Everything runs on this machine/)).toBeInTheDocument()
+    expect(screen.queryByText('Local-only')).not.toBeInTheDocument()
+    expect(screen.queryByText('No API keys')).not.toBeInTheDocument()
+
+    const pane = screen.getByRole('heading', { name: 'Privacy & data' }).closest('section')!
+    const rows = [...pane.querySelectorAll('.about-row')]
+    expect(rows.map(row => row.querySelector('.tx span')?.textContent)).toEqual([
+      'Anonymous usage statistics', 'Device sharing', 'Local report snapshots', 'Export your data',
+    ])
+    // Exactly one control per row, all in the right-hand block, and no per-row icons.
+    expect(rows.map(row => row.querySelector('.r')!.children.length)).toEqual([1, 1, 1, 1])
+    expect(pane.querySelector('svg')).toBeNull()
+    // Every pane reads at the shared bounded column, so Privacy carries no width modifier.
+    expect(pane).toHaveClass('set-p')
+    expect(pane.className).not.toMatch(/set-p-wide/)
+  })
+
+  it('reads the device-sharing row from the share status and opens the Devices pane', async () => {
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+    expect(await screen.findByText(/Paired devices on your local network/)).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Manage Device sharing' }))
+    expect(await screen.findByRole('heading', { name: 'Devices' })).toBeInTheDocument()
+  })
+
+  it('says nothing leaves the machine while sharing is off', async () => {
+    mocks.getShareStatus.mockResolvedValue({ sharing: false, name: 'Studio MacBook Pro', port: 9732, always: false, peers: 0, pending: [] })
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+    expect(await screen.findByText(/Nothing leaves this machine/)).toBeInTheDocument()
+  })
+
+  it('opens the Export pane from Privacy, and the telemetry doc from the inline link', async () => {
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+
+    await user.click(await screen.findByRole('button', { name: 'What is sent' }))
+    expect(mocks.openExternal).toHaveBeenCalledWith('https://www.codeburn.app/telemetry')
+
+    await user.click(screen.getByRole('button', { name: 'Open export Export your data' }))
+    expect(await screen.findByRole('heading', { name: 'Export' })).toBeInTheDocument()
   })
 
   it('stores a positive daily budget from General', async () => {
@@ -416,7 +471,9 @@ describe('Settings', () => {
     expect(await screen.findByText('Claude')).toBeInTheDocument()
     expect(screen.getByText('Detected · $12.34')).toBeInTheDocument()
     expect(screen.getByText('Codex')).toBeInTheDocument()
-    expect(mocks.getOverview).toHaveBeenCalledWith('week', 'all')
+    // The providers pane detects live providers over a cheap fixed 1-day window,
+    // decoupled from the global period, so it never asks for 'week' here.
+    expect(mocks.getOverview).toHaveBeenCalledWith('today', 'all')
   })
 
   it('keys provider logos on the internal id from providerDetails', async () => {
@@ -557,7 +614,9 @@ describe('Settings', () => {
     await user.click(screen.getByRole('option', { name: 'Claude' }))
     await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
     expect(mocks.exportData).toHaveBeenCalledWith('json', 'claude', '/Users/x/Exports')
-    expect(await screen.findByText('Exported to /Users/x/Exports')).toBeInTheDocument()
+    // The toast names what the CLI wrote, not the folder that was picked: the
+    // CLI nests a dated folder (CSV) or appends the extension (JSON).
+    expect(await screen.findByText('Exported to /Users/x/Exports/codeburn-export-2026-09-19')).toBeInTheDocument()
   })
 
   it('renders real device status and removes paired devices without fake pairing controls', async () => {

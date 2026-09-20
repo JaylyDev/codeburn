@@ -24,6 +24,14 @@ struct MenubarRemoteCommandTests {
         #expect(command?.unregistersLoginItem == true)
     }
 
+    @Test("relaunch does not terminate for good and leaves the login item alone")
+    func relaunchNeitherTerminatesNorUnregisters() {
+        let command = MenubarRemoteCommand(rawValue: "relaunch")
+        #expect(command == .relaunch)
+        #expect(command?.terminates == false)
+        #expect(command?.unregistersLoginItem == false)
+    }
+
     @Test("settings neither terminates nor unregisters the login item")
     func settingsNeitherTerminatesNorUnregisters() {
         let command = MenubarRemoteCommand(rawValue: "settings")

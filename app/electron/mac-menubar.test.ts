@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, existsSync, readFileSync, statSync, writeFileSy
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { DOCK_ENABLED_KEY, MENUBAR_BUNDLE_ID, NO_ANSWER, OLDEST_ASKABLE, REMOTE_COMMAND_KEY, MacMenubar, installErrorMessage, installPhase, isOlderThan } from './mac-menubar'
+import { DOCK_ENABLED_KEY, MENUBAR_BUNDLE_ID, NO_ANSWER, OLDEST_ASKABLE, REMOTE_COMMAND_KEY, MacMenubar, installErrorMessage, installPhase, isOlderThan, leftoverBundle } from './mac-menubar'
 
 const HOME = '/Users/tester'
 const USER_APP = `${HOME}/Applications/CodeBurnMenubar.app`
@@ -25,9 +25,16 @@ function harness(opts: {
   honoursRemoteCommand?: boolean
   /** How many `open` calls no-op before one actually brings the process up. */
   flakyOpen?: number
+  /** A menubar that takes the relaunch command, goes down, and never starts itself again. */
+  relaunchDies?: boolean
+  /** A menubar that takes the relaunch command and stays exactly as it was: the process
+   *  that answered is still the one running, so nothing was actually restarted. */
+  relaunchStalls?: boolean
 } = {}) {
   const present = new Set(opts.present ?? [])
   let running = Boolean(opts.running)
+  // A restart is a new process, and that is what a relaunch has to be confirmed by.
+  let pid = 4242
   let opensToIgnore = opts.flakyOpen ?? 0
   // The command the menubar has not taken out of its defaults yet. A menubar that watches the
   // key consumes it as it acts, which is what settings() waits for.
@@ -38,15 +45,18 @@ function harness(opts: {
     calls.push([command, args])
     if (command.endsWith('mdfind')) return opts.mdfind ?? ''
     if (command.endsWith('PlistBuddy')) return opts.version ?? '9.9.9'
-    if (command.endsWith('pgrep')) return running ? '4242' : null
+    if (command.endsWith('pgrep')) return running ? String(pid) : null
     if (command.endsWith('pkill')) { running = false; return '' }
     if (command.endsWith('defaults') && args[0] === 'read') {
       return args[2] === REMOTE_COMMAND_KEY ? pendingCommand : (opts.dock ?? null)
     }
     if (command.endsWith('defaults') && args[0] === 'write') {
       if (args[2] === REMOTE_COMMAND_KEY) {
+        // `relaunch` and `settings` leave the process up: the first restarts itself.
         if (opts.honoursRemoteCommand === false) pendingCommand = args[4]
-        else if (args[4] !== 'settings') running = false
+        else if (args[4] === 'quit' || args[4] === 'uninstall') running = false
+        else if (opts.relaunchDies && args[4] === 'relaunch') running = false
+        else if (args[4] === 'relaunch' && !opts.relaunchStalls) pid += 1
       }
       return ''
     }
@@ -55,7 +65,7 @@ function harness(opts: {
       return ''
     }
     if (command.endsWith('osascript')) { running = false; return '' }
-    if (command.endsWith('open')) { if (opensToIgnore > 0) opensToIgnore--; else running = true; return '' }
+    if (command.endsWith('open')) { if (opensToIgnore > 0) opensToIgnore--; else { running = true; pid += 1 } ; return '' }
     return null
   })
   const runCli = vi.fn(async (args: string[]) => {
@@ -302,17 +312,48 @@ describe('MacMenubar.settings', () => {
     expect(calls.some(([cmd, args]) => cmd.endsWith('defaults') && args[0] === 'delete' && args[2] === REMOTE_COMMAND_KEY)).toBe(true)
   })
 
-  // AppKit reads AppleLanguages only at launch, so a running menu bar must be quit and
-  // reopened for the switch to show — and the quit is AppleScript, which every version honors.
-  it('writes AppleLanguages and relaunches a running menu bar so it re-reads it', async () => {
-    const { menubar, calls } = harness({ present: [USER_APP], running: true })
+  // AppKit reads AppleLanguages only at launch, so a running menu bar has to come back
+  // up. Reopening it from here made the desktop app its responsible process and macOS
+  // re-asked for "access data from other apps" every time, so it is asked to do it itself.
+  it('writes AppleLanguages and asks a running menu bar to relaunch itself', async () => {
+    const { menubar, calls, isRunning } = harness({ present: [USER_APP], running: true })
     await menubar.setLanguage('zh-Hans')
     const write = calls.find(([cmd, args]) => cmd.endsWith('defaults') && args[0] === 'write' && args[2] === 'AppleLanguages')
     expect(write?.[1].at(-1)).toBe('zh-Hans')
+    const command = calls.find(([cmd, args]) => cmd.endsWith('defaults') && args[0] === 'write' && args[2] === REMOTE_COMMAND_KEY)
+    expect(command?.[1]).toEqual(['write', MENUBAR_BUNDLE_ID, REMOTE_COMMAND_KEY, '-string', 'relaunch'])
+    expect(calls.some(([cmd]) => cmd.endsWith('osascript'))).toBe(false)
+    expect(calls.some(([cmd, args]) => cmd.endsWith('open') && args[0] === USER_APP)).toBe(false)
+    expect(isRunning()).toBe(true)
+  })
+
+  // A menubar too old to watch the key never answers, and the switch has to keep working.
+  it('falls back to quitting and reopening a menu bar that does not answer', async () => {
+    const { menubar, calls } = harness({ present: [USER_APP], running: true, honoursRemoteCommand: false })
+    await menubar.setLanguage('ja')
     const quitIdx = calls.findIndex(([cmd]) => cmd.endsWith('osascript'))
     const openIdx = calls.findIndex(([cmd, args]) => cmd.endsWith('open') && args[0] === USER_APP)
     expect(quitIdx).toBeGreaterThanOrEqual(0)
     expect(openIdx).toBeGreaterThan(quitIdx)
+    // Left behind, the command would relaunch the next launch instead.
+    expect(calls.some(([cmd, args]) => cmd.endsWith('defaults') && args[0] === 'delete' && args[2] === REMOTE_COMMAND_KEY)).toBe(true)
+  })
+
+  // The command was taken, so the fallback below never runs; without a check on the
+  // relaunch actually landing, a menubar that goes down and stays down is left gone.
+  it('opens the menu bar itself when a consumed relaunch never brings it back', async () => {
+    const { menubar, calls, isRunning } = harness({ present: [USER_APP], running: true, relaunchDies: true })
+    await menubar.setLanguage('ja')
+    expect(calls.some(([cmd, args]) => cmd.endsWith('open') && args[0] === USER_APP)).toBe(true)
+    expect(isRunning()).toBe(true)
+  })
+
+  // The old process still answers pgrep while it is tearing itself down, so waiting for
+  // "something is running" passed instantly and a relaunch that never happened looked fine.
+  it('opens the menu bar itself when the process that took the relaunch never gives way', async () => {
+    const { menubar, calls } = harness({ present: [USER_APP], running: true, relaunchStalls: true })
+    await menubar.setLanguage('ja')
+    expect(calls.some(([cmd, args]) => cmd.endsWith('open') && args[0] === USER_APP)).toBe(true)
   })
 
   it('clears the override for System and never quits a menu bar that is down', async () => {
@@ -325,7 +366,7 @@ describe('MacMenubar.settings', () => {
   // The `open` right after a quit can activate the dying instance and no-op,
   // leaving the switch with a dead menu bar; the relaunch must be confirmed.
   it('opens again when the first relaunch does not bring the menu bar up', async () => {
-    const { menubar, calls, isRunning } = harness({ present: [USER_APP], running: true, flakyOpen: 1 })
+    const { menubar, calls, isRunning } = harness({ present: [USER_APP], running: true, honoursRemoteCommand: false, flakyOpen: 1 })
     await menubar.setLanguage('ja')
     const opens = calls.filter(([cmd, args]) => cmd.endsWith('open') && args[0] === USER_APP)
     expect(opens.length).toBe(2)
@@ -529,5 +570,34 @@ describe('install progress', () => {
     })
     await menubar.install()
     expect(seen).toEqual(['Downloading', 'Downloading', 'Verifying', 'Installing', 'Installing', 'Starting'])
+  })
+
+  it('collects the leftover bundles the CLI reports, and asks for them', async () => {
+    let env: NodeJS.ProcessEnv | undefined
+    const menubar = new MacMenubar({
+      platform: 'darwin', mas: false, home: HOME,
+      run: async () => null,
+      exists: () => true,
+      runCli: async (_args, opts) => {
+        env = opts?.extraEnv
+        opts?.onStdout?.('An older copy is still at /Applications/CodeBurnMenubar.app. Move it to the Trash.\n')
+        opts?.onStdout?.('CODEBURN_LEFTOVER /Applications/CodeBurnMenubar.app\n')
+        return { ok: true, stdout: '', stderr: '', code: 0 }
+      },
+    })
+
+    const result = await menubar.install()
+
+    // The prose line is the terminal's; only the marker reaches the card.
+    expect(result.leftovers).toEqual(['/Applications/CodeBurnMenubar.app'])
+    expect(env).toEqual({ CODEBURN_PROGRESS: '1' })
+  })
+})
+
+describe('leftoverBundle', () => {
+  it('reads the path off a marker line and ignores everything else', () => {
+    expect(leftoverBundle('CODEBURN_LEFTOVER /Applications/CodeBurnMenubar.app')).toBe('/Applications/CodeBurnMenubar.app')
+    expect(leftoverBundle('An older copy is still at /Applications/CodeBurnMenubar.app.')).toBeNull()
+    expect(leftoverBundle('CODEBURN_LEFTOVER ')).toBeNull()
   })
 })

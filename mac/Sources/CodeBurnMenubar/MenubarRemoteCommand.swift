@@ -7,14 +7,18 @@ enum MenubarRemoteCommand: String {
     case quit
     case uninstall
     case settings
+    /// Quit and come straight back up, started by this app rather than by
+    /// whoever asked for it. See `AppRelaunch`.
+    case relaunch
 
     /// Whether this command should call `SMAppService.mainApp.unregister()`.
     var unregistersLoginItem: Bool {
         self == .uninstall
     }
 
-    /// Whether this command should terminate the app. `settings` instead opens
-    /// the settings window and activates the app.
+    /// Whether this command should terminate the app for good. `settings`
+    /// instead opens the settings window and activates the app, and `relaunch`
+    /// goes through `AppRelaunch`, which starts the replacement first.
     var terminates: Bool {
         self == .quit || self == .uninstall
     }

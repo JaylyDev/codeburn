@@ -108,6 +108,10 @@ export type ProviderCost = {
   calls?: number
   /** True when the selected period contains cost, calls, sessions, savings, or tokens. */
   hasUsage?: boolean
+  /** Set only on a provider whose spend the headline deliberately leaves out
+   *  (daily aggregates that local tools already report — see
+   *  `excludeProviderFromDay`). Add-only: absent means "counted". */
+  excludedFromTotal?: boolean
   /** Provider-scoped tokens for the period. Absent (not zero) when no day in the
    *  period carried a per-provider token breakdown, so a consumer can tell
    *  "no token data" from "no tokens". */
@@ -353,6 +357,12 @@ export type MenubarPayload = {
       cost: number
       calls: number
       hasUsage: boolean
+      /// Present (and always `true`) only on a provider this payload's totals
+      /// deliberately exclude: its rows are daily aggregates the local tools
+      /// pointed at it already report, so counting both double counts. The
+      /// row still carries the real `cost` — a consumer must label it, never
+      /// add it to `cost`.
+      excludedFromTotal?: boolean
       inputTokens?: number
       outputTokens?: number
       sessions?: number
@@ -650,6 +660,7 @@ function buildProviderDetails(providers: ProviderCost[]): MenubarPayload['curren
       cost: p.cost,
       calls: p.calls ?? 0,
       hasUsage: p.hasUsage ?? (p.cost > 0 || (p.calls ?? 0) > 0),
+      ...(p.excludedFromTotal ? { excludedFromTotal: true as const } : {}),
       ...(p.inputTokens === undefined ? {} : { inputTokens: p.inputTokens }),
       ...(p.outputTokens === undefined ? {} : { outputTokens: p.outputTokens }),
       ...(p.sessions === undefined ? {} : { sessions: p.sessions }),

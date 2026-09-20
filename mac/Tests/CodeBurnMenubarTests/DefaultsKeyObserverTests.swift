@@ -15,7 +15,7 @@ struct DefaultsKeyObserverTests {
     @Test("a change to the watched key calls back")
     func firesOnChange() async throws {
         let (defaults, name) = suite()
-        defer { UserDefaults.standard.removePersistentDomain(forName: name) }
+        defer { TestDefaults.forget(name) }
         defaults.set(false, forKey: CapacityDockPreferences.enabledKey)
 
         let fired = Counter()
@@ -35,7 +35,7 @@ struct DefaultsKeyObserverTests {
     @Test("another key in the same domain is not the dock's business")
     func ignoresOtherKeys() throws {
         let (defaults, name) = suite()
-        defer { UserDefaults.standard.removePersistentDomain(forName: name) }
+        defer { TestDefaults.forget(name) }
 
         let fired = Counter()
         let observer = DefaultsKeyObserver(defaults: defaults, key: CapacityDockPreferences.enabledKey) {
@@ -50,7 +50,7 @@ struct DefaultsKeyObserverTests {
     @Test("a released observer stops watching, so a torn-down dock leaves nothing behind")
     func stopsAfterRelease() throws {
         let (defaults, name) = suite()
-        defer { UserDefaults.standard.removePersistentDomain(forName: name) }
+        defer { TestDefaults.forget(name) }
 
         let fired = Counter()
         var observer: DefaultsKeyObserver? = DefaultsKeyObserver(

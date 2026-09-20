@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, readFile, readdir, rm } from 'fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
@@ -173,6 +173,18 @@ describe('exportCsv', () => {
     expect(models).toContain(',1,100,0,')
   })
 
+  it('nests into a dated subfolder when the destination is an existing folder', async () => {
+    // The desktop app passes a real folder (e.g. Desktop) with unrelated files in it.
+    await writeFile(join(tmpDir, 'unrelated.txt'), 'keep me', 'utf-8')
+    const periods: PeriodExport[] = [{ label: '30 Days', projects: [makeProject('app')] }]
+
+    const folder = await exportCsv(periods, tmpDir)
+
+    expect(folder.startsWith(join(tmpDir, 'codeburn-export-'))).toBe(true)
+    expect(await readFile(join(tmpDir, 'unrelated.txt'), 'utf-8')).toBe('keep me')
+    expect(await readFile(join(folder, 'summary.csv'), 'utf-8')).toContain('Period')
+  })
+
   it('does not crash when periods array is empty', async () => {
     const outputPath = join(tmpDir, 'empty.csv')
     const folder = await exportCsv([], outputPath)
@@ -342,6 +354,42 @@ describe('exportJson', () => {
     expect(data.records).toHaveLength(2)
     expect(data.records[0]).not.toHaveProperty('supplementary')
     expect(data.records[1]).toMatchObject({ supplementary: true, cost: 0.5 })
+  })
+
+  it('writes a dated file inside the folder when the destination is an existing folder', async () => {
+    // The desktop app passes the folder the user picked; `${dir}.json` wrote a sibling of it.
+    await writeFile(join(tmpDir, 'unrelated.txt'), 'keep me', 'utf-8')
+    const periods: PeriodExport[] = [{ label: '30 Days', projects: [makeProject('app')] }]
+
+    const saved = await exportJson(periods, tmpDir)
+
+    expect(saved.startsWith(join(tmpDir, 'codeburn-export-'))).toBe(true)
+    expect(saved.endsWith('.json')).toBe(true)
+    expect(JSON.parse(await readFile(saved, 'utf-8')).schema).toBe('codeburn.export.v2')
+    expect(await readFile(join(tmpDir, 'unrelated.txt'), 'utf-8')).toBe('keep me')
+  })
+
+  it('creates a folder named with a trailing separator and writes inside it', async () => {
+    const periods: PeriodExport[] = [{ label: '30 Days', projects: [makeProject('app')] }]
+    const folder = join(tmpDir, 'new-exports')
+
+    const saved = await exportJson(periods, `${folder}/`)
+
+    expect(saved.startsWith(join(folder, 'codeburn-export-'))).toBe(true)
+    expect(JSON.parse(await readFile(saved, 'utf-8')).schema).toBe('codeburn.export.v2')
+  })
+
+  it('still appends .json to a destination that is not a folder', async () => {
+    const periods: PeriodExport[] = [{ label: '30 Days', projects: [makeProject('app')] }]
+    const saved = await exportJson(periods, join(tmpDir, 'report'))
+    expect(saved).toBe(join(tmpDir, 'report.json'))
+  })
+
+  it('still refuses to overwrite a file inside the folder that is not a codeburn export', async () => {
+    const periods: PeriodExport[] = [{ label: '30 Days', projects: [makeProject('app')] }]
+    const saved = await exportJson(periods, tmpDir)
+    await writeFile(saved, '{"schema": "something.else"}', 'utf-8')
+    await expect(exportJson(periods, tmpDir)).rejects.toThrow(/Refusing to overwrite/)
   })
 
   it('includes an mcp section with per-server usage', async () => {

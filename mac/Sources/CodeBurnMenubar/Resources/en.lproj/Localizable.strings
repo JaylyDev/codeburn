@@ -721,3 +721,9 @@
 "%1$@ · %2$@ at 80%%" = "%1$@ · %2$@ at 80%%";
 "%1$@ · %2$@ limit reached" = "%1$@ · %2$@ limit reached";
 "Quota crossings (%1$lld%% and %2$lld%%)" = "Quota crossings (%1$lld%% and %2$lld%%)";
+
+/* MARK: Privacy */
+"Privacy" = "Privacy";
+"Anonymous usage statistics" = "Anonymous usage statistics";
+"Controlled in the CodeBurn desktop app." = "Controlled in the CodeBurn desktop app.";
+"Optional usage statistics: the names of the models, tools and providers you use, with bucketed counts of how often each one came up, plus when the app is opened. A random install id, the app version and your country code travel with them. Never your prompts, your code, your project and file names, or exact amounts." = "Optional usage statistics: the names of the models, tools and providers you use, with bucketed counts of how often each one came up, plus when the app is opened. A random install id, the app version and your country code travel with them. Never your prompts, your code, your project and file names, or exact amounts.";

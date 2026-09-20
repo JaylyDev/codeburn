@@ -55,13 +55,12 @@ Supported M1 periods are `today`, `week`, `30days`, `month`, and `all`. Provider
 
 ## Packaging
 
-`npm run package` produces an ad-hoc-signed macOS `.dmg`/`.zip` (arm64 and x64) via `electron-builder`, no paid Apple Developer account required. Packaging rebuilds the root CLI and bundles it into the app (`Resources/cli`), so installs need nothing on the target machine. See `DISTRIBUTION.md` for build instructions, the bundled-CLI mechanism, artifact locations, and the Gatekeeper first-open story.
+`npm run package` produces a macOS `.dmg`/`.zip` (arm64 and x64) via `electron-builder`. Release builds are signed with a Developer ID Application certificate and notarized by Apple (ad-hoc signing is only a fallback when no signing identity is configured). Packaging rebuilds the root CLI and bundles it into the app (`Resources/cli`), so installs need nothing on the target machine. See `DISTRIBUTION.md` for build instructions, the bundled-CLI mechanism, artifact locations, and the notarization process.
 
 ## M2 Backlog
 
 - Add Electron `autoUpdater` (the app already bundles its own version-matched CLI, so end-user installs need nothing on the machine; auto-update is the remaining piece).
 - Keep npm as a separate CLI-user channel at the same version as the desktop app.
-- Add macOS code signing with a paid Developer ID and notarization (ad-hoc packaging exists today; see `DISTRIBUTION.md`).
 - Add a `codeburn desktop` launcher subcommand.
 - Implement in-app pairing, approve, pull, and visibility mutations currently shown as M2 affordances.
 - Build the Models Compare sheet.

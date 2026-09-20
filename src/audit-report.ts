@@ -1,4 +1,4 @@
-import { isBehavioralCall } from './behavioral-weight.js'
+import { behavioralCallWeight } from './behavioral-weight.js'
 import { billableOutputTokens, fallbackRawModelDisplayName, getModelCosts, getShortModelName, sanitizeModelForDisplay, type ModelCosts } from './models.js'
 import { getProvider } from './providers/index.js'
 import { formatCost, formatTokens } from './format.js'
@@ -101,7 +101,7 @@ export async function aggregateAudit(projects: ProjectSummary[]): Promise<AuditR
           bucket.attributedCostUSD += call.costUSD
           // Supplementary accounting calls keep their tokens and cost above but are not
           // distinct requests, so they add no call weight (see behavioral-weight.ts).
-          if (isBehavioralCall(call)) bucket.calls += 1
+          bucket.calls += behavioralCallWeight(call)
         }
       }
     }

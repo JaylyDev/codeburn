@@ -714,3 +714,9 @@
 "%1$@ · %2$@ at 80%%" = "%1$@ · %2$@ à 80%%";
 "%1$@ · %2$@ limit reached" = "%1$@ · %2$@ limite atteinte";
 "Quota crossings (%1$lld%% and %2$lld%%)" = "Franchissements de quota (%1$lld%% et %2$lld%%)";
+
+/* MARK: Privacy */
+"Privacy" = "Confidentialité";
+"Anonymous usage statistics" = "Statistiques d'usage anonymes";
+"Controlled in the CodeBurn desktop app." = "Géré dans l'application de bureau CodeBurn.";
+"Optional usage statistics: the names of the models, tools and providers you use, with bucketed counts of how often each one came up, plus when the app is opened. A random install id, the app version and your country code travel with them. Never your prompts, your code, your project and file names, or exact amounts." = "Statistiques d'usage optionnelles : les noms des modèles, outils et fournisseurs que vous utilisez, avec des compteurs groupés indiquant leur fréquence d'apparition, ainsi que les ouvertures de l'application. Un identifiant d'installation aléatoire, la version de l'application et votre code pays les accompagnent. Jamais vos prompts, votre code, les noms de vos projets et fichiers, ni les montants exacts.";

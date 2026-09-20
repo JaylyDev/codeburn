@@ -74,6 +74,8 @@ export type CachedCall = {
   // depend on the `:obs:` key regex alone. Copilot still assigns the flag
   // at serve time and does not persist it.
   supplementaryAccounting?: boolean
+  // Requests this one call stands for (see ParsedProviderCall.requestCount).
+  requestCount?: number
   // Billing route id the provider recorded (see ParsedProviderCall).
   // Persisted so the row key survives the cache; a cached call without it is
   // a direct-door call or one parsed before the provider carried the column
@@ -428,6 +430,11 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // `billing` (`included` -> subscription, `actual` -> metered). Cached calls
   // hold none, so they must re-parse.
   hermes: 'reasoning-output-accounting-v1-est-cost-routed-ids-workspace-pr-v5-cost-provenance-v3-billing-route-v1-billing-mode-v1',
+  // reported-cost-v1: OpenClaw's per-message `usage.cost.total` is now
+  // preserved through the cache via `costFromBilling`. This is OpenClaw's
+  // first parse version; adding it moves the provider's env fingerprint,
+  // which is what forces the one re-parse that lands the reported dollars.
+  openclaw: 'reported-cost-v1',
   'lingtai-tui': 'token-ledger-registry-activity-v3',
   'ibm-bob': 'worktree-project-grouping-v1',
   // project-path-v1: the parser now records the session's full working
@@ -454,7 +461,12 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // projectPath/workingDirectory instead of basename-only identity.
   // project-group-by-abs-v1 (#1260): parseProviderSources groups by abs
   // projectPath/workingDirectory so same-basename distinct roots stay apart.
-  pi: 'cwd-project-path-v1-project-group-by-abs-v1',
+  // reported-cost-v1: Pi writes a per-message `usage.cost.total`, which is now
+  // preserved through the cache via `costFromBilling` instead of being
+  // re-priced from tokens on every read. (omp, the same parser, has carried
+  // reported costs since reported-cost-v2 below.) Cached calls hold
+  // costUSD: undefined, so they must re-parse once.
+  pi: 'cwd-project-path-v1-project-group-by-abs-v1-reported-cost-v1',
   // project-group-by-abs-v1: shared Pi/OMP serve grouping uses abs identity.
   omp: 'nested-agent-v1-reported-cost-v2-cwd-project-path-v1-project-group-by-abs-v1',
   // archived-subtree-v1 (#1362): the subtree walk no longer filters
@@ -482,7 +494,13 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // billing-routes-v2: its warm cache must move with both shared route fields.
   'kilo-code': 'worktree-project-grouping-v1-session-model-v1-archived-subtree-v1-billing-routes-v2',
   'roo-code': 'worktree-project-grouping-v1',
-  warp: 'worktree-project-grouping-v1-est-cost',
+  // billing-cost-v1: Warp's own billing record (total_provider_cost_in_cents,
+  // total_charged_usage, credits_spent) now rides on each call as
+  // `costFromBilling` and is preserved by providerCallToCachedCall. Entries
+  // cached before this hold costUSD: undefined and are re-priced from the
+  // token floor on every read, so they must re-parse once for the real dollars
+  // to land.
+  warp: 'worktree-project-grouping-v1-est-cost-billing-cost-v1',
   antigravity: 'worktree-project-grouping-v6',
 }
 
@@ -624,6 +642,17 @@ export function markCacheDirty(cache: SessionCache, provider: string, filePath?:
 /** True when any provider section changed since the last save. */
 export function isCacheDirty(cache: SessionCache): boolean {
   return stateOf(cache).dirty
+}
+
+/** True when a dirty bucket belongs to a provider whose cache entry is the ONLY
+ *  surviving record of that spend (see {@link DURABLE_PROVIDER_NAMES}): the
+ *  source can be pruned before the next publish, so such a window must never be
+ *  held back by the resident process's coalescing. */
+export function hasDirtyDurableProvider(cache: SessionCache): boolean {
+  for (const provider of stateOf(cache).dirtyBuckets.keys()) {
+    if (DURABLE_PROVIDER_NAMES.has(provider)) return true
+  }
+  return false
 }
 
 // ── Env Fingerprint ────────────────────────────────────────────────────
@@ -809,6 +838,7 @@ function validateCall(c: unknown): c is CachedCall {
     && isOptionalNum(o['toolErrors'])
     && isOptionalNum(o['editFailed'])
     && isOptionalBool(o['supplementaryAccounting'])
+    && isOptionalNum(o['requestCount'])
     && isOptionalString(o['route'])
     && (o['billing'] === undefined || parseBillingMode(o['billing'] as string) !== undefined)
     && validateUsage(o['usage'])
@@ -970,6 +1000,17 @@ let cacheMemo: { dir: string; nonce: string; scope: string; cache: SessionCache 
 export function clearLoadCacheMemo(): void {
   cacheMemo = null
   clearShardMemo()
+}
+
+/// Is this in-memory cache still the one the published envelope describes? A
+/// holder that deferred its publish (see the coalescing window in parser.ts)
+/// asks before writing: if another process has published since, this object is
+/// a stale pre-image and saving it could drop that process's entries. Dropping
+/// the deferred write instead costs a re-parse, never a wrong number.
+export async function isCacheCurrent(cache: SessionCache): Promise<boolean> {
+  if (!cacheMemo || cacheMemo.cache !== cache) return false
+  const live = await readEnvelope(cacheMemo.dir)
+  return live?.nonce === cacheMemo.nonce
 }
 
 /** Months (UTC `YYYY-MM`, inclusive) a query can possibly report on. The load

@@ -47,7 +47,7 @@ export function writeDisabledProviders(disabled: ProviderName[]): void {
   try { globalThis.localStorage?.setItem(DISABLED_KEY, JSON.stringify(disabled)) } catch { /* storage can be unavailable in hardened contexts */ }
 }
 
-export type DetectedProvider = { id: string; label: string; cost: number; idle: boolean }
+export type DetectedProvider = { id: string; label: string; cost: number; idle: boolean; excludedFromTotal?: boolean }
 
 /**
  * Every provider the CLI found on this machine, whether or not it billed
@@ -59,7 +59,16 @@ export function detectedProviders(current: MenubarPayload['current'] | undefined
   if (!current) return []
   if (current.providerDetails) {
     return [...current.providerDetails]
-      .map(entry => ({ id: entry.id, label: entry.label, cost: entry.cost, idle: entry.hasUsage === false }))
+      .map(entry => ({
+        id: entry.id,
+        label: entry.label,
+        cost: entry.cost,
+        idle: entry.hasUsage === false,
+        // Real spend, deliberately outside the headline: the CLI flags a
+        // provider whose rows are daily aggregates the local tools already
+        // report. Label it, never subtract or hide it.
+        ...(entry.excludedFromTotal ? { excludedFromTotal: true as const } : {}),
+      }))
       .sort((a, b) => Number(a.idle) - Number(b.idle) || (a.idle ? a.label.localeCompare(b.label) : b.cost - a.cost))
   }
   // Fallback map keys are lowercased display names; ones with spaces ("grok

@@ -42,7 +42,7 @@ import { localDateKey, PERIOD_LABELS } from './lib/period'
 import { generationAt } from './lib/generation'
 import { detectedProviders as detectedProviderList, providerLabel, readDisabledProviders, type DetectedProvider } from './lib/providers'
 import { reportMemoKey } from './lib/reportMemoKey'
-import { persistRefreshValue, readRefreshValue, refreshValueToMs, RefreshCadenceContext, type RefreshCadence } from './lib/refreshCadence'
+import { persistRefreshValue, readRefreshValue, resolveCadenceMs, useOnBattery, RefreshCadenceContext, type RefreshCadence } from './lib/refreshCadence'
 import { OverviewContent, type InvestigateRequest } from './sections/Overview'
 import { OptimizeContent } from './sections/Optimize'
 import { Models } from './sections/Models'
@@ -276,9 +276,12 @@ export function App() {
     setRefreshValue(value)
     persistRefreshValue(value)
   }, [])
+  // On battery the live tier runs half as often; the user's chosen value is
+  // still the base, and AC restores it.
+  const onBattery = useOnBattery()
   const cadence = useMemo<RefreshCadence>(
-    () => ({ value: refreshValue, intervalMs: refreshValueToMs(refreshValue), setValue }),
-    [refreshValue, setValue],
+    () => ({ value: refreshValue, intervalMs: resolveCadenceMs(refreshValue, onBattery), setValue }),
+    [refreshValue, onBattery, setValue],
   )
   return (
     <RefreshCadenceContext.Provider value={cadence}>
@@ -971,7 +974,7 @@ function AppMain() {
             />
             <div className={motionClass('body', 'section-fade')}>
               {section === 'overview' ? (
-                <OverviewContent period={period} provider={provider} range={customRange} overview={overview} onNavigate={navigate} onInvestigate={investigate} ready={ready} scope={scope} headlineSnapshot={headlineSnapshot} />
+                <OverviewContent period={period} provider={provider} range={customRange} overview={overview} onNavigate={navigate} onInvestigate={investigate} ready={ready} scope={scope} configSource={claudeConfigSource} refreshToken={refreshToken} headlineSnapshot={headlineSnapshot} />
               ) : section === 'sessions' ? (
                 // A new sort or a changed selection reorders the whole list, so
                 // the pagination depth resets IN THE SAME commit — one history
@@ -983,7 +986,7 @@ function AppMain() {
               ) : section === 'spend' ? (
                 <SpendContent period={period} provider={provider} range={customRange} overview={overview} refreshToken={refreshToken} ready={ready} onInvestigate={investigate} />
               ) : section === 'optimize' ? (
-                <OptimizeContent period={period} provider={provider} range={customRange} overview={overview} refreshToken={refreshToken} ready={ready} />
+                <OptimizeContent period={period} provider={provider} range={customRange} overview={overview} refreshToken={refreshToken} ready={ready} configSource={claudeConfigSource} scope={scope} />
               ) : section === 'models' ? (
                 <Models period={period} provider={provider} range={customRange} refreshToken={refreshToken} onNavigate={navigate} onInvestigate={investigate} ready={ready} />
               ) : section === 'compare' ? (

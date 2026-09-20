@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 
 import { Hint } from '../components/Hint'
 import { CliErrorText, cliErrorDisplay } from '../components/CliErrorPanel'
@@ -29,7 +29,7 @@ import { rateLimitedNote } from './Plans'
 import { SharingPane } from './SettingsSharing'
 import { CapacityDockPane, MenuBarPane } from './SettingsTray'
 import type { ActionResult, AliasRow, ClaudeConfigSelector, CompanionStatus, CliError, CombinedUsage, DeviceScanResult, Identity, JsonPlanSummary, MenubarPayload, Period, PlanId, PlanProvider, PriceOverrideList, PriceOverrideRow, PriceRates, ProjectFilter, ProjectRow, ProjectsReport, ProviderName, QuotaProvider, Scope, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
-import { Icon, type IconName } from '../components/icons'
+import { Icon } from '../components/icons'
 
 export type SettingsPane = 'general' | 'providers' | 'projects' | 'aliases' | 'pricing' | 'plans' | 'devices' | 'export' | 'privacy' | 'sharing' | 'menubar'
 type Pane = SettingsPane
@@ -177,7 +177,7 @@ export function Settings({ period, refreshToken = 0, onNavigate, initialPane, cl
         </nav>
         <main className="set-pane">
           {pane === 'general' && <GeneralPane period={period} refreshToken={refreshToken} claudeConfigs={claudeConfigs} claudeConfigSource={claudeConfigSource} onConfigMutated={onConfigMutated} scope={scope} onScopeChange={onScopeChange} projectFiltered={projectFiltered} />}
-          {pane === 'providers' && <ProvidersPane period={period} refreshToken={refreshToken} />}
+          {pane === 'providers' && <ProvidersPane refreshToken={refreshToken} />}
           {pane === 'projects' && <ProjectsPane refreshToken={refreshToken} onConfigMutated={onConfigMutated} />}
           {pane === 'aliases' && <AliasesPane refreshToken={refreshToken} onConfigMutated={onConfigMutated} />}
           {pane === 'pricing' && <PricingPane refreshToken={refreshToken} onConfigMutated={onConfigMutated} />}
@@ -185,7 +185,7 @@ export function Settings({ period, refreshToken = 0, onNavigate, initialPane, cl
           {pane === 'devices' && <DevicesPane period={period} refreshToken={refreshToken} />}
           {pane === 'export' && <ExportPane period={period} refreshToken={refreshToken} />}
           {pane === 'sharing' && <SharingPane />}
-          {pane === 'privacy' && <PrivacyPane />}
+          {pane === 'privacy' && <PrivacyPane onPane={setPane} />}
           {pane === 'menubar' && (
             // A clear gap between the Menu bar card and the Capacity Dock card, since the two
             // sections share one pane rather than sitting behind separate rail entries.
@@ -296,12 +296,15 @@ function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, 
   )
 }
 
-function ProvidersPane({ period, refreshToken }: { period: Period; refreshToken: number }) {
-  const overview = usePolled<MenubarPayload>(() => codeburn.getOverview(period, 'all'), [period, refreshToken])
+function ProvidersPane({ refreshToken }: { refreshToken: number }) {
+  // Detection only needs to know which providers are live and a small headline, so it
+  // always uses a cheap 1-day window instead of the global period — a 6-month period
+  // would otherwise recompute every provider over 6 months just to render this list.
+  const overview = usePolled<MenubarPayload>(() => codeburn.getOverview('today', 'all'), [refreshToken])
   const providers = detectedProviders(overview.data?.current)
   return <section className="set-p on">
     <div><h3 className="set-h">{t('settings.providers.heading')}</h3><p className="set-sub">{t('settings.providers.subtitle')}</p></div>
-    {overview.error ? <SettingsErrorText error={overview.error} /> : !overview.data ? <p className="set-cap">{t('settings.providers.loading')}</p> : providers.length === 0 ? <p className="set-cap">{t('settings.providers.empty')}</p> : providers.map(entry => <div className="card" key={entry.id}><div className="set-prov-head"><ProviderLogo provider={entry.id} /><span className="set-prov-name">{entry.label}</span><span className="set-status"><span className={entry.idle ? 'set-dot' : 'set-dot ok'} />{entry.idle ? t('settings.providers.idle') : t('settings.providers.detected', { cost: formatUsd(entry.cost) })}</span></div></div>)}
+    {overview.error ? <SettingsErrorText error={overview.error} /> : !overview.data ? <p className="set-cap">{t('settings.providers.loading')}</p> : providers.length === 0 ? <p className="set-cap">{t('settings.providers.empty')}</p> : providers.map(entry => <div className="card" key={entry.id}><div className="set-prov-head"><ProviderLogo provider={entry.id} /><span className="set-prov-name">{entry.label}</span><span className="set-status"><span className={entry.idle ? 'set-dot' : 'set-dot ok'} />{entry.idle ? t('settings.providers.idle') : t('settings.providers.detected', { cost: formatUsd(entry.cost) })}{entry.excludedFromTotal ? <span className="set-cap" title={t('settings.providers.notInTotalHint')}> · {t('settings.providers.notInTotal')}</span> : null}</span></div></div>)}
   </section>
 }
 
@@ -374,7 +377,7 @@ function ProjectsPane({ refreshToken, onConfigMutated }: { refreshToken: number;
   const orphans = report.data ? filter.exclude.filter(entry => !projects.some(project => projectMatches(project, entry))) : []
   const hiddenCount = projects.filter(project => !projectVisible(project, filter)).length
 
-  return <section className="set-p on">
+  return <section className="set-p set-p-wide on">
     <div><h3 className="set-h">{t('settings.projects.heading')}</h3><p className="set-sub">{t('settings.projects.subtitle')}</p></div>
     {filter.project.length > 0 && <div className="card"><div className="about-row">
       <span className="tx">{t('settings.projects.matchingPrefix')} <span className="set-mono">{filter.project.join(', ')}</span></span>
@@ -427,7 +430,7 @@ function AliasesPane({ refreshToken, onConfigMutated }: { refreshToken: number; 
     setActionNonce(value => value + 1)
     onConfigMutated?.()
   }
-  return <section className="set-p on">
+  return <section className="set-p set-p-wide on">
     <div><h3 className="set-h">{t('settings.aliases.heading')}</h3><p className="set-sub">{t('settings.aliases.subtitle')}</p></div>
     <div className="card"><div className="about-sec set-last-sec">
       {aliases.error ? <SettingsErrorText error={aliases.error} /> : !aliases.data ? <p className="set-cap">{t('settings.aliases.loading')}</p> : aliases.data.length === 0 ? <p className="set-cap set-alias-empty">{t('settings.aliases.empty')}</p> : aliases.data.map(alias => <div className="set-alias" key={alias.from}><span className="set-mono">{alias.from}</span><span className="set-alias-ar">→</span><span className="set-mono set-alias-to">{alias.to}</span><button className="btnp" onClick={() => void codeburn.removeAlias(alias.from).then(result => complete(result))}>{t('settings.action.remove')}</button></div>)}
@@ -486,7 +489,7 @@ function PricingPane({ refreshToken, onConfigMutated }: { refreshToken: number; 
     void codeburn.setPriceOverride(model.trim(), rates).then(result => complete(result, true))
   }
 
-  return <section className="set-p on">
+  return <section className="set-p set-p-wide on">
     <div><h3 className="set-h">{t('settings.pricing.heading')}</h3><p className="set-sub">{t('settings.pricing.subtitle')}</p></div>
     <div className="card"><div className="about-sec set-last-sec">
       {overrides.error ? <SettingsErrorText error={overrides.error} /> : !overrides.data ? <p className="set-cap">{t('settings.pricing.loading')}</p> : overrides.data.overrides.length === 0 ? <p className="set-cap set-alias-empty">{t('settings.pricing.empty')}</p> : overrides.data.overrides.map(override => <div className="set-price-row" key={override.model}><span className="set-mono">{override.model}</span><span className="set-price-rates">{priceRateSummary(override)}</span><ConfirmButton label={t('settings.action.remove')} prompt={t('settings.confirm.removePrompt')} onConfirm={() => void codeburn.removePriceOverride(override.model).then(result => complete(result))} /></div>)}
@@ -620,7 +623,7 @@ function ExportPane({ period, refreshToken }: { period: Period; refreshToken: nu
       // machine and never leaves it.
       trackEvent('export', { format, provider })
       const result = await codeburn.exportData(format, provider, destination)
-      showToast(result.ok ? t('settings.export.exported', { destination }) : (result.stderr || t('settings.export.failed')), result.ok ? 'ok' : 'error')
+      showToast(result.ok ? t('settings.export.exported', { destination: result.savedPath ?? destination }) : (result.stderr || t('settings.export.failed')), result.ok ? 'ok' : 'error')
     } finally {
       setExporting(false)
     }
@@ -650,22 +653,55 @@ function DevicesPane({ period, refreshToken }: { period: Period; refreshToken: n
   return <section className="set-p on"><div><h3 className="set-h">{t('settings.devices.heading')}</h3><p className="set-sub">{t('settings.devices.subtitle')}</p></div><ThisDevicePanel identity={identity} shareStatus={shareStatus} /><DiscoveredPanel scan={scan} /><PairedPanel devices={devices} period={period} onRefresh={refresh} /></section>
 }
 
-function PrivacyPane() {
+const TELEMETRY_DOC_URL = 'https://www.codeburn.app/telemetry'
+
+function PrivacyPane({ onPane }: { onPane: (pane: Pane) => void }) {
+  const shareStatus = usePolled<ShareStatus>(() => codeburn.getShareStatus(), [])
   const clearSnapshots = () => {
     clearPolledMemo()
     clearOverviewHeadlines()
     showToast(t('settings.privacy.snapshotsCleared'), 'ok')
   }
-  return <section className="set-p on"><div><h3 className="set-h">{t('settings.privacy.heading')}</h3><p className="set-sub">{t('settings.privacy.subtitle')}</p></div><div className="card">
-    <PrivacyClaim title={t('settings.privacy.localOnly.title')} detail={t('settings.privacy.localOnly.detail')} icon="lock" />
-    <PrivacyClaim title={t('settings.privacy.noApiKeys.title')} detail={t('settings.privacy.noApiKeys.detail')} icon="shield" />
-    <div className="set-claim"><Icon name="trash-2" /><div style={{ flex: 1 }}><div className="set-claim-t">{t('settings.privacy.snapshots.title')}</div><div className="set-claim-d">{t('settings.privacy.snapshots.detail')}</div></div><button type="button" className="btnp" onClick={clearSnapshots}>{t('settings.privacy.clearButton')}</button></div>
-    <TelemetryClaim />
-  </div></section>
+  return <section className="set-p on">
+    <div><h3 className="set-h">{t('settings.privacy.heading')}</h3><p className="set-sub">{t('settings.privacy.subtitle')}</p></div>
+    <div className="card"><div className="about-sec set-last-sec set-rows">
+      <TelemetryRow />
+      <SettingRow
+        title={t('settings.privacy.sharing.title')}
+        description={shareStatus.data?.sharing ? t('settings.privacy.sharing.on') : t('settings.privacy.sharing.off')}
+        control={labelId => <RowButton labelId={labelId} label={t('settings.privacy.sharing.manage')} onClick={() => onPane('devices')} />}
+      />
+      <SettingRow
+        title={t('settings.privacy.snapshots.title')}
+        description={t('settings.privacy.snapshots.detail')}
+        control={labelId => <RowButton labelId={labelId} label={t('settings.privacy.clearButton')} onClick={clearSnapshots} />}
+      />
+      <SettingRow
+        title={t('settings.privacy.export.title')}
+        description={t('settings.privacy.export.detail')}
+        control={labelId => <RowButton labelId={labelId} label={t('settings.privacy.export.button')} onClick={() => onPane('export')} />}
+      />
+    </div></div>
+  </section>
+}
+
+/** One settings row: title over description on the left, exactly one control on the right. */
+function SettingRow({ title, description, control }: { title: string; description: React.ReactNode; control: (labelId: string) => React.ReactNode }) {
+  const labelId = useId()
+  return <div className="about-row">
+    <span className="tx"><span id={labelId}>{title}</span><small>{description}</small></span>
+    <span className="r">{control(labelId)}</span>
+  </div>
+}
+
+/** Secondary row action, named by its own verb plus the row it acts on. */
+function RowButton({ labelId, label, onClick }: { labelId: string; label: string; onClick: () => void }) {
+  const id = `${labelId}action`
+  return <button type="button" className="btnp" id={id} aria-labelledby={`${id} ${labelId}`} onClick={onClick}>{label}</button>
 }
 
 /** The anonymous-telemetry consent toggle, mirroring the onboarding decision. */
-function TelemetryClaim() {
+function TelemetryRow() {
   const [status, setStatus] = useState<TelemetryStatus | null>(null)
   useEffect(() => {
     if (typeof codeburn.telemetryStatus !== 'function') return
@@ -685,13 +721,15 @@ function TelemetryClaim() {
       if (optingIn && value?.enabled) trackEvent('settings_change', { setting: 'telemetry', value: true })
     }).catch(() => {})
   }
-  return <div className="set-claim"><Icon name="chart-column" /><div style={{ flex: 1 }}><div className="set-claim-t">{t('settings.privacy.telemetry.title')}</div><div className="set-claim-d">{t('settings.privacy.telemetry.detail')}</div></div>
-    <button type="button" role="switch" aria-checked={status.enabled} aria-label={t('settings.privacy.telemetry.title')} className={status.enabled ? 'switch on' : 'switch'} onClick={toggle}><span className="switch-knob" /></button>
-  </div>
-}
-
-function PrivacyClaim({ title, detail, icon }: { title: string; detail: string; icon: IconName }) {
-  return <div className="set-claim"><Icon name={icon} /><div style={{ flex: 1 }}><div className="set-claim-t">{title}</div><div className="set-claim-d">{detail}</div></div></div>
+  const detail = <>
+    {t('settings.privacy.telemetry.detail')}
+    <button type="button" className="set-text-button set-row-link" onClick={() => { void codeburn.openExternal?.(TELEMETRY_DOC_URL) }}>{t('settings.privacy.telemetry.learnMore')}<span aria-hidden="true"> →</span></button>
+  </>
+  return <SettingRow
+    title={t('settings.privacy.telemetry.title')}
+    description={detail}
+    control={labelId => <button type="button" role="switch" aria-checked={status.enabled} aria-labelledby={labelId} className={status.enabled ? 'switch on' : 'switch'} onClick={toggle}><span className="switch-knob" /></button>}
+  />
 }
 
 function ThisDevicePanel({ identity, shareStatus }: { identity: ReturnType<typeof usePolled<Identity>>; shareStatus: ReturnType<typeof usePolled<ShareStatus>> }) {

@@ -521,7 +521,7 @@ private struct GeneralSettingsTab: View {
                         Text(L("Relaunch to apply."))
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
-                        Button(L("Relaunch")) { relaunch() }
+                        Button(L("Relaunch")) { AppRelaunch.now() }
                     }
                 } else {
                     Text(L("Follows System Settings > Language & Region unless you pick one here."))
@@ -653,20 +653,11 @@ private struct GeneralSettingsTab: View {
                 tokenCustom = store.dailyTokenBudget > 0 && !tokenPresets.contains(store.dailyTokenBudget)
                 if tokenCustom { tokenText = trimNumber(store.dailyTokenBudget / 1_000_000) }
             }
+
+            PrivacySettingsSection()
         }
         .formStyle(.grouped)
         .padding()
-    }
-
-    /// Restarts through a detached shell so the new process is not a child of
-    /// the one being terminated. The delay lets this instance exit before `open`
-    /// looks for a running copy.
-    private func relaunch() {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/sh")
-        task.arguments = ["-c", "sleep 0.6; open -n \"\(Bundle.main.bundlePath)\""]
-        try? task.run()
-        NSApp.terminate(nil)
     }
 
     private func applyCurrency(code: String) {
@@ -682,6 +673,43 @@ private struct GeneralSettingsTab: View {
             CurrencyState.shared.apply(code: code, rate: fresh ?? cached, symbol: symbol)
         }
         CLICurrencyConfig.persist(code: code)
+    }
+}
+
+/// One toggle and one sentence. When the decision came from the desktop app's
+/// state file the toggle is a read-only readout of it: that file is the desktop
+/// app's to write, and one decision covers both apps.
+private struct PrivacySettingsSection: View {
+    /// Read on appear rather than in the initializer: resolving reads the
+    /// desktop app's state file, and an initializer runs on every rebuild of
+    /// the pane around it. Refreshed when the window comes forward, so a
+    /// decision changed in the desktop app shows without reopening Settings
+    /// and without anything polling for it.
+    @State private var status: TelemetryStatus?
+
+    var body: some View {
+        Section(L("Privacy")) {
+            Toggle(L("Anonymous usage statistics"), isOn: Binding(
+                get: { status?.enabled ?? false },
+                set: {
+                    Telemetry.shared.setEnabled($0)
+                    status = Telemetry.shared.status()
+                }
+            ))
+            .disabled(status?.isLocked ?? true)
+            if status?.isLocked == true {
+                Text(L("Controlled in the CodeBurn desktop app."))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            Text(L("Optional usage statistics: the names of the models, tools and providers you use, with bucketed counts of how often each one came up, plus when the app is opened. A random install id, the app version and your country code travel with them. Never your prompts, your code, your project and file names, or exact amounts."))
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+        .onAppear { status = Telemetry.shared.status() }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            status = Telemetry.shared.status()
+        }
     }
 }
 
@@ -707,7 +735,10 @@ private struct CapacityDockSettingsSection: View {
         Section(L("Capacity Dock")) {
             Toggle(L("Show Capacity Dock"), isOn: Binding(
                 get: { snapshot.isEnabled },
-                set: { CapacityDockPreferences.setEnabled($0) }
+                set: {
+                    CapacityDockPreferences.setEnabled($0)
+                    Telemetry.shared.track($0 ? "dock_enabled" : "dock_disabled")
+                }
             ))
 
             if !enabledEligibleProviders.isEmpty {

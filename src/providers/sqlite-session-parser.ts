@@ -202,7 +202,8 @@ function tryQuerySessionTokens(db: SqliteDatabase, sessionId: string, generation
       model: parsedModel?.model,
       providerID: parsedModel?.providerID,
     }
-  } catch {
+  } catch (err) {
+    if (isSqliteBusyError(err)) throw err
     return null
   }
 }
@@ -484,7 +485,11 @@ export async function discoverSqliteSessions(
 
     try {
       const generation = detectGeneration(db)
-      if (generation === null) continue
+      if (generation === null) {
+        const schema = validateSchemaDetailed(db)
+        if (!schema.ok) warnUnrecognizedSchemaOnce(config.displayName, schema.missing)
+        continue
+      }
 
       // Same projection on both generations; only the table name moves.
       const table = generation === 'v2' ? 'session_v2' : 'session'
@@ -514,7 +519,11 @@ export async function discoverSqliteSessions(
           provider: config.providerName,
         })
       }
-    } catch {
+    } catch (err) {
+      // A busy/locked DB (OpenCode or KiloCode open during the scan) is not an
+      // empty DB: let it reach the caller so discovery is marked failed rather
+      // than sealing an empty period as fully scanned.
+      if (isSqliteBusyError(err)) throw err
       // skip this DB
     } finally {
       db.close()

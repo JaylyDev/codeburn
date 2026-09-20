@@ -712,3 +712,9 @@
 "%1$@ · %2$@ at 80%%" = "%1$@ · %2$@ 已达 80%%";
 "%1$@ · %2$@ limit reached" = "%1$@ · %2$@ 已达上限";
 "Quota crossings (%1$lld%% and %2$lld%%)" = "配额跨越（%1$lld%% 与 %2$lld%%）";
+
+/* MARK: Privacy */
+"Privacy" = "隐私";
+"Anonymous usage statistics" = "匿名使用统计";
+"Controlled in the CodeBurn desktop app." = "由 CodeBurn 桌面应用管理。";
+"Optional usage statistics: the names of the models, tools and providers you use, with bucketed counts of how often each one came up, plus when the app is opened. A random install id, the app version and your country code travel with them. Never your prompts, your code, your project and file names, or exact amounts." = "可选的使用统计信息:您使用的模型、工具和服务商的名称,以及每项出现频率的分段计数,还有应用的打开次数。随附的还有随机安装 ID、应用版本和国家/地区代码。绝不包含您的提示词、代码、项目与文件名称或确切金额。";
