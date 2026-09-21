@@ -27,17 +27,46 @@
 
 <p align="center">If CodeBurn shows you something your bill never did, <a href="https://github.com/getagentseal/codeburn/stargazers">star the repo</a> so other developers find it, and consider <a href="https://github.com/sponsors/iamtoruk">sponsoring</a> to keep 41 integrations honest.</p>
 
+<p align="center"><sub>Starred by developers at</sub></p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Red%20Hat-1f1f1f?style=flat&logo=redhat&logoColor=white" alt="Red Hat" />
+  <img src="https://img.shields.io/badge/Microsoft-1f1f1f?style=flat" alt="Microsoft" />
+  <img src="https://img.shields.io/badge/Amazon%20Web%20Services-1f1f1f?style=flat" alt="Amazon Web Services" />
+  <img src="https://img.shields.io/badge/Alibaba-1f1f1f?style=flat" alt="Alibaba" />
+  <img src="https://img.shields.io/badge/IBM-1f1f1f?style=flat" alt="IBM" />
+  <img src="https://img.shields.io/badge/Google-1f1f1f?style=flat&logo=google&logoColor=white" alt="Google" />
+  <img src="https://img.shields.io/badge/SAP-1f1f1f?style=flat&logo=sap&logoColor=white" alt="SAP" />
+  <img src="https://img.shields.io/badge/Samsung-1f1f1f?style=flat&logo=samsung&logoColor=white" alt="Samsung" />
+  <img src="https://img.shields.io/badge/Tencent-1f1f1f?style=flat" alt="Tencent" />
+  <img src="https://img.shields.io/badge/Adobe-1f1f1f?style=flat" alt="Adobe" />
+  <img src="https://img.shields.io/badge/Accenture-1f1f1f?style=flat&logo=accenture&logoColor=white" alt="Accenture" />
+  <img src="https://img.shields.io/badge/Zalando-1f1f1f?style=flat&logo=zalando&logoColor=white" alt="Zalando" />
+  <img src="https://img.shields.io/badge/Apple-1f1f1f?style=flat&logo=apple&logoColor=white" alt="Apple" />
+  <img src="https://img.shields.io/badge/ByteDance-1f1f1f?style=flat&logo=bytedance&logoColor=white" alt="ByteDance" />
+  <img src="https://img.shields.io/badge/Bosch-1f1f1f?style=flat&logo=bosch&logoColor=white" alt="Bosch" />
+  <img src="https://img.shields.io/badge/Kakao-1f1f1f?style=flat&logo=kakao&logoColor=white" alt="Kakao" />
+  <img src="https://img.shields.io/badge/Delivery%20Hero-1f1f1f?style=flat" alt="Delivery Hero" />
+  <img src="https://img.shields.io/badge/Oracle-1f1f1f?style=flat" alt="Oracle" />
+  <img src="https://img.shields.io/badge/Siemens-1f1f1f?style=flat&logo=siemens&logoColor=white" alt="Siemens" />
+  <img src="https://img.shields.io/badge/NVIDIA-1f1f1f?style=flat&logo=nvidia&logoColor=white" alt="NVIDIA" />
+  <img src="https://img.shields.io/badge/Baidu-1f1f1f?style=flat&logo=baidu&logoColor=white" alt="Baidu" />
+  <img src="https://img.shields.io/badge/Mercedes--Benz-1f1f1f?style=flat" alt="Mercedes-Benz" />
+  <img src="https://img.shields.io/badge/Walmart-1f1f1f?style=flat" alt="Walmart" />
+  <img src="https://img.shields.io/badge/Salesforce-1f1f1f?style=flat" alt="Salesforce" />
+</p>
+
 <table align="center">
   <tr>
     <td align="center" width="50%">
       <strong>Desktop</strong><br/>
       <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/desktop.jpg" alt="CodeBurn Desktop" /><br/>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.24/CodeBurn-0.9.24-arm64.dmg"><img src="https://img.shields.io/badge/macOS-Apple_Silicon-F97316?logo=apple&logoColor=white" alt="Download for macOS (Apple Silicon)" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.24/CodeBurn-0.9.24.dmg"><img src="https://img.shields.io/badge/macOS-Intel-F97316?logo=apple&logoColor=white" alt="Download for macOS (Intel)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.25/CodeBurn-0.9.25-arm64.dmg"><img src="https://img.shields.io/badge/macOS-Apple_Silicon-F97316?logo=apple&logoColor=white" alt="Download for macOS (Apple Silicon)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.25/CodeBurn-0.9.25.dmg"><img src="https://img.shields.io/badge/macOS-Intel-F97316?logo=apple&logoColor=white" alt="Download for macOS (Intel)" /></a>
       <a href="https://apps.microsoft.com/detail/9P0R4ZL5XMB8"><img src="https://img.shields.io/badge/Windows-Microsoft_Store-F97316?logo=microsoft&logoColor=white" alt="Get CodeBurn from the Microsoft Store" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.24/codeburn-desktop_0.9.24_amd64.deb"><img src="https://img.shields.io/badge/Linux-.deb-F97316?logo=debian&logoColor=white" alt="Download for Linux (.deb)" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.24/codeburn-desktop-0.9.24.x86_64.rpm"><img src="https://img.shields.io/badge/Linux-.rpm-F97316?logo=redhat&logoColor=white" alt="Download for Linux (.rpm)" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.24/CodeBurn-0.9.24.AppImage"><img src="https://img.shields.io/badge/Linux-AppImage-F97316?logo=linux&logoColor=white" alt="Download for Linux (AppImage)" /></a><br/>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.25/codeburn-desktop_0.9.25_amd64.deb"><img src="https://img.shields.io/badge/Linux-.deb-F97316?logo=debian&logoColor=white" alt="Download for Linux (.deb)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.25/codeburn-desktop-0.9.25.x86_64.rpm"><img src="https://img.shields.io/badge/Linux-.rpm-F97316?logo=redhat&logoColor=white" alt="Download for Linux (.rpm)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.25/CodeBurn-0.9.25.AppImage"><img src="https://img.shields.io/badge/Linux-AppImage-F97316?logo=linux&logoColor=white" alt="Download for Linux (AppImage)" /></a><br/>
       <sub>🍎 macOS builds are signed with a Developer ID and notarized by Apple — no security warning on open.</sub>
     </td>
     <td align="center" width="50%">
@@ -57,7 +86,7 @@
       <img src="https://raw.githubusercontent.com/getagentseal/codeburn/main/assets/menubar-app.jpg" alt="CodeBurn macOS menubar" /><br/>
       <code>codeburn menubar</code><br/>
       <a href="https://apps.microsoft.com/detail/9P0R4ZL5XMB8"><img src="https://img.shields.io/badge/Windows-Microsoft_Store-F97316?logo=microsoft&logoColor=white" alt="Get CodeBurn from the Microsoft Store" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.24"><img src="https://img.shields.io/badge/Windows-Tray_app_.msi_(preview)-F97316?logo=windows&logoColor=white" alt="Download the CodeBurn Windows tray app developer preview (.msi)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.25"><img src="https://img.shields.io/badge/Windows-Tray_app_.msi_(preview)-F97316?logo=windows&logoColor=white" alt="Download the CodeBurn Windows tray app developer preview (.msi)" /></a>
     </td>
   </tr>
   <tr>
@@ -314,7 +343,7 @@ Pairing is PIN-authorized and stays on your local network. You can also discover
 codeburn menubar
 ```
 
-One command: downloads the latest `.app`, installs into `~/Applications`, and launches it. Re-run with `--force` to reinstall. The native Swift and SwiftUI app lives in `mac/` (see `mac/README.md` for build details).
+One command: downloads the latest `.app`, installs it, and launches it. A copy you already have is replaced where it lives, in `/Applications` or `~/Applications`, so you never end up with two bundles and two login items; if that folder cannot be written to, the install goes to `~/Applications` and names the old copy for you to move to the Trash. Re-run with `--force` to reinstall. Launching the app retires the copy already running, so there is only ever one flame in the menu bar. You can also install and manage it from the desktop app's Plugins page. The native Swift and SwiftUI app lives in `mac/` (see `mac/README.md` for build details).
 
 The menubar icon shows the spend period selected in Settings (Today by default; Week, Month, and 6 Months are also available). Non-today periods add a short suffix such as `$42 / mo` so the menu bar value stays clear. Click to open a popover with agent tabs, period switcher (Today, 7 Days, 30 Days, Month, All), Trend, Forecast, Pulse, Stats, and Plan insights, activity and model breakdowns, optimize findings, and CSV/JSON export. Refreshes every 30 seconds.
 
@@ -369,11 +398,13 @@ Windows gets the same ambient view from the system tray, from the same one comma
 codeburn menubar
 ```
 
-It downloads the `.msi` for your CLI version, verifies its sha256, runs it through `msiexec /passive`, and launches the tray app. Re-run with `--force` to reinstall; an already-installed matching version is just launched. You can also download the `.msi` yourself from the [latest Windows Menubar release](https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.24).
+It downloads the `.msi` for your CLI version, verifies its sha256, runs it through `msiexec /passive`, and launches the tray app. Re-run with `--force` to reinstall; an already-installed matching version is just launched. You can also download the `.msi` yourself from the [latest Windows Menubar release](https://github.com/getagentseal/codeburn/releases/tag/windows-v0.9.25).
 
 Today's spend sits in the tray as a number beside the flame icon (turn it off in Settings, and the tooltip always carries it). Click for the same popover the macOS app shows: agent tabs, period switcher, Trend, Forecast, Pulse, Stats and Plan insights, activity and model breakdowns, optimize findings, and CSV/JSON export. Settings covers launch at login, the tray number, theme, and currency. It refreshes every 60 seconds while the popover is open and every 2 minutes while it is closed.
 
-Turn on **Show Capacity Dock** in the tray menu for the same edge-docked quota rail the macOS menubar has: one ring per connected provider, hover for every quota window with its reset time, drag it to any screen edge. It is off by default and needs codeburn 0.9.24 or newer for `codeburn quota`.
+Turn on **Show Capacity Dock** in the tray menu, or from the desktop app, for the same edge-docked quota rail the macOS menubar has: one ring per connected provider, hover for every quota window with its reset time, drag it to any screen edge. It is off by default and needs codeburn 0.9.24 or newer for `codeburn quota`.
+
+The desktop app installs and configures the tray companion from a card on its **Plugins** page, the way it does the macOS menu bar: Install, Update, Open, Settings, Quit and Uninstall, a Running dot with the installed version, and the Capacity Dock switch. `codeburn menubar --uninstall` removes it from the command line.
 
 The tray app reads everything through the CLI, so install that first (`npm install -g codeburn`). It needs **codeburn 0.9.9 or newer**, and shows a setup screen with the install command until it finds one. Source and build instructions are in [`windows/`](windows/) ([windows/DEVELOPMENT.md](windows/DEVELOPMENT.md)).
 
@@ -497,6 +528,7 @@ Run `codeburn` for the dashboard, or use a subcommand below. Most commands also 
 | `codeburn status --format json` | The same totals as JSON |
 | `codeburn export` | CSV covering today, 7 days, and 30 days |
 | `codeburn export -f json` | Export as JSON instead of CSV |
+| `codeburn export -f json -o <dir>/` | Write the export inside a folder, as `codeburn-export-YYYY-MM-DD.json` |
 
 **Sync (team telemetry)** _preview_
 
@@ -526,6 +558,7 @@ Sync sends token counts, costs, models, and projects, never prompts or code. Thi
 |---------|--------------|
 | `codeburn quota` | Live provider capacity: quota windows for each signed-in coding tool |
 | `codeburn quota --format json` | The same capacity readings as JSON |
+| `codeburn gateway-totals` | Show whether Vercel AI Gateway spend counts toward totals (`include`, `exclude`) |
 | `codeburn doctor` | Per-provider detection status: paths probed, sessions found, parse health (`--json`, `--provider`) |
 | `codeburn audit` | Per provider-model token source table: where every number comes from |
 | `codeburn context` | What fills a session's context window: interactive browser (Claude Code and Codex) |
