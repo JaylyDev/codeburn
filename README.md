@@ -264,6 +264,8 @@ MIT licensed. Development happens in this repo.
   <a href="https://github.com/sponsors/iamtoruk"><img src="https://img.shields.io/badge/Sponsor_CodeBurn-%E2%99%A5-F97316?style=for-the-badge&logo=github&labelColor=1a1a1a" alt="Sponsor CodeBurn" /></a>
 </p>
 
+<p align="center"><sub>Companies sponsor at <a href="https://github.com/sponsors/iamtoruk">Bronze, Silver or Gold</a>. Your logo goes in a sponsors block in this section, separate from the stargazer badges above. Silver and Gold also put it on <a href="https://codeburn.app">codeburn.app</a>. Gold puts it at the top of this README as well, and issues your team files get triaged first. The first company sponsor has the space to itself until the next one shows up.</sub></p>
+
 <a href="https://www.star-history.com/?repos=getagentseal%2Fcodeburn&type=date&legend=top-left">
  <picture>
    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=getagentseal/codeburn&type=date&theme=dark&legend=top-left" />
