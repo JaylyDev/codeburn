@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **An expired Claude Code login is recovered from the Keychain, and `codeburn quota` and the desktop app say so when it cannot be.** Both providers read the OAuth credential from `~/.claude/.credentials.json` and fall back to the macOS Keychain, which is where Claude Code keeps it on a normal Mac. After a 401 the retry re-read the file whatever the credential had come from, so a Keychain user got `Temporarily unavailable.` until Claude Code was run again, and the desktop Plans card kept showing the last percentage it had fetched. A 401 now re-reads the store the credential came from, which picks up a login Claude Code has since renewed. When nothing newer is there and the credential's `expiresAt` has passed, the row reports a terminal failure with a line telling you to run Claude Code once. The desktop app still reads the Keychain only on Check now or a forced refresh, and a background poll keeps that reconnect prompt instead of falling back to Check now. A 401 on a credential still within its life stays transient with its backoff. (#1516, thanks @ozymandiashh)
+
 ## 0.9.25 - 2026-09-21
 
 ### Added
