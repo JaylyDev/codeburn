@@ -6,9 +6,11 @@ import { fetchClaudeQuota } from './claude'
 import { fetchCodexQuota } from './codex'
 import { fetchCopilotQuota } from './copilot'
 import { fetchGeminiQuota } from './gemini'
+import { fetchGrokbotQuota, grokbotInstalled } from './grokbot'
 import { fetchKimiQuota } from './kimi'
 import { atomicWriteSecureFile, readSecureFile, sanitizeError } from './security'
 import type { ProviderName, QuotaProvider } from './types'
+import { fetchZcodeQuota } from './zcode'
 
 export type { QuotaProvider, QuotaWindow } from './types'
 export { sanitizeError } from './security'
@@ -23,6 +25,9 @@ type QuotaDeps = {
   copilot: (options: FetcherOptions) => Promise<FetchResult>
   antigravity: (options: FetcherOptions) => Promise<FetchResult>
   kimi: (options: FetcherOptions) => Promise<FetchResult>
+  zcode: (options: FetcherOptions) => Promise<FetchResult>
+  grokbot: (options: FetcherOptions) => Promise<FetchResult>
+  grokbotInstalled: () => boolean
   statePath: string
   readFile: typeof readSecureFile
   writeFile: typeof atomicWriteSecureFile
@@ -30,7 +35,7 @@ type QuotaDeps = {
   refreshMs: number
 }
 
-const PROVIDERS: ProviderName[] = ['claude', 'codex', 'gemini', 'copilot', 'antigravity', 'kimi']
+const PROVIDERS: ProviderName[] = ['claude', 'codex', 'gemini', 'copilot', 'antigravity', 'kimi', 'zcode', 'grokbot']
 
 const defaultDeps: QuotaDeps = {
   claude: fetchClaudeQuota,
@@ -41,6 +46,9 @@ const defaultDeps: QuotaDeps = {
   // no remote endpoints), so it ignores the abort/keychain options entirely.
   antigravity: async () => ({ quota: await fetchAntigravityQuota() }),
   kimi: fetchKimiQuota,
+  zcode: fetchZcodeQuota,
+  grokbot: options => fetchGrokbotQuota({ signal: options.signal }),
+  grokbotInstalled,
   statePath: path.join(os.homedir(), '.codeburn', 'quota-backoff.json'),
   readFile: readSecureFile,
   writeFile: atomicWriteSecureFile,
@@ -71,6 +79,9 @@ export class QuotaService {
   private readonly deps: QuotaDeps
   private cache: { at: number; value: QuotaProvider[] } | null = null
   private flight: Promise<QuotaProvider[]> | null = null
+  /** Whether `flight` was allowed to read the keychain, so a later call can tell
+   *  whether that run can answer it. */
+  private flightAllowKeychain = false
   private generations: Record<ProviderName, number> = Object.fromEntries(PROVIDERS.map(p => [p, 0])) as Record<ProviderName, number>
   private controllers: Partial<Record<ProviderName, AbortController>> = {}
 
@@ -87,13 +98,30 @@ export class QuotaService {
   }
 
   async getQuota(options: { force?: boolean; allowKeychain?: boolean; disabled?: string[] } = {}): Promise<QuotaProvider[]> {
-    if (options.force) this.invalidate()
+    const allowKeychain = Boolean(options.allowKeychain)
     if (!options.force && this.cache && this.deps.now() - this.cache.at < this.deps.refreshMs) return this.cache.value
-    if (this.flight) return this.flight
+    // Join an in-flight run only when it can already answer this call. A
+    // keychain-allowed call may not join a keychain-less poll, and must not
+    // invalidate its way past one either: invalidate() aborts that poll, every
+    // provider in it then fails its generation check and resolves
+    // `disconnected`, so the click would repaint every card as logged out
+    // without the keychain it asked for ever being read. A second forced click
+    // on top of a forced run does join it — same answer, and no second macOS
+    // keychain prompt.
+    if (this.flight && (!allowKeychain || this.flightAllowKeychain)) return this.flight
+    if (options.force) this.invalidate()
     // IPC names are untrusted strings; only known providers may be skipped.
     const disabled = new Set((options.disabled ?? []).filter((p): p is ProviderName => PROVIDERS.includes(p as ProviderName)))
-    this.flight = this.fetchAll(Boolean(options.allowKeychain), disabled).finally(() => { this.flight = null })
-    return this.flight
+    let flight: Promise<QuotaProvider[]>
+    flight = this.fetchAll(allowKeychain, disabled)
+      // Superseded: this run was aborted by the one that replaced it, so its
+      // rows are abort artefacts rather than an answer. Hand the caller the
+      // replacement instead of a card that falsely reads "not connected".
+      .then(value => (this.flight !== flight && this.flight) ? this.flight : value)
+      .finally(() => { if (this.flight === flight) this.flight = null })
+    this.flight = flight
+    this.flightAllowKeychain = allowKeychain
+    return flight
   }
 
   private async readBlocked(): Promise<Blocked> {
@@ -118,6 +146,13 @@ export class QuotaService {
     const run = async (provider: ProviderName): Promise<QuotaProvider> => {
       const retainOnFailure = (next: QuotaProvider): QuotaProvider => {
         const previous = prior.find(item => item.provider === provider)
+        // A keychain-less poll reporting `keychainUnchecked` is saying "I did not
+        // look", which is never news: it must not overwrite what a forced check
+        // established — neither a live connection nor the keychain-denied
+        // guidance, which would otherwise be replaced by "Check now" one poll
+        // after the user denied it.
+        if (!allowKeychain && next.connection === 'keychainUnchecked'
+          && (previous?.connection === 'connected' || previous?.connection === 'accessDenied')) return previous
         if (previous?.connection !== 'connected') return next
         // Keychain-only credentials are invisible to a background (keychain-less)
         // poll; keep showing the live connection rather than flapping to
@@ -145,7 +180,11 @@ export class QuotaService {
       if (this.controllers[provider] === controller) this.controllers[provider] = undefined
       return retainOnFailure(result.quota)
     }
-    const value = await Promise.all(PROVIDERS.filter(provider => !disabled.has(provider)).map(provider =>
+    // Grok Bot is an optional desktop app rather than a signed-in account: with
+    // the app absent there is no row to show, only someone else's Cursor
+    // allowance under a Grok Bot label.
+    const pollable = PROVIDERS.filter(provider => provider !== 'grokbot' || this.deps.grokbotInstalled())
+    const value = await Promise.all(pollable.filter(provider => !disabled.has(provider)).map(provider =>
       provider === 'codex' && !codexQuotaSupported()
         ? Promise.resolve(unavailable('codex', 'disconnected'))
         : run(provider),

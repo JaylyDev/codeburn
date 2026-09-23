@@ -149,6 +149,18 @@
 "Usage tracking still works. For live quota, sign in with the Copilot CLI or gh auth login, or paste a token below, then click Connect." = "Usage tracking still works. For live quota, sign in with the Copilot CLI or gh auth login, or paste a token below, then click Connect.";
 "Quota tracking disconnected. Credentials are untouched. Click Connect to resume." = "Quota tracking disconnected. Credentials are untouched. Click Connect to resume.";
 
+/* MARK: Grok Bot quota copy */
+"Grok Bot is not installed. Install the Grok Bot app, then click Retry." = "Grok Bot is not installed. Install the Grok Bot app, then click Retry.";
+"Sign in to the Cursor app with the account Grok Bot uses, then click Retry." = "Sign in to the Cursor app with the account Grok Bot uses, then click Retry.";
+"Cursor rejected the current app session. Sign in again, then click Retry." = "Cursor rejected the current app session. Sign in again, then click Retry.";
+"Could not read the Cursor app's local session data. Quit and reopen Cursor, then click Retry." = "Could not read the Cursor app's local session data. Quit and reopen Cursor, then click Retry.";
+"This account has no included Grok Bot allowance." = "This account has no included Grok Bot allowance.";
+"Grok Bot usage is drawn from a pooled enterprise allowance, which has no per-account reading." = "Grok Bot usage is drawn from a pooled enterprise allowance, which has no per-account reading.";
+"Cursor rate-limited the quota request." = "Cursor rate-limited the quota request.";
+"Grok Bot quota is temporarily unavailable." = "Grok Bot quota is temporarily unavailable.";
+"Cursor returned an unrecognized Grok Bot quota response." = "Cursor returned an unrecognized Grok Bot quota response.";
+"Network error fetching Grok Bot quota." = "Network error fetching Grok Bot quota.";
+
 /* MARK: Updates */
 "Update Check Failed" = "Update Check Failed";
 "CLI Update Failed" = "CLI Update Failed";
@@ -262,7 +274,10 @@
 "Tokens" = "Tokens";
 "%@ in" = "%@ in";
 "%@ out" = "%@ out";
+"%1$@ in · %2$@ out · %3$@ cache read" = "%1$@ in · %2$@ out · %3$@ cache read";
 "%@%% cache hit" = "%@%% cache hit";
+"1 model unpriced, counted at $0 · %@ tokens" = "1 model unpriced, counted at $0 · %@ tokens";
+"%1$lld models unpriced, counted at $0 · %2$@ tokens" = "%1$lld models unpriced, counted at $0 · %2$@ tokens";
 
 /* MARK: Pull requests section */
 "Pull requests" = "Pull requests";
@@ -336,7 +351,7 @@
 "Tracked spend (last %lld days)" = "Tracked spend (last %lld days)";
 "Costliest session" = "Costliest session";
 "Retry tax" = "Retry tax";
-"%1$lld retries across %2$lld edits" = "%1$lld retries across %2$lld edits";
+"%1$lld retries across %2$lld retried edits" = "%1$lld retries across %2$lld retried edits";
 "%@ ret/edit" = "%@ ret/edit";
 "Hides session details" = "Hides session details";
 "Shows session details" = "Shows session details";
@@ -605,11 +620,6 @@
 "Automatic" = "Automatic";
 "CLI" = "CLI";
 "API" = "API";
-"ACU Conversion" = "ACU Conversion";
-"USD per ACU" = "USD per ACU";
-"Save" = "Save";
-"CodeBurn reads Devin ACU usage from local transcripts only after this rate is configured, then multiplies each step by the rate before reporting cost." = "CodeBurn reads Devin ACU usage from local transcripts only after this rate is configured, then multiplies each step by the rate before reporting cost.";
-"Saved. Refresh CodeBurn to recalculate Devin cost." = "Saved. Refresh CodeBurn to recalculate Devin cost.";
 "Version %@" = "Version %@";
 "%@ is available. Choose Check for Updates in the CodeBurn menu to install it." = "%@ is available. Choose Check for Updates in the CodeBurn menu to install it.";
 "GitHub" = "GitHub";
@@ -635,6 +645,7 @@
 "%lld%% left" = "%lld%% left";
 
 /* MARK: Codex credit limit */
+"Monthly" = "Monthly";
 "Monthly usage limit" = "Monthly usage limit";
 "Monthly usage limit · limit reached" = "Monthly usage limit · limit reached";
 "Monthly usage limit · %1$@ / %2$@ credits" = "Monthly usage limit · %1$@ / %2$@ credits";
@@ -646,8 +657,7 @@
 "Notify me when Codex banks a limit reset" = "Notify me when Codex banks a limit reset";
 "OpenAI sometimes grants Codex accounts a credit that resets a rate-limit window early. CodeBurn reads these from the quota response it already fetches and tells you once per grant. It never spends one." = "OpenAI sometimes grants Codex accounts a credit that resets a rate-limit window early. CodeBurn reads these from the quota response it already fetches and tells you once per grant. It never spends one.";
 "Notify me when a quota resets early" = "Notify me when a quota resets early";
-"Posts a notification when a provider resets a usage limit before its scheduled time, so you know the capacity is back. The Capacity Dock shows the same notice for 12 hours either way." = "Posts a notification when a provider resets a usage limit before its scheduled time, so you know the capacity is back. The Capacity Dock shows the same notice for 12 hours either way.";
-"Derived from this Mac's own record of past quota windows for this provider. Local only — nothing is fetched to produce it." = "Derived from this Mac's own record of past quota windows for this provider. Local only — nothing is fetched to produce it.";
+"Posts a notification when a provider resets a usage limit before its scheduled time, so you know the capacity is back." = "Posts a notification when a provider resets a usage limit before its scheduled time, so you know the capacity is back.";
 "cache read" = "cache read";
 "Cache read: %@ tokens" = "Cache read: %@ tokens";
 "Quota window %@" = "Quota window %@";
@@ -655,8 +665,6 @@
 /* MARK: Language picker */
 "Language" = "Language";
 "System" = "System";
-"Relaunch to apply." = "Relaunch to apply.";
-"Relaunch" = "Relaunch";
 "Follows System Settings > Language & Region unless you pick one here." = "Follows System Settings > Language & Region unless you pick one here.";
 
 /* MARK: Quota pace captions (#1267) */
@@ -670,15 +678,8 @@
 "You're back to %lld%%." = "You're back to %lld%%.";
 "%1$@'s %2$@ reset %3$@ early. %4$@" = "%1$@'s %2$@ reset %3$@ early. %4$@";
 "%1$@ cleared your %2$@ %3$@ before its reset. %4$@" = "%1$@ cleared your %2$@ %3$@ before its reset. %4$@";
-"%1$@ reset %2$@ early" = "%1$@ reset %2$@ early";
-"%1$@ cleared, %2$@ before reset" = "%1$@ cleared, %2$@ before reset";
-"%lld%% of it was available when CodeBurn noticed." = "%lld%% of it was available when CodeBurn noticed.";
-"%1$@ reset this %2$@ %3$@ before its scheduled time. %4$@" = "%1$@ reset this %2$@ %3$@ before its scheduled time. %4$@";
-"%1$@ cleared this %2$@ %3$@ before the window's scheduled reset, which has not moved. %4$@" = "%1$@ cleared this %2$@ %3$@ before the window's scheduled reset, which has not moved. %4$@";
-"Last %1$@ reset came ~%2$@ early" = "Last %1$@ reset came ~%2$@ early";
-"Last %1$lld %2$@ resets came ~%3$@ early" = "Last %1$lld %2$@ resets came ~%3$@ early";
-"%1$lld of the last %2$lld %3$@ resets came ~%4$@ early" = "%1$lld of the last %2$lld %3$@ resets came ~%4$@ early";
 "%lldh" = "%lldh";
+"%@ limit" = "%@ limit";
 "5-hour limit" = "5-hour limit";
 "weekly limit" = "weekly limit";
 "Opus weekly limit" = "Opus weekly limit";
@@ -718,3 +719,9 @@
 "%1$@ · %2$@ at 80%%" = "%1$@ · %2$@ at 80%%";
 "%1$@ · %2$@ limit reached" = "%1$@ · %2$@ limit reached";
 "Quota crossings (%1$lld%% and %2$lld%%)" = "Quota crossings (%1$lld%% and %2$lld%%)";
+
+/* MARK: Privacy */
+"Privacy" = "Privacy";
+"Anonymous usage statistics" = "Anonymous usage statistics";
+"Managed by the CodeBurn desktop app. Change it there under Settings → Privacy & data." = "Managed by the CodeBurn desktop app. Change it there under Settings → Privacy & data.";
+"Optional usage statistics: the names of the models, tools and providers you use, with bucketed counts of how often each one came up, plus when the app is opened. A random install id, the app version and your country code travel with them. Never your prompts, your code, your project and file names, or exact amounts." = "Optional usage statistics: the names of the models, tools and providers you use, with bucketed counts of how often each one came up, plus when the app is opened. A random install id, the app version and your country code travel with them. Never your prompts, your code, your project and file names, or exact amounts.";

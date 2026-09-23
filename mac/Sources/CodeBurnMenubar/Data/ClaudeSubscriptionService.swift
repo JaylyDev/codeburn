@@ -146,7 +146,8 @@ enum ClaudeSubscriptionService {
             clearUsageBlock()
             do {
                 let tier = try ClaudeCredentialStore.subscriptionTier()
-                return try parseUsage(data, rawTier: tier)
+                let subscriptionType = try ClaudeCredentialStore.subscriptionType()
+                return try parseUsage(data, rawTier: tier, subscriptionType: subscriptionType)
             } catch {
                 throw FetchError.usageDecodeFailed
             }
@@ -256,9 +257,9 @@ enum ClaudeSubscriptionService {
 
     /// Decodes a usage endpoint response body. Internal so tests can feed the
     /// captured JSON shape without a network round trip.
-    static func parseUsage(_ data: Data, rawTier: String?) throws -> SubscriptionUsage {
+    static func parseUsage(_ data: Data, rawTier: String?, subscriptionType: String? = nil) throws -> SubscriptionUsage {
         let decoded = try JSONDecoder().decode(UsageResponse.self, from: data)
-        return mapResponse(decoded, rawTier: rawTier)
+        return mapResponse(decoded, rawTier: rawTier, subscriptionType: subscriptionType)
     }
 
     private struct UsageResponse: Decodable {
@@ -310,7 +311,7 @@ enum ClaudeSubscriptionService {
         }
     }
 
-    private static func mapResponse(_ r: UsageResponse, rawTier: String?) -> SubscriptionUsage {
+    private static func mapResponse(_ r: UsageResponse, rawTier: String?, subscriptionType: String? = nil) -> SubscriptionUsage {
         let scopedWeekly = (r.limits ?? []).compactMap { limit -> SubscriptionUsage.ScopedWindow? in
             guard limit.kind == "weekly_scoped",
                   let name = limit.scope?.model?.displayName,
@@ -323,7 +324,7 @@ enum ClaudeSubscriptionService {
             )
         }
         return SubscriptionUsage(
-            tier: SubscriptionUsage.tier(from: rawTier),
+            tier: SubscriptionUsage.tier(subscriptionType: subscriptionType, rateLimitTier: rawTier),
             rawTier: rawTier,
             fiveHourPercent: r.fiveHour?.utilization,
             fiveHourResetsAt: parseDate(r.fiveHour?.resetsAt),

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { fetchAntigravityQuota, decodeAntigravitySummary, parseNetstatPorts } from '../src/quota/antigravity.js'
-import { decodeClaudeUsage, fetchClaudeQuota } from '../src/quota/claude.js'
+import { decodeClaudeUsage, fetchClaudeQuota, planLabel } from '../src/quota/claude.js'
 import { decodeCodexUsage, fetchCodexQuota } from '../src/quota/codex.js'
 import { decodeCopilotUsage, fetchCopilotQuota } from '../src/quota/copilot.js'
 import { decodeGeminiUsage, fetchGeminiQuota } from '../src/quota/gemini.js'
@@ -27,6 +27,23 @@ describe('Claude quota', () => {
   it('reports disconnected without a credential and never fetches', async () => {
     const result = await fetchClaudeQuota({ fetch: neverFetch as unknown as typeof fetch, readFile: noFile })
     expect(result.quota.connection).toBe('disconnected')
+  })
+
+  it('prefers subscriptionType over rateLimitTier for the plan label', () => {
+    const cases: Array<[string | undefined, string | undefined, string]> = [
+      ['max', 'default_claude_max_20x', 'Max 20x'],
+      ['team', 'default_claude_max_5x', 'Team Premium'],
+      ['team', undefined, 'Team'],
+      ['enterprise', 'default_claude_max_5x', 'Enterprise Premium'],
+      ['pro', 'default_claude_pro', 'Pro'],
+      [undefined, 'max_5x', 'Max 5x'],
+      [undefined, 'max_20x', 'Max 20x'],
+      [undefined, 'team', 'Team'],
+      [undefined, undefined, 'Subscription'],
+    ]
+    for (const [subscriptionType, rateLimitTier, label] of cases) {
+      expect(planLabel({ subscriptionType, rateLimitTier })).toBe(label)
+    }
   })
 })
 
@@ -221,6 +238,46 @@ describe('quota command envelope', () => {
       ],
     })
     expect(renderQuotaTable(report, { color: false })).toContain('Claude (Max 20x)')
+  })
+
+  it('hides a connected ZCode row while the Z.ai credential is live, and notes the duplicate', async () => {
+    const zai: QuotaProvider = {
+      provider: 'zai', connection: 'connected', planLabel: 'Pro', footerLines: [],
+      primary: { label: 'Weekly', percent: 0.45, resetsAt: '2026-09-21T12:00:00.000Z' }, details: [],
+    }
+    const zcode: QuotaProvider = {
+      provider: 'zcode', connection: 'connected', planLabel: 'Pro', footerLines: [],
+      primary: { label: 'Weekly', percent: 0.45, resetsAt: '2026-09-21T12:00:00.000Z' }, details: [],
+    }
+    const report = await collectQuota({
+      readers: [
+        { id: 'zai', name: 'Z.ai', read: async () => zai },
+        { id: 'zcode', name: 'ZCode', read: async () => zcode },
+      ],
+    })
+    expect(report.providers.map(row => row.id)).toEqual(['zai'])
+    expect(report.providers[0].notes).toEqual([
+      'A ZCode app login is also connected; it reads the same z.ai plan endpoint and is hidden as a duplicate.',
+    ])
+  })
+
+  it('keeps the ZCode row when Z.ai is configured but not usable', async () => {
+    // A rejected or stale Z.ai state must never hide a working ZCode login.
+    const zai: QuotaProvider = {
+      provider: 'zai', connection: 'terminalFailure', primary: null, details: [], planLabel: null,
+      footerLines: ['Z.ai rejected this API key.'],
+    }
+    const zcode: QuotaProvider = {
+      provider: 'zcode', connection: 'connected', planLabel: 'Pro', footerLines: [],
+      primary: { label: 'Weekly', percent: 0.45, resetsAt: '2026-09-21T12:00:00.000Z' }, details: [],
+    }
+    const report = await collectQuota({
+      readers: [
+        { id: 'zai', name: 'Z.ai', read: async () => zai },
+        { id: 'zcode', name: 'ZCode', read: async () => zcode },
+      ],
+    })
+    expect(report.providers.map(row => row.id)).toEqual(['zai', 'zcode'])
   })
 
   it('gives up on a provider that outlives its timeout', async () => {

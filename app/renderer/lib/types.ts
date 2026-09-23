@@ -27,6 +27,9 @@ export interface CliError {
 
 export type AliasRow = { from: string; to: string }
 export type ActionResult = { ok: boolean; stdout: string; stderr: string; code: number | null }
+/** `savedPath` is where the CLI actually wrote, which is not the chosen folder:
+ *  CSV nests a dated subfolder, JSON appends the extension. */
+export type ExportResult = ActionResult & { savedPath?: string }
 
 export type QuotaWindow = {
   label: string
@@ -35,14 +38,22 @@ export type QuotaWindow = {
 }
 
 export type QuotaProvider = {
-  provider: 'claude' | 'codex' | 'gemini' | 'copilot' | 'antigravity' | 'kimi'
-  connection: 'connected' | 'disconnected' | 'accessDenied' | 'loading' | 'stale' | 'transientFailure' | 'terminalFailure'
+  provider: 'claude' | 'codex' | 'gemini' | 'copilot' | 'antigravity' | 'kimi' | 'zcode' | 'grokbot'
+  /** `keychainUnchecked` is darwin-only and distinct from `disconnected`: no
+   *  credential file was found and the keychain has NOT been looked at yet
+   *  (a keychain read raises a one-time macOS dialog, so only a user-initiated
+   *  forced refresh does one). It means "we do not know", not "logged out". */
+  connection: 'connected' | 'disconnected' | 'keychainUnchecked' | 'accessDenied' | 'loading' | 'stale' | 'transientFailure' | 'terminalFailure'
   primary: QuotaWindow | null
   details: QuotaWindow[]
   planLabel: string | null
   footerLines: string[]
   /** True when the provider is in a 429 backoff window (upstream rate limit). */
   rateLimited?: boolean
+  /** Set when the error is an auth expiry a (re)connect can fix (a 401/403 or an
+   *  expired token), or when a stuck "waiting" is capped to an actionable state,
+   *  so the card shows the Connect affordance. */
+  connectable?: boolean
 }
 
 export type ProviderName = QuotaProvider['provider']
@@ -136,8 +147,38 @@ export type HydrationState = {
   totalFiles: number
 }
 
+/** The optimize scan's figures. Carried by a full menubar payload, and — since
+ *  the poll runs with --no-optimize — cached on disk between daily recomputes. */
+export type OptimizeBlock = {
+  findingCount: number
+  savingsUSD: number
+  topFindings: Array<{
+    title: string
+    impact: 'high' | 'medium' | 'low'
+    savingsUSD: number
+  }>
+}
+
+/** A cached optimize scan: the figures plus WHEN and FOR WHICH query scope they
+ *  were computed, so a stored number is never shown as live or under another
+ *  period/provider/filter. */
+export type OptimizeSnapshot = {
+  scope: string
+  computedAt: string
+  appVersion: string
+  optimize: OptimizeBlock
+}
+
 export type MenubarPayload = {
   generated: string
+  /** Consecutive active days across every provider, independent of the selected
+   *  period and provider filter. Omitted by CLIs that predate the field. */
+  streak?: number
+  /** Cost and calls for the headline windows this payload's live scan covered,
+   *  all from the one aggregation that produced it. A window that is absent was
+   *  not scanned, so the client falls back to that period's own payload.
+   *  Omitted entirely on scoped or filtered requests. */
+  periodTotals?: Partial<Record<'today' | 'week' | '30days' | 'month' | 'all' | 'lifetime', { cost: number; calls: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }>>
   // Optional: older CLIs omit it. Present and true only on a stale read-only
   // serve; absent otherwise. Absence must always be read as "assume fresh."
   stale?: boolean
@@ -176,6 +217,15 @@ export type MenubarPayload = {
       savingsUSD: number
       savingsBaselineModel: string
       calls: number
+      // Per-model token counts (src/menubar-json.ts buildTopModels): billable
+      // output, cache read = reused input, cache write separate. Optional:
+      // older CLIs omit them, and a row whose contributing legacy data lacked
+      // counts omits them even on a new CLI. Absent means unknown — render a
+      // dash, never zero, and never substitute a period-wide figure.
+      inputTokens?: number
+      outputTokens?: number
+      cacheReadTokens?: number
+      cacheWriteTokens?: number
     }>
     unpricedModels?: Array<{ model: string; calls: number; tokens: number }>
     localModelSavings: LocalModelSavings
@@ -183,7 +233,7 @@ export type MenubarPayload = {
     // Optional: older CLIs omit it. `id` is the internal provider name (round-trips
     // as --provider), `label` the display name. `hasUsage` distinguishes active $0
     // providers from detected-but-idle providers when present.
-    providerDetails?: Array<{ id: string; label: string; cost: number; calls?: number; hasUsage?: boolean; sessions?: number; sessionCountBasis?: 'identity' | 'partial' }>
+    providerDetails?: Array<{ id: string; label: string; cost: number; calls?: number; hasUsage?: boolean; excludedFromTotal?: boolean; sessions?: number; sessionCountBasis?: 'identity' | 'partial' }>
     topProjects: Array<{
       id?: string
       name: string
@@ -298,15 +348,7 @@ export type MenubarPayload = {
       unattributedCost?: number
     }
   }
-  optimize: {
-    findingCount: number
-    savingsUSD: number
-    topFindings: Array<{
-      title: string
-      impact: 'high' | 'medium' | 'low'
-      savingsUSD: number
-    }>
-  }
+  optimize: OptimizeBlock
   history: {
     daily: DailyHistoryEntry[]
     // Granular per-bucket timeline. Present only on the punchcard's dedicated
@@ -508,6 +550,8 @@ export type BranchSpendCoverage = {
 export type BranchSpendProjectReport = {
   id: string
   label: string
+  /** Normalized `origin` remote; shared by every clone and worktree of a repo. */
+  originKey?: string | null
   totalCost: number
   branches: BranchSpendRow[]
   coverage: BranchSpendCoverage
@@ -986,6 +1030,9 @@ export type TelemetryStatus = {
   enabled: boolean
   defaultEnabled: boolean
   onboarded: boolean
+  /** Set by the setters only: false when the decision holds in memory but could
+   *  not be written to disk, so the menu bar app still inherits the old one. */
+  persisted?: boolean
 }
 
 /** Cold-start scan progress streamed from the CLI warmup (src/parser.ts).
@@ -1019,6 +1066,39 @@ export type CompanionStatus = {
    *  the next restart. Nothing is started until then, so the corner says so rather than
    *  showing two switches on with nothing running. */
   restartRequired?: boolean
+  // Mirrors MacMenubarStatus so the Plugins card renders one companion card per platform. All
+  // reflect on-disk truth, never intent. Optional so a preload predating them still parses.
+  canInstall?: boolean
+  installed?: boolean
+  running?: boolean
+  version?: string | null
+  outdated?: boolean
+}
+
+/** The discrete companion actions' return shape (install/quit/uninstall): the outcome plus the
+ *  status that followed. Mirrors MacMenubarInstall. */
+export type CompanionActionResult = { ok: boolean; error: string | null; status: CompanionStatus }
+
+/** The macOS menubar app (mac/) as the Plugins page sees it (app/electron/mac-menubar.ts). */
+export type MacMenubarStatus = {
+  supported: boolean
+  /** False in a Mac App Store build, which may not download an executable. */
+  canInstall: boolean
+  installed: boolean
+  path: string | null
+  version: string | null
+  running: boolean
+  dock: boolean
+  /** True for a menubar too old to be driven from here; the card offers Update instead. */
+  outdated: boolean
+}
+
+export type MacMenubarInstall = {
+  ok: boolean
+  error: string | null
+  status: MacMenubarStatus
+  /** Older bundles the CLI found and left in place. Absent on the actions that never install. */
+  leftovers?: string[]
 }
 
 /** The tray app's own settings, from the two files it reads them from
@@ -1056,6 +1136,13 @@ export type ProjectRow = { name: string; path: string; cost: number; sessions: n
 export type ProjectsReport = { projects: ProjectRow[] }
 
 export interface CodeburnBridge {
+  /** The Electron app's own UI language tag (app.getLocale()), for the 'system'
+   *  locale choice. Absent on preloads that predate desktop localization. */
+  readonly appLocale?: string
+  /** The persisted shared config `language` (null/absent = follow the system). */
+  getLanguage?(): Promise<string | null>
+  /** Persist the config `language` (null clears it) and propagate to the menu bar. */
+  setLanguage?(language: string | null): Promise<void>
   /** Subscribe to cold-start scan progress; returns an unsubscribe fn. */
   onProgress(cb: (event: ScanProgressEvent) => void): () => void
   /** Read the cached update-availability status (launch + 24h background check). */
@@ -1095,6 +1182,14 @@ export interface CodeburnBridge {
   /** Spend per canonical project × branch (`spend --format branch-json`). */
   getBranchSpend(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<BranchSpendReport>
   getOptimizeReport(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<OptimizeJsonReport>
+  /** The once-a-day optimize scan for this query scope, cached on disk.
+   *  `maxAgeMs` 0 forces a recompute. Optional so an older preload degrades to
+   *  no coach figures rather than throwing. */
+  getOptimizeSnapshot?(period: Period, provider: string, range?: DateRange, configSource?: string | null, scope?: string, maxAgeMs?: number): Promise<OptimizeSnapshot>
+  /** Whether the machine is on battery. Optional: an older preload reads as AC. */
+  powerStatus?(): Promise<boolean>
+  /** Subscribe to power-source changes; returns an unsubscribe fn. */
+  onPowerStatus?(cb: (onBattery: boolean) => void): () => void
   getDevices(period: Period): Promise<CombinedUsage>
   getDevicesScan(): Promise<DeviceScanResult>
   getShareStatus(): Promise<ShareStatus>
@@ -1116,7 +1211,7 @@ export interface CodeburnBridge {
   removeDevice(name: string): Promise<ActionResult>
   setPlan(id: string, provider: string): Promise<ActionResult>
   resetPlan(provider: string): Promise<ActionResult>
-  exportData(format: string, provider: string, outPath: string): Promise<ActionResult>
+  exportData(format: string, provider: string, outPath: string): Promise<ExportResult>
   chooseDirectory(): Promise<string | null>
   cliStatus(): Promise<{ found: boolean; path: string | null; error?: string }>
   telemetryStatus(): Promise<TelemetryStatus | null>
@@ -1127,13 +1222,29 @@ export interface CodeburnBridge {
   /** The bundled tray app and Capacity Dock (Windows). Optional so a preload that
    *  predates them degrades to "not supported" rather than throwing. */
   companionStatus?(): Promise<CompanionStatus>
-  setMenuBarEnabled?(enabled: boolean): Promise<CompanionStatus>
-  setSidebarEnabled?(enabled: boolean): Promise<CompanionStatus>
+  /** The Plugins card's discrete actions, mirroring the macOS card. Optional for the same
+   *  reason: a preload that predates them leaves the buttons inert rather than throwing. */
+  companionInstall?(): Promise<CompanionActionResult>
+  companionOpen?(): Promise<CompanionStatus>
+  companionQuit?(): Promise<CompanionActionResult>
+  companionUninstall?(): Promise<CompanionActionResult>
+  companionSetDock?(enabled: boolean): Promise<CompanionStatus>
   /** The tray app's own settings. Null when there is no tray app to have any. */
   trayPrefs?(): Promise<TrayPrefs | null>
   setTrayAppPref?(patch: Record<string, unknown>): Promise<TrayPrefs | null>
   setTrayDockPref?(patch: Record<string, unknown>): Promise<TrayPrefs | null>
   setLaunchAtLogin?(enabled: boolean): Promise<TrayPrefs | null>
+  /** The macOS menubar app. Optional so a preload that predates the card degrades to
+   *  "not supported" rather than throwing. */
+  macMenubarStatus?(): Promise<MacMenubarStatus>
+  macMenubarInstall?(): Promise<MacMenubarInstall>
+  macMenubarOpen?(): Promise<MacMenubarStatus>
+  macMenubarSetDock?(enabled: boolean): Promise<MacMenubarStatus>
+  macMenubarSettings?(): Promise<MacMenubarInstall>
+  macMenubarQuit?(): Promise<MacMenubarInstall>
+  macMenubarUninstall?(): Promise<MacMenubarInstall>
+  /** Named steps of a running install: Downloading, Verifying, Installing, Starting. */
+  onMacMenubarProgress?(cb: (phase: string) => void): () => void
   // Plugin management
   pluginList(): Promise<unknown>
   pluginInfo(name: string): Promise<unknown>

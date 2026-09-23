@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
 
 import { CliErrorText } from './CliErrorPanel'
 import { EmptyNote } from './EmptyState'
@@ -7,8 +7,10 @@ import { ListRow } from './ListRow'
 import { Panel } from './Panel'
 import { SectionSkeleton } from './Skeleton'
 import { usePolled } from '../hooks/usePolled'
-import { formatCompact, formatDayShort, formatUsd } from '../lib/format'
+import { t } from '../i18n'
+import { formatCompact, formatCount, formatDayShort, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
+import { groupProjects } from '../lib/projectGroups'
 import { reportMemoKey } from '../lib/reportMemoKey'
 import type { BranchSpendProjectReport, BranchSpendReport, BranchSpendRow, BranchSpendSessionRow, BranchTokenSplit, DateRange, Period } from '../lib/types'
 
@@ -26,7 +28,7 @@ function shortSessionId(value: string): string {
     return `Codex ${tail ?? id.slice(-8)}`
   }
   if (/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(id)) return `${id.slice(0, 8)}…${id.slice(-4)}`
-  return id.length > 24 ? `${id.slice(0, 12)}…${id.slice(-6)}` : id || 'Unknown session'
+  return id.length > 24 ? `${id.slice(0, 12)}…${id.slice(-6)}` : id || t('shared.branch.unknownSession')
 }
 
 /** "Jul 3" from an ISO timestamp; local noon keeps the calendar day stable. */
@@ -47,11 +49,11 @@ function activitySpan(first: string | null, last: string | null): string {
 
 function tokenSummary(tokens: BranchTokenSplit): string {
   return [
-    `in ${formatCompact(tokens.inputTokens)}`,
-    `out ${formatCompact(tokens.outputTokens)}`,
-    ...(tokens.reasoningTokens > 0 ? [`reason ${formatCompact(tokens.reasoningTokens)}`] : []),
-    `cacheR ${formatCompact(tokens.cacheReadTokens)}`,
-    ...(tokens.cacheWriteTokens > 0 ? [`cacheW ${formatCompact(tokens.cacheWriteTokens)}`] : []),
+    `${t('shared.branch.tokens.in')} ${formatCompact(tokens.inputTokens)}`,
+    `${t('shared.branch.tokens.out')} ${formatCompact(tokens.outputTokens)}`,
+    ...(tokens.reasoningTokens > 0 ? [`${t('shared.branch.tokens.reasoning')} ${formatCompact(tokens.reasoningTokens)}`] : []),
+    `${t('shared.branch.tokens.cacheRead')} ${formatCompact(tokens.cacheReadTokens)}`,
+    ...(tokens.cacheWriteTokens > 0 ? [`${t('shared.branch.tokens.cacheWrite')} ${formatCompact(tokens.cacheWriteTokens)}`] : []),
   ].join(' · ')
 }
 
@@ -62,15 +64,22 @@ function pathLabel(path: string): string {
   return parts.at(-1) || path
 }
 
+/** Parent directory plus name, so sibling checkouts named "clone" are told
+ *  apart without printing a full home path. */
+function homeRelativePath(path: string): string {
+  const parts = path.replace(/\\/g, '/').split('/').filter(Boolean)
+  return parts.slice(-2).join('/') || path
+}
+
 function BranchSessionDetail({ session }: { session: BranchSpendSessionRow }) {
   return (
-    <div className="spend-proj-detail branch-session-detail" role="region" aria-label={`Session ${session.sessionId} detail`}>
-      <div className="branch-detail-line"><span>Session</span><code>{session.sessionId}</code></div>
-      <div className="branch-detail-line"><span>Provider</span><span>{session.provider}{session.isSidechain ? ' (subagent)' : ''}</span></div>
-      <div className="branch-detail-line"><span>Working directory</span><span title={session.workingDirectory}>{session.workingDirectory ? pathLabel(session.workingDirectory) : 'Not recorded'}</span></div>
-      <div className="branch-detail-line"><span>Models</span><span>{session.models.length ? session.models.join(', ') : '—'}</span></div>
-      <div className="branch-detail-line"><span>Tokens</span><span>{tokenSummary(session.tokens)}</span></div>
-      <div className="branch-detail-line"><span>Activity</span><span>{activitySpan(session.firstActive, session.lastActive)} · {session.calls.toLocaleString('en-US')} calls</span></div>
+    <div className="spend-proj-detail branch-session-detail" role="region" aria-label={t('shared.branch.sessionDetailAria', { id: session.sessionId })}>
+      <div className="branch-detail-line"><span>{t('shared.branch.session')}</span><code>{session.sessionId}</code></div>
+      <div className="branch-detail-line"><span>{t('shared.branch.provider')}</span><span>{session.provider}{session.isSidechain ? t('shared.branch.subagentSuffix') : ''}</span></div>
+      <div className="branch-detail-line"><span>{t('shared.branch.workingDirectory')}</span><span title={session.workingDirectory}>{session.workingDirectory ? pathLabel(session.workingDirectory) : t('shared.branch.notRecorded')}</span></div>
+      <div className="branch-detail-line"><span>{t('shared.branch.models')}</span><span>{session.models.length ? session.models.join(', ') : '—'}</span></div>
+      <div className="branch-detail-line"><span>{t('shared.branch.tokens')}</span><span>{tokenSummary(session.tokens)}</span></div>
+      <div className="branch-detail-line"><span>{t('shared.branch.activity')}</span><span>{activitySpan(session.firstActive, session.lastActive)} · {formatCount(session.calls, 'call')}</span></div>
     </div>
   )
 }
@@ -86,24 +95,24 @@ function BranchRowView({ row, index, showProject, expanded, onToggle }: {
   // An expansion must never survive onto different data: the session ids here
   // belong to this report snapshot.
   useEffect(() => { setOpenSession(null) }, [row.projectId, row.branch])
-  const title = showProject ? `${row.projectLabel} / ${row.branch ?? 'Unknown'}` : (row.branch ?? 'Unknown')
+  const title = showProject ? `${row.projectLabel} / ${row.branch ?? t('shared.branch.unknownBranch')}` : (row.branch ?? t('shared.branch.unknownBranch'))
   return (
     <Fragment key={`${row.projectId}|${row.branch ?? '__unknown__'}`}>
       <ListRow
         no={String(index + 1).padStart(2, '0')}
         title={title}
-        sub={`${row.sessions.toLocaleString('en-US')} ${row.sessions === 1 ? 'session' : 'sessions'} · ${row.calls.toLocaleString('en-US')} calls · ${activitySpan(row.firstActive, row.lastActive)}`}
+        sub={`${formatCount(row.sessions, 'session')} · ${formatCount(row.calls, 'call')} · ${activitySpan(row.firstActive, row.lastActive)}`}
         value={formatUsd(row.cost)}
         expanded={expanded}
         onClick={onToggle}
       />
       {expanded && (
-        <div className="spend-proj-detail" role="region" aria-label={`${title} detail`}>
-          <div className="branch-detail-line"><span>Tokens</span><span>{tokenSummary(row.tokens)}</span></div>
+        <div className="spend-proj-detail" role="region" aria-label={t('shared.branch.rowDetailAria', { title })}>
+          <div className="branch-detail-line"><span>{t('shared.branch.tokens')}</span><span>{tokenSummary(row.tokens)}</span></div>
           {row.worktrees.map(wt => (
             <div className="branch-detail-line" key={wt.path}>
-              <span>Worktree</span>
-              <span title={wt.path}>{pathLabel(wt.path)} · {wt.sessions} {wt.sessions === 1 ? 'session' : 'sessions'} · {formatUsd(wt.cost)}</span>
+              <span>{t('shared.branch.worktree')}</span>
+              <span title={wt.path}>{homeRelativePath(wt.path)} · {formatCount(wt.sessions, 'session')} · {formatUsd(wt.cost)}</span>
             </div>
           ))}
           {row.sessionRows.map(session => {
@@ -116,7 +125,7 @@ function BranchRowView({ row, index, showProject, expanded, onToggle }: {
                   role="button"
                   tabIndex={0}
                   aria-expanded={open}
-                  aria-label={`Inspect session ${session.title ?? session.sessionId}`}
+                  aria-label={t('shared.branch.inspectSessionAria', { name: session.title ?? session.sessionId })}
                   onClick={() => setOpenSession(current => current === sessionKey ? null : sessionKey)}
                   onKeyDown={event => {
                     if (event.target !== event.currentTarget) return
@@ -128,14 +137,14 @@ function BranchRowView({ row, index, showProject, expanded, onToggle }: {
                 >
                   <span className="sps-date" title={session.sessionId}>{session.title ?? shortSessionId(session.sessionId)}</span>
                   <span className="sps-model">{session.models[0] ?? session.provider}</span>
-                  <span className="sps-calls">{session.calls.toLocaleString('en-US')} calls</span>
+                  <span className="sps-calls">{formatCount(session.calls, 'call')}</span>
                   <span className="sps-cost">{formatUsd(session.cost)}</span>
                 </div>
                 {open && <BranchSessionDetail session={session} />}
               </Fragment>
             )
           })}
-          {row.sessionRows.length === 0 && <div className="spend-proj-empty">No session detail for this branch.</div>}
+          {row.sessionRows.length === 0 && <div className="spend-proj-empty">{t('shared.branch.noSessionDetail')}</div>}
         </div>
       )}
     </Fragment>
@@ -145,15 +154,15 @@ function BranchRowView({ row, index, showProject, expanded, onToggle }: {
 function CoverageNote({ scope }: { scope: BranchSpendProjectReport['coverage'] }) {
   const providers = scope.noBranchDataProviders
   return (
-    <div className="branch-coverage" role="note" aria-label="Branch metadata coverage">
-      <span>On branches {formatUsd(scope.branchKnownCost)}</span>
-      <span>Unknown, before first branch {formatUsd(scope.branchUnknownCost)}</span>
+    <div className="branch-coverage" role="note" aria-label={t('shared.branch.coverageAriaLabel')}>
+      <span>{t('shared.branch.coverage.onBranches', { amount: formatUsd(scope.branchKnownCost) })}</span>
+      <span>{t('shared.branch.coverage.beforeFirstBranch', { amount: formatUsd(scope.branchUnknownCost) })}</span>
       <span>
-        No branch data {formatUsd(scope.noBranchDataCost)}
-        {scope.noBranchDataSessions > 0 ? ` (${scope.noBranchDataSessions} ${scope.noBranchDataSessions === 1 ? 'session' : 'sessions'}${providers.length ? `: ${providers.join(', ')}` : ''})` : ''}
+        {t('shared.branch.coverage.noBranchData', { amount: formatUsd(scope.noBranchDataCost) })}
+        {scope.noBranchDataSessions > 0 ? ` (${formatCount(scope.noBranchDataSessions, 'session')}${providers.length ? `: ${providers.join(', ')}` : ''})` : ''}
       </span>
       <span className="branch-coverage-note">
-        {scope.distinctSessions.toLocaleString('en-US')} distinct {scope.distinctSessions === 1 ? 'session' : 'sessions'} — a session that switched branches appears on each one, so rows are not summed.
+        {formatCount(scope.distinctSessions, 'distinct session')}. {t('shared.branch.coverage.distinctNote')}
       </span>
     </div>
   )
@@ -165,23 +174,24 @@ function BranchPage({ report }: { report: BranchSpendReport }) {
   // when the chosen project no longer appears in a new report snapshot.
   const [selected, setSelected] = useState<string | null>(null)
   const [expandedKey, setExpandedKey] = useState<string | null>(null)
+  const groups = useMemo(() => groupProjects(report.projects), [report.projects])
   const projectOptions = [
-    { value: ALL_PROJECTS, label: 'All projects' },
-    ...report.projects.map(p => ({ value: p.id, label: p.label })),
+    { value: ALL_PROJECTS, label: t('shared.branch.allProjects') },
+    ...groups.map(group => ({ value: group.id, label: group.label, note: group.note })),
   ]
   const chosen = selected !== null && selected !== ALL_PROJECTS
-    ? report.projects.find(p => p.id === selected)
+    ? groups.find(group => group.id === selected)
     : undefined
   const effectiveId = selected === ALL_PROJECTS
     ? ALL_PROJECTS
-    : chosen ? chosen.id : report.projects[0]?.id ?? ALL_PROJECTS
+    : chosen ? chosen.id : groups[0]?.id ?? ALL_PROJECTS
 
   const scope: BranchSpendProjectReport['coverage'] = effectiveId === ALL_PROJECTS
     ? report.totals
-    : report.projects.find(p => p.id === effectiveId)?.coverage ?? report.totals
+    : groups.find(group => group.id === effectiveId)?.coverage ?? report.totals
   const rows: BranchSpendRow[] = effectiveId === ALL_PROJECTS
-    ? report.projects.flatMap(p => p.branches)
-    : report.projects.find(p => p.id === effectiveId)?.branches ?? []
+    ? groups.flatMap(group => group.branches)
+    : groups.find(group => group.id === effectiveId)?.branches ?? []
   const showProject = effectiveId === ALL_PROJECTS
 
   // Reset any open expansion when the visible row set changes (project or
@@ -191,19 +201,21 @@ function BranchPage({ report }: { report: BranchSpendReport }) {
 
   return (
     <Panel
-      title="By branch"
-      right="spend per project and branch"
+      title={t('shared.branch.title')}
+      right={t('shared.branch.subtitle')}
       className="spend-scroll"
     >
-      <div className="branch-picker">
-        <Dropdown
-          id="branch-project"
-          ariaLabel="Project for the By branch lens"
-          value={effectiveId}
-          options={projectOptions}
-          onChange={value => setSelected(value)}
-        />
-      </div>
+      {groups.length > 0 && (
+        <div className="branch-picker">
+          <Dropdown
+            id="branch-project"
+            ariaLabel={t('shared.branch.projectAriaLabel')}
+            value={effectiveId}
+            options={projectOptions}
+            onChange={value => setSelected(value)}
+          />
+        </div>
+      )}
       {rows.length ? (
         rows.map((row, i) => {
           const rowKey = `${row.projectId}|${row.branch ?? '__unknown__'}`
@@ -219,9 +231,9 @@ function BranchPage({ report }: { report: BranchSpendReport }) {
           )
         })
       ) : (
-        <EmptyNote>No branch activity for this project in the selected range yet. Branch metadata is captured per turn (Claude transcripts carry it today); sources without it are listed in the coverage note.</EmptyNote>
+        <EmptyNote>{t('shared.branch.empty')}</EmptyNote>
       )}
-      <CoverageNote scope={scope} />
+      {groups.length > 0 && <CoverageNote scope={scope} />}
     </Panel>
   )
 }
@@ -239,12 +251,12 @@ export function BranchBreakdown({ period, provider, range = null }: { period: Pe
   if (!report.data) {
     if (report.error) {
       return (
-        <Panel title="By branch" className="spend-scroll">
+        <Panel title={t('shared.branch.title')} className="spend-scroll">
           <CliErrorText error={report.error} />
         </Panel>
       )
     }
-    return <SectionSkeleton label="Scanning branches…" rows={4} />
+    return <SectionSkeleton label={t('shared.branch.scanning')} rows={4} />
   }
   return <BranchPage report={report.data} />
 }

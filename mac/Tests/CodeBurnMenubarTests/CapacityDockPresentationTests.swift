@@ -27,6 +27,7 @@ struct CapacityDockPresentationTests {
     func presentationLengthInterpolates() {
         let suite = "CodeBurnMenubarTests.CapacityDock.Presentation.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
+        defer { TestDefaults.forget(suite) }
         CapacityDockPreferences.setSelectedProviders([.codex, .claude, .gemini], defaults: defaults)
         let model = CapacityDockViewModel(preferences: CapacityDockPreferences.load(defaults: defaults))
         model.interaction.setRailHovered(true)
@@ -44,6 +45,7 @@ struct CapacityDockPresentationTests {
     func restingProviderFollowsExpansionAnchor() {
         let suite = "CodeBurnMenubarTests.CapacityDock.AnchorOrder.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
+        defer { TestDefaults.forget(suite) }
         CapacityDockPreferences.setSelectedProviders([.codex, .claude, .gemini], defaults: defaults)
         let model = CapacityDockViewModel(preferences: CapacityDockPreferences.load(defaults: defaults))
         model.isRailPresentationExpanded = true
@@ -59,6 +61,7 @@ struct CapacityDockPresentationTests {
     func attachmentKeepsPanelSizeStable() {
         let suite = "CodeBurnMenubarTests.CapacityDock.EdgeSpread.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
+        defer { TestDefaults.forget(suite) }
         CapacityDockPreferences.setScale(1.2, defaults: defaults)
         let model = CapacityDockViewModel(preferences: CapacityDockPreferences.load(defaults: defaults))
 
@@ -78,7 +81,7 @@ struct CapacityDockPresentationTests {
     func supportedSettledGeometryIsIntegral() {
         let suite = "CodeBurnMenubarTests.CapacityDock.IntegralGeometry.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
-        defer { defaults.removePersistentDomain(forName: suite) }
+        defer { TestDefaults.forget(suite) }
         CapacityDockPreferences.setSelectedProviders([.codex, .claude, .gemini], defaults: defaults)
 
         for step in 0...12 {
@@ -227,6 +230,7 @@ struct CapacityDockPresentationTests {
     func selectedProviderIdentityStaysStable() {
         let suite = "CodeBurnMenubarTests.CapacityDock.Identity.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
+        defer { TestDefaults.forget(suite) }
         CapacityDockPreferences.setSelectedProviders([.codex, .claude, .gemini], defaults: defaults)
         CapacityDockPreferences.setPreferredProvider(.codex, defaults: defaults)
         let model = CapacityDockViewModel(preferences: CapacityDockPreferences.load(defaults: defaults))
@@ -250,6 +254,7 @@ struct CapacityDockPresentationTests {
     func restingProviderNeverFlashesToAnotherIcon() {
         let suite = "CodeBurnMenubarTests.CapacityDock.NoIconFlash.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
+        defer { TestDefaults.forget(suite) }
         CapacityDockPreferences.setSelectedProviders([.codex, .claude, .gemini], defaults: defaults)
         CapacityDockPreferences.setPreferredProvider(.codex, defaults: defaults)
         let model = CapacityDockViewModel(preferences: CapacityDockPreferences.load(defaults: defaults))
@@ -314,33 +319,43 @@ struct CapacityDockPresentationTests {
         #expect(lines == ["Source: ClinePass"])
     }
 
-    @Test("terminal recovery cards reserve enough height for wrapped guidance and the action")
+    @Test("terminal recovery cards fit their guidance and the action with no surplus")
     func terminalCardHeight() {
         let reason = "No available fetch strategy for clinepass."
-        let quota = QuotaSummary(
-            providerFilter: .all,
-            connection: .terminalFailure(reason: reason),
-            primary: nil,
-            details: [],
-            planLabel: nil,
-            footerLines: [reason]
-        )
+        func height(_ reason: String) -> CGFloat {
+            CapacityDockMetrics.detailHeight(
+                quota: QuotaSummary(
+                    providerFilter: .all,
+                    connection: .terminalFailure(reason: reason),
+                    primary: nil,
+                    details: [],
+                    planLabel: nil,
+                    footerLines: [reason]
+                ),
+                provider: .claude,
+                sessionCount: nil,
+                hasToday: false,
+                tailEdge: .right,
+                scale: 1
+            )
+        }
 
-        let height = CapacityDockMetrics.detailHeight(
-            quota: quota,
-            sessionCount: nil,
-            hasToday: false,
-            tailEdge: .right,
-            scale: 1
+        // The card is the header, the guidance block as it actually wraps, and
+        // the action row — nothing more. A worst-case reserve would not clip,
+        // but the panel frame is computed, so its surplus lands as dead space
+        // above the button instead of shrinking the card.
+        let block = CapacityDockGlance.connectionBlockHeight(
+            .terminalFailure(reason: reason),
+            provider: .claude,
+            width: 350 - 2 * CapacityDockGlance.contentInset
         )
-        // Worst case the card must not clip: the provider header, the guidance
-        // block at full wrap ("Reconnect required", a 2-line reason and a 3-line
-        // instruction at ~13pt each, plus their spacing), and the action button.
-        // The windows row is absent, since a disconnected provider has no quota.
-        let guidance: CGFloat = 84
-        let actionButton: CGFloat = 38
-        let floor: CGFloat = CapacityDockGlance.headerHeight + guidance + actionButton
-        #expect(height >= floor)
+        #expect(
+            height(reason)
+                == CapacityDockGlance.headerHeight + block + CapacityDockGlance.actionRowHeight
+        )
+        // And the block really is measured: a reason that wraps reserves the
+        // second line rather than clipping it.
+        #expect(height(String(repeating: "fetch strategy unavailable ", count: 6)) > height(reason))
     }
 
     @MainActor

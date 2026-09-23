@@ -4,13 +4,14 @@ import { EventEmitter } from 'node:events'
 import React, { Fragment, useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, type DOMElement, type Instance, type RenderOptions } from 'ink'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
-import { formatCost, formatTokens, markEstimated, carriedCostNote } from './format.js'
+import { formatCost, formatTokens, markEstimated, carriedCostNote, excludedGatewayNote } from './format.js'
+import { maxOf } from './math-utils.js'
 import { formatSessionCount } from './session-count-label.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
-import { parseAllSessions, filterProjectsByDateRange, filterProjectsByName, setInteractiveScanUI, withSinglePassParse, withColdFirstPaintFloor, filesParsedFromSourceCount, isCompleteSessionSnapshotAvailable } from './parser.js'
+import { parseAllSessions, excludeAggregateOnlyProjects, filterProjectsByDateRange, filterProjectsByName, setInteractiveScanUI, withSinglePassParse, withColdFirstPaintFloor, filesParsedFromSourceCount, isCompleteSessionSnapshotAvailable } from './parser.js'
 import { findUnpricedModels, isExpectedFreeModel, loadPricing } from './models.js'
 import { aggregateModelTotals } from './model-breakdown.js'
-import { buildDurableOverviewFromNormalizedIndex, buildDurablePeriod, hydrateDailyCacheFromNormalizedProjects } from './usage-aggregator.js'
+import { buildDurableOverviewFromNormalizedIndex, buildDurablePeriod, hydrateDailyCacheFromNormalizedProjects, type ExcludedGatewayTotals } from './usage-aggregator.js'
 import { loadDailyCache, type DailyCache } from './daily-cache.js'
 import { exitAfterCacheCleanup } from './session-cache.js'
 import { getAllProviders } from './providers/index.js'
@@ -372,6 +373,10 @@ export type DurableOverview = {
   // its total may exceed what the (live-scan-bounded) Daily Activity panel
   // below can show. See carriedCostNote in format.ts.
   carriedCostUSD: number
+  // Gateway spend shown on its own labelled row but held out of `cost`.
+  // Optional like OverviewDurable's: a fixture or an older persisted shape
+  // simply has nothing to footnote. See excludedGatewayNote in format.ts.
+  excludedGateway?: ExcludedGatewayTotals
 }
 
 function getDurableRange(period: Period, customRange: DateRange | null | undefined, day: string | null): DateRange {
@@ -387,7 +392,7 @@ async function computeDurableOverview(
   day: string | null,
 ): Promise<DurableOverview> {
   const range = getDurableRange(period, customRange, day)
-  const { data, carriedCostUSD } = await buildDurablePeriod(
+  const { data, carriedCostUSD, excludedGateway } = await buildDurablePeriod(
     { range, label: PERIOD_LABELS[period] },
     { provider, project: projectFilter ?? [], exclude: excludeFilter ?? [] },
   )
@@ -402,6 +407,7 @@ async function computeDurableOverview(
     cacheReadTokens: data.cacheReadTokens,
     cacheWriteTokens: data.cacheWriteTokens,
     carriedCostUSD,
+    excludedGateway,
   }
 }
 
@@ -480,7 +486,7 @@ function fit(s: string, n: number): string {
 type MetricCell = { text: string; color?: string; dimColor?: boolean }
 
 function getMetricWidths(headers: string[], rows: string[][]): number[] {
-  return headers.map((header, index) => Math.max(header.length, ...rows.map(row => row[index]?.length ?? 0)))
+  return headers.map((header, index) => maxOf(rows.map(row => row[index]?.length ?? 0), header.length))
 }
 
 function getMetricGroupWidth(metricWidths: number[]): number {
@@ -637,6 +643,9 @@ function Overview({ projects, label, width, planUsages, durable }: { projects: P
       {durable && carriedCostNote(durable.carriedCostUSD) && (
         <Text dimColor wrap="truncate-end">  {carriedCostNote(durable.carriedCostUSD)}</Text>
       )}
+      {durable && excludedGatewayNote(durable.excludedGateway?.costUSD ?? 0) && (
+        <Text dimColor wrap="truncate-end">  {excludedGatewayNote(durable.excludedGateway?.costUSD ?? 0)}</Text>
+      )}
       {activePlanUsages.length > 0 && (
         <>
           {activePlanUsages.map(planUsage => {
@@ -684,7 +693,7 @@ function DailyActivity({ projects, days = 14, pw, bw, scrollable = false, cursor
   const allRows = getDailyActivityRows(projects)
   const orderedRows = scrollable ? [...allRows].reverse() : allRows
   const rows = scrollable ? orderedRows.slice(cursor, cursor + days) : orderedRows.slice(-days)
-  const maxCost = Math.max(0, ...(scrollable ? orderedRows : rows).map(row => row.cost))
+  const maxCost = maxOf((scrollable ? orderedRows : rows).map(row => row.cost), 0)
   const headers = ['cost', 'calls']
   const values = rows.map(row => [formatCost(row.cost), String(row.calls)])
   const metricWidths = getMetricWidths(headers, values)
@@ -764,13 +773,13 @@ export function shortProject(absPath: string, width = Infinity): string {
 
 export function getDashboardMaxWidth(projects: ProjectSummary[], budgets?: Map<string, ContextBudget>, activeProvider?: string): number {
   const sessions = projects.flatMap(project => project.sessions)
-  const longest = (values: string[]) => Math.max(1, ...values.map(value => value.length))
+  const longest = (values: string[]) => maxOf(values.map(value => value.length), 1)
   const rowWidth = (labels: string[], metricCount: number, metricWidth = 7) =>
     PANEL_CHROME + 10 + 1 + longest(labels) + metricCount * metricWidth
   const modelTotals = aggregateModelTotals(projects)
-  const modelMetricWidth = Math.max(7, ...Object.values(modelTotals).map(model =>
+  const modelMetricWidth = maxOf(Object.values(modelTotals).map(model =>
     markEstimated(formatCost(model.costUSD), model.estimatedCostUSD > 0).length
-  ))
+  ), 7)
   const categoryLabels = sessions.flatMap(session => Object.keys(session.categoryBreakdown).map(category => CATEGORY_LABELS[category as TaskCategory] ?? category))
   const skillLabels = sessions.flatMap(session => Object.keys(session.skillBreakdown))
   const agentLabels = sessions.flatMap(session => Object.keys(session.subagentBreakdown))
@@ -792,7 +801,7 @@ function getProjectBreakdownRowLimit(period: Period, dayMode = false): number {
 }
 
 function ProjectBreakdown({ projects, pw, bw, budgets, rows = 14 }: { projects: ProjectSummary[]; pw: number; bw: number; budgets?: Map<string, ContextBudget>; rows?: number }) {
-  const maxCost = Math.max(...projects.map(p => p.totalCostUSD))
+  const maxCost = maxOf(projects.map(p => p.totalCostUSD), -Infinity)
   const hasBudgets = budgets && budgets.size > 0
   const headers = ['cost', 'avg/s', 'session', ...(hasBudgets ? ['overhead'] : [])]
   const visibleProjects = projects.slice(0, rows)
@@ -2338,7 +2347,10 @@ export async function buildDashboardHistoryIndex(
 ): Promise<DashboardHistoryIndex> {
   const readyThrough = options.readyThrough ?? 'lifetime'
   const range = dashboardIndexScanRange(readyThrough)
-  const parse = () => parseAllSessions(range, provider)
+  // Feeds hydrateDailyCacheFromNormalizedProjects below, so it takes the whole
+  // corpus; the period projection holds the aggregate-only provider out of its
+  // totals instead (buildDurableOverviewFromNormalizedIndex).
+  const parse = () => parseAllSessions(range, provider, { includeAggregateOnly: true })
   const normalizedProjects = options.preferCompleteSnapshot || options.progressiveSource
     ? (await withColdFirstPaintFloor(
         range.start,
@@ -2363,7 +2375,8 @@ export function selectDashboardHistoryIndex(
   period: Period,
 ): { projects: ProjectSummary[]; durable: DurableOverview } {
   const filtered = filterProjectsByName(index.normalizedProjects, index.projectFilter, index.excludeFilter)
-  const projects = filterProjectsByDateRange(filtered, getPeriodRange(period))
+  // The index holds the whole corpus for the cache fill; the panels follow the headline.
+  const projects = excludeAggregateOnlyProjects(filterProjectsByDateRange(filtered, getPeriodRange(period)), index.provider)
   const durable = buildDurableOverviewFromNormalizedIndex(
     { range: getPeriodRange(period), label: PERIOD_LABELS[period] },
     index.normalizedProjects,

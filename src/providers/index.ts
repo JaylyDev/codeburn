@@ -27,6 +27,8 @@ import { quickdesk } from './quickdesk.js'
 import { rooCode } from './roo-code.js'
 import { zerostack } from './zerostack.js'
 import { grok } from './grok.js'
+import { grokbot } from './grokbot.js'
+import { isBlockedDatabaseError } from '../sqlite.js'
 import type { Provider, SessionSource } from './types.js'
 
 let antigravityProvider: Provider | null = null
@@ -193,7 +195,7 @@ async function loadZed(): Promise<Provider | null> {
   }
 }
 
-const coreProviders: Provider[] = [claude, cline, clineCli, codewhale, codebuff, codex, copilot, devin, droid, dsh, gemini, hermes, ibmBob, kiloCode, kiro, kimi, kimicode, lingtaiTui, mistralVibe, mux, openclaw, openclaude, openDesign, pi, omp, qwen, quickdesk, rooCode, zerostack, grok]
+const coreProviders: Provider[] = [claude, cline, clineCli, codewhale, codebuff, codex, copilot, devin, droid, dsh, gemini, hermes, ibmBob, kiloCode, kiro, kimi, kimicode, lingtaiTui, mistralVibe, mux, openclaw, openclaude, openDesign, pi, omp, qwen, quickdesk, rooCode, zerostack, grok, grokbot]
 
 // Lazily loaded providers, listed by name so --provider validation works even
 // when an optional module fails to load. Must stay in sync with getAllProviders.
@@ -265,7 +267,9 @@ async function discoverOne(provider: Provider): Promise<{ sources: SessionSource
   try {
     return { sources: await provider.discoverSessions(), failed: false }
   } catch (err) {
-    if (!warnedDiscoveryFailures.has(provider.name)) {
+    // An error that already explained itself on stderr does not need a second,
+    // vaguer line.
+    if (!warnedDiscoveryFailures.has(provider.name) && !isBlockedDatabaseError(err)) {
       warnedDiscoveryFailures.add(provider.name)
       const msg = err instanceof Error ? err.message : String(err)
       process.stderr.write(

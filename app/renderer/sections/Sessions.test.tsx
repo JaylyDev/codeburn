@@ -148,7 +148,7 @@ describe('Sessions', () => {
     const search = await screen.findByRole('textbox', { name: 'Search sessions' })
 
     await user.type(search, 'codeb')
-    expect(screen.getByText('1 sessions · $8.41 · 1.5M tokens')).toBeInTheDocument()
+    expect(screen.getByText('1 session · $8.41 · 1.5M tokens')).toBeInTheDocument()
     expect(container.querySelectorAll('.session-row')).toHaveLength(1)
     expect(screen.getByText('projects/codeburn')).toBeInTheDocument()
     expect(screen.queryByText('client-api')).not.toBeInTheDocument()
@@ -210,6 +210,23 @@ describe('Sessions', () => {
     expect(container.querySelectorAll('.session-row')).toHaveLength(INITIAL_VISIBLE + 5)
     expect(screen.queryByRole('button', { name: /remaining/ })).not.toBeInTheDocument()
     expect(getSessions).toHaveBeenCalledTimes(1)
+  })
+
+  it('opens a session row on Enter and keeps its cost breakdown out of the tab order', async () => {
+    const user = userEvent.setup()
+    getSessions.mockResolvedValue(rows)
+    render(<Sessions period="30days" provider="all" />)
+    await screen.findByText('6 sessions · $21.93 · 4.2M tokens')
+
+    const row = screen.getByRole('button', { name: /projects\/codeburn/ })
+    // The cost breakdown inside the row is not its own tab stop.
+    expect(row.querySelector('[data-usd]')).toHaveAttribute('tabindex', '-1')
+
+    // Enter on the focused row opens it — the nested trigger no longer swallows it.
+    row.focus()
+    await user.keyboard('{Enter}')
+    expect(row).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByRole('dialog', { name: /session details/i })).toBeInTheDocument()
   })
 
   it('opens the session in a side drawer, closes on Escape, and returns focus to the row', async () => {
@@ -398,7 +415,7 @@ describe('Sessions', () => {
     )
 
     // The chips bar explains the selection and offers per-chip removal + Clear.
-    await screen.findByText(/sessions in selection/)
+    await screen.findByText(/sessions? in selection/)
     const chips = screen.getByRole('group', { name: /active investigation filters/i })
     expect(within(chips).getByText('coding')).toBeInTheDocument()
     expect(within(chips).getByRole('button', { name: /remove category filter coding/i })).toBeInTheDocument()

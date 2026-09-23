@@ -62,26 +62,31 @@ describe('getModelCosts', () => {
     expect(costs!.inputCostPerToken).toBe(5e-6)
   })
 
-  it('prices lowercase glm-5.2 (Hermes spelling) the same as capitalized GLM-5.2', () => {
+  it('prices lowercase glm-5.2 (Hermes spelling) the same as capitalized GLM-5.2, at the z.ai discounted rate', () => {
     const lower = getModelCosts('glm-5.2')
     const upper = getModelCosts('GLM-5.2')
+    const zai = (snapshotData as Record<string, number[]>)['z-ai/glm-5.2']!
     expect(lower).not.toBeNull()
     expect(upper).not.toBeNull()
     expect(lower!.inputCostPerToken).toBe(upper!.inputCostPerToken)
     expect(lower!.outputCostPerToken).toBe(upper!.outputCostPerToken)
+    expect(lower!.inputCostPerToken).toBe(zai[0])
+    expect(lower!.outputCostPerToken).toBe(zai[1])
   })
 
-  it('prices glm-5.3 (Hermes / Cline spelling) instead of leaving it unpriced', () => {
+  it('prices glm-5.3 (Hermes / Cline spelling) at the z.ai discounted rate', () => {
     const lower = getModelCosts('glm-5.3')
     const upper = getModelCosts('GLM-5.3')
-    const sibling = getModelCosts('glm-5p2')
+    // Both spellings alias to `z-ai/glm-5.3`, the discounted row, not the bare
+    // `glm-5.3` list row nor the glm-5p2 sibling. Assert against the snapshot's
+    // own row so an upstream reprice or namespace rename can't flip this.
+    const zai = (snapshotData as Record<string, number[]>)['z-ai/glm-5.3']!
     expect(lower).not.toBeNull()
     expect(upper).not.toBeNull()
-    expect(sibling).not.toBeNull()
-    expect(lower!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
-    expect(upper!.outputCostPerToken).toBe(sibling!.outputCostPerToken)
-    expect(getModelCosts('cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
-    expect(getModelCosts('omniroute:cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
+    expect(lower!.inputCostPerToken).toBe(zai[0])
+    expect(upper!.outputCostPerToken).toBe(zai[1])
+    expect(getModelCosts('cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(zai[0])
+    expect(getModelCosts('omniroute:cp/cline-pass/glm-5.3')!.inputCostPerToken).toBe(zai[0])
     expect(getModelCosts('cmd/deepseek/deepseek-v4-flash')).not.toBeNull()
     expect(getModelCosts('provider/org/glm-5.3')).toBeNull()
     expect(getModelCosts('provider/glm-5.3')).toBeNull()
@@ -89,7 +94,7 @@ describe('getModelCosts', () => {
     expect(getModelCosts('omniroute:provider/glm-5.3')).toBeNull()
     expect(getModelCosts('unknown/deepseek-v4-flash')).toBeNull()
     expect(getModelCosts('z-ai/glm-5.2')).not.toBeNull()
-    expect(getModelCosts('z-ai/glm-5.3')!.inputCostPerToken).toBe(sibling!.inputCostPerToken)
+    expect(getModelCosts('z-ai/glm-5.3')!.inputCostPerToken).toBe(zai[0])
   })
 
   it('prices gpt-5.6-codex and gpt-5.6-codex-max, sourced directly from the snapshot (#1077)', () => {
@@ -246,7 +251,7 @@ describe('resolveCanonicalModelId', () => {
     expect(resolveCanonicalModelId('glm-5p2')).toBe('glm-5p2')
     expect(resolveCanonicalModelId('cliproxy/claude-fable-5-1')).toBe('claude-fable-5-1')
     expect(resolveCanonicalModelId('cliproxy/zcode/glm-5.3-flash')).toBe('glm-5.3-flash')
-    expect(resolveCanonicalModelId('GLM-5.2')).toBe('glm-5p1')
+    expect(resolveCanonicalModelId('GLM-5.2')).toBe('z-ai/glm-5.2')
     expect(resolveCanonicalModelId('gpt-5-fast')).toBe('gpt-5')
     expect(resolveCanonicalModelId('gpt-5-untracked-xyz')).toBe('gpt-5-untracked-xyz')
     expect(resolveCanonicalModelId('claude-opus-4.6')).toBe('claude-opus-4-6')
@@ -1136,6 +1141,48 @@ describe('findUnpricedModels', () => {
       { model: 'Sonnet 4.6', calls: 12, cost: 0, tokens: 500_000 },
     ])
     expect(unpriced).toEqual([{ model: 'Sonnet 4.6', calls: 12, tokens: 500_000 }])
+  })
+
+  it('does not mistake a Bedrock `-v1:0` version for an Ollama tag', () => {
+    // Claude Code with CLAUDE_CODE_USE_BEDROCK=1 records Bedrock's foundation-
+    // model id, which ends in `-v<major>:<minor>`. The colon used to read as
+    // a local `:tag`, so an unpriced Bedrock model was classed as free local
+    // inference and never reached the unpriced list. It is metered.
+    expect(isExpectedFreeModel('anthropic.claude-nonexistent-99-v1:0')).toBe(false)
+    expect(findUnpricedModels([
+      { model: 'anthropic.claude-nonexistent-99-v1:0', calls: 3, cost: 0, tokens: 1000 },
+    ])).toEqual([{ model: 'anthropic.claude-nonexistent-99-v1:0', calls: 3, tokens: 1000 }])
+    // A priced Bedrock id is still not "expected free" — its $0 would be a gap.
+    expect(isExpectedFreeModel('anthropic.claude-haiku-4-5-20251001-v1:0')).toBe(false)
+    // Not every Bedrock id spells the `v`: OpenAI and Cohere ids on Bedrock
+    // end in a bare `-<major>:<minor>`, and they are metered all the same.
+    expect(isExpectedFreeModel('openai.gpt-oss-120b-1:0')).toBe(false)
+    expect(isExpectedFreeModel('cohere.rerank-v3-5:0')).toBe(false)
+    expect(isExpectedFreeModel('us-gov-west-1/openai.gpt-oss-20b-1:0')).toBe(false)
+    // Ollama tags keep their treatment; only the version shape is exempted.
+    expect(isExpectedFreeModel('qwen3.6:35b-a3b-bf16')).toBe(true)
+    expect(isExpectedFreeModel('gpt-oss:120b')).toBe(true)
+    expect(isExpectedFreeModel('llama3.1:8b-instruct-q4_K_M')).toBe(true)
+  })
+
+  it('flags Bedrock provisioned-model / custom-model ARNs as unpriced, not local', () => {
+    // These ARNs carry colons from the ARN structure, so they used to fall to
+    // the `:tag` branch and be hidden as free local inference. They are metered
+    // Bedrock and, when unpriced, must reach the unpriced list.
+    const provisioned = 'arn:aws:bedrock:us-east-1:123456789012:provisioned-model/2c3f9a1b'
+    const custom = 'arn:aws:bedrock:eu-central-1:210987654321:custom-model/my-tuned-claude'
+    expect(isExpectedFreeModel(provisioned)).toBe(false)
+    expect(isExpectedFreeModel(custom)).toBe(false)
+    expect(findUnpricedModels([
+      { model: provisioned, calls: 4, cost: 0, tokens: 2000 },
+      { model: custom, calls: 1, cost: 0, tokens: 300 },
+    ])).toEqual([
+      { model: provisioned, calls: 4, tokens: 2000 },
+      { model: custom, calls: 1, tokens: 300 },
+    ])
+    // Real local tags are untouched by the ARN exemption.
+    expect(isExpectedFreeModel('llama3.1:8b-instruct-q4_K_M')).toBe(true)
+    expect(isExpectedFreeModel('qwen3.6:35b-a3b-bf16')).toBe(true)
   })
 
   it('flags zero-rate pricing stubs but not explicit zero-rate user overrides', async () => {

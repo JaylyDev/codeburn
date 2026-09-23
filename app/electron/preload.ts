@@ -19,6 +19,12 @@ async function invoke<T>(channel: string, ...args: unknown[]): Promise<T> {
 // Shape matches CodeburnBridge (app/renderer/lib/types.ts); typing is enforced
 // renderer-side where `window.codeburn` is declared as CodeburnBridge.
 const bridge = {
+  // The Electron app's own UI language tag (app.getLocale()), for the renderer's
+  // 'system' locale choice. Seeded into the environment by main before the
+  // window loads, so it is sync-safe at preload time.
+  appLocale: process.env.__CODEBURN_APP_LOCALE__ ?? '',
+  getLanguage: () => invoke('codeburn:getLanguage'),
+  setLanguage: (language: string | null) => invoke('codeburn:setLanguage', language),
   getQuota: (force?: boolean, disabled?: string[]) => invoke('codeburn:getQuota', force, disabled),
   getOverview: (period: string, provider: string, range?: DateRange, configSource?: string | null, background?: boolean, scope?: string) => invoke('codeburn:getOverview', period, provider, range, configSource, background, scope),
   getTimeline: (period: string, provider: string, range?: DateRange) => invoke('codeburn:getTimeline', period, provider, range),
@@ -38,6 +44,17 @@ const bridge = {
   getSpendFlow: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getSpendFlow', period, provider, range, background),
   getBranchSpend: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getBranchSpend', period, provider, range, background),
   getOptimizeReport: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getOptimizeReport', period, provider, range, background),
+  // The once-a-day optimize scan, cached on disk per query scope. `maxAgeMs` 0
+  // forces a recompute (Optimize page, manual refresh).
+  getOptimizeSnapshot: (period: string, provider: string, range?: DateRange, configSource?: string | null, scope?: string, maxAgeMs?: number) =>
+    invoke('codeburn:getOptimizeSnapshot', period, provider, range, configSource, scope, maxAgeMs),
+  // Power source for the battery-aware live cadence: one read plus a push.
+  powerStatus: () => invoke('codeburn:powerStatus'),
+  onPowerStatus: (cb: (onBattery: boolean) => void) => {
+    const listener = (_e: unknown, onBattery: boolean) => cb(onBattery)
+    ipcRenderer.on('codeburn:power', listener)
+    return () => { ipcRenderer.removeListener('codeburn:power', listener) }
+  },
   getDevices: (period: string) => invoke('codeburn:getDevices', period),
   getDevicesScan: () => invoke('codeburn:getDevicesScan'),
   getShareStatus: () => invoke('codeburn:getShareStatus'),
@@ -82,13 +99,30 @@ const bridge = {
   // The bundled tray app and its Capacity Dock (Windows). Every setter answers with the
   // whole status, so the sidebar renders what took rather than what it asked for.
   companionStatus: () => invoke('codeburn:companionStatus'),
-  setMenuBarEnabled: (enabled: boolean) => invoke('codeburn:setMenuBarEnabled', enabled),
-  setSidebarEnabled: (enabled: boolean) => invoke('codeburn:setSidebarEnabled', enabled),
+  // The Plugins card's discrete actions, mirroring the macOS card.
+  companionInstall: () => invoke('codeburn:companionInstall'),
+  companionOpen: () => invoke('codeburn:companionOpen'),
+  companionQuit: () => invoke('codeburn:companionQuit'),
+  companionUninstall: () => invoke('codeburn:companionUninstall'),
+  companionSetDock: (enabled: boolean) => invoke('codeburn:companionSetDock', enabled),
   // The tray app's own settings, in the two files it reads them from.
   trayPrefs: () => invoke('codeburn:trayPrefs'),
   setTrayAppPref: (patch: Record<string, unknown>) => invoke('codeburn:setTrayAppPref', patch),
   setTrayDockPref: (patch: Record<string, unknown>) => invoke('codeburn:setTrayDockPref', patch),
   setLaunchAtLogin: (enabled: boolean) => invoke('codeburn:setLaunchAtLogin', enabled),
+  // The macOS menubar app's card on the Plugins page.
+  macMenubarStatus: () => invoke('codeburn:macMenubarStatus'),
+  macMenubarInstall: () => invoke('codeburn:macMenubarInstall'),
+  macMenubarOpen: () => invoke('codeburn:macMenubarOpen'),
+  macMenubarSetDock: (enabled: boolean) => invoke('codeburn:macMenubarSetDock', enabled),
+  macMenubarSettings: () => invoke('codeburn:macMenubarSettings'),
+  macMenubarQuit: () => invoke('codeburn:macMenubarQuit'),
+  macMenubarUninstall: () => invoke('codeburn:macMenubarUninstall'),
+  onMacMenubarProgress: (cb: (phase: string) => void) => {
+    const listener = (_e: unknown, phase: string) => cb(phase)
+    ipcRenderer.on('codeburn:macMenubarProgress', listener)
+    return () => { ipcRenderer.removeListener('codeburn:macMenubarProgress', listener) }
+  },
   // Plugin management
   pluginList: () => invoke('codeburn:pluginList'),
   pluginInfo: (name: string) => invoke('codeburn:pluginInfo', name),

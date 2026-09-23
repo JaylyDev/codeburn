@@ -9,8 +9,10 @@ import { SectionSkeleton } from '../components/Skeleton'
 import { SegTabs } from '../components/SegTabs'
 import { SessionDrawer } from '../components/SessionDrawer'
 import { StaleBanner } from '../components/StaleBanner'
+import { Icon } from '../components/icons'
 import { usePolled } from '../hooks/usePolled'
-import { formatCompact, formatDayShort, formatUsd, shortenProjectPath } from '../lib/format'
+import { formatCompact, formatCount, formatDayShort, formatUsd, shortenProjectPath } from '../lib/format'
+import { Usd, tokensOf } from '../components/Usd'
 import { codeburn } from '../lib/ipc'
 import {
   applyInvestigation,
@@ -22,18 +24,12 @@ import {
 } from '../lib/investigation'
 import { reportMemoKey } from '../lib/reportMemoKey'
 import type { DateRange, Period, SessionDrillRow, SessionRow } from '../lib/types'
+import { t } from '../i18n'
 
 export const INITIAL_VISIBLE = 120
 const STEP = 120
 
 export type SessionSort = 'cost' | 'recent' | 'turns' | 'tokens'
-
-const SORT_OPTIONS = [
-  { value: 'cost', label: 'Cost' },
-  { value: 'recent', label: 'Recent' },
-  { value: 'turns', label: 'Turns' },
-  { value: 'tokens', label: 'Tokens' },
-]
 
 /** Composite identity of a session row: provider + project + sessionId. An id
  *  alone is not globally unique (another provider, or an imported transcript,
@@ -42,7 +38,11 @@ export function sessionRowKey(row: Pick<SessionRow, 'provider' | 'project' | 'se
   return `${row.provider}\u0000${row.project}\u0000${row.sessionId}`
 }
 
-function providerName(provider: string): string {
+/** The CLI's own display name for a provider id ("kimicode" -> "Kimi Code"),
+ *  falling back to a title-cased id when the catalog has not loaded. */
+function providerName(provider: string, detected: Array<{ id: string; label: string }>): string {
+  const known = detected.find(entry => entry.id === provider)
+  if (known) return known.label
   return provider
     .split(/[-\s]+/)
     .filter(Boolean)
@@ -90,14 +90,14 @@ function ProviderFilterRow({
 }) {
   if (detectedProviders.length === 0) return null
   return (
-    <div className="seg session-provider-filter" role="group" aria-label="Filter sessions by provider">
+    <div className="seg session-provider-filter" role="group" aria-label={t('sessions.providerFilter.ariaLabel')}>
       <button
         type="button"
         className={provider === 'all' ? 'on' : undefined}
         aria-pressed={provider === 'all'}
         onClick={() => onProviderChange('all')}
       >
-        All
+        {t('sessions.providerFilter.all')}
       </button>
       {detectedProviders.map(entry => (
         <button
@@ -339,20 +339,20 @@ export function Sessions({
   }, [effectiveOpenSessionId])
 
   if (!report.data) {
-    if (report.error) return <CliErrorPanel error={report.error} subject="sessions" />
-    return <SectionSkeleton label="Scanning sessions…" rows={5} />
+    if (report.error) return <CliErrorPanel error={report.error} subject={t('common.subject.sessions')} />
+    return <SectionSkeleton label={t('sessions.skeleton.label')} rows={5} />
   }
 
   if (!report.data.length) {
     return (
       <>
-        <Panel title="Sessions">
+        <Panel title={t('sessions.panel.title')}>
           <ProviderFilterRow provider={provider} detectedProviders={detectedProviders} onProviderChange={onProviderChange} />
           {investigating && <FilterChips filters={filters} onChange={next => onFiltersChange?.(next)} />}
           <EmptyNote>
             {investigating
-              ? 'No sessions match the current selection. Remove a chip above to widen it.'
-              : 'No sessions in this range yet.'}
+              ? t('sessions.empty.noMatchSelection')
+              : t('sessions.empty.noneInRange')}
           </EmptyNote>
         </Panel>
       </>
@@ -371,13 +371,18 @@ export function Sessions({
       <div className="sessions-toolbar">
         <input
           className="sessions-search"
-          aria-label="Search sessions"
-          placeholder="Search project, model, or id…"
+          aria-label={t('sessions.search.ariaLabel')}
+          placeholder={t('sessions.search.placeholder')}
           value={query}
           onChange={event => setQuery(event.target.value)}
         />
         <SegTabs
-          options={SORT_OPTIONS}
+          options={[
+            { value: 'cost', label: t('sessions.sort.cost') },
+            { value: 'recent', label: t('sessions.sort.recent') },
+            { value: 'turns', label: t('sessions.sort.turns') },
+            { value: 'tokens', label: t('sessions.sort.tokens') },
+          ]}
           value={sort}
           onChange={value => setSort(value as SessionSort)}
         />
@@ -387,24 +392,24 @@ export function Sessions({
           aria-pressed={grouped}
           onClick={() => setGrouped(value => !value)}
         >
-          Group by provider
+          {t('sessions.toolbar.groupByProvider')}
         </button>
       </div>
       <div className="sessions-summary">
         {investigating
           ? (
               <>
-                {included.length.toLocaleString('en-US')} sessions in selection · <strong>{formatUsd(selectionCost)}</strong> in selection
-                {summary.fullCost > selectionCost + 1e-9 && <> · full cost of these sessions {formatUsd(summary.fullCost)}</>}
-                {summary.tokens > 0 && <> · {formatCompact(summary.tokens)} tokens in selection</>}
+                {formatCount(included.length, 'session')} {t('sessions.summary.inSelection')} · <strong>{formatUsd(selectionCost)}</strong> {t('sessions.summary.inSelection')}
+                {summary.fullCost > selectionCost + 1e-9 && <> · {t('sessions.summary.fullCostOfSessions')} {formatUsd(summary.fullCost)}</>}
+                {summary.tokens > 0 && <> · {formatCompact(summary.tokens)} {t('sessions.summary.tokensInSelection')}</>}
                 {summary.unattributable > 0 && (
-                  <span className="sessions-unattributed"> · {summary.unattributable.toLocaleString('en-US')} {summary.unattributable === 1 ? 'session' : 'sessions'} could not be attributed to this selection</span>
+                  <span className="sessions-unattributed"> · {formatCount(summary.unattributable, 'session')} {t('sessions.summary.unattributedSuffix')}</span>
                 )}
               </>
             )
           : (
               <>
-                {included.length} sessions · {formatUsd(selectionCost)} · {formatCompact(summary.tokens)} tokens
+                {formatCount(included.length, 'session')} · {formatUsd(selectionCost)} · {formatCompact(summary.tokens)} {t('sessions.summary.tokens')}
               </>
             )}
       </div>
@@ -412,68 +417,72 @@ export function Sessions({
         <div className="sessions-empty">
           <EmptyNote>
             {investigating
-              ? 'No sessions contribute to the current selection.'
+              ? t('sessions.empty.noneContribute')
               : q
-                ? <>No sessions match &quot;{query}&quot;.</>
-                : 'No sessions in this range yet.'}
+                ? t('sessions.empty.noMatchQuery', { query })
+                : t('sessions.empty.noneInRange')}
           </EmptyNote>
           {investigating && onFiltersChange && (
-            <button className="sessions-clear" type="button" onClick={() => onFiltersChange(EMPTY_FILTERS)}>Clear selection</button>
+            <button className="sessions-clear" type="button" onClick={() => onFiltersChange(EMPTY_FILTERS)}>{t('sessions.empty.clearSelection')}</button>
           )}
           {!investigating && q && (
-            <button className="sessions-clear" type="button" onClick={() => setQuery('')}>Clear search</button>
+            <button className="sessions-clear" type="button" onClick={() => setQuery('')}>{t('sessions.empty.clearSearch')}</button>
           )}
         </div>
       ) : (
         <>
           <div className="session-list">
-            {renderedSequence.map(entry => entry.type === 'header' ? (
-              <div className="provider-h" key={`provider-${entry.provider}`}>
-                <span>{providerName(entry.provider)}</span>
-                <span className="provider-count">{entry.count.toLocaleString('en-US')} sessions</span>
-                <span className="provider-cost">{formatUsd(entry.cost)}</span>
-              </div>
-            ) : (
-              <Fragment key={sessionRowKey(entry.entry.row)}>
-                <button
-                  className="session-row"
-                  type="button"
-                  aria-expanded={effectiveOpenSessionId === sessionRowKey(entry.entry.row)}
-                  onClick={event => {
-                    lastOpenerRef.current = event.currentTarget
-                    setInternalOpenSessionId(sessionRowKey(entry.entry.row))
-                    onSessionOpen?.(sessionRowKey(entry.entry.row))
-                  }}
-                >
-                  <span className="session-primary">
-                    <span className="session-chevron" aria-hidden="true">›</span>
-                    <span className="session-project-copy">
-                      <span className="session-title" title={entry.entry.row.title || undefined}>{entry.entry.row.title || shortenProjectPath(entry.entry.row.project)}</span>
-                      <span className="session-project">{entry.entry.row.sessionId.slice(0, 18)}</span>
+            <div className="session-list-inner">
+              {renderedSequence.map(entry => entry.type === 'header' ? (
+                <div className="provider-h" key={`provider-${entry.provider}`}>
+                  <span className="provider-h-name"><ProviderLogo provider={entry.provider} size={13} />{providerName(entry.provider, detectedProviders)}</span>
+                  <span className="provider-count">{formatCount(entry.count, 'session')}</span>
+                  <span className="provider-cost">{formatUsd(entry.cost)}</span>
+                </div>
+              ) : (
+                <Fragment key={sessionRowKey(entry.entry.row)}>
+                  <button
+                    className="session-row"
+                    type="button"
+                    aria-expanded={effectiveOpenSessionId === sessionRowKey(entry.entry.row)}
+                    onClick={event => {
+                      lastOpenerRef.current = event.currentTarget
+                      setInternalOpenSessionId(sessionRowKey(entry.entry.row))
+                      onSessionOpen?.(sessionRowKey(entry.entry.row))
+                    }}
+                  >
+                    <span className="session-primary">
+                      <span className="session-chevron" aria-hidden="true"><Icon name="chevron-right" /></span>
+                      <span className="session-project-copy">
+                        <span className="session-title" title={entry.entry.row.title || undefined}>{entry.entry.row.title || shortenProjectPath(entry.entry.row.project)}</span>
+                        <span className="session-project">{entry.entry.row.sessionId.slice(0, 18)}</span>
+                      </span>
                     </span>
-                  </span>
-                  <span className="session-when">{formatDayShort(entry.entry.row.endedAt)}</span>
-                  <span className="session-models">{entry.entry.row.models.join(', ')}</span>
-                  <span>{entry.entry.row.turns}</span>
-                  {investigating ? (
-                    <span className="session-cost-split">
-                      <strong>{formatUsd(entry.entry.cost)}</strong>
-                      {entry.entry.cost < entry.entry.row.cost - 1e-9 && (
-                        <small title="Full cost of the whole session"> of {formatUsd(entry.entry.row.cost)}</small>
-                      )}
-                    </span>
-                  ) : (
-                    <span>{formatUsd(entry.entry.row.cost)}</span>
-                  )}
-                  <span>{formatCompact(rowTokens(entry.entry.row))}</span>
-                </button>
-              </Fragment>
-            ))}
+                    <span className="session-when">{formatDayShort(entry.entry.row.endedAt)}</span>
+                    <span className="session-models">{entry.entry.row.models.join(', ')}</span>
+                    <span>{entry.entry.row.turns}</span>
+                    {investigating ? (
+                      <span className="session-cost-split">
+                        <strong>{formatUsd(entry.entry.cost)}</strong>
+                        {entry.entry.cost < entry.entry.row.cost - 1e-9 && (
+                          <small title={t('sessions.list.fullCostTooltip')}> {t('sessions.list.ofConnector')} <Usd value={entry.entry.row.cost} tokens={tokensOf(entry.entry.row)} nested /></small>
+                        )}
+                      </span>
+                    ) : (
+                      <span><Usd value={entry.entry.row.cost} tokens={tokensOf(entry.entry.row)} nested /></span>
+                    )}
+                    <span>{formatCompact(rowTokens(entry.entry.row))}</span>
+                  </button>
+                </Fragment>
+              ))}
+            </div>
           </div>
-          <div className="sessions-more-caption">Showing {renderedRows} of {included.length}</div>
+          <div className="sessions-more-caption">
+            {t('sessions.list.showingOf', { shown: renderedRows.toLocaleString('en-US'), total: included.length.toLocaleString('en-US') })}
+          </div>
           {remaining > 0 && (
             <button className="sessions-more" type="button" onClick={() => setVisibleCount(visibleCount + STEP)}>
-              Show {Math.min(STEP, remaining)} more · {remaining} remaining
+              {t('sessions.list.showMore', { count: Math.min(STEP, remaining).toLocaleString('en-US'), remaining: remaining.toLocaleString('en-US') })}
             </button>
           )}
         </>
@@ -481,6 +490,7 @@ export function Sessions({
       {openRow && (
         <SessionDrawer
           row={openRow}
+          openKey={sessionRowKey(openRow)}
           filters={filters}
           medianCost={medianCost}
           onClose={closeDrawer}

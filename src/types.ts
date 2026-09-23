@@ -1,3 +1,5 @@
+import type { BillingMode } from './models.js'
+
 export type TokenUsage = {
   inputTokens: number
   outputTokens: number
@@ -163,10 +165,22 @@ export type ParsedApiCall = {
   /// model-call / turn counts. Hermes deltas persist the flag on CachedCall;
   /// Copilot remains serve-time / never cached.
   supplementaryAccounting?: boolean
+  /// Requests this one call stands for (see ParsedProviderCall.requestCount).
+  /// Absent means 1. Read through `behavioralCallWeight`, never directly.
+  requestCount?: number
   /// Copilot session-store `total_nano_aiu`. 1e9 nano-AIU = 1 credit = $0.01.
   /// Threaded from CachedCall / ParsedProviderCall so plan math can sum credits.
   /// Absent on older stores and on JSONL / shutdown-rollup siblings.
   nanoAiu?: number
+  /// Billing route id the provider recorded (see ParsedProviderCall.route).
+  /// Reports key model rows on `modelRowKey(model, route)`, so a call routed
+  /// through Bedrock lands in its own row.
+  route?: string
+  /// Billing mode the provider recorded (see ParsedProviderCall.billing).
+  /// `--billing` reads it through `callBillingMode`, which falls back to the
+  /// effective route's default; absent here means the provider stated no
+  /// fact, never that the call is unbilled.
+  billing?: BillingMode
 }
 
 export type ToolCall = {

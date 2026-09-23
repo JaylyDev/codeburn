@@ -40,6 +40,7 @@ For the architectural picture, see `../architecture.md`.
 | [Roo Code](roo-code.md) | JSON | `src/providers/roo-code.ts` | `tests/providers/roo-code.test.ts` |
 | [Zerostack](zerostack.md) | JSON | `src/providers/zerostack.ts` | `tests/providers/zerostack.test.ts` |
 | [Grok Build](grok.md) | JSON/JSONL | `src/providers/grok.ts` | `tests/providers/grok.test.ts` |
+| [Grok Bot](grokbot.md) | JSON | `src/providers/grokbot.ts` | `tests/providers/grokbot.test.ts` |
 
 ### Lazy (loaded on first call)
 
@@ -54,7 +55,7 @@ For the architectural picture, see `../architecture.md`.
 | [OpenCode](opencode.md) | SQLite | `src/providers/opencode.ts` | `tests/providers/opencode.test.ts` |
 | [Warp](warp.md) | SQLite | `src/providers/warp.ts` | `tests/providers/warp.test.ts` |
 | [Vercel AI Gateway](vercel-gateway.md) | REST API | `src/providers/vercel-gateway.ts` | `tests/providers/vercel-gateway.test.ts` |
-| [ZCode](zcode.md) | SQLite | `src/providers/zcode.ts` | `tests/providers/zcode.test.ts` |
+| [ZCode](zcode.md) | SQLite (usage) + z.ai quota endpoint (plan) | `src/providers/zcode.ts`, `src/quota/zcode.ts` | `tests/providers/zcode.test.ts`, `tests/quota-zcode.test.ts` |
 | [Zed](zed.md) | SQLite | `src/providers/zed.ts` | `tests/providers/zed.test.ts` |
 
 ### Shared

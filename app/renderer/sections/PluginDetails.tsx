@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react'
+import { useEscape } from '../hooks/useEscape'
+import { t } from '../i18n'
 import { codeburn } from '../lib/ipc'
 import styles from './Plugins.module.css'
+import { Icon } from '../components/icons'
 
 interface PluginManifest {
   name: string
@@ -40,20 +43,14 @@ export function PluginDetailsModal({ pluginName, onClose }: PluginDetailsProps) 
     }
   }
 
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
-    }
-    document.addEventListener('keydown', handleKeyDown)
-    return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [onClose])
+  useEscape(true, onClose)
 
   if (loading) {
     return (
       <div className={styles.modalBackdrop} onClick={onClose}>
         <div className={styles.modal} onClick={e => e.stopPropagation()}>
-          <button className={styles.modalClose} onClick={onClose}>×</button>
-          <div className={styles.modalContent}>Loading plugin details...</div>
+          <button className={styles.modalClose} onClick={onClose}><Icon name="x" /></button>
+          <div className={styles.modalContent}>{t('plugins.details.loading')}</div>
         </div>
       </div>
     )
@@ -63,9 +60,9 @@ export function PluginDetailsModal({ pluginName, onClose }: PluginDetailsProps) 
     return (
       <div className={styles.modalBackdrop} onClick={onClose}>
         <div className={styles.modal} onClick={e => e.stopPropagation()}>
-          <button className={styles.modalClose} onClick={onClose}>×</button>
+          <button className={styles.modalClose} onClick={onClose}><Icon name="x" /></button>
           <div className={styles.modalContent}>
-            <div className={styles.error}>{error || 'Failed to load plugin details'}</div>
+            <div className={styles.error}>{error || t('plugins.details.loadFailed')}</div>
           </div>
         </div>
       </div>
@@ -75,14 +72,14 @@ export function PluginDetailsModal({ pluginName, onClose }: PluginDetailsProps) 
   return (
     <div className={styles.modalBackdrop} onClick={onClose}>
       <div className={styles.modal} onClick={e => e.stopPropagation()}>
-        <button className={styles.modalClose} onClick={onClose}>×</button>
+        <button className={styles.modalClose} onClick={onClose}><Icon name="x" /></button>
         <div className={styles.modalContent}>
           <h2>{manifest.name}@{manifest.version}</h2>
           {manifest.description && <p className={styles.description}>{manifest.description}</p>}
 
           {manifest.commands && manifest.commands.length > 0 && (
             <section className={styles.section}>
-              <h3>Commands</h3>
+              <h3>{t('plugins.details.commands')}</h3>
               <ul>
                 {manifest.commands.map((cmd: any) => (
                   <li key={cmd.name}>
@@ -96,7 +93,7 @@ export function PluginDetailsModal({ pluginName, onClose }: PluginDetailsProps) 
 
           {manifest.syncAttributes && manifest.syncAttributes.length > 0 && (
             <section className={styles.section}>
-              <h3>Sync Fields</h3>
+              <h3>{t('plugins.details.syncFields')}</h3>
               <ul>
                 {manifest.syncAttributes.map((attr: any) => (
                   <li key={attr.key}>
@@ -111,7 +108,7 @@ export function PluginDetailsModal({ pluginName, onClose }: PluginDetailsProps) 
 
           {manifest.spanKinds && manifest.spanKinds.length > 0 && (
             <section className={styles.section}>
-              <h3>Span Kinds</h3>
+              <h3>{t('plugins.details.spanKinds')}</h3>
               <ul>
                 {manifest.spanKinds.map((kind: string) => (
                   <li key={kind}>{kind}</li>
@@ -122,7 +119,7 @@ export function PluginDetailsModal({ pluginName, onClose }: PluginDetailsProps) 
 
           {manifest.payloadSections && manifest.payloadSections.length > 0 && (
             <section className={styles.section}>
-              <h3>Payload Sections</h3>
+              <h3>{t('plugins.details.payloadSections')}</h3>
               <ul>
                 {manifest.payloadSections.map((section: string) => (
                   <li key={section}>{section}</li>

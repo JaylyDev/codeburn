@@ -81,6 +81,21 @@ enum ClaudeCredentialStore {
         let refreshToken: String?
         let expiresAt: Date?
         let rateLimitTier: String?
+        let subscriptionType: String?
+
+        init(
+            accessToken: String,
+            refreshToken: String?,
+            expiresAt: Date?,
+            rateLimitTier: String?,
+            subscriptionType: String? = nil
+        ) {
+            self.accessToken = accessToken
+            self.refreshToken = refreshToken
+            self.expiresAt = expiresAt
+            self.rateLimitTier = rateLimitTier
+            self.subscriptionType = subscriptionType
+        }
     }
 
     enum StoreError: Error, LocalizedError {
@@ -261,6 +276,10 @@ enum ClaudeCredentialStore {
         try currentRecord()?.rateLimitTier
     }
 
+    static func subscriptionType() throws -> String? {
+        try currentRecord()?.subscriptionType
+    }
+
     // MARK: - Bootstrap source
 
     private static func readClaudeSource() throws -> CredentialRecord {
@@ -368,6 +387,7 @@ enum ClaudeCredentialStore {
             let refreshToken: String?
             let expiresAt: Double?
             let rateLimitTier: String?
+            let subscriptionType: String?
         }
         do {
             let root = try JSONDecoder().decode(Root.self, from: data)
@@ -379,7 +399,8 @@ enum ClaudeCredentialStore {
                 accessToken: token,
                 refreshToken: oauth.refreshToken,
                 expiresAt: oauth.expiresAt.map { Date(timeIntervalSince1970: $0 / 1000.0) },
-                rateLimitTier: oauth.rateLimitTier
+                rateLimitTier: oauth.rateLimitTier,
+                subscriptionType: oauth.subscriptionType
             )
         } catch {
             throw StoreError.bootstrapDecodeFailed
@@ -417,13 +438,15 @@ enum ClaudeCredentialStore {
         let accessToken: String
         let expiresAt: Date?
         let rateLimitTier: String?
+        let subscriptionType: String?
     }
 
     private static func encodePersisted(_ record: CredentialRecord) -> PersistedCacheRecord {
         PersistedCacheRecord(
             accessToken: record.accessToken,
             expiresAt: record.expiresAt,
-            rateLimitTier: record.rateLimitTier
+            rateLimitTier: record.rateLimitTier,
+            subscriptionType: record.subscriptionType
         )
     }
 
@@ -433,7 +456,8 @@ enum ClaudeCredentialStore {
                 accessToken: persisted.accessToken,
                 refreshToken: nil,
                 expiresAt: persisted.expiresAt,
-                rateLimitTier: persisted.rateLimitTier
+                rateLimitTier: persisted.rateLimitTier,
+                subscriptionType: persisted.subscriptionType
             )
         }
         // Historical blobs may still include refreshToken; drop it on read.
@@ -442,7 +466,8 @@ enum ClaudeCredentialStore {
                 accessToken: legacy.accessToken,
                 refreshToken: nil,
                 expiresAt: legacy.expiresAt,
-                rateLimitTier: legacy.rateLimitTier
+                rateLimitTier: legacy.rateLimitTier,
+                subscriptionType: legacy.subscriptionType
             )
         }
         return nil
@@ -522,7 +547,8 @@ enum ClaudeCredentialStore {
             accessToken: decoded.accessToken,
             refreshToken: nil,
             expiresAt: decoded.expiresAt,
-            rateLimitTier: decoded.rateLimitTier
+            rateLimitTier: decoded.rateLimitTier,
+            subscriptionType: decoded.subscriptionType
         )
     }
 

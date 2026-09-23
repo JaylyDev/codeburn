@@ -64,7 +64,7 @@ import { join, basename, dirname, posix, win32 } from 'path'
 import { existsSync } from 'fs'
 import { createHash } from 'crypto'
 import { readSessionFile } from '../fs-utils.js'
-import { calculateCost, getShortModelName } from '../models.js'
+import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import { estimateTokens } from '../context-tree.js'
 import type {
@@ -92,18 +92,7 @@ const transcriptToolCallModelHints: Array<{ prefix: string; model: string }> = [
 // Legacy chat-session JSON format helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Normalise the model ID emitted by the legacy chatSessions JSON format.
- * Examples:
- *   "copilot/claude-sonnet-4.5" → "claude-sonnet-4-5"
- *   "copilot/gpt-4o"           → "gpt-4o"
- *
- * The alias table in models.ts (BUILTIN_ALIASES) maps dot-separated Claude
- * versions ("claude-sonnet-4.5") to dash-separated ones ("claude-sonnet-4-5")
- * so calculateCost() will already resolve them correctly, but we also
- * normalise here so the stored `model` field matches what modelDisplayName()
- * expects (dash-separated).
- */
+// Legacy ids arrive as "copilot/claude-sonnet-4.5"; dotted ids price through the aliases in models.ts.
 function stripCopilotPrefix(raw: string): string {
   return raw.replace(/^(?:copilot|github\.copilot-chat)\//, '').trim()
 }
@@ -353,37 +342,6 @@ interface LegacyResponsePart {
   }
 }
 
-interface LegacyResultMetadata {
-  promptTokens?: number
-  outputTokens?: number
-  cacheReadTokens?: number
-  cachedTokens?: number
-  cacheCreationTokens?: number
-  cacheWriteTokens?: number
-  metadata?: {
-    promptTokens?: number
-    outputTokens?: number
-    cacheReadTokens?: number
-    cachedTokens?: number
-    cacheCreationTokens?: number
-    cacheWriteTokens?: number
-  }
-  usage?: {
-    promptTokens?: number
-    prompt_tokens?: number
-    completionTokens?: number
-    completion_tokens?: number
-    cacheReadTokens?: number
-    cache_read_tokens?: number
-    cachedTokens?: number
-    cached_tokens?: number
-    cacheCreationTokens?: number
-    cache_creation_tokens?: number
-    cacheWriteTokens?: number
-    cache_write_tokens?: number
-  }
-}
-
 function inferModelFromLegacySession(session: LegacyChatSession): string {
   // 1. Try to find the first request that has a non-empty, non-auto modelId
   for (const req of session.requests ?? []) {
@@ -617,7 +575,6 @@ function parseLegacyChatSession(
   sessionId: string,
   project: string,
   seenKeys: Set<string>,
-  isJsonl: boolean,
 ): ParsedProviderCall[] {
   if (!session || !Array.isArray(session.requests)) return []
 
@@ -670,47 +627,16 @@ function parseLegacyChatSession(
 
     const hasExactTokens = exactPromptTokens !== undefined || exactOutputTokens !== undefined
 
-    // Regressed .jsonl path fix: modern .jsonl sessions never char-estimate.
-    // Rows with no token fields (or 0 tokens) are skipped.
-    if (isJsonl) {
-      if (!hasExactTokens || ((exactPromptTokens ?? 0) === 0 && (exactOutputTokens ?? 0) === 0)) {
-        continue
-      }
-    }
-
     const model = extractModelFromRequest(req, session)
 
-    // Extract tool calls / tools
     const rawRounds = (meta?.['toolCallRounds'] ?? resultObj?.['toolCallRounds'])
     const rounds: IToolCallRound[] = Array.isArray(rawRounds) ? (rawRounds as IToolCallRound[]) : []
-    const toolNamesSet = new Set<string>()
-
-    const addTool = (raw: unknown): void => {
-      if (typeof raw === 'string' && raw.trim()) {
-        toolNamesSet.add(normalizeTool(raw.trim()))
-      }
-    }
-
-    for (const round of rounds) {
-      if (!isRecord(round)) continue
-      addTool(round.summary)
-      addTool(round.phase)
-      if (Array.isArray(round.toolCalls)) {
-        for (const tc of round.toolCalls) {
-          if (isRecord(tc)) {
-            addTool(tc.name)
-            addTool(tc.id)
-          }
-        }
-      }
-    }
-    if (Array.isArray(req.response)) {
-      for (const item of req.response) {
-        if (item && typeof item === 'object') {
-          if ((item as LegacyResponsePart).kind === 'toolInvocationSerialized') {
-            addTool((item as LegacyResponsePart).toolId)
-          }
-        }
+    const extracted = extractChatSessionTools({ toolCallRounds: rawRounds })
+    const toolNamesSet = new Set(extracted.tools)
+    for (const item of req.response ?? []) {
+      const part = item as LegacyResponsePart
+      if (part?.kind === 'toolInvocationSerialized' && typeof part.toolId === 'string' && part.toolId.trim()) {
+        toolNamesSet.add(normalizeTool(part.toolId.trim()))
       }
     }
     const tools = [...toolNamesSet]
@@ -725,22 +651,20 @@ function parseLegacyChatSession(
     let reasoningTokens = 0
     let isEstimated = false
 
-    // Extract reasoning tokens
-    if (reasoningText.length > 0) {
-      reasoningTokens = Math.ceil(reasoningText.length / CHARS_PER_TOKEN_LEGACY)
-    }
-    for (const round of rounds) {
-      if (round.thinking?.tokens && typeof round.thinking.tokens === 'number') {
-        reasoningTokens = Math.max(reasoningTokens, round.thinking.tokens)
-      }
-    }
-
     if (hasExactTokens) {
       totalInputTokens = exactPromptTokens ?? 0
       outputTokens = exactOutputTokens ?? 0
       isEstimated = false
     } else {
       isEstimated = true
+
+      // Exact output counts already include reasoning, so thinking is only estimated here.
+      reasoningTokens = Math.ceil(reasoningText.length / CHARS_PER_TOKEN_LEGACY)
+      for (const round of rounds) {
+        if (typeof round.thinking?.tokens === 'number') {
+          reasoningTokens = Math.max(reasoningTokens, round.thinking.tokens)
+        }
+      }
 
       const globalParts = ((meta?.['renderedGlobalContext'] as unknown[]) ?? []).filter(
         (p): p is ChatCompletionContentPartText => isRecord(p) && p.type === ChatCompletionContentPartKind.Text && typeof p.text === 'string'
@@ -827,11 +751,12 @@ function parseLegacyChatSession(
       costUSD,
       costIsEstimated: isEstimated,
       tools,
-      bashCommands: [],
+      bashCommands: extracted.bashCommands,
+      skills: extracted.skills.length > 0 ? extracted.skills : undefined,
       timestamp: ts,
       speed: 'standard',
       deduplicationKey: dedupKey,
-      userMessage: msgText.slice(0, 500),
+      userMessage: msgText,
       sessionId,
       project,
     })
@@ -847,44 +772,12 @@ const modelDisplayNames: Record<string, string> = {
   'gpt-4.1-nano': 'GPT-4.1 Nano',
   'gpt-4.1-mini': 'GPT-4.1 Mini',
   'gpt-4.1': 'GPT-4.1',
-  'gpt-4-1': 'GPT-4.1',
   'gpt-4o-mini': 'GPT-4o Mini',
-  'gpt-5.4': 'GPT-5.4',
-  'gpt-5-4': 'GPT-5.4',
-  'gpt-5.3-codex': 'GPT-5.3 Codex',
-  'gpt-5-3-codex': 'GPT-5.3 Codex',
-  'gpt-5.2-codex': 'GPT-5.2 Codex',
-  'gpt-5-2-codex': 'GPT-5.2 Codex',
-  'gpt-5.1-codex-max': 'GPT-5.1 Codex Max',
-  'gpt-5-1-codex-max': 'GPT-5.1 Codex Max',
-  'gpt-5.4-mini': 'GPT-5.4 Mini',
-  'gpt-5-4-mini': 'GPT-5.4 Mini',
+  'gpt-4o': 'GPT-4o',
   'gpt-5-mini': 'GPT-5 Mini',
   'gpt-5': 'GPT-5',
-  // Dot-form spellings emitted by Copilot's native model IDs (e.g. copilot/claude-sonnet-4.5)
-  // and their equivalent dash-form counterparts that other sources may store.
-  'claude-sonnet-4.6': 'Sonnet 4.6',
-  'claude-sonnet-4-6': 'Sonnet 4.6',
-  'claude-sonnet-4.5': 'Sonnet 4.5',
   'claude-sonnet-4-5': 'Sonnet 4.5',
   'claude-sonnet-4': 'Sonnet 4',
-  'claude-opus-4.7': 'Opus 4.7',
-  'claude-opus-4-7': 'Opus 4.7',
-  'claude-opus-4.6': 'Opus 4.6',
-  'claude-opus-4-6': 'Opus 4.6',
-  'claude-opus-4.5': 'Opus 4.5',
-  'claude-opus-4-5': 'Opus 4.5',
-  'claude-3-7-sonnet': 'Sonnet 3.7',
-  'claude-3-5-sonnet': 'Sonnet 3.5',
-  'claude-haiku-4.5': 'Haiku 4.5',
-  'claude-haiku-4-5': 'Haiku 4.5',
-  'gemini-3-1-pro-preview': 'Gemini 3.1 Pro',
-  'gemini-3-pro-preview': 'Gemini 3 Pro',
-  'gemini-2-5-pro': 'Gemini 2.5 Pro',
-  'o4-mini': 'o4-mini',
-  'o3': 'o3',
-  'copilot-auto': 'Copilot (auto)',
-  'auto': 'Copilot (auto)',
   'copilot-openai-auto': 'Copilot (OpenAI auto)',
   'copilot-anthropic-auto': 'Copilot (Anthropic auto)',
 }
@@ -971,20 +864,6 @@ type SessionStartData = {
   selectedModel?: string
 }
 
-
-// --- Parser ---
-
-function isChatSessionJsonFormat(path: string, content: string): boolean {
-  // The legacy chatSessions files are plain .json files (not .jsonl).
-  if (!path.endsWith('.json')) return false
-  try {
-    const obj = JSON.parse(content) as Record<string, unknown>
-    return Array.isArray(obj['requests'])
-  } catch {
-    return false
-  }
-}
-
 type ModelChangeData = {
   newModel: string
   previousModel?: string
@@ -1047,11 +926,11 @@ type CopilotEvent =
   | { type: 'subagent.started'; data: SubagentSelectedData; timestamp?: string }
   | { type: 'subagent.completed'; data: SubagentSelectedData; timestamp?: string }
   | { type: 'session.shutdown'; data: SessionShutdownData; timestamp?: string }
-  | { type: 'llm_request' | 'llm.request'; attrs?: { model?: string }; timestamp?: string; data?: any }
   | { type: 'session.compaction_start'; data: Record<string, unknown>; timestamp?: string }
   | { type: 'session.compaction_complete'; data: SessionCompactionCompleteData; timestamp?: string }
 
 type ChatJournalPathSegment = string | number
+type ChatSessionRequest = Record<string, unknown>
 
 // ---------------------------------------------------------------------------
 // Types for OTel span rows from agent-traces.db
@@ -1210,7 +1089,7 @@ function loadSpanAttributesFromTable(
         try {
           // Try to parse numeric values
           const numValue = Number(row.value)
-          attrs[row.key as keyof SpanAttributes] = Number.isNaN(numValue)
+          attrs[row.key as keyof SpanAttributes] = Number.isNaN(numValue) 
             ? row.value
             : numValue
         } catch {
@@ -1291,7 +1170,7 @@ function getReplayValue(container: object, segment: ChatJournalPathSegment): unk
 }
 
 function setReplayValue(container: object, segment: ChatJournalPathSegment, value: unknown): void {
-  ; (container as Record<string, unknown>)[String(segment)] = value
+  ;(container as Record<string, unknown>)[String(segment)] = value
 }
 
 function createContainerForNext(segment: ChatJournalPathSegment): unknown[] | Record<string, unknown> {
@@ -1394,6 +1273,81 @@ function readString(raw: unknown): string {
   return typeof raw === 'string' ? raw : ''
 }
 
+function modelFromChatSessionRequest(req: ChatSessionRequest, metadata: Record<string, unknown>): string {
+  const resolved = readString(metadata['resolvedModel'])
+  if (resolved) return resolved
+
+  const modelId = readString(req['modelId']).replace(/^copilot\//, '')
+  return modelId || 'unknown'
+}
+
+function parseStructuredArguments(raw: unknown): Record<string, unknown> | null {
+  const payload = typeof raw === 'string'
+    ? (() => {
+        try {
+          return JSON.parse(raw) as unknown
+        } catch {
+          return null
+        }
+      })()
+    : raw
+  return isRecord(payload) ? payload : null
+}
+
+function extractStructuredSkill(raw: unknown): string | null {
+  const payload = parseStructuredArguments(raw)
+  if (!payload) return null
+  const skill = payload['skill']
+  return typeof skill === 'string' && skill.trim() ? skill.trim() : null
+}
+
+function extractChatSessionTools(metadata: Record<string, unknown>): { tools: string[]; skills: string[]; bashCommands: string[] } {
+  const rounds = metadata['toolCallRounds']
+  if (!Array.isArray(rounds)) return { tools: [], skills: [], bashCommands: [] }
+
+  const names = new Set<string>()
+  const skills = new Set<string>()
+  const bashCommands: string[] = []
+  const addName = (raw: unknown): void => {
+    if (typeof raw === 'string' && raw.trim()) names.add(normalizeTool(raw))
+  }
+  const addFromRecord = (record: Record<string, unknown>): void => {
+    const rawNames = ['toolName', 'name', 'tool'].map(key => record[key])
+    for (const raw of rawNames) {
+      addName(raw)
+      if (typeof raw !== 'string' || normalizeTool(raw) !== 'Skill') continue
+      const skill = extractStructuredSkill(record['arguments'])
+        ?? extractStructuredSkill(record['input'])
+      if (skill) skills.add(skill)
+    }
+    if (rawNames.some(raw => typeof raw === 'string' && BASH_TOOL_NAMES.has(raw))) {
+      const args = parseStructuredArguments(record['arguments'])
+        ?? parseStructuredArguments(record['input'])
+      const command = args?.['command']
+      if (typeof command === 'string') bashCommands.push(...extractBashCommands(command))
+    }
+  }
+
+  for (const round of rounds) {
+    if (!isRecord(round)) continue
+    addFromRecord(round)
+
+    for (const key of ['tools', 'toolCalls', 'toolRequests']) {
+      const entries = round[key]
+      if (!Array.isArray(entries)) continue
+      for (const entry of entries) {
+        if (typeof entry === 'string') {
+          addName(entry)
+        } else if (isRecord(entry)) {
+          addFromRecord(entry)
+        }
+      }
+    }
+  }
+
+  return { tools: [...names], skills: [...skills], bashCommands }
+}
+
 /**
  * Extract a shell command string from an OTel execute_tool span's
  * `gen_ai.tool.call.arguments` attribute. The attribute is a JSON-encoded
@@ -1467,7 +1421,6 @@ function inferTranscriptModel(lines: string[]): string {
   for (const line of lines) {
     try {
       const event = JSON.parse(line) as CopilotEvent
-
       if (event.type !== 'assistant.message') continue
       const data = event.data as AssistantMessageData & { toolRequests?: Array<{ toolCallId?: string }> }
       const reqs = coerceToolRequests(data.toolRequests)
@@ -1508,7 +1461,6 @@ function createJsonlParser(
     async *parse(): AsyncGenerator<ParsedProviderCall> {
       const content = await readSessionFile(source.path)
       if (!content) return
-
       // CLI session-state files live at <sessionId>/events.jsonl; transcripts
       // at transcripts/<sessionId>.jsonl — keying the latter on the parent dir
       // would collapse every transcript into one "transcripts" session (and
@@ -1853,7 +1805,7 @@ function createJsonlParser(
 }
 
 function createChatSessionParser(
-  source: ChatSessionSource,
+  source: SessionSource,
   seenKeys: Set<string>
 ): SessionParser {
   return {
@@ -1861,28 +1813,73 @@ function createChatSessionParser(
       const content = await readSessionFile(source.path)
       if (!content) return
 
-      const isJson = source.path.endsWith('.json') || isChatSessionJsonFormat(source.path, content)
-      let session: LegacyChatSession | null = null
-
-      if (isJson) {
+      if (source.path.endsWith('.json')) {
+        let session: LegacyChatSession
         try {
           session = JSON.parse(content) as LegacyChatSession
         } catch {
           return
         }
-      } else {
-        const root = replayChatSessionJournal(content)
-        if (!isRecord(root)) return
-        session = root as unknown as LegacyChatSession
+        const sessionId = readString(session.sessionId) || basename(source.path, '.json')
+        yield* parseLegacyChatSession(session, sessionId, source.project, seenKeys)
+        return
       }
 
-      if (!session) return
+      const root = replayChatSessionJournal(content)
+      if (!isRecord(root)) return
 
-      const fallbackSessionId = basename(source.path, isJson ? '.json' : '.jsonl')
-      const sessionId = readString(session.sessionId) || fallbackSessionId
-      const calls = parseLegacyChatSession(session, sessionId, source.project, seenKeys, !isJson)
-      for (const call of calls) {
-        yield call
+      const sessionId = readString(root['sessionId']) || basename(source.path, '.jsonl')
+      const sessionCreatedAt = timestampToISO(root['creationDate'])
+      const requests = Array.isArray(root['requests']) ? root['requests'] : []
+
+      for (let index = 0; index < requests.length; index++) {
+        const rawReq = requests[index]
+        if (!isRecord(rawReq)) continue
+
+        const result = rawReq['result']
+        const resultRecord = isRecord(result) ? result : null
+        const rawMetadata = resultRecord?.['metadata']
+        const metadata = isRecord(rawMetadata) ? rawMetadata : createReplayObject()
+
+        const inputTokens = numberOrZero(metadata['promptTokens'])
+        const metadataOutputTokens = numberOrZero(metadata['outputTokens'])
+        const outputTokens = metadataOutputTokens || numberOrZero(rawReq['completionTokens'])
+
+        if (inputTokens === 0 && outputTokens === 0) continue
+
+        const requestId = readString(rawReq['requestId']) || `request-${index}`
+        const dedupKey = `copilot-chatsession:${sessionId}:${requestId}`
+        if (seenKeys.has(dedupKey)) continue
+        seenKeys.add(dedupKey)
+
+        const model = modelFromChatSessionRequest(rawReq, metadata)
+        const costUSD = calculateCost(model, inputTokens, outputTokens, 0, 0, 0)
+        const timestamp = timestampToISO(rawReq['timestamp']) || sessionCreatedAt
+        const userMessage = isRecord(rawReq['message']) ? readString(rawReq['message']['text']) : ''
+
+        const extracted = extractChatSessionTools(metadata)
+
+        yield {
+          provider: 'copilot',
+          sessionId,
+          project: source.project,
+          model,
+          inputTokens,
+          outputTokens,
+          cacheCreationInputTokens: 0,
+          cacheReadInputTokens: 0,
+          cachedInputTokens: 0,
+          reasoningTokens: 0,
+          webSearchRequests: 0,
+          costUSD,
+          tools: extracted.tools,
+          bashCommands: extracted.bashCommands,
+          skills: extracted.skills.length > 0 ? extracted.skills : undefined,
+          timestamp,
+          speed: 'standard' as const,
+          deduplicationKey: dedupKey,
+          userMessage,
+        }
       }
     },
   }
@@ -2588,6 +2585,7 @@ function createOtelParser(
           // subagent's own chat spans, so attributing the agent name per-trace
           // labels exactly the subagent's calls.
           const toolsByTrace = new Map<string, string[]>()
+          const skillsByTrace = new Map<string, string[]>()
           const bashByTrace = new Map<string, string[]>()
           const subagentsByTrace = new Map<string, string[]>()
           const chatSpanIds: string[] = []
@@ -2607,9 +2605,19 @@ function createOtelParser(
               const attrs = loadSpanAttributesFromTable(db, span.span_id)
               const rawToolName = attrs['gen_ai.tool.name'] as string | undefined
               if (rawToolName) {
+                const normalizedTool = normalizeTool(rawToolName)
                 const existing = toolsByTrace.get(span.trace_id) ?? []
-                existing.push(normalizeTool(rawToolName))
+                existing.push(normalizedTool)
                 toolsByTrace.set(span.trace_id, existing)
+
+                if (normalizedTool === 'Skill') {
+                  const skill = extractStructuredSkill(attrs['gen_ai.tool.call.arguments'])
+                  if (skill) {
+                    const skills = skillsByTrace.get(span.trace_id) ?? []
+                    skills.push(skill)
+                    skillsByTrace.set(span.trace_id, skills)
+                  }
+                }
 
                 // For shell tools, extract command names via the OTEL-specific
                 // normaliser (handles the full multi-line scripts the OTEL store
@@ -2640,6 +2648,19 @@ function createOtelParser(
               }
             }
           }
+
+          // Attribute trace-level tool/skill/bash metadata to a single chat
+          // span. execute_tool spans happen ONCE in a trace, not once per chat
+          // span, so re-reading them for every span billed a 5-span trace's one
+          // skill call ~5x turns/cost (and split it across periods when the
+          // trace crossed midnight). Order spans by start time and credit the
+          // first one that actually yields, so the metadata lands on exactly one
+          // call in the trace's opening period. Subagent names stay per-trace:
+          // every chat span in a subagent's trace is genuinely that subagent's
+          // call, so all of them are correctly labelled.
+          chatSpanIds.sort((a, b) =>
+            (spanMetaById.get(a)?.start_time_ms ?? 0) - (spanMetaById.get(b)?.start_time_ms ?? 0))
+          const creditedTraces = new Set<string>()
 
           // Yield one ParsedProviderCall per chat span
           for (const spanId of chatSpanIds) {
@@ -2677,8 +2698,11 @@ function createOtelParser(
               seenKeys.add(jsonlDedupKey)
             }
 
-            const tools = toolsByTrace.get(spanMetadata.trace_id) ?? []
-            const bashCommands = bashByTrace.get(spanMetadata.trace_id) ?? []
+            const ownsTraceMetadata = !creditedTraces.has(spanMetadata.trace_id)
+            if (ownsTraceMetadata) creditedTraces.add(spanMetadata.trace_id)
+            const tools = ownsTraceMetadata ? (toolsByTrace.get(spanMetadata.trace_id) ?? []) : []
+            const skills = ownsTraceMetadata ? (skillsByTrace.get(spanMetadata.trace_id) ?? []) : []
+            const bashCommands = ownsTraceMetadata ? (bashByTrace.get(spanMetadata.trace_id) ?? []) : []
             const subagentTypes = subagentsByTrace.get(spanMetadata.trace_id)
             const timestamp = epochToISO(spanMetadata.start_time_ms)
 
@@ -2707,6 +2731,7 @@ function createOtelParser(
               costUSD,
               tools,
               bashCommands,
+              skills: skills.length > 0 ? skills : undefined,
               subagentTypes: subagentTypes && subagentTypes.length > 0 ? subagentTypes : undefined,
               timestamp,
               speed: 'standard' as const,
@@ -3096,7 +3121,7 @@ function isOtelSource(source: SessionSource): source is OTelSessionSource {
 }
 
 function isChatSessionSource(source: SessionSource): source is ChatSessionSource {
-  return (source as ChatSessionSource).sourceType === 'chatsession' || source.path.endsWith('.json')
+  return (source as ChatSessionSource).sourceType === 'chatsession'
 }
 
 function isJetBrainsSource(source: SessionSource): source is JetBrainsSessionSource {
@@ -3659,9 +3684,9 @@ export function createCopilotProvider(
 
     modelDisplayName(model: string): string {
       for (const [key, display] of modelDisplayEntries) {
-        if (model === key || model.startsWith(key + '-')) return display
+        if (model.includes(key)) return display
       }
-      return getShortModelName(model)
+      return model
     },
 
     toolDisplayName(rawTool: string): string {

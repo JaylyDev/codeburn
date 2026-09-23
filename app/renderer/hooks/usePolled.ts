@@ -18,6 +18,10 @@ export type Polled<T> = {
   switching: boolean
   /** Wall-clock timestamp for the most recent successful fetch. */
   lastSuccessAt: number | null
+  /** The most recent result that was refused for being partial or stale while a
+   *  complete one was already on screen. `data` still holds the complete answer;
+   *  this is only here so the UI can say indexing is still running. */
+  degraded?: T | null
   /** Re-run the fetcher immediately (period/provider change, manual refresh). */
   refresh: () => void
 }
@@ -103,7 +107,18 @@ function snapshotHeader(raw: string | null): { at: number; generation?: number; 
   }
 }
 
-function isDurableSnapshotValue(value: unknown): boolean {
+/**
+ * Whether a report is a finished answer rather than a first paint the producer
+ * is still filling in, or a read-only serve that could not see real files.
+ *
+ * This is the one rule for both persistence AND display. Only persistence
+ * honoured it before, so after a local-day rollover the resident serve child
+ * re-derived the new day and the partials it served replaced a complete payload
+ * on screen: `history.daily` came back with about 27 cost-bearing rows instead
+ * of 125, and the streak, month-to-date and medians read off that same array
+ * were wrong with it.
+ */
+export function isCompleteReport(value: unknown): boolean {
   if (!value || typeof value !== 'object') return true
   const report = value as { stale?: unknown; hydration?: { complete?: unknown } }
   return report.stale !== true && report.hydration?.complete !== false
@@ -151,11 +166,16 @@ function memoSet(key: string, value: unknown): void {
   const at = Date.now()
   let json: string | undefined
   try { json = JSON.stringify(value) } catch { /* memory-only fallback */ }
+  // A degraded report never displaces a complete one, in memory or on disk: the
+  // memo is what a period switch paints from, so a partial cached here would
+  // resurface as the answer long after the producer had converged.
+  const held = memoStore.get(key)
+  if (!isCompleteReport(value) && held && isCompleteReport(held.value)) return
   const entry = { value, at, sizeChars: json?.length }
   memoPut(key, entry)
   // Partial hydration and stale read-only reports are useful last-good data for
   // the current renderer, but must never become the restart-time exact answer.
-  if (!isDurableSnapshotValue(value)) return
+  if (!isCompleteReport(value)) return
   try {
     const storage = globalThis.localStorage
     if (!storage) return
@@ -286,12 +306,15 @@ export function hasPolledMemo(key: string): boolean {
   return memoGet(key) !== undefined
 }
 
-/** Timestamp of the exact report snapshot currently available for `key`.
- * The app footer uses this to describe the selected destination instead of
- * repeating Overview's timestamp everywhere. Reading it may hydrate the
- * in-memory memo from the versioned durable snapshot, but never changes data. */
+/** Timestamp of the last fetch that produced the report for `key` IN THIS
+ * renderer. A snapshot restored from disk is painted but never reported as a
+ * refresh: it dates from an earlier app run, so claiming it here made the footer
+ * announce a refresh that was hours old and had not happened. Reading this may
+ * hydrate the in-memory memo from the versioned durable snapshot, but never
+ * changes data. */
 export function polledMemoTimestamp(key: string): number | null {
-  return memoGet(key)?.at ?? null
+  const entry = memoGet(key)
+  return entry && !entry.durable ? entry.at : null
 }
 
 /**
@@ -310,14 +333,30 @@ export function polledMemoTimestamp(key: string): number | null {
  * parallel full-history parse per section.
  *
  * `memoKey` opts into the instant-switch memo above.
+ *
+ * `cadence` picks the refresh speed. 'live' (the default, and what every caller
+ * that passes nothing gets) is the user's chosen cadence from Settings.
+ * `{ slowMs }` is a SLOW request: mount, deps change and refresh() still fetch
+ * immediately, but the timer runs at `slowMs` — never faster than the live
+ * cadence, and never at all under Manual, where the user asked for no timer.
  */
 export function usePolled<T>(
   fetcher: () => Promise<T>,
   deps: unknown[],
-  opts: { intervalMs?: number | null; enabled?: boolean; memoKey?: string } = {},
+  opts: {
+    intervalMs?: number | null
+    enabled?: boolean
+    memoKey?: string
+    cadence?: 'live' | { slowMs: number }
+  } = {},
 ): Polled<T> {
   const cadence = useContext(RefreshCadenceContext)
-  const intervalMs = opts.intervalMs !== undefined ? opts.intervalMs : cadence.intervalMs
+  const slow = opts.cadence && opts.cadence !== 'live' ? opts.cadence.slowMs : null
+  const intervalMs = opts.intervalMs !== undefined
+    ? opts.intervalMs
+    : slow == null || cadence.intervalMs == null
+      ? cadence.intervalMs
+      : Math.max(slow, cadence.intervalMs)
   const enabled = opts.enabled ?? true
   const memoKey = opts.memoKey
   const [data, setData] = useState<T | null>(() => (memoKey ? memoGet<T>(memoKey)?.value ?? null : null))
@@ -328,6 +367,12 @@ export function usePolled<T>(
   const [loading, setLoading] = useState(true)
   const [switching, setSwitching] = useState(false)
   const [lastSuccessAt, setLastSuccessAt] = useState<number | null>(null)
+  const [degraded, setDegraded] = useState<T | null>(null)
+  // Whether the value currently displayed is a finished answer, and the key it
+  // belongs to. Refs because the resolve handler must read the CURRENT state,
+  // not the one captured when the fetch started.
+  const completeRef = useRef(false)
+  const dataKeyRef = useRef<string | null>(null)
   // Generation counter: every load() (mount, deps change, interval, refresh)
   // claims the next epoch; a fetch applies its result only while its epoch is
   // still current. This is what keeps a slow fetch from an older deps/period
@@ -359,11 +404,18 @@ export function usePolled<T>(
       if (cached !== undefined) {
         setData(cached.value)
         setDataKey(memoKey)
+        dataKeyRef.current = memoKey
+        completeRef.current = isCompleteReport(cached.value)
+        setDegraded(null)
         servedCached = true
         // The footer's "refreshed Ns ago" must describe the payload on screen,
-        // not this hook instance's last fetch of some other key.
-        setLastSuccessAt(cached.at)
-        lastSuccessRef.current = cached.at
+        // not this hook instance's last fetch of some other key. A durable entry
+        // is a snapshot from an earlier app run, not a refresh this one made, so
+        // it stamps nothing: the fetch below is what sets the clock.
+        if (!cached.durable) {
+          setLastSuccessAt(cached.at)
+          lastSuccessRef.current = cached.at
+        }
         // Still fresh, and this is a switch rather than a poll/manual refresh:
         // the painted answer is good enough, so skip the CLI spawn entirely.
         // A durable entry came from an earlier renderer lifetime. Paint it, but
@@ -379,6 +431,9 @@ export function usePolled<T>(
       } else {
         setData(null)
         setDataKey(null)
+        dataKeyRef.current = null
+        completeRef.current = false
+        setDegraded(null)
       }
     }
     setLoading(true)
@@ -398,10 +453,20 @@ export function usePolled<T>(
     pending
       .then(result => {
         if (epochRef.current !== epoch || memoEpoch !== loadMemoEpoch) return
-        setData(result)
-        setDataKey(memoKey ?? null)
         setError(null)
         setErrorKey(null)
+        // A finished answer is never given up for an unfinished one. The producer
+        // keeps converging and the next poll replaces this; until then the screen
+        // keeps the complete numbers and says indexing is still running.
+        if (!isCompleteReport(result) && completeRef.current && dataKeyRef.current === (memoKey ?? null)) {
+          setDegraded(result)
+          return
+        }
+        setDegraded(null)
+        setData(result)
+        setDataKey(memoKey ?? null)
+        dataKeyRef.current = memoKey ?? null
+        completeRef.current = isCompleteReport(result)
         const at = Date.now()
         setLastSuccessAt(at)
         lastSuccessRef.current = at
@@ -424,30 +489,52 @@ export function usePolled<T>(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, memoKey, ...deps])
 
+  // FETCHING. Mount, and every change of the fetcher itself (deps, `enabled`,
+  // `memoKey`). Deliberately NOT keyed on the cadence: changing how OFTEN to
+  // poll is not a reason to poll now. Before the split, a power transition (or
+  // useOnBattery resolving a moment after launch) changed intervalMs and
+  // therefore re-ran this, spawning an immediate extra CLI process for every
+  // live hook — including a whole `act report` on its 10-minute tier.
   useEffect(() => {
     load()
-    // Data freshness is a product contract, including while the app is covered
-    // or minimized. The CLI resident process coalesces reads, so keep the cadence
-    // alive; purely visual animation remains visibility-gated elsewhere.
-    const tick = () => load()
-    // Manual cadence (intervalMs == null) skips the interval entirely.
-    const id = intervalMs != null ? setInterval(tick, intervalMs) : null
-    // On return to visible, if the last success is older than a full cadence,
-    // refresh once immediately instead of waiting up to intervalMs for the next
-    // tick. Manual cadence has no catch-up (the user drives refresh).
-    const onVisible = () => {
-      if (intervalMs == null) return
-      if (typeof document === 'undefined' || document.visibilityState !== 'visible') return
-      const last = lastSuccessRef.current
-      if (last == null || Date.now() - last >= intervalMs) load()
-    }
-    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisible)
     return () => {
-      if (id != null) clearInterval(id)
-      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisible)
       // Retire this generation so an in-flight fetch can't resolve into state
       // after unmount or a deps change.
       epochRef.current++
+    }
+  }, [load])
+
+  // TIMING. Arms (and re-arms) the interval and the visibility gate. Re-running
+  // this on a cadence change restarts the timer at the new interval without
+  // fetching.
+  useEffect(() => {
+    // Poll only while the window is visible. Each tick drives a CLI re-parse in
+    // the resident serve child, and on a machine with active agent sessions the
+    // watched roots change constantly, so every tick is a full-core parse. A
+    // minimized/occluded window has no viewer to keep fresh; letting it poll was
+    // the app's dominant idle energy drain. On return to visible the catch-up
+    // below refreshes immediately, so freshness while looking is unchanged.
+    const tick = () => load()
+    // Manual cadence (intervalMs == null) skips the interval entirely.
+    let id: ReturnType<typeof setInterval> | null = null
+    const isVisible = () => typeof document === 'undefined' || document.visibilityState === 'visible'
+    const startTicking = () => { if (id == null && intervalMs != null) id = setInterval(tick, intervalMs) }
+    const stopTicking = () => { if (id != null) { clearInterval(id); id = null } }
+    if (isVisible()) startTicking()
+    // On return to visible, if the last success is older than a full cadence,
+    // refresh once immediately instead of waiting up to intervalMs; then resume
+    // ticking. On hide, stop ticking so no CLI work happens while unwatched.
+    const onVisible = () => {
+      if (intervalMs == null) return
+      if (!isVisible()) { stopTicking(); return }
+      const last = lastSuccessRef.current
+      if (last == null || Date.now() - last >= intervalMs) load()
+      startTicking()
+    }
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      stopTicking()
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisible)
     }
   }, [load, intervalMs])
 
@@ -464,7 +551,9 @@ export function usePolled<T>(
   const keyMismatch = memoKey !== undefined && dataKey !== memoKey
   const renderedData = keyMismatch ? renderMemo?.value ?? null : data
   const renderedDataKey = keyMismatch ? (renderMemo ? memoKey : null) : dataKey
-  const renderedLastSuccessAt = keyMismatch && renderMemo ? renderMemo.at : lastSuccessAt
+  // A durable entry dates from an earlier app run, so it stamps no refresh time
+  // here either — same rule as `polledMemoTimestamp`.
+  const renderedLastSuccessAt = keyMismatch && renderMemo ? (renderMemo.durable ? null : renderMemo.at) : lastSuccessAt
   const renderedLoading = keyMismatch ? true : loading
   const renderedSwitching = keyMismatch ? renderMemo !== undefined : switching
   const renderedError = memoKey !== undefined && errorKey !== memoKey ? null : error
@@ -474,8 +563,11 @@ export function usePolled<T>(
     dataKey: renderedDataKey,
     error: renderedError,
     loading: renderedLoading,
-    switching: renderedSwitching,
+    // A refused partial means the producer is still working, which reads as
+    // in-flight to every consumer of `switching`.
+    switching: renderedSwitching || (keyMismatch ? false : degraded !== null),
     lastSuccessAt: renderedLastSuccessAt,
+    degraded: keyMismatch ? null : degraded,
     refresh,
   }
 }

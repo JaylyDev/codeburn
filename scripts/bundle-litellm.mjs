@@ -1,4 +1,4 @@
-import { writeFileSync, mkdirSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync } from 'fs'
 import { dirname, join } from 'path'
 import { fileURLToPath } from 'url'
 
@@ -77,14 +77,37 @@ for (const [name, entry] of entries) {
   const val = toVal(entry)
   if (val) snapshot[name] = val
 }
-// Pass 2: prefixed entries - store full key + stripped (first-write-wins)
+// A tuple's completeness: how many optional rate slots (cache-write,
+// cache-read) carry a published value. A richer upstream row may cite it to
+// FILL a sparser entry's missing slots - never as a license to re-price it
+// (see the fillsOnly guard in Pass 2).
+const completeness = (val) => (val[2] != null ? 1 : 0) + (val[3] != null ? 1 : 0) + (val[5] != null ? 1 : 0)
+
+// Pass 2: prefixed entries - store full key + stripped (slot-fill-only)
 for (const [name, entry] of entries) {
   if (!name.includes('/')) continue
   const val = toVal(entry)
   if (!val) continue
   if (!snapshot[name]) snapshot[name] = val
   const stripped = name.replace(/^[^/]+\//, '')
-  if (stripped !== name && !snapshot[stripped]) snapshot[stripped] = val
+  if (stripped === name) continue
+  const existing = snapshot[stripped]
+  // The stripped key may already hold Pass 1's direct entry or an earlier
+  // Pass 2 row. A "more complete" upstream row may only top up missing
+  // slots - it never re-prices a filled one: input/output must be identical,
+  // and every non-null optional slot of the existing tuple must survive
+  // verbatim (val may add slots, never change them). Guarantees no rate ever
+  // changes across a refresh; only missing slots fill. The completeness-wins
+  // version re-priced 43 input/output and 34 cache rates by swapping in a
+  // different upstream row (grok-3 3/15 -> 1.25/2.5, mistral-large-latest
+  // 8/24 -> 0.5/1.5).
+  const fillsOnly = (cand, prev) =>
+    cand[0] === prev[0]
+    && cand[1] === prev[1]
+    && (prev[2] == null || cand[2] === prev[2])
+    && (prev[3] == null || cand[3] === prev[3])
+    && (prev[5] == null || cand[5] === prev[5])
+  if (!existing || (completeness(val) > completeness(existing) && fillsOnly(val, existing))) snapshot[stripped] = val
 }
 
 // A MANUAL_ENTRY that LiteLLM now ships is a candidate to delete (the override
@@ -109,6 +132,30 @@ for (const k of Object.keys(snapshot)) {
   seen.add(k.toLowerCase())
   seen.add(bareKey(k).toLowerCase())
 }
+// A refresh must never leave a model that HAD pricing without any: carry the
+// previous files' entries forward verbatim when neither the new primary nor
+// the new gap-fill covers them exactly. That means both the previous
+// fallback's own last-resort entries AND previous PRIMARY rows the new
+// upstream data dropped or renamed (LiteLLM removed e.g.
+// `gpt-image-2-2026-04-21` and the Bedrock marengo embeds between regens) —
+// an id users priced yesterday stays priced at its last known rate in the
+// fallback tier, which is exactly the last-resort tier orphaned ids belong
+// in. Primary rows are consulted before fallback rows so a key present in
+// both keeps its authoritative primary value.
+const previousFallback = (() => {
+  try {
+    return JSON.parse(readFileSync(fallbackPath, 'utf8'))
+  } catch {
+    return {}
+  }
+})()
+const previousSnapshot = (() => {
+  try {
+    return JSON.parse(readFileSync(snapshotPath, 'utf8'))
+  } catch {
+    return {}
+  }
+})()
 const finite = (v) => { const n = Number(v); return Number.isFinite(n) ? n : null }
 // A rate pair is usable only if both sides are non-negative and not both zero.
 // OpenRouter uses -1 as a "variable / BYOK price" sentinel; without this guard a
@@ -173,6 +220,26 @@ try {
 }
 
 mkdirSync(dataDir, { recursive: true })
+let carried = 0
+// Coverage here is exact-key ONLY. The runtime resolver (`getModelCosts`)
+// never tries `vendor/<id>` for a bare `<id>` query — it looks the given id
+// up verbatim, peels segments off it, and strips variant suffixes, but never
+// adds a vendor prefix — so treating a `~x-ai/grok-latest` primary as
+// covering a bare `grok-latest` would drop the old entry while the model
+// still prices as null (the first version of this refresh did exactly that
+// to 96 fallback ids). NOT date-stripped either, for the same reason: a
+// dated primary variant like `qwen/qwen3.5-plus-20260420` does not answer
+// the undated query.
+const coveredByKey = (key) =>
+  snapshot[key] !== undefined
+  || fallback[key] !== undefined
+for (const [k, v] of [...Object.entries(previousSnapshot), ...Object.entries(previousFallback)]) {
+  if (coveredByKey(k)) continue
+  if (fallback[k] !== undefined) continue
+  fallback[k] = v
+  carried += 1
+}
+if (carried > 0) console.log(`carried ${carried} previously-priced entries forward (dropped primary rows + fallback)`)
 writeFileSync(snapshotPath, JSON.stringify(snapshot))
 writeFileSync(fallbackPath, JSON.stringify(fallback))
 console.log(`Bundled ${Object.keys(snapshot).length} primary + ${Object.keys(fallback).length} fallback models`)

@@ -16,6 +16,7 @@ import {
   dockPrefsPath,
   findPackagedTrayExe,
   findStagedMsi,
+  isNewerVersion,
   parseInstallResult,
   parseRunKeyValue,
   readCompanionSettings,
@@ -66,6 +67,24 @@ describe('staged tray app discovery', () => {
     expect(findPackagedTrayExe(sandbox)).toBeNull()
     writeFileSync(join(sandbox, 'codeburn-menubar.exe'), 'exe')
     expect(findPackagedTrayExe(sandbox)).toBe(join(sandbox, 'codeburn-menubar.exe'))
+  })
+})
+
+describe('isNewerVersion', () => {
+  it('compares release versions component by component', () => {
+    expect(isNewerVersion('0.9.24', '0.9.23')).toBe(true)
+    expect(isNewerVersion('0.9.23', '0.9.24')).toBe(false)
+    expect(isNewerVersion('0.10.0', '0.9.99')).toBe(true)
+    expect(isNewerVersion('1.2', '1.2.0')).toBe(false) // a missing component is zero
+    expect(isNewerVersion(null, '1.0.0')).toBe(false)
+    expect(isNewerVersion('1.0.0', null)).toBe(true)
+  })
+
+  // A `dev` (unparseable) component sorts below every real number, so a real staged release is
+  // newer than a dev build already installed, and a dev build is never newer than a release.
+  it('treats a dev build as older than any release', () => {
+    expect(isNewerVersion('1.2.0', '1.2.dev')).toBe(true)
+    expect(isNewerVersion('1.2.dev', '1.2.0')).toBe(false)
   })
 })
 
@@ -346,13 +365,13 @@ describe('MenubarCompanion', () => {
 
   afterEach(() => { rmSync(sandbox, { recursive: true, force: true }) })
 
-  it('is unsupported off Windows and on a build with nothing staged', () => {
-    expect(new MenubarCompanion(deps()).status().supported).toBe(false)
+  it('is unsupported off Windows and on a build with nothing staged', async () => {
+    expect((await new MenubarCompanion(deps()).status()).supported).toBe(false)
     stageMsi()
-    expect(new MenubarCompanion(deps({ platform: 'darwin' })).status().supported).toBe(false)
-    expect(new MenubarCompanion(deps()).status().supported).toBe(true)
+    expect((await new MenubarCompanion(deps({ platform: 'darwin' })).status()).supported).toBe(false)
+    expect((await new MenubarCompanion(deps()).status()).supported).toBe(true)
     // The Store route wants the executable itself; an .msi it cannot run is not support.
-    expect(new MenubarCompanion(deps({ store: true })).status().supported).toBe(false)
+    expect((await new MenubarCompanion(deps({ store: true })).status()).supported).toBe(false)
   })
 
   // The path is an argument rather than an environment variable, so nothing a stray variable
@@ -392,7 +411,7 @@ describe('MenubarCompanion', () => {
     await companion.bootstrap()
 
     expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toEqual({ enabled: false, scale: 1.2 })
-    expect(companion.status().sidebar).toBe(false)
+    expect((await companion.status()).sidebar).toBe(false)
     expect(readCompanionSettings(stateDir).sidebar).toBe(false)
   })
 
@@ -621,7 +640,7 @@ describe('MenubarCompanion', () => {
 
       expect(cliCalls).toHaveLength(1)
       expect(launches).toEqual([])
-      expect(companion.status().restartRequired).toBe(true)
+      expect((await companion.status()).restartRequired).toBe(true)
       log.mockRestore()
     })
 
@@ -636,7 +655,7 @@ describe('MenubarCompanion', () => {
       await companion.bootstrap()
 
       expect(launches).toEqual([])
-      expect(companion.status().restartRequired).toBe(true)
+      expect((await companion.status()).restartRequired).toBe(true)
       log.mockRestore()
     })
 
@@ -690,7 +709,7 @@ describe('MenubarCompanion', () => {
 
       expect(cliCalls).toEqual([])
       expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--reload-settings'] }])
-      expect(companion.status().restartRequired).toBe(false)
+      expect((await companion.status()).restartRequired).toBe(false)
       // The pending mark is spent, so a later launch does not have to derive it again.
       expect(readCompanionSettings(stateDir).restartRequiredSince).toBeNull()
       log.mockRestore()
@@ -713,7 +732,7 @@ describe('MenubarCompanion', () => {
       await companion.bootstrap()
 
       expect(launches).toEqual([])
-      expect(companion.status().restartRequired).toBe(true)
+      expect((await companion.status()).restartRequired).toBe(true)
       expect(readCompanionSettings(stateDir).restartRequiredSince).not.toBeNull()
       log.mockRestore()
     })
@@ -816,7 +835,7 @@ describe('MenubarCompanion', () => {
 
     const status = await companion.setMenuBarEnabled(false)
 
-    expect(status).toEqual({ supported: true, menuBar: false, sidebar: false, store: false, restartRequired: false })
+    expect(status).toMatchObject({ supported: true, menuBar: false, sidebar: false, store: false, restartRequired: false })
     expect(regCalls).toEqual([runKeyArgs(false, TRAY_EXE)])
     expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--quit'] }])
   })
@@ -861,7 +880,7 @@ describe('MenubarCompanion', () => {
 
     const status = await companion.setMenuBarEnabled(false)
 
-    expect(status).toEqual({ supported: true, menuBar: false, sidebar: false, store: false, restartRequired: false })
+    expect(status).toMatchObject({ supported: true, menuBar: false, sidebar: false, store: false, restartRequired: false })
     // Written before --quit, so what the tray app finds next time is what the switches show.
     expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toEqual({ enabled: false })
     expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--quit'] }])
@@ -906,6 +925,104 @@ describe('MenubarCompanion', () => {
     expect(status.sidebar).toBe(false)
     expect(JSON.parse(readFileSync(dockPrefsPath(home), 'utf8'))).toEqual({ enabled: false })
     expect(launches).toEqual([{ exe: TRAY_EXE, args: ['--reload-settings'] }])
+  })
+
+  // The discrete Plugins-card actions, mirroring the macOS card.
+  describe('discrete actions', () => {
+    it('install stages and runs the bundled MSI, then seeds launch-at-login', async () => {
+      stageMsi()
+      const companion = new MenubarCompanion(deps())
+
+      const res = await companion.install()
+
+      expect(res.ok).toBe(true)
+      expect(cliCalls.some(c => c.args.join(' ') === `menubar ${STAGED_MSI_FLAG} ${join(resources, 'menubar', MSI_NAME)}`)).toBe(true)
+      expect(regCalls).toContainEqual(runKeyArgs(true, TRAY_EXE))
+      expect(launches).toContainEqual({ exe: TRAY_EXE, args: ['--reload-settings'] })
+      expect(res.status.installed).toBe(true)
+    })
+
+    it('treats a cancelled elevation prompt as a no-op, not a failure', async () => {
+      stageMsi()
+      installResult = result({ action: 'cancelled' })
+      const companion = new MenubarCompanion(deps())
+
+      const res = await companion.install()
+
+      // The person declined the UAC prompt: no error, nothing installed, and the declined
+      // version is remembered so it is not re-offered until they ask again.
+      expect(res.ok).toBe(true)
+      expect(res.status.installed).toBe(false)
+      expect(readCompanionSettings(stateDir).installDeclinedVersion).toBe(VERSION)
+    })
+
+    it('install passes --force when a copy is already there (Reinstall)', async () => {
+      stageMsi()
+      writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, trayExePath: TRAY_EXE, trayExeVersion: VERSION, seeded: true })
+      const companion = new MenubarCompanion(deps())
+
+      await companion.install()
+
+      expect(cliCalls.some(c => c.args.includes('--force'))).toBe(true)
+    })
+
+    it('open shows the tray popover with a bare relaunch', async () => {
+      stageMsi()
+      writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: true, trayExePath: TRAY_EXE, seeded: true })
+      const companion = new MenubarCompanion(deps())
+
+      await companion.open()
+
+      expect(launches).toContainEqual({ exe: TRAY_EXE, args: [] })
+    })
+
+    it('quit stops the tray without dropping the Run value or turning the switch off', async () => {
+      stageMsi()
+      writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: true, trayExePath: TRAY_EXE, seeded: true })
+      let calls = 0
+      const companion = new MenubarCompanion(deps({ isRunning: async () => { calls++; return calls === 1 } }))
+
+      const res = await companion.quit()
+
+      expect(launches).toContainEqual({ exe: TRAY_EXE, args: ['--quit'] })
+      expect(regCalls).toEqual([])
+      expect(res.ok).toBe(true)
+      expect(readCompanionSettings(stateDir).menuBar).toBe(true)
+    })
+
+    it('uninstall runs the CLI uninstall, drops the Run value and clears the recorded path', async () => {
+      stageMsi()
+      writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: true, trayExePath: TRAY_EXE, trayExeVersion: VERSION, seeded: true })
+      installResult = result({ action: 'uninstalled' })
+      let calls = 0
+      const companion = new MenubarCompanion(deps({ isRunning: async () => { calls++; return calls === 1 } }))
+
+      const res = await companion.uninstall()
+
+      expect(cliCalls.some(c => c.args.join(' ') === 'menubar --uninstall')).toBe(true)
+      expect(regCalls).toContainEqual(runKeyArgs(false, ''))
+      expect(readCompanionSettings(stateDir).trayExePath).toBeNull()
+      expect(res.ok).toBe(true)
+      expect(res.status.installed).toBe(false)
+    })
+
+    it('leaves the tray recorded and launch-at-login intact when the CLI uninstall fails', async () => {
+      stageMsi()
+      writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: true, trayExePath: TRAY_EXE, trayExeVersion: VERSION, seeded: true })
+      const companion = new MenubarCompanion(deps({
+        runCli: async () => ({ ok: false, stdout: '', stderr: 'msiexec exited with 1603', code: 1 }),
+      }))
+
+      const res = await companion.uninstall()
+
+      // The tray app is still on disk, so its path, version and Run value must survive: dropping
+      // them would orphan a working install and wrongly show the card as uninstalled.
+      expect(res.ok).toBe(false)
+      expect(regCalls).not.toContainEqual(runKeyArgs(false, ''))
+      const saved = readCompanionSettings(stateDir)
+      expect(saved.trayExePath).toBe(TRAY_EXE)
+      expect(saved.menuBar).toBe(true)
+    })
   })
 
   // The tray app's own settings, which the two panes in the desktop app's Settings render.
@@ -999,7 +1116,7 @@ describe('MenubarCompanion', () => {
       const prefs = await companion.setTrayDockPref({ enabled: false })
 
       expect(prefs.dock.enabled).toBe(false)
-      expect(companion.status().sidebar).toBe(false)
+      expect((await companion.status()).sidebar).toBe(false)
     })
 
     it('writes launch at login to the Run value this app owns', async () => {
@@ -1116,13 +1233,23 @@ describe('MenubarCompanion', () => {
       expect(await companion.setTrayDockPref({ enabled: false })).toEqual(NEUTRAL)
 
       expect(readDockEnabled(home)).toBeUndefined()
-      expect(companion.status().sidebar).toBe(true)
+      expect((await companion.status()).sidebar).toBe(true)
       expect(launches).toEqual([])
     })
 
     it('setLaunchAtLogin runs no reg.exe', async () => {
       expect(await unsupported().setLaunchAtLogin(true)).toEqual(NEUTRAL)
       expect(regCalls).toEqual([])
+    })
+
+    it('status treats a leftover trayExePath as not installed, and never probes for the process', async () => {
+      stageMsi()
+      writeCompanionSettings(stateDir, { ...DEFAULT_COMPANION_SETTINGS, menuBar: true, sidebar: true, trayExePath: TRAY_EXE, seeded: true })
+      const isRunning = vi.fn(async () => true)
+      const status = await new MenubarCompanion(deps({ platform: 'darwin', isRunning })).status()
+
+      expect(status).toMatchObject({ supported: false, installed: false, running: false })
+      expect(isRunning).not.toHaveBeenCalled()
     })
   })
 

@@ -135,7 +135,7 @@ impl PlanClient {
         }
 
         Ok(PlanUsage::Ok {
-            tier: tier_display(creds.rate_limit_tier.as_deref()),
+            tier: tier_display(creds.subscription_type.as_deref(), creds.rate_limit_tier.as_deref()),
             raw_tier: creds.rate_limit_tier,
             windows,
             fetched_at: to_rfc3339(now),
@@ -148,6 +148,7 @@ impl PlanClient {
 struct StoredCredentials {
     access_token: String,
     rate_limit_tier: Option<String>,
+    subscription_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -162,6 +163,8 @@ struct OAuthBlock {
     access_token: Option<String>,
     #[serde(rename = "rateLimitTier")]
     rate_limit_tier: Option<String>,
+    #[serde(rename = "subscriptionType")]
+    subscription_type: Option<String>,
 }
 
 fn credentials_path() -> Option<PathBuf> {
@@ -196,30 +199,26 @@ fn load_credentials() -> Result<Option<StoredCredentials>> {
     Ok(Some(StoredCredentials {
         access_token: token,
         rate_limit_tier: oauth.rate_limit_tier,
+        subscription_type: oauth.subscription_type,
     }))
 }
 
-fn tier_display(raw: Option<&str>) -> String {
-    let Some(raw) = raw.map(|r| r.to_lowercase()) else {
-        return "Subscription".into();
-    };
-    if raw.contains("max_20x") || raw.contains("max20x") || raw.contains("max-20x") {
-        return "Max 20x".into();
+fn tier_display(subscription_type: Option<&str>, rate_limit_tier: Option<&str>) -> String {
+    let subscription_type = subscription_type.map(|s| s.to_lowercase()).unwrap_or_default();
+    let tier = rate_limit_tier.map(|r| r.to_lowercase()).unwrap_or_default();
+    let has_max_20 = tier.contains("max_20x") || tier.contains("max20x") || tier.contains("max-20x");
+    let has_max = tier.contains("max");
+    if subscription_type == "team" || (subscription_type.is_empty() && tier.contains("team")) {
+        return if has_max { "Team Premium".into() } else { "Team".into() };
     }
-    if raw.contains("max_5x") || raw.contains("max5x") || raw.contains("max-5x") {
-        return "Max 5x".into();
+    if subscription_type == "enterprise" || (subscription_type.is_empty() && tier.contains("enterprise")) {
+        return if has_max { "Enterprise Premium".into() } else { "Enterprise".into() };
     }
-    if raw.contains("max") {
-        return "Max 5x".into();
+    if subscription_type == "max" || has_max {
+        return if has_max_20 { "Max 20x".into() } else { "Max 5x".into() };
     }
-    if raw.contains("pro") {
+    if subscription_type == "pro" || tier.contains("pro") {
         return "Pro".into();
-    }
-    if raw.contains("team") {
-        return "Team".into();
-    }
-    if raw.contains("enterprise") {
-        return "Enterprise".into();
     }
     "Subscription".into()
 }
@@ -476,4 +475,27 @@ fn civil_from_unix(secs: i64) -> (i64, i64, i64, i64, i64, i64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tier_display;
+
+    #[test]
+    fn tier_display_prefers_subscription_type() {
+        let cases: [(Option<&str>, Option<&str>, &str); 9] = [
+            (Some("max"), Some("default_claude_max_20x"), "Max 20x"),
+            (Some("team"), Some("default_claude_max_5x"), "Team Premium"),
+            (Some("team"), None, "Team"),
+            (Some("enterprise"), Some("default_claude_max_5x"), "Enterprise Premium"),
+            (Some("pro"), Some("default_claude_pro"), "Pro"),
+            (None, Some("max_5x"), "Max 5x"),
+            (None, Some("max_20x"), "Max 20x"),
+            (None, Some("team"), "Team"),
+            (None, None, "Subscription"),
+        ];
+        for (subscription_type, rate_limit_tier, expected) in cases {
+            assert_eq!(tier_display(subscription_type, rate_limit_tier), expected);
+        }
+    }
 }

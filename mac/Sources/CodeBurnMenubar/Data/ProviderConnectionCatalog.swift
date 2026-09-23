@@ -45,7 +45,7 @@ struct ProviderConnectionCatalogEntry: Equatable, Sendable {
 /// Declarative connection inventory owned by CodeBurn. The live flag identifies
 /// every provider with a native CodeBurn quota adapter.
 enum ProviderConnectionCatalog {
-    static let inventoryRevision = "714bff00815f0d98ae206e781d563595129ba185"
+    static let inventoryRevision = "5b09e44d0f9e60107d3fbed232e5f6e17d486df3"
 
     static let providers: [ProviderConnectionCatalogEntry] = [
         entry("codex", "Codex", [.automatic, .web, .cli, .oauth, .api],
@@ -75,6 +75,8 @@ enum ProviderConnectionCatalog {
         entry("devin", "Devin", [.automatic, .web], [.cookieOrWebSession]),
         entry("zai", "Z.ai", [.automatic, .api],
               [.localAppOrCLI, .apiTokenOrCloudCredentials], live: true),
+        entry("zcode", "ZCode", [.automatic, .cli],
+              [.localAppOrCLI], live: true),
         entry("minimax", "MiniMax", [.automatic, .web, .api],
               [.cookieOrWebSession, .apiTokenOrCloudCredentials]),
         entry("manus", "Manus", [.automatic, .web], [.cookieOrWebSession]),
@@ -119,6 +121,7 @@ enum ProviderConnectionCatalog {
         entry("bedrock", "AWS Bedrock", [.automatic, .api], [.apiTokenOrCloudCredentials]),
         entry("grok", "Grok", [.automatic, .cli, .oauth],
               [.localAppOrCLI, .oauth], live: true),
+        entry("grokbot", "Grok Bot", [.automatic, .cli], [.localAppOrCLI], live: true),
         entry("groq", "Groq", [.automatic, .web, .api],
               [.cookieOrWebSession, .apiTokenOrCloudCredentials]),
         entry("llmproxy", "LLM Proxy", [.automatic, .api], [.apiTokenOrCloudCredentials]),

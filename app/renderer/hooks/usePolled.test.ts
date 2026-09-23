@@ -3,8 +3,8 @@ import { createElement, type ReactNode } from 'react'
 import { afterEach, describe, it, expect, vi } from 'vitest'
 import { render, renderHook, act } from '@testing-library/react'
 
-import { RefreshCadenceContext, type RefreshCadence } from '../lib/refreshCadence'
-import { __resetPolledMemo, clearPolledMemo, hasPolledMemo, primePolledMemo, usePolled } from './usePolled'
+import { RefreshCadenceContext, resolveCadenceMs, type RefreshCadence } from '../lib/refreshCadence'
+import { __resetPolledMemo, clearPolledMemo, hasPolledMemo, polledMemoTimestamp, primePolledMemo, usePolled } from './usePolled'
 
 function cadenceWrapper(intervalMs: number | null) {
   const value: RefreshCadence = { value: 'x', intervalMs, setValue: () => {} }
@@ -232,6 +232,55 @@ describe('usePolled', () => {
     expect(secondFetcher).toHaveBeenCalledTimes(1)
   })
 
+  it('never reports a refresh time from a restored snapshot, not even for the render before switch effects run', async () => {
+    // Leave a durable snapshot for key B behind, then drop module memory: B is
+    // now reachable only from disk, as it would be after a restart.
+    const seed = renderHook(() => usePolled(vi.fn().mockResolvedValue({ total: 42 }), [], { memoKey: 'overview|B', intervalMs: null }))
+    await act(async () => {})
+    seed.unmount()
+    __resetPolledMemo()
+    const aged = Date.now() - 3 * 24 * 60 * 60 * 1000
+    for (const key of Object.keys(localStorage)) {
+      localStorage.setItem(key, (localStorage.getItem(key) ?? '').replace(/^\{"at":\d+/, `{"at":${aged}`))
+    }
+
+    // The consumers of `lastSuccessAt` (the generation and the persisted
+    // headline) read it every render, so sample every render, not the settled one.
+    const started = Date.now()
+    const stamps: Array<number | null> = []
+    const { rerender } = renderHook(
+      ({ k }: { k: string }) => {
+        const polled = usePolled(vi.fn().mockResolvedValue({ total: 43 }), [k], { memoKey: k, intervalMs: null })
+        stamps.push(polled.lastSuccessAt)
+        return polled
+      },
+      { initialProps: { k: 'overview|A' } },
+    )
+    await act(async () => {})
+    stamps.length = 0
+
+    rerender({ k: 'overview|B' })
+    expect(stamps.length).toBeGreaterThan(0)
+    expect(stamps.filter(at => at !== null && at < started)).toEqual([])
+  })
+
+  it('reports no refresh time for a snapshot restored from a previous app run', async () => {
+    const first = renderHook(() => usePolled(vi.fn().mockResolvedValue({ total: 42 }), [], { memoKey: 'overview|restart', intervalMs: null }))
+    await act(async () => {})
+    expect(polledMemoTimestamp('overview|restart')).toBeCloseTo(Date.now(), -3)
+    first.unmount()
+
+    // The restored payload is hours old and the refresh it describes never
+    // happened in this run: the footer must not announce it as one.
+    __resetPolledMemo()
+    expect(polledMemoTimestamp('overview|restart')).toBeNull()
+
+    const second = renderHook(() => usePolled(vi.fn().mockResolvedValue({ total: 43 }), [], { memoKey: 'overview|restart', intervalMs: null }))
+    await act(async () => {})
+    expect(polledMemoTimestamp('overview|restart')).toBeCloseTo(Date.now(), -3)
+    second.unmount()
+  })
+
   it('compresses a heavy report snapshot before placing it in renderer storage', async () => {
     const repeated = Array.from({ length: 2_000 }, (_, index) => ({
       id: index,
@@ -377,7 +426,7 @@ describe('usePolled', () => {
     }
   })
 
-  it('continues data refreshes while the document is hidden', async () => {
+  it('stops the interval while hidden, then resumes with a catch-up on return', async () => {
     vi.useFakeTimers()
     try {
       setVisibility('visible')
@@ -386,18 +435,23 @@ describe('usePolled', () => {
       expect(fetcher).toHaveBeenCalledTimes(1) // mount fetch
       // Let the mount fetch resolve so lastSuccess is recorded.
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      // One visible cadence ticks.
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
+      expect(fetcher).toHaveBeenCalledTimes(2)
 
-      // Hidden/minimized is still an open product. Data refreshes continue so a
-      // return hours later never exposes an arbitrarily stale snapshot.
+      // Hidden: the interval stops, so no CLI re-parse fires while unwatched.
       setVisibility('hidden')
+      await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
       await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
-      expect(fetcher).toHaveBeenCalledTimes(6)
+      expect(fetcher).toHaveBeenCalledTimes(2) // frozen while hidden
 
-      // Returning visible does not duplicate a refresh because the latest hidden
-      // interval already succeeded inside one cadence.
+      // Back to visible after more than one cadence: an immediate catch-up
+      // refresh fires so the returning view is never stale, then ticking resumes.
       setVisibility('visible')
       await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
-      expect(fetcher).toHaveBeenCalledTimes(6)
+      expect(fetcher).toHaveBeenCalledTimes(3) // catch-up
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
+      expect(fetcher).toHaveBeenCalledTimes(4) // single resumed interval, no stack
     } finally {
       vi.useRealTimers()
     }
@@ -451,5 +505,174 @@ describe('usePolled', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  describe('refresh tiers', () => {
+    it('a slow request fetches on mount and on its own timer, never on a live tick', async () => {
+      vi.useFakeTimers()
+      try {
+        const fetcher = vi.fn().mockResolvedValue('x')
+        const { result } = renderHook(
+          () => usePolled(fetcher, [], { cadence: { slowMs: 600_000 } }),
+          { wrapper: cadenceWrapper(60_000) },
+        )
+        // Mount fetch.
+        expect(fetcher).toHaveBeenCalledTimes(1)
+
+        // Nine live cadences pass with no slow fetch.
+        await act(async () => { await vi.advanceTimersByTimeAsync(60_000 * 9) })
+        expect(fetcher).toHaveBeenCalledTimes(1)
+
+        // The slow timer comes due at 10 minutes.
+        await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+        expect(fetcher).toHaveBeenCalledTimes(2)
+
+        // A manual refresh is immediate, whatever the tier.
+        act(() => { result.current.refresh() })
+        expect(fetcher).toHaveBeenCalledTimes(3)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('never runs a slow request faster than the live cadence, and not at all under Manual', async () => {
+      vi.useFakeTimers()
+      try {
+        // Live cadence slower than the slow tier: the live cadence wins.
+        const slower = vi.fn().mockResolvedValue('x')
+        renderHook(() => usePolled(slower, [], { cadence: { slowMs: 60_000 } }), { wrapper: cadenceWrapper(600_000) })
+        await act(async () => { await vi.advanceTimersByTimeAsync(300_000) })
+        expect(slower).toHaveBeenCalledTimes(1)
+        await act(async () => { await vi.advanceTimersByTimeAsync(300_000) })
+        expect(slower).toHaveBeenCalledTimes(2)
+
+        // Manual means no timer at any tier.
+        const manual = vi.fn().mockResolvedValue('x')
+        renderHook(() => usePolled(manual, [], { cadence: { slowMs: 60_000 } }), { wrapper: cadenceWrapper(null) })
+        await act(async () => { await vi.advanceTimersByTimeAsync(3_600_000) })
+        expect(manual).toHaveBeenCalledTimes(1)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('runs a slow request that came due while hidden exactly once on return', async () => {
+      vi.useFakeTimers()
+      try {
+        const fetcher = vi.fn().mockResolvedValue('x')
+        renderHook(() => usePolled(fetcher, [], { cadence: { slowMs: 600_000 } }), { wrapper: cadenceWrapper(60_000) })
+        expect(fetcher).toHaveBeenCalledTimes(1)
+
+        setVisibility('hidden')
+        await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+        // Four slow intervals go by unwatched.
+        await act(async () => { await vi.advanceTimersByTimeAsync(600_000 * 4) })
+        expect(fetcher).toHaveBeenCalledTimes(1)
+
+        setVisibility('visible')
+        await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+        expect(fetcher).toHaveBeenCalledTimes(2) // one catch-up, not four
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('doubles the live cadence on battery and restores it on AC', async () => {
+      vi.useFakeTimers()
+      try {
+        expect(resolveCadenceMs('1m', false)).toBe(60_000)
+        expect(resolveCadenceMs('1m', true)).toBe(120_000)
+        expect(resolveCadenceMs('manual', true)).toBeNull() // Manual stays manual
+
+        const fetcher = vi.fn().mockResolvedValue('x')
+        const Probe = () => { usePolled(fetcher, []); return null }
+        const tree = (onBattery: boolean) => createElement(
+          RefreshCadenceContext.Provider,
+          { value: { value: '1m', intervalMs: resolveCadenceMs('1m', onBattery), setValue: () => {} } },
+          createElement(Probe),
+        )
+        const { rerender } = render(tree(true))
+        expect(fetcher).toHaveBeenCalledTimes(1)
+        // On battery the user's 1m base becomes 2m: nothing at 60s.
+        await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+        expect(fetcher).toHaveBeenCalledTimes(1)
+        await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+        expect(fetcher).toHaveBeenCalledTimes(2)
+
+        // Back on AC. Changing how OFTEN to poll is not a reason to poll NOW:
+        // the power transition itself must spawn nothing.
+        await act(async () => { rerender(tree(false)) })
+        expect(fetcher).toHaveBeenCalledTimes(2)
+
+        // The timer is re-armed at the restored 1m, measured from the change.
+        await act(async () => { await vi.advanceTimersByTimeAsync(59_000) })
+        expect(fetcher).toHaveBeenCalledTimes(2)
+        await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+        expect(fetcher).toHaveBeenCalledTimes(3)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('launching on battery does not double the first fetch of every hook', async () => {
+      vi.useFakeTimers()
+      try {
+        // useOnBattery reads the bridge asynchronously, so the first render is
+        // always AC and the real answer lands a tick later. That must re-arm the
+        // timer, not re-fetch: with act on its 10-minute tier the old effect
+        // spawned a whole extra `act report` on every power transition.
+        const live = vi.fn().mockResolvedValue('x')
+        const slow = vi.fn().mockResolvedValue('x')
+        const Probe = () => {
+          usePolled(live, [])
+          usePolled(slow, [], { cadence: { slowMs: 600_000 } })
+          return null
+        }
+        const tree = (onBattery: boolean) => createElement(
+          RefreshCadenceContext.Provider,
+          { value: { value: '1m', intervalMs: resolveCadenceMs('1m', onBattery), setValue: () => {} } },
+          createElement(Probe),
+        )
+        const { rerender } = render(tree(false))
+        expect(live).toHaveBeenCalledTimes(1)
+        expect(slow).toHaveBeenCalledTimes(1)
+
+        await act(async () => { rerender(tree(true)) }) // powerStatus resolves: on battery
+        expect(live).toHaveBeenCalledTimes(1)
+        expect(slow).toHaveBeenCalledTimes(1)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('a cadence change from Settings re-arms the timer without an immediate fetch', async () => {
+      vi.useFakeTimers()
+      try {
+        const fetcher = vi.fn().mockResolvedValue('x')
+        const Probe = () => { usePolled(fetcher, []); return null }
+        const tree = (intervalMs: number | null) => createElement(
+          RefreshCadenceContext.Provider,
+          { value: { value: 'x', intervalMs, setValue: () => {} } },
+          createElement(Probe),
+        )
+        const { rerender } = render(tree(30_000))
+        expect(fetcher).toHaveBeenCalledTimes(1)
+
+        await act(async () => { rerender(tree(300_000)) }) // user picks 5m
+        expect(fetcher).toHaveBeenCalledTimes(1)
+        await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+        expect(fetcher).toHaveBeenCalledTimes(1) // old cadence is gone
+        await act(async () => { await vi.advanceTimersByTimeAsync(270_000) })
+        expect(fetcher).toHaveBeenCalledTimes(2) // new cadence fires
+
+        // Manual stops the timer, still without fetching.
+        await act(async () => { rerender(tree(null)) })
+        expect(fetcher).toHaveBeenCalledTimes(2)
+        await act(async () => { await vi.advanceTimersByTimeAsync(3_600_000) })
+        expect(fetcher).toHaveBeenCalledTimes(2)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
   })
 })

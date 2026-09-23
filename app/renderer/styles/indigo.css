@@ -16,8 +16,22 @@
 
   --grad: linear-gradient(135deg, #5B8CFF, #8B7CF6);
   --grad-bar: linear-gradient(to top, rgba(91,140,255,.55), #6FA2FF 60%, #4DD8E6);
-  --mono: ui-monospace, "SF Mono", "Berkeley Mono", Menlo, Consolas, monospace;
-  --sans: system-ui, -apple-system, "SF Pro Text", "Segoe UI", sans-serif;
+  --mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", "Berkeley Mono", Menlo, "Cascadia Mono", Consolas, monospace;
+  --sans: "Inter Variable", system-ui, -apple-system, "SF Pro Text", "Segoe UI", "PingFang SC", "Hiragino Sans", "Yu Gothic", "Malgun Gothic", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+}
+/* Per-language font stacks: the CJK locales share Unicode with Simplified
+   Chinese, so a stack that lists "PingFang SC" first renders Japanese kanji and
+   Traditional characters in Simplified forms. <html lang> carries the active
+   locale, so reorder the stack to put each language's own faces first (macOS,
+   then Windows, then Linux fallbacks). zh-Hans/en/fr keep the base above. */
+:root:lang(ja) {
+  --sans: "Inter Variable", system-ui, -apple-system, "SF Pro Text", "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic", "Segoe UI", "Meiryo", "Noto Sans CJK JP", sans-serif;
+}
+:root:lang(zh-Hant), :root:lang(zh-TW) {
+  --sans: "Inter Variable", system-ui, -apple-system, "SF Pro Text", "PingFang TC", "Hiragino Sans CNS", "Segoe UI", "Microsoft JhengHei", "Noto Sans CJK TC", sans-serif;
+}
+:root:lang(ko) {
+  --sans: "Inter Variable", system-ui, -apple-system, "SF Pro Text", "Apple SD Gothic Neo", "Segoe UI", "Malgun Gothic", "Noto Sans CJK KR", sans-serif;
 }
 body {
   background:
@@ -134,7 +148,7 @@ td.pos, td .pos { color: var(--ok); }
 .est { font-size: 9.5px; color: var(--mut2); font-family: var(--mono); }
 .alias { color: var(--accent); font-family: var(--sans); font-size: 11px; font-weight: 530; }
 
-.track { height: 5px; border-radius: 3px; background: rgba(160,175,255,.08); position: relative; margin-top: 8px; }
+.track { height: 5px; border-radius: 3px; background: var(--bar); position: relative; margin-top: 8px; }
 .track i { position: absolute; inset: 0 auto 0 0; border-radius: 3px; background: var(--grad); }
 .track i.over { background: linear-gradient(90deg, #F26D6D, #E8484F); }
 .track i.mut { background: #2A3145; }

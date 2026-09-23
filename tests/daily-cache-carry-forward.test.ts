@@ -601,7 +601,10 @@ describe('adoption union across older cache files', () => {
         models: { 'opus-4-8': { calls: 3, cost: 20, savingsUSD: 0, inputTokens: 1000, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } },
         categories: { coding: { turns: 3, cost: 20, savingsUSD: 0, editTurns: 1, oneShotTurns: 1 } },
       }),
-    }, { carried: true })
+    }, {
+      carried: true,
+      models: { 'opus-4-8': { calls: 3, cost: 20, savingsUSD: 0, inputTokens: 1000, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+    })
     const cache: DailyCache = {
       version: DAILY_CACHE_VERSION,
       savingsConfigHash: '',
@@ -634,7 +637,11 @@ describe('adoption union across older cache files', () => {
 
     const loaded = await loadDailyCache()
 
-    expect(loaded.days[0]!.models).toEqual({})
+    // The junk map is dropped; the day's own calls and cost are then left with
+    // nothing to attribute them to, so they land on the carried row.
+    expect(loaded.days[0]!.models).toEqual({
+      'Unknown (carried)': { calls: 2, cost: 5, savingsUSD: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    })
     expect(loaded.days[0]!.categories).toEqual({})
   })
 
@@ -729,6 +736,11 @@ describe('adoption union across older cache files', () => {
 // Numbers below are kelchm's isolated machine-A day (2026-08-07): the v17
 // slice deep-equalled the migrated v21 one field-for-field, and a virgin-cache
 // run of the same build derived the store-backed slice instead.
+// The last daily-cache version written before the #1450 route contract, which
+// is what these two cases seed. Pinned, not DAILY_CACHE_VERSION - 1: a later
+// bump must not silently move the boundary they are asserting.
+const PRE_ROUTE_CONTRACT_VERSION = 32
+
 describe('#946: a migration re-derives copilot instead of carrying it', () => {
   const settled = daysAgoStr(33)
   const PRE_STORE = slice(0.630267, 37, { sessions: 6, cacheWriteTokens: 125987 })
@@ -786,9 +798,9 @@ describe('#946: a migration re-derives copilot instead of carrying it', () => {
 
   it('does not re-open Copilot re-derivation for a cache already past its contract change', async () => {
     await writeFile(
-      join(TMP_CACHE_ROOT, `daily-cache.v${DAILY_CACHE_VERSION - 1}.json`),
+      join(TMP_CACHE_ROOT, `daily-cache.v${PRE_ROUTE_CONTRACT_VERSION}.json`),
       JSON.stringify({
-        version: DAILY_CACHE_VERSION - 1,
+        version: PRE_ROUTE_CONTRACT_VERSION,
         savingsConfigHash: 'cfg-A',
         tzKey: currentTzKey(),
         lastComputedDate: daysAgoStr(1),
@@ -800,14 +812,16 @@ describe('#946: a migration re-derives copilot instead of carrying it', () => {
     )
 
     const loaded = await loadDailyCache()
-    expect(loaded.pendingRederive).toEqual(['dsh'])
+    // From v32 only hermes (contract 33: day.models keyed by route) is owed a
+    // re-derivation; dsh's v32 contract is already satisfied.
+    expect(loaded.pendingRederive).toEqual(['hermes'])
   })
 
   it('preserves an older cache pending repair while adding a newer provider repair', async () => {
     await writeFile(
-      join(TMP_CACHE_ROOT, `daily-cache.v${DAILY_CACHE_VERSION - 1}.json`),
+      join(TMP_CACHE_ROOT, `daily-cache.v${PRE_ROUTE_CONTRACT_VERSION}.json`),
       JSON.stringify({
-        version: DAILY_CACHE_VERSION - 1,
+        version: PRE_ROUTE_CONTRACT_VERSION,
         savingsConfigHash: 'cfg-A',
         tzKey: currentTzKey(),
         lastComputedDate: daysAgoStr(1),
@@ -820,7 +834,7 @@ describe('#946: a migration re-derives copilot instead of carrying it', () => {
     )
 
     const loaded = await loadDailyCache()
-    expect(loaded.pendingRederive).toEqual(['copilot', 'dsh'])
+    expect(loaded.pendingRederive).toEqual(['copilot', 'hermes'])
   })
 
   it('still carries the slice whole when the sources are gone (never-lose, #1033)', async () => {

@@ -2,8 +2,8 @@ import { readdir, readFile } from 'fs/promises'
 import { basename, join } from 'path'
 
 import type { ClassifiedTurn, ProjectSummary } from './types.js'
-import { isBehavioralCall } from './behavioral-weight.js'
-import { getShortModelName } from './models.js'
+import { behavioralCallWeight, isBehavioralCall } from './behavioral-weight.js'
+import { modelRowKey } from './models.js'
 import { callBillableOutputTokens } from './session-output.js'
 
 const PLANNING_TOOLS = new Set(['TaskCreate', 'TaskUpdate', 'TodoWrite', 'EnterPlanMode', 'ExitPlanMode'])
@@ -66,7 +66,7 @@ export function aggregateModelStats(projects: ProjectSummary[]): ModelStats[] {
         for (const call of turn.assistantCalls) {
           if (call.model === '<synthetic>') continue
           const cs = call.model === primaryModel ? ms : ensure(call.model)
-          if (isBehavioralCall(call)) cs.calls++
+          cs.calls += behavioralCallWeight(call)
           cs.cost += call.costUSD
           cs.outputTokens += callBillableOutputTokens(call)
           cs.inputTokens += call.usage.inputTokens
@@ -90,7 +90,7 @@ export function aggregateModelStats(projects: ProjectSummary[]): ModelStats[] {
 /// rather than a new alias table.
 export function findModelStat(models: ModelStats[], input: string): ModelStats | undefined {
   return models.find(m => m.model === input)
-    ?? models.find(m => getShortModelName(m.model).toLowerCase() === input.toLowerCase())
+    ?? models.find(m => modelRowKey(m.model).toLowerCase() === input.toLowerCase())
 }
 
 export type ComparisonRow = {

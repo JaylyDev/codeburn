@@ -4,9 +4,11 @@ import { homedir } from 'os'
 
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost as baseCost, getCurrency } from './currency.js'
-import { findUnpricedModels, getShortModelName, unpricedModelHint } from './models.js'
+import { findUnpricedModels, modelRowKey, unpricedModelHint } from './models.js'
 import { callBillableOutputTokens, sessionBillableOutputTokens, sessionModelBillableOutputTokens } from './session-output.js'
-import { markEstimated } from './format.js'
+import { markEstimated, excludedGatewayNote } from './format.js'
+import { AGGREGATE_ONLY_PROVIDER } from './parser.js'
+import { maxOf } from './math-utils.js'
 import { formatSessionCount, SESSION_COUNT_HELP, type SessionCountBasis } from './session-count-label.js'
 import { normalizeAbsProjectPathKey } from './parser.js'
 import { dateKey } from './day-aggregator.js'
@@ -79,7 +81,7 @@ function vlen(s: string): number {
 
 function renderTable(c: ChalkInstance, cols: Col[], rows: string[][]): string {
   const widths = cols.map((col, i) =>
-    Math.max(vlen(col.header), ...rows.map((r) => vlen(r[i] ?? ''))),
+    maxOf(rows.map((r) => vlen(r[i] ?? '')), vlen(col.header)),
   )
   const pad = (s: string, w: number, right?: boolean): string => {
     const fill = ' '.repeat(Math.max(0, w - vlen(s)))
@@ -121,6 +123,9 @@ export type OverviewDurable = {
   /// Cost a --project/--exclude filter could not attribute (cached days with no
   /// per-project split). Optional so callers that never filter can omit it.
   unattributedCostUSD?: number
+  /// Gateway spend shown as its own labelled `By tool` row but deliberately
+  /// not in `cost`. Optional so callers that never build it can omit it.
+  excludedGateway?: { costUSD: number; calls: number; tokens: number }
 }
 
 export function renderOverview(
@@ -292,15 +297,25 @@ export function renderOverview(
     out.push('')
   }
 
-  // By tool (provider)
+  // By tool (provider). The aggregate-only gateway is never in `byProvider`
+  // (the corpus filter dropped it) and never in `cost`, so the shares below
+  // still sum over the counted tools only; it gets one labelled row of its own
+  // with no share, because a share of a total it is not in is meaningless.
+  const excludedGateway = durable?.excludedGateway
+  const gatewayRow = excludedGateway && excludedGateway.costUSD > 0
+    ? [[`${AGGREGATE_ONLY_PROVIDER} (not in total)`, formatCost(excludedGateway.costUSD), formatTokens(excludedGateway.tokens), '-']]
+    : []
   const providerRows = [...byProvider.entries()]
     .filter(([, v]) => v.cost > 0 || v.tokens > 0)
     .sort((a, b) => b[1].cost - a[1].cost)
-  if (providerRows.length) {
+  if (providerRows.length || gatewayRow.length) {
     out.push(heading('By tool'))
     out.push(renderTable(c,
       [{ header: 'Tool' }, { header: 'Cost', right: true }, { header: 'Tokens', right: true }, { header: 'Share', right: true }],
-      providerRows.map(([name, v]) => [name, formatCost(v.cost), formatTokens(v.tokens), cost > 0 ? `${Math.round((v.cost / cost) * 100)}%` : '0%']),
+      [
+        ...providerRows.map(([name, v]) => [name, formatCost(v.cost), formatTokens(v.tokens), cost > 0 ? `${Math.round((v.cost / cost) * 100)}%` : '0%']),
+        ...gatewayRow,
+      ],
     ))
     out.push('')
   }
@@ -311,7 +326,7 @@ export function renderOverview(
     out.push(heading('Top models'))
     out.push(renderTable(c,
       [{ header: 'Model' }, { header: 'Cost', right: true }, { header: 'Calls', right: true }, { header: 'Tokens', right: true }],
-      modelRows.map(([m, v]) => [getShortModelName(m), markEstimated(formatCost(v.cost), v.estimatedCost > 0), formatCount(v.calls), formatTokens(v.tokens)]),
+      modelRows.map(([m, v]) => [modelRowKey(m), markEstimated(formatCost(v.cost), v.estimatedCost > 0), formatCount(v.calls), formatTokens(v.tokens)]),
     ))
     if (modelRows.some(([, v]) => v.estimatedCost > 0)) {
       out.push('  ' + c.dim('~ estimated cost (priced from estimated tokens)'))
@@ -380,7 +395,7 @@ export function renderOverview(
   }
 
   const topTool = providerRows[0]?.[0]
-  const topModel = modelRows[0] ? getShortModelName(modelRows[0][0]) : ''
+  const topModel = modelRows[0] ? modelRowKey(modelRows[0][0]) : ''
   const mostly = topTool ? `, mostly ${topTool}${topModel ? ` / ${topModel}` : ''}` : ''
   out.push(c.dim('Bottom line: ') + `${opts.label} totals ${formatCost(cost)} across ${formatTokens(totalTokens)} tokens${mostly}.`)
 
@@ -397,6 +412,9 @@ export function renderOverview(
   if (durable && (durable.unattributedCostUSD ?? 0) > 0) {
     out.push(c.dim(`  excludes ${formatCost(durable.unattributedCostUSD!)} from days with no per-project history`))
   }
+
+  const gatewayNote = excludedGatewayNote(durable?.excludedGateway?.costUSD ?? 0)
+  if (gatewayNote) out.push(c.dim(`  ${gatewayNote}`))
 
   return out.join('\n') + '\n'
 }

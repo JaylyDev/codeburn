@@ -5,7 +5,9 @@ import { join } from 'path'
 
 import { getCodeburnCacheDir } from './cache-dir.js'
 import { acquireCacheRefreshLock, releaseOwnedRefreshLocksForExit } from './cache-refresh-lock.js'
+import { parseBillingMode, type BillingMode } from './models.js'
 import type { ToolCall } from './types.js'
+import { isWslUncPath } from './wsl.js'
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -72,6 +74,18 @@ export type CachedCall = {
   // depend on the `:obs:` key regex alone. Copilot still assigns the flag
   // at serve time and does not persist it.
   supplementaryAccounting?: boolean
+  // Requests this one call stands for (see ParsedProviderCall.requestCount).
+  requestCount?: number
+  // Billing route id the provider recorded (see ParsedProviderCall).
+  // Persisted so the row key survives the cache; a cached call without it is
+  // a direct-door call or one parsed before the provider carried the column
+  // (its parse version forces a re-parse).
+  route?: string
+  // Billing mode the provider recorded (see ParsedProviderCall.billing).
+  // Persisted so a warm read answers the same --billing question a cold parse
+  // would. Absent means the provider stated no fact; a value outside the two
+  // modes fails validation rather than being coerced into one.
+  billing?: BillingMode
 }
 
 export type CachedTurn = {
@@ -261,6 +275,14 @@ const UNREFERENCED_SHARD_MAX_AGE_MS = 60 * 60 * 1000
 // cached rows persist as durable orphans contributing exactly what they
 // always did. There is no cross-file dependency for the fingerprint to catch,
 // so declaring it would buy nothing and cost the durable-history loss above.
+//
+// CODEBURN_WSL (src/wsl.ts) is also deliberately absent, for claude and codex
+// alike. It is a live read policy, not parsed content: active roots add paths;
+// stopped roots retain historical WSL rows without touching their UNC share;
+// and active-root deletions are reconciled explicitly by src/parser.ts.
+// `off` disables discovery/UNC access while leaving that retained history
+// readable. Hashing the policy here would instead discard the rows that make a
+// shutdown/restart cycle lossless and force a full 9P re-parse after re-enable.
 export const PROVIDER_ENV_VARS: Record<string, string[]> = {
   claude: ['CLAUDE_CONFIG_DIRS', 'CLAUDE_CONFIG_DIR', 'CODEBURN_DESKTOP_SESSIONS_DIR', 'APPDATA', 'LOCALAPPDATA'],
   'cline-cli': ['CLINE_SESSION_DATA_DIR', 'CLINE_DATA_DIR', 'CLINE_DIR'],
@@ -280,6 +302,7 @@ export const PROVIDER_ENV_VARS: Record<string, string[]> = {
   opencode: ['XDG_DATA_HOME', 'OPENCODE_DATA_DIR', 'OPENCODE_DB_PREFIX'],
   goose: ['XDG_DATA_HOME', 'GOOSE_PATH_ROOT'],
   grok: ['GROK_HOME'],
+  grokbot: ['CODEBURN_GROKBOT_DIR', 'APPDATA'],
   crush: ['XDG_DATA_HOME', 'CRUSH_GLOBAL_DATA', 'LOCALAPPDATA'],
   warp: ['WARP_DB_PATH'],
   antigravity: ['CODEBURN_CACHE_DIR'],
@@ -381,11 +404,19 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // it identifies the request, and moving it would leave the cached output-0
   // copy beside the new row - so only this bump re-parses a v2 cache into the
   // corrected shape.
-  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1-session-store-v3',
+  // chatsession-otel-skills-v1: structured Skill calls are now extracted from
+  // VS Code chatSessions and OTel execute_tool spans. Cached calls lack those
+  // fields, so force one re-parse before serving period breakdowns.
+  // otel-trace-metadata-once-v1: trace-level tool/skill/bash metadata is now
+  // attributed to one chat span per trace instead of every span, so cached
+  // calls carry the old per-span duplication - force one re-parse.
+  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1-session-store-v3-chatsession-otel-skills-v1-otel-trace-metadata-once-v1',
   // authoritative-usage-v4: persist one Grok session call from top-level
   // authoritative totals, use modelUsage only for priced attribution, clamp
   // reasoning per record, and label mixed sessions estimated.
   grok: 'authoritative-usage-v4',
+  // Estimated from message text: Grok Bot's local mirror records no tokens.
+  grokbot: 'estimated-usage-v1',
   // v0-v3 generations, embedded attempt streams, retry accounting, and the
   // version-specific inherited-prefix rules all change cached DSH calls.
   dsh: 'session-formats-v0-v3-attempts-v5',
@@ -393,7 +424,17 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // rebuild the provider section alongside the v3 lifetime ledger. The parse
   // bump is required with the ledger bump: seeding a new ledger from a section
   // produced under v2 can turn historical accounting deltas into today's use.
-  hermes: 'reasoning-output-accounting-v1-est-cost-routed-ids-workspace-pr-v5-cost-provenance-v3',
+  // billing-route-v1: the session's `billing_provider` column now rides on
+  // each call as `route`. Cached calls hold none, so they must re-parse.
+  // billing-mode-v1: the resolved cost basis now rides on each call as
+  // `billing` (`included` -> subscription, `actual` -> metered). Cached calls
+  // hold none, so they must re-parse.
+  hermes: 'reasoning-output-accounting-v1-est-cost-routed-ids-workspace-pr-v5-cost-provenance-v3-billing-route-v1-billing-mode-v1',
+  // reported-cost-v1: OpenClaw's per-message `usage.cost.total` is now
+  // preserved through the cache via `costFromBilling`. This is OpenClaw's
+  // first parse version; adding it moves the provider's env fingerprint,
+  // which is what forces the one re-parse that lands the reported dollars.
+  openclaw: 'reported-cost-v1',
   'lingtai-tui': 'token-ledger-registry-activity-v3',
   'ibm-bob': 'worktree-project-grouping-v1',
   // project-path-v1: the parser now records the session's full working
@@ -420,10 +461,25 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // projectPath/workingDirectory instead of basename-only identity.
   // project-group-by-abs-v1 (#1260): parseProviderSources groups by abs
   // projectPath/workingDirectory so same-basename distinct roots stay apart.
-  pi: 'cwd-project-path-v1-project-group-by-abs-v1',
+  // reported-cost-v1: Pi writes a per-message `usage.cost.total`, which is now
+  // preserved through the cache via `costFromBilling` instead of being
+  // re-priced from tokens on every read. (omp, the same parser, has carried
+  // reported costs since reported-cost-v2 below.) Cached calls hold
+  // costUSD: undefined, so they must re-parse once.
+  pi: 'cwd-project-path-v1-project-group-by-abs-v1-reported-cost-v1',
   // project-group-by-abs-v1: shared Pi/OMP serve grouping uses abs identity.
   omp: 'nested-agent-v1-reported-cost-v2-cwd-project-path-v1-project-group-by-abs-v1',
-  opencode: 'session-model-v1',
+  // archived-subtree-v1 (#1362): the subtree walk no longer filters
+  // `time_archived IS NULL`. An archived ROOT self-heals — it was evicted as an
+  // undiscovered non-durable source and comes back new — but a root whose CHILD
+  // was archived stays a present, unchanged source: every opencode entry
+  // fingerprints the same database file, so a warm cache keeps serving the
+  // parse that dropped the child's calls until the database is written again.
+  // billing-routes-v2: OpenCode's exact `providerID` values now ride on every
+  // parsed call as `route`: `openrouter` and `amazon-bedrock`. Cached calls hold
+  // neither, so they must re-parse. v2 also invalidates the OpenRouter-only
+  // fingerprint used by pre-merge builds of #1486.
+  opencode: 'session-model-v1-archived-subtree-v1-billing-routes-v2',
   quickdesk: 'emf-sqlite-v2-est-cost',
   // session-lineage-capture-v1: SessionLineage (CB-1, slice 1) is now carried
   // on the cached file for every kimicode wire. Child evidence is the
@@ -434,10 +490,18 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // additive; every cost / token / call total is byte-identical to a build
   // that omits it.
   kimicode: 'wire-usage-v1-est-cost-session-lineage-capture-v1',
-  'kilo-code': 'worktree-project-grouping-v1-session-model-v1',
+  // archived-subtree-v1: KiloCode shares the SQLite parser and the same schema.
+  // billing-routes-v2: its warm cache must move with both shared route fields.
+  'kilo-code': 'worktree-project-grouping-v1-session-model-v1-archived-subtree-v1-billing-routes-v2',
   'roo-code': 'worktree-project-grouping-v1',
-  warp: 'worktree-project-grouping-v1-est-cost',
-  antigravity: 'worktree-project-grouping-v5',
+  // billing-cost-v1: Warp's own billing record (total_provider_cost_in_cents,
+  // total_charged_usage, credits_spent) now rides on each call as
+  // `costFromBilling` and is preserved by providerCallToCachedCall. Entries
+  // cached before this hold costUSD: undefined and are re-priced from the
+  // token floor on every read, so they must re-parse once for the real dollars
+  // to land.
+  warp: 'worktree-project-grouping-v1-est-cost-billing-cost-v1',
+  antigravity: 'worktree-project-grouping-v6',
 }
 
 function getLegacyCachePath(): string {
@@ -578,6 +642,17 @@ export function markCacheDirty(cache: SessionCache, provider: string, filePath?:
 /** True when any provider section changed since the last save. */
 export function isCacheDirty(cache: SessionCache): boolean {
   return stateOf(cache).dirty
+}
+
+/** True when a dirty bucket belongs to a provider whose cache entry is the ONLY
+ *  surviving record of that spend (see {@link DURABLE_PROVIDER_NAMES}): the
+ *  source can be pruned before the next publish, so such a window must never be
+ *  held back by the resident process's coalescing. */
+export function hasDirtyDurableProvider(cache: SessionCache): boolean {
+  for (const provider of stateOf(cache).dirtyBuckets.keys()) {
+    if (DURABLE_PROVIDER_NAMES.has(provider) || cache.providers[provider]?.durable) return true
+  }
+  return false
 }
 
 // ── Env Fingerprint ────────────────────────────────────────────────────
@@ -763,6 +838,9 @@ function validateCall(c: unknown): c is CachedCall {
     && isOptionalNum(o['toolErrors'])
     && isOptionalNum(o['editFailed'])
     && isOptionalBool(o['supplementaryAccounting'])
+    && isOptionalNum(o['requestCount'])
+    && isOptionalString(o['route'])
+    && (o['billing'] === undefined || parseBillingMode(o['billing'] as string) !== undefined)
     && validateUsage(o['usage'])
 }
 
@@ -921,6 +999,18 @@ let cacheMemo: { dir: string; nonce: string; scope: string; cache: SessionCache 
 
 export function clearLoadCacheMemo(): void {
   cacheMemo = null
+  clearShardMemo()
+}
+
+/// Is this in-memory cache still the one the published envelope describes? A
+/// holder that deferred its publish (see the coalescing window in parser.ts)
+/// asks before writing: if another process has published since, this object is
+/// a stale pre-image and saving it could drop that process's entries. Dropping
+/// the deferred write instead costs a re-parse, never a wrong number.
+export async function isCacheCurrent(cache: SessionCache): Promise<boolean> {
+  if (!cacheMemo || cacheMemo.cache !== cache) return false
+  const live = await readEnvelope(cacheMemo.dir)
+  return live?.nonce === cacheMemo.nonce
 }
 
 /** Months (UTC `YYYY-MM`, inclusive) a query can possibly report on. The load
@@ -997,6 +1087,78 @@ async function loadShard(path: string): Promise<Record<string, CachedFile> | nul
   }
 }
 
+// Shards a resident process (codeburn serve) keeps parsed between requests,
+// keyed by shard FILE NAME. A name carries a fresh nonce on every write
+// (shardFileName), so a name that is still published names the same bytes and
+// the memo needs no revalidation: a rewritten month arrives under a new name
+// and the retired one ages out below. This is what makes a period switch stop
+// re-parsing the months it already read - the whole-cache memo above is keyed
+// by scope and misses the moment the range widens.
+// Counted in shard text. A shard the current query scope also holds costs this
+// memo nothing extra - the same objects are already in the whole-cache memo
+// above - so this budget only bounds the months NOTHING else is holding, which
+// is why it is the smaller of the two. Both budgets together have to stay well
+// under SERVE_MAX_RSS_BYTES: reaching that guard drops every memo, and the next
+// request pays a cold parse and a cold scan.
+const SHARD_MEMO_MAX_BYTES = 64 * 1024 * 1024
+const SHARD_MEMO_MAX_AGE_MS = 10 * 60 * 1000
+type ShardMemoEntry = { files: Record<string, CachedFile>; bytes: number; usedAt: number }
+const shardMemo = new Map<string, ShardMemoEntry>()
+let shardMemoBytes = 0
+
+export function clearShardMemo(): void {
+  shardMemo.clear()
+  shardMemoBytes = 0
+}
+
+export function shardMemoStats(): { entries: number; bytes: number } {
+  return { entries: shardMemo.size, bytes: shardMemoBytes }
+}
+
+/// Drop entries unused past the age bound, then least-recently-used entries
+/// until the byte budget holds. `now` is injected so the rule is testable.
+export function evictShardMemo(now: number, maxBytes: number = SHARD_MEMO_MAX_BYTES): void {
+  // Least-recently-used order is the map's own insertion order, because a hit
+  // reinserts its entry at the back; walking from the front therefore evicts the
+  // oldest first and stops as soon as the budget holds.
+  for (const [name, entry] of shardMemo) {
+    if (shardMemoBytes <= maxBytes && now - entry.usedAt <= SHARD_MEMO_MAX_AGE_MS) break
+    shardMemo.delete(name)
+    shardMemoBytes -= entry.bytes
+  }
+}
+
+export async function loadShardMemoized(dir: string, name: string): Promise<Record<string, CachedFile> | null> {
+  const key = `${dir}\0${name}`
+  const now = Date.now()
+  const hit = shardMemo.get(key)
+  if (hit) {
+    hit.usedAt = now
+    shardMemo.delete(key)
+    shardMemo.set(key, hit)
+    return hit.files
+  }
+  let raw: string
+  try {
+    raw = await readFile(join(dir, name), 'utf-8')
+  } catch {
+    return null
+  }
+  let files: Record<string, CachedFile>
+  try {
+    const parsed = JSON.parse(raw)
+    if (!validateFiles(parsed)) return null
+    files = parsed
+  } catch {
+    return null
+  }
+  const bytes = Buffer.byteLength(raw)
+  shardMemo.set(key, { files, bytes, usedAt: now })
+  shardMemoBytes += bytes
+  evictShardMemo(now)
+  return files
+}
+
 /**
  * Read the cache. With a `scope`, only the shards whose months can contribute a
  * turn to that range are read — everything else stays on disk and is carried
@@ -1052,7 +1214,7 @@ export async function loadCache(scope?: CacheLoadScope): Promise<SessionCache> {
     for (const [bucket, ref] of Object.entries(meta.shards)) {
       if (loaded && !shardInScope(bucket, ref.until, scope!)) continue
       loaded?.add(bucket)
-      pending.push({ bucket, files: loadShard(join(dir, ref.name)) })
+      pending.push({ bucket, files: loadShardMemoized(dir, ref.name) })
     }
     reads.push((async () => {
       for (const { bucket, files: read } of pending) {
@@ -1551,6 +1713,10 @@ export async function fingerprintFile(filePath: string): Promise<FileFingerprint
     // A source path that IS a SQLite database (copilot OTel's agent-traces.db)
     // needs the same WAL fold as the virtual-suffix forms below.
     if (SQLITE_DB_PATH.test(filePath)) return fingerprintSqliteFile(filePath)
+    // WSL's 9P share (`\\wsl$\...`) synthesizes dev/ino per mount, so they can
+    // differ run to run for an unchanged file — keying on them would re-parse
+    // every WSL session every time. mtime+size only for those paths (#1059).
+    if (isWslUncPath(filePath)) return { dev: 0, ino: 0, mtimeMs: s.mtimeMs, sizeBytes: s.size }
     return { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, sizeBytes: s.size }
   } catch {
     // Providers encode extra context into source paths using virtual suffixes:

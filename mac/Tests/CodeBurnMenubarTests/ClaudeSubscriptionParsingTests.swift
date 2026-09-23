@@ -74,4 +74,22 @@ struct ClaudeSubscriptionParsingTests {
         let usage = try ClaudeSubscriptionService.parseUsage(Data(body.utf8), rawTier: nil)
         #expect(usage.scopedWeekly.isEmpty)
     }
+
+    @Test("plan tier prefers subscriptionType over rateLimitTier")
+    func tierPrefersSubscriptionType() {
+        let cases: [(String?, String?, SubscriptionUsage.Tier)] = [
+            ("max", "default_claude_max_20x", .max20x),
+            ("team", "default_claude_max_5x", .teamPremium),
+            ("team", nil, .team),
+            ("enterprise", "default_claude_max_5x", .enterprisePremium),
+            ("pro", "default_claude_pro", .pro),
+            (nil, "max_5x", .max5x),
+            (nil, "max_20x", .max20x),
+            (nil, "team", .team),
+            (nil, nil, .unknown),
+        ]
+        for (subscriptionType, rateLimitTier, expected) in cases {
+            #expect(SubscriptionUsage.tier(subscriptionType: subscriptionType, rateLimitTier: rateLimitTier) == expected)
+        }
+    }
 }

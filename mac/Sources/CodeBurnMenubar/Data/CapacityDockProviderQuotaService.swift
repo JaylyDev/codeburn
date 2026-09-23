@@ -23,7 +23,9 @@ final class CapacityDockProviderQuotaService {
         var refreshClinePass: @Sendable (String) async throws -> QuotaSummary
         var refreshCursor: @Sendable () async throws -> QuotaSummary
         var refreshGrok: @Sendable () async throws -> QuotaSummary
+        var refreshGrokBot: @Sendable () async throws -> QuotaSummary
         var refreshZai: @Sendable (String?) async throws -> QuotaSummary
+        var refreshZcode: @Sendable () async throws -> QuotaSummary
 
         static let live = Dependencies(
             refreshClinePass: { apiKey in
@@ -35,8 +37,14 @@ final class CapacityDockProviderQuotaService {
             refreshGrok: {
                 try await GrokBuildSubscriptionService.refresh()
             },
+            refreshGrokBot: {
+                try await GrokBotSubscriptionService.refresh()
+            },
             refreshZai: { apiKey in
                 try await ZaiSubscriptionService.refresh(apiKey: apiKey)
+            },
+            refreshZcode: {
+                try await ZcodeSubscriptionService.refresh()
             }
         )
     }
@@ -70,6 +78,14 @@ final class CapacityDockProviderQuotaService {
             } catch {
                 throw CapacityDockProviderFetchFailure(error: error)
             }
+        case "grokbot":
+            do {
+                return try await dependencies.refreshGrokBot()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw CapacityDockProviderFetchFailure(error: error)
+            }
         case "clinepass":
             guard let apiKey = credential.sanitizedOverride.apiKey else {
                 throw CapacityDockProviderFetchFailure(
@@ -87,6 +103,14 @@ final class CapacityDockProviderQuotaService {
         case "zai":
             do {
                 return try await dependencies.refreshZai(credential.sanitizedOverride.apiKey)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw CapacityDockProviderFetchFailure(error: error)
+            }
+        case "zcode":
+            do {
+                return try await dependencies.refreshZcode()
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -153,7 +177,23 @@ struct CapacityDockProviderFetchFailure: LocalizedError, Equatable, Sendable {
                 return .transient
             }
         }
+        if let error = error as? GrokBotSubscriptionService.FetchError {
+            switch error.classification {
+            case .terminalAuth:
+                return .terminal
+            case .transient, .parseFailure:
+                return .transient
+            }
+        }
         if let error = error as? ZaiSubscriptionService.FetchError {
+            switch error.classification {
+            case .terminalAuth:
+                return .terminal
+            case .transient, .parseFailure:
+                return .transient
+            }
+        }
+        if let error = error as? ZcodeSubscriptionService.FetchError {
             switch error.classification {
             case .terminalAuth:
                 return .terminal

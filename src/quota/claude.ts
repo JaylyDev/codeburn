@@ -8,12 +8,11 @@ import type { QuotaProvider, QuotaWindow } from './types.js'
 const ENDPOINT = 'https://api.anthropic.com/api/oauth/usage'
 const KEYCHAIN_SERVICE = 'Claude Code-credentials'
 
-type ClaudeCredential = { accessToken: string; expiresAt?: number; rateLimitTier?: string }
+type ClaudeCredential = { accessToken: string; expiresAt?: number; rateLimitTier?: string; subscriptionType?: string }
 export type ClaudeDeps = {
   fetch: typeof fetch
   credentialPath: string
   readFile: typeof readSecureFile
-  now: () => number
   keychain?: () => Promise<KeychainOutcome>
 }
 
@@ -21,7 +20,6 @@ const defaults: ClaudeDeps = {
   fetch: globalThis.fetch,
   credentialPath: path.join(os.homedir(), '.claude', '.credentials.json'),
   readFile: readSecureFile,
-  now: Date.now,
 }
 
 function empty(connection: QuotaProvider['connection']): QuotaProvider {
@@ -36,6 +34,7 @@ function parseCredential(raw: string): ClaudeCredential | null {
     accessToken: oauth.accessToken,
     expiresAt: typeof oauth.expiresAt === 'number' ? oauth.expiresAt : undefined,
     rateLimitTier: typeof oauth.rateLimitTier === 'string' ? oauth.rateLimitTier : undefined,
+    subscriptionType: typeof oauth.subscriptionType === 'string' ? oauth.subscriptionType : undefined,
   }
 }
 
@@ -62,13 +61,23 @@ function windowOf(label: string, value: unknown): QuotaWindow | null {
   return { label, percent, resetsAt }
 }
 
-function tierLabel(raw: string | undefined): string {
-  const value = raw?.toLowerCase() ?? ''
-  if (value.includes('max_20x') || value.includes('max20x') || value.includes('max-20x')) return 'Max 20x'
-  if (value.includes('max_5x') || value.includes('max5x') || value.includes('max-5x') || value.includes('max')) return 'Max 5x'
-  if (value.includes('pro')) return 'Pro'
-  if (value.includes('team')) return 'Team'
-  if (value.includes('enterprise')) return 'Enterprise'
+export function planLabel(credential: Pick<ClaudeCredential, 'subscriptionType' | 'rateLimitTier'>): string {
+  const subscriptionType = credential.subscriptionType?.toLowerCase() ?? ''
+  const tier = credential.rateLimitTier?.toLowerCase() ?? ''
+  const hasMax20 = tier.includes('max_20x') || tier.includes('max20x') || tier.includes('max-20x')
+  const hasMax = tier.includes('max')
+  if (subscriptionType === 'team' || (subscriptionType === '' && tier.includes('team'))) {
+    return hasMax ? 'Team Premium' : 'Team'
+  }
+  if (subscriptionType === 'enterprise' || (subscriptionType === '' && tier.includes('enterprise'))) {
+    return hasMax ? 'Enterprise Premium' : 'Enterprise'
+  }
+  if (subscriptionType === 'max' || hasMax) {
+    return hasMax20 ? 'Max 20x' : 'Max 5x'
+  }
+  if (subscriptionType === 'pro' || tier.includes('pro')) {
+    return 'Pro'
+  }
   return 'Subscription'
 }
 
@@ -94,7 +103,7 @@ export function decodeClaudeUsage(body: unknown, credential: ClaudeCredential): 
   return {
     provider: 'claude', connection: 'connected', primary: weekly,
     details: [five, weekly, opus, sonnet].filter((row): row is QuotaWindow => row !== null).concat(scoped),
-    planLabel: tierLabel(credential.rateLimitTier), footerLines: [],
+    planLabel: planLabel(credential), footerLines: [],
   }
 }
 
@@ -123,13 +132,7 @@ export async function fetchClaudeQuota(options: Partial<ClaudeDeps> & { signal?:
     }
     if (!credential) return { quota: empty('disconnected') }
 
-    let response: Response
-    if (credential.expiresAt !== undefined && credential.expiresAt - deps.now() <= 5 * 60_000) {
-      const reread = await credentialFromFile(deps)
-      if (!reread || reread.accessToken === credential.accessToken) return { quota: empty('transientFailure') }
-      credential = reread
-    }
-    response = await request(credential.accessToken, deps, options.signal)
+    let response = await request(credential.accessToken, deps, options.signal)
     if (response.status === 401) {
       const reread = await credentialFromFile(deps)
       if (!reread || reread.accessToken === credential.accessToken) return { quota: empty('transientFailure') }

@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
-import userEvent from '@testing-library/user-event'
 
 // The section reads the preload bridge at module load, so it is mocked rather than
 // assigned onto window after the fact. isWindowsPlatform reads window.codeburn.platform.
@@ -12,6 +11,7 @@ const bridge = vi.hoisted(() => ({
   pluginRemove: vi.fn(),
   pluginVerify: vi.fn(),
   syncAutoStatus: vi.fn(),
+  companionStatus: vi.fn(),
 }))
 vi.mock('../lib/ipc', () => ({ codeburn: bridge, normalizeCliError: (err: unknown) => err }))
 
@@ -154,47 +154,50 @@ describe('PluginsSection', () => {
 })
 
 describe('PluginsSection empty state', () => {
-  it('shows the coming-soon card and opens the install flow from the link', async () => {
+  it('shows the Teams card and nothing else to press', async () => {
     setPlatform('darwin')
     bridge.pluginList.mockResolvedValue([])
 
-    const user = userEvent.setup()
     render(<PluginsSection />)
 
     await waitFor(() => expect(bridge.pluginList).toHaveBeenCalled())
-    expect(screen.getByRole('heading', { name: 'Coming soon' })).toBeInTheDocument()
+    expect(screen.getByText('Teams')).toBeInTheDocument()
+    expect(screen.getByText('Coming soon')).toBeInTheDocument()
     expect(screen.queryByText('No plugins installed')).toBeNull()
     expect(screen.queryByText('Refresh')).toBeNull()
-
-    await user.click(screen.getByRole('button', { name: 'Install it' }))
-    expect(await screen.findByText('Install Plugin')).toBeInTheDocument()
+    // The manual plugin-file line is gone; the flow itself still opens from Install plugin.
+    expect(screen.queryByRole('button', { name: 'Install it' })).toBeNull()
   })
 })
 
 describe('PluginsSection on Windows', () => {
-  // The plugin runtime has not shipped for Windows, so the CLI never answers and the page
-  // used to sit on "Loading plugins..." for good.
-  it('renders the coming-soon panel and never asks the CLI for anything', async () => {
+  // The companion (tray app plus Capacity Dock) is configured from a card here, the same place
+  // macOS configures its menubar. The CLI plugin runtime has not shipped for Windows, so the
+  // list is still never fetched: no CLI call, no spinner, no timer.
+  it('shows the companion card and never asks the CLI for the plugin list', async () => {
     setPlatform('win32')
+    bridge.companionStatus.mockResolvedValue({
+      supported: true, menuBar: true, sidebar: true, store: false,
+      canInstall: true, installed: true, running: true, version: '0.9.24', outdated: false,
+    })
 
     render(<PluginsSection />)
 
-    expect(screen.getByText(/Plugins are coming to Windows/)).toBeInTheDocument()
+    expect(await screen.findByText('Menu bar')).toBeInTheDocument()
+    expect(screen.getByRole('switch', { name: 'Capacity Dock' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Plugins' })).toBeInTheDocument()
     expect(screen.queryByText(/Loading plugins/)).toBeNull()
-    // No CLI call, so no spinner to wait on and no timer to unwind.
     expect(bridge.pluginList).not.toHaveBeenCalled()
     await Promise.resolve()
     expect(bridge.pluginList).not.toHaveBeenCalled()
   })
 
-  it('still loads on every other platform', async () => {
+  it('still loads the plugin list on every other platform', async () => {
     setPlatform('darwin')
     bridge.pluginList.mockResolvedValue([])
 
     render(<PluginsSection />)
 
     await waitFor(() => expect(bridge.pluginList).toHaveBeenCalled())
-    expect(screen.queryByText(/Plugins are coming to Windows/)).toBeNull()
   })
 })

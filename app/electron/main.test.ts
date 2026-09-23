@@ -36,6 +36,8 @@ function fakeSpawn(result: unknown = { current: { cost: 12.34 } }) {
 // must spawn. cliStatus is the one channel that resolves without spawning.
 const CHANNELS = [
   'codeburn:getOverview',
+  'codeburn:getOptimizeSnapshot',
+  'codeburn:powerStatus',
   'codeburn:getTimeline',
   'codeburn:getQuota',
   'codeburn:getPlans',
@@ -64,6 +66,8 @@ const CHANNELS = [
   'codeburn:getProjectFilter',
   'codeburn:setProjectFilter',
   'codeburn:getUnfilteredProjects',
+  'codeburn:getLanguage',
+  'codeburn:setLanguage',
   'codeburn:setCurrency',
   'codeburn:resetCurrency',
   'codeburn:addAlias',
@@ -81,12 +85,22 @@ const CHANNELS = [
   'codeburn:telemetryTrack',
   'codeburn:getUpdateStatus',
   'codeburn:companionStatus',
-  'codeburn:setMenuBarEnabled',
-  'codeburn:setSidebarEnabled',
+  'codeburn:companionInstall',
+  'codeburn:companionOpen',
+  'codeburn:companionQuit',
+  'codeburn:companionUninstall',
+  'codeburn:companionSetDock',
   'codeburn:trayPrefs',
   'codeburn:setTrayAppPref',
   'codeburn:setTrayDockPref',
   'codeburn:setLaunchAtLogin',
+  'codeburn:macMenubarStatus',
+  'codeburn:macMenubarInstall',
+  'codeburn:macMenubarOpen',
+  'codeburn:macMenubarSetDock',
+  'codeburn:macMenubarQuit',
+  'codeburn:macMenubarSettings',
+  'codeburn:macMenubarUninstall',
   'codeburn:pluginList',
   'codeburn:pluginInfo',
   'codeburn:pluginAdd',
@@ -98,12 +112,12 @@ const CHANNELS = [
 ] as const
 
 const ARGV_CASES: Array<{ channel: string; args: unknown[]; argv: string[] }> = [
-  { channel: 'codeburn:getOverview', args: ['30days', 'claude'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--provider', 'claude'] },
-  { channel: 'codeburn:getOverview', args: ['30days', 'all'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline'] },
+  { channel: 'codeburn:getOverview', args: ['30days', 'claude'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--no-optimize', '--provider', 'claude'] },
+  { channel: 'codeburn:getOverview', args: ['30days', 'all'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--no-optimize'] },
   { channel: 'codeburn:getPlans', args: ['week'], argv: ['status', '--format', 'json', '--period', 'week'] },
   { channel: 'codeburn:getActReport', args: [], argv: ['act', 'report', '--json'] },
-  { channel: 'codeburn:getModels', args: ['week', 'claude', true], argv: ['models', '--format', 'json', '--period', 'week', '--provider', 'claude', '--by-task'] },
-  { channel: 'codeburn:getModels', args: ['week', 'all', false], argv: ['models', '--format', 'json', '--period', 'week'] },
+  { channel: 'codeburn:getModels', args: ['week', 'claude', true], argv: ['models', '--format', 'json', '--period', 'week', '--min-cost', '0', '--provider', 'claude', '--by-task'] },
+  { channel: 'codeburn:getModels', args: ['week', 'all', false], argv: ['models', '--format', 'json', '--period', 'week', '--min-cost', '0'] },
   { channel: 'codeburn:getSessions', args: ['week', 'all'], argv: ['sessions', '--format', 'json', '--period', 'week'] },
   { channel: 'codeburn:getSessions', args: ['30days', 'claude', { from: '2026-07-01', to: '2026-07-11' }], argv: ['sessions', '--format', 'json', '--period', '30days', '--provider', 'claude', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getSessionsContributions', args: ['week', 'all'], argv: ['sessions', '--format', 'json', '--contributions', '--period', 'week'] },
@@ -123,16 +137,16 @@ const ARGV_CASES: Array<{ channel: string; args: unknown[]; argv: string[] }> = 
   { channel: 'codeburn:getYield', args: ['today', 'claude'], argv: ['yield', '--format', 'json', '--period', 'today', '--provider', 'claude'] },
   { channel: 'codeburn:getSpendFlow', args: ['month', 'openai'], argv: ['spend', '--format', 'flow-json', '--period', 'month', '--provider', 'openai'] },
   { channel: 'codeburn:getOptimizeReport', args: ['month', 'openai'], argv: ['optimize', '--format', 'json', '--period', 'month', '--provider', 'openai'] },
-  { channel: 'codeburn:getOverview', args: ['30days', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--from', '2026-07-01', '--to', '2026-07-11'] },
-  { channel: 'codeburn:getOverview', args: ['30days', 'all', undefined, 'claude-config:91dda17e8cf35193'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--claude-config-source', 'claude-config:91dda17e8cf35193'] },
-  { channel: 'codeburn:getOverview', args: ['month', 'claude', { from: '2026-07-01', to: '2026-07-11' }, 'claude-desktop:980e1e488a654830'], argv: ['status', '--format', 'menubar-json', '--period', 'month', '--no-timeline', '--provider', 'claude', '--from', '2026-07-01', '--to', '2026-07-11', '--claude-config-source', 'claude-desktop:980e1e488a654830'] },
+  { channel: 'codeburn:getOverview', args: ['30days', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--no-optimize', '--from', '2026-07-01', '--to', '2026-07-11'] },
+  { channel: 'codeburn:getOverview', args: ['30days', 'all', undefined, 'claude-config:91dda17e8cf35193'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--no-optimize', '--claude-config-source', 'claude-config:91dda17e8cf35193'] },
+  { channel: 'codeburn:getOverview', args: ['month', 'claude', { from: '2026-07-01', to: '2026-07-11' }, 'claude-desktop:980e1e488a654830'], argv: ['status', '--format', 'menubar-json', '--period', 'month', '--no-timeline', '--no-optimize', '--provider', 'claude', '--from', '2026-07-01', '--to', '2026-07-11', '--claude-config-source', 'claude-desktop:980e1e488a654830'] },
   // Combined scope emits --scope combined; an explicit local scope is identical
   // to the default (no flag). The CLI rejects --scope with --provider, so a
   // provider passed alongside combined is dropped (the renderer forces 'all').
-  { channel: 'codeburn:getOverview', args: ['30days', 'all', undefined, undefined, undefined, 'combined'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--scope', 'combined'] },
-  { channel: 'codeburn:getOverview', args: ['30days', 'claude', undefined, undefined, undefined, 'combined'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--scope', 'combined'] },
-  { channel: 'codeburn:getOverview', args: ['30days', 'claude', undefined, undefined, undefined, 'local'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--provider', 'claude'] },
-  { channel: 'codeburn:getModels', args: ['week', 'claude', true, { from: '2026-07-01', to: '2026-07-11' }], argv: ['models', '--format', 'json', '--period', 'week', '--provider', 'claude', '--by-task', '--from', '2026-07-01', '--to', '2026-07-11'] },
+  { channel: 'codeburn:getOverview', args: ['30days', 'all', undefined, undefined, undefined, 'combined'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--no-optimize', '--scope', 'combined'] },
+  { channel: 'codeburn:getOverview', args: ['30days', 'claude', undefined, undefined, undefined, 'combined'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--no-optimize', '--scope', 'combined'] },
+  { channel: 'codeburn:getOverview', args: ['30days', 'claude', undefined, undefined, undefined, 'local'], argv: ['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--no-optimize', '--provider', 'claude'] },
+  { channel: 'codeburn:getModels', args: ['week', 'claude', true, { from: '2026-07-01', to: '2026-07-11' }], argv: ['models', '--format', 'json', '--period', 'week', '--min-cost', '0', '--provider', 'claude', '--by-task', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getYield', args: ['today', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['yield', '--format', 'json', '--period', 'today', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getSpendFlow', args: ['month', 'all', { from: '2026-07-01', to: '2026-07-11' }], argv: ['spend', '--format', 'flow-json', '--period', 'month', '--from', '2026-07-01', '--to', '2026-07-11'] },
   { channel: 'codeburn:getBranchSpend', args: ['month', 'openai'], argv: ['spend', '--format', 'branch-json', '--period', 'month', '--provider', 'openai'] },
@@ -223,7 +237,7 @@ describe('createBridgeHandlers (IPC wiring)', () => {
     const { spawnCli, spawnCliAction, calls } = fakeSpawn()
     const handlers = createBridgeHandlers(withQuota({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
     const res = await handlers['codeburn:getOverview']!('30days', 'all')
-    expect(calls[0]).toEqual(['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline'])
+    expect(calls[0]).toEqual(['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--no-optimize'])
     expect(res).toEqual({ ok: true, value: { current: { cost: 12.34 } } })
   })
 
@@ -231,7 +245,7 @@ describe('createBridgeHandlers (IPC wiring)', () => {
     const { spawnCli, spawnCliAction, calls } = fakeSpawn([])
     const handlers = createBridgeHandlers(withQuota({ spawnCli, spawnCliAction, resolveCodeburnPath: () => null }))
     await handlers['codeburn:getModels']!('week', 'claude', true)
-    expect(calls[0]).toEqual(['models', '--format', 'json', '--period', 'week', '--provider', 'claude', '--by-task'])
+    expect(calls[0]).toEqual(['models', '--format', 'json', '--period', 'week', '--min-cost', '0', '--provider', 'claude', '--by-task'])
   })
 
   it('returns an error envelope carrying the CliError kind', async () => {
@@ -901,7 +915,7 @@ describe('project filter', () => {
       const handlers = createBridgeHandlers(deps({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
       await handlers['codeburn:getOverview']!('30days', 'all', undefined, undefined, undefined, 'combined')
       // No --scope combined: the CLI rejects it next to --exclude.
-      expect(calls[0]).toEqual(['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--exclude=my-company'])
+      expect(calls[0]).toEqual(['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--no-optimize', '--exclude=my-company'])
     })
   })
 
@@ -911,7 +925,7 @@ describe('project filter', () => {
       const { spawnCli, spawnCliAction, calls } = fakeSpawn()
       const handlers = createBridgeHandlers(deps({ spawnCli, spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
       await handlers['codeburn:getOverview']!('30days', 'all', undefined, undefined, undefined, 'combined')
-      expect(calls[0]).toEqual(['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--scope', 'combined'])
+      expect(calls[0]).toEqual(['status', '--format', 'menubar-json', '--period', '30days', '--no-timeline', '--no-optimize', '--scope', 'combined'])
     })
   })
 
@@ -1102,15 +1116,28 @@ describe('project filter', () => {
       const handlers = createBridgeHandlers(deps({ spawnCli: vi.fn(), spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
       const res = await handlers['codeburn:exportData']!('csv', 'all', '/tmp/out')
       expect(res).toMatchObject({ ok: true, value: { ok: false, stderr: expect.stringMatching(/Nothing to export/) } })
+      expect((res as { value: { savedPath?: string } }).value.savedPath).toBeUndefined()
     })
   })
 
-  it('keeps an export that named a saved path successful', async () => {
+  it('keeps an export that named a saved path successful, and reports where it landed', async () => {
     await withFilterFile(async () => {
-      const spawnCliAction = vi.fn(async () => ({ ok: true, stdout: '\n  Exported (Today + 7 Days + 30 Days) to: /tmp/out\n', stderr: '', code: 0 }))
+      // CSV nests a dated folder inside the picked destination, so the toast
+      // must name the CLI's path, not the argument it was given.
+      const spawnCliAction = vi.fn(async () => ({ ok: true, stdout: '\n  Exported (Today + 7 Days + 30 Days) to: /tmp/out/codeburn-export-2026-09-19\n', stderr: '', code: 0 }))
       const handlers = createBridgeHandlers(deps({ spawnCli: vi.fn(), spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
       const res = await handlers['codeburn:exportData']!('csv', 'all', '/tmp/out')
-      expect(res).toMatchObject({ ok: true, value: { ok: true } })
+      expect(res).toMatchObject({ ok: true, value: { ok: true, savedPath: '/tmp/out/codeburn-export-2026-09-19' } })
+    })
+  })
+
+  it('reports the JSON export path the CLI chose, extension and all', async () => {
+    await withFilterFile(async () => {
+      // JSON lands inside the picked folder too, as a dated file.
+      const spawnCliAction = vi.fn(async () => ({ ok: true, stdout: '\n  Exported (Today + 7 Days + 30 Days) to: /tmp/out/codeburn-export-2026-09-19.json\n', stderr: '', code: 0 }))
+      const handlers = createBridgeHandlers(deps({ spawnCli: vi.fn(), spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
+      const res = await handlers['codeburn:exportData']!('json', 'all', '/tmp/out')
+      expect(res).toMatchObject({ ok: true, value: { ok: true, savedPath: '/tmp/out/codeburn-export-2026-09-19.json' } })
     })
   })
 

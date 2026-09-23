@@ -43,6 +43,10 @@ import {
  *  ever reaches msiexec. The source of truth is src/menubar-installer.ts, which rejects the
  *  variable this flag replaced. */
 export const STAGED_MSI_FLAG = '--staged-msi'
+/** Removes the installed tray app: the CLI reads the product code from its own install marker
+ *  (or the uninstall registry) and runs `msiexec /x`. Lifted out of the desktop NSIS
+ *  uninstaller so the Plugins card can offer a discrete Uninstall, the way macOS does. */
+export const UNINSTALL_FLAG = '--uninstall'
 /** One machine-readable line the same installer prints, so this side need not read its prose. */
 export const BUNDLED_RESULT_PREFIX = 'CODEBURN_MENUBAR_RESULT '
 /** The one line the installer prints for msiexec exit 3010, which its machine-readable result
@@ -74,7 +78,7 @@ const QUIT_SETTLE_MS = 4_000
 
 /** Mirrors BundledInstallResult in src/menubar-installer.ts. */
 export type MenubarInstallResult = {
-  action: 'installed' | 'up-to-date' | 'kept-newer' | 'cancelled'
+  action: 'installed' | 'up-to-date' | 'kept-newer' | 'cancelled' | 'uninstalled'
   bundledVersion: string
   previousVersion: string | null
   exePath: string
@@ -475,6 +479,49 @@ export type CompanionStatus = {
    *  at the next restart. Nothing is started until then, so the switches say why rather than
    *  looking on with nothing running. Absent on a preload that predates it. */
   restartRequired?: boolean
+  // The fields below mirror MacMenubarStatus so the Plugins card can render one companion card
+  // per platform. All reflect on-disk truth, never intent.
+  /** False on the Store route (install and removal are the package's, not msiexec's). */
+  canInstall: boolean
+  /** A tray app is on the machine (NSIS: the recorded exe is on disk; Store: the packaged exe). */
+  installed: boolean
+  /** The tray process is up right now. */
+  running: boolean
+  /** The installed tray app's version, or null when nothing is installed. */
+  version: string | null
+  /** A newer tray app is staged in this build than the one installed, so the card offers Update. */
+  outdated: boolean
+}
+
+/** The shape the discrete actions (install, quit, uninstall) return: the outcome plus the
+ *  status that followed, so the card renders what took rather than what was asked. Mirrors
+ *  MacMenubarInstall. `error` is null on success, else a short reason (the card falls back to a
+ *  localized message when it is null). */
+export type CompanionActionResult = { ok: boolean; error: string | null; status: CompanionStatus }
+
+/** True when `candidate` is a higher version than `installed`. Any unparseable component sorts
+ *  low, so a `dev` build never reads as newer than a real one. Lights the Update affordance
+ *  only; the CLI installer owns the real never-downgrade decision. */
+export function isNewerVersion(candidate: string | null, installed: string | null): boolean {
+  if (!candidate) return false
+  if (!installed) return true
+  // A missing component is 0 (so "1.2" == "1.2.0"); an unparseable one (a `dev` build) sorts
+  // below every real number, so a dev build never reads as newer than a release, and a real
+  // staged release does read as newer than a dev build already installed.
+  const norm = (part: string | undefined): number => {
+    if (part === undefined) return 0
+    const n = Number.parseInt(part, 10)
+    return Number.isNaN(n) ? -1 : n
+  }
+  const a = candidate.split('.')
+  const b = installed.split('.')
+  const len = Math.max(a.length, b.length)
+  for (let i = 0; i < len; i++) {
+    const x = norm(a[i])
+    const y = norm(b[i])
+    if (x !== y) return x > y
+  }
+  return false
 }
 
 export class MenubarCompanion {
@@ -589,13 +636,25 @@ export class MenubarCompanion {
     return this.deps.store ? findPackagedTrayExe(dir) !== null : findStagedMsi(dir) !== null
   }
 
-  status(): CompanionStatus {
+  async status(): Promise<CompanionStatus> {
+    const supported = this.supported()
+    const store = this.deps.store
+    const installedExe = store
+      ? findPackagedTrayExe(menubarResourcesDir(this.deps))
+      : (this.settings.trayExePath && this.exists(this.settings.trayExePath) ? this.settings.trayExePath : null)
+    const installed = supported && installedExe !== null
+    const staged = supported && !store ? findStagedMsi(menubarResourcesDir(this.deps)) : null
     return {
-      supported: this.supported(),
+      supported,
       menuBar: this.settings.menuBar,
       sidebar: this.settings.sidebar,
-      store: this.deps.store,
+      store,
       restartRequired: this.restartRequired,
+      canInstall: supported && !store,
+      installed,
+      running: installed ? await this.isRunning() : false,
+      version: installed ? this.settings.trayExeVersion : null,
+      outdated: installed && !store ? isNewerVersion(staged?.version ?? null, this.settings.trayExeVersion) : false,
     }
   }
 
@@ -718,14 +777,15 @@ export class MenubarCompanion {
     if (stored && this.settings.trayExeVersion === staged.version && this.exists(stored)) return stored
     if (this.settings.installDeclinedVersion === staged.version) return stored
 
-    return this.install(staged)
+    return this.installStaged(staged)
   }
 
   /** The install itself belongs to the CLI: it owns the registry read, the checksum, the
    *  msiexec call and the never-downgrade rule, and this side only stages the file and
-   *  records what came back. */
-  private async install(staged: { path: string; version: string }): Promise<string | null> {
-    const result = await this.runCli(['menubar', STAGED_MSI_FLAG, staged.path], {
+   *  records what came back. `force` reinstalls over a matching version (the Reinstall path),
+   *  which the CLI would otherwise report as up to date. */
+  private async installStaged(staged: { path: string; version: string }, force = false): Promise<string | null> {
+    const result = await this.runCli(['menubar', STAGED_MSI_FLAG, staged.path, ...(force ? ['--force'] : [])], {
       timeoutMs: INSTALL_TIMEOUT_MS,
     })
     const parsed = parseInstallResult(result.stdout)
@@ -835,6 +895,105 @@ export class MenubarCompanion {
       this.launchTray(exePath)
     }
     return this.status()
+  }
+
+  // Discrete actions for the Plugins card ---------------------------------------------------
+  //
+  // These mirror the macOS card's install / open / quit / uninstall so both platforms configure
+  // the companion the same way. They are the on-demand counterparts of bootstrap: where the
+  // toggles couple install with launch-at-login and the dock, these do one thing each.
+
+  /**
+   * Install or reinstall the tray app now (the card's Install / Update / Reinstall button).
+   * Unlike bootstrap this always asks: the declined-version memory is cleared first, and an
+   * existing install is replaced with `--force` rather than reported as up to date. Turns Menu
+   * bar on and seeds launch-at-login, the way the switch going on does.
+   */
+  async install(): Promise<CompanionActionResult> {
+    if (!this.supported() || this.deps.store) return { ok: false, error: null, status: await this.status() }
+    const staged = findStagedMsi(menubarResourcesDir(this.deps))
+    if (!staged) return { ok: false, error: null, status: await this.status() }
+    this.save({ installDeclinedVersion: null })
+    const already = Boolean(this.settings.trayExePath && this.exists(this.settings.trayExePath))
+    const exePath = await this.installStaged(staged, already)
+    if (!exePath || !this.exists(exePath)) {
+      // A cancelled elevation prompt is the person's own decision, not a failure: installStaged
+      // records the declined version, and this leaves the card as it was (still offering Install)
+      // with no error banner, the way the sidebar switch used to treat a cancelled install.
+      const cancelled = this.settings.installDeclinedVersion === staged.version
+      return { ok: cancelled, error: null, status: await this.status() }
+    }
+    this.save({ menuBar: true, trayExePath: exePath })
+    await this.setRunKey(true)
+    await this.awaitQuit()
+    this.launchTray(exePath)
+    return { ok: true, error: null, status: await this.status() }
+  }
+
+  /**
+   * Bring the tray UI forward. The tray app has no main window; a launch with no arguments is
+   * its "show the popover" (windows/src-tauri/src/lib.rs), handed to the running instance by
+   * the single-instance plugin. Nothing to open while a restart is owed or nothing is on disk.
+   */
+  async open(): Promise<CompanionStatus> {
+    if (this.supported() && !this.restartRequired) {
+      const exePath = this.settings.trayExePath
+      if (exePath && this.exists(exePath)) this.launch(exePath, [], this.launchEnv())
+    }
+    return this.status()
+  }
+
+  /**
+   * Stop the tray process without uninstalling it or turning the switch off: the Menu bar
+   * setting and the Run value stay, so it comes back at the next login (and the card offers
+   * Open meanwhile). Distinct from `setMenuBarEnabled(false)`, which also drops the Run value
+   * and the dock.
+   */
+  async quit(): Promise<CompanionActionResult> {
+    if (!this.supported()) return { ok: false, error: null, status: await this.status() }
+    const exePath = this.settings.trayExePath
+    if (!exePath || !this.exists(exePath) || !(await this.isRunning())) {
+      return { ok: true, error: null, status: await this.status() }
+    }
+    this.launch(exePath, ['--quit'])
+    this.quitAskedAt = Date.now()
+    await this.awaitQuit()
+    const running = await this.isRunning()
+    return { ok: !running, error: null, status: await this.status() }
+  }
+
+  /**
+   * Remove the tray app from the machine: quit it, then hand the CLI `menubar --uninstall`,
+   * which reads the product code from the install marker (or the uninstall registry) and runs
+   * `msiexec /x`. Drops the Run value and clears the recorded path so the card returns to its
+   * uninstalled state. Store builds cannot uninstall from here (the package owns it).
+   */
+  async uninstall(): Promise<CompanionActionResult> {
+    if (!this.supported() || this.deps.store) return { ok: false, error: null, status: await this.status() }
+    const exePath = this.settings.trayExePath
+    if (exePath && this.exists(exePath) && await this.isRunning()) {
+      this.launch(exePath, ['--quit'])
+      this.quitAskedAt = Date.now()
+      await this.awaitQuit()
+    }
+    const result = await this.runCli(['menubar', UNINSTALL_FLAG], { timeoutMs: INSTALL_TIMEOUT_MS })
+    const parsed = parseInstallResult(result.stdout)
+    const ok = parsed ? parsed.action === 'uninstalled' : result.code === 0
+    // Only forget the tray app once it is actually gone. An uninstall that failed (msiexec
+    // errored, or the product code could not be read) leaves it installed on disk, so dropping
+    // the Run value and the recorded path would orphan a working tray app and wrongly show the
+    // card as uninstalled. The same rule installStaged follows for a failed install.
+    if (ok) {
+      await this.setRunKey(false)
+      this.save({ menuBar: false, sidebar: false, trayExePath: null, trayExeVersion: null, installDeclinedVersion: null })
+    }
+    return { ok, error: null, status: await this.status() }
+  }
+
+  /** The card's Capacity Dock toggle, named to match the macOS card; the same path as the
+   *  Sidebar switch, so the rail still cannot outlive the tray app. */
+  setDockEnabled(enabled: boolean): Promise<CompanionStatus> {
+    return this.setSidebarEnabled(enabled)
   }
 
   // The tray app's own settings ------------------------------------------------------------

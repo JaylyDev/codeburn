@@ -14,9 +14,12 @@ import { fetchCopilotQuota } from './copilot.js'
 import { fetchCursorQuota } from './cursor.js'
 import { fetchGeminiQuota } from './gemini.js'
 import { fetchGrokQuota } from './grok.js'
+import { fetchGrokbotQuota, grokbotInstalled } from './grokbot.js'
 import { fetchKimiQuota } from './kimi.js'
+import { KEYCHAIN_TIMEOUT_MS } from './security.js'
 import type { ProviderName, QuotaProvider } from './types.js'
 import { fetchZaiQuota } from './zai.js'
+import { fetchZcodeQuota } from './zcode.js'
 
 export type QuotaCommandWindow = { label: string; usedPct: number; resetsAt?: string }
 
@@ -47,11 +50,26 @@ const READERS: { id: ProviderName; name: string; read: ProviderReader }[] = [
   { id: 'kimi', name: 'Kimi', read: async signal => (await fetchKimiQuota({ signal })).quota },
   { id: 'cursor', name: 'Cursor', read: async signal => (await fetchCursorQuota({ signal })).quota },
   { id: 'zai', name: 'Z.ai', read: async signal => (await fetchZaiQuota({ signal })).quota },
+  { id: 'zcode', name: 'ZCode', read: async signal => (await fetchZcodeQuota({ signal })).quota },
   { id: 'grok', name: 'Grok', read: async signal => (await fetchGrokQuota({ signal })).quota },
+  { id: 'grokbot', name: 'Grok Bot', read: async signal => (await fetchGrokbotQuota({ signal })).quota },
   { id: 'clinepass', name: 'ClinePass', read: async signal => (await fetchClinePassQuota({ signal })).quota },
 ]
 
-const DEFAULT_TIMEOUT_MS = 5_000
+/** Grok Bot is an optional desktop app rather than a signed-in account. With
+ *  the app absent its reader would still answer — with the Cursor allowance of
+ *  whoever is signed into Cursor, under a Grok Bot label — so the row is left
+ *  out entirely. */
+export function availableReaders(installed: () => boolean = grokbotInstalled): typeof READERS {
+  return READERS.filter(entry => entry.id !== 'grokbot' || installed())
+}
+
+// Must cover the slowest documented per-reader allowance - Claude's keychain
+// fallback waits up to KEYCHAIN_TIMEOUT_MS for the macOS "Allow" dialog - or
+// this outer race aborts a reader that is still legitimately waiting and
+// misreports it as disconnected. Derived rather than a separate literal so
+// the two cannot drift apart; the margin covers the request itself.
+const DEFAULT_TIMEOUT_MS = KEYCHAIN_TIMEOUT_MS + 5_000
 
 function errorFor(quota: QuotaProvider): string | undefined {
   switch (quota.connection) {
@@ -77,6 +95,16 @@ function toWindows(quota: QuotaProvider): QuotaCommandWindow[] {
 
 export function toCommandProvider(id: ProviderName, name: string, quota: QuotaProvider): QuotaCommandProvider {
   const error = errorFor(quota)
+  // errorFor() only surfaces footerLines on a non-connected state; a connected
+  // read (e.g. Grok Bot's "this is the Cursor account's allowance" disclosure)
+  // still needs its first line said out loud so it isn't shown as fact-free.
+  const baseNotes = quota.notes ?? []
+  const footerNote =
+    quota.connection === 'connected' && quota.footerLines.length > 0 ? quota.footerLines[0] : undefined
+  const notes = [
+    ...baseNotes,
+    ...(footerNote && !baseNotes.includes(footerNote) ? [footerNote] : []),
+  ]
   return {
     id,
     name,
@@ -84,7 +112,7 @@ export function toCommandProvider(id: ProviderName, name: string, quota: QuotaPr
     ...(quota.planLabel ? { plan: quota.planLabel } : {}),
     windows: toWindows(quota),
     ...(error ? { error } : {}),
-    ...(quota.notes?.length ? { notes: quota.notes } : {}),
+    ...(notes.length ? { notes } : {}),
   }
 }
 
@@ -92,7 +120,7 @@ export async function collectQuota(options: {
   readers?: { id: ProviderName; name: string; read: ProviderReader }[]
   timeoutMs?: number
 } = {}): Promise<QuotaReport> {
-  const readers = options.readers ?? READERS
+  const readers = options.readers ?? availableReaders()
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const providers = await Promise.all(readers.map(async entry => {
     const controller = new AbortController()
@@ -108,6 +136,20 @@ export async function collectQuota(options: {
       clearTimeout(timer)
     }
   }))
+  // ZCode and Z.ai read the same endpoint and report the same plan numbers
+  // whenever both credentials belong to one z.ai account: showing both is a
+  // duplicate row. The deliberately configured Z.ai credential (Keychain,
+  // ZAI_API_KEY, Pi) wins and the ambient ZCode app login yields — but only
+  // while Z.ai is actually connected, so a rejected or stale Z.ai state never
+  // hides a working ZCode row.
+  const zaiRow = providers.find(row => row.id === 'zai')
+  if (zaiRow?.available) {
+    const zcodeIndex = providers.findIndex(row => row.id === 'zcode')
+    if (zcodeIndex !== -1 && providers[zcodeIndex].available) {
+      providers.splice(zcodeIndex, 1)
+      zaiRow.notes = [...(zaiRow.notes ?? []), 'A ZCode app login is also connected; it reads the same z.ai plan endpoint and is hidden as a duplicate.']
+    }
+  }
   return { providers }
 }
 

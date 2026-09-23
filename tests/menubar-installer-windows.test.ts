@@ -16,8 +16,10 @@ import {
   compareMenubarVersions,
   decideBundledInstall,
   decideWindowsMenubarSource,
+  extractMsiProductCode,
   findStoreMenubar,
   installMenubarApp,
+  uninstallMenubarApp,
   menubarMarkerPath,
   parseInstalledWindowsMenubar,
   parseWindowsMsiVersion,
@@ -1111,5 +1113,92 @@ describe('installMenubarApp with a store install', () => {
     expect(launched).toEqual([MSI_EXE])
     expect(result).toEqual({ installedPath: MSI_EXE, launched: true })
     expect(logs.some(line => line.includes('Microsoft Store'))).toBe(false)
+  })
+})
+
+describe('extractMsiProductCode', () => {
+  it('reads the product code out of an MSI uninstall string', () => {
+    const code = '{9c1e2f0a-0000-0000-0000-000000000001}'
+    expect(extractMsiProductCode(`MsiExec.exe /X${code}`)).toBe(code)
+    expect(extractMsiProductCode(`MsiExec.exe /I${code}`)).toBe(code)
+  })
+
+  it('is null for a missing or non-MSI string', () => {
+    expect(extractMsiProductCode(null)).toBeNull()
+    expect(extractMsiProductCode(undefined)).toBeNull()
+    expect(extractMsiProductCode('C:/some/uninstaller.exe /quiet')).toBeNull()
+  })
+})
+
+describe('uninstallMenubarApp on windows', () => {
+  const PRODUCT_CODE = '{9c1e2f0a-0000-0000-0000-000000000001}'
+  const INSTALLED_WITH_UNINSTALL = regBlock({
+    DisplayName: 'CodeBurn Menubar',
+    DisplayVersion: '0.9.24',
+    InstallLocation: 'C:\\Program Files\\CodeBurn Menubar\\',
+    UninstallString: `MsiExec.exe /X${PRODUCT_CODE}`,
+  })
+
+  let sandbox: string
+  let logs: string[]
+  let installerCalls: Array<{ exe: string; args: string[] }>
+
+  function env() {
+    return { SystemRoot: 'C:\\Windows', LOCALAPPDATA: join(sandbox, 'Local') }
+  }
+
+  function lastResult(): BundledInstallResult {
+    const line = logs.find(entry => entry.startsWith(BUNDLED_RESULT_PREFIX))
+    if (!line) throw new Error('no CODEBURN_MENUBAR_RESULT line was printed')
+    return JSON.parse(line.slice(BUNDLED_RESULT_PREFIX.length)) as BundledInstallResult
+  }
+
+  beforeEach(async () => {
+    sandbox = await mkdtemp(join(tmpdir(), 'menubar-uninstall-'))
+    logs = []
+    installerCalls = []
+  })
+
+  afterEach(async () => {
+    await rm(sandbox, { recursive: true, force: true })
+  })
+
+  it('runs msiexec /x with the product code from the registry and reports uninstalled', async () => {
+    await uninstallMenubarApp({
+      platform: 'win32',
+      windows: {
+        env: env(),
+        log: (message: string) => { logs.push(message) },
+        queryRegistry: async () => INSTALLED_WITH_UNINSTALL,
+        isTrayRunning: async () => false,
+        runInstaller: async (exe: string, args: string[]) => { installerCalls.push({ exe, args }); return 0 },
+      },
+    })
+
+    expect(installerCalls).toEqual([{
+      exe: resolveSystem32Path('msiexec.exe', env()),
+      args: ['/x', PRODUCT_CODE, '/passive', '/norestart'],
+    }])
+    expect(lastResult().action).toBe('uninstalled')
+  })
+
+  it('reports uninstalled and touches msiexec nowhere when nothing is installed', async () => {
+    await uninstallMenubarApp({
+      platform: 'win32',
+      windows: {
+        env: env(),
+        log: (message: string) => { logs.push(message) },
+        queryRegistry: async () => '',
+        isTrayRunning: async () => false,
+        runInstaller: async (exe: string, args: string[]) => { installerCalls.push({ exe, args }); return 0 },
+      },
+    })
+
+    expect(installerCalls).toEqual([])
+    expect(lastResult().action).toBe('uninstalled')
+  })
+
+  it('is a Windows-only option', async () => {
+    await expect(uninstallMenubarApp({ platform: 'darwin' })).rejects.toThrow(/Windows option/)
   })
 })

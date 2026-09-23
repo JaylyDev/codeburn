@@ -198,9 +198,36 @@ type Provider = {
 
 Both lists hit the same `getAllProviders()` aggregator. A failed lazy import is silent and excludes that provider from the run.
 
+### WSL roots (Windows)
+
+`src/wsl.ts` is inert off Windows: `wslHomes()` returns `[]` and nothing is spawned. On Windows it runs `%SystemRoot%\System32\wsl.exe --list --quiet --running` (3 s timeout, absolute path so nothing dropped next to the CLI can impersonate it), decodes its UTF-16LE output, keeps only lines shaped like a distro name (single token, no path-banned characters, no trailing period — which discards the "no installed distributions" prose wholesale), drops container-runtime distros, and enumerates `\\wsl$\<distro>\home\*` plus `\\wsl$\<distro>\root`. `\\wsl$\` is probed before `\\wsl.localhost\`: the older spelling works on every build, while probing `wsl.localhost` on a build that lacks it stalls through MUP, SMB and DNS. Results have a 60-second, mode-aware TTL; changing `running`, `all`, or `off` takes effect immediately, and an orphan reconciliation re-probes before deciding whether a missing source is offline or deleted.
+
+`claude` (via `getClaudeConfigDirs`) and `codex` (via `createCodexProvider`) append `<wslHome>/.claude` and `<wslHome>/.codex` to their root lists, so the existing multi-root discovery, `probeRoots()` and `codeburn doctor` cover them with no other changes. Roots are additive — they do not replace `CLAUDE_CONFIG_DIRS`/`CODEX_HOME`.
+
+Two knock-on rules:
+
+- **Running distros only** by default. Touching `\\wsl$\<distro>` boots a stopped distro, which is intrusive and slow. `CODEBURN_WSL=all` opts into every installed distro; `CODEBURN_WSL=off` disables both discovery and UNC access while retained historical cache rows remain reportable. It is a read policy, never part of a cache fingerprint (see `PROVIDER_ENV_VARS` in `src/session-cache.ts`).
+- **Fingerprints drop `dev`/`ino` for `\\wsl$` paths** (`fingerprintFile` in `src/session-cache.ts` and `src/codex-cache.ts`). The 9P share synthesizes them per mount, so keying on them would re-parse every WSL session on every run; mtime+size alone still detects both a modification and an append.
+- **Offline and deleted are reconciled separately.** A stopped distro drops its whole root out of discovery, so cached WSL rows remain reportable without statting the unavailable UNC share. When the owning home is still reachable, an undiscovered transcript is a real deletion and is evicted like a native source, including from Codex's separate raw-result cache. Claude rows carrying PR links retain the pre-existing historical-attribution exception. This also works when WSL was the provider's only source; the generic orphan pass still runs for cached WSL rows even with zero newly discovered files.
+
+Session `cwd` values recorded inside WSL are Linux paths (`/home/me/proj`) that name nothing on the Windows filesystem. `resolveCanonicalProjectPath` (`src/parser.ts`) already refuses to walk a path that is not absolute *on the current platform*, so those are attributed to the recorded `cwd` verbatim instead of being walked or canonicalized.
+
 `src/providers/vscode-cline-parser.ts` is a shared helper consumed by `cline`, `ibm-bob`, `kilo-code`, and `roo-code`. It is not registered as a provider on its own.
 
 For the per-provider data location, storage format, parser quirks, and test coverage, see `docs/providers/`.
+
+### Model rows and billing routes (`src/models.ts`)
+
+Every report keys a model row on `modelRowKey(model, route)`, never on the raw id and never on `getShortModelName` directly. The key is the model's short name plus, when the call was billed through a door other than the vendor's own API, the door's label: `Haiku 4.5`, `Haiku 4.5 (Bedrock)`, `Haiku 4.5 (Bedrock us)`, `north-mini-code:free (OpenRouter)`. One SKU through one door is one row; the same key is used by `parser.ts` (`modelBreakdown`), `day-aggregator.ts` (`day.models`, since daily cache v33), `usage-aggregator.ts`, `menubar-json.ts`, `model-breakdown.ts`, `models-report.ts` and every renderer, so the surfaces cannot disagree about what one row is. `models-report.ts` folds on the alias-resolved id plus that same row-key suffix, never on the route id, so two doors sharing one label land on one row instead of two the reader cannot tell apart. The key is idempotent: a pre-v33 daily row keyed by display name re-keys to itself. One surface is deliberately outside this: the desktop Trend timeline (`granular-history.ts`) still keys on the raw model id.
+
+A **route** is the door, and it has two sources feeding one `route` field on the call (`ParsedProviderCall` → `ParsedApiCall` → `CachedCall`):
+
+- the model id, when the door renames the model. `getModelRoute(id)` recognises Bedrock's `<vendor>.<model>[-vN:M]` with an optional cross-region profile prefix (`us.`, `eu.`, `global.`, …) for the vendors with coding sessions on disk (`anthropic`, `openai`). The profile is a dearer SKU and stays a distinct row (the `(Bedrock us)` variant).
+- the provider's own endpoint field, when it does not. `routeFromProviderField(value)` maps Hermes' `billing_provider` and OpenCode's `providerID`: `bedrock`, exact `amazon-bedrock`, and exact `openrouter` become registered routes; direct doors (`anthropic`, `openai`, …) map to nothing, because the unsuffixed row *is* the direct row. Only doors with usage-bearing sessions on disk are registered, the same rule the id shapes follow.
+
+A call can also carry an optional **billing mode**: `metered` for a provider-recorded actual charge or a registered metered route, and `subscription` only when the provider records that the usage was included. Absence stays unknown; neither provider name, model name, calculated cost, nor plan ownership fills it. `models`, `sessions`, `export`, and `audit` expose call-level `--route` and `--billing` filters. `--route direct` is the complement of registered routes and therefore includes unknown doors. Filtered work-unit grouping is rejected rather than inferring a missing root; durable `today`/`status` and payload filtering wait for a cache schema that preserves this dimension.
+
+Pricing never consults the route or billing mode. `getModelCosts` runs on the raw id, and LiteLLM already carries the routed rows, so selection and grouping never change what a call costs.
 
 ## macOS Menubar (`mac/`)
 

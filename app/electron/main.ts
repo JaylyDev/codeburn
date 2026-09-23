@@ -1,11 +1,13 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, powerMonitor, shell, type MenuItemConstructorOptions } from 'electron'
 import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { CliError, DESKTOP_COLD_TIMEOUT_MS, PROGRESS_LINE_PREFIX, reapOrphanServe, resolveCodeburnPath, shutdownAll, spawnCli, spawnCliAction, startServe, type ActionResult, type SpawnPriority } from './cli'
-import { MenubarCompanion, STARTUP_APPS_SETTINGS_URL, type CompanionStatus } from './menubar'
+import { CliError, DESKTOP_COLD_TIMEOUT_MS, PROGRESS_LINE_PREFIX, reapOrphanServe, resolveCodeburnPath, serveUsage, shutdownAll, spawnCli, spawnCliAction, startServe, type ActionResult, type SpawnPriority } from './cli'
+import { MenubarCompanion, readDockEnabled, STARTUP_APPS_SETTINGS_URL, type CompanionStatus } from './menubar'
+import { MacMenubar, NO_MAC_MENUBAR, type InstallPhase } from './mac-menubar'
+import { readOptimizeSnapshot, sameLocalDay, writeOptimizeSnapshot, type OptimizeBlock, type OptimizeSnapshot } from './optimize-store'
 import { getQuota, sanitizeError } from './quota'
 import { Telemetry } from './telemetry'
 import { createUpdateChecker, type UpdateChecker, type UpdateStatus } from './updates'
@@ -16,9 +18,15 @@ let telemetryInstance: Telemetry | null = null
 let updateChecker: UpdateChecker | null = null
 // The bundled tray app and its Capacity Dock (Windows only). Null under tests.
 let companion: MenubarCompanion | null = null
+let macMenubar: MacMenubar | null = null
 
-/** What the sidebar switches read on a platform that has no tray app to bundle. */
-export const NO_COMPANION: CompanionStatus = { supported: false, menuBar: false, sidebar: false, store: false }
+/** What the companion card reads on a platform that has no tray app to bundle. */
+export const NO_COMPANION: CompanionStatus = {
+  supported: false, menuBar: false, sidebar: false, store: false,
+  canInstall: false, installed: false, running: false, version: null, outdated: false,
+}
+/** The discrete-action fallback (install/quit/uninstall) where there is no companion. */
+export const NO_COMPANION_ACTION = { ok: false, error: null, status: NO_COMPANION }
 
 /** The slice of Telemetry the bridge handlers use — injectable for tests. */
 export type TelemetryBridge = Pick<Telemetry, 'status' | 'setEnabled' | 'completeOnboarding' | 'track'>
@@ -93,6 +101,8 @@ export type Envelope<T = unknown> = { ok: true; value: T } | { ok: false; error:
 const WARMUP_TIMEOUT_MS = DESKTOP_COLD_TIMEOUT_MS
 // IPC channel carrying cold-start scan-progress events to the splash.
 export const PROGRESS_CHANNEL = 'codeburn:progress'
+/** Named steps of a running menubar install, pushed while the card waits on one. */
+export const MAC_MENUBAR_PROGRESS_CHANNEL = 'codeburn:macMenubarProgress'
 // IPC channel pushing update-availability status to open windows (launch + 24h).
 export const UPDATE_CHANNEL = 'codeburn:update'
 
@@ -246,6 +256,62 @@ export function writeProjectFilter(value: unknown): ProjectFilter {
   }
   appFilterCache = null
   return filter
+}
+
+// The shared CLI config. The desktop writes only its `language` key; the CLI
+// reads the same field. Path is fixed (os.homedir), matching src/config.ts.
+function configPath(): string {
+  return path.join(os.homedir(), '.config', 'codeburn', 'config.json')
+}
+
+/** The desktop's six locales; absent/other = follow the system. */
+const APP_LOCALES = new Set(['en', 'fr', 'ja', 'ko', 'zh-CN', 'zh-TW'])
+
+export function readConfigLanguage(): string | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(configPath(), 'utf8')) as { language?: unknown }
+    return typeof parsed.language === 'string' && APP_LOCALES.has(parsed.language) ? parsed.language : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Persist config `language` (null clears it), preserving every other key. Staged
+ * and renamed like writeProjectFilter, so a torn write never corrupts the shared
+ * config. A missing file starts fresh; any other read error aborts rather than
+ * clobber a config that is merely unreadable this instant.
+ */
+export function writeConfigLanguage(language: string | null): void {
+  const target = configPath()
+  let config: Record<string, unknown> = {}
+  try {
+    config = JSON.parse(fs.readFileSync(target, 'utf8')) as Record<string, unknown>
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+  if (language === null) delete config.language
+  else config.language = language
+  fs.mkdirSync(path.dirname(target), { recursive: true })
+  const tmpPath = `${target}.${randomBytes(8).toString('hex')}.tmp`
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(config, null, 2) + '\n')
+    fs.renameSync(tmpPath, target)
+  } catch (error) {
+    fs.rmSync(tmpPath, { force: true })
+    throw error
+  }
+}
+
+/**
+ * The menu bar reads AppleLanguages and falls back to English for locales it
+ * lacks (it ships en + zh-Hans). Chinese maps to the script tags the .lproj
+ * uses; null (System) clears the override so the OS language decides.
+ */
+export function appleLanguageFor(language: string | null): string | null {
+  if (language === 'zh-CN') return 'zh-Hans'
+  if (language === 'zh-TW') return 'zh-Hant'
+  return language
 }
 
 // `--opt=value`, never `--opt value`: a pattern routinely starts with "-", and
@@ -412,8 +478,18 @@ type Deps = {
   /** The bundled tray app and Capacity Dock; absent off Windows and under tests. */
   companion?: Pick<
     MenubarCompanion,
-    'status' | 'setMenuBarEnabled' | 'setSidebarEnabled' | 'trayPrefs' | 'setTrayAppPref' | 'setTrayDockPref' | 'setLaunchAtLogin'
+    'status' | 'trayPrefs' | 'setTrayAppPref' | 'setTrayDockPref' | 'setLaunchAtLogin'
+    | 'install' | 'open' | 'quit' | 'uninstall' | 'setDockEnabled'
   > | null
+  /** The macOS menubar app, as the Plugins page sees it; absent off darwin and under tests. */
+  macMenubar?: Pick<MacMenubar, 'status' | 'install' | 'open' | 'setDockEnabled' | 'setLanguage' | 'quit' | 'uninstall' | 'settings'> | null
+  /** Where the daily optimize scan is cached (app userData). Absent = no cache. */
+  stateDir?: string
+  /** Stamped into a cached scan so a build whose finding shapes changed never
+   *  reads the previous build's cache. */
+  appVersion?: string
+  /** Electron's powerMonitor, for the on-battery live cadence. */
+  isOnBatteryPower?: () => boolean
 }
 
 type Handler = (...args: any[]) => Promise<Envelope>
@@ -430,9 +506,24 @@ type Handler = (...args: any[]) => Promise<Envelope>
  * cannot tell the two apart.
  */
 const EXPORT_SAVED_MARKER = 'Exported ('
+const EXPORT_PATH_SEPARATOR = ') to: '
 const EXPORT_NOTHING_WRITTEN = 'Nothing to export: no usage in the export window, or the project filter hides all of it.'
 
-export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, resolveCodeburnPath, getQuota, emitProgress: broadcastProgress, telemetry: telemetryInstance, getUpdateStatus: () => updateChecker ? updateChecker.getStatus() : Promise.resolve(NO_UPDATE_STATUS), companion: companion }): Record<string, Handler> {
+/** The path the CLI actually wrote, which is not the destination the user picked: inside
+ *  the chosen folder an export is a dated folder (CSV) or a dated file (JSON). */
+export function exportedPath(stdout: string): string | null {
+  for (const line of stdout.split('\n')) {
+    const marker = line.indexOf(EXPORT_SAVED_MARKER)
+    if (marker < 0) continue
+    const sep = line.indexOf(EXPORT_PATH_SEPARATOR, marker)
+    if (sep < 0) continue
+    const saved = line.slice(sep + EXPORT_PATH_SEPARATOR.length).trim()
+    if (saved) return saved
+  }
+  return null
+}
+
+export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, resolveCodeburnPath, getQuota, emitProgress: broadcastProgress, telemetry: telemetryInstance, getUpdateStatus: () => updateChecker ? updateChecker.getStatus() : Promise.resolve(NO_UPDATE_STATUS), companion: companion, macMenubar: macMenubar, stateDir: app.getPath('userData'), appVersion: app.getVersion(), isOnBatteryPower: () => powerMonitor.isOnBatteryPower() }): Record<string, Handler> {
   const emitProgress = deps.emitProgress ?? (() => {})
   const telemetry = deps.telemetry ?? null
   // Flips true after the first overview fetch succeeds. Until then, every
@@ -506,16 +597,70 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
   // A project filter cannot be dropped the same way: the hidden projects would
   // come back inside the combined total. The renderer already picks local while
   // a filter is set; this keeps a stale caller off the rejected argv.
-  const buildOverviewArgs = (period: string, provider: string, range?: DateRange, configSource?: string | null, scope?: string): string[] => {
+  //
+  // The optimize scan is OFF this argv (`--no-optimize`): it is the one part of
+  // the payload that reads mutable project files, so it defeats the snapshot
+  // fast path (src/main.ts `useSnapshot = !queryScope.optimize`) and costs a
+  // fresh ~0.2s scan on every poll. The three figures the UI takes from it come
+  // from the once-a-day cache below (`codeburn:getOptimizeSnapshot`), which
+  // runs this same argv WITHOUT the flag, so no displayed number changes value.
+  const buildOverviewArgs = (period: string, provider: string, range?: DateRange, configSource?: string | null, scope?: string, optimize = false): string[] => {
     const vScopeValue = vScope(scope)
     const filterArgs = projectArgs()
     const combined = vScopeValue === 'combined' && filterArgs.length === 0
     return [
       'status', '--format', 'menubar-json', '--period', vPeriod(period), '--no-timeline',
+      ...(optimize ? [] : ['--no-optimize']),
       ...(combined ? ['--scope', 'combined'] : providerArgs(vProvider(provider))),
       ...filterArgs,
       ...rangeArgs(vRange(range)), ...configSourceArgs(vConfigSource(configSource)),
     ]
+  }
+
+  // The optimize scan is a DAILY figure: recomputed when nothing is cached for
+  // this scope, when the cache is older than `maxAgeMs` (24h by default) OR was
+  // computed on an earlier local day, or when the renderer forces it (the
+  // Optimize page, manual refresh). Never on a poll tick. The cache key is the
+  // full argv, so a period/provider/project/config/scope change is a different
+  // entry and one scope's savings can never be served for another.
+  //
+  // The same-day rule is what makes the key honest: the key says
+  // `--period today` (or week/30days/month), which names a window anchored to
+  // the LOCAL day, not a fixed date. Without it a scan taken at 23:50 would be
+  // served at 00:10 as today's, and every rolling window would be a day stale.
+  const OPTIMIZE_MAX_AGE_MS = 24 * 60 * 60 * 1000
+  const getOptimizeSnapshot: Handler = async (period: string, provider: string, range?: DateRange, configSource?: string | null, scope?: string, maxAgeMs?: number) => {
+    const argv = buildOverviewArgs(period, provider, range, configSource, scope, true)
+    const key = argv.join(' ')
+    const appVersion = deps.appVersion ?? '0'
+    const maxAge = typeof maxAgeMs === 'number' && maxAgeMs >= 0 ? maxAgeMs : OPTIMIZE_MAX_AGE_MS
+    if (deps.stateDir) {
+      const cached = readOptimizeSnapshot(deps.stateDir, key, appVersion)
+      // An unparseable computedAt yields NaN, which fails both tests and
+      // recomputes — the safe direction.
+      const computedAt = cached ? Date.parse(cached.computedAt) : NaN
+      const now = Date.now()
+      if (cached && now - computedAt < maxAge && sameLocalDay(computedAt, now)) return { ok: true, value: cached }
+    }
+    try {
+      // Background priority, which only applies to the one-shot fallback path:
+      // a serve-routed command (this one is `status`) is dispatched before
+      // priority is read, and the resident child answers strictly FIFO. So this
+      // does NOT let a click overtake it — it only keeps it out of the way when
+      // serve is unavailable.
+      const payload = await deps.spawnCli(argv, { ...(readOpts() ?? {}), priority: 'background' })
+      const optimize = (payload as { optimize?: OptimizeBlock } | null)?.optimize
+      if (!optimize || !Array.isArray(optimize.topFindings)) {
+        return { ok: false, error: { kind: 'nonzero', message: 'No optimize findings in the payload.' } }
+      }
+      const snapshot: OptimizeSnapshot = { scope: key, computedAt: new Date().toISOString(), appVersion, optimize }
+      if (deps.stateDir) writeOptimizeSnapshot(deps.stateDir, snapshot)
+      return { ok: true, value: snapshot }
+    } catch (err) {
+      const error = coldError(err)
+      telemetry?.track('cli_error', cliErrorProps(err, 'status'))
+      return { ok: false, error }
+    }
   }
 
   // `background` (renderer prefetch only) drops this fetch to background priority
@@ -559,6 +704,11 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
       catch (error) { return { ok: false, error: { kind: 'nonzero', message: sanitizeError(error) } } }
     },
     'codeburn:getOverview': getOverview,
+    'codeburn:getOptimizeSnapshot': getOptimizeSnapshot,
+    'codeburn:powerStatus': async () => {
+      try { return { ok: true, value: deps.isOnBatteryPower ? deps.isOnBatteryPower() : false } }
+      catch { return { ok: true, value: false } }
+    },
     // Timeline variant for the Spend punchcard only: identical payload WITH
     // history.timeline (every other fetch keeps --no-timeline lean).
     'codeburn:getTimeline': run((period: string, provider: string, range?: DateRange) => [
@@ -571,7 +721,11 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     'codeburn:getPlans': run((period: string) => ['status', '--format', 'json', '--period', vPeriod(period)], 1),
     'codeburn:getActReport': run(() => ['act', 'report', '--json']),
     'codeburn:getModels': run((period: string, provider: string, byTask: boolean, range?: DateRange) => [
-      'models', '--format', 'json', '--period', vPeriod(period),
+      // The CLI defaults minCost to $0.01, which silently dropped every row
+      // below a cent — including ALL unpriced rows, so the dimming and
+      // add-alias affordances could never fire. Ask for the whole table;
+      // the renderer already distinguishes unpriced rows (#1465).
+      'models', '--format', 'json', '--period', vPeriod(period), '--min-cost', '0',
       ...providerArgs(vProvider(provider)),
       ...projectArgs(),
       ...(byTask ? ['--by-task'] : []),
@@ -695,6 +849,17 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     // out of "N projects hidden". `all` is capped at six months, so `lifetime`
     // is the only horizon that can answer for the whole filter.
     'codeburn:getUnfilteredProjects': run(() => ['report', '--format', 'json', '--period', 'lifetime']),
+    'codeburn:getLanguage': async () => ({ ok: true, value: readConfigLanguage() }),
+    'codeburn:setLanguage': async (language?: unknown) => {
+      try {
+        const lang = typeof language === 'string' && APP_LOCALES.has(language) ? language : null
+        writeConfigLanguage(lang)
+        if (deps.macMenubar) await deps.macMenubar.setLanguage(appleLanguageFor(lang))
+        return { ok: true, value: undefined }
+      } catch (err) {
+        return { ok: false, error: toEnvelopeError(err) }
+      }
+    },
     'codeburn:setCurrency': runAction((code: string) => ['currency', vCurrency(code)]),
     'codeburn:resetCurrency': runAction(() => ['currency', '--reset']),
     'codeburn:addAlias': runAction((from: string, to: string) => ['model-alias', vToken(from), vToken(to)]),
@@ -715,10 +880,11 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
           'export', '-f', vToken(format), '-o', vOutPath(outPath), '--provider', vProvider(provider),
           ...projectArgs(),
         ])
-        if (result.ok && !result.stdout.includes(EXPORT_SAVED_MARKER)) {
+        const savedPath = exportedPath(result.stdout)
+        if (result.ok && savedPath === null) {
           return { ok: true, value: { ...result, ok: false, stderr: EXPORT_NOTHING_WRITTEN } }
         }
-        return { ok: true, value: { ...result, stderr: sanitizeError(result.stderr) } }
+        return { ok: true, value: { ...result, stderr: sanitizeError(result.stderr), ...(savedPath ? { savedPath } : {}) } }
       } catch (err) {
         return { ok: false, error: toEnvelopeError(err) }
       }
@@ -742,11 +908,19 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     // The bundled tray app and its Capacity Dock (Windows). Every setter answers with the
     // whole status, so the sidebar renders the state that actually took rather than the one
     // it asked for: an install that was cancelled leaves the switch where it was.
-    'codeburn:companionStatus': async () => ({ ok: true, value: deps.companion ? deps.companion.status() : NO_COMPANION }),
-    'codeburn:setMenuBarEnabled': async (enabled?: boolean) =>
-      ({ ok: true, value: deps.companion ? await deps.companion.setMenuBarEnabled(Boolean(enabled)) : NO_COMPANION }),
-    'codeburn:setSidebarEnabled': async (enabled?: boolean) =>
-      ({ ok: true, value: deps.companion ? await deps.companion.setSidebarEnabled(Boolean(enabled)) : NO_COMPANION }),
+    'codeburn:companionStatus': async () => ({ ok: true, value: deps.companion ? await deps.companion.status() : NO_COMPANION }),
+    // The Plugins card's discrete actions, mirroring the macOS card: install/reinstall, show
+    // the tray UI, quit without uninstalling, and remove. Each answers with the whole status.
+    'codeburn:companionInstall': async () =>
+      ({ ok: true, value: deps.companion ? await deps.companion.install() : NO_COMPANION_ACTION }),
+    'codeburn:companionOpen': async () =>
+      ({ ok: true, value: deps.companion ? await deps.companion.open() : NO_COMPANION }),
+    'codeburn:companionQuit': async () =>
+      ({ ok: true, value: deps.companion ? await deps.companion.quit() : NO_COMPANION_ACTION }),
+    'codeburn:companionUninstall': async () =>
+      ({ ok: true, value: deps.companion ? await deps.companion.uninstall() : NO_COMPANION_ACTION }),
+    'codeburn:companionSetDock': async (enabled?: boolean) =>
+      ({ ok: true, value: deps.companion ? await deps.companion.setDockEnabled(Boolean(enabled)) : NO_COMPANION }),
     // The tray app's own settings, which live in the files it reads them from. Every setter
     // answers with the whole set, so the panes render what landed rather than what was sent.
     'codeburn:trayPrefs': async () => ({ ok: true, value: deps.companion ? await deps.companion.trayPrefs() : null }),
@@ -758,6 +932,21 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
       ({ ok: true, value: deps.companion ? await deps.companion.setTrayDockPref(patch) : null }),
     'codeburn:setLaunchAtLogin': async (enabled?: boolean) =>
       ({ ok: true, value: deps.companion ? await deps.companion.setLaunchAtLogin(Boolean(enabled)) : null }),
+    // The macOS menubar app's card on the Plugins page. Every call answers with the whole
+    // status for the same reason the Windows switches do: the card renders what is on disk,
+    // never what it asked for.
+    'codeburn:macMenubarStatus': async () => ({ ok: true, value: deps.macMenubar ? await deps.macMenubar.status() : NO_MAC_MENUBAR }),
+    'codeburn:macMenubarInstall': async () =>
+      ({ ok: true, value: deps.macMenubar ? await deps.macMenubar.install() : { ok: false, error: 'The menu bar app is macOS only.', status: NO_MAC_MENUBAR } }),
+    'codeburn:macMenubarOpen': async () => ({ ok: true, value: deps.macMenubar ? await deps.macMenubar.open() : NO_MAC_MENUBAR }),
+    'codeburn:macMenubarSetDock': async (enabled?: boolean) =>
+      ({ ok: true, value: deps.macMenubar ? await deps.macMenubar.setDockEnabled(Boolean(enabled)) : NO_MAC_MENUBAR }),
+    'codeburn:macMenubarSettings': async () =>
+      ({ ok: true, value: deps.macMenubar ? await deps.macMenubar.settings() : { ok: false, error: 'The menu bar app is macOS only.', status: NO_MAC_MENUBAR } }),
+    'codeburn:macMenubarQuit': async () =>
+      ({ ok: true, value: deps.macMenubar ? await deps.macMenubar.quit() : { ok: false, error: 'The menu bar app is macOS only.', status: NO_MAC_MENUBAR } }),
+    'codeburn:macMenubarUninstall': async () =>
+      ({ ok: true, value: deps.macMenubar ? await deps.macMenubar.uninstall() : { ok: false, error: 'The menu bar app is macOS only.', status: NO_MAC_MENUBAR } }),
     // Plugin management reads (all return parsed JSON)
     'codeburn:pluginList': run(() => ['plugin', 'list', '--json']),
     'codeburn:pluginInfo': run((name: string) => ['plugin', 'info', vToken(name), '--json']),
@@ -986,11 +1175,20 @@ function bootstrap(): void {
         country: app.getLocaleCountryCode() || null,
         isPackaged: app.isPackaged,
         appVersion: app.getVersion(),
+        getAppMetrics: () => app.getAppMetrics(),
+        getServeUsage: serveUsage,
       })
       // completeOnboarding tracks the first app_open itself; only already-
-      // onboarded installs record subsequent opens here.
-      if (telemetryInstance.status().onboarded) telemetryInstance.track('app_open', {})
-      setInterval(() => { void telemetryInstance?.flush() }, 5 * 60_000)
+      // onboarded installs record subsequent opens here. app_open carries the
+      // Capacity Dock state (on/off/none) so dock adoption is measurable.
+      if (telemetryInstance.status().onboarded) {
+        const dockPref = readDockEnabled()
+        telemetryInstance.track('app_open', { dock: dockPref === undefined ? 'none' : dockPref ? 'on' : 'off' })
+      }
+      setInterval(() => {
+        telemetryInstance?.sampleResources()
+        void telemetryInstance?.flush()
+      }, 5 * 60_000)
     } catch (err) {
       console.error('telemetry init failed (continuing without):', err)
     }
@@ -998,7 +1196,11 @@ function bootstrap(): void {
     // before the handlers so the sidebar's switches have something to read, and installed in
     // the background so a `/passive` msiexec run never holds the first window back.
     companion = new MenubarCompanion({
-      resourcesPath: app.isPackaged ? process.resourcesPath : null,
+      // Packaged: the real resources dir. Dev: null, unless CODEBURN_MENUBAR_RESOURCES points at
+      // a packaged-style layout (a `menubar` dir under it, with CodeBurn.exe beside it), so the
+      // tray install can be exercised without packaging. A dev convenience like CODEBURN_BIN and
+      // CODEBURN_DEV_REPO_ROOT; the CLI still validates the staged path in full (menubar-installer.ts).
+      resourcesPath: app.isPackaged ? process.resourcesPath : (process.env.CODEBURN_MENUBAR_RESOURCES ?? null),
       stateDir: app.getPath('userData'),
       // Electron sets this in an installed AppX package, which is the Store route.
       store: (process as NodeJS.Process & { windowsStore?: boolean }).windowsStore === true,
@@ -1006,8 +1208,37 @@ function bootstrap(): void {
       env: process.env,
     })
     void companion.bootstrap().catch(err => console.error('menubar bootstrap failed:', err))
+    // No bootstrap: nothing is installed, moved or launched until the card asks.
+    macMenubar = new MacMenubar({
+      platform: process.platform,
+      // Electron sets this only in a Mac App Store build, where downloading an executable is
+      // against the rules, so the card offers the website instead of an Install button.
+      mas: (process as NodeJS.Process & { mas?: boolean }).mas === true,
+      runCli: spawnCliAction,
+      // So the menubar this installs can find a codeburn without one on PATH: the launcher is
+      // written into userData and recorded where the menubar looks first.
+      execPath: process.execPath,
+      bundledCli: process.env.CODEBURN_BUNDLED_CLI,
+      stateDir: app.getPath('userData'),
+      onPhase: (phase: InstallPhase) => {
+        for (const win of BrowserWindow.getAllWindows()) win.webContents.send(MAC_MENUBAR_PROGRESS_CHANNEL, phase)
+      },
+    })
     registerHandlers()
+    // Power source, pushed to the renderer so the live cadence halves on
+    // battery and restores on AC.
+    const broadcastPower = () => {
+      const onBattery = powerMonitor.isOnBatteryPower()
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed()) win.webContents.send('codeburn:power', onBattery)
+      }
+    }
+    powerMonitor.on('on-battery', broadcastPower)
+    powerMonitor.on('on-ac', broadcastPower)
     installApplicationMenu()
+    // Seed the preload-readable app locale before any window loads. app.getLocale()
+    // needs the ready state, so this runs inside bootstrap's whenReady.
+    process.env.__CODEBURN_APP_LOCALE__ = app.getLocale()
     createWindow()
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow()

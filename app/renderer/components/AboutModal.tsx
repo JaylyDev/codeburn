@@ -1,10 +1,14 @@
-import { useEffect, useState, type MouseEvent, type ReactNode } from 'react'
+import { useState, type MouseEvent, type ReactNode } from 'react'
 
 import { version } from '../../package.json'
 import { FlameMark } from './FlameMark'
+import { Icon } from './icons'
 import { BUILD_STAMP } from '../lib/build'
+import { useEscape } from '../hooks/useEscape'
+import { t } from '../i18n'
 import { updateDownloadUrl, useUpdateStatus } from '../hooks/useUpdateStatus'
 import { codeburn } from '../lib/ipc'
+import { DUR, useExitAnimation } from '../lib/motion'
 
 export type SocialLink = {
   label: string
@@ -28,21 +32,15 @@ function openExternal(event: MouseEvent<HTMLAnchorElement>, url: string): void {
   void codeburn.openExternal(url)
 }
 
-export function AboutModal({ socials = SOCIALS, onClose }: { socials?: SocialLink[]; onClose: () => void }) {
+export function AboutModal({ socials = SOCIALS, openKey, onClose }: { socials?: SocialLink[]; openKey: string; onClose: () => void }) {
   const status = useUpdateStatus()
   const [checked, setChecked] = useState(false)
+  const { closing, beginExit } = useExitAnimation(onClose, DUR.base, openKey)
 
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
-    }
-
-    document.addEventListener('keydown', onKeyDown)
-    return () => document.removeEventListener('keydown', onKeyDown)
-  }, [onClose])
+  useEscape(true, beginExit)
 
   return (
-    <div className="about-modal-backdrop" onClick={onClose}>
+    <div className={closing ? 'about-modal-backdrop closing' : 'about-modal-backdrop'} onClick={beginExit}>
       <div
         className="about-modal"
         role="dialog"
@@ -50,18 +48,18 @@ export function AboutModal({ socials = SOCIALS, onClose }: { socials?: SocialLin
         aria-labelledby="about-modal-title"
         onClick={event => event.stopPropagation()}
       >
-        <button className="about-modal-close" type="button" aria-label="Close About" onClick={onClose}>×</button>
+        <button className="about-modal-close" type="button" aria-label={t('shared.aboutModal.closeAria')} onClick={beginExit}><Icon name="x" /></button>
         <div className="about-modal-grid">
           <div className="about-modal-hero">
             <span className="about-modal-logo" aria-hidden="true"><FlameMark size={52} /></span>
             <div className="about-modal-name" id="about-modal-title">CodeBurn</div>
             <div className="about-modal-version">v{version}</div>
             <div className="about-modal-build">{BUILD_STAMP}</div>
-            <div className="about-modal-tagline">Know where every token goes, across every AI coding tool.</div>
+            <div className="about-modal-tagline">{t('shared.aboutModal.tagline')}</div>
           </div>
           <div className="about-modal-side">
             <div className="about-modal-section">
-              <div className="about-modal-section-title">Links</div>
+              <div className="about-modal-section-title">{t('shared.aboutModal.linksTitle')}</div>
               {socials.map(social => (
                 <a
                   className="about-modal-link"
@@ -71,43 +69,43 @@ export function AboutModal({ socials = SOCIALS, onClose }: { socials?: SocialLin
                 >
                   {social.icon}
                   <span>{social.label}</span>
-                  <span className="about-modal-external" aria-hidden="true">↗</span>
+                  <Icon name="arrow-up-right" className="about-modal-external" />
                 </a>
               ))}
             </div>
             <div className="about-modal-section about-modal-updates">
-              <div className="about-modal-section-title">Updates</div>
+              <div className="about-modal-section-title">{t('shared.aboutModal.updatesTitle')}</div>
               <button
                 className="about-modal-update-button"
                 type="button"
                 onClick={() => setChecked(true)}
               >
-                Check for updates
+                {t('shared.aboutModal.checkForUpdates')}
               </button>
               {checked && (
                 <p className="about-modal-update-note" role="status">
                   {status?.updateAvailable && status.tag ? (
                     <>
-                      Update available: {status.latestVersion} ·{' '}
+                      {t('shared.aboutModal.updateAvailable', { version: status.latestVersion ?? '' })}{' '}
                       <button
                         type="button"
                         className="set-text-button"
                         onClick={() => { void codeburn.openExternal(updateDownloadUrl(status.tag!)) }}
                       >
-                        Download
+                        {t('shared.aboutModal.download')}
                       </button>
                     </>
                   ) : status?.latestVersion ? (
-                    "You're on the latest version"
+                    t('shared.aboutModal.upToDate')
                   ) : (
-                    'Unable to check right now'
+                    t('shared.aboutModal.unableToCheck')
                   )}
                 </p>
               )}
             </div>
           </div>
         </div>
-        <div className="about-modal-credit">Developed by Resham Joshi · github.com/iamtoruk</div>
+        <div className="about-modal-credit">{t('shared.aboutModal.developedBy')}</div>
       </div>
     </div>
   )

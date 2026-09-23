@@ -1,25 +1,27 @@
 import { isAbsolute } from 'path'
 import { Command, Option } from 'commander'
-import { installMenubarApp } from './menubar-installer.js'
+import { installMenubarApp, uninstallMenubarApp } from './menubar-installer.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
-import { findUnpricedModels, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, getFlatRateModelsConfigHash, getPricingGenerationKey } from './models.js'
+import { findUnpricedModels, modelRowKey, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, getFlatRateModelsConfigHash, getPricingGenerationKey } from './models.js'
 import { cachedProjectIdentitiesForRange } from './daily-cache.js'
 import { reportUnmatchedProjectPatterns } from './project-filter-warnings.js'
-import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint, isSessionHydrationComplete } from './parser.js'
+import { getVercelGatewayApiKey } from './providers/vercel-gateway.js'
+import { BILLING_FILTER_VALUES, ROUTE_FILTER_VALUES, filterProjectsByBillingRoute } from './billing-filter.js'
+import { AGGREGATE_ONLY_PROVIDER, aggregateOnlyCostUSD, excludesAggregateOnlyProviders, parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint, isSessionHydrationComplete } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
 import { getProvider } from './providers/index.js'
 import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { convertCost, formatCost } from './currency.js'
-import { renderStatusBar } from './format.js'
+import { excludedGatewayNote, formatTokens, renderStatusBar } from './format.js'
 import { toDateString } from './daily-cache.js'
 import { statusSnapshotSemanticKey } from './status-snapshot-semantic.js'
 import { dateKey } from './day-aggregator.js'
-import { sessionModelBillableOutputTokens, inferSessionProvider } from './session-output.js'
-import { isBehavioralCall } from './behavioral-weight.js'
+import { inferSessionProvider } from './session-output.js'
+import { behavioralCallWeight } from './behavioral-weight.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import type { AppliedFix } from './act/types.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
-import { buildPeriodData, buildMenubarPayloadForRange, buildDurablePeriod, getDailyCacheConfigHash, type DurablePeriod } from './usage-aggregator.js'
+import { buildPeriodData, buildMenubarPayloadForRange, buildDurablePeriod, getDailyCacheConfigHash, SERVE_HYDRATION_ENV, type DurablePeriod } from './usage-aggregator.js'
 import { aggregateProjectsIntoDays } from './day-aggregator.js'
 import { buildPeriodDiffReport, defaultSevenDayRanges, diffSessions, dayKeyToRange, historyBasis, localRangeInfo } from './period-diff.js'
 import { loadStatusSnapshot, saveStatusSnapshot } from './session-cache.js'
@@ -50,7 +52,7 @@ import {
   runAgyStatusLineHook,
   uninstallAntigravityStatusLineHook,
 } from './antigravity-statusline.js'
-import { clearPlan, readConfig, readPlan, readPlans, saveConfig, savePlan, getConfigFilePath, type CodeburnConfig, type Plan, type PlanId, type PlanProvider } from './config.js'
+import { clearPlan, readConfig, readPlan, readPlans, saveConfig, savePlan, getConfigFilePath, setIncludeGatewayInTotals, gatewayIncludedInTotals, type CodeburnConfig, type Plan, type PlanId, type PlanProvider } from './config.js'
 import { clampResetDay, copilotCreditsNote, getPlanUsageOrNull, getPlanUsages, type PlanUsage } from './plan-usage.js'
 import { getPresetPlan, isPlanId, isPlanProvider, PLAN_IDS, PLAN_PROVIDERS, planDisplayName } from './plans.js'
 import { createRequire } from 'node:module'
@@ -486,6 +488,24 @@ function assertScope(value: string, allowed: readonly string[], command: string)
   }
 }
 
+/** `--route`: a registered door plus `direct`, its complement. Undefined/absent is not validated (no filter). */
+function assertRoute(value: string | undefined, command: string): void {
+  if (value === undefined || (ROUTE_FILTER_VALUES as readonly string[]).includes(value)) return
+  process.stderr.write(
+    `codeburn ${command}: unknown route "${value}". Valid values: ${ROUTE_FILTER_VALUES.join(', ')}.\n`
+  )
+  process.exit(1)
+}
+
+/** `--billing`: exactly metered|subscription. Undefined/absent is not validated (no filter). */
+function assertBilling(value: string | undefined, command: string): void {
+  if (value === undefined || (BILLING_FILTER_VALUES as readonly string[]).includes(value)) return
+  process.stderr.write(
+    `codeburn ${command}: unknown billing mode "${value}". Valid values: ${BILLING_FILTER_VALUES.join(', ')}.\n`
+  )
+  process.exit(1)
+}
+
 // Wrapped in a factory because commander option state is sticky across
 // parses: `codeburn serve` executes many requests in one process and must
 // build a FRESH program per request or one request's --period would leak
@@ -526,11 +546,26 @@ program.hook('preAction', async (thisCommand) => {
   setFlatRateModels(config.flatRateModels ?? [])
   setFlatRateRemoved(config.flatRateModelsRemoved ?? [])
   setProxyPaths(config.proxyPaths ?? [])
+  setIncludeGatewayInTotals(config.includeGatewayInTotals === true)
   if (thisCommand.opts<{ verbose?: boolean }>().verbose) {
     process.env['CODEBURN_VERBOSE'] = '1'
   }
   await loadCurrency()
 })
+
+/// Every standalone report (`models`, `sessions`, `export`, `compare`,
+/// `compare-periods`, `spend`, `yield`, `audit`, `web`, `optimize`) leaves the
+/// aggregate-only gateway corpus out of its totals, the same rule the headline
+/// uses. Say so once, on stderr — beside the unmatched-`--project` warning that
+/// already lives at these call sites — so every stdout body (text, JSON, CSV)
+/// stays byte-identical to a run with no gateway credential. Gated on the
+/// credential: without one there is no gateway corpus and this costs nothing.
+async function reportExcludedGatewayCost(range: DateRange, provider?: string): Promise<void> {
+  if (!excludesAggregateOnlyProviders(provider) || !getVercelGatewayApiKey()) return
+  // Same memo entry the caller just filled, so this is a sum, not a re-parse.
+  const note = excludedGatewayNote(aggregateOnlyCostUSD(await parseAllSessions(range, provider, { includeAggregateOnly: true })))
+  if (note) process.stderr.write(`codeburn: ${note}\n`)
+}
 
 function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: string, durable: DurablePeriod) {
   const sessions = projects.flatMap(p => p.sessions)
@@ -547,6 +582,7 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
   // out-of-pocket figure. `cost` stays the full billable/would-be amount.
   const totalProxiedUSD = projects.reduce((s, p) => s + p.totalProxiedCostUSD, 0)
   const netCostUSD = totalCostUSD - totalProxiedUSD
+  const excludedGateway = durable.excludedGateway
   const totalCalls = durable.data.calls
   const totalSessions = durable.data.sessions
   const totalInput = durable.data.inputTokens
@@ -593,25 +629,24 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
 
   const modelMap: Record<string, { calls: number; cost: number; savings: number; estimatedCost: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; baselineModel: string }> = {}
   const modelEfficiency = aggregateModelEfficiency(projects)
-  for (const sess of sessions) {
-    for (const [model, d] of Object.entries(sess.modelBreakdown)) {
-      if (!modelMap[model]) { modelMap[model] = { calls: 0, cost: 0, savings: 0, estimatedCost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, baselineModel: '' } }
-      modelMap[model].calls += d.calls
-      modelMap[model].cost += d.costUSD
-      modelMap[model].savings += d.savingsUSD
-      modelMap[model].estimatedCost += d.estimatedCostUSD ?? 0
-      modelMap[model].inputTokens += d.tokens.inputTokens
-      modelMap[model].cacheReadTokens += d.tokens.cacheReadInputTokens
-      modelMap[model].cacheWriteTokens += d.tokens.cacheCreationInputTokens
-    }
-    // Output must be billed per call while provider identity is still known.
-    // Join on the same key as parser modelBreakdown (getShortModelName), not raw call.model.
-    for (const [model, output] of Object.entries(sessionModelBillableOutputTokens(sess))) {
-      if (!modelMap[model]) {
-        modelMap[model] = { calls: 0, cost: 0, savings: 0, estimatedCost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, baselineModel: '' }
-      }
-      modelMap[model].outputTokens += output
-    }
+  // Same durable day set as the headline and `daily`, so the rows sum to it:
+  // days whose transcripts have expired keep their models, and the pre-v14 ones
+  // that never had any show up as "Unknown (carried)". Day and session rows are
+  // keyed alike (modelRowKey), so the efficiency join below still lands.
+  for (const m of durable.data.models) {
+    // Day rows key by the raw provider id on days written before v33; resolve
+    // to the display name the same way buildTopModels does, so ids that
+    // collapse to one model land in one row.
+    const name = modelRowKey(m.name)
+    const acc = modelMap[name] ??= { calls: 0, cost: 0, savings: 0, estimatedCost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, baselineModel: '' }
+    acc.calls += m.calls
+    acc.cost += m.cost
+    acc.savings += m.savingsUSD ?? 0
+    acc.estimatedCost += m.estimatedCostUSD ?? 0
+    acc.inputTokens += m.inputTokens ?? 0
+    acc.outputTokens += m.outputTokens ?? 0
+    acc.cacheReadTokens += m.cacheReadTokens ?? 0
+    acc.cacheWriteTokens += m.cacheWriteTokens ?? 0
   }
   // Pull the active baseline model name out of the savings config so the
   // report can show what the local calls were mapped against without
@@ -748,6 +783,23 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
       // paths configured, so existing consumers are unaffected.
       proxiedCost: convertCost(totalProxiedUSD),
       netCost: convertCost(netCostUSD),
+      // Vercel AI Gateway spend deliberately NOT in `cost`: its rows are daily
+      // aggregates the local tools routed through the gateway already report,
+      // so adding both double counts. Emitted only when something is actually
+      // excluded, so a report with no gateway credential is unchanged.
+      ...(excludedGateway.costUSD > 0 ? {
+        excludedGatewayCost: convertCost(excludedGateway.costUSD),
+        // The same amount as one labelled provider row, so a consumer can show
+        // it beside the counted providers without adding it to `cost` or
+        // looking for it in `projects[]` / `models[]` (which no longer hold it).
+        excludedProviders: [{
+          id: AGGREGATE_ONLY_PROVIDER,
+          cost: convertCost(excludedGateway.costUSD),
+          calls: excludedGateway.calls,
+          tokens: excludedGateway.tokens,
+          excludedFromTotal: true,
+        }],
+      } : {}),
       savings: convertCost(totalSavingsUSD),
       // Portion of `cost` priced from estimated tokens (issue #639). Display/
       // metadata only; never subtracted from `cost`. 0 when nothing is estimated.
@@ -1027,6 +1079,7 @@ program
         days: durable.days,
         carriedCostUSD: durable.carriedCostUSD,
         unattributedCostUSD: durable.unattributedCostUSD,
+        excludedGateway: durable.excludedGateway,
       },
     }))
   })
@@ -1086,6 +1139,7 @@ program
       const { range } = periodInfoFromQuery({ period: opts.period, from: opts.from, to: opts.to }, 'today')
       const parsed = await parseAllSessions(range, opts.provider)
       await reportUnmatchedProjectPatterns(parsed, opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(range))
+      await reportExcludedGatewayCost(range, opts.provider)
     }
     await runWebDashboard({
       period: opts.period,
@@ -1220,6 +1274,11 @@ program
         // fetch or a pricing-logic fix can keep serving old rendered costs
         // indefinitely against an unchanged session corpus.
         pricingGenerationKey: getPricingGenerationKey(),
+        // Not a pricing input, but it moves the headline: with it off the
+        // gateway's daily aggregates are held out of every total. A warm
+        // snapshot taken under the other setting would keep serving the wrong
+        // headline until something unrelated moved the corpus.
+        includeGatewayInTotals: gatewayIncludedInTotals(),
       })
       // Optimize findings (the default; see --no-optimize) depend on mutable
       // project/config/prompt/hook state: ~/.claude and project-level
@@ -1237,7 +1296,17 @@ program
       // optimize path never reads or writes the disk snapshot at all, it
       // always recomputes fresh. One-shot and serve-child behavior are
       // identical for both optimize values.
-      const useSnapshot = !queryScope.optimize
+      // Inside the resident `serve` child (SERVE_HYDRATION_ENV is set for the
+      // life of that process) the snapshot is pure downside: the process
+      // already holds the incremental parse state and an output memo, so the
+      // snapshot buys no work back — it only adds `loadStatusSnapshot`'s
+      // settle window, which hands back the deliberately deferred PRE-change
+      // payload. serve then memoizes that answer, and with the roots quiet
+      // again the memo stays "clean", replaying the stale payload until the
+      // next filesystem event or the 5-minute memo cap. One-shot invocations
+      // (a terminal run, the menubar's spawn fallback) keep the snapshot and
+      // its debounce exactly as before.
+      const useSnapshot = !queryScope.optimize && process.env[SERVE_HYDRATION_ENV] !== '1'
       const corpus = useSnapshot ? await computeCorpusFingerprint(pf) : null
       const snapshot = corpus ? await loadStatusSnapshot(corpus.hash, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY) : null
       const payload = (snapshot ?? await buildMenubarPayloadForRange(periodInfo, {
@@ -1308,8 +1377,8 @@ program
       // Savings DOLLARS keep every call, but these are request COUNTS: a
       // supplementary accounting call (copilot rollup / paired store row) can
       // carry configured model-savings too and must not count as a request.
-      const savingsCallsToday = todayProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 && isBehavioralCall(c) ? 1 : 0), 0), 0), 0), 0)
-      const savingsCallsMonth = monthProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 && isBehavioralCall(c) ? 1 : 0), 0), 0), 0), 0)
+      const savingsCallsToday = todayProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 ? behavioralCallWeight(c) : 0), 0), 0), 0), 0)
+      const savingsCallsMonth = monthProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 ? behavioralCallWeight(c) : 0), 0), 0), 0), 0)
       if (todayData.savingsUSD > 0 || monthData.savingsUSD > 0) {
         payload.localModelSavings = {
           today: payload.today.savings,
@@ -1375,11 +1444,15 @@ program
   .option('--from <date>', 'Start date (YYYY-MM-DD). Exports a single custom period when set')
   .option('--to <date>', 'End date (YYYY-MM-DD). Exports a single custom period when set')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, gemini, cursor, copilot)', 'all')
+  .option('--route <route>', `Filter by billing route (${ROUTE_FILTER_VALUES.join('|')}; direct includes unknown)`)
+  .option('--billing <mode>', `Filter by billing mode (${BILLING_FILTER_VALUES.join('|')})`)
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
   .action(async (opts) => {
     assertFormat(opts.format, ['csv', 'json'], 'export')
     assertProvider(opts.provider, 'export')
+    assertRoute(opts.route, 'export')
+    assertBilling(opts.billing, 'export')
     await loadPricing()
     const pf = opts.provider
     // Both callers below pass a whole-period parse, so the first one is the
@@ -1388,7 +1461,10 @@ program
     let widestParse: ProjectSummary[] | null = null
     const fp = (p: ProjectSummary[]) => {
       widestParse ??= p
-      return filterProjectsByName(p, opts.project, opts.exclude)
+      return filterProjectsByBillingRoute(
+        filterProjectsByName(p, opts.project, opts.exclude),
+        { route: opts.route, billing: opts.billing },
+      )
     }
     let customRange: DateRange | null = null
     try {
@@ -1403,10 +1479,12 @@ program
     if (customRange) {
       periods = [{ label: formatDateRangeLabel(opts.from, opts.to), projects: fp(await parseAllSessions(customRange, pf)) }]
       await reportUnmatchedProjectPatterns(widestParse ?? [], opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(customRange!))
+      await reportExcludedGatewayCost(customRange!, opts.provider)
       clearSessionCache()
     } else {
       const thirtyDayProjects = fp(await parseAllSessions(getDateRange('30days').range, pf))
       await reportUnmatchedProjectPatterns(widestParse ?? [], opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(getDateRange('30days').range))
+      await reportExcludedGatewayCost(getDateRange('30days').range, opts.provider)
       clearSessionCache()
       periods = [
         { label: 'Today', projects: filterProjectsByDateRange(thirtyDayProjects, getDateRange('today').range) },
@@ -1451,14 +1529,19 @@ program
   .description('Install and launch the menubar app on macOS and Windows (one command, no clone)')
   .option('--force', 'Reinstall even if a copy is already installed')
   .option('--staged-msi <path>', 'Windows: install the CodeBurn.Menubar .msi staged inside an installed CodeBurn desktop app, by absolute path')
-  .action(async (opts: { force?: boolean; stagedMsi?: string }) => {
+  .option('--uninstall', 'Windows: remove the installed CodeBurn Menubar (msiexec /x)')
+  .action(async (opts: { force?: boolean; stagedMsi?: string; uninstall?: boolean }) => {
     try {
+      if (opts.uninstall) {
+        await uninstallMenubarApp({ cliVersion: version })
+        return
+      }
       const result = await installMenubarApp({ force: opts.force, cliVersion: version, stagedMsi: opts.stagedMsi })
       // A cancelled Windows installer leaves nothing to point at.
       if (result.installedPath) console.log(`\n  Ready. ${result.installedPath}\n`)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      console.error(`\n  Menubar install failed: ${message}\n`)
+      console.error(`\n  Menubar ${opts.uninstall ? 'uninstall' : 'install'} failed: ${message}\n`)
       process.exit(1)
     }
   })
@@ -1872,6 +1955,34 @@ program
   })
 
 program
+  .command('gateway-totals [mode]')
+  .description('Include or exclude Vercel AI Gateway spend in headline totals. Gateway reports are daily per-model aggregates with no request identity, so the same spend is usually already counted by the local tools you pointed at the gateway (Claude Code, Codex, OpenCode, Cline/Roo/Kilo, Cursor). Excluded by default; the gateway is always shown as its own row either way. Modes: include, exclude.')
+  .option('--format <format>', 'Output format: text, json', 'text')
+  .action(async (mode?: string, opts?: { format?: string }) => {
+    const format = opts?.format ?? 'text'
+    assertFormat(format, ['text', 'json'], 'gateway-totals')
+    const config = await readConfig()
+    if (mode !== undefined) {
+      if (mode !== 'include' && mode !== 'exclude') {
+        console.error(`\n  Usage: codeburn gateway-totals [include|exclude] (got: ${mode})\n`)
+        process.exitCode = 1
+        return
+      }
+      config.includeGatewayInTotals = mode === 'include' ? true : undefined
+      await saveConfig(config)
+    }
+    const included = config.includeGatewayInTotals === true
+    if (format === 'json') {
+      console.log(JSON.stringify({ includeGatewayInTotals: included }, null, 2))
+      return
+    }
+    console.log(included
+      ? '\n  Vercel AI Gateway spend is INCLUDED in headline totals.\n  Its daily aggregates may duplicate spend your local tools already report.\n  Exclude it with: codeburn gateway-totals exclude'
+      : '\n  Vercel AI Gateway spend is EXCLUDED from headline totals (default).\n  It is still shown as its own provider row.\n  Include it with: codeburn gateway-totals include')
+    console.log(`  Config: ${getConfigFilePath()}\n`)
+  })
+
+program
   .command('plan [action] [id]')
   .description('Show or configure a subscription plan for overage tracking')
   .option('--format <format>', 'Output format: text or json', 'text')
@@ -2093,6 +2204,7 @@ program
     }
     const parsed = await parseAllSessions(range, opts.provider)
     await reportUnmatchedProjectPatterns(parsed, opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(range))
+    await reportExcludedGatewayCost(range, opts.provider)
     const projects = filterProjectsByName(parsed, opts.project, opts.exclude)
     if (opts.apply) {
       const { runOptimizeApply } = await import('./act/optimize-apply.js')
@@ -2273,6 +2385,7 @@ program
       const { aggregateModelStats, buildCohortComparison, buildCohortFacets, findModelStat, renderCohortJson, selectCohortProjects } = await import('./compare-cohorts.js')
       const parsed = await parseAllSessions(range, opts.provider)
       await reportUnmatchedProjectPatterns(parsed, opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(range))
+      await reportExcludedGatewayCost(range, opts.provider)
       const projects = selectCohortProjects(filterProjectsByName(parsed, opts.project, opts.exclude), opts.projectId)
 
       // Without --model-a/--model-b the cohort format answers the FACET query:
@@ -2309,6 +2422,7 @@ program
       const { aggregateModelStats, buildCompareJson, findModelStat, projectSessionIds, renderCompareJson, scanSelfCorrections } = await import('./compare-stats.js')
       const parsed = await parseAllSessions(range, opts.provider)
       await reportUnmatchedProjectPatterns(parsed, opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(range))
+      await reportExcludedGatewayCost(range, opts.provider)
       const projects = filterProjectsByName(parsed, opts.project, opts.exclude)
       const models = aggregateModelStats(projects)
 
@@ -2435,6 +2549,7 @@ program
       parseAllSessions(keyRangeB, opts.provider),
     ])
     await reportUnmatchedProjectPatterns([...parsedA, ...parsedB], opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(keyRangeB))
+    await reportExcludedGatewayCost(keyRangeB, opts.provider)
     const projectsA = filterProjectsByName(parsedA, opts.project, opts.exclude)
     const projectsB = filterProjectsByName(parsedB, opts.project, opts.exclude)
 
@@ -2447,7 +2562,9 @@ program
       try {
         const { ensureCacheHydrated } = await import('./daily-cache.js')
         const cache = await ensureCacheHydrated(
-          range => parseAllSessions(range, 'all'),
+          // Cache writer: seals whole days, gateway slice included (see
+          // parseAllSessions' includeAggregateOnly).
+          range => parseAllSessions(range, 'all', { includeAggregateOnly: true }),
           aggregateProjectsIntoDays,
           getDailyCacheConfigHash(),
           isSessionHydrationComplete,
@@ -2483,11 +2600,15 @@ program
   .option('--from <date>', 'Custom range start (YYYY-MM-DD)')
   .option('--to <date>', 'Custom range end (YYYY-MM-DD)')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, cursor)', 'all')
+  .option('--route <route>', `Filter by billing route (${ROUTE_FILTER_VALUES.join('|')}; direct includes unknown)`)
+  .option('--billing <mode>', `Filter by billing mode (${BILLING_FILTER_VALUES.join('|')})`)
   .option('--format <format>', 'Output format: table, json', 'table')
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
   .action(async (opts) => {
     assertProvider(opts.provider, 'audit')
+    assertRoute(opts.route, 'audit')
+    assertBilling(opts.billing, 'audit')
     const { aggregateAudit, renderAuditTable, renderAuditJson } = await import('./audit-report.js')
     await loadPricing()
 
@@ -2505,7 +2626,11 @@ program
 
     const parsed = await parseAllSessions(range, opts.provider)
     await reportUnmatchedProjectPatterns(parsed, opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(range))
-    const projects = filterProjectsByName(parsed, opts.project, opts.exclude)
+    await reportExcludedGatewayCost(range, opts.provider)
+    const projects = filterProjectsByBillingRoute(
+      filterProjectsByName(parsed, opts.project, opts.exclude),
+      { route: opts.route, billing: opts.billing },
+    )
     const rows = await aggregateAudit(projects)
 
     const fmt = (opts.format ?? 'table').toLowerCase()
@@ -2527,6 +2652,8 @@ program
   .option('--from <date>', 'Custom range start (YYYY-MM-DD)')
   .option('--to <date>', 'Custom range end (YYYY-MM-DD)')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, cursor)', 'all')
+  .option('--route <route>', `Filter by billing route (${ROUTE_FILTER_VALUES.join('|')}; direct includes unknown)`)
+  .option('--billing <mode>', `Filter by billing mode (${BILLING_FILTER_VALUES.join('|')})`)
   .option('--task <category>', 'Filter to one task type (e.g. feature, debugging, refactoring)')
   .option('--by-task', 'One row per (provider, model, task) instead of one row per (provider, model)')
   .option('--by-agent', 'One row per (provider, model, agent) instead of one row per (provider, model). Claude subagent transcripts only; other providers and main sessions bucket under "main"')
@@ -2539,6 +2666,8 @@ program
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
   .action(async (opts) => {
     assertProvider(opts.provider, 'models')
+    assertRoute(opts.route, 'models')
+    assertBilling(opts.billing, 'models')
     if (opts.byTask && opts.byAgent) {
       process.stderr.write('codeburn: --by-task and --by-agent cannot be combined. Pick one breakdown.\n')
       process.exit(1)
@@ -2560,19 +2689,56 @@ program
 
     const parsed = await parseAllSessions(range, opts.provider)
     await reportUnmatchedProjectPatterns(parsed, opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(range))
-    const projects = filterProjectsByName(parsed, opts.project, opts.exclude)
+    await reportExcludedGatewayCost(range, opts.provider)
+    const projects = filterProjectsByBillingRoute(
+      filterProjectsByName(parsed, opts.project, opts.exclude),
+      { route: opts.route, billing: opts.billing },
+    )
     const topN = typeof opts.top === 'number' && Number.isFinite(opts.top) ? opts.top : undefined
-    let rows = await aggregateModels(projects, {
+    const explicitMinCost = typeof opts.minCost === 'number' && Number.isFinite(opts.minCost)
+    // `aggregateModels` filters and slices before the unpriced filter. Its
+    // rows are sorted cost-first, so a small --top would remove exactly the
+    // rows `--unpriced` exists to show, and its default $0.01 floor would drop
+    // them before the default flow can say what the table omitted (#1420).
+    // Take the whole set here; apply floor and slice after instead.
+    const all = await aggregateModels(projects, {
       byTask: !!opts.byTask,
       byAgent: !!opts.byAgent,
       taskFilter: opts.task,
-      // `aggregateModels` filters and slices before the unpriced filter. Its
-      // rows are sorted cost-first, so a small --top would remove exactly the
-      // rows `--unpriced` exists to show. Take the whole set here and slice
-      // after filtering and ranking instead.
-      topN: opts.unpriced ? undefined : topN,
-      minCost: typeof opts.minCost === 'number' && Number.isFinite(opts.minCost) ? opts.minCost : (opts.unpriced ? 0 : 0.01),
+      topN: undefined,
+      minCost: explicitMinCost ? opts.minCost : 0,
     })
+    // A route/billing filter is itself an explicit request for those rows.
+    // Subscription-covered and free routed calls legitimately cost $0, so
+    // the ordinary noise floor must not erase the complete filtered answer.
+    const floor = (opts.unpriced || opts.route || opts.billing)
+      ? undefined
+      : explicitMinCost ? opts.minCost : 0.01
+    let rows = floor === undefined ? all : all.filter(r => r.costUSD >= floor || r.savingsUSD >= floor)
+    if (!opts.unpriced && topN !== undefined) rows = rows.slice(0, topN)
+    // Models the default floor removed carry $0 by definition, so the default
+    // table read "cheap" and "uncounted" identically. Say they exist — but only
+    // when the floor was the default: an explicit --min-cost is a user's own
+    // cut and gets no nagging. Breakdown modes emit several rows per model, so
+    // the count needs the set folded per model first.
+    let droppedUnpriced: ReturnType<typeof findUnpricedModels> = []
+    if (!explicitMinCost && floor !== undefined) {
+      const perModel = new Map<string, { model: string; calls: number; cost: number; tokens: number }>()
+      for (const r of all) {
+        // Here floor is always the implicit default: the guard above excludes
+        // --unpriced, a route/billing filter, and an explicit --min-cost.
+        if (r.costUSD >= floor! || r.savingsUSD >= floor!) continue
+        const agg = perModel.get(r.model) ?? { model: r.model, calls: 0, cost: 0, tokens: 0 }
+        agg.calls += r.calls
+        agg.cost += r.costUSD
+        agg.tokens += r.totalTokens
+        perModel.set(r.model, agg)
+      }
+      droppedUnpriced = findUnpricedModels(perModel.values())
+    }
+    const unpricedLine = droppedUnpriced.length > 0
+      ? `${droppedUnpriced.length} more model${droppedUnpriced.length === 1 ? '' : 's'} price${droppedUnpriced.length === 1 ? 's' : ''} at $0 (${formatTokens(droppedUnpriced.reduce((sum, u) => sum + u.tokens, 0))} tok) — codeburn models --unpriced to see them`
+      : null
     if (opts.unpriced) {
       const unpriced = findUnpricedModels(rows.map(row => ({
         model: row.model,
@@ -2597,6 +2763,9 @@ program
       process.stdout.write(opts.unpriced
         ? 'No unpriced models found for the selected period.\n'
         : 'No model usage found for the selected period.\n')
+      // An empty default table with unpriced usage behind it is the whole of
+      // #1420 in one screen: "no usage found" while millions of tokens ran.
+      if (!opts.unpriced && fmt === 'table' && unpricedLine) process.stdout.write(unpricedLine + '\n')
       return
     }
     // The friendly name is useless for `model-alias`, which keys on the raw ID.
@@ -2615,6 +2784,7 @@ program
       // Never advise aliasing unconditionally: a subscription or flat-rate model
       // is correctly $0, and mapping it onto another model's rate invents spend.
       if (opts.unpriced) process.stdout.write(unpricedModelHint() + '\n')
+      else if (unpricedLine) process.stdout.write(unpricedLine + '\n')
     } else {
       process.stderr.write(`codeburn: unknown --format "${opts.format}". Choose table, markdown, json, or csv.\n`)
       process.exit(1)
@@ -2628,6 +2798,8 @@ program
   .option('--from <date>', 'Custom range start (YYYY-MM-DD)')
   .option('--to <date>', 'Custom range end (YYYY-MM-DD)')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, codex, cursor)', 'all')
+  .option('--route <route>', `Filter by billing route (${ROUTE_FILTER_VALUES.join('|')}; direct includes unknown)`)
+  .option('--billing <mode>', `Filter by billing mode (${BILLING_FILTER_VALUES.join('|')})`)
   .option('--format <format>', 'Output format: table, json', 'table')
   .option('--by-pr', 'Group spend by the pull requests each session referenced')
   .option('--by-work-unit', 'Group sessions into provider-recorded work units: one row per orchestration root with its delegated children folded beneath')
@@ -2638,6 +2810,12 @@ program
   .action(async (opts) => {
     assertProvider(opts.provider, 'sessions')
     assertFormat(opts.format, ['table', 'json'], 'sessions')
+    assertRoute(opts.route, 'sessions')
+    assertBilling(opts.billing, 'sessions')
+    if (opts.byWorkUnit && (opts.route || opts.billing)) {
+      process.stderr.write('codeburn sessions: --by-work-unit cannot be combined with --route or --billing.\n')
+      process.exit(1)
+    }
     if (opts.contributions && (opts.byPr || opts.byWorkUnit || opts.format !== 'json')) {
       process.stderr.write('codeburn: --contributions requires plain --format json (no --by-pr/--by-work-unit)\n')
       process.exit(1)
@@ -2661,7 +2839,11 @@ program
 
     const parsed = await parseAllSessions(range, opts.provider)
     await reportUnmatchedProjectPatterns(parsed, opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(range))
-    const projects = filterProjectsByName(parsed, opts.project, opts.exclude)
+    await reportExcludedGatewayCost(range, opts.provider)
+    const projects = filterProjectsByBillingRoute(
+      filterProjectsByName(parsed, opts.project, opts.exclude),
+      { route: opts.route, billing: opts.billing },
+    )
     if (opts.byPr) {
       const { rows: prRows, totals } = buildPrAttribution(projects)
       if (opts.format === 'json') {

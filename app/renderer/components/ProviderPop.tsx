@@ -1,7 +1,8 @@
+import { t } from '../i18n'
 import { Dropdown } from './Dropdown'
 import { ProviderLogo } from './ProviderLogo'
 
-export type ProviderOption = { value: string; label: string }
+export type ProviderOption = { value: string; label: string; muted?: boolean }
 
 /**
  * Provider selector built on the Dropdown listbox (roving tabindex, arrow-key
@@ -22,7 +23,7 @@ export function ProviderPop({
   return (
     <Dropdown
       id="provider-select"
-      ariaLabel="Providers"
+      ariaLabel={t('shared.providerPop.ariaLabel')}
       value={value}
       options={options}
       onChange={onSelect}

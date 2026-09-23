@@ -18,6 +18,10 @@ struct MenubarPayload: Codable, Sendable {
     /// Absent on payloads from a CLI that predates the block, so absence means
     /// "unknown", not "nothing running": the popover hides the section either way.
     let liveSessions: LiveSessionsBlock?
+    /// The CLI's anonymised daily aggregate (`src/telemetry-snapshot.ts`),
+    /// carried opaquely so telemetry forwards exactly what the CLI computed
+    /// rather than re-deriving any of it here. Absent on an older CLI.
+    let telemetrySnapshot: JSONValue?
 
     init(generated: String,
          current: CurrentBlock,
@@ -26,8 +30,10 @@ struct MenubarPayload: Codable, Sendable {
          combined: CombinedUsage?,
          claudeConfigs: ClaudeConfigSelector? = nil,
          stale: Bool? = nil,
-         liveSessions: LiveSessionsBlock? = nil) {
+         liveSessions: LiveSessionsBlock? = nil,
+         telemetrySnapshot: JSONValue? = nil) {
         self.liveSessions = liveSessions
+        self.telemetrySnapshot = telemetrySnapshot
         self.generated = generated
         self.stale = stale
         self.current = current
@@ -39,6 +45,7 @@ struct MenubarPayload: Codable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case generated, stale, current, optimize, history, combined, claudeConfigs, liveSessions
+        case telemetrySnapshot
     }
 
     init(from decoder: Decoder) throws {
@@ -51,6 +58,7 @@ struct MenubarPayload: Codable, Sendable {
         combined = try c.decodeIfPresent(CombinedUsage.self, forKey: .combined)
         claudeConfigs = try c.decodeIfPresent(ClaudeConfigSelector.self, forKey: .claudeConfigs)
         liveSessions = try c.decodeIfPresent(LiveSessionsBlock.self, forKey: .liveSessions)
+        telemetrySnapshot = try c.decodeIfPresent(JSONValue.self, forKey: .telemetrySnapshot)
     }
 }
 
@@ -316,6 +324,17 @@ struct CurrentBlock: Codable, Sendable {
     /// only). Optional so payloads from older CLIs still decode; absent or
     /// empty -> the Pull requests section hides.
     var pullRequests: PullRequestsBlock? = nil
+    /// Models with recorded usage whose cost prices at $0 for lack of pricing
+    /// data (#1420). Their usage ran, so the figure is unknown, not zero —
+    /// but no cost-table floor ever shows them. Empty on older CLI payloads;
+    /// absent or empty -> the Models section's unpriced line hides.
+    var unpricedModels: [UnpricedModelEntry] = []
+}
+
+struct UnpricedModelEntry: Codable, Sendable, Equatable {
+    let model: String
+    let calls: Int
+    let tokens: Int
 }
 
 struct PullRequestsBlock: Codable, Sendable {
@@ -335,7 +354,7 @@ extension CurrentBlock {
              cacheHitPercent, codexCredits, topActivities, topModels, localModelSavings, providers, providerDetails, topProjects,
              modelEfficiency, topSessions, retryTax, routingWaste,
              tools, skills, subagents, mcpServers,
-             workflow, topReworkedFiles, pullRequests
+             workflow, topReworkedFiles, pullRequests, unpricedModels
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -366,6 +385,7 @@ extension CurrentBlock {
         workflow = try c.decodeIfPresent(WorkflowBlock.self, forKey: .workflow)
         topReworkedFiles = try c.decodeIfPresent([ReworkedFileEntry].self, forKey: .topReworkedFiles) ?? []
         pullRequests = try c.decodeIfPresent(PullRequestsBlock.self, forKey: .pullRequests)
+        unpricedModels = try c.decodeIfPresent([UnpricedModelEntry].self, forKey: .unpricedModels) ?? []
     }
 }
 
@@ -504,6 +524,41 @@ struct ModelEntry: Codable, Sendable {
     let savingsUSD: Double
     let savingsBaselineModel: String
     let calls: Int
+    /// Per-model token counts: input, output, cache read (reused input), and
+    /// cache write, kept separate so the two cache flavors are never summed.
+    /// Nil on every CLI up to the token-breakdown release and on any row whose
+    /// contributing legacy data lacked counts: absent means "unknown", which
+    /// renders as a dash — never as zero, and never as a period-wide figure.
+    let inputTokens: Int?
+    let outputTokens: Int?
+    let cacheReadTokens: Int?
+    let cacheWriteTokens: Int?
+
+    /// Whether any per-model count arrived. A row with none (legacy payload)
+    /// renders without the secondary token line rather than as a run of dashes.
+    var hasTokenCounts: Bool {
+        inputTokens != nil || outputTokens != nil || cacheReadTokens != nil
+    }
+
+    init(name: String,
+         cost: Double,
+         savingsUSD: Double,
+         savingsBaselineModel: String,
+         calls: Int,
+         inputTokens: Int? = nil,
+         outputTokens: Int? = nil,
+         cacheReadTokens: Int? = nil,
+         cacheWriteTokens: Int? = nil) {
+        self.name = name
+        self.cost = cost
+        self.savingsUSD = savingsUSD
+        self.savingsBaselineModel = savingsBaselineModel
+        self.calls = calls
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadTokens = cacheReadTokens
+        self.cacheWriteTokens = cacheWriteTokens
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -512,10 +567,15 @@ struct ModelEntry: Codable, Sendable {
         savingsUSD = try c.decodeIfPresent(Double.self, forKey: .savingsUSD) ?? 0
         savingsBaselineModel = try c.decodeIfPresent(String.self, forKey: .savingsBaselineModel) ?? ""
         calls = try c.decode(Int.self, forKey: .calls)
+        inputTokens = try c.decodeIfPresent(Int.self, forKey: .inputTokens)
+        outputTokens = try c.decodeIfPresent(Int.self, forKey: .outputTokens)
+        cacheReadTokens = try c.decodeIfPresent(Int.self, forKey: .cacheReadTokens)
+        cacheWriteTokens = try c.decodeIfPresent(Int.self, forKey: .cacheWriteTokens)
     }
 
     private enum CodingKeys: String, CodingKey {
         case name, cost, savingsUSD, savingsBaselineModel, calls
+        case inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens
     }
 }
 

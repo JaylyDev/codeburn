@@ -6,7 +6,9 @@ struct SubscriptionUsage: Sendable, Equatable {
         case max5x
         case max20x
         case team
+        case teamPremium
         case enterprise
+        case enterprisePremium
         case unknown
 
         var displayName: String {
@@ -15,7 +17,9 @@ struct SubscriptionUsage: Sendable, Equatable {
             case .max5x: "Max 5x"
             case .max20x: "Max 20x"
             case .team: "Team"
+            case .teamPremium: "Team Premium"
             case .enterprise: "Enterprise"
+            case .enterprisePremium: "Enterprise Premium"
             case .unknown: "Subscription"
             }
         }
@@ -44,13 +48,26 @@ struct SubscriptionUsage: Sendable, Equatable {
     let fetchedAt: Date
 
     static func tier(from raw: String?) -> Tier {
-        guard let raw = raw?.lowercased() else { return .unknown }
-        if raw.contains("max_20x") || raw.contains("max20x") || raw.contains("max-20x") { return .max20x }
-        if raw.contains("max_5x") || raw.contains("max5x") || raw.contains("max-5x") { return .max5x }
-        if raw.contains("max") { return .max5x }
-        if raw.contains("pro") { return .pro }
-        if raw.contains("team") { return .team }
-        if raw.contains("enterprise") { return .enterprise }
+        tier(subscriptionType: nil, rateLimitTier: raw)
+    }
+
+    static func tier(subscriptionType: String?, rateLimitTier: String?) -> Tier {
+        let subscriptionType = subscriptionType?.lowercased() ?? ""
+        let rateLimitTier = rateLimitTier?.lowercased() ?? ""
+        let hasMax20 = rateLimitTier.contains("max_20x") || rateLimitTier.contains("max20x") || rateLimitTier.contains("max-20x")
+        let hasMax = rateLimitTier.contains("max")
+        if subscriptionType == "team" || (subscriptionType.isEmpty && rateLimitTier.contains("team")) {
+            return hasMax ? .teamPremium : .team
+        }
+        if subscriptionType == "enterprise" || (subscriptionType.isEmpty && rateLimitTier.contains("enterprise")) {
+            return hasMax ? .enterprisePremium : .enterprise
+        }
+        if subscriptionType == "max" || hasMax {
+            return hasMax20 ? .max20x : .max5x
+        }
+        if subscriptionType == "pro" || rateLimitTier.contains("pro") {
+            return .pro
+        }
         return .unknown
     }
 }
