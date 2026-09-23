@@ -109,26 +109,21 @@ interface LegacyRenderNode {
   children?: LegacyRenderNode[]
 }
 
-// Most of the types below are extracted from https://github.com/microsoft/vscode-copilot-chat/
+// Types below are trimmed from https://github.com/microsoft/vscode-copilot-chat/
 
-export interface ChatCompletionContentPartText {
+interface ChatCompletionContentPartText {
   /**
    * The text content.
    */
   text: string;
-
   /**
    * The type of the content part.
    */
   type: ChatCompletionContentPartKind.Text;
 }
 
-export interface ChatCompletionContentPartCacheBreakpoint {
-  type: ChatCompletionContentPartKind.CacheBreakpoint;
-  /**
-   * Optional implementation-specific type of the breakpoint.
-   */
-  cacheType?: string;
+interface ChatCompletionContentPartCacheBreakpoint {
+  type: ChatCompletionContentPartKind.CacheBreakpoint
 }
 
 export enum ChatCompletionContentPartKind {
@@ -139,52 +134,23 @@ export enum ChatCompletionContentPartKind {
   Document,
 }
 
-export type ChatCompletionContentPart = ChatCompletionContentPartText | ChatCompletionContentPartCacheBreakpoint;
+type ChatCompletionContentPart = ChatCompletionContentPartText | ChatCompletionContentPartCacheBreakpoint
 
-export const openAIContextManagementCompactionType = 'compaction';
-
-export interface OpenAIContextManagementResponse {
-  encrypted_content: string;
-  type: typeof openAIContextManagementCompactionType;
-  id: string;
+interface ThinkingData {
+  text: string | string[]
+  tokens?: number
 }
 
-export interface ThinkingData {
-  id: string;
-  text: string | string[];
-  metadata?: { [key: string]: any };
-  tokens?: number;
-  encrypted?: string;
+interface IToolCall {
+  name: string
+  arguments: string
+  id: string
 }
 
-export interface IToolCall {
-  name: string;
-  arguments: string;
-  id: string;
-}
-
-export interface IToolCallRound {
-  id: string;
-  summary?: string;
-  response: string;
-  toolInputRetry: number;
-  toolCalls: IToolCall[];
-  thinking?: ThinkingData;
-  statefulMarker?: string;
-  /** Compaction data from the Responses API, round-tripped in outgoing requests */
-  compaction?: OpenAIContextManagementResponse;
-  /** Epoch millis (`Date.now()`) when this round started. */
-  timestamp?: number;
-  /**
-   * Additional context from a hook that was executed after this round completed.
-   * For example, when a stop hook blocks the agent from stopping, this contains
-   * the message to show the model about what requirements must be addressed.
-   */
-  hookContext?: string;
-  /** The phase of the agent loop during which this tool call round occurred. */
-  phase?: string;
-  /** The model ID that produced the phase value. */
-  phaseModelId?: string;
+interface IToolCallRound {
+  response: string
+  toolCalls: IToolCall[]
+  thinking?: ThinkingData
 }
 
 // (native VScode types are hidden behind a `vscode` import, these are relevant bits)
@@ -211,23 +177,12 @@ interface IResultMetadata {
   details?: string
 }
 
-export interface IParsedChatRequestPart {
-  readonly kind: string; // for serialization
-  readonly range: unknown;
-  readonly editorRange: unknown;
-  readonly text: string;
-  /** How this part is represented in the prompt going to the agent */
-  readonly promptText: string;
-}
-
-
-export interface IParsedChatRequest {
-  readonly parts: ReadonlyArray<IParsedChatRequestPart>;
-  readonly text: string;
+interface IParsedChatRequest {
+  readonly text: string
 }
 
 // https://github.com/microsoft/vscode/blob/main/src/vs/workbench/contrib/chat/common/model/chatModel.ts#L1648
-export interface SerializedChatResponsePart {
+interface SerializedChatResponsePart {
   kind?: string
   value?: string
   invocationMessage?: string
@@ -290,8 +245,8 @@ function extractRenderNodeTexts(node: LegacyRenderNode | null | undefined): stri
 /**
  * Extract text from a toolCallResults entry's content array.
  * Handles two observed shapes:
- *  - $mid:21 — value is a plain string (terminal output, error messages)
- *  - $mid:23 — value is an object with a .node render tree (edit confirmations, etc.)
+ *  - $mid:21: value is a plain string (terminal output, error messages)
+ *  - $mid:23: value is an object with a .node render tree (edit confirmations, etc.)
  */
 function extractToolCallResultContent(
   results: NonNullable<NonNullable<LegacyChatRequest['result']>['metadata']>['toolCallResults'],
@@ -433,6 +388,7 @@ interface LegacyOutputs {
   reasoningText: string
 }
 
+// Prefer toolCallRounds over req.response: response also embeds terminal output, which is model input.
 function extractLegacyOutputs(req: LegacyChatRequest): LegacyOutputs {
   let outputText = ''
   let reasoningText = ''
@@ -500,7 +456,7 @@ function extractLegacyOutputs(req: LegacyChatRequest): LegacyOutputs {
   }
 
   // invocationMessage strings are model narration in the UI ("Checking terminal output",
-  // "Using 'Multi-Replace String'", etc.) — short but part of model output.
+  // "Using 'Multi-Replace String'", etc.); short but part of model output.
   for (const item of response ?? []) {
     if (item && typeof item === 'object') {
       const inv = (item as { invocationMessage?: unknown }).invocationMessage
@@ -1089,7 +1045,7 @@ function loadSpanAttributesFromTable(
         try {
           // Try to parse numeric values
           const numValue = Number(row.value)
-          attrs[row.key as keyof SpanAttributes] = Number.isNaN(numValue) 
+          attrs[row.key as keyof SpanAttributes] = Number.isNaN(numValue)
             ? row.value
             : numValue
         } catch {
@@ -2538,7 +2494,7 @@ function createOtelParser(
           const spanIdRows = db.query<{ span_id: string; trace_id: string }>(
             `SELECT DISTINCT s.span_id, s.trace_id
              FROM spans s
-             INNER JOIN span_attributes sa 
+             INNER JOIN span_attributes sa
                ON s.span_id = sa.span_id AND sa.key = 'gen_ai.conversation.id' AND sa.value = ?
              ORDER BY s.start_time_ms ASC`,
             [conversationId]
@@ -3498,41 +3454,26 @@ async function discoverWorkspaceChatSessions(
     }
 
     for (const hashDir of hashDirs) {
-      const candidates = [
-        join(wsDir, hashDir, 'chatSessions'),
-        join(wsDir, hashDir, 'GitHub.copilot-chat', 'chatSessions'),
-        join(wsDir, hashDir, 'github.copilot-chat', 'chatSessions'),
-        join(wsDir, hashDir, 'GitHub.copilot', 'chatSessions'),
-        join(wsDir, hashDir, 'github.copilot', 'chatSessions'),
-      ]
+      const chatSessionsDir = join(wsDir, hashDir, 'chatSessions')
+      let files: string[]
+      try {
+        files = await readdir(chatSessionsDir)
+      } catch {
+        continue
+      }
 
-      let project: string | undefined
-
-      for (const chatSessionsDir of candidates) {
-        if (!existsSync(chatSessionsDir)) continue
-        let files: string[]
-        try {
-          files = await readdir(chatSessionsDir)
-        } catch {
-          continue
-        }
-
-        if (project === undefined) {
-          project = await resolveWorkspaceProject(wsDir, hashDir)
-        }
-
-        for (const file of files) {
-          if (!file.endsWith('.json') && !file.endsWith('.jsonl')) continue
-          const path = join(chatSessionsDir, file)
-          const s = await stat(path).catch(() => null)
-          if (!s?.isFile()) continue
-          sources.push({
-            path,
-            project,
-            provider: 'copilot',
-            sourceType: 'chatsession',
-          })
-        }
+      const project = await resolveWorkspaceProject(wsDir, hashDir)
+      for (const file of files) {
+        if (!file.endsWith('.json') && !file.endsWith('.jsonl')) continue
+        const path = join(chatSessionsDir, file)
+        const s = await stat(path).catch(() => null)
+        if (!s?.isFile()) continue
+        sources.push({
+          path,
+          project,
+          provider: 'copilot',
+          sourceType: 'chatsession',
+        })
       }
     }
   }

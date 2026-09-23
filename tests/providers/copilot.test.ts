@@ -3676,14 +3676,14 @@ describe('copilot provider - legacy JSON format', () => {
               },
             },
           },
-          // Row 2: No token fields at all — must be skipped in .jsonl (never char-estimated)
+          // Row 2: No token fields at all; must be skipped in .jsonl (never char-estimated)
           {
             requestId: 'req-empty-tokens',
             modelId: 'copilot/claude-sonnet-4.6',
             message: 'A message with no tokens recorded',
             response: [{ kind: 'markdownContent', content: { value: 'Some output text' } }],
           },
-          // Row 3: Zero tokens — must be skipped in .jsonl
+          // Row 3: Zero tokens; must be skipped in .jsonl
           {
             requestId: 'req-zero-tokens',
             modelId: 'copilot/claude-sonnet-4.6',
