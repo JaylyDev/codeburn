@@ -1,4 +1,4 @@
-import { billableOutputTokens, calculateCost, routeFromProviderField } from '../models.js'
+import { billableOutputTokens, calculateCost, recordedCostFallback, routeFromProviderField } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import type { ParsedProviderCall } from './types.js'
 
@@ -144,9 +144,8 @@ export function buildAssistantCall(opts: {
     0,
   )
 
-  if (costUSD === 0 && typeof data.cost === 'number' && data.cost > 0) {
-    costUSD = data.cost
-  }
+  const fallbackCostUSD = recordedCostFallback(model, costUSD, data.cost)
+  if (fallbackCostUSD) costUSD = fallbackCostUSD
 
   return {
     provider: opts.providerName,
@@ -160,6 +159,7 @@ export function buildAssistantCall(opts: {
     reasoningTokens: tokens.reasoning,
     webSearchRequests: 0,
     costUSD,
+    ...(fallbackCostUSD ? { fallbackCostUSD } : {}),
     // A call with output but no usage recorded has unknown tokens, not zero.
     ...(allZero && costUSD === 0 ? { costIsEstimated: true } : {}),
     tools,
