@@ -31,6 +31,10 @@ type AssistantTurn = {
 
 type ParsedTurn = {
   userMessage: string
+  userTextFull: string
+  // The user text was already billed on an earlier assistant message of the
+  // same agentic loop; this turn only carries it for display.
+  carried: boolean
   assistant: AssistantTurn
 }
 
@@ -217,7 +221,7 @@ async function appendTranscriptSources(
   }
 }
 
-function extractUserQuery(userBlock: string): string {
+function extractUserQuery(userBlock: string, maxLength: number = MAX_USER_TEXT_LENGTH): string {
   const chunks: string[] = []
   let cursor = 0
 
@@ -235,34 +239,47 @@ function extractUserQuery(userBlock: string): string {
   }
 
   const combined = chunks.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim()
-  return combined.slice(0, MAX_USER_TEXT_LENGTH)
+  return combined.slice(0, maxLength)
 }
 
 function parseJsonlTranscript(raw: string): { turns: ParsedTurn[]; recognized: boolean } {
   const lines = raw.split(/\r?\n/).filter(l => l.trim())
   if (lines.length === 0) return { turns: [], recognized: false }
-
   const turns: ParsedTurn[] = []
-  let currentUserMessage = ''
+  let lastUserDisplay = ''
+  let lastUserFull = ''
+  let seenUser = false
+  let userBilled = false
+  let recognized = false
 
   for (const line of lines) {
-    let entry: { role?: string; message?: { content?: Array<{ type?: string; text?: string; name?: string }> } }
+    let entry: { role?: string; type?: string; message?: { content?: Array<{ type?: string; text?: string; name?: string; input?: unknown }> } }
     try {
       entry = JSON.parse(line)
     } catch {
       continue
     }
 
+    // A turn that errored or was aborted before any assistant message leaves
+    // only a `turn_ended` line (or a user line and nothing else); that is a
+    // Cursor transcript with nothing to bill, not an unknown format.
+    if (entry.type === 'turn_ended') recognized = true
+
     if (entry.role === 'user') {
+      recognized = true
       const texts = normalizeContentBlocks(entry.message?.content)
         .filter(c => c.type === 'text')
         .map(c => c.text ?? '')
       const combined = texts.join(' ')
-      currentUserMessage = extractUserQuery(combined) || combined.slice(0, MAX_USER_TEXT_LENGTH)
+      const full = extractUserQuery(combined, Number.POSITIVE_INFINITY) || combined
+      lastUserFull = full
+      lastUserDisplay = full.slice(0, MAX_USER_TEXT_LENGTH)
+      seenUser = true
+      userBilled = false
       continue
     }
 
-    if (entry.role === 'assistant' && currentUserMessage) {
+    if (entry.role === 'assistant' && seenUser) {
       const content = normalizeContentBlocks(entry.message?.content)
       const bodyParts: string[] = []
       const tools: string[] = []
@@ -272,22 +289,31 @@ function parseJsonlTranscript(raw: string): { turns: ParsedTurn[]; recognized: b
           bodyParts.push(block.text)
         } else if (block.type === 'tool_use' && block.name) {
           tools.push(`cursor:${block.name.toLowerCase()}`)
+          if (block.input !== undefined) {
+            try {
+              bodyParts.push(JSON.stringify(block.input))
+            } catch {
+              // Unserializable tool input contributes its name only (above).
+            }
+          }
         }
       }
 
       turns.push({
-        userMessage: currentUserMessage,
+        userMessage: lastUserDisplay,
+        userTextFull: lastUserFull,
+        carried: userBilled,
         assistant: {
           body: bodyParts.join('\n').trim(),
           reasoning: '',
           tools,
         },
       })
-      currentUserMessage = ''
+      userBilled = true
     }
   }
 
-  return { turns, recognized: turns.length > 0 }
+  return { turns, recognized: recognized || turns.length > 0 }
 }
 
 function parseTranscript(raw: string): { turns: ParsedTurn[]; recognized: boolean } {
@@ -295,6 +321,7 @@ function parseTranscript(raw: string): { turns: ParsedTurn[]; recognized: boolea
   let recognized = false
 
   const pendingUsers: string[] = []
+  let lastUserMessage: string | null = null
   const turns: ParsedTurn[] = []
 
   let active: 'none' | 'user' | 'assistant' = 'none'
@@ -303,7 +330,7 @@ function parseTranscript(raw: string): { turns: ParsedTurn[]; recognized: boolea
 
   const flushUser = () => {
     if (userLines.length === 0) return
-    const userQuery = extractUserQuery(userLines.join('\n'))
+    const userQuery = extractUserQuery(userLines.join('\n'), Number.POSITIVE_INFINITY)
     if (userQuery.length > 0) pendingUsers.push(userQuery)
     userLines = []
   }
@@ -336,11 +363,15 @@ function parseTranscript(raw: string): { turns: ParsedTurn[]; recognized: boolea
       output += `${line}\n`
     }
 
-    if (pendingUsers.length > 0) {
-      const userMessage = pendingUsers.shift()!
+    const carried = pendingUsers.length === 0
+    const userMessage = carried ? lastUserMessage : pendingUsers.shift()!
+    if (userMessage !== null) {
+      lastUserMessage = userMessage
       const tools = Array.from(toolsByTurn.keys())
       turns.push({
-        userMessage,
+        userMessage: userMessage.slice(0, MAX_USER_TEXT_LENGTH),
+        userTextFull: userMessage,
+        carried,
         assistant: {
           body: output.trim(),
           reasoning: reasoning.trim(),
@@ -450,7 +481,7 @@ function createParser(
 
         for (let turnIndex = 0; turnIndex < parsed.turns.length; turnIndex++) {
           const turn = parsed.turns[turnIndex]!
-          const inputTokens = estimateTokens(turn.userMessage.length)
+          const inputTokens = turn.carried ? 0 : estimateTokens(turn.userTextFull.length)
           const outputTokens = estimateTokens(turn.assistant.body.length)
           const reasoningTokens = estimateTokens(turn.assistant.reasoning.length)
           const deduplicationKey = `cursor-agent:${conversationId}:${turnIndex}`
