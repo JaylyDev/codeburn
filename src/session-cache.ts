@@ -410,7 +410,9 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // otel-trace-metadata-once-v1: trace-level tool/skill/bash metadata is now
   // attributed to one chat span per trace instead of every span, so cached
   // calls carry the old per-span duplication - force one re-parse.
-  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1-session-store-v3-chatsession-otel-skills-v1-otel-trace-metadata-once-v1',
+  // transcript-unknown-usage-v1: a transcript call with no token count is
+  // marked estimated; cached entries hold no flag and must re-parse once.
+  copilot: 'cli-shutdown-cost-v1-skills-source-provenance-v1-session-store-v3-chatsession-otel-skills-v1-otel-trace-metadata-once-v1-transcript-unknown-usage-v1',
   // authoritative-usage-v4: persist one Grok session call from top-level
   // authoritative totals, use modelUsage only for priced attribution, clamp
   // reasoning per record, and label mixed sessions estimated.
@@ -479,11 +481,12 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // parsed call as `route`: `openrouter` and `amazon-bedrock`. Cached calls hold
   // neither, so they must re-parse. v2 also invalidates the OpenRouter-only
   // fingerprint used by pre-merge builds of #1486.
+  // unknown-usage-v1: a message with output but no usage is marked estimated.
   // v2-legacy-union-v1: a session present in both OpenCode 2.x `session_v2` and
   // the frozen 1.x tables now reads its legacy turns too. Cached parses of an
   // upgraded database hold only what the 2.x migration carried over, and v2
   // turns now carry the bare model id 1.x used instead of `provider/model`.
-  opencode: 'session-model-v1-archived-subtree-v1-billing-routes-v2-v2-legacy-union-v1',
+  opencode: 'session-model-v1-archived-subtree-v1-billing-routes-v2-v2-legacy-union-v1-unknown-usage-v1',
   quickdesk: 'emf-sqlite-v2-est-cost',
   // session-lineage-capture-v1: SessionLineage (CB-1, slice 1) is now carried
   // on the cached file for every kimicode wire. Child evidence is the
@@ -496,7 +499,7 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   kimicode: 'wire-usage-v1-est-cost-session-lineage-capture-v1',
   // archived-subtree-v1: KiloCode shares the SQLite parser and the same schema.
   // billing-routes-v2: its warm cache must move with both shared route fields.
-  'kilo-code': 'worktree-project-grouping-v1-session-model-v1-archived-subtree-v1-billing-routes-v2-v2-legacy-union-v1',
+  'kilo-code': 'worktree-project-grouping-v1-session-model-v1-archived-subtree-v1-billing-routes-v2-v2-legacy-union-v1-unknown-usage-v1',
   'roo-code': 'worktree-project-grouping-v1',
   // billing-cost-v1: Warp's own billing record (total_provider_cost_in_cents,
   // total_charged_usage, credits_spent) now rides on each call as
