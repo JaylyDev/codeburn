@@ -28,18 +28,25 @@ import {
   type ProviderSection,
   type SessionCache,
   beginColdHydration,
+  cacheEntriesInLoadOrder,
+  cacheStubs,
   cleanupOrphanedTempFiles,
   computeEnvFingerprint,
   DURABLE_PROVIDER_NAMES,
+  evictCacheStub,
   fingerprintFile,
+  hasCachedEntries,
   hasDirtyDurableProvider,
   isCacheComplete,
   isCacheCurrent,
   isCacheDirty,
+  isCacheStub,
   loadCache,
+  loadCacheStubs,
   markCacheDirty,
   markProviderComplete,
   monthScopeForRange,
+  type CacheLoadScope,
   reconcileFile,
   saveCache,
   sourcePathStatCandidates,
@@ -2045,15 +2052,30 @@ async function scanProjectDirs(
     rememberSweepFingerprint(e.filePath, fp, sweptAt)
     return fp
   })
+  // A stub stands in for its entry. One whose file changed loads its member
+  // first, so the append or re-parse below runs exactly as on a full load.
+  const stubs = cacheStubs(diskCache, 'claude')
+  if (stubs?.size && !readOnly) {
+    await loadCacheStubs(diskCache, 'claude', discovered.flatMap(({ filePath }, i) => {
+      const stub = stubs.get(filePath)
+      return stub && fingerprints[i] && reconcileFile(fingerprints[i]!, stub).action !== 'unchanged' ? [filePath] : []
+    }))
+  }
+  const servedStubs: string[][][] = []
+
   for (const [i, { filePath, dirName, source }] of discovered.entries()) {
     allDiscoveredFiles.add(filePath)
     const fp = fingerprints[i]
     if (!fp) continue
 
     const cached = section.files[filePath]
-    const action = reconcileFile(fp, cached)
-    if (!readOnly && deferToBackgroundFill(filePath, fp, cached)) {
+    const stub = cached ? undefined : stubs?.get(filePath)
+    const action = reconcileFile(fp, cached ?? stub)
+    if (!readOnly && deferToBackgroundFill(filePath, fp, cached ?? stub)) {
       continue
+    } else if (stub && (readOnly || action.action === 'unchanged')) {
+      if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
+      servedStubs.push(stub.keys)
     } else if (cached && (readOnly || action.action === 'unchanged')) {
       if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
       unchangedFiles.push({ filePath, dirName, source, cached: section.files[filePath]! })
@@ -2083,8 +2105,13 @@ async function scanProjectDirs(
   // is gone and can never re-parse, but they carry attributable PR spend the by-PR
   // report must keep (as a legacy even-split); the eviction below preserves the
   // same set so `section.files` still holds them when summaries are built.
-  for (const [filePath, cached] of Object.entries(section.files)) {
+  for (const [filePath, cached] of cacheEntriesInLoadOrder(diskCache, 'claude')) {
     if (allDiscoveredFiles.has(filePath)) continue
+    if (isCacheStub(cached)) {
+      // Never a WSL path (those always load in full).
+      if (readOnly || cached.hasPr) servedStubs.push(cached.keys)
+      continue
+    }
     const wslStatus = classifyWslCachePath(filePath, wslHomesForOrphans)
     // A WSL path missing from discovery is retained only when its root is
     // currently offline (or WSL discovery is explicitly disabled). If the
@@ -2106,6 +2133,7 @@ async function scanProjectDirs(
       }
     }
   }
+  for (const keys of servedStubs) for (const turn of keys) for (const key of turn) seenMsgIds.add(key)
 
   const parseProgress = createScanProgress('parsing changed claude sessions', changedFiles.length)
   const progressTotal = changedFiles.length
@@ -2376,6 +2404,10 @@ async function scanProjectDirs(
       if (wslStatus === 'not-wsl' && dirs.length === 0) continue
       delete section.files[cachedPath]
       markCacheDirty(diskCache, 'claude', cachedPath)
+    }
+    for (const [cachedPath, stub] of stubs ?? []) {
+      if (allDiscoveredFiles.has(cachedPath) || stub.hasPr || dirs.length === 0) continue
+      evictCacheStub(diskCache, 'claude', cachedPath)
     }
   }
 
@@ -3426,6 +3458,20 @@ export async function parseProviderSources(
       return fp
     })
 
+  // As in scanProjectDirs: a changed stub (and every network source, which
+  // re-fetches on a write run) loads its member so the parse below runs as on
+  // a full load. An unchanged one only ever contributes its dedup keys.
+  const stubs = cacheStubs(diskCache, providerName)
+  const stubServed = new Set<string>()
+  if (stubs?.size && !readOnly) {
+    await loadCacheStubs(diskCache, providerName, sources.flatMap((s, i) => {
+      const stub = stubs.get(s.path)
+      if (!stub) return []
+      const fp = sourceFingerprints[i]
+      return skipFingerprint || (fp && reconcileFile(fp, stub).action !== 'unchanged') ? [s.path] : []
+    }))
+  }
+
   for (const [sourceIndex, source] of sources.entries()) {
     allDiscoveredFiles.add(source.path)
 
@@ -3465,12 +3511,16 @@ export async function parseProviderSources(
     }
 
     const cached = section.files[source.path]
-    const action = reconcileFile(fp, cached)
+    const stub = cached ? undefined : stubs?.get(source.path)
+    const action = reconcileFile(fp, cached ?? stub)
     // A cached parse failure at this same fingerprint stays skipped — don't
     // re-read a file that already threw and hasn't changed. It re-parses only
     // when the file changes (then `reconcileFile` reports non-'unchanged').
-    if (!readOnly && deferToBackgroundFill(source.path, fp, cached)) {
+    if (!readOnly && deferToBackgroundFill(source.path, fp, cached ?? stub)) {
       continue
+    } else if (stub && (readOnly || action.action === 'unchanged')) {
+      if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
+      stubServed.add(source.path)
     } else if (cached && (readOnly || (action.action === 'unchanged' && (cached.failed || !cachedFileNeedsProviderReparse(providerName, source.path, cached))))) {
       if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
       unchangedSources.push({ source, cached })
@@ -3485,8 +3535,14 @@ export async function parseProviderSources(
   const wslHomesForOrphans = refreshWslHomesForOrphans(Object.keys(section.files), allDiscoveredFiles)
 
   if (readOnly) {
-    for (const [path, cached] of Object.entries(section.files)) {
+    for (const [path, cached] of cacheEntriesInLoadOrder(diskCache, providerName)) {
       if (allDiscoveredFiles.has(path)) continue
+      if (isCacheStub(cached)) {
+        servedSources.push({ provider: providerName, path, project: providerName })
+        allDiscoveredFiles.add(path)
+        stubServed.add(path)
+        continue
+      }
       servedSources.push({
         provider: providerName,
         path,
@@ -3522,6 +3578,7 @@ export async function parseProviderSources(
       }
     }
   }
+  for (const path of stubServed) for (const turn of stubs?.get(path)?.keys ?? []) for (const key of turn) parserDedup.add(key)
 
   // Codex rollouts are the bulk of a cold parse (multi-GB against Claude's
   // hundreds of MB), so whole-file decodes go to worker threads. A file the
@@ -3814,6 +3871,11 @@ export async function parseProviderSources(
       delete section.files[cachedPath]
       markCacheDirty(diskCache, providerName, cachedPath)
     }
+    // Never a WSL path (those always load in full).
+    for (const [cachedPath] of stubs ?? []) {
+      if (allDiscoveredFiles.has(cachedPath) || sources.length === 0) continue
+      evictCacheStub(diskCache, providerName, cachedPath)
+    }
   }
   if (evictedCodexResultCache) await flushCodexCache()
 
@@ -4081,7 +4143,14 @@ export async function parseProviderSources(
 
   for (const source of servedSources) {
     const cachedFile = section.files[source.path]
-    if (!cachedFile) continue
+    if (!cachedFile) {
+      // Out of range: it adds nothing but the keys a full entry would claim here.
+      for (const keys of stubs?.get(source.path)?.keys ?? []) {
+        if (keys.some(k => seenKeys.has(k))) continue
+        for (const k of keys) seenKeys.add(k)
+      }
+      continue
+    }
 
     for (const rawTurn of cachedFile.turns) {
       const turn = reconcileCopilotCalls(rawTurn)
@@ -5558,6 +5627,33 @@ const dateFloorSkippedProviders = new Set<string>()
 type SinglePassScope = { range: DateRange; parses: Map<string, Promise<ProjectSummary[]>> }
 let singlePassScope: SinglePassScope | null = null
 
+// A command that asks for several ranges one after another (status: today,
+// then the month) declares their union here, so the session cache loads once
+// and every later request finds its range already held in full. Only the load
+// range widens: each request keeps its own month scope and summaries, and a
+// cached file the wider range holds in full instead of as a stub contributes
+// exactly what its stub would.
+let loadWindow: DateRange | null = null
+
+export async function withLoadWindow<T>(range: DateRange, fn: () => Promise<T>): Promise<T> {
+  const outer = loadWindow
+  loadWindow = range
+  try {
+    return await fn()
+  } finally {
+    loadWindow = outer
+  }
+}
+
+function withinLoadWindow(scope: CacheLoadScope): CacheLoadScope {
+  if (!loadWindow) return scope
+  return {
+    ...scope,
+    startMs: Math.min(scope.startMs!, loadWindow.start.getTime()),
+    endMs: Math.max(scope.endMs!, loadWindow.end.getTime()),
+  }
+}
+
 export async function withSinglePassParse<T>(range: DateRange, fn: () => Promise<T>): Promise<T> {
   const outer = singlePassScope
   singlePassScope = { range, parses: new Map() }
@@ -5780,7 +5876,7 @@ function canServeCompleteSnapshot(cache: SessionCache, providerFilter?: string, 
   const sections = providerFilter && providerFilter !== 'all'
     ? ([[providerFilter, cache.providers[providerFilter]]] as const).filter((entry): entry is readonly [string, ProviderSection] => entry[1] != null)
     : Object.entries(cache.providers)
-  return sections.some(([, section]) => Object.keys(section.files).length > 0)
+  return sections.some(([name]) => hasCachedEntries(cache, name))
     && sections.every(([name, section]) => section.envFingerprint === computeEnvFingerprint(name))
 }
 
@@ -5836,10 +5932,10 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
   // unaffected (a suppressed duplicate contributes nothing either way), but for
   // a proxied key emitted under two providers the attribution can land on a
   // different provider than a full load would pick.
-  const loadScope = dateRange ? monthScopeForRange(dateRange.start, dateRange.end) : undefined
+  const loadScope = dateRange ? withinLoadWindow(monthScopeForRange(dateRange.start, dateRange.end)) : undefined
   const rangeStartMs = dateRange?.start.getTime()
   const cacheLoadStarted = performance.now()
-  let diskCache = await loadCache(loadScope)
+  let diskCache: SessionCache | null = await loadCache(loadScope)
   await cleanupOrphanedTempFiles()
   if (process.env['CODEBURN_VERBOSE'] === '1') {
     process.stderr.write(`codeburn: startup timing cache-load=${(performance.now() - cacheLoadStarted).toFixed(1)}ms complete=${isCacheComplete(diskCache, providerFilter, rangeStartMs)}\n`)
@@ -5876,7 +5972,6 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
   // A complete cache refresh is a strict read/reconcile/parse/save transaction.
   // Keep the snapshot loaded before acquisition: timeout/unavailable paths serve
   // exactly this complete snapshot and never mutate or invalidate the holder.
-  const priorSnapshot = diskCache
   // Heartbeat the WAIT too, not just the parse behind it. This is the one place
   // a healthy process is deliberately idle for a long stretch, and the desktop
   // and menubar watchdogs read silence as a dead child - which is how a waiter
@@ -5894,8 +5989,11 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
     process.stderr.write(`codeburn: startup timing refresh-lock=${(performance.now() - refreshWaitStarted).toFixed(1)}ms outcome=${refresh.outcome}\n`)
   }
   if (refresh.outcome === 'timed-out' || refresh.outcome === 'unavailable') {
-    return runParse(key, priorSnapshot, dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
+    return runParse(key, diskCache, dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   }
+  // Every other outcome reloads, so the snapshot goes first: two views of a
+  // large cache are never held at once.
+  diskCache = null
   if (refresh.outcome === 'completed-by-other') {
     return runParse(key, await loadCache(loadScope), dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   }
@@ -6077,7 +6175,7 @@ async function runParseInner(
     // Skip if filtered to a different provider
     if (providerFilter && providerFilter !== 'all' && providerFilter !== providerName) continue
     const section = diskCache.providers[providerName]
-    if (!section || Object.keys(section.files).length === 0) continue
+    if (!section || !hasCachedEntries(diskCache, providerName)) continue
     const hasWslCachedSources = Object.keys(section.files).some(isWslUncPath)
     // Use the persisted durable flag (set by parseProviderSources when it first
     // processes a durableSources provider) OR the static DURABLE_PROVIDER_NAMES
