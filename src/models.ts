@@ -373,6 +373,11 @@ const BUILTIN_ALIASES: Record<string, string> = {
   'anthropic--claude-4.5-haiku':   'claude-haiku-4-5',
   // #1093: copilot session-store.db writes 'claude-haiku-4.5' (tier-first, dot)
   'claude-haiku-4.5':             'claude-haiku-4-5',
+  // Copilot's own spellings of the pre-2026 Claude SKUs (VS Code chat sessions, session-store.db)
+  'claude-3.5-sonnet':             'claude-3-5-sonnet',
+  'claude-3.7-sonnet':             'claude-3-7-sonnet',
+  'claude-3.7-sonnet-thought':     'claude-3-7-sonnet',
+  'claude-opus-4.1':               'claude-opus-4-1',
   'claude-sonnet-4.6':             'claude-sonnet-4-6',
   'claude-sonnet-4.5':             'claude-sonnet-4-5',
   'claude-opus-4.7':               'claude-opus-4-7',

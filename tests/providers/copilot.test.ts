@@ -4062,6 +4062,30 @@ describe('copilot provider - legacy JSON format', () => {
     expect(calls).toHaveLength(1)
     expect(calls[0]!.reasoningTokens).toBe(300 + 200 + 101)
   })
+
+  it('prices the Copilot spellings of the pre-2026 Claude SKUs', async () => {
+    const session = {
+      sessionId: 'sess-legacy-claude',
+      requests: [
+        { requestId: 'r35', modelId: 'copilot/claude-3.5-sonnet', promptTokens: 1_000_000, completionTokens: 0 },
+        { requestId: 'r37', modelId: 'copilot/claude-3.7-sonnet', promptTokens: 1_000_000, completionTokens: 0 },
+        { requestId: 'r37t', modelId: 'copilot/claude-3.7-sonnet-thought', promptTokens: 1_000_000, completionTokens: 0 },
+        { requestId: 'r41', modelId: 'copilot/claude-opus-4.1', promptTokens: 1_000_000, completionTokens: 0 },
+      ],
+    }
+    const filePath = join(tmpDir, 'legacy-claude.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const calls = await collectCalls({ path: filePath, project: 'test-project', provider: 'copilot', sourceType: 'chatsession' })
+
+    expect(calls.map(c => [c.model, c.costUSD])).toEqual([
+      ['claude-3.5-sonnet', calculateCost('claude-3-5-sonnet', 1_000_000, 0, 0, 0, 0)],
+      ['claude-3.7-sonnet', calculateCost('claude-3-7-sonnet', 1_000_000, 0, 0, 0, 0)],
+      ['claude-3.7-sonnet-thought', calculateCost('claude-3-7-sonnet', 1_000_000, 0, 0, 0, 0)],
+      ['claude-opus-4.1', calculateCost('claude-opus-4-1', 1_000_000, 0, 0, 0, 0)],
+    ])
+    for (const c of calls) expect(c.costUSD).toBeGreaterThan(0)
+  })
 })
 // ═══════════════════════════════════════════════════════════════════════════
 // Dedup-key shapes are a CACHE contract, not an implementation detail
