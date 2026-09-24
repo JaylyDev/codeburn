@@ -292,6 +292,7 @@ interface LegacyResponsePart {
   resultDetails?: {
     output?: {
       type?: string
+      mimeType?: string
       base64Data?: string
     }
   }
@@ -367,10 +368,11 @@ function extractToolCallResultContentFromParts(response: LegacyChatRequest['resp
         }
       }
 
-      // Handle resultDetails containing base64 data
+      // Handle resultDetails containing base64 data. Images and other binary
+      // outputs are not tokenised as text, so only text payloads count.
       const resultDetails = itemTyped.resultDetails
       if (resultDetails && typeof resultDetails === 'object') {
-        if (resultDetails.output && resultDetails.output.type === 'data') {
+        if (resultDetails.output && resultDetails.output.type === 'data' && resultDetails.output.mimeType?.startsWith('text/')) {
           const base64 = resultDetails.output.base64Data
           if (typeof base64 === 'string') {
             const decoded = Buffer.from(base64, 'base64').toString('utf8')
@@ -386,12 +388,14 @@ function extractToolCallResultContentFromParts(response: LegacyChatRequest['resp
 interface LegacyOutputs {
   outputText: string
   reasoningText: string
+  recordedReasoningTokens: number
 }
 
 // Prefer toolCallRounds over req.response: response also embeds terminal output, which is model input.
 function extractLegacyOutputs(req: LegacyChatRequest): LegacyOutputs {
   let outputText = ''
   let reasoningText = ''
+  let recordedReasoningTokens = 0
 
   const rounds = req.result?.metadata?.toolCallRounds
   const response = req.response
@@ -406,7 +410,9 @@ function extractLegacyOutputs(req: LegacyChatRequest): LegacyOutputs {
           outputText += tc.arguments + '\n'
         }
       }
-      if (round.thinking) {
+      if (numberOrZero(round.thinking?.tokens) > 0) {
+        recordedReasoningTokens += round.thinking!.tokens!
+      } else if (round.thinking) {
         const text = round.thinking.text
         if (typeof text === 'string' && text) {
           reasoningText += text + '\n'
@@ -468,7 +474,7 @@ function extractLegacyOutputs(req: LegacyChatRequest): LegacyOutputs {
     }
   }
 
-  return { outputText, reasoningText }
+  return { outputText, reasoningText, recordedReasoningTokens }
 }
 
 function extractModelFromRequest(req: LegacyChatRequest, session: LegacyChatSession): string {
@@ -586,7 +592,6 @@ function parseLegacyChatSession(
     const model = extractModelFromRequest(req, session)
 
     const rawRounds = (meta?.['toolCallRounds'] ?? resultObj?.['toolCallRounds'])
-    const rounds: IToolCallRound[] = Array.isArray(rawRounds) ? (rawRounds as IToolCallRound[]) : []
     const extracted = extractChatSessionTools({ toolCallRounds: rawRounds })
     const toolNamesSet = new Set(extracted.tools)
     for (const item of req.response ?? []) {
@@ -598,7 +603,7 @@ function parseLegacyChatSession(
     const tools = [...toolNamesSet]
 
     const msgText = typeof req.message === 'string' ? req.message : (req.message?.text ?? '')
-    const { outputText, reasoningText } = extractLegacyOutputs(req)
+    const { outputText, reasoningText, recordedReasoningTokens } = extractLegacyOutputs(req)
 
     let totalInputTokens: number
     let outputTokens: number
@@ -615,12 +620,7 @@ function parseLegacyChatSession(
       isEstimated = true
 
       // Exact output counts already include reasoning, so thinking is only estimated here.
-      reasoningTokens = Math.ceil(reasoningText.length / CHARS_PER_TOKEN_LEGACY)
-      for (const round of rounds) {
-        if (typeof round.thinking?.tokens === 'number') {
-          reasoningTokens = Math.max(reasoningTokens, round.thinking.tokens)
-        }
-      }
+      reasoningTokens = recordedReasoningTokens + Math.ceil(reasoningText.length / CHARS_PER_TOKEN_LEGACY)
 
       const globalParts = ((meta?.['renderedGlobalContext'] as unknown[]) ?? []).filter(
         (p): p is ChatCompletionContentPartText => isRecord(p) && p.type === ChatCompletionContentPartKind.Text && typeof p.text === 'string'

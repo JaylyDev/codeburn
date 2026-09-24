@@ -14,7 +14,7 @@ source is found. Other discovered sources are walked on every run; results merge
 dedupe.
 
 1. **Legacy CLI sessions:** `~/.copilot/session-state/`
-2. **VS Code core chat sessions:** `~/Library/Application Support/Code/User/workspaceStorage/<hash>/chatSessions/*.jsonl` plus `~/Library/Application Support/Code/User/globalStorage/emptyWindowChatSessions/*.jsonl` and equivalents on Windows / Linux
+2. **VS Code core chat sessions:** `~/Library/Application Support/Code/User/workspaceStorage/<hash>/chatSessions/*.jsonl` plus `~/Library/Application Support/Code/User/globalStorage/emptyWindowChatSessions/*.jsonl` and equivalents on Windows / Linux. Sessions saved by VS Code before 1.109 (February 2026) sit beside them as flat `*.json` files; VS Code keeps the flat file when it migrates a session to the journal, so both formats of one session dedupe on the same `copilot-chatsession:` key.
 3. **VS Code transcripts:** `~/Library/Application Support/Code/User/workspaceStorage/<hash>/GitHub.copilot-chat/transcripts/` and equivalents on Windows / Linux
 4. **OTel SQLite store:** VS Code Copilot Chat's `agent-traces.db` (see the OTel section). Preferred when present because it carries full input / output / cache token counts; legacy JSONL sources only record output tokens.
 5. **CLI session store:** `~/.copilot/session-store.db` (see the session-store section). One `assistant_usage_events` row per API request — the authoritative input/cache source for CLI and GitHub desktop-app sessions.
@@ -407,7 +407,7 @@ None for the JSONL sources. The OTel and session-store sources use the durable c
 
 Legacy JSONL and transcript sessions dedupe per `messageId`. Core chat sessions dedupe per `copilot-chatsession:<sessionId>:<requestId>`, and are not discovered when an OTel source is present. Session-store rows dedupe per `copilot-store:<sessionId>:<rowId>:<hash>` (the hash covers `created_at`, token counts, and model, so a same-path DB reset reusing AUTOINCREMENT ids cannot alias a different request onto a cached key); shutdown rollups per `copilot:<sessionId>:shutdown:<model>:<n>`, with serve-time residuals synthesized (never cached) under `copilot:<sessionId>:shutdown-residual:<model>:<leg>`. JetBrains `.db` turns dedupe per `copilot:jb:<conversationId>:<turnIndex>` (a per-conversation index, plus reply-content dedup within each conversation). These sources otherwise touch disjoint locations from the VS Code / CLI sources.
 
-If a workspace hash contains at least one `chatSessions/*.jsonl` file, the provider skips that hash's legacy `GitHub.copilot-chat/transcripts/` directory. The core chat session journal is the modern token-bearing source for the same conversations, so reading both would inflate call counts.
+If a workspace hash contains at least one `chatSessions/*.jsonl` or flat `chatSessions/*.json` file, the provider skips that hash's legacy `GitHub.copilot-chat/transcripts/` directory. The core chat session journal is the modern token-bearing source for the same conversations, so reading both would inflate call counts.
 
 ## Model inference
 

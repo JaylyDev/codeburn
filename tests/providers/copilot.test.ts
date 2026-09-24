@@ -4007,6 +4007,61 @@ describe('copilot provider - legacy JSON format', () => {
     expect(calls[0]!.reasoningTokens).toBe(120)
     expect(calls[0]!.tools).toContain('Search')
   })
+
+  it('does not count a binary tool output (screenshot) as input text', async () => {
+    const png = Buffer.alloc(200_000, 137).toString('base64')
+    const session = {
+      sessionId: 'sess-image',
+      requests: [
+        {
+          requestId: 'req-1',
+          message: 'screenshot',
+          modelId: 'copilot/claude-sonnet-4.5',
+          response: [
+            { kind: 'toolInvocationSerialized', toolId: 'browser_screenshot', resultDetails: { output: { type: 'data', mimeType: 'image/png', base64Data: png } } },
+            { kind: 'markdownContent', content: { value: 'Here is the page.' } },
+          ],
+        },
+      ],
+    }
+    const filePath = join(tmpDir, 'image.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const calls = await collectCalls({ path: filePath, project: 'test-project', provider: 'copilot', sourceType: 'chatsession' })
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.inputTokens).toBe(3)
+    expect(calls[0]!.costUSD).toBeLessThan(0.001)
+  })
+
+  it('uses the recorded thinking token count over the char estimate, summed per round', async () => {
+    const session = {
+      sessionId: 'sess-thinking-tokens',
+      requests: [
+        {
+          requestId: 'req-1',
+          message: 'hi',
+          modelId: 'copilot/claude-sonnet-4.5',
+          result: {
+            metadata: {
+              toolCallRounds: [
+                { response: 'ok', toolCalls: [], thinking: { text: 'x'.repeat(4000), tokens: 300 } },
+                { response: 'done', toolCalls: [], thinking: { text: 'y'.repeat(4000), tokens: 200 } },
+                { response: 'end', toolCalls: [], thinking: { text: 'z'.repeat(400) } },
+              ],
+            },
+          },
+        },
+      ],
+    }
+    const filePath = join(tmpDir, 'thinking-tokens.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const calls = await collectCalls({ path: filePath, project: 'test-project', provider: 'copilot', sourceType: 'chatsession' })
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.reasoningTokens).toBe(300 + 200 + 101)
+  })
 })
 // ═══════════════════════════════════════════════════════════════════════════
 // Dedup-key shapes are a CACHE contract, not an implementation detail
