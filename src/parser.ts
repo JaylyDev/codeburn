@@ -5,7 +5,7 @@ import { createHash } from 'crypto'
 import { performance } from 'node:perf_hooks'
 import { basename, dirname, join, resolve, sep } from 'path'
 import { FS_SCAN_CONCURRENCY, mapWithConcurrency, readSessionLines } from './fs-utils.js'
-import { billableOutputTokens, calculateCost, calculateLocalModelSavings, getShortModelName, modelRowKey, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
+import { billableOutputTokens, calculateCost, calculateLocalModelSavings, getShortModelName, modelRowKey, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, recordedCostFallback } from './models.js'
 import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
 import { normalizeContentBlocks, flatSlice, flatString } from './content-utils.js'
 import { discoverAllSessions, discoverAllSessionsWithFailures, getProvider } from './providers/index.js'
@@ -2645,6 +2645,7 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
       cacheCreationOneHourTokens: 0,
     },
     costUSD: (REPORTED_COST_PROVIDERS.has(call.provider) || call.costFromBilling === true) ? call.costUSD : undefined,
+    ...(call.fallbackCostUSD ? { fallbackCostUSD: call.fallbackCostUSD } : {}),
     isEstimated: call.costIsEstimated || undefined,
     speed: call.speed,
     timestamp: call.timestamp,
@@ -2817,7 +2818,7 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
       reasoningTokens: u.reasoningTokens,
       webSearchRequests: u.webSearchRequests,
     },
-    costUSD: call.costUSD ?? costUSD,
+    costUSD: call.costUSD ?? recordedCostFallback(call.model, costUSD, call.fallbackCostUSD) ?? costUSD,
     isEstimated: call.isEstimated,
     tools: call.tools,
     mcpTools: extractMcpTools(call.tools),
