@@ -7,7 +7,7 @@ import { cachedProjectIdentitiesForRange } from './daily-cache.js'
 import { reportUnmatchedProjectPatterns } from './project-filter-warnings.js'
 import { getVercelGatewayApiKey } from './providers/vercel-gateway.js'
 import { BILLING_FILTER_VALUES, ROUTE_FILTER_VALUES, filterProjectsByBillingRoute } from './billing-filter.js'
-import { AGGREGATE_ONLY_PROVIDER, aggregateOnlyCostUSD, excludesAggregateOnlyProviders, parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint, isSessionHydrationComplete } from './parser.js'
+import { AGGREGATE_ONLY_PROVIDER, aggregateOnlyCostUSD, excludesAggregateOnlyProviders, parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint, isSessionHydrationComplete, withLoadWindow } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
 import { getProvider } from './providers/index.js'
 import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
@@ -1354,10 +1354,12 @@ program
 
     if (opts.format === 'json') {
       // Durable totals so the compact status matches the menubar / report.
-      const todayDurable = await buildDurablePeriod(getDateRange('today'), { provider: pf, project: opts.project, exclude: opts.exclude })
+      const [todayDurable, monthDurable] = await withLoadWindow(getDateRange('month').range, async () => [
+        await buildDurablePeriod(getDateRange('today'), { provider: pf, project: opts.project, exclude: opts.exclude }),
+        await buildDurablePeriod(getDateRange('month'), { provider: pf, project: opts.project, exclude: opts.exclude }),
+      ] as const)
       const todayData = todayDurable.data
       const todayProjects = todayDurable.liveProjects
-      const monthDurable = await buildDurablePeriod(getDateRange('month'), { provider: pf, project: opts.project, exclude: opts.exclude })
       await reportUnmatchedProjectPatterns([...todayDurable.knownProjects, ...monthDurable.knownProjects], opts.project, opts.exclude)
       const monthData = monthDurable.data
       const monthProjects = monthDurable.liveProjects
@@ -1391,8 +1393,10 @@ program
       return
     }
 
-    const todayDurable = await buildDurablePeriod(getDateRange('today'), { provider: pf, project: opts.project, exclude: opts.exclude })
-    const monthDurable = await buildDurablePeriod(getDateRange('month'), { provider: pf, project: opts.project, exclude: opts.exclude })
+    const [todayDurable, monthDurable] = await withLoadWindow(getDateRange('month').range, async () => [
+      await buildDurablePeriod(getDateRange('today'), { provider: pf, project: opts.project, exclude: opts.exclude }),
+      await buildDurablePeriod(getDateRange('month'), { provider: pf, project: opts.project, exclude: opts.exclude }),
+    ] as const)
     await reportUnmatchedProjectPatterns([...todayDurable.knownProjects, ...monthDurable.knownProjects], opts.project, opts.exclude)
     console.log(renderStatusBar([], {
       today: { cost: todayDurable.data.cost, calls: todayDurable.data.calls },
@@ -1956,7 +1960,7 @@ program
 
 program
   .command('gateway-totals [mode]')
-  .description('Include or exclude Vercel AI Gateway spend in headline totals. Gateway reports are daily per-model aggregates with no request identity, so the same spend is usually already counted by the local tools you pointed at the gateway (Claude Code, Codex, OpenCode, Cline/Roo/Kilo, Cursor). Excluded by default; the gateway is always shown as its own row either way. Modes: include, exclude.')
+  .description('Include or exclude Vercel AI Gateway spend in headline totals. Gateway reports are daily per-model aggregates with no request identity, so the same spend is usually already counted by the local tools you pointed at the gateway (Claude Code, Codex, OpenCode, Cline/Kilo, Cursor). Excluded by default; the gateway is always shown as its own row either way. Modes: include, exclude.')
   .option('--format <format>', 'Output format: text, json', 'text')
   .action(async (mode?: string, opts?: { format?: string }) => {
     const format = opts?.format ?? 'text'

@@ -149,3 +149,72 @@ describe('Claude keychain fallback', () => {
     expect(keychain).not.toHaveBeenCalled()
   })
 })
+
+// The desktop app reads the same credential the CLI does, and on macOS that is
+// normally the Keychain with no credential file at all - which is exactly the
+// install the app never writes back to. The 401 re-read has to consult that store.
+describe('Claude credential recovery', () => {
+  const originalPlatform = process.platform
+  beforeAll(() => Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true }))
+  afterAll(() => Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true }))
+
+  const now = () => 1_760_000_000_000
+  const HOUR = 3_600_000
+  const usage = JSON.stringify({ seven_day: { utilization: 55, resets_at: '2026-07-19T12:00:00Z' } })
+  const stored = (accessToken: string, expiresAt: number) =>
+    JSON.stringify({ claudeAiOauth: { accessToken, expiresAt, rateLimitTier: 'max_20x' } })
+  const ok = () => new Response(usage, { status: 200 })
+
+  it('re-reads the keychain, not the absent file, when a 401 rejects the token', async () => {
+    let reads = 0
+    const keychain = vi.fn(async () => ({ status: 'found' as const, value: stored(reads++ === 0 ? 'before' : 'after', now() + HOUR) }))
+    let requests = 0
+    const fetchMock = vi.fn(async () => (requests++ === 0 ? new Response('', { status: 401 }) : ok()))
+    const readFile = vi.fn(async () => null)
+
+    const result = await fetchClaudeQuota({ fetch: fetchMock, readFile, keychain, allowKeychain: true, now })
+
+    expect(result.quota.connection).toBe('connected')
+    expect(result.quota.primary?.percent).toBe(0.55)
+    expect(keychain).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('calls an expired login terminal when a 401 rejects it and the keychain has nothing newer', async () => {
+    const keychain = vi.fn(async () => ({ status: 'found' as const, value: stored('unchanged', now() - HOUR) }))
+    const fetchMock = vi.fn(async () => new Response('', { status: 401 }))
+
+    const result = await fetchClaudeQuota({ fetch: fetchMock, readFile: vi.fn(async () => null), keychain, allowKeychain: true, now })
+
+    expect(result.quota.connection).toBe('terminalFailure')
+    expect(result.quota.footerLines[0]).toMatch(/expired/i)
+    expect(result.quota.connectable).toBe(true)
+    expect(keychain).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a 401 transient while the credential is still within its life', async () => {
+    const keychain = vi.fn(async () => ({ status: 'found' as const, value: stored('unchanged', now() + HOUR) }))
+    const fetchMock = vi.fn(async () => new Response('', { status: 401 }))
+
+    const result = await fetchClaudeQuota({ fetch: fetchMock, readFile: vi.fn(async () => null), keychain, allowKeychain: true, now })
+
+    expect(result.quota.connection).toBe('transientFailure')
+    expect(result.quota.footerLines).toEqual([])
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('re-reads the file for a file-backed credential on a background poll and never touches the keychain', async () => {
+    let reads = 0
+    const readFile = vi.fn(async () => stored(reads++ === 0 ? 'before' : 'after', now() + HOUR))
+    let requests = 0
+    const fetchMock = vi.fn(async () => (requests++ === 0 ? new Response('', { status: 401 }) : ok()))
+    const keychain = vi.fn(async () => ({ status: 'found' as const, value: stored('keychain', now() + HOUR) }))
+
+    const result = await fetchClaudeQuota({ fetch: fetchMock, readFile, keychain, now })
+
+    expect(result.quota.connection).toBe('connected')
+    expect(readFile).toHaveBeenCalledTimes(2)
+    expect(keychain).not.toHaveBeenCalled()
+  })
+})
